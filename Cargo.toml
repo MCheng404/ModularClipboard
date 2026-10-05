@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/tiez-core",
-    "crates/tiez-store",
-    "crates/tiez-capture",
-    "crates/tiez-platform",
-    "crates/tiez-app",
-    "crates/tiez-gfx",
-    "crates/tiez-ui",
-    "crates/tiez-bin",
+    "crates/modular-clipboard-core",
+    "crates/modular-clipboard-store",
+    "crates/modular-clipboard-capture",
+    "crates/modular-clipboard-platform",
+    "crates/modular-clipboard-app",
+    "crates/modular-clipboard-gfx",
+    "crates/modular-clipboard-ui",
+    "crates/modular-clipboard",
 ]
 
 [workspace.package]
@@ -18,13 +18,13 @@ rust-version = "1.85"
 license = "MIT"
 
 [workspace.dependencies]
-tiez-core = { path = "crates/tiez-core" }
-tiez-store = { path = "crates/tiez-store" }
-tiez-capture = { path = "crates/tiez-capture" }
-tiez-platform = { path = "crates/tiez-platform" }
-tiez-app = { path = "crates/tiez-app" }
-tiez-gfx = { path = "crates/tiez-gfx" }
-tiez-ui = { path = "crates/tiez-ui" }
+modular-clipboard-core = { path = "crates/modular-clipboard-core" }
+modular-clipboard-store = { path = "crates/modular-clipboard-store" }
+modular-clipboard-capture = { path = "crates/modular-clipboard-capture" }
+modular-clipboard-platform = { path = "crates/modular-clipboard-platform" }
+modular-clipboard-app = { path = "crates/modular-clipboard-app" }
+modular-clipboard-gfx = { path = "crates/modular-clipboard-gfx" }
+modular-clipboard-ui = { path = "crates/modular-clipboard-ui" }
 
 anyhow = "1.0"
 thiserror = "2.0"
@@ -45,7 +45,7 @@ global-hotkey = "0.8"
 trash = "5.2"
 
 egui = "0.36"
-# eframe 已移除：渲染后端改为 ash 直驱 Vulkan（见 crates/tiez-ui/src/app.rs）。
+# eframe 已移除：渲染后端改为 ash 直驱 Vulkan（见 crates/modular-clipboard-ui/src/app.rs）。
 # 它的引入会让 Vulkan 为每个枚举到的 Adapter 加载对应厂商驱动栈，
 # 内存占用从 85MB 涨到 383MB（MEMORY.md 有实测数据）。
 

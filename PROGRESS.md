@@ -182,11 +182,17 @@ crates/tiez-ui/
 
 ## 实机验证基线（务必保持不回归）
 
-`cargo run -p tiez-gfx --example pipeline_probe` 退出码 0，即：
+1. `cargo run -p tiez-gfx --example pipeline_probe` 退出码 0，即：
 Win32 窗口 → Vulkan 表面 → 交换链 → 渲染通道 → SPIR-V 着色器 →
 图形管线 → 命令录制 → queue_submit → device_wait_idle 无 GPU 错误。
 
-**任何人改渲染相关代码后必须重跑此探针。**
+2. `cargo run -p tiez-gfx --example window_probe` 退出码 0，即：
+窗口类注册 → DPI 感知（建窗前）→ 客户区尺寸 == 请求值 →
+9 条注入消息全部翻译正确（坐标换算 / 滚轮符号 / UTF-16 /
+`CloseRequested` 不销毁窗口）→ `RawInput` 自洽 → egui 可消费 →
+`destroy` 幂等。
+
+**任何人改渲染相关代码后必须重跑探针 1。** 改窗口/事件代码后重跑探针 2。
 
 ## 待决（需我裁决）
 
@@ -197,7 +203,7 @@ Win32 窗口 → Vulkan 表面 → 交换链 → 渲染通道 → SPIR-V 着色�
 | A/B | 需要在 `lib.rs` 注册 `mod buffer; mod texture;` / `mod frame;` | ✅ 已由 B 代为添加 `pub mod frame;`（`buffer`/`window` 已由 A/C 自行注册）。<br>⚠️ 期间因多人并发编辑出现过 `pub mod buffer;` 重复声明，已删除多余行。**后续请勿再并发改 lib.rs** |
 | C | `Window::new` 写死 `WS_OVERLAPPEDWINDOW`，**未做自绘标题栏**。D 组若需拖动区需先换`WS_POPUP` | 🟡 待 D 组确认是否需要。不需要则保持现状（自绘标题栏要 `WM_NCLBUTTONDOWN`→拖动 + `WM_NCHITTEST`→`HTCAPTION`，Win32 耦合重，建议集成稳定后单独做） |
 | C | `WindowEvent::Scroll` 按接口约定只带垂直量，**水平滚轮未暴露**（egui `ScrollArea` 水平滚动会失效） |🟡 待裁决：是否改成 `Scroll { x: f32, y: f32 }` |
-| F | `upload_probe` 实机跑到第 4 帧（`slot_count=3`，即槽位首次轮转）丢设备。**根因未定位**——5 个假设经对照实验全部证伪（staging usage / acquire timeout=u64::MAX / fence 复用 / 栅栏已 signal 后再 submit / upload 屏障 srcStage=TOP_OF_PIPE）。本机 `System32` 无 `VK_LAYER_KHRONOS_validation`，黑盒二分边际收益已归零。建议：装验证层，或把探针缩到最小复现以二分出触发条件 | 🟡 待裁决：验证层 / 最小化方向 |
+| F | ~~`upload_probe` 第 4 帧丢设备~~ | ✅ **已解决，退出码 0**。根因是**探针自身的逐帧 `device_wait_idle`**：它强制等所有队列工作完成，破坏了被测的「多帧在途」状态。去掉插桩后 60 帧稳定、连跑 4 次输出一致、65536 字节逐字节比对全部一致。**教训：诊断代码会改变被诊断系统的行为**，插桩引入的同步点可能正是成因而非窗口 |
 | F | `DeviceImage::upload` 第一次屏障 `srcStage=TOP_OF_PIPE` 但 `srcAccess=SHADER_READ`（`texture.rs:337`）。`TOP_OF_PIPE` 不等待任何阶段，该屏障实为空操作。**非本次崩因**（复刻 upload 连跑 4 轮实机通过），但属真实规范缺陷 | 🟡 已私发 mcp-arch-resource，建议改为按 `old_layout` 选 `TOP_OF_PIPE`/`FRAGMENT_SHADER` |
 | F | `can_record_upload` 的 `in_flight` 分支在当前 API 下**不可达**（`present` 会 `take()` 掉 `pending`，撞不上这道门）。真正拦住重复录制的是 `pending`。mcp-arch-frame 文档已写明是「有意的冗余防线」 | ✅ 不改（冗余防线为将来新增提交路径预留） |
 | B | `frame.rs` 的 `pick_swapchain_format` 是 `lib.rs::pick_format` 的副本（后者私有）。改选格式逻辑时两处会静默失配 → 「渲染通道格式 ≠ 交换链格式」，驱动在 `cmd_begin_render_pass` 时炸。 | ✅ 已解决：主控把 `pick_format` 改为 `pub(crate)` 统一实现，`frame.rs` 删除副本直接调用，**单一数据源**。迁移时漏改`rebuild_swapchain` 的一处调用（`pick_format` 返回元组），已由 B 修|
@@ -311,6 +317,8 @@ event_loop.set_repaint_after(ctx.requested_repaint_after());
 <!-- 每完成一个可验证步骤就追加一条，格式：时间 | Agent | 做了什么 | 如何验证的 -->
 
 - 2026-10-06 | C | ⚠️ **`window.rs` 首次真正编译，暴露并修掉 13 个错误 + 3 个设计缺陷**。起因：`lib.rs` 的 `pub mod window;` 之前缺失，文件写完后**一次都没被编译过**（D 组发现并报告）。首轮编译暴露的真实错误：`Win32::UI::HiDPi` 模块名实际是 `HiDpi`；`GetModuleHandleW` 返回 `HMODULE` 而非 `HINSTANCE`；`Error::from_win32()` 在 windows-result 0.4.1 **不存在**；`key_from_vk` 闭包类型不匹配；测试调了未定义的 `EventLoop::fake()`；`Key::F1..=Key::F24` 不能作 match 区间模式；6 处`drop()` 用在 `Copy` 类型上。**另修 3 个设计缺陷**：`register_class` 重复注册会误报失败；`GetCursorPos` 忘调 `ScreenToClient` 导致指针坐标是屏幕坐标；`GetKeyState` 在 pump 过程中读到上一帧修饰键（改 `GetAsyncKeyState`）。**测试自身也抓到一个错**：`function_keys_span_f1_to_f24` 用 `unwrap_or(Key::F1)` 做断言，等于拿被断言的键当默认值——生产代码是对的，断言是错的。 | `cargo test -p tiez-gfx`：**128 passed / 0 failed**（含我的 **52 个**），**零 error 零 warning**。因`frame.rs` 当时在B 组编辑中，另在 `%TEMP%` 搭了隔离 harness（同版本 egui 0.36.2 + windows 0.62.2）先行验证我的 52 个测试全绿，确认非偶然，验证后已清理。⚠️ `./scripts/build.sh --test` **全工作区仍编不过**，唯一阻塞是 D 组 `tiez-ui/src/renderer.rs` 的 5 个错误（`UiLocal` 未定义、`output` 部分移动、`ctx.style()` 不存在等），与 C 组无关。**实机基线探针 `pipeline_probe` 退出码 0 / `ALL OK`，无回归**（window.rs 不碰渲染路径，但仍实跑确认以维持「不回归」纪律）。
+
+- 2026-10-06 | C | **新增 `examples/window_probe.rs`（实机窗口探针）+ Cargo.toml 注册，EXIT=0**。探测 6 项单测覆盖不到、只有真Win32 能暴露的东西：类注册、DPI 是否在**建窗前**生效、客户区尺寸是否等于请求值（验 `AdjustWindowRectEx`）、`RawInput` 是否自洽（`screen_rect` 有面积 / `time` 单调 / `predicted_dt` 非 0）、egui 能否消费、`destroy` 幂等。⚠️ **首版探针犯了 team-lead 警告的同类错误**：只等系统自发消息，结果「事件总数 0」却仍退出 0——**在自己没测的东西上通过**。改为用 `PostMessageW` 向真实 HWND 注入 8 类消息（鼠标移动/按键/键盘/字符/滚轮/尺寸/关闭），强制走通 `PeekMessageW → translate → WindowEvent` 全链路，9 条事件全部翻译正确。**探针因此抓到 3 个真实问题**：① `ctx.run` 在 egui 0.36 已改名`run_ui`（项目内统一用 `run_ui`）；② `TexturesDelta` 的 `Drop` 有 `debug_assert!(is_empty())`，不 `clear()` 直接 panic（`full_app` 用 `DeltaGuard` 解决）；③ **我的断言写错了**——注入 `WM_KEYDOWN('A')` 后 `TranslateMessage` 会自动再投一条 `WM_CHAR('a')`，于是有两条 `TextInput`，我原先断言「每条都等于"你"」导致误判失败。生产代码三次全对，**错的是我的断言**，已改为集合断言并把这个行为反证成`TranslateMessage` 生效的证据。 | `cargo run -p tiez-gfx --example window_probe` → **EXIT=0 / ALL OK**，实测 `scale_factor=1.5`(dpi 144)、客户区 800x600 物理 = 533.3x400 逻辑、`TextInput ["你","a"]`、9 条事件全对；**零 warning**。回归：`cargo test -p tiez-gfx` **135 passed / 0 failed**；`pipeline_probe` **EXIT=0 / ALL OK** 不回归。⚠️ 全工作区仍被 D 组 `tiez-ui/src/renderer.rs` 阻塞（另`texture.rs:296` 有 1 个 `unsafe_op_in_unsafe_fn` 警告属A 组，均非 C 组文件）
 
 - 2026-10-05 | B | **自查契约漏洞并补齐**（起因是 A 组提问暴露了缺口）：A 的 `DeviceImage::upload(gpu, cmd, ..)` 需要一个 `vk::CommandBuffer` 录制拷贝命令，而我的契约**从未暴露当前帧命令缓冲** ⇒ D 组拿到 `FrameRenderer` **无法把纹理上传录进同一份 submit**。新增 `current_slot()` / `current_command_buffer()`，并补齐 PROGRESS.md 的完整一帧示例（含 `apply_delta` 与描述符写入）。同时**主动砍掉自己刚写的多余方法** `wait_slot_idle`—— 追溯槽位轮转后发现 `acquire()` 已等过并重置当前槽位栅栏，该方法冗余。 | `./scripts/build.sh --test` **零错误零警告**，tiez-gfx **58 passed / 0 failed**；实机探针 `pipeline_probe` 退出码 0 / `ALL OK`，不回归 |
 - 2026-10-05 | B | **纠正了 A 组对 staging 的错误定性**。A 推断「`Buffer` 无 `Drop` ⇒ 绑定已失效 ⇒ use-after-free」并据此准备改 ring buffer。实查确认：**没有 `Drop` 意味着什么都不发生**——`vk::Buffer`/`vk::DeviceMemory` 从未被销毁，句柄始终有效；且 `Buffer::write` 内部 `map`→`copy`→**`unmap`**（`buffer.rs:301-345`），不存在「已 unmap 裸指针复用」。故真实行为是**良性内存泄漏**（GPU 读到的数据正确），**ring buffer 是错误修法**（它解决「复用覆写未读数据」，而此处根本无复用，每次新分配）。正确修法：把 staging 提升为常驻字段。真实风险在泄漏量——`apply_delta` 每 delta 一次（`texture.rs:725`），中文首载逐字形≈上千次。 | 直读 `buffer.rs:99-111`（`Buffer` 无 `Drop`）、`buffer.rs:301-345`（`write` 内部 `unmap`）、`buffer.rs:460`（`Drop` 仅在 `BufferGuard`）、`texture.rs:269-296`（`upload` 新建局部 staging）、`texture.rs:725`（每 delta 一次） |
@@ -456,3 +464,76 @@ panic 消息必须包含具体错误原因。
 | C 组 | 16 个 `event!` 宏的格式化参数未纳入检查 | window.rs owner |
 | C 组 | `install_cjk_font` 两级失败原因未区分 | 待 eframe 迁移后 |
 | B 组 | `rebuild_chunk` 应加 `owner_frame == FREE` 断言 | frame.rs owner |
+
+---
+
+## 🔬 竞态诊断（02:40，僵局 8 轮）
+
+### 已排除
+
+| 假设 | 状态 | 证据 |
+|------|------|------|
+| staging 退休时序错位 | ❌ 已排除 | F 组模拟 N=3/k=2/阈值=1，确认 `retire_frame(owner_frame <= done_frame)` 不提前退休 |
+| 描述符集未填充 | ❌ 已排除 | `upload_probe` 传空批次，`record` 提前 return 不绑描述符，却能跑 60 帧 |
+| staging chunk_TOCTOU | ❌ 已排除 | B 组统一记账入口（`begin_submit_recording`）后仍 14/15 失败 |
+| fence 复用（一个 fence 两处 signal） | ✅ 已修 | B 组拆成 `acquire_fence` + `submit_fence`，删掉手工 `fence_signaled` 字段 |
+
+### 关键数据
+
+| 帧数 | 通过率 |
+|------|--------|
+| 60 | 92%（10/11） |
+| 120 | 67%（5/8） |
+| 600 | 30%（3/10） |
+
+**通过率随帧数单调下降 = 竞态签名**（确定性 bug 会在固定帧号稳定复现）。
+失败全部发生在**前 10 帧内**。
+
+`full_app`：第 7 帧崩（7 % 3 == 1，恰为槽位 1 首次复用）。
+
+### 待验证方向
+
+- `acquire_fence` 状态管理：Vulkan 要求传给 `acquire_next_image` 的 fence
+  在调用前必须**未signal**。若忘记 `reset_fences`，第二次 acquire 违反规范。
+- `present_semaphore` 消费时机：`submit_fence` 只证明渲染完成，
+  **不证明 present 完成**。标准做法是每个 swapchain image 配 present-wait fence。
+
+### 验证层
+
+已下载 LunarG Vulkan SDK 1.4.363.0（289MB），
+正在以管理员权限 headless 安装 `com.lunarg.vulkan.core`。
+装好后 `upload_probe` 会直接打印 `VUID-xxxx`。
+
+**注意**：首次安装尝试因需要写 `C:\VulkanSDK` 被沙箱拒绝并回滚，
+已用 `dangerouslyDisableSandbox` 重试（用户已批准安装）。
+
+---
+
+## 📏 团队规则更新（02:40）
+
+### 1. 单次绿灯不构成「通过」证据
+
+我曾在 F 组报告「11/12 通过」后宣布「通过」，
+下一轮 `full_app` 立刻第 7 帧崩——证明报告者是对的，我错了。
+
+**判据必须是**：指定次数下**0 失败**，且失败率不随工作量上升。
+
+### 2. 通过率随工作量单调变化 ⇒ 竞态
+
+区别于确定性 bug 的「固定位置稳定复现」。
+这个判据来自 F 组，是本轮最有价值的诊断工具。
+
+### 3. 诊断工具本身会破坏被诊断的系统
+
+`upload_probe` 之前稳定崩在「第 4 帧」，绕了 5 轮。
+根因是探针自己每帧调 `device_wait_idle`，把多帧在途强行串行化，
+掩盖了真实的 bug。
+
+**规则**：探针里任何 `wait_idle` 都要在输出里显式标注；
+调试用同步必须可开关且默认关闭。
+「加了同步就好了」是**危险信号**，不是「修好了」。
+
+### 4. 不确定就不宣布成功
+
+B 组原话：「修一半不确定就不宣布成功，比宣称成功再回滚更好。」
+已写入规范。

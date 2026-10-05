@@ -1,0 +1,16 @@
+[package]
+name = "modular-clipboard-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+modular-clipboard-core = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true }
+image = { workspace = true }
+directories = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }

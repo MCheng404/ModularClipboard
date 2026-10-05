@@ -25,7 +25,7 @@ Vulkan 两条路径，且为每个枚举到的 Adapter 加载对应厂商驱动�
 
 ## 渲染后端
 
-`crates/tiez-gfx` 用 `ash` 直接驱动 Vulkan：
+`crates/modular-clipboard-gfx` 用 `ash` 直接驱动 Vulkan：
 
 - 实例、表面、物理设备与逻辑设备创建
 - 设备选择（支持 `MODULARCLIPBOARD_GPU=integrated|discrete` 限定显卡）
@@ -35,7 +35,7 @@ Vulkan 两条路径，且为每个枚举到的 Adapter 加载对应厂商驱动�
 已通过实机探针验证：成功加载 Vulkan 1.4.341 运行时，枚举到 2 个设备。
 
 ```bash
-cargo run -p tiez-gfx --example probe
+cargo run -p modular-clipboard-gfx --example probe
 ```
 
 ## 构建
@@ -100,8 +100,8 @@ tiez --help
 实现 `Action` trait 并注册，**不需要改动捕获、存储或界面的任何代码**：
 
 ```rust
-use tiez_app::action::{Action, ActionId, ActionPlan, ActionRegistry};
-use tiez_core::ClipItem;
+use modular_clipboard_app::action::{Action, ActionId, ActionPlan, ActionRegistry};
+use modular_clipboard_core::ClipItem;
 
 struct SendToPhoneAction;
 
@@ -109,7 +109,7 @@ impl Action for SendToPhoneAction {
     fn id(&self) -> ActionId { "send_to_phone" }
     fn label(&self) -> &'static str { "发送到手机" }
     fn accepts(&self, item: &ClipItem) -> bool {
-        item.kind == tiez_core::ClipKind::Text
+        item.kind == modular_clipboard_core::ClipKind::Text
     }
     fn plan(&self, item: &ClipItem) -> Option<ActionPlan> {
         Some(ActionPlan::RunCommand {
@@ -125,10 +125,10 @@ reg.register(Box::new(SendToPhoneAction))?;
 
 ## 架构
 
-单向依赖，`tiez-core` 零 IO 依赖：
+单向依赖，`modular-clipboard-core` 零 IO 依赖：
 
 ```
-tiez-bin → tiez-ui → tiez-app → {tiez-capture, tiez-platform, tiez-gfx} → tiez-store → tiez-core
+modular-clipboard → modular-clipboard-ui → modular-clipboard-app → {modular-clipboard-capture, modular-clipboard-platform, modular-clipboard-gfx} → modular-clipboard-store → modular-clipboard-core
 ```
 
 两个线程 + 一个无锁环形队列：UI 线程负责绘制与全部 SQLite 读写，捕获线程只做剪贴板轮询。解耦的原因是读取剪贴板可能被其他进程锁住数秒，同步写库会连带卡住界面。
@@ -138,7 +138,7 @@ tiez-bin → tiez-ui → tiez-app → {tiez-capture, tiez-platform, tiez-gfx} �
 ## 未实现
 
 **渲染层**：Vulkan 渲染管线（着色器、图形管线、帧图）、egui 图元上传绘制、
-Win32 窗口与事件循环、`tiez-ui` 从 eframe 迁移到自写渲染器。
+Win32 窗口与事件循环、`modular-clipboard-ui` 从 eframe 迁移到自写渲染器。
 
 **功能层**：托盘常驻、全局快捷键唤出、图片缩略图预览、分页加载、
 载荷加密、跨平台验证。

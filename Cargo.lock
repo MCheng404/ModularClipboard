@@ -773,6 +773,112 @@ dependencies = [
 ]
 
 [[package]]
+name = "modular-clipboard"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "modular-clipboard-app",
+ "modular-clipboard-core",
+ "modular-clipboard-ui",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "modular-clipboard-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "image",
+ "modular-clipboard-capture",
+ "modular-clipboard-core",
+ "modular-clipboard-platform",
+ "modular-clipboard-store",
+ "rtrb",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "modular-clipboard-capture"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "modular-clipboard-core",
+ "tracing",
+ "windows",
+]
+
+[[package]]
+name = "modular-clipboard-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "modular-clipboard-gfx"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "bytemuck",
+ "egui",
+ "modular-clipboard-core",
+ "naga",
+ "tracing",
+ "windows",
+]
+
+[[package]]
+name = "modular-clipboard-platform"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "modular-clipboard-capture",
+ "modular-clipboard-core",
+ "tracing",
+ "windows",
+]
+
+[[package]]
+name = "modular-clipboard-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "image",
+ "modular-clipboard-core",
+ "rusqlite",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "modular-clipboard-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "bytemuck",
+ "egui",
+ "modular-clipboard-app",
+ "modular-clipboard-core",
+ "modular-clipboard-gfx",
+ "modular-clipboard-store",
+ "tracing",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1342,112 +1448,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tiez-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "directories",
- "image",
- "rtrb",
- "serde_json",
- "tiez-capture",
- "tiez-core",
- "tiez-platform",
- "tiez-store",
- "tracing",
-]
-
-[[package]]
-name = "tiez-bin"
-version = "0.1.0"
-dependencies = [
- "directories",
- "tiez-app",
- "tiez-core",
- "tiez-ui",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tiez-capture"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "tiez-core",
- "tracing",
- "windows",
-]
-
-[[package]]
-name = "tiez-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "tiez-gfx"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "bytemuck",
- "egui",
- "naga",
- "tiez-core",
- "tracing",
- "windows",
-]
-
-[[package]]
-name = "tiez-platform"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "tiez-capture",
- "tiez-core",
- "tracing",
- "windows",
-]
-
-[[package]]
-name = "tiez-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "directories",
- "image",
- "rusqlite",
- "serde_json",
- "sha2",
- "thiserror",
- "tiez-core",
- "tracing",
-]
-
-[[package]]
-name = "tiez-ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "bytemuck",
- "egui",
- "tiez-app",
- "tiez-core",
- "tiez-gfx",
- "tiez-store",
- "tracing",
 ]
 
 [[package]]
