@@ -15,8 +15,11 @@
 
 use std::ffi::CString;
 
+pub mod buffer;
+pub mod frame;
 pub mod pipeline;
 pub mod shader;
+pub mod texture;
 
 use ash::{Device, Entry, Instance as AshInstance, khr, vk};
 use khr::surface::Instance as SurfaceLoader;
@@ -447,7 +450,12 @@ fn create_image_view(gpu: &Gpu, image: vk::Image, format: vk::Format) -> anyhow:
 ///
 /// 返回 `(format, color_space)`。表面只报告一种格式时必须原样采用，
 /// 不能自行挑选——这是 Vulkan 规范的明确要求。
-fn pick_format(
+///
+/// **本函数是格式选择的唯一实现**。渲染通道的附件格式必须与交换链一致，
+/// 任何地方需要预知交换链格式都必须调用它，不得另写一份
+/// （历史上frame.rs 曾有一份副本，两份逻辑一旦分叉会导致
+/// 「渲染通道格式 ≠ 交换链格式」，驱动在 `cmd_begin_render_pass` 时崩溃）。
+pub(crate) fn pick_format(
     formats: &[vk::SurfaceFormatKHR],
 ) -> anyhow::Result<(vk::Format, vk::ColorSpaceKHR)> {
     if formats.is_empty() {

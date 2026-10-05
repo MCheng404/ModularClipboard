@@ -2657,6 +2657,7 @@ dependencies = [
  "anyhow",
  "ash",
  "bytemuck",
+ "egui",
  "naga 25.0.1",
  "tiez-core",
  "tracing",

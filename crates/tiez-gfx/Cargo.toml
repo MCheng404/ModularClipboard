@@ -10,6 +10,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 ash = { workspace = true }
 bytemuck = { workspace = true }
+# window.rs 需要把 Win32 事件翻译成 egui 的 RawInput，
+# 这是 UI 层与渲染层之间唯一的耦合点，由本 crate 持有以避免循环依赖。
+egui = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -17,6 +20,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
+    # window.rs 的键鼠事件转换需要
+    "Win32_UI_Input_KeyboardAndMouse",
+    # DPI 感知：SetProcessDpiAwarenessContext
+    "Win32_UI_HiDpi",
 ] }
 
 [[example]]

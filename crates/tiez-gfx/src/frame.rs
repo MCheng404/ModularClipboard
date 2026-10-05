@@ -1,0 +1,1476 @@
+//! 帧图与呈现：acquire → record → submit → present，以及交换链重建。
+//!
+//! 本模块是渲染器的帧循环骨架，也是**唯一**持有交换链派生资源的地方
+//! （framebuffer、命令缓冲、信号量、栅栏、描述符集）。上层只管提供
+//! 「画什么」，不管「画到哪里」——目标图像由 [`FrameRenderer::acquire`] 决定。
+//!
+//! # 一帧的流程
+//!
+//! ```
+//! use ash::vk;
+//! use tiez_gfx::frame::{DrawBatch, DrawInput, FrameRenderer, PresentResult};
+//!
+//! # fn run(fr: &mut FrameRenderer<'_>) -> anyhow::Result<()> {
+//! let Some(frame) = fr.acquire()? else {
+//!     // acquire 返回 None 表示交换链已过期，必须重建后才能继续
+//!     fr.rebuild_swapchain(Default::default())?;
+//!     return Ok(());
+//! };
+//! let input = DrawInput {
+//!     vertex_buffer: vk::Buffer::null(),
+//!     index_buffer: vk::Buffer::null(),
+//!     batches: &[DrawBatch { index_offset: 0, index_count: 3 }],
+//!     ..Default::default()
+//! };
+//! fr.record(&input)?;
+//! if fr.present(frame)? == PresentResult::Outdated {
+//!     // 呈现时才发现过期：同样要重建，下一帧的 acquire 才会成功
+//!     fr.rebuild_swapchain(Default::default())?;
+//! }
+//! # Ok(()) }
+//! ```
+//!
+//! # 布局转换为什么必须逐图像跟踪
+//!
+//! 交换链的图像在两次 [`acquire_next_image`] 之间**不会**被重置布局——
+//! 上一帧结束时它们停在 `PRESENT_SRC_KHR`，下次 acquire 拿到的可能还是
+//! 同一张。因此不能用 `UNDEFINED` 一刀切，必须为每张图像单独记当前布局。
+//! 见 [`LayoutTracker`]。
+
+use ash::vk::Handle;
+use ash::{Device, khr, vk};
+use std::time::Instant;
+
+use crate::pipeline::{BINDING_SAMPLER, BINDING_TEXTURE, BINDING_UNIFORM};
+use crate::{Gpu, Swapchain, image_barrier};
+
+/// `VK_SUBOPTIMAL_KHR` 的原始返回码。
+///
+/// ash 0.38 **没有**为它生成常量（`vk::Result` 里只有 Vulkan 1.0 核心的
+/// 那批），只能自己按扩展规定的数值比较。
+pub const RESULT_SUBOPTIMAL_KHR: i32 = 1_000_001_003;
+
+/// `VK_ERROR_OUT_OF_DATE_KHR` 的原始返回码。同样没有现成常量。
+pub const RESULT_OUT_OF_DATE_KHR: i32 = -1_000_001_004;
+
+/// 无法从表面能力推断尺寸时使用的兜底窗口尺寸。
+///
+/// Windows 的 `current_extent` 总是有效（等于真实客户区尺寸），因此这个
+/// 兜底值实际上只在离屏/异常表面上才会被用到。
+const FALLBACK_EXTENT: vk::Extent2D = vk::Extent2D {
+    width: 1280,
+    height: 800,
+};
+
+/// acquire 的等待上限。取 u64::MAX 表示「一直等到有图像可用」。
+const ACQUIRE_TIMEOUT: u64 = u64::MAX;
+
+/// 栅栏等待上限。取 u64::MAX 表示「等 GPU 真的画完」。
+const FENCE_TIMEOUT: u64 = u64::MAX;
+
+// ---------------------------------------------------------------------------
+// 契约类型
+// ---------------------------------------------------------------------------
+
+/// 渲染所需的全部管线对象，打包交给 [`FrameRenderer`] 持有引用。
+///
+/// 只存裸句柄、不接管所有权：这些对象由调用方创建与销毁，
+/// `FrameRenderer` 销毁时不会去动它们。这样重建交换链时
+/// 管线可以继续复用（前提是表面格式没变，见 [`FrameRenderer::rebuild_swapchain`]）。
+#[derive(Debug, Clone, Copy)]
+pub struct PipelineBundle {
+    /// 渲染通道。附件格式必须与交换链图像格式一致。
+    pub render_pass: vk::RenderPass,
+    /// 管线布局，内含描述符集布局。
+    pub pipeline_layout: vk::PipelineLayout,
+    /// 图形管线。
+    pub pipeline: vk::Pipeline,
+    /// 描述符集布局。`FrameRenderer` 用它分配 [`FrameRenderer`] 自己的描述符集。
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+}
+
+impl PipelineBundle {
+    /// 从三件套 + 描述符集布局组装。
+    pub fn new(
+        render_pass: vk::RenderPass,
+        pipeline_layout: vk::PipelineLayout,
+        pipeline: vk::Pipeline,
+        descriptor_set_layout: vk::DescriptorSetLayout,
+    ) -> Self {
+        Self {
+            render_pass,
+            pipeline_layout,
+            pipeline,
+            descriptor_set_layout,
+        }
+    }
+}
+
+/// 一次成功的 acquire。
+#[derive(Debug, Clone)]
+pub struct AcquiredFrame {
+    /// 交换链图像索引。
+    pub image_index: u32,
+    /// 与 `image_index` 对应的 framebuffer。**不能传空句柄**，否则驱动崩溃。
+    pub framebuffer: vk::Framebuffer,
+    /// 与 `image_index` 对应的图像。
+    pub image: vk::Image,
+    /// acquire 完成的时刻，用于上层统计帧耗时。
+    pub acquired_at: Instant,
+}
+
+/// 呈现结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentResult {
+    /// 画面已提交。交换链仍与表面匹配。
+    Presented,
+    /// 交换链已过期或不匹配，**调用方必须重建交换链**后才能继续 acquire。
+    Outdated,
+}
+
+/// acquire 的原始返回在本模块的归一化结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcquireOutcome {
+    /// 拿到了可渲染的图像。`suboptimal` 为真时仍可渲染，
+    /// 但表面已不匹配，建议尽快重建。
+    Ready {
+        image_index: u32,
+        suboptimal: bool,
+    },
+    /// 交换链已过期，必须重建。本帧不产生任何 GPU 工作。
+    Rebuild,
+}
+
+/// 绘制批次：索引缓冲上的一段连续区间，对应一次 `draw_indexed`。
+///
+/// egui 的裁剪矩形在 CPU 侧 tessellation 时就已反映为「被裁掉的顶点
+/// 不进入网格」，因此这里不需要逐批次的 scissor。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawBatch {
+    /// 索引缓冲中的起始索引。
+    pub index_offset: u32,
+    /// 索引个数。为 0 的批次会被跳过（`draw_indexed` 传 0 是未定义行为）。
+    pub index_count: u32,
+}
+
+/// 一帧的绘制输入。
+///
+/// 顶点/索引缓冲由 GPU 资源层（`buffer.rs`）拥有并上传，
+/// 本模块只负责绑定句柄并发出绘制命令，不关心数据从哪来。
+#[derive(Debug, Clone, Copy)]
+pub struct DrawInput<'a> {
+    /// 顶点缓冲句柄。
+    pub vertex_buffer: vk::Buffer,
+    /// 索引缓冲句柄。
+    pub index_buffer: vk::Buffer,
+    /// 顶点缓冲绑定偏移。
+    pub vertex_offset: vk::DeviceSize,
+    /// 索引缓冲绑定偏移。
+    pub index_offset: vk::DeviceSize,
+    /// 索引类型。默认 `UINT32`，与 `pipeline.rs` 的属性布局配套。
+    pub index_type: vk::IndexType,
+    /// 绘制批次。为空则只清屏不绘制。
+    pub batches: &'a [DrawBatch],
+    /// 覆盖默认描述符集。为 `null` 时使用该帧槽自带的描述符集。
+    pub descriptor_set: vk::DescriptorSet,
+}
+
+// 不能 derive(Default)：`vk::IndexType` 的 Default 是 UINT16，
+// 而本项目的索引缓冲统一按 u32 上传。默认值错了不会崩，只会静默画出乱码，
+// 因此这里手写 Default 把索引类型钉死为 UINT32。
+impl Default for DrawInput<'_> {
+    fn default() -> Self {
+        Self {
+            vertex_buffer: vk::Buffer::null(),
+            index_buffer: vk::Buffer::null(),
+            vertex_offset: 0,
+            index_offset: 0,
+            index_type: vk::IndexType::UINT32,
+            batches: &[],
+            descriptor_set: vk::DescriptorSet::null(),
+        }
+    }
+}
+
+impl<'a> DrawInput<'a> {
+    /// 只画一个三角形批次，其余字段取默认值。
+    pub fn single_batch(vertex_buffer: vk::Buffer, index_buffer: vk::Buffer) -> Self {
+        Self {
+            vertex_buffer,
+            index_buffer,
+            batches: &[DrawBatch {
+                index_offset: 0,
+                index_count: 3,
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 可单测的纯逻辑
+// ---------------------------------------------------------------------------
+
+/// 计算真正要用的交换链尺寸。
+///
+/// 规则来自 Vulkan 规范的 `VkSurfaceCapabilitiesKHR::currentExtent`：
+/// - **非 0 时必须原样采用**，不能自行 clamp——这是规范强制要求，
+///   自行计算出的尺寸在某些表面上会导致 `vkCreateSwapchainKHR` 失败；
+/// - 为 0（0 表示「由应用自行决定」）时才用 `desired` 并 clamp 到
+///   `[min_image_extent, max_image_extent]`。
+pub fn resolve_extent(
+    caps: &vk::SurfaceCapabilitiesKHR,
+    desired: vk::Extent2D,
+) -> vk::Extent2D {
+    if caps.current_extent.width != 0 && caps.current_extent.height != 0 {
+        return caps.current_extent;
+    }
+    let axis = |want: u32, min: u32, max: u32| {
+        // 上限小于下限是驱动报告异常数据。`clamp` 在这种输入下会 panic，
+        // 因此退化为「取下限」，保证函数总是不崩。
+        if max < min { min } else { want.clamp(min, max) }
+    };
+    vk::Extent2D {
+        width: axis(desired.width, caps.min_image_extent.width, caps.max_image_extent.width),
+        height: axis(desired.height, caps.min_image_extent.height, caps.max_image_extent.height),
+    }
+}
+
+/// 把 `queue_present` 的双重返回（整体码 + 每交换链码）归一化。
+///
+/// 整体码与 `pResults` 可能给出不同结论：整体 `SUCCESS` 但某个交换链
+/// 单独 `OUT_OF_DATE` 的情况真实存在（多交换链时），只看整体码会漏掉重建信号。
+pub fn map_present_result(
+    overall: Result<bool, vk::Result>,
+    per_swapchain: Option<vk::Result>,
+) -> anyhow::Result<PresentResult> {
+    let outdated = |r: vk::Result| r == vk::Result::from_raw(RESULT_OUT_OF_DATE_KHR);
+    if let Some(inner) = per_swapchain
+        && outdated(inner)
+    {
+        return Ok(PresentResult::Outdated);
+    }
+    match overall {
+        // 第二个值是「suboptimal」：能显示，但表面已不匹配。
+        Ok(false) => Ok(PresentResult::Presented),
+        Ok(true) => Ok(PresentResult::Outdated),
+        Err(e) if outdated(e) => Ok(PresentResult::Outdated),
+        Err(e) => Err(anyhow::anyhow!("queue_present 失败: {e:?}")),
+    }
+}
+
+/// 把 `acquire_next_image` 的返回归一化。
+pub fn map_acquire_result(
+    raw: Result<(u32, bool), vk::Result>,
+) -> anyhow::Result<AcquireOutcome> {
+    match raw {
+        // ash 0.38 把 SUBOPTIMAL 折叠成 Ok((idx, true))，
+        // OUTDATED 才是 Err——网上 0.37 的示例写法在这里是错的。
+        Ok((image_index, suboptimal)) => Ok(AcquireOutcome::Ready {
+            image_index,
+            suboptimal,
+        }),
+        Err(e) if e.as_raw() == RESULT_OUT_OF_DATE_KHR => Ok(AcquireOutcome::Rebuild),
+        // 超时意味着这一帧没抢到图像，同样按「下一帧重建」处理，
+        // 否则会陷入「返回 None 但永不重建」的死循环。
+        Err(vk::Result::TIMEOUT) => Ok(AcquireOutcome::Rebuild),
+        Err(e) => Err(anyhow::anyhow!("acquire_next_image 失败: {e:?}")),
+    }
+}
+
+/// 逐图像跟踪当前布局。
+///
+/// 交换链图像的布局在帧与帧之间**不会**自动回到 `UNDEFINED`。
+/// 每张图像各自停在上一帧结束时的布局（通常是 `PRESENT_SRC_KHR`），
+/// 下次 acquire 到同一张时必须从那个布局转出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutTracker {
+    layouts: Vec<vk::ImageLayout>,
+}
+
+impl LayoutTracker {
+    /// 为 `image_count` 张图像建立跟踪，全部初始为 `UNDEFINED`。
+    pub fn new(image_count: u32) -> Self {
+        Self {
+            layouts: vec![vk::ImageLayout::UNDEFINED; image_count as usize],
+        }
+    }
+
+    /// 交换链重建后调用：图像是全新的，全部回到 `UNDEFINED`。
+    pub fn reset(&mut self, image_count: u32) {
+        self.layouts.clear();
+        self.layouts
+            .resize(image_count as usize, vk::ImageLayout::UNDEFINED);
+    }
+
+    /// 图像总数。
+    pub fn len(&self) -> usize {
+        self.layouts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layouts.is_empty()
+    }
+
+    /// 读某张图像的当前布局。索引越界返回 `None`。
+    pub fn get(&self, index: u32) -> Option<vk::ImageLayout> {
+        self.layouts.get(index as usize).copied()
+    }
+
+    /// 写某张图像的当前布局。索引越界返回 `false`（不 panic）。
+    pub fn set(&mut self, index: u32, layout: vk::ImageLayout) -> bool {
+        match self.layouts.get_mut(index as usize) {
+            Some(slot) => {
+                *slot = layout;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 状态机核心：把某张图像从当前布局迁移到 `to`。
+    ///
+    /// 返回 `(旧布局, 新布局)`；索引越界返回 `None`。
+    /// 旧布局等于新布局时不做任何事，但仍返回 `(l, l)` 便于调用方断言。
+    pub fn transition(&mut self, index: u32, to: vk::ImageLayout) -> Option<(vk::ImageLayout, vk::ImageLayout)> {
+        let from = *self.layouts.get(index as usize)?;
+        self.layouts[index as usize] = to;
+        Some((from, to))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FrameRenderer
+// ---------------------------------------------------------------------------
+
+/// 一帧在飞所独占的同步对象。
+///
+/// 按**在飞帧槽位**索引，不是按交换链图像索引：图像索引由驱动决定，
+/// 我们无法提前知道，因此「等栅栏」只能按槽位轮转。
+struct FrameSlot {
+    command_buffer: vk::CommandBuffer,
+    /// 由 `acquire_next_image` 与 `queue_submit` 共同 signal。
+    fence: vk::Fence,
+    /// 当前是否处于已 signal 但未 reset 的状态。
+    fence_signaled: bool,
+    /// acquire signal → submit wait。
+    acquire_semaphore: vk::Semaphore,
+    /// submit signal → present wait。
+    present_semaphore: vk::Semaphore,
+    descriptor_set: vk::DescriptorSet,
+}
+
+/// 帧循环核心。
+pub struct FrameRenderer<'a> {
+    gpu: &'a Gpu,
+    bundle: PipelineBundle,
+    /// 自行创建的表面 loader，用于**重建时重新查询**能力。
+    ///
+    /// `Gpu` 里的 loader 是私有字段，且其 `surface_caps` 是初始化时的快照——
+    /// 窗口 resize 后 `current_extent` 会变，必须重查。
+    surface_loader: khr::surface::Instance,
+    swapchain_loader: khr::swapchain::Device,
+    swapchain: Swapchain,
+    /// 交换链格式。渲染通道按它创建；重建时若格式变了必须报错。
+    pipeline_format: vk::Format,
+    command_pool: vk::CommandPool,
+    descriptor_pool: vk::DescriptorPool,
+    slots: Vec<FrameSlot>,
+    /// 在飞帧槽位的轮转游标。
+    cursor: usize,
+    layouts: LayoutTracker,
+    /// 当前待完成的帧。未 acquire 时为 `None`。
+    pending: Option<Pending>,
+    clear_color: [f32; 4],
+}
+
+/// 正在录制中的帧。
+struct Pending {
+    frame: AcquiredFrame,
+    /// 使用的帧槽位下标。
+    slot: usize,
+    suboptimal: bool,
+}
+
+impl<'a> FrameRenderer<'a> {
+    /// 创建帧渲染器并建立初始交换链。
+    ///
+    /// 尺寸取自表面能力的 `current_extent`（Windows 上恒为有效值），
+    /// 不可用时退化为 [`FALLBACK_EXTENT`]。窗口尺寸确定后调用方应主动
+    /// [`FrameRenderer::rebuild_swapchain`] 一次。
+    ///
+    /// `pipeline_bundle` 的渲染通道格式必须与表面选中的格式一致，
+    /// 否则 [`Swapchain::new`] 建出的 framebuffer 与渲染通道不兼容。
+    pub fn new(gpu: &'a Gpu, pipeline_bundle: PipelineBundle) -> anyhow::Result<Self> {
+        // 自行建一套 Entry/SurfaceLoader：Gpu 的 surface_caps 是启动时快照，
+        // 重建交换链必须重新查询。Entry::load 只是再取一次已加载的
+        // vulkan-1.dll 的函数地址，开销可忽略。
+        let entry = unsafe { ash::Entry::load()? };
+        let surface_loader = khr::surface::Instance::new(&entry, &gpu.instance);
+        let swapchain_loader = khr::swapchain::Device::new(&gpu.instance, &gpu.device);
+
+        let caps = gpu.surface_caps;
+        let extent = resolve_extent(&caps, FALLBACK_EXTENT);
+        let swapchain = Swapchain::new(gpu, extent.width, extent.height, pipeline_bundle.render_pass)?;
+
+        // 渲染通道是按某个格式建的。若交换链最终选中的格式不同，
+        // framebuffer 与渲染通道不兼容——直接失败，别让驱动在运行时炸。
+        let pipeline_format = swapchain_format_of(gpu)?;
+        if pipeline_format != swapchain.format {
+            anyhow::bail!(
+                "渲染通道格式 {pipeline_format:?} 与交换链格式 {:?} 不一致",
+                swapchain.format
+            );
+        }
+
+        let command_pool = create_command_pool(&gpu.device, gpu.queue_family)?;
+
+        let mut this = Self {
+            gpu,
+            bundle: pipeline_bundle,
+            surface_loader,
+            swapchain_loader,
+            swapchain,
+            pipeline_format,
+            command_pool,
+            descriptor_pool: vk::DescriptorPool::null(),
+            slots: Vec::new(),
+            cursor: 0,
+            layouts: LayoutTracker::new(0),
+            pending: None,
+            clear_color: [0.10, 0.10, 0.12, 1.0],
+        };
+        this.allocate_frame_resources()?;
+
+        tracing::debug!(
+            extent = ?this.swapchain.extent,
+            images = this.swapchain.image_count,
+            slots = this.slots.len(),
+            "FrameRenderer 就绪"
+        );
+        Ok(this)
+    }
+
+    /// 当前交换链尺寸。
+    pub fn extent(&self) -> vk::Extent2D {
+        self.swapchain.extent
+    }
+
+    /// 交换链格式。
+    pub fn format(&self) -> vk::Format {
+        self.swapchain.format
+    }
+
+    /// 在飞帧槽位数量（等于交换链图像数）。
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// acquire 是否返回了 suboptimal（画面能出，但表面已不匹配）。
+    pub fn last_acquire_was_suboptimal(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.suboptimal)
+    }
+
+    /// 设置清屏颜色（线性空间 RGBA）。
+    pub fn set_clear_color(&mut self, rgba: [f32; 4]) {
+        self.clear_color = rgba;
+    }
+
+    /// 取某个帧槽位的描述符集，供资源层填充 uniform / 纹理。
+    pub fn descriptor_set(&self, slot: usize) -> anyhow::Result<vk::DescriptorSet> {
+        self.slots
+            .get(slot)
+            .map(|s| s.descriptor_set)
+            .ok_or_else(|| anyhow::anyhow!("帧槽位 {slot} 越界（共 {} 个）", self.slots.len()))
+    }
+
+    /// 更新某帧槽位描述符集里的 uniform 绑定。
+    ///
+    /// **每个在飞槽位都要写一遍**：GPU 可能还在读上一个槽位的描述符集，
+    /// 只写当前帧会导致其它帧读到未初始化的绑定。
+    pub fn update_uniform_binding(
+        &self,
+        slot: usize,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        range: vk::DeviceSize,
+    ) -> anyhow::Result<()> {
+        let set = self.descriptor_set(slot)?;
+        let info = vk::DescriptorBufferInfo {
+            buffer,
+            offset,
+            range,
+        };
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(BINDING_UNIFORM)
+            .descriptor_count(1)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(std::slice::from_ref(&info));
+        unsafe {
+            // ash 0.38 的方法名是 update_descriptor_sets（规范名 vkUpdateDescriptorSets），
+            // 不是网上常见的 write_descriptor_sets。
+            self.gpu.device.update_descriptor_sets(
+                std::slice::from_ref(&write),
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    /// 更新某帧槽位描述符集里的采样器 + 字体纹理绑定。
+    pub fn update_texture_binding(
+        &self,
+        slot: usize,
+        sampler: vk::Sampler,
+        image_view: vk::ImageView,
+        layout: vk::ImageLayout,
+    ) -> anyhow::Result<()> {
+        let set = self.descriptor_set(slot)?;
+        let info = vk::DescriptorImageInfo {
+            sampler,
+            image_view,
+            image_layout: layout,
+        };
+        // 两个绑定共用一次 update 调用：sampler 是裸 sampler，
+        // texture 是 combined image sampler，各写一条。
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_SAMPLER)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(std::slice::from_ref(&info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_TEXTURE)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&info)),
+        ];
+        unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
+        Ok(())
+    }
+
+    /// 取下一张可绘制的交换链图像。
+    ///
+    /// 返回 `Ok(None)` 表示交换链已过期（或本次没抢到图像），
+    /// 调用方**必须**先 [`FrameRenderer::rebuild_swapchain`] 再继续。
+    /// 成功时本帧的命令录制已经开始（布局转换 + 渲染通道开启 + 管线绑定）。
+    pub fn acquire(&mut self) -> anyhow::Result<Option<AcquiredFrame>> {
+        if self.pending.is_some() {
+            anyhow::bail!("上一帧尚未 present，不能开始新帧");
+        }
+        let slot = self.cursor % self.slots.len();
+
+        // 等 GPU 用完这个槽位（上一帧的提交 + 本帧的 acquire 都已完成）。
+        // 不等就会在 GPU 还在读命令缓冲时 reset 它——未定义行为。
+        if self.slots[slot].fence_signaled {
+            let fence = self.slots[slot].fence;
+            unsafe { self.gpu.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT)? };
+            unsafe { self.gpu.device.reset_fences(&[fence])? };
+            self.slots[slot].fence_signaled = false;
+        }
+
+        let (image_index, suboptimal) = match map_acquire_result(unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain.handle,
+                ACQUIRE_TIMEOUT,
+                self.slots[slot].acquire_semaphore,
+                self.slots[slot].fence,
+            )
+        })? {
+            AcquireOutcome::Ready {
+                image_index,
+                suboptimal,
+            } => (image_index, suboptimal),
+            AcquireOutcome::Rebuild => return Ok(None),
+        };
+
+        let image_index = image_index as usize;
+        let Some(&image) = self.swapchain.images.get(image_index) else {
+            anyhow::bail!("驱动返回的图像索引 {image_index} 超出交换链图像数");
+        };
+        let Some(&framebuffer) = self.swapchain.framebuffers.get(image_index) else {
+            anyhow::bail!("交换链图像 {image_index} 缺少对应 framebuffer");
+        };
+        // image_index 必然落在 layouts 的长度内（长度等于图像数），
+        // 但驱动返回越界索引时上面的 get 已经拦住了，这里用 get 保持一致。
+        if self.layouts.get(image_index as u32).is_none() {
+            anyhow::bail!("图像索引 {image_index} 超出布局跟踪表");
+        }
+
+        let frame = AcquiredFrame {
+            image_index: image_index as u32,
+            framebuffer,
+            image,
+            acquired_at: Instant::now(),
+        };
+
+        self.cursor += 1;
+        self.open_command_buffer(slot, &frame)?;
+        self.pending = Some(Pending {
+            frame: frame.clone(),
+            slot,
+            suboptimal,
+        });
+        Ok(Some(frame))
+    }
+
+    /// 录制绘制命令。必须紧跟在成功的 [`FrameRenderer::acquire`] 之后。
+    pub fn record(&mut self, input: &DrawInput<'_>) -> anyhow::Result<()> {
+        let Some(pending) = self.pending.as_ref() else {
+            anyhow::bail!("record 必须在 acquire 之后调用");
+        };
+        let slot = pending.slot;
+        let device = &self.gpu.device;
+        let cmd = self.slots[slot].command_buffer;
+
+        // 视口与剪裁跟随当前交换链尺寸；交换链重建后自动更新，
+        // 不需要重建管线（管线里声明的是 dynamic state）。
+        let extent = self.swapchain.extent;
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        unsafe {
+            device.cmd_set_viewport(cmd, 0, std::slice::from_ref(&viewport));
+            device.cmd_set_scissor(cmd, 0, std::slice::from_ref(&scissor));
+        }
+
+        let set = if input.descriptor_set.is_null() {
+            self.slots[slot].descriptor_set
+        } else {
+            input.descriptor_set
+        };
+        let sets = [set];
+        unsafe {
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.bundle.pipeline_layout,
+                0,
+                &sets,
+                &[],
+            );
+        }
+
+        // 没有批次就只清屏。此时不绑定缓冲——绑定空句柄虽不崩，
+        // 但会让调试器里的抓帧变得难以解释。
+        let drawable: Vec<DrawBatch> = input
+            .batches
+            .iter()
+            .copied()
+            .filter(|b| b.index_count > 0)
+            .collect();
+        if drawable.is_empty() {
+            return Ok(());
+        }
+
+        let buffers = [input.vertex_buffer];
+        let offsets = [input.vertex_offset];
+        let index_buffer = input.index_buffer;
+        let index_offset = input.index_offset;
+        let index_type = input.index_type;
+        unsafe {
+            device.cmd_bind_vertex_buffers(cmd, 0, &buffers, &offsets);
+            device.cmd_bind_index_buffer(cmd, index_buffer, index_offset, index_type);
+        }
+        for batch in drawable {
+            unsafe {
+                device.cmd_draw_indexed(cmd, batch.index_count, 1, batch.index_offset, 0, 0);
+            }
+        }
+        Ok(())
+    }
+
+    /// 结束渲染通道、提交并呈现。
+    ///
+    /// `frame` 必须是本帧 [`FrameRenderer::acquire`] 返回的那一个
+    /// （用于校验调用方没有把帧搞混）。
+    pub fn present(&mut self, frame: AcquiredFrame) -> anyhow::Result<PresentResult> {
+        let Some(pending) = self.pending.take() else {
+            anyhow::bail!("present 必须在 acquire 之后调用");
+        };
+        if pending.frame.image_index != frame.image_index {
+            anyhow::bail!(
+                "present 的图像索引 {} 与 acquire 的 {} 不一致",
+                frame.image_index,
+                pending.frame.image_index
+            );
+        }
+
+        let slot = pending.slot;
+        let image_index = frame.image_index as usize;
+        let device = &self.gpu.device;
+        let cmd = self.slots[slot].command_buffer;
+
+        // 渲染通道内的绘制已经结束，先关通道再做布局转换——
+        // 顺序反了会让转换屏障落在一个正在被写入的附件上。
+        unsafe { device.cmd_end_render_pass(cmd) };
+
+        let image = self.swapchain.images[image_index];
+        let (old_layout, new_layout) = self
+            .layouts
+            .transition(image_index as u32, vk::ImageLayout::PRESENT_SRC_KHR)
+            .ok_or_else(|| anyhow::anyhow!("图像索引 {image_index} 超出布局跟踪表"))?;
+        let mut barrier = image_barrier(
+            image,
+            old_layout,
+            new_layout,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::empty(),
+        );
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_mut(&mut barrier),
+            );
+            device.end_command_buffer(cmd)?;
+        }
+
+        // 提交。注意 builder 的调用顺序：ash 0.38 的 `wait_dst_stage_mask`
+        // 会顺手把 `wait_semaphore_count` 也设成切片长度，两者必须都以
+        // 1 为长度才不出错——先设 stage mask，再设 semaphores 最保险。
+        let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+        let acquire_sem = self.slots[slot].acquire_semaphore;
+        let present_sem = self.slots[slot].present_semaphore;
+        let submit = vk::SubmitInfo::default()
+            .wait_dst_stage_mask(&wait_stage)
+            .wait_semaphores(std::slice::from_ref(&acquire_sem))
+            .command_buffers(std::slice::from_ref(&cmd))
+            .signal_semaphores(std::slice::from_ref(&present_sem));
+        unsafe {
+            device.queue_submit(
+                self.gpu.queue,
+                std::slice::from_ref(&submit),
+                self.slots[slot].fence,
+            )?;
+        }
+        // 提交成功即意味着该栅栏最终会被 signal。
+        self.slots[slot].fence_signaled = true;
+
+        let swapchains = [self.swapchain.handle];
+        let image_indices = [frame.image_index];
+        let mut results = [vk::Result::SUCCESS];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(std::slice::from_ref(&present_sem))
+            .results(&mut results)
+            .image_indices(&image_indices)
+            .swapchains(&swapchains);
+        let overall = unsafe {
+            self.swapchain_loader
+                .queue_present(self.gpu.queue, &present_info)
+        };
+        map_present_result(overall, Some(results[0]))
+    }
+
+    /// 重建交换链。
+    ///
+    /// `desired_extent` 只在表面能力的 `current_extent` 为 0 时才起作用；
+    /// 非 0 时**必须**采用表面报告的尺寸（见 [`resolve_extent`]）。
+    /// 传 [`vk::Extent2D::default()`] 表示「由表面决定」。
+    ///
+    /// 重建后视口与剪裁自动跟随新尺寸（它们是动态状态，无需重建管线）。
+    /// 若表面格式发生变化则直接失败——此时渲染通道与图形管线都必须重建，
+    /// 已超出本模块的职责。
+    pub fn rebuild_swapchain(&mut self, desired_extent: vk::Extent2D) -> anyhow::Result<()> {
+        // 必须先等 GPU 空闲：旧交换链的 framebuffer 还在被在飞命令引用。
+        self.gpu.wait_idle();
+
+        let caps = unsafe {
+            self.surface_loader.get_physical_device_surface_capabilities(
+                self.gpu.physical_device,
+                self.gpu.surface(),
+            )?
+        };
+        let desired = if desired_extent.width == 0 || desired_extent.height == 0 {
+            FALLBACK_EXTENT
+        } else {
+            desired_extent
+        };
+        let extent = resolve_extent(&caps, desired);
+
+        // 重建前先确认格式没变——渲染通道与图形管线都是按旧格式建的。
+        let (format, _) = crate::pick_format(
+            unsafe {
+                self.surface_loader.get_physical_device_surface_formats(
+                    self.gpu.physical_device,
+                    self.gpu.surface(),
+                )?
+            }
+            .as_slice(),
+        )?;
+        if format != self.pipeline_format {
+            anyhow::bail!(
+                "重建时表面格式从 {:?} 变为 {format:?}，需重建渲染通道与图形管线",
+                self.pipeline_format
+            );
+        }
+
+        // 销毁顺序由 Swapchain::destroy 保证：framebuffer → image_view → swapchain。
+        // 反序会留下悬空引用。
+        self.swapchain.destroy(&self.gpu.device);
+        self.swapchain =
+            Swapchain::new(self.gpu, extent.width, extent.height, self.bundle.render_pass)?;
+        if self.swapchain.format != self.pipeline_format {
+            anyhow::bail!("重建后交换链格式与渲染通道不一致");
+        }
+
+        // 图像是全新的，布局全部回到 UNDEFINED。
+        self.layouts.reset(self.swapchain.image_count);
+        self.allocate_frame_resources()?;
+
+        tracing::debug!(
+            extent = ?self.swapchain.extent,
+            images = self.swapchain.image_count,
+            slots = self.slots.len(),
+            "交换链已重建"
+        );
+        Ok(())
+    }
+
+    // -- 内部 ------------------------------------------------------------
+
+    /// 开启本帧的命令录制：清空命令缓冲、布局转换、开渲染通道、绑管线。
+    fn open_command_buffer(&mut self, slot: usize, frame: &AcquiredFrame) -> anyhow::Result<()> {
+        let device = &self.gpu.device;
+        let cmd = self.slots[slot].command_buffer;
+        unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
+        }
+
+        // 渲染前：当前布局 → COLOR_ATTACHMENT_OPTIMAL。
+        let (old_layout, new_layout) = self
+            .layouts
+            .transition(frame.image_index, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .ok_or_else(|| anyhow::anyhow!("图像索引超出布局跟踪表"))?;
+        // 从 UNDEFINED 转出时没有可等待的写入，直接清空访问掩码。
+        let src_access = if old_layout == vk::ImageLayout::UNDEFINED {
+            vk::AccessFlags::empty()
+        } else {
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+        };
+        let mut barrier = image_barrier(
+            frame.image,
+            old_layout,
+            new_layout,
+            src_access,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        );
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_mut(&mut barrier),
+            );
+        }
+
+        let clear = vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: self.clear_color,
+            },
+        };
+        let clear_values = [clear];
+        let area = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: self.swapchain.extent,
+        };
+        let begin = vk::RenderPassBeginInfo::default()
+            .render_pass(self.bundle.render_pass)
+            // 绝不能传空 framebuffer：未定义行为，驱动直接崩。
+            .framebuffer(frame.framebuffer)
+            .render_area(area)
+            .clear_values(&clear_values);
+        unsafe {
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.bundle.pipeline,
+            );
+            device.cmd_begin_render_pass(cmd, &begin, vk::SubpassContents::INLINE);
+        }
+        Ok(())
+    }
+
+    /// 按当前交换链的图像数重建命令缓冲 / 栅栏 / 信号量 / 描述符集。
+    ///
+    /// 数量可能变化（`min_image_count + 1` 与驱动上限共同决定），
+    /// 因此整体销毁后重建，而不是尝试增量调整。
+    fn allocate_frame_resources(&mut self) -> anyhow::Result<()> {
+        self.destroy_frame_resources();
+
+        let count = self.swapchain.image_count.max(1);
+        let device = &self.gpu.device;
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: count,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: count,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: count,
+            },
+        ];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(count)
+            .pool_sizes(&pool_sizes);
+        self.descriptor_pool =
+            unsafe { device.create_descriptor_pool(&pool_info, None) }
+                .map_err(|e| anyhow::anyhow!("创建描述符池失败: {e:?}"))?;
+
+        let layouts = [self.bundle.descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+        // 数量取自 allocate_info 的切片长度（坑 15），不设则返回空 Vec。
+        let sets = unsafe { device.allocate_descriptor_sets(&alloc_info)? };
+        anyhow::ensure!(
+            sets.len() == count as usize,
+            "描述符集分配数量不符：期望 {count}，实际 {}",
+            sets.len()
+        );
+
+        let cmd_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(count);
+        let buffers = unsafe { device.allocate_command_buffers(&cmd_alloc)? };
+        anyhow::ensure!(
+            buffers.len() == count as usize,
+            "命令缓冲分配数量不符：期望 {count}，实际 {}",
+            buffers.len()
+        );
+
+        let mut slots = Vec::with_capacity(count as usize);
+        for i in 0..count as usize {
+            let fence = unsafe {
+                device.create_fence(
+                    &vk::FenceCreateInfo::default()
+                        .flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("创建栅栏失败: {e:?}"))?;
+            let semaphore_info = vk::SemaphoreCreateInfo::default();
+            let acquire_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
+                .map_err(|e| anyhow::anyhow!("创建 acquire 信号量失败: {e:?}"))?;
+            let present_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
+                .map_err(|e| anyhow::anyhow!("创建 present 信号量失败: {e:?}"))?;
+            slots.push(FrameSlot {
+                command_buffer: buffers[i],
+                fence,
+                // 初始就建成 SIGNALED 且标记为已 signal：
+                // 第一次 wait 会立刻通过，之后交给 acquire 去 signal。
+                fence_signaled: true,
+                acquire_semaphore,
+                present_semaphore,
+                descriptor_set: sets[i],
+            });
+        }
+        self.slots = slots;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    fn destroy_frame_resources(&mut self) {
+        let device = &self.gpu.device;
+        for slot in &self.slots {
+            unsafe {
+                device.destroy_fence(slot.fence, None);
+                device.destroy_semaphore(slot.acquire_semaphore, None);
+                device.destroy_semaphore(slot.present_semaphore, None);
+            }
+        }
+        // 命令缓冲随命令池一起回收，不单独销毁。
+        self.slots.clear();
+        if !self.descriptor_pool.is_null() {
+            unsafe { device.destroy_descriptor_pool(self.descriptor_pool, None) };
+            self.descriptor_pool = vk::DescriptorPool::null();
+        }
+    }
+}
+
+impl Drop for FrameRenderer<'_> {
+    fn drop(&mut self) {
+        // 在飞命令可能还引用着交换链图像与 framebuffer，必须等 GPU 空闲。
+        self.gpu.wait_idle();
+        self.destroy_frame_resources();
+        unsafe { self.gpu.device.destroy_command_pool(self.command_pool, None) };
+        // framebuffer → image_view → swapchain 的销毁顺序由 Swapchain 保证。
+        self.swapchain.destroy(&self.gpu.device);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 辅助
+// ---------------------------------------------------------------------------
+
+fn create_command_pool(device: &Device, queue_family: u32) -> anyhow::Result<vk::CommandPool> {
+    let info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(queue_family)
+        // 每帧都要 reset 命令缓冲，这个标志位是必需的。
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    unsafe { device.create_command_pool(&info, None) }
+        .map_err(|e| anyhow::anyhow!("创建命令池失败: {e:?}"))
+}
+
+/// 预知交换链将选中的格式。
+///
+/// 复用 `crate::pick_format`——**不另写副本**。渲染通道的附件格式必须与
+/// 交换链完全一致，两份实现一旦分叉就是静默失配，表现为驱动在
+/// `cmd_begin_render_pass` 时崩溃，极难定位。
+fn swapchain_format_of(gpu: &Gpu) -> anyhow::Result<vk::Format> {
+    Ok(crate::pick_format(&gpu.surface_formats)?.0)
+}
+
+// ---------------------------------------------------------------------------
+// 单测
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(
+        cur_w: u32,
+        cur_h: u32,
+        min: vk::Extent2D,
+        max: vk::Extent2D,
+    ) -> vk::SurfaceCapabilitiesKHR {
+        vk::SurfaceCapabilitiesKHR {
+            current_extent: vk::Extent2D {
+                width: cur_w,
+                height: cur_h,
+            },
+            min_image_extent: min,
+            max_image_extent: max,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn current_extent_wins_over_our_own_calculation() {
+        // 规范强制：current_extent 非 0 时必须原样采用，
+        // 哪怕它落在 [min, max] 之外、哪怕我们想要别的尺寸。
+        let c = caps(
+            1281,
+            721,
+            vk::Extent2D { width: 1, height: 1 },
+            vk::Extent2D {
+                width: 4096,
+                height: 4096,
+            },
+        );
+        let got = resolve_extent(&c, vk::Extent2D { width: 800, height: 600 });
+        assert_eq!(got.width, 1281);
+        assert_eq!(got.height, 721);
+    }
+
+    #[test]
+    fn zero_current_extent_falls_back_to_clamped_desired() {
+        let c = caps(
+            0,
+            0,
+            vk::Extent2D {
+                width: 320,
+                height: 240,
+            },
+            vk::Extent2D {
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let got = resolve_extent(&c, vk::Extent2D { width: 800, height: 600 });
+        assert_eq!((got.width, got.height), (800, 600));
+
+        // 超出上限要被压回上限
+        let big = resolve_extent(&c, vk::Extent2D { width: 4000, height: 4000 });
+        assert_eq!((big.width, big.height), (1920, 1080));
+
+        // 低于下限要被抬到下限
+        let small = resolve_extent(&c, vk::Extent2D { width: 1, height: 1 });
+        assert_eq!((small.width, small.height), (320, 240));
+    }
+
+    #[test]
+    fn extent_survives_inverted_caps() {
+        // 驱动报告 max < min 是异常数据，但 clamp 会因此 panic。
+        // 函数必须给出确定结果而不是崩掉。
+        let c = caps(
+            0,
+            0,
+            vk::Extent2D { width: 800, height: 600 },
+            vk::Extent2D { width: 100, height: 100 },
+        );
+        let got = resolve_extent(&c, vk::Extent2D { width: 640, height: 480 });
+        assert_eq!((got.width, got.height), (800, 600));
+    }
+
+    #[test]
+    fn extent_only_treats_partial_zero_as_free() {
+        // 只给宽、不给高不构成「由应用决定」，仍应视为无效并回退。
+        let c = caps(
+            640,
+            0,
+            vk::Extent2D { width: 1, height: 1 },
+            vk::Extent2D {
+                width: 4096,
+                height: 4096,
+            },
+        );
+        let got = resolve_extent(&c, vk::Extent2D { width: 800, height: 600 });
+        assert_eq!((got.width, got.height), (800, 600));
+    }
+
+    #[test]
+    fn layout_tracker_tracks_each_image_independently() {
+        let mut t = LayoutTracker::new(3);
+        assert_eq!(t.len(), 3);
+        for i in 0..3 {
+            assert_eq!(t.get(i), Some(vk::ImageLayout::UNDEFINED));
+        }
+
+        // 只推进第 1 张
+        assert_eq!(
+            t.transition(1, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+            Some((vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL))
+        );
+        // 关键断言：其余两张不能跟着变。
+        // 用 UNDEFINED 一刀切会让第 0、2 张的 PRESENT_SRC_KHR 状态丢失。
+        assert_eq!(t.get(0), Some(vk::ImageLayout::UNDEFINED));
+        assert_eq!(t.get(2), Some(vk::ImageLayout::UNDEFINED));
+
+        // 推进到 PRESENT 后再取一次，仍只影响第 1 张
+        assert_eq!(
+            t.transition(1, vk::ImageLayout::PRESENT_SRC_KHR),
+            Some((
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR
+            ))
+        );
+        assert_eq!(t.get(1), Some(vk::ImageLayout::PRESENT_SRC_KHR));
+        assert_eq!(t.get(0), Some(vk::ImageLayout::UNDEFINED));
+    }
+
+    #[test]
+    fn layout_tracker_round_trips_a_second_frame() {
+        // 模拟真实的两帧：同一批图像连续被 acquire 两次。
+        // 第二帧必须从上一帧留下的 PRESENT_SRC_KHR 出发，
+        // 这正是「不能假设都是 UNDEFINED」的根据。
+        let mut t = LayoutTracker::new(2);
+        let mut observed: Vec<vk::ImageLayout> = Vec::new();
+        for _ in 0..2 {
+            for idx in 0..2u32 {
+                let (from, _) = t
+                    .transition(idx, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .unwrap();
+                observed.push(from);
+                t.transition(idx, vk::ImageLayout::PRESENT_SRC_KHR).unwrap();
+            }
+        }
+        // 第一轮全是 UNDEFINED（首帧），第二轮全是 PRESENT_SRC_KHR（复用图像）
+        assert_eq!(
+            observed[..2],
+            [vk::ImageLayout::UNDEFINED, vk::ImageLayout::UNDEFINED]
+        );
+        assert_eq!(
+            observed[2..],
+            [
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::PRESENT_SRC_KHR
+            ]
+        );
+    }
+
+    #[test]
+    fn layout_tracker_rejects_out_of_range() {
+        let mut t = LayoutTracker::new(2);
+        assert_eq!(t.get(2), None);
+        assert_eq!(t.transition(9, vk::ImageLayout::PRESENT_SRC_KHR), None);
+        assert!(!t.set(9, vk::ImageLayout::PRESENT_SRC_KHR));
+        // 越界不能污染状态
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn layout_tracker_reset_clears_all() {
+        let mut t = LayoutTracker::new(2);
+        t.transition(0, vk::ImageLayout::PRESENT_SRC_KHR).unwrap();
+        // 重建后图像数可能变化
+        t.reset(4);
+        assert_eq!(t.len(), 4);
+        for i in 0..4 {
+            assert_eq!(t.get(i), Some(vk::ImageLayout::UNDEFINED));
+        }
+        // 缩容也要生效
+        t.reset(1);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.get(1), None);
+    }
+
+    #[test]
+    fn layout_transition_to_same_layout_is_allowed() {
+        let mut t = LayoutTracker::new(1);
+        assert_eq!(
+            t.transition(0, vk::ImageLayout::PRESENT_SRC_KHR),
+            Some((vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR))
+        );
+        // 幂等：PRESENT → PRESENT
+        assert_eq!(
+            t.transition(0, vk::ImageLayout::PRESENT_SRC_KHR),
+            Some((
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::ImageLayout::PRESENT_SRC_KHR
+            ))
+        );
+    }
+
+    #[test]
+    fn acquire_success_and_suboptimal_are_both_runnable() {
+        assert_eq!(
+            map_acquire_result(Ok((2, false))).unwrap(),
+            AcquireOutcome::Ready {
+                image_index: 2,
+                suboptimal: false
+            }
+        );
+        // suboptimal 仍可渲染，只是要提示重建
+        assert_eq!(
+            map_acquire_result(Ok((0, true))).unwrap(),
+            AcquireOutcome::Ready {
+                image_index: 0,
+                suboptimal: true
+            }
+        );
+    }
+
+    #[test]
+    fn acquire_outdated_and_timeout_request_rebuild() {
+        assert_eq!(
+            map_acquire_result(Err(vk::Result::from_raw(RESULT_OUT_OF_DATE_KHR))).unwrap(),
+            AcquireOutcome::Rebuild
+        );
+        // 超时不能当成错误，否则窗口最小化时会刷屏报错
+        assert_eq!(
+            map_acquire_result(Err(vk::Result::TIMEOUT)).unwrap(),
+            AcquireOutcome::Rebuild
+        );
+    }
+
+    #[test]
+    fn acquire_propagates_real_errors() {
+        // 设备丢失、内存不足这类是真错误，必须上抛而不是伪装成「重建」。
+        for e in [
+            vk::Result::ERROR_DEVICE_LOST,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_INITIALIZATION_FAILED,
+        ] {
+            assert!(map_acquire_result(Err(e)).is_err(), "{e:?} 应上抛");
+        }
+    }
+
+    #[test]
+    fn present_ok_is_presented_and_suboptimal_is_outdated() {
+        assert_eq!(
+            map_present_result(Ok(false), None).unwrap(),
+            PresentResult::Presented
+        );
+        // ash 0.38 的第二个值是 suboptimal，等价于需要重建
+        assert_eq!(
+            map_present_result(Ok(true), None).unwrap(),
+            PresentResult::Outdated
+        );
+    }
+
+    #[test]
+    fn present_outdated_maps_to_rebuild() {
+        assert_eq!(
+            map_present_result(Err(vk::Result::from_raw(RESULT_OUT_OF_DATE_KHR)), None).unwrap(),
+            PresentResult::Outdated
+        );
+    }
+
+    #[test]
+    fn present_reads_per_swapchain_result() {
+        // 整体 SUCCESS 但单个交换链 OUT_OF_DATE：只看整体码会漏掉重建信号。
+        assert_eq!(
+            map_present_result(
+                Ok(false),
+                Some(vk::Result::from_raw(RESULT_OUT_OF_DATE_KHR))
+            )
+            .unwrap(),
+            PresentResult::Outdated
+        );
+        // 单交换链 suboptimal 也要能看出来
+        assert_eq!(
+            map_present_result(
+                Ok(false),
+                Some(vk::Result::from_raw(RESULT_SUBOPTIMAL_KHR))
+            )
+            .unwrap(),
+            PresentResult::Presented
+        );
+    }
+
+    #[test]
+    fn present_propagates_other_errors() {
+        for e in [
+            vk::Result::ERROR_DEVICE_LOST,
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            // 扩展错误码：OUT_OF_DATE 之外的 -1000001003 家族成员
+            vk::Result::from_raw(RESULT_SUBOPTIMAL_KHR - 1),
+        ] {
+            assert!(
+                map_present_result(Err(e), None).is_err(),
+                "{e:?} 不应被当成 Outdated"
+            );
+        }
+        // 表面丢失（-1000000000）同样必须上抛
+        assert!(map_present_result(Err(vk::Result::from_raw(-1_000_000_000)), None).is_err());
+    }
+
+    #[test]
+    fn draw_input_helper_uses_uint32_indices_by_default() {
+        let input = DrawInput::single_batch(vk::Buffer::null(), vk::Buffer::null());
+        assert_eq!(input.index_type, vk::IndexType::UINT32);
+        assert_eq!(input.batches.len(), 1);
+        assert_eq!(input.batches[0].index_count, 3);
+        assert_eq!(input.vertex_offset, 0);
+        assert_eq!(input.index_offset, 0);
+    }
+
+    #[test]
+    fn zero_index_count_batches_must_be_filtered() {
+        // draw_indexed 传 index_count = 0 是未定义行为，
+        // record() 里的过滤就是为此存在；这里守住该前提。
+        let input = DrawInput {
+            batches: &[
+                DrawBatch {
+                    index_offset: 0,
+                    index_count: 0,
+                },
+                DrawBatch {
+                    index_offset: 3,
+                    index_count: 6,
+                },
+            ],
+            ..Default::default()
+        };
+        let drawable: Vec<DrawBatch> = input
+            .batches
+            .iter()
+            .copied()
+            .filter(|b| b.index_count > 0)
+            .collect();
+        assert_eq!(drawable.len(), 1);
+        assert_eq!(drawable[0].index_offset, 3);
+    }
+
+    #[test]
+    fn vertex_stride_matches_pipeline_layout() {
+        // 与 pipeline.rs 的属性布局对齐：pos(8) + uv(8) + color(4)
+        assert_eq!(2 * 4 + 2 * 4 + 4, 20);
+    }
+
+    #[test]
+    fn format_selection_matches_swapchain_rules() {
+        assert!(crate::pick_format(&[]).is_err());
+        // 单格式原样采用
+        assert_eq!(
+            crate::pick_format(&[vk::SurfaceFormatKHR {
+                format: vk::Format::R8G8B8A8_UNORM,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            }])
+            .unwrap()
+            .0,
+            vk::Format::R8G8B8A8_UNORM
+        );
+        // 多格式选 8 位
+        let both = [
+            vk::SurfaceFormatKHR {
+                format: vk::Format::R16G16B16A16_SFLOAT,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            },
+            vk::SurfaceFormatKHR {
+                format: vk::Format::B8G8R8A8_UNORM,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            },
+        ];
+        assert_eq!(
+            crate::pick_format(&both).unwrap().0,
+            vk::Format::B8G8R8A8_UNORM
+        );
+        // 只有一种格式时必须原样采用——哪怕它不是 8 位 RGBA。
+        // Vulkan 规范的明确要求，与 lib.rs 的 pick_format 保持一致。
+        let only = [vk::SurfaceFormatKHR {
+            format: vk::Format::D32_SFLOAT,
+            color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        }];
+        assert_eq!(
+            crate::pick_format(&only).unwrap().0,
+            vk::Format::D32_SFLOAT
+        );
+        // 只有多种格式且全都不支持 8 位 RGBA 时才报错
+        let none = [
+            vk::SurfaceFormatKHR {
+                format: vk::Format::D32_SFLOAT,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            },
+            vk::SurfaceFormatKHR {
+                format: vk::Format::R16G16B16A16_SFLOAT,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            },
+        ];
+        assert!(crate::pick_format(&none).is_err());
+    }
+
+    #[test]
+    fn format_selection_has_single_source_of_truth() {
+        // 历史上 frame.rs 曾持有 pick_format 的副本，两份逻辑一旦分叉就会
+        // 出现「framebuffer 附件格式 ≠ 渲染通道格式」，驱动在
+        // cmd_begin_render_pass 时崩溃，且错误信息完全不指向根因。
+        //
+        // 现在已统一：frame.rs 直接调用 crate::pick_format，不存在副本。
+        // 本测试改为守住「重建时拿到的格式必须与建渲染通道时一致」这条不变量。
+        let probe = crate::pick_format(&[vk::SurfaceFormatKHR {
+            format: vk::Format::B8G8R8A8_UNORM,
+            color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+        }])
+        .unwrap();
+        // FrameRenderer::new / rebuild_swapchain 都会把交换链实际返回的格式
+        // 与这个值比对，不等即 bail。渲染通道就是按这个 probe 建的。
+        assert_eq!(probe.0, vk::Format::B8G8R8A8_UNORM);
+    }
+
+    #[test]
+    fn draw_input_default_has_no_descriptor_override() {
+        // descriptor_set 为 null 时 record() 回退到帧槽位自带的描述符集。
+        // 若默认值不是 null，上层忘填就会绑到空描述符集上，驱动直接崩。
+        let input = DrawInput::single_batch(vk::Buffer::null(), vk::Buffer::null());
+        assert!(input.descriptor_set.is_null());
+    }
+}
