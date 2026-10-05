@@ -699,7 +699,6 @@ impl<'a> StagingArena<'a> {
         if fence.is_null() {
             return;
         }
-        eprintln!("DBG RF fence={:?} owners={:?}", fence, self.chunks.iter().map(|c| if c.owner_frame==FREE {"-".to_string()} else {c.owner_frame.to_string()}).collect::<Vec<_>>());
         for c in &mut self.chunks {
             if c.owner_frame == FREE {
                 continue; // 已空闲
@@ -1471,7 +1470,6 @@ impl<'a> FrameRenderer<'a> {
     /// `frame` 必须是本帧 [`FrameRenderer::acquire`] 返回的那一个
     /// （用于校验调用方没有把帧搞混）。
     pub fn present(&mut self, frame: AcquiredFrame) -> anyhow::Result<PresentResult> {
-        eprintln!("DBG PV present enter, pending={}", self.pending.is_some());
         let Some(pending) = self.pending.take() else {
             anyhow::bail!("present 必须在 acquire 之后调用");
         };
@@ -1487,12 +1485,9 @@ impl<'a> FrameRenderer<'a> {
         let image_index = frame.image_index as usize;
         let device = &self.gpu.device;
         let cmd = self.slots[slot].command_buffer;
-
-        eprintln!("DBG PE slot={slot} begin");
         // 渲染通道内的绘制已经结束，先关通道再做布局转换——
         // 顺序反了会让转换屏障落在一个正在被写入的附件上。
         unsafe { device.cmd_end_render_pass(cmd) };
-        eprintln!("DBG PE end_render_pass ok");
 
         let image = self.swapchain.images[image_index];
         let (old_layout, new_layout) = self
@@ -1518,12 +1513,10 @@ impl<'a> FrameRenderer<'a> {
             );
             device.end_command_buffer(cmd)?;
         }
-        eprintln!("DBG PE end_command_buffer ok");
 
         // 提交。注意 builder 的调用顺序：ash 0.38 的 `wait_dst_stage_mask`
         // 会顺手把 `wait_semaphore_count` 也设成切片长度，两者必须都以
         // 1 为长度才不出错——先设 stage mask，再设 semaphores 最保险。
-        eprintln!("DBG S slot={slot} submit begin");
         let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let acquire_sem = self.slots[slot].acquire_semaphore;
         let present_sem = self.slots[slot].present_semaphore;
@@ -1539,7 +1532,6 @@ impl<'a> FrameRenderer<'a> {
                 self.slots[slot].fence,
             )?;
         }
-        eprintln!("DBG S submit ok");
         // 提交成功即意味着该栅栏最终会被 signal。
         self.slots[slot].fence_signaled = true;
         // 命令缓冲此刻已交给 GPU，**不可再录制**。见 `FrameSlot::in_flight`。
@@ -1547,7 +1539,6 @@ impl<'a> FrameRenderer<'a> {
         // 把本帧占用的 staging 块与该栅栏绑定：栅栏 signal 之后
         // `StagingArena::retire` 才会允许复用它们。
         let fence = self.slots[slot].fence;
-        eprintln!("DBG NS slot={slot} fence={:?}", fence);
         self.staging.note_submitted(fence);
         self.staging.end_frame();
 

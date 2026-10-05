@@ -42,7 +42,7 @@ const H: i32 = 480;
 const TEX: u32 = 256;
 
 /// 上传帧数。必须远超在飞帧数（3），否则测不到 arena 的退休/复用。
-const FRAMES: u32 = 6;
+const FRAMES: u32 = 60;
 
 /// 进度打印间隔。
 const PROGRESS_EVERY: u32 = 10;
@@ -209,7 +209,6 @@ fn run() -> anyhow::Result<()> {
     while done < FRAMES {
         // acquire 返回 None = 交换链过期。重建后重试**同一帧号**，
         // 保证帧计数与上传计划一一对应。
-        eprintln!("DBG P1 before acquire");
         let Some(acquired) = fr.acquire()? else {
             fr.rebuild_swapchain(Default::default())?;
             rebuilds += 1;
@@ -235,8 +234,6 @@ fn run() -> anyhow::Result<()> {
         for (x, y, w, h, data) in &pending_data {
             apply_patch(&mut shadow, TEX, (*x, *y, *w, *h), data);
         }
-
-        eprintln!("DBG P4 before present");
         let res = fr.present(acquired)?;
         if res == PresentResult::Outdated {
             fr.rebuild_swapchain(Default::default())?;
