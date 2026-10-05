@@ -1047,10 +1047,27 @@ impl ArenaDecider {
 /// 我们无法提前知道，因此「等栅栏」只能按槽位轮转。
 struct FrameSlot {
     command_buffer: vk::CommandBuffer,
-    /// 由 `acquire_next_image` 与 `queue_submit` 共同 signal。
-    fence: vk::Fence,
-    /// 当前是否处于已 signal 但未 reset 的状态。
-    fence_signaled: bool,
+    /// **只**交给 `queue_submit`。
+    ///
+    /// # 为什么必须与 `acquire_fence` 分开
+    ///
+    /// 曾让同一个 fence 同时传给 `acquire_next_image` 与 `queue_submit`。
+    /// 规范允许这么做，但该fence 会有**两个** signal 来源：
+    /// acquire 成功时驱动 signal 一次，submit 完成时再 signal 一次。
+    /// 配合「等完就`reset_fences`」的写法，手工维护的 `fence_signaled`
+    /// 标志必然与驱动实际状态错位——某帧的 wait 会提前返回，
+    /// 于是reset 了GPU 仍在读的命令缓冲，表现为随机丢设备。
+    ///
+    /// 拆开后每个 fence 只有一个 signal 源，配合
+    /// [`FrameRenderer::fence_signaled`] 直接查驱动状态，
+    /// 就不需要任何手工标志了。
+    submit_fence: vk::Fence,
+    /// **只**交给 `acquire_next_image`。语义与 [`Self::submit_fence`] 对称。
+    ///
+    /// 实测中它从未被等待过——acquire 的等待由 `acquire_semaphore` 与
+    /// 槽位轮转天然保证。保留它是为了满足「信号量与 fence 至少给一个」
+    /// 的显式契约，并让两处 signal 来源在结构上就分开。
+    acquire_fence: vk::Fence,
     /// acquire signal → submit wait。
     acquire_semaphore: vk::Semaphore,
     /// submit signal → present wait。
@@ -1245,6 +1262,22 @@ impl<'a> FrameRenderer<'a> {
         self.clear_color = rgba;
     }
 
+    /// 查询栅栏是否已 signal——**直接问驱动**，而不是靠手工标志。
+    ///
+    /// 这是消除「标志与驱动状态脱节」的关键：手工标志只在某条路径上被
+    /// 置位/清除，而 fence 可能被多处 signal（`acquire_next_image` 与
+    /// `queue_submit` 各一次），标志迟早对不上。对不上时 `wait_for_fences`
+    /// 会提前返回，于是 reset 了GPU 仍在读的命令缓冲 → 设备丢失。
+    ///
+    /// 查不到状态（`ERROR`）时按「未 signal」处理：宁可多等一次，
+    /// 也不能因为误判「已完成」而破坏在途工作。
+    fn fence_signaled(&self, fence: vk::Fence) -> bool {
+        if fence.is_null() {
+            return false;
+        }
+        unsafe { self.gpu.device.get_fence_status(fence).unwrap_or(false) }
+    }
+
     /// 取某个帧槽位的描述符集，供资源层填充 uniform / 纹理。
     pub fn descriptor_set(&self, slot: usize) -> anyhow::Result<vk::DescriptorSet> {
         self.slots
@@ -1388,21 +1421,28 @@ impl<'a> FrameRenderer<'a> {
         }
         let slot = self.cursor % self.slots.len();
 
-        // 等 GPU 用完这个槽位（上一帧的提交 + 本帧的 acquire 都已完成）。
-        // 不等就会在 GPU 还在读命令缓冲时 reset 它——未定义行为。
+        // 复用槽位前，若该槽位**有未完成的提交**，必须等GPU 跑完。
         //
-        // 注意顺序：**先退休，后 reset**。
-        // `wait_for_fences` 返回即证明「该槽位上一轮提交的 GPU 工作
-        // 全部完成」，这是最可靠的退休凭据。而 `get_fence_status` 在
-        // reset 之后读到的永远是未 signal——若把退休放在 reset 之后，
-        // staging 块将永远查不到signal，arena 会在几帧内耗尽。
-        if self.slots[slot].fence_signaled {
-            let fence = self.slots[slot].fence;
+        // 判据是「有没有待完成的提交」（`in_flight`），而**不是**
+        // 「栅栏是否已 signal」——后者恰好是错的：多帧在途下进入这里时
+        // GPU 通常还在忙、栅栏**未 signal**，据此跳过等待就会往
+        // GPU 仍在读的命令缓冲追加命令（实测报「不能重复录制」）。
+        //
+        // `wait_for_fences` 对未 signal 的栅栏会**阻塞**到signal，
+        // 这正是所需语义；等完再向驱动复核一次。
+        if self.slots[slot].in_flight {
+            let fence = self.slots[slot].submit_fence;
             unsafe { self.gpu.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT)? };
+
+            // 等完必须复核：驱动若报错/状态异常，继续下去会破坏在途工作。
+            anyhow::ensure!(
+                self.fence_signaled(fence),
+                "槽位 {slot} 的 submit 栅栏等待后仍未 signal，                 同步状态不可信，拒绝继续以免破坏在途工作"
+            );
 
             // 栅栏已 signal ⇒ 上一轮占用该槽位的那一帧，GPU 必已读完它写入的
             // staging。按**该帧的帧号**精确退休，而不是「落后 N 帧」——
-            // 后者的cutoff 恒小于当前帧，永远追不上，导致 arena 耗尽。
+            // 后者的 cutoff 恒小于当前帧，永远追不上，导致 arena 耗尽。
             let done_frame = self.slots[slot].last_frame;
             if done_frame != u64::MAX {
                 self.staging.retire_frame(done_frame);
@@ -1410,8 +1450,18 @@ impl<'a> FrameRenderer<'a> {
             self.slots[slot].last_frame = u64::MAX;
             self.slots[slot].in_flight = false;
 
+            // 注意：**先退休、后 reset**。`get_fence_status` 在 reset 之后
+            // 读到的永远是 false，若把退休放到 reset 之后，
+            // staging 块将永远查不到 signal，arena 会在几帧内耗尽。
             unsafe { self.gpu.device.reset_fences(&[fence])? };
-            self.slots[slot].fence_signaled = false;
+        }
+        // acquire_fence 同样复位到未signal，好让下次 acquire 拿到干净状态。
+        // （它由本次 acquire signal，槽位再次被复用前必须复位。）
+        {
+            let af = self.slots[slot].acquire_fence;
+            if self.fence_signaled(af) {
+                unsafe { self.gpu.device.reset_fences(&[af])? };
+            }
         }
         self.staging.begin_frame();
 
@@ -1420,7 +1470,7 @@ impl<'a> FrameRenderer<'a> {
                 self.swapchain.handle,
                 ACQUIRE_TIMEOUT,
                 self.slots[slot].acquire_semaphore,
-                self.slots[slot].fence,
+                self.slots[slot].acquire_fence,
             )
         })? {
             AcquireOutcome::Ready {
@@ -1631,16 +1681,15 @@ impl<'a> FrameRenderer<'a> {
             device.queue_submit(
                 self.gpu.queue,
                 std::slice::from_ref(&submit),
-                self.slots[slot].fence,
+                // 只给 submit_fence：它**只有这一个** signal 来源。
+                self.slots[slot].submit_fence,
             )?;
         }
-        // 提交成功即意味着该栅栏最终会被 signal。
-        self.slots[slot].fence_signaled = true;
         // 命令缓冲此刻已交给 GPU，**不可再录制**。见 `FrameSlot::in_flight`。
         self.slots[slot].in_flight = true;
         // 把本帧占用的 staging 块与该栅栏绑定：栅栏 signal 之后
-        // `StagingArena::retire` 才会允许复用它们。
-        let fence = self.slots[slot].fence;
+        // 才会允许复用它们。
+        let fence = self.slots[slot].submit_fence;
         self.staging.note_submitted(fence);
         self.staging.end_frame();
         // 记下本槽位这一轮用的帧号：下次 acquire 等完栅栏后，
@@ -1930,14 +1979,19 @@ impl<'a> FrameRenderer<'a> {
 
         let mut slots = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
-            let fence = unsafe {
-                device.create_fence(
-                    &vk::FenceCreateInfo::default()
-                        .flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-            }
-            .map_err(|e| anyhow::anyhow!("创建栅栏失败: {e:?}"))?;
+            // 两个 fence 各自**只有一个** signal 来源：
+            // submit_fence 由 queue_submit signal，acquire_fence 由
+            // acquire_next_image signal。绝不让两者共用一个——
+            // 共用会产生两个 signal 源，使「是否已完成」的判断不可靠。
+            //
+            // 初始建成 SIGNALED：让首次复用该槽位时 wait 立刻通过
+            // （此时确实没有在途工作，符合实际状态）。
+            let fence_info = vk::FenceCreateInfo::default()
+                .flags(vk::FenceCreateFlags::SIGNALED);
+            let submit_fence = unsafe { device.create_fence(&fence_info, None) }
+                .map_err(|e| anyhow::anyhow!("创建 submit 栅栏失败: {e:?}"))?;
+            let acquire_fence = unsafe { device.create_fence(&fence_info, None) }
+                .map_err(|e| anyhow::anyhow!("创建 acquire 栅栏失败: {e:?}"))?;
             let semaphore_info = vk::SemaphoreCreateInfo::default();
             let acquire_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
                 .map_err(|e| anyhow::anyhow!("创建 acquire 信号量失败: {e:?}"))?;
@@ -1945,11 +1999,9 @@ impl<'a> FrameRenderer<'a> {
                 .map_err(|e| anyhow::anyhow!("创建 present 信号量失败: {e:?}"))?;
             slots.push(FrameSlot {
                 command_buffer: buffers[i],
-                fence,
-                // 初始就建成 SIGNALED 且标记为已 signal：
-                // 第一次 wait 会立刻通过，之后交给 acquire 去 signal。
-                fence_signaled: true,
-                // 初始没有在途提交（栅栏已 signal），可以自由录制。
+                submit_fence,
+                acquire_fence,
+                // 初始没有在途提交，可以自由录制。
                 in_flight: false,
                 // 从未使用过，没有可退休的上一轮帧。
                 last_frame: u64::MAX,
@@ -1967,7 +2019,8 @@ impl<'a> FrameRenderer<'a> {
         let device = &self.gpu.device;
         for slot in &self.slots {
             unsafe {
-                device.destroy_fence(slot.fence, None);
+                device.destroy_fence(slot.submit_fence, None);
+                device.destroy_fence(slot.acquire_fence, None);
                 device.destroy_semaphore(slot.acquire_semaphore, None);
                 device.destroy_semaphore(slot.present_semaphore, None);
             }
