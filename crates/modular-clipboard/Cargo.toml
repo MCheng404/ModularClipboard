@@ -12,6 +12,8 @@ path = "src/main.rs"
 modular-clipboard-core = { workspace = true }
 modular-clipboard-app = { workspace = true }
 modular-clipboard-ui = { workspace = true }
+# --help 的数据目录文本经 ui 层转发 store 的目录常量（见 ui::default_data_dir_display），
+# 本 crate 不直接依赖 store，保持「只依赖 core/app/ui 三层」的架构约定。
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
