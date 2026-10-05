@@ -19,6 +19,7 @@ pub mod buffer;
 pub mod frame;
 pub mod pipeline;
 pub mod shader;
+pub mod staging;
 pub mod texture;
 pub mod window;
 
