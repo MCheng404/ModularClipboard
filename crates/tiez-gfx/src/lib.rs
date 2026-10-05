@@ -15,6 +15,9 @@
 
 use std::ffi::CString;
 
+pub mod pipeline;
+pub mod shader;
+
 use ash::{Device, Entry, Instance as AshInstance, khr, vk};
 use khr::surface::Instance as SurfaceLoader;
 
@@ -90,12 +93,13 @@ impl Gpu {
             // 只请求 1.1 基线，保证旧驱动也能启动
             .api_version(vk::API_VERSION_1_1);
 
-        // ash 0.38 未提供扩展名常量，直接使用规范中的名称字符串。
-        // 这三者是 Win32 上显示窗口的最小集合。
+        // 实例级扩展：只有「表面」相关的两个。
+        // 注意 VK_KHR_swapchain 是**设备级**扩展，不能在实例创建时启用——
+        // 误加会让 create_instance 报 "Extension specified does not exist"。
+        // 名称大小写敏感：swapchain 全小写，写成 VK_KHR_swap_chain 同样失败。
         let surface_ext = c"VK_KHR_surface";
         let win32_ext = c"VK_KHR_win32_surface";
-        let swap_ext = c"VK_KHR_swap_chain";
-        let exts = [surface_ext.as_ptr(), win32_ext.as_ptr(), swap_ext.as_ptr()];
+        let exts = [surface_ext.as_ptr(), win32_ext.as_ptr()];
 
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&mut app_info)
@@ -168,7 +172,7 @@ impl Gpu {
             .queue_family_index(queue_family)
             .queue_priorities(&queue_priorities);
 
-        let device_exts = [c"VK_KHR_swap_chain".as_ptr()];
+        let device_exts = [c"VK_KHR_swapchain".as_ptr()];
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&device_info))
             .enabled_extension_names(&device_exts);
@@ -304,6 +308,11 @@ pub struct Swapchain {
     pub handle: vk::SwapchainKHR,
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
+    /// 与图像视图一一对应的 framebuffer。
+    ///
+    /// 渲染通道必须绑定 framebuffer 而非裸图像视图；传空句柄是未定义行为，
+    /// 驱动会直接崩溃。
+    pub framebuffers: Vec<vk::Framebuffer>,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub present_mode: vk::PresentModeKHR,
@@ -313,7 +322,14 @@ pub struct Swapchain {
 
 impl Swapchain {
     /// 为给定尺寸创建交换链。
-    pub fn new(gpu: &Gpu, width: u32, height: u32) -> anyhow::Result<Self> {
+    ///
+    /// `render_pass` 需已创建——framebuffer 依赖它的附件描述。
+    pub fn new(
+        gpu: &Gpu,
+        width: u32,
+        height: u32,
+        render_pass: vk::RenderPass,
+    ) -> anyhow::Result<Self> {
         let caps = &gpu.surface_caps;
         let extent = vk::Extent2D {
             width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
@@ -354,12 +370,28 @@ impl Swapchain {
             image_views.push(create_image_view(gpu, *image, format)?);
         }
 
+        // framebuffer 必须在图像视图与渲染通道都就绪后创建
+        let mut framebuffers = Vec::with_capacity(image_views.len());
+        for view in &image_views {
+            let attachments = [*view];
+            let fb_info = vk::FramebufferCreateInfo::default()
+                .render_pass(render_pass)
+                .attachments(&attachments)
+                .width(extent.width)
+                .height(extent.height)
+                .layers(1);
+            let fb = unsafe { gpu.device.create_framebuffer(&fb_info, None) }
+                .map_err(|e| anyhow::anyhow!("创建 framebuffer 失败: {e:?}"))?;
+            framebuffers.push(fb);
+        }
+
         tracing::debug!(
             ?format,
             present_mode = ?present_mode,
             width = extent.width,
             height = extent.height,
             images = images.len(),
+            framebuffers = framebuffers.len(),
             "交换链创建成功"
         );
 
@@ -367,6 +399,7 @@ impl Swapchain {
             handle,
             images,
             image_views,
+            framebuffers,
             format,
             extent,
             present_mode,
@@ -378,11 +411,17 @@ impl Swapchain {
     /// 销毁资源。需在渲染通道不再引用图像视图后调用。
     pub fn destroy(&mut self, device: &Device) {
         unsafe {
+            // 顺序很重要：framebuffer 引用了图像视图，
+            // 必须先销毁 framebuffer 再销毁视图。
+            for fb in &self.framebuffers {
+                device.destroy_framebuffer(*fb, None);
+            }
             for view in &self.image_views {
                 device.destroy_image_view(*view, None);
             }
             self.loader.destroy_swapchain(self.handle, None);
         }
+        self.framebuffers.clear();
         self.image_views.clear();
         self.images.clear();
     }
