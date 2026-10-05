@@ -377,7 +377,7 @@ impl Store {
 
     /// LIKE 回退查询。中文场景下 FTS 失效时的兜底。
     fn like_search(&self, q: &str, limit: usize) -> Result<Vec<ClipItem>> {
-        let pattern = format!("%{}%", q.replace('"', "\""));
+        let pattern = format!("%{}%", Self::escape_like(q));
         let sql = format!(
             "SELECT {} FROM items
              WHERE preview LIKE ?1 ESCAPE '\\'
@@ -387,6 +387,27 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], Self::row_to_item)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// LIKE 查询里匹配「字面量」而不是「通配符」。
+    ///
+    /// SQL 侧声明了 `ESCAPE '\'`，所以要用反斜杠转义三个字符。
+    /// 顺序不能颠倒：**必须先转义反斜杠本身**，
+    /// 否则后面新增的转义符会被它再次转义。
+    ///
+    /// 漏掉任何一项都会造成「语义注入」——搜索框里输入 `%`
+    /// 会匹配全部条目，输入 `_` 会匹配任意单字符。
+    /// 这不是 SQL 注入（整体仍是参数绑定），但结果完全不符合预期。
+    fn escape_like(raw: &str) -> String {
+        const ESCAPE: char = '\\';
+        let mut out = String::with_capacity(raw.len() + 8);
+        for c in raw.chars() {
+            if matches!(c, ESCAPE | '%' | '_') {
+                out.push(ESCAPE);
+            }
+            out.push(c);
+        }
+        out
     }
 
     /// 读取载荷字节。
@@ -661,11 +682,53 @@ fn compute_dims(kind: &ClipKind, bytes: &[u8]) -> Option<(u32, u32)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn like_pattern_escapes_wildcards() {
+        // LIKE 的 `%` 与 `_` 是通配符。用户搜 `%` 是想找字面量百分号，
+        // 不是想列出全部。不转义的话搜索结果会完全跑偏。
+        assert_eq!(Store::escape_like("100%"), r"100\%");
+        assert_eq!(Store::escape_like("a_b"), r"a\_b");
+        // 反斜杠自身也必须转义，否则它会把后面加的转义符再转义一次：
+        // 输入 `a\b`（单个反斜杠）应变成 `a\\b`（两个）。
+        assert_eq!(Store::escape_like("a\\b"), r"a\\b");
+        // 普通字符与中文不受影响
+        assert_eq!(Store::escape_like("剪贴板"), "剪贴板");
+        assert_eq!(Store::escape_like(""), "");
+    }
+
+    #[test]
+    fn like_search_treats_wildcards_literally() {
+        // 端到端验证：插入含 % 的条目，搜 "%" 不应命中它。
+        // 这是 escape_like 存在的理由——单测字符串变换不够，
+        // 要确认最终 SQL 行为符合预期。
+        let (mut st, dir) = temp_store();
+        for preview in ["50% 折扣", "普通条目"] {
+            let item = ClipItem::new(
+                ClipKind::Text,
+                "h".into(),
+                preview.into(),
+                "app".into(),
+            );
+            st.insert(item, preview.as_bytes().to_vec()).unwrap();
+        }
+
+        let hits = st.like_search("%", 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "搜索 % 应只匹配字面量含 % 的那一条，实际命中 {} 条",
+            hits.len()
+        );
+        assert!(hits[0].preview.contains('%'));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn temp_store() -> (Store, PathBuf) {
         // 目录名必须全进程唯一：仅用 now_ms() 会在毫秒精度内并发测试时冲突。
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!("tiez-store-test-{}-{}", std::process::id(), n));
+        let base = std::env::temp_dir().join(format!("{DATA_DIR_NAME}-store-test-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&base).unwrap();
         let s = Store::open(&base.join("t.db"), &base.join("blobs")).unwrap();
         (s, base)
