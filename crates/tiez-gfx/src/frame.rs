@@ -682,6 +682,28 @@ impl<'a> StagingArena<'a> {
         }
     }
 
+    /// 退休「属于 `frame` 号那一帧」的所有块。
+    ///
+    /// # 为什么按帧号精确退休，而不是「落后 N 帧就算安全」
+    ///
+    /// 帧号差值只是**保守估计**：块数 == 槽位数时，落后 N 帧的块确实安全，
+    /// 但当前帧的块永远追不上cutoff（`cutoff = current_frame - N` 恒小于
+    /// `current_frame`），于是每帧都新占一块、N 帧后 arena 必然耗尽。
+    /// 实测 3 块/3 槽位时第 4 帧就报「全部在途」。
+    ///
+    /// 而我们手上恰好有**精确**凭据：`acquire` 里`wait_for_fences` 等的
+    /// 那个栅栏，就属于「上一轮占用该槽位的那一帧」。该帧写入的块，
+    /// GPU 必然已读完。因此按帧号精确退休既安全又不浪费。
+    pub fn retire_frame(&mut self, frame: u64) {
+        for c in &mut self.chunks {
+            if c.owner_frame != FREE && c.owner_frame <= frame {
+                c.owner_frame = FREE;
+                c.fence = vk::Fence::null();
+                c.cursor = 0;
+            }
+        }
+    }
+
     /// 退休与 `fence` 关联的块：该栅栏已 signal，GPU 读完了其中的数据。
     ///
     /// # 为什么按「栅栏身份」而不是「查栅栏状态」
@@ -707,34 +729,6 @@ impl<'a> StagingArena<'a> {
         c.owner_frame = FREE;
         c.fence = vk::Fence::null();
         c.cursor = 0;
-    }
-
-    /// 退休「上一轮槽位」占用的所有块。
-    ///
-    /// # 为什么按槽位而不是按栅栏身份退休
-    ///
-    /// 曾用「按 fence 身份匹配」的做法，但那条路是错的：
-    /// `allocate` 发生在 `note_submitted` **之前**，所以分配时
-    /// `chunk.fence` 还是 null。若某块没被正确记上 fence，
-    /// 它就永远退休不掉，于是每帧都会被当作可追加的块——
-    /// 而 GPU 可能仍在读上上帧写入的数据 ⇒ use-after-free，
-    /// 表现为随机花屏或设备丢失。
-    ///
-    /// 槽位轮转是**可推算**的：`acquire` 里等完栅栏后，
-    /// 上一轮占用的那些块必然已经安全。块数≥ 槽位数保证有空闲块可用。
-    pub fn retire_previous_slots(&mut self, slots_in_flight: usize) {
-        let cutoff = self.current_frame.saturating_sub(slots_in_flight as u64);
-        for c in &mut self.chunks {
-            if c.owner_frame == FREE {
-                continue;
-            }
-            // 落后足够的块，其栅栏早已等过（acquire 里等的是本槽位的）。
-            if c.owner_frame <= cutoff {
-                c.owner_frame = FREE;
-                c.fence = vk::Fence::null();
-                c.cursor = 0;
-            }
-        }
     }
 
     /// 退休所有「栅栏已 signal」的块。
@@ -1046,6 +1040,12 @@ struct FrameSlot {
     /// 生命周期：`present` 提交后置真，`acquire` 里等完栅栏后置假。
     /// 换言之，它等价于「本槽位是否有未完成的 GPU 工作」。
     in_flight: bool,
+    /// 该槽位**上一轮**使用的 arena 帧号。
+    ///
+    /// `acquire` 等完本槽位栅栏时，这个帧号就是「GPU 肯定已读完」的
+    /// 精确凭据，用来退休该帧占用的 staging 块（见
+    /// [`StagingArena::retire_frame`]）。`u64::MAX` 表示从未用过。
+    last_frame: u64,
 }
 
 /// 帧循环核心。
@@ -1374,11 +1374,14 @@ impl<'a> FrameRenderer<'a> {
             let fence = self.slots[slot].fence;
             unsafe { self.gpu.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT)? };
 
-            // 栅栏已 signal：占用该槽位的那几帧 staging 可以安全复用。
-            // 按帧号差值退休（落后 >= 槽位数即安全），而不是按 fence 身份——
-            // 见retire_previous_slots 的说明：fence 身份记账不可靠。
-            let n = self.slots.len();
-            self.staging.retire_previous_slots(n);
+            // 栅栏已 signal ⇒ 上一轮占用该槽位的那一帧，GPU 必已读完它写入的
+            // staging。按**该帧的帧号**精确退休，而不是「落后 N 帧」——
+            // 后者的cutoff 恒小于当前帧，永远追不上，导致 arena 耗尽。
+            let done_frame = self.slots[slot].last_frame;
+            if done_frame != u64::MAX {
+                self.staging.retire_frame(done_frame);
+            }
+            self.slots[slot].last_frame = u64::MAX;
             self.slots[slot].in_flight = false;
 
             unsafe { self.gpu.device.reset_fences(&[fence])? };
@@ -1614,6 +1617,9 @@ impl<'a> FrameRenderer<'a> {
         let fence = self.slots[slot].fence;
         self.staging.note_submitted(fence);
         self.staging.end_frame();
+        // 记下本槽位这一轮用的帧号：下次 acquire 等完栅栏后，
+        // 就可据此精确退休这一帧占用的 staging 块。
+        self.slots[slot].last_frame = self.staging.current_frame();
 
         let swapchains = [self.swapchain.handle];
         let image_indices = [frame.image_index];
@@ -1919,6 +1925,8 @@ impl<'a> FrameRenderer<'a> {
                 fence_signaled: true,
                 // 初始没有在途提交（栅栏已 signal），可以自由录制。
                 in_flight: false,
+                // 从未使用过，没有可退休的上一轮帧。
+                last_frame: u64::MAX,
                 acquire_semaphore,
                 present_semaphore,
                 descriptor_set: sets[i],

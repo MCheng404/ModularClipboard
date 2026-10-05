@@ -199,16 +199,17 @@ fn run() -> anyhow::Result<()> {
         // 后续不再整体借用 output（shapes 已被 tessellate 移走），
         // 因此先把还要用的字段取出来。
         let pixels_per_point = output.pixels_per_point;
-        let mut textures_delta = std::mem::take(&mut output.textures_delta);
+        // 用守卫而不是裸变量：`?` 提前返回时也必须清空增量，
+        // 否则 epaint 的 `TexturesDelta::drop` 断言会 panic，
+        // 把「真正的错误」掩盖成一个毫不相干的帧循环断言。
+        let mut textures_delta = DeltaGuard(std::mem::take(&mut output.textures_delta));
         let repaint = repaint_delay(&output);
 
         // ---- 3. 客户区尺寸兜底检查 ------------------------------------
         // 最小化时客户区为 0×0，交换链拿不到可呈现的图像。
         let (cw, ch) = window.inner_size_physical();
         if cw == 0 || ch == 0 {
-            // egui 的 `TexturesDelta` 在 drop 时断言增量为空。最小化期间
-            // 不渲染，但增量已被本帧消费，必须显式清掉。
-            textures_delta.clear();
+            // 最小化期间不渲染，但增量已被本帧产出，守卫会在离开作用域时清空。
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
@@ -241,10 +242,8 @@ fn run() -> anyhow::Result<()> {
                 &mut last_uniform_key,
                 &mut rebuilds,
             )?;
-            // 本帧不渲染，但增量已被产出。egui 的 `TexturesDelta` 在 drop 时
-            // 断言增量为空，漏清会 panic——而且这个 panic 与真正的失败无关，
-            // 纯粹是帧循环写法问题。
-            textures_delta.clear();
+            // 本帧不渲染，但增量已被产出。守卫会在离开作用域时清空，
+            // 无需在此手写——漏写一处就是一个与真实错误无关的 panic。
             println!("  [警告] acquire 返回过期，已重建交换链");
             continue;
         };
@@ -264,7 +263,7 @@ fn run() -> anyhow::Result<()> {
         //
         // 必须在 acquire 之后：`record_texture_upload` 把命令录进本帧的
         // 命令缓冲，且 staging 的生命周期由帧层arena 用栅栏保证。
-        let uploaded = apply_font_delta(&gpu, &mut fr, &mut font, &mut textures_delta)?;
+        let uploaded = apply_font_delta(&gpu, &mut fr, &mut font, &mut textures_delta.0)?;
         if uploaded > 0 {
             texture_uploads += uploaded;
             // 图集可能已被重建（尺寸变化）→ 图像视图变了 → 必须重绑。
@@ -837,6 +836,24 @@ fn uniforms_for(extent: vk::Extent2D, pixels_per_point: f32) -> Uniforms {
 // ---------------------------------------------------------------------------
 // 字体图集
 // ---------------------------------------------------------------------------
+
+/// 离开作用域时自动清空 [`egui::TexturesDelta`]。
+///
+/// # 为什么需要它
+///
+/// `TexturesDelta` 的 `Drop` 里有一条 `debug_assert!(is_empty())`：
+/// 增量必须被消费或显式 `clear()`，否则 panic。手写 `clear()` 极易漏——
+/// 帧循环里那些 `?` 提前返回、`continue`、最小化跳过的分支各都要写一遍，
+/// 漏一处就是一个**与真实错误毫无关系**的 panic，把排查方向带偏。
+///
+/// 用守卫把「清理」绑到作用域上，就不必逐条路径操心。
+struct DeltaGuard(egui::TexturesDelta);
+
+impl Drop for DeltaGuard {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
 
 /// 应用 egui 的字体图集增量，返回本帧的上传次数。
 ///

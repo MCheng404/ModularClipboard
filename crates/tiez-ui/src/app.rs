@@ -32,6 +32,25 @@ use crate::renderer::{Painter, WINDOW_TITLE};
 use crate::view::UiLocal;
 use crate::{theme, view};
 
+/// 离开作用域时自动清空 [`egui::TexturesDelta`]。
+///
+/// # 为什么需要它
+///
+/// `TexturesDelta` 的 `Drop` 里有一条 `debug_assert!(is_empty())`：
+/// 增量必须被消费或显式 `clear()`，否则 panic。手写 `clear()` 极易漏——
+/// 帧循环里 `?` 提前返回、`continue`、最小化跳过的分支各都要写一遍，
+/// 漏一处就是一个**与真实错误毫无关系**的 panic，把排查方向带偏。
+///
+/// 我第一版就踩了这个坑：`full_app` 首帧明明成功渲染了 552 个顶点，
+/// 却在第二帧因为一处漏清的 delta panic 退出。用作用域守卫从根上消除。
+struct DeltaGuard(egui::TexturesDelta);
+
+impl Drop for DeltaGuard {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
 /// 启动图形界面。`config` 为初始配置。
 pub fn run(config: tiez_core::Config) -> anyhow::Result<()> {
     // `Window::new` 的宽高是**物理像素**，而配置里存的是逻辑点。
@@ -137,9 +156,7 @@ pub fn run(config: tiez_core::Config) -> anyhow::Result<()> {
         // 客户区可能被最小化到 0×0，此时交换链拿不到可呈现的图像。
         let (cw, ch) = window.inner_size_physical();
         if cw == 0 || ch == 0 {
-            // 不渲染，但增量已被本帧产出，必须显式清掉（见模块文档第 3 条）。
-            output.textures_delta.clear();
-            drop(output);
+            // 不渲染。增量由守卫在离开作用域时清空。
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
@@ -152,20 +169,18 @@ pub fn run(config: tiez_core::Config) -> anyhow::Result<()> {
         // ---- 4. 帧渲染 ----
         //
         // 把这一帧要用的东西全部从 `output` 里取出来，之后让它整体 drop。
-        // `tessellate` 会消耗 `output.shapes`（按值），那之后 `output`
-        // 处于「部分移动」状态，既不能整体借用也不能整体 drop。
-        let mut textures_delta = std::mem::take(&mut output.textures_delta);
+        // `tessellate` 按值消耗 shapes，因此要先 `mem::take` 才能整体 drop。
+        let textures_delta = DeltaGuard(std::mem::take(&mut output.textures_delta));
         let primitives = ctx.tessellate(std::mem::take(&mut output.shapes), ppp);
         drop(output);
 
         let Some(acquired) = fr.acquire()? else {
             rebuild(&mut fr, &mut painter)?;
             tracing::debug!("acquire 返回过期，已重建交换链");
-            textures_delta.clear();
             continue;
         };
 
-        painter.paint(&mut fr, &primitives, ppp, &mut textures_delta)?;
+        painter.paint(&mut fr, &primitives, ppp, &mut textures_delta.0)?;
 
         if fr.present(acquired)? == PresentResult::Outdated {
             // 呈现时才发现过期：下一轮 acquire 会返回 None 再重建。

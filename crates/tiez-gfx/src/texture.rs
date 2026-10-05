@@ -943,12 +943,11 @@ mod tests {
         assert!(validate_region(size, (0, 0), (0, 10)).is_err());
     }
 
-    #[test]
     /// 屏障的 srcStage 与 srcAccess 必须匹配。
     ///
     /// 这是本组最重要的不变量：`TOP_OF_PIPE` 不等待任何东西，
     /// 若同时声明了非空 srcAccess，屏障就是空操作。
-    /// 曾经的 bug 正是「srcAccess=SHADER_READ 却配TOP_OF_PIPE」。
+    /// 曾经的 bug 正是「srcAccess=SHADER_READ 却配 TOP_OF_PIPE」。
     #[test]
     fn barrier_scope_pairs_stage_with_access() {
         // UNDEFINED：无需等待
@@ -1015,6 +1014,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn region_validation_uses_wide_arithmetic() {
         // u32 加法若在 u32 下做，u32::MAX + 1 会回绕成 0 而误判为合法。
         // 这里确认实现用的是不会回绕的运算。

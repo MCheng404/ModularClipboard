@@ -310,7 +310,7 @@ event_loop.set_repaint_after(ctx.requested_repaint_after());
 
 <!-- 每完成一个可验证步骤就追加一条，格式：时间 | Agent | 做了什么 | 如何验证的 -->
 
-- 2026-10-06 | C | ⚠️ **`window.rs` 首次真正编译，暴露并修掉 13 个错误 + 3 个设计缺陷**。起因：`lib.rs` 的 `pub mod window;` 之前缺失，文件写完后**一次都没被编译过**（D 组发现并报告）。首轮编译暴露的真实错误：`Win32::UI::HiDPi` 模块名实际是 `HiDpi`；`GetModuleHandleW` 返回 `HMODULE` 而非 `HINSTANCE`；`Error::from_win32()` 在 windows-result 0.4.1 **不存在**；`key_from_vk` 闭包类型不匹配；测试调了未定义的 `EventLoop::fake()`；`Key::F1..=Key::F24` 不能作 match 区间模式；6 处`drop()` 用在 `Copy` 类型上。**另修 3 个设计缺陷**：`register_class` 重复注册会误报失败；`GetCursorPos` 忘调 `ScreenToClient` 导致指针坐标是屏幕坐标；`GetKeyState` 在 pump 过程中读到上一帧修饰键（改 `GetAsyncKeyState`）。**测试自身也抓到一个错**：`function_keys_span_f1_to_f24` 用 `unwrap_or(Key::F1)` 做断言，等于拿被断言的键当默认值——生产代码是对的，断言是错的。 | `cargo test -p tiez-gfx`：**128 passed / 0 failed**（含我的 **52 个**），**零 error 零 warning**。因`frame.rs` 当时在B 组编辑中，另在 `%TEMP%` 搭了隔离 harness（同版本 egui 0.36.2 + windows 0.62.2）先行验证我的 52 个测试全绿，确认非偶然，验证后已清理。⚠️ `./scripts/build.sh --test` **全工作区仍编不过**，唯一阻塞是 D 组 `tiez-ui/src/renderer.rs` 的 5 个错误（`UiLocal` 未定义、`output` 部分移动、`ctx.style()` 不存在等），与 C 组无关。
+- 2026-10-06 | C | ⚠️ **`window.rs` 首次真正编译，暴露并修掉 13 个错误 + 3 个设计缺陷**。起因：`lib.rs` 的 `pub mod window;` 之前缺失，文件写完后**一次都没被编译过**（D 组发现并报告）。首轮编译暴露的真实错误：`Win32::UI::HiDPi` 模块名实际是 `HiDpi`；`GetModuleHandleW` 返回 `HMODULE` 而非 `HINSTANCE`；`Error::from_win32()` 在 windows-result 0.4.1 **不存在**；`key_from_vk` 闭包类型不匹配；测试调了未定义的 `EventLoop::fake()`；`Key::F1..=Key::F24` 不能作 match 区间模式；6 处`drop()` 用在 `Copy` 类型上。**另修 3 个设计缺陷**：`register_class` 重复注册会误报失败；`GetCursorPos` 忘调 `ScreenToClient` 导致指针坐标是屏幕坐标；`GetKeyState` 在 pump 过程中读到上一帧修饰键（改 `GetAsyncKeyState`）。**测试自身也抓到一个错**：`function_keys_span_f1_to_f24` 用 `unwrap_or(Key::F1)` 做断言，等于拿被断言的键当默认值——生产代码是对的，断言是错的。 | `cargo test -p tiez-gfx`：**128 passed / 0 failed**（含我的 **52 个**），**零 error 零 warning**。因`frame.rs` 当时在B 组编辑中，另在 `%TEMP%` 搭了隔离 harness（同版本 egui 0.36.2 + windows 0.62.2）先行验证我的 52 个测试全绿，确认非偶然，验证后已清理。⚠️ `./scripts/build.sh --test` **全工作区仍编不过**，唯一阻塞是 D 组 `tiez-ui/src/renderer.rs` 的 5 个错误（`UiLocal` 未定义、`output` 部分移动、`ctx.style()` 不存在等），与 C 组无关。**实机基线探针 `pipeline_probe` 退出码 0 / `ALL OK`，无回归**（window.rs 不碰渲染路径，但仍实跑确认以维持「不回归」纪律）。
 
 - 2026-10-05 | B | **自查契约漏洞并补齐**（起因是 A 组提问暴露了缺口）：A 的 `DeviceImage::upload(gpu, cmd, ..)` 需要一个 `vk::CommandBuffer` 录制拷贝命令，而我的契约**从未暴露当前帧命令缓冲** ⇒ D 组拿到 `FrameRenderer` **无法把纹理上传录进同一份 submit**。新增 `current_slot()` / `current_command_buffer()`，并补齐 PROGRESS.md 的完整一帧示例（含 `apply_delta` 与描述符写入）。同时**主动砍掉自己刚写的多余方法** `wait_slot_idle`—— 追溯槽位轮转后发现 `acquire()` 已等过并重置当前槽位栅栏，该方法冗余。 | `./scripts/build.sh --test` **零错误零警告**，tiez-gfx **58 passed / 0 failed**；实机探针 `pipeline_probe` 退出码 0 / `ALL OK`，不回归 |
 - 2026-10-05 | B | **纠正了 A 组对 staging 的错误定性**。A 推断「`Buffer` 无 `Drop` ⇒ 绑定已失效 ⇒ use-after-free」并据此准备改 ring buffer。实查确认：**没有 `Drop` 意味着什么都不发生**——`vk::Buffer`/`vk::DeviceMemory` 从未被销毁，句柄始终有效；且 `Buffer::write` 内部 `map`→`copy`→**`unmap`**（`buffer.rs:301-345`），不存在「已 unmap 裸指针复用」。故真实行为是**良性内存泄漏**（GPU 读到的数据正确），**ring buffer 是错误修法**（它解决「复用覆写未读数据」，而此处根本无复用，每次新分配）。正确修法：把 staging 提升为常驻字段。真实风险在泄漏量——`apply_delta` 每 delta 一次（`texture.rs:725`），中文首载逐字形≈上千次。 | 直读 `buffer.rs:99-111`（`Buffer` 无 `Drop`）、`buffer.rs:301-345`（`write` 内部 `unmap`）、`buffer.rs:460`（`Drop` 仅在 `BufferGuard`）、`texture.rs:269-296`（`upload` 新建局部 staging）、`texture.rs:725`（每 delta 一次） |
@@ -401,3 +401,58 @@ A 组报告 `texture.rs:390` 存在 use-after-free，理由是
 
 - 2026-10-05 | B | **实机`upload_probe` 抓出并修复 2 个真bug**（单测全绿时溜过去了）：<br>① **描述符集只拿到 1 份**：查 ash 源码（`vk/definitions.rs:3734`）确认 `set_layouts()` 会**主动把 `descriptor_set_count` 覆盖成切片长度**，而 `allocate_descriptor_sets` 按该 count 决定返回几份。必须在其**之后**直接写字段（该字段无 builder 方法）。这是 MEMORY.md 坑 15 的**后半段**——之前只记「不设 count 返空 Vec」，没意识到 slice 构造器会主动写入。症状会是多帧共用一份描述符集 → GPU 读到被改写的数据 → **随机花屏**。<br>② **`LayoutTracker` 初始化为 0**：`reset(image_count)` 只在 `rebuild_swapchain` 里调，初始化路径不经过 → 首次 `acquire` 时 `layouts.get()` 越界。修法：在 `swapchain` 被移进结构体前先取 `image_count`（`Swapchain` 无 `Clone`）。 | `upload_probe` 实机报错「期望 3，实际 1」→ 修复后 lib **76 passed / 0 failed 零警告**；`pipeline_probe` 退出码 0 / `ALL OK` 不回归。**教训：这两个 bug 在 76 个单测全绿的情况下漏过，只有真跑GPU 才暴露——A 坚持做实机probe 的判断正确。** |
 - 2026-10-05 | B | **补完 arena 接线并修好并发编辑造成的破坏**：`frame.rs` 被第三方加入约 700 行 `StagingArena` 但两处接线未完成（`align_up` 未import、`FrameRenderer` 缺 `staging` 字段）→ 已补齐，`Drop` 中`staging.destroy()` 位置正确（在 `wait_idle` 之后）未改。同时修 `examples/upload_probe.rs` 3 处编译错误（漏 `mut`、借用冲突、传 `GraphicsPipeline` 而非 `.handle`）。**未加 `#[allow(dead_code)]` 消警**——消警不等于解决。 | `cargo test -p tiez-gfx --lib` 76 passed / 零警告 |
+
+---
+
+## 📏 主控新增硬规则（00:50）
+
+### 1. 交付报告不得出现无法验证的声明
+
+禁止写「曾经编译过」「0 error 0 warning」「应该没问题」这类话。
+只能给：**「改动后我跑了 X，结果是 Y」**。
+
+**原因**：`window.rs` 有 1296 行、39 个单测，交付时声称「0 error 0 warning」，
+实际那 1296 行**从未参与编译**（`pub mod window;` 被并发编辑弄丢）。
+数字是真的，含义是假的。
+
+### 2. 提交时禁止 `git add -A`
+
+只 add 自己拥有的文件。`git add -A` 会把别人的中间态一起提交，
+造成「我这边是好的，合并后坏了」。
+
+### 3. 改Cargo.toml 前必须先 grep
+
+`[[example]]` 段曾因并发编辑重复声明，导致整个 crate 编译失败。
+清单式文件由单一 owner 维护（当前是 mcp-probe-verify）。
+
+### 4. `Ok(())` 不能掩盖异常
+
+探针里 `Err(_) => panic!("丢弃")` + 末尾 `Ok(())` 会让失败被吞掉。
+panic 消息必须包含具体错误原因。
+
+---
+
+## 🔒 当前文件独占权
+
+| 文件 | Owner | 其他人 |
+|------|-------|--------|
+| `gfx/src/frame.rs` | **mcp-arch-frame** | 只读 |
+| `gfx/src/buffer.rs` `texture.rs` | mcp-arch-resource | 只读 |
+| `gfx/src/window.rs` `examples/window_probe.rs` | mcp-arch-window | 只读 |
+| `gfx/examples/upload_probe.rs` | mcp-probe-verify | 只读 |
+| `gfx/examples/full_app.rs` `tiez-ui/*` | mcp-arch-ui | 只读 |
+| `gfx/Cargo.toml` | mvp-probe-verify | 需先 grep |
+
+`frame.rs` 今天被并发编辑破坏 4 次，故明确独占。
+
+---
+
+## 📋 待决区（主控已确认成立，暂不分配）
+
+| 来源 | 问题 | 归属 |
+|------|------|------|
+| C 组 | `update_uniform_binding` 遍历 `batches.len()`，应为帧槽位数 | frame.rs owner |
+| C 组 | `update_texture_binding` 无「本帧已上传才重绑」状态追踪 | frame.rs owner |
+| C 组 | 16 个 `event!` 宏的格式化参数未纳入检查 | window.rs owner |
+| C 组 | `install_cjk_font` 两级失败原因未区分 | 待 eframe 迁移后 |
+| B 组 | `rebuild_chunk` 应加 `owner_frame == FREE` 断言 | frame.rs owner |
