@@ -41,10 +41,27 @@ pub struct Store {
     payload_limit: std::sync::atomic::AtomicU64,
 }
 
+/// 数据目录名（`ProjectDirs` 的第三参数）。
+///
+/// 单一来源：帮助文本、默认路径、临时目录都从这里派生。
+/// 之前这些字符串散落三处，改名时漏了一处，导致
+/// `--help` 显示的路径与实际行为不符。
+pub const DATA_DIR_NAME: &str = "modular-clipboard";
+
+/// 用于展示的默认数据目录全路径。
+///
+/// 帮助文本用它，避免文档与实现漂移。
+pub fn default_data_dir_display() -> String {
+    match directories::ProjectDirs::from("", "", DATA_DIR_NAME) {
+        Some(d) => d.data_dir().display().to_string(),
+        None => DATA_DIR_NAME.to_string(),
+    }
+}
+
 impl Store {
     /// 在标准数据目录下打开或创建库。
     pub fn open_default() -> Result<Self> {
-        let dir = directories::ProjectDirs::from("", "", "modular-clipboard")
+        let dir = directories::ProjectDirs::from("", "", DATA_DIR_NAME)
             .ok_or_else(|| anyhow::anyhow!("无法确定数据目录"))?
             .data_dir()
             .to_path_buf();
@@ -57,7 +74,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
             conn,
-            blob_dir: std::env::temp_dir().join(format!("tiez-mem-{}", std::process::id())),
+            blob_dir: std::env::temp_dir().join(format!("{DATA_DIR_NAME}-mem-{}", std::process::id())),
             db_path: std::path::PathBuf::from(":memory:"),
             payload_limit: std::sync::atomic::AtomicU64::new(MAX_PAYLOAD_DEFAULT),
         };

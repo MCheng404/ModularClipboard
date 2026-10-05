@@ -50,15 +50,20 @@ fn print_help() {
         "ModularClipboard 剪贴板管理器 {version}
 
 用法:
-  tiez [选项]
+  modular-clipboard [选项]
 
 选项:
-      --data-dir <路径>   指定数据目录（默认 %APPDATA%/tiez）
+      --data-dir <路径>   指定数据目录（默认 {data_dir}）
       --no-capture         启动时不监听剪贴板（调试用）
   -V, --version           显示版本
   -h, --help              显示帮助
 ",
-        version = env!("CARGO_PKG_VERSION")
+        version = env!("CARGO_PKG_VERSION"),
+        // 从真实的目录常量派生，而不是硬编码字符串。
+        // 之前这里写的是「%APPDATA%/tiez」，而实现用的是
+        // 「modular-clipboard」——帮助文本与实际行为不符，
+        // 用户照着它找数据目录会找不到。
+        data_dir = modular_clipboard_ui::default_data_dir_display()
     );
 }
 
