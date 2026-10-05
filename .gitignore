@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.db
+*.db-wal
+*.db-shm
+/blobs
+
+# 本地 Agent 工作数据，不应进入仓库
+/.workbuddy/

@@ -1,0 +1,18 @@
+[package]
+name = "tiez-gfx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tiez-core = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+ash = { workspace = true }
+bytemuck = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }

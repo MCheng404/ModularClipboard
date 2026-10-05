@@ -1,0 +1,14 @@
+[package]
+name = "tiez-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tiez-core = { workspace = true }
+tiez-store = { workspace = true }
+tiez-app = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }

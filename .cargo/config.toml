@@ -1,0 +1,14 @@
+# 默认使用 MSVC 目标：Windows 原生 ABI，且 rusqlite 的 bundled SQLite
+# 需要一个真正的 C 编译器。本机Visual Studio 位于 D:\Program Files 下，
+# 因此具体环境变量注入见 scripts/build.sh。
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+# rusqlite bundled 会编译 sqlite3.c，交由 cc-rs 用 cl.exe 处理。
+# 链接器由 rustc 自带的 lld-link / link 处理，无需额外指定。
+
+[env]
+CC = { value = "cl.exe", force = false }
+CXX = { value = "cl.exe", force = false }
+AR = { value = "lib.exe", force = false }
