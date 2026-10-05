@@ -620,3 +620,32 @@ lib 单测 140 passed / 零警告；新增 3 个回归测试
 `draw_probe`（1 帧）根本触发不了。
 
 回归测试 `append_then_grow_must_use_a_different_chunk` 是精确复现。
+
+---
+
+##✅ 竞态已消除（04:10，主控独立复核）
+
+```
+1000 帧压力 × 5 次: 5 / 5 通过（18 秒）
+full_app     × 10:  10 / 10 通过（每次 600 帧）
+测试: 246 全通过，零警告
+```
+
+**per-image fence 决定：不做。**
+
+B 组用压力测试证明缺失无害，我独立复核确认。
+理由记录在案：
+
+1. `acquire_next_image` 在图像未被present 释放时返回
+   `VK_NOT_READY`，**驱动侧已负责这个同步**。
+2. 规范提供的显式机制只有两种（per-image fence、
+   `VK_KHR_present_wait` 扩展），**两种都有代价**：
+   - per-image fence：每张图像一次额外 `waitForFences`，
+     空闲时是纯开销
+   - present-wait 扩展：同步等待，**丢帧率换延迟**，
+     与本项目「常驻低功耗工具」的定位冲突
+3. 无证据表明不加就会出问题 ⇒ **不盲目加机制**。
+
+**这次的关键收获**：我两次凭记忆发明 API/状态结构，
+都被 B 组查源码拦下（`PresentInfoKHR::fence` 不存在、
+`FrameRenderer` 只有 1 个状态字段）。详见 MEMORY.md 第 8 批。
