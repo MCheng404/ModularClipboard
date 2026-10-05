@@ -440,18 +440,28 @@ panic 消息必须包含具体错误原因。
 
 ---
 
-## 🔒 当前文件独占权
+## 🔒 当前文件独占权（05:30，路径已按 crate 改名更新）
 
-| 文件 | Owner | 其他人 |
-|------|-------|--------|
-| `gfx/src/frame.rs` | **mcp-arch-frame** | 只读 |
-| `gfx/src/buffer.rs` `texture.rs` | mcp-arch-resource | 只读 |
-| `gfx/src/window.rs` `examples/window_probe.rs` | mcp-arch-window | 只读 |
-| `gfx/examples/upload_probe.rs` | mcp-probe-verify | 只读 |
-| `gfx/examples/full_app.rs` `tiez-ui/*` | mcp-arch-ui | 只读 |
-| `gfx/Cargo.toml` | mvp-probe-verify | 需先 grep |
+> 上一版还写着 `gfx/src/*` 旧路径，导致 mcp-rename 找不到 store 的 owner。
+> 全部改为 `crates/modular-clipboard-*` 全路径。
 
-`frame.rs` 今天被并发编辑破坏 4 次，故明确独占。
+| 文件（全路径） | Owner | 其他人 |
+|---|---|---|
+| `crates/modular-clipboard-gfx/src/frame.rs` | mcp-arch-frame | 只读 |
+| `crates/modular-clipboard-gfx/src/staging.rs` | mcp-split-arena | 只读 |
+| `crates/modular-clipboard-gfx/src/buffer.rs` | mcp-arch-resource | 只读 |
+| `crates/modular-clipboard-gfx/src/texture.rs` | mcp-arch-resource | 只读 |
+| `crates/modular-clipboard-gfx/src/window.rs` | mcp-arch-window | 只读 |
+| `crates/modular-clipboard-gfx/src/pipeline.rs` `shader.rs` `lib.rs` | **主控** | 只读 |
+| `crates/modular-clipboard-gfx/examples/upload_probe.rs` | mcp-fix-probe | 只读 |
+| `crates/modular-clipboard-gfx/examples/draw_probe.rs` `full_app.rs` | mcp-arch-ui | 只读 |
+| `crates/modular-clipboard-gfx/examples/window_probe.rs` | mcp-arch-window | 只读 |
+| `crates/modular-clipboard-gfx/Cargo.toml` | mcp-fix-probe | **改前须 grep** |
+| `crates/modular-clipboard-store/src/**` | **主控** | 只读 |
+| `crates/modular-clipboard-platform/src/tray.rs` `hotkey.rs` | mcp-tray | 只读 |
+| `crates/modular-clipboard-ui/src/**` | mcp-arch-ui | 只读 |
+| `crates/modular-clipboard-core/src/**` `app/src/**` | **主控** | 只读 |
+| `PROGRESS.md` `MEMORY.md` | **主控** | 只读 |
 
 ---
 
@@ -689,3 +699,34 @@ Vulkan 1.3 §3.5.3：present 提前退出（`OUT_OF_DATE` / `SUBOPTIMAL` /
 `bin` 原本直接依赖 `store` 只为拼一句帮助文本。
 现改为经 `ui` 层转发，依赖方向恢复为
 `bin → {core, app, ui}`，符合分层约定。
+
+---
+
+## 🔒 隔离构建目录纪律（06:10）
+
+多个 Agent 共用同一个 `target/` 会有两个问题，且**第二个是隐性的**：
+
+1. **文件锁冲突**：`LNK1104 无法打开 ... .exe`——
+   正在运行的探针 exe 被占用，别人无法重新链接。
+2. **测的不是最新构建** ⚠️ **更危险**。
+   改完源码后若未重新编译就跑探针，测的是**旧二进制**。
+   本夜已发生两次「假绿灯」：
+   - 主控采信了 F 组的「30/30 通过」，但那个二进制是 01:26 的旧构建
+   - F 组自己测「修前基线 0/50」，实际文件处于半编辑坏状态、
+     跑的是**根本没重新编译的旧二进制**（该二进制修前也是 30/30）
+
+**规则**：
+- 每个 Agent 用**独立的 `CARGO_TARGET_DIR`**：
+  ```bash
+  CARGO_TARGET_DIR="C:/Users/Cookies/WorkBuddy/Tiez/target-<你的名字>" \
+    MSYS_NO_PATHCONV=1 CC=cl.exe cargo build -p modular-clipboard-gfx \
+    --example upload_probe --target x86_64-pc-windows-msvc
+  ```
+- **报告任何测试结果前，必须先确认二进制时间戳晚于最后一次源码修改**：
+  ```bash
+  stat -c '%y' target-xxx/debug/examples/upload_probe.exe
+  ```
+- **红灯同样需要多次验证**。不是只有绿灯要重复确认——
+  「跑出来有问题」这个结论本身也可能是旧二进制的产物。
+
+（这条是 F 组在我误采信假绿灯后提出的，比我原先的规则更完整。）

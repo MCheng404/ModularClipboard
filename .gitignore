@@ -7,3 +7,7 @@
 
 # 本地 Agent 工作数据，不应进入仓库
 /.workbuddy/
+
+# 各 Agent 的隔离构建目录（避免文件锁冲突 +确保测的是当前源码）
+target-lead-verify/
+target-split-*/
