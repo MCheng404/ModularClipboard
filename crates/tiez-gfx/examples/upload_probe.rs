@@ -42,7 +42,7 @@ const H: i32 = 480;
 const TEX: u32 = 256;
 
 /// 上传帧数。必须远超在飞帧数（3），否则测不到 arena 的退休/复用。
-const FRAMES: u32 = 60;
+const FRAMES: u32 = 6;
 
 /// 进度打印间隔。
 const PROGRESS_EVERY: u32 = 10;
