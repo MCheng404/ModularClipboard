@@ -35,9 +35,17 @@ name = "pipeline_probe"
 [[example]]
 name = "upload_probe"
 
+# 首次真实绘制验证（1 帧，1 次 draw call）
+[[example]]
+name = "draw_probe"
+
 # 端到端：egui 界面真正显示出来
 [[example]]
 name = "full_app"
+
+# 窗口与事件循环实机验证（无渲染，退出码 0 = 正常）
+[[example]]
+name = "window_probe"
 
 # 着色器在编译期由 naga 编译为 SPIR-V，不进最终二进制。
 # 这样无需 glslc / glslang 等 C++ 工具链，保持纯 Rust 构建链。
