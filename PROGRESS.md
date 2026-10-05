@@ -649,3 +649,43 @@ B 组用压力测试证明缺失无害，我独立复核确认。
 **这次的关键收获**：我两次凭记忆发明 API/状态结构，
 都被 B 组查源码拦下（`PresentInfoKHR::fence` 不存在、
 `FrameRenderer` 只有 1 个状态字段）。详见 MEMORY.md 第 8 批。
+
+---
+
+## 📌 提交归属说明（04:50，补记）
+
+`7c7665f`「refactor(gfx): 把 StagingArena 拆成独立的 staging 模块」
+**除纯搬移外，还含 present 信号量修复**（`map_present_result` 重写
++ `present_failure_never_claims_semaphore_was_consumed` 测试）。
+
+原因是主控与拆分 Agent 几乎同时改 `frame.rs`，各自 `git add` 时
+把对方的改动一并带入了。
+
+**内容正确、已验证**（250 测试全过、`upload_probe` 30/30、
+`full_app` 10/10），且 `7c7665f` 的提交信息与内容一致，
+**历史不算说谎**——故不做 rebase 拆分，改为在此说明。
+
+## present 信号量修复（D 组发现，主控实施）
+
+Vulkan 1.3 §3.5.3：present 提前退出（`OUT_OF_DATE` / `SUBOPTIMAL` /
+`SURFACE_LOST_KHR`）时，`wait_semaphores` **可能不被 signal**。
+原实现把这些都当作「已消费」，槽位复用时会再次 signal
+同一 semaphore = **未定义行为**。
+
+现行为：除「彻底成功」外一律返回 `Outdated`，
+强制上层重建、绝不复用槽位。
+
+**这不是「加机制」，是修正错误的成功判定**——
+压力测试跑得过（1000 帧 × 5、55 次 full_app）只说明
+本机时序恰好对，不构成正确性证明。
+
+## 清理
+
+- `stash@{0}` / `stash@{1}`：拆分过程的中间态，内容已入账 `7c7665f`，已删
+- `target/.../tiez.exe`：改名前的旧产物，已删
+
+## 死依赖清理（`7626b80`）
+
+`bin` 原本直接依赖 `store` 只为拼一句帮助文本。
+现改为经 `ui` 层转发，依赖方向恢复为
+`bin → {core, app, ui}`，符合分层约定。
