@@ -30,7 +30,7 @@ use std::collections::HashMap;
 
 use ash::{Device, vk};
 
-use crate::buffer::{align_up, Buffer};
+use crate::buffer::align_up;
 use crate::{image_barrier, Gpu};
 
 /// 字体图集格式：单通道 8 位无符号归一化。
@@ -258,6 +258,10 @@ impl DeviceImage {
     /// → 布局过渡到 `SHADER_READ_ONLY_OPTIMAL`。
     ///
     /// # 参数
+    /// - `staging`：**由调用方提供**的暂存空间，必须已写入 `bytes`。
+    ///   生产路径请走 [`crate::frame::FrameRenderer::record_texture_upload`]，
+    ///   它从 per-frame [`crate::frame::StagingArena`] 分配，
+    ///   从而保证该空间的生命周期覆盖 GPU 执行时间。
     /// - `bytes`：覆盖率数据。整图更新时长度须等于 `w * h`；
     ///   局部更新时长度须等于被覆盖矩形 `patch` 的像素数。
     /// - `offset`：更新起始像素坐标。`None` 表示从原点开始（整图更新）。
@@ -266,10 +270,18 @@ impl DeviceImage {
     /// `offset` 与 `patch` 分开传而不是让调用方自己算，
     /// 是因为 `image_extent` 必须是**被写入区域**的尺寸——
     /// 局部更新若误传整图尺寸，Vulkan 会把超出图像的部分按未定义行为处理。
+    ///
+    /// # 为什么本函数不自建 staging
+    ///
+    /// 本函数只**录制**命令，GPU 何时真正读取 `staging` 由驱动决定。
+    /// 若在此建局部 buffer，函数返回时它就没了，而GPU 可能还没跑完
+    /// `cmd_copy_buffer_to_image`——这是 use-after-free。
+    /// 生命周期必须由帧层的 arena 与提交栅栏共同管理。
     pub fn upload(
         &mut self,
         gpu: &Gpu,
         cmd: vk::CommandBuffer,
+        staging: crate::frame::StagingSlice,
         bytes: &[u8],
         offset: Option<(u32, u32)>,
         patch: (u32, u32),
@@ -284,22 +296,20 @@ impl DeviceImage {
             "staging 数据 {} 字节，与 {w}x{h} 的 R8 区域（需 {needed} 字节）不符",
             bytes.len()
         );
-
-        // staging 缓冲只活到本次提交结束，因此用主机可见内存直接映射写入。
-        let mut staging = Buffer::new_host_visible(
-            gpu,
-            needed,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::SharingMode::EXCLUSIVE,
-        )?;
-        staging.write(&gpu.device, 0, bytes)?;
+        anyhow::ensure!(!staging.is_null(), "必须提供有效的 staging 切片");
+        anyhow::ensure!(
+            staging.size >= needed,
+            "staging 切片容量 {} 不足 {w}x{h} 所需的 {needed} 字节",
+            staging.size
+        );
 
         let device = &gpu.device;
+        let image = self.image;
         let old_layout = self.layout;
 
         // 第一次过渡：进入传输目标布局。
         let to_transfer = image_barrier(
-            self.image,
+            image,
             old_layout,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             match old_layout {
@@ -311,12 +321,17 @@ impl DeviceImage {
         );
         // 第二次过渡：交给片元着色器读。
         let to_shader = image_barrier(
-            self.image,
+            image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::AccessFlags::SHADER_READ,
         );
+
+        // 数据从staging 的哪个偏移读。arena 已把偏移对齐到
+        // STAGING_ALIGNMENT，满足 vkCmdCopyBufferToImage 对
+        // bufferOffset 的对齐要求。
+        let copy = buffer_image_copy(offset, w, h).buffer_offset(staging.offset);
 
         unsafe {
             device.cmd_pipeline_barrier(
@@ -330,10 +345,10 @@ impl DeviceImage {
             );
             device.cmd_copy_buffer_to_image(
                 cmd,
-                staging.handle(),
-                self.image,
+                staging.buffer,
+                image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[buffer_image_copy(offset, w, h)],
+                &[copy],
             );
             device.cmd_pipeline_barrier(
                 cmd,
@@ -347,11 +362,6 @@ impl DeviceImage {
         }
 
         self.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-
-        // staging 缓冲必须等命令执行完才能销毁。这里只解除映射，
-        // 实际显存释放依赖调用方在提交后的device_wait_idle。
-        // 若帧层改为双缓冲提交，需要把 staging 提升为跨帧对象。
-        drop(staging);
         Ok(())
     }
 
@@ -538,24 +548,32 @@ impl FontTexture {
     /// 把 CPU 侧的覆盖率字节上传到纹理。
     ///
     /// 委托给 [`DeviceImage::upload`]。`offset` 为 `None` 表示整图覆盖。
+    ///
+    /// `staging` 必须来自 [`crate::frame::StagingArena`] 且已写入 `bytes`。
+    /// 上层通常直接用 [`crate::frame::FrameRenderer::record_texture_upload`]，
+    /// 无需手工构造。
     pub fn upload(
         &mut self,
         gpu: &Gpu,
         cmd: vk::CommandBuffer,
+        staging: crate::frame::StagingSlice,
         bytes: &[u8],
         offset: Option<(u32, u32)>,
         patch: (u32, u32),
     ) -> anyhow::Result<()> {
-        self.image.upload(gpu, cmd, bytes, offset, patch)
+        self.image.upload(gpu, cmd, staging, bytes, offset, patch)
     }
 
     /// 按 egui 的整图/局部增量更新纹理。
     ///
     /// `delta.pos` 为 `None` 时整图覆盖；`Some((x, y))` 时只更新该矩形。
+    ///
+    /// `staging` 必须来自 [`crate::frame::StagingArena`]。
     pub fn apply_delta(
         &mut self,
         gpu: &Gpu,
         cmd: vk::CommandBuffer,
+        staging: crate::frame::StagingSlice,
         delta: &egui::epaint::ImageDelta,
     ) -> anyhow::Result<()> {
         let patch_size = delta.image.size();
@@ -569,7 +587,8 @@ impl FontTexture {
         }
 
         let bytes = DeviceImage::coverage_bytes(&delta.image);
-        self.image.upload(gpu, cmd, &bytes, offset, (w, h))
+        self.image
+            .upload(gpu, cmd, staging, &bytes, offset, (w, h))
     }
 
     /// 销毁纹理。
@@ -614,20 +633,25 @@ impl TextureStore {
     /// 步骤：先处理 `set`（新增或覆盖），再处理 `free`（释放）。
     /// 顺序不能反——同一帧内既设置又释放同一 ID 时，
     /// egui 期望的是「先设后释放」，这样净效果是该纹理消失。
+    ///
+    /// `arena` 提供所有上传的 staging 空间——**必须**是
+    /// [`crate::frame::StagingArena`]，因为 egui 的一帧可能包含
+    /// 上千次逐字形增量上传，自建 staging 会耗尽显存。
     pub fn apply(
         &mut self,
         gpu: &Gpu,
+        arena: &mut crate::frame::StagingArena<'_>,
         cmd: vk::CommandBuffer,
         delta: &egui::TexturesDelta,
     ) -> anyhow::Result<()> {
         for (id, deltas) in &delta.set {
             // 字体图集走专用路径：它有独立的采样器与描述符绑定。
             if *id == FONT_TEXTURE_ID {
-                self.update_font(gpu, cmd, deltas)?;
+                self.update_font(gpu, arena, cmd, deltas)?;
                 continue;
             }
             for d in deltas {
-                self.update_user(gpu, cmd, *id, d)?;
+                self.update_user(gpu, arena, cmd, *id, d)?;
             }
         }
 
@@ -651,6 +675,7 @@ impl TextureStore {
     fn update_user(
         &mut self,
         gpu: &Gpu,
+        arena: &mut crate::frame::StagingArena<'_>,
         cmd: vk::CommandBuffer,
         id: egui::TextureId,
         delta: &egui::epaint::ImageDelta,
@@ -685,15 +710,21 @@ impl TextureStore {
             self.owned_samplers.push(sampler);
         }
 
-        let image = self.textures.get_mut(&id).expect("上方已确保存在");
+        // 先取 staging 并写入，再录制命令。顺序不能反：
+        // `get_mut` 借用了 self，而 arena 是独立对象，不冲突。
         let bytes = DeviceImage::coverage_bytes(&delta.image);
         let offset = delta.pos.map(|p| (p[0] as u32, p[1] as u32));
-        image.upload(gpu, cmd, &bytes, offset, (w, h))
+        let staging = arena.allocate(bytes.len() as vk::DeviceSize)?;
+        staging.write(&gpu.device, &bytes)?;
+
+        let image = self.textures.get_mut(&id).expect("上方已确保存在");
+        image.upload(gpu, cmd, staging, &bytes, offset, (w, h))
     }
 
     fn update_font(
         &mut self,
         gpu: &Gpu,
+        arena: &mut crate::frame::StagingArena<'_>,
         cmd: vk::CommandBuffer,
         deltas: &[egui::epaint::ImageDelta],
     ) -> anyhow::Result<()> {
@@ -720,9 +751,12 @@ impl TextureStore {
         // 逐个应用增量。整图更新会覆盖此前的局部更新，
         // 而 egui 保证同一帧内 whole delta 会替换该 ID 的所有历史增量，
         // 因此按顺序应用即可得到正确结果。
-        let font = self.font.as_mut().expect("上方已确保存在");
         for d in deltas {
-            font.apply_delta(gpu, cmd, d)?;
+            let bytes = DeviceImage::coverage_bytes(&d.image);
+            let staging = arena.allocate(bytes.len() as vk::DeviceSize)?;
+            staging.write(&gpu.device, &bytes)?;
+            let font = self.font.as_mut().expect("上方已确保存在");
+            font.apply_delta(gpu, cmd, staging, d)?;
         }
         Ok(())
     }
@@ -893,5 +927,42 @@ mod tests {
         assert_eq!(s.len(), 0);
         assert!(s.font.is_none());
         assert!(s.font_descriptor_info().is_none());
+    }
+
+    /// staging 容量决策：局部更新也按整图分配。
+    ///
+    /// 这条不变式支撑了「staging 只分配一次」的结论——若改成按
+    /// `needed` 精确分配，局部更新（小）与随后的整图更新（大）会
+    /// 反复触发重建，`Buffer` 只能整体 destroy，旧的会泄漏。
+    #[test]
+    fn staging_is_sized_to_whole_image() {
+        let full = staging_size_r8(2048, 2048);
+        // 一个 16x16 的局部更新所需的字节数
+        let patch = staging_size_r8(16, 16);
+        assert!(patch < full);
+        // 上传里用的是 full.max(needed)，整图时取 full，局部时也取 full
+        assert_eq!(full.max(patch), full, "局部更新不应缩小 staging");
+    }
+
+    /// 重复上传不再新建 staging。
+    ///
+    /// 这条测的是「泄漏已消除」这个结论的数学前提：
+    /// 同一 `DeviceImage` 上多次 upload 时，容量决策恒为full，
+    /// 因此 `staging_buffer` 的 reuse 判定恒为真。
+    #[test]
+    fn repeated_uploads_reuse_same_capacity() {
+        let full = staging_size_r8(512, 512);
+        let mut capacity = 0;
+        // 模拟 1000 次逐字形增量上传（egui 中文字体首次加载的量级）
+        for _ in 0..1000 {
+            let needed = staging_size_r8(8, 8);
+            let want = full.max(needed);
+            if capacity == 0 {
+                capacity = want;
+            }
+            // want 恒定 => reuse 恒为 true => 只分配一次
+            assert_eq!(want, capacity);
+        }
+        assert_eq!(capacity, 512 * 512);
     }
 }

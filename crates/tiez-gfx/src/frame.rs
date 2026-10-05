@@ -36,11 +36,25 @@
 //! 上一帧结束时它们停在 `PRESENT_SRC_KHR`，下次 acquire 拿到的可能还是
 //! 同一张。因此不能用 `UNDEFINED` 一刀切，必须为每张图像单独记当前布局。
 //! 见 [`LayoutTracker`]。
+//!
+//! # staging 内存为什么必须跨帧持有
+//!
+//! `cmd_copy_buffer_to_image` 只是把命令**写进命令缓冲**，GPU 何时真正
+//! 读staging 内存由驱动决定。若在上传函数里`let staging = Buffer::new(..)`
+//! 然后函数返回，staging 的生命周期就只覆盖「录制」而不覆盖「执行」——
+//! 这是 use-after-free。
+//!
+//! 注意本项目的 `Buffer` **不实现 `Drop`**（销毁需要 `&Device`），
+//! 因此那个版本的实际症状是**显存泄漏**而非立即崩溃：泄漏同样不可接受，
+//! 且修法一致——把 staging 提升为帧层持有的 [`StagingArena`]，
+//! 由提交时的栅栏来保证「GPU 读完之后才允许复用」。
+//! 见 [`StagingArena`] 与 [`FrameRenderer::record_texture_upload`]。
 
 use ash::vk::Handle;
 use ash::{Device, khr, vk};
 use std::time::Instant;
 
+use crate::buffer::align_up;
 use crate::pipeline::{BINDING_SAMPLER, BINDING_TEXTURE, BINDING_UNIFORM};
 use crate::{Gpu, Swapchain, image_barrier};
 
@@ -236,8 +250,33 @@ pub fn resolve_extent(
     }
 }
 
-/// 把 `queue_present` 的双重返回（整体码 + 每交换链码）归一化。
+/// 上传录制的前置条件判定。
 ///
+/// # 为什么需要它
+///
+/// `record_texture_upload` 会往**帧槽位的命令缓冲**追加命令。若该槽位
+/// 上一轮提交后GPU 仍在执行，追加命令会破坏在途录制——Vulkan 明确
+/// 禁止修改处于可执行状态的命令缓冲。这类错误不会立刻崩，而是表现为
+/// 「画面偶尔花一帧」，极难定位，因此必须在 API 边界挡掉。
+///
+/// # 纯逻辑
+///
+/// 只依赖两个布尔量，因此可脱离 GPU 单测——真实路径上GPU 是否执行完
+/// 由栅栏保证，本函数只负责把「状态 → 允许/拒绝」这条规则固定下来。
+pub fn can_record_upload(pending: bool, in_flight: bool) -> anyhow::Result<()> {
+    if !pending {
+        anyhow::bail!("record_texture_upload 必须在 acquire 之后调用");
+    }
+    if in_flight {
+        anyhow::bail!(
+            "帧槽位的命令缓冲已提交、GPU 仍在执行，不能重复录制。\
+             请先present/acquire 推进到下一帧（每帧每个槽位只录一次）"
+        );
+    }
+    Ok(())
+}
+
+/// 把 `queue_present` 的双重返回（整体码 + 每交换链码）归一化。///
 /// 整体码与 `pResults` 可能给出不同结论：整体 `SUCCESS` 但某个交换链
 /// 单独 `OUT_OF_DATE` 的情况真实存在（多交换链时），只看整体码会漏掉重建信号。
 pub fn map_present_result(
@@ -340,6 +379,574 @@ impl LayoutTracker {
 }
 
 // ---------------------------------------------------------------------------
+// StagingArena
+// ---------------------------------------------------------------------------
+
+/// staging 缓冲的默认字节容量。
+///
+/// 取 4 MiB 是因为最坏情况是整张字体图集：`2048 x 2048` 的 `R8_UNORM`
+/// 恰好 4 MiB。egui 图集涨到 4096x4096（16 MiB）时
+/// [`StagingArena::allocate`] 会惰性扩容，调用方无需预判。
+pub const DEFAULT_STAGING_CAPACITY: vk::DeviceSize = 4 * 1024 * 1024;
+
+/// arena 内每块 staging 的**最小**字节数。
+///
+/// 下限的意义是「小图集不该一上来就占4 MiB」。首次上传小纹理时
+/// 按需给小缓冲，遇到大上传再涨。
+pub const MIN_STAGING_CAPACITY: vk::DeviceSize = 64 * 1024;
+
+/// arena 里 staging 块的数量。
+///
+/// **必须 ≥ 在飞帧数**。每个在飞帧各自独占一块：本帧写入的字节在
+/// GPU 读完之前不能被下一帧覆写。
+pub const UPLOAD_POOL_CAPACITY: usize = 3;
+
+/// staging 内部分配的字节对齐。
+///
+/// Vulkan 要求 `vkCmdCopyBufferToImage` 的 `bufferOffset` 是
+/// `optimalBufferCopyOffsetAlignment` 的倍数；该值在多数桌面驱动上是 4，
+/// 但规范允许到 256。取 256 一次覆盖所有驱动，省得为兼容性去查
+/// `maintenance3`（那要求 1.1 之外的特性）。
+pub const STAGING_ALIGNMENT: vk::DeviceSize = 256;
+
+/// arena 里的一块 staging 空间。
+///
+/// 由 [`StagingArena::allocate`] 产出。它只是**对 arena 内部缓冲的视图**
+/// —— 所有权在 arena 上，因此本类型不实现 `Drop`，离开作用域不释放
+/// 任何东西（与 [`crate::buffer::Buffer`] 一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingSlice {
+    /// 可作为 `TRANSFER_SRC` 绑定的缓冲句柄。
+    pub buffer: vk::Buffer,
+    /// 绑定的显存。`cmd_copy_*` 本身不需要它，但 [`StagingSlice::write`]
+    /// 要靠它映射。
+    pub memory: vk::DeviceMemory,
+    /// 在该缓冲内的字节偏移。**必然是 [`STAGING_ALIGNMENT`] 的倍数。**
+    pub offset: vk::DeviceSize,
+    /// 从 `offset` 起可用的字节数。
+    pub size: vk::DeviceSize,
+}
+
+/// 校验一次 staging 写入是否合法。
+///
+/// 抽成纯函数是为了能脱离 GPU 单测「非法写入会被拒绝」——
+/// 这两条校验挡在 `map_memory` 之前，漏掉任何一条都会让驱动去解引用
+/// 无效句柄。
+pub fn validate_staging_write(
+    slice: &StagingSlice,
+    bytes_len: usize,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!slice.is_null(), "不能向空 staging 切片写入");
+    anyhow::ensure!(
+        bytes_len as vk::DeviceSize <= slice.size,
+        "写入 {bytes_len} 字节超出 staging 切片容量 {}",
+        slice.size
+    );
+    Ok(())
+}
+
+impl StagingSlice {
+    /// 空切片。作为「无 staging」的哨兵值。
+    pub const NULL: Self = Self {
+        buffer: vk::Buffer::null(),
+        memory: vk::DeviceMemory::null(),
+        offset: 0,
+        size: 0,
+    };
+
+    /// 是否是空切片。
+    pub fn is_null(&self) -> bool {
+        self.buffer.is_null()
+    }
+
+    /// 把 `bytes` 写入本切片起始处。
+    ///
+    /// 内部完成 map → 拷贝 → flush → unmap，调用方无需关心映射生命周期。
+    ///
+    /// # 前置条件
+    /// 本切片尚未被 GPU 读取 —— 由 arena 的退休机制保证
+    /// （见 [`StagingArena::allocate`]）。
+    pub fn write(&self, device: &Device, bytes: &[u8]) -> anyhow::Result<()> {
+        // 校验必须在触碰设备之前完成（规则见 validate_staging_write）。
+        validate_staging_write(self, bytes.len())?;
+        let ptr = unsafe {
+            device.map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|e| anyhow::anyhow!("映射 staging 显存失败: {e:?}"))?
+        .cast::<u8>();
+        // SAFETY:
+        // - 指针来自 map_memory(本切片所属 memory, 0, WHOLE_SIZE)，覆盖整块
+        //   分配，故 [ptr+offset, ptr+offset+len) 落在映射区间内
+        //   （上面已校验 len <= size，而 slice 是 arena 按容量切出来的）。
+        // - bytes 是调用方的不可变借用，存活到本函数结束，拷贝是同步的。
+        // - 同一块 staging 不会既被 CPU 写又被 GPU 读：arena 的 owner_frame
+        //   记账保证只有「本帧拥有者」才能拿到可写切片。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                ptr.add(self.offset as usize),
+                bytes.len(),
+            );
+            // 相干内存上 flush 是空操作；非相干内存必须刷。
+            // 无条件调用以免调用方需要区分内存类型。
+            let range = vk::MappedMemoryRange::default()
+                .memory(self.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            device.flush_mapped_memory_ranges(&[range])?;
+        }
+        unsafe { device.unmap_memory(self.memory) };
+        Ok(())
+    }
+}
+
+/// arena 内部的一块 staging，由帧层持有。
+struct ArenaChunk {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    capacity: vk::DeviceSize,
+    /// 已用字节数。归零的前提是该块已退休。
+    cursor: vk::DeviceSize,
+    /// 当前占用这块的帧号；`FREE` 表示空闲。
+    owner_frame: u64,
+    /// 本帧提交时关联的栅栏。GPU signal 后才允许退休。
+    fence: vk::Fence,
+    /// 是否已创建 Vulkan 资源。纯逻辑单测里恒为 false。
+    materialized: bool,
+}
+
+/// 表示「空闲」的 `owner_frame` 哨兵。
+///
+/// 用帧号 0 做合法值，因此不能用 0；`u64::MAX` 与帧号 practically
+/// 不会相撞（跑到 2^64 帧需要约 5 万亿年）。
+const FREE: u64 = u64::MAX;
+
+/// 每帧专用的 staging 环形缓冲。
+///
+/// # 存在的唯一理由
+///
+/// staging 缓冲的生命周期必须**覆盖 GPU 执行时间**，而不只是「录制时间」。
+/// 在上传函数里 `let staging = Buffer::new(..)` 是经典错误：命令刚录完，
+/// GPU 可能还没跑，buffer 已经没了。本类型把 staging 所有权提升到帧层，
+/// 用「帧号 + 栅栏」判定一块空间何时可以安全复用。
+///
+/// # 不变式
+///
+/// 1. 任一时刻每块 chunk 至多被一个帧号占用（`owner_frame`）。
+/// 2. 复用一块 chunk 前，必须确认它上一任主人已退休 —— 由
+///    [`StagingArena::retire`] 查询栅栏确认，**不靠帧号差值猜测**。
+///    猜测会在某帧栅栏没等到时静默覆写GPU 正在读的数据。
+/// 3. 块数 ≥ 在飞帧数。
+///
+/// # 逻辑与资源分离
+///
+/// 「该复用哪一块/ 该扩容哪一块」这层**决策**是纯逻辑，不碰 Vulkan 对象，
+/// 因此可在单测里由 [`ArenaDecider`] 直接驱动，无需真实 GPU。
+/// 真正建缓冲的动作只发生在 [`StagingArena::allocate`] 里。
+pub struct StagingArena<'a> {
+    gpu: &'a Gpu,
+    chunks: Vec<ArenaChunk>,
+    current_frame: u64,
+}
+
+impl<'a> StagingArena<'a> {
+    /// 绑定设备，登记 `frame_count` 块 staging。
+    ///
+    /// `frame_count` 应传在飞帧数（交换链图像数）。此时**不创建任何
+    /// Vulkan 资源** —— 每块在首次 [`StagingArena::allocate`] 时才按需
+    /// 建成，避免小图集场景白占 12 MiB 主机可见内存。
+    pub fn new(gpu: &'a Gpu, frame_count: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(frame_count > 0, "staging 块数必须大于 0");
+        let chunks = (0..frame_count)
+            .map(|_| ArenaChunk {
+                buffer: vk::Buffer::null(),
+                memory: vk::DeviceMemory::null(),
+                capacity: 0,
+                cursor: 0,
+                owner_frame: FREE,
+                fence: vk::Fence::null(),
+                materialized: false,
+            })
+            .collect();
+        Ok(Self {
+            gpu,
+            chunks,
+            current_frame: 0,
+        })
+    }
+
+    /// 块数。
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// 当前帧号。
+    pub fn current_frame(&self) -> u64 {
+        self.current_frame
+    }
+
+    /// 推进到下一帧。
+    ///
+    /// 应在 [`FrameRenderer::acquire`] 等完该槽位栅栏**之后**调用——
+    /// 那次等待正是「上一轮 GPU 已读完」的证据。
+    pub fn begin_frame(&mut self) {
+        self.current_frame += 1;
+    }
+
+    /// 标记本帧结束（提交之后调用）。
+    ///
+    /// 本帧占用的块已在 [`StagingArena::note_submitted`] 记上栅栏，
+    /// 此处无额外记账需要——真正决定何时能复用的是栅栏，不是帧边界。
+    pub fn end_frame(&mut self) {
+        // 刻意为空：见上方文档。保留此方法是为了让调用方的帧结构
+        // 与「begin / 提交 / note / retire」四步显式对应，
+        // 将来若需要按帧批量回收（例如显存吃紧时主动降容量），
+        // 落点就在这里，而不必改动所有调用点。
+    }
+
+    /// 分配一块 staging 空间。
+    ///
+    /// 返回切片的偏移必然是 [`STAGING_ALIGNMENT`] 的倍数，
+    /// 且生命周期由 arena 保证覆盖 GPU 执行时间。
+    ///
+    /// # 复用规则
+    ///
+    /// - **本帧已占用**的块可以继续往后追加：同一帧内多次上传很常见
+    ///   （egui 一帧可能有十几次纹理增量）。
+    /// - **空闲**的块（`owner_frame == FREE`，即已被 [`StagingArena::retire`]
+    ///   确认 GPU 读完）才会被本帧接管。
+    /// - **在途**的块（属于别的帧）既不复用也不扩容——否则 GPU 正在读的
+    ///   内容会被 `destroy_buffer` 掉。
+    ///
+    /// 容量不足时在**本帧可写**的那块上原地扩容，必要时惰性新建。
+    pub fn allocate(&mut self, size: vk::DeviceSize) -> anyhow::Result<StagingSlice> {
+        anyhow::ensure!(size > 0, "staging 分配大小必须大于 0");
+        let aligned = align_up(size, STAGING_ALIGNMENT);
+        let frame = self.current_frame;
+
+        // 优先本帧已占用的块（追加），其次空闲块（接管）。
+        let pick = self
+            .chunks
+            .iter()
+            .position(|c| c.owner_frame == frame)
+            .or_else(|| self.chunks.iter().position(|c| c.owner_frame == FREE));
+
+        let i = match pick {
+            Some(i) => i,
+            None => {
+                // 所有块都在途。这不该发生：块数 ≥ 在飞帧数，
+                // 且 acquire 会等栅栏。仍需给出明确错误而不是静默复用。
+                anyhow::bail!(
+                    "staging arena 的 {} 块全部在途，无可分配空间；\
+                     请确认块数 ≥ 在飞帧数且每帧都等过了栅栏",
+                    self.chunks.len()
+                );
+            }
+        };
+
+        let need_new = self.chunks[i].capacity < aligned;
+        if need_new {
+            // 目标容量：至少装下本次请求，且不低于下限。
+            let want = aligned.max(MIN_STAGING_CAPACITY);
+            self.rebuild_chunk(i, want, frame)?;
+        }
+
+        let c = &mut self.chunks[i];
+        let slice = StagingSlice {
+            buffer: c.buffer,
+            memory: c.memory,
+            offset: c.cursor,
+            size: c.capacity - c.cursor,
+        };
+        c.cursor += aligned;
+        c.owner_frame = frame;
+        Ok(slice)
+    }
+
+    /// 记账：把本帧占用的块与该帧的栅栏关联。
+    ///
+    /// `fence` signal 即代表 GPU 读完了这些块里的数据，之后
+    /// [`StagingArena::retire`] 才可以把它们判为空闲。
+    /// [`FrameRenderer`] 传本帧槽位的栅栏。
+    pub fn note_submitted(&mut self, fence: vk::Fence) {
+        for c in &mut self.chunks {
+            if c.owner_frame == self.current_frame {
+                c.fence = fence;
+            }
+        }
+    }
+
+    /// 回收已退休（栅栏已 signal）的块。
+    ///
+    /// **幂等**：判定条件是「持有栅栏且栅栏已 signal」，而空闲块不持有
+    /// 任何栅栏，因此重复调用不会二次释放，也不会把已判空闲的块
+    /// 重新拉回在用状态。
+    pub fn retire(&mut self) {
+        let gpu = self.gpu;
+        for c in &mut self.chunks {
+            if c.owner_frame == FREE {
+                continue; // 已空闲
+            }
+            if c.fence.is_null() {
+                continue; // 本帧尚未提交/记账
+            }
+            // 非阻塞查询：只有真正 signal 了才敢复用。
+            let signaled = unsafe { gpu.device.get_fence_status(c.fence) }.unwrap_or(false);
+            if signaled {
+                c.owner_frame = FREE;
+                c.fence = vk::Fence::null();
+                c.cursor = 0;
+            }
+        }
+    }
+
+    /// 销毁所有 staging 块。
+    ///
+    /// # 前置条件
+    /// 调用方**必须**已 `device_wait_idle` —— 否则 GPU 可能还在读，
+    /// 销毁其数据源是未定义行为。`FrameRenderer::drop` 会先 `wait_idle`
+    /// 再调用本函数。
+    pub fn destroy(&mut self) {
+        let gpu = self.gpu;
+        for c in &mut self.chunks {
+            if c.materialized {
+                unsafe {
+                    gpu.device.destroy_buffer(c.buffer, None);
+                    gpu.device.free_memory(c.memory, None);
+                }
+            }
+            *c = ArenaChunk {
+                buffer: vk::Buffer::null(),
+                memory: vk::DeviceMemory::null(),
+                capacity: 0,
+                cursor: 0,
+                owner_frame: FREE,
+                fence: vk::Fence::null(),
+                materialized: false,
+            };
+        }
+    }
+
+    /// 把第 `i` 块重建为 `capacity` 字节的staging 缓冲。
+    ///
+    /// # 前置条件
+    /// 该块必须是「本帧可写」的（本帧占用或完全空闲）——
+    /// 调用方 [`StagingArena::allocate`] 已保证。在途块绝不能走到这里。
+    fn rebuild_chunk(
+        &mut self,
+        i: usize,
+        capacity: vk::DeviceSize,
+        frame: u64,
+    ) -> anyhow::Result<()> {
+        let gpu = self.gpu;
+        let device = &gpu.device;
+        let info = vk::BufferCreateInfo::default()
+            .size(capacity)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .queue_family_indices(&[]);
+        let buffer = unsafe { device.create_buffer(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建 {capacity} 字节 staging 缓冲失败: {e:?}"))?;
+
+        // 从这里起任何一步失败都必须销毁已创建的 buffer（坑 30）。
+        let mut guard = ArenaChunkGuard {
+            device,
+            buffer: Some(buffer),
+            memory: None,
+        };
+
+        let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let alloc_size = align_up(req.size, req.alignment);
+        let props =
+            unsafe { gpu.instance.get_physical_device_memory_properties(gpu.physical_device) };
+        let type_index = crate::buffer::find_memory_type(
+            &props,
+            req.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            vk::MemoryPropertyFlags::HOST_CACHED,
+        )
+        .ok_or_else(|| anyhow::anyhow!("找不到 staging 可用的主机可见内存类型"))?;
+
+        let alloc = vk::MemoryAllocateInfo::default()
+            .allocation_size(alloc_size)
+            .memory_type_index(type_index);
+        let memory = unsafe { device.allocate_memory(&alloc, None) }
+            .map_err(|e| anyhow::anyhow!("为 staging 分配 {alloc_size} 字节失败: {e:?}"))?;
+        guard.memory = Some(memory);
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .map_err(|e| anyhow::anyhow!("绑定 staging 显存失败: {e:?}"))?;
+
+        // 旧资源此刻可安全销毁：调用方已确认该块「本帧占用」或
+        // 「完全空闲」，不存在在途读取。
+        let old = &mut self.chunks[i];
+        if old.materialized {
+            unsafe {
+                device.destroy_buffer(old.buffer, None);
+                device.free_memory(old.memory, None);
+            }
+        }
+        old.buffer = buffer;
+        old.memory = memory;
+        old.capacity = capacity;
+        old.cursor = 0;
+        old.owner_frame = frame;
+        old.materialized = true;
+        Ok(())
+    }
+}
+
+/// staging 建缓冲失败时的清理守卫。
+struct ArenaChunkGuard<'a> {
+    device: &'a Device,
+    buffer: Option<vk::Buffer>,
+    memory: Option<vk::DeviceMemory>,
+}
+
+impl Drop for ArenaChunkGuard<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(m) = self.memory.take() {
+                self.device.free_memory(m, None);
+            }
+            if let Some(b) = self.buffer.take() {
+                self.device.destroy_buffer(b, None);
+            }
+        }
+    }
+}
+
+/// arena 分配决策的**纯逻辑**描述。
+///
+/// 真实实现见 [`StagingArena::allocate`]。抽出这个枚举是为了让单测
+/// 能在**不创建任何 Vulkan 对象**的前提下断言复用/ 扩容 / 被阻止
+/// 三条路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArenaPlan {
+    /// 复用第 `chunk` 块的 `[offset, offset+len)`；容量不足则原地扩容到
+    /// `capacity`。
+    Reuse {
+        chunk: usize,
+        offset: vk::DeviceSize,
+        capacity: vk::DeviceSize,
+    },
+    /// 该块仍被在途命令引用，既不能复用也不能扩容。
+    ///
+    /// 出现这个结果说明**调用顺序有问题**（同帧重复录制，或未等栅栏
+    /// 就复用 staging）。必须让调用方看见，绝不能降级为「另开一块」——
+    /// 那会把顺序错误掩盖成不断增长的显存占用。
+    Blocked { chunk: usize, owner_frame: u64 },
+}
+
+/// 纯逻辑的 arena 决策器。**仅供单测使用。**
+///
+/// 它复刻 [`StagingArena`] 的选择规则，但完全不碰 Vulkan，因此可以在
+/// 单测里构造「块数不足」「同帧多次上传」「延迟退休」等真实 GPU 下难以
+/// 复现的场景。
+#[cfg(test)]
+pub(crate) struct ArenaDecider {
+    capacities: Vec<vk::DeviceSize>,
+    owners: Vec<u64>,
+    cursors: Vec<vk::DeviceSize>,
+    frame: u64,
+}
+
+#[cfg(test)]
+impl ArenaDecider {
+    pub(crate) fn new(frame_count: usize) -> Self {
+        Self {
+            capacities: vec![0; frame_count],
+            owners: vec![FREE; frame_count],
+            cursors: vec![0; frame_count],
+            frame: 0,
+        }
+    }
+
+    pub(crate) fn frame(&self) -> u64 {
+        self.frame
+    }
+
+    pub(crate) fn owner(&self, chunk: usize) -> u64 {
+        self.owners[chunk]
+    }
+
+    pub(crate) fn capacity(&self, chunk: usize) -> vk::DeviceSize {
+        self.capacities[chunk]
+    }
+
+    pub(crate) fn cursor(&self, chunk: usize) -> vk::DeviceSize {
+        self.cursors[chunk]
+    }
+
+    /// 推进一帧。
+    ///
+    /// 返回 `Err(chunk)` 表示所有块都在途、本帧拿不到空间。
+    pub(crate) fn begin_frame(&mut self) -> Result<(), usize> {
+        if self.owners.iter().all(|&o| o != FREE) {
+            let blocked = self
+                .owners
+                .iter()
+                .position(|&o| o == self.frame)
+                .unwrap_or(0);
+            return Err(blocked);
+        }
+        self.frame += 1;
+        Ok(())
+    }
+
+    /// 模拟一次分配。
+    pub(crate) fn allocate(&mut self, size: vk::DeviceSize) -> ArenaPlan {
+        let aligned = align_up(size, STAGING_ALIGNMENT);
+        let pick = self
+            .owners
+            .iter()
+            .position(|&o| o == self.frame)
+            .or_else(|| self.owners.iter().position(|&o| o == FREE));
+
+        let i = match pick {
+            Some(i) => i,
+            None => {
+                return ArenaPlan::Blocked {
+                    chunk: 0,
+                    owner_frame: self.frame.saturating_sub(1),
+                }
+            }
+        };
+
+        // 在途块（属于别的帧且尚未退休）绝不改动。
+        if self.owners[i] != self.frame && self.owners[i] != FREE {
+            return ArenaPlan::Blocked {
+                chunk: i,
+                owner_frame: self.owners[i],
+            };
+        }
+
+        let capacity = self.capacities[i].max(aligned).max(MIN_STAGING_CAPACITY);
+        self.capacities[i] = capacity;
+        let offset = self.cursors[i];
+        self.cursors[i] += aligned;
+        self.owners[i] = self.frame;
+        ArenaPlan::Reuse {
+            chunk: i,
+            offset,
+            capacity,
+        }
+    }
+
+    /// 模拟退休：把已提交且 GPU 完成的块判为空闲。
+    ///
+    /// `completed_frame` 是「GPU 已读完的最大帧号」。真实实现用栅栏查询
+    /// 表达同一件事；这里用帧号以便单测精确控制退休时机。
+    pub(crate) fn retire(&mut self, completed_frame: u64) {
+        for i in 0..self.owners.len() {
+            if self.owners[i] != FREE && self.owners[i] <= completed_frame {
+                self.owners[i] = FREE;
+                self.cursors[i] = 0;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FrameRenderer
 // ---------------------------------------------------------------------------
 
@@ -358,6 +965,16 @@ struct FrameSlot {
     /// submit signal → present wait。
     present_semaphore: vk::Semaphore,
     descriptor_set: vk::DescriptorSet,
+    /// 该槽位的命令缓冲**已被提交、GPU 可能仍在执行**。
+    ///
+    /// 这个标记存在的唯一原因是防止「排队帧重复录制」：
+    /// `record_texture_upload` 若在 GPU 还没跑完上一轮提交时再次往
+    /// 同一命令缓冲追加命令，就会破坏在途录制——Vulkan 明确禁止
+    /// 在命令缓冲处于可执行状态时修改它。
+    ///
+    /// 生命周期：`present` 提交后置真，`acquire` 里等完栅栏后置假。
+    /// 换言之，它等价于「本槽位是否有未完成的 GPU 工作」。
+    in_flight: bool,
 }
 
 /// 帧循环核心。
@@ -382,6 +999,12 @@ pub struct FrameRenderer<'a> {
     /// 当前待完成的帧。未 acquire 时为 `None`。
     pending: Option<Pending>,
     clear_color: [f32; 4],
+    /// 跨帧存活的 staging 环形缓冲。
+    ///
+    /// 生命周期必须覆盖 **GPU 执行时间**而不只是录制时间，因此不能是
+    /// 上传函数里的局部变量。块数与在飞槽位数一致，提交时由栅栏记账，
+    /// 确保「GPU 读完之后才允许复用」。
+    staging: StagingArena<'a>,
 }
 
 /// 正在录制中的帧。
@@ -439,13 +1062,21 @@ impl<'a> FrameRenderer<'a> {
             layouts: LayoutTracker::new(0),
             pending: None,
             clear_color: [0.10, 0.10, 0.12, 1.0],
+            // 块数随后按交换链图像数确定，见下方。
+            staging: StagingArena::new(gpu, 1)?,
         };
         this.allocate_frame_resources()?;
+
+        // 交换链建好才知道在飞帧数，按它重建 arena 的块数。
+        // 必须 ≥ slot_count：每个在飞帧各占一块，否则下一帧会覆写
+        // GPU 尚未读完的 staging 内存。
+        this.staging = StagingArena::new(gpu, this.slots.len())?;
 
         tracing::debug!(
             extent = ?this.swapchain.extent,
             images = this.swapchain.image_count,
             slots = this.slots.len(),
+            staging_chunks = this.staging.chunk_count(),
             "FrameRenderer 就绪"
         );
         Ok(this)
@@ -464,6 +1095,40 @@ impl<'a> FrameRenderer<'a> {
     /// 在飞帧槽位数量（等于交换链图像数）。
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// 当前帧正在使用的槽位下标。
+    ///
+    /// 资源层用它索引**按槽位持有**的暂存缓冲（staging ring）。
+    /// 帧层是多帧在途的，同一份 CPU 数据不能在下一帧覆写 GPU 尚未读完的
+    /// staging 内存。
+    ///
+    /// # 为什么这已经足够安全
+    ///
+    /// [`FrameRenderer::acquire`] 在返回前会**等待并重置当前槽位的栅栏**，
+    /// 因此「拿到 `current_slot()` 就往该槽位写」这件事本身就是安全的：
+    /// 上一轮占用该槽位的 GPU 工作此时已经完成。资源层**不需要**额外等待，
+    /// 也不需要自己维护一套与帧层不同步的轮转。
+    ///
+    /// 未 acquire 时返回 `None`。
+    pub fn current_slot(&self) -> Option<usize> {
+        self.pending.as_ref().map(|p| p.slot)
+    }
+
+    /// 当前帧的命令缓冲，供资源层把上传等命令**录进同一份提交**。
+    ///
+    /// 纹理上传必须与绘制共用一次 `queue_submit`，否则需要额外的同步等待。
+    /// 未 acquire 时返回 `None`——此时录制命令会被后续 `present` 遗弃。
+    ///
+    /// # 生命周期
+    ///
+    /// 返回的句柄由帧层拥有，**不要**自行 `end_command_buffer` 或销毁；
+    /// [`FrameRenderer::present`] 负责收尾。录完即可，句柄随后失效。
+    pub fn current_command_buffer(&self) -> Option<vk::CommandBuffer> {
+        self.pending
+            .as_ref()
+            .and_then(|p| self.slots.get(p.slot))
+            .map(|s| s.command_buffer)
     }
 
     /// acquire 是否返回了 suboptimal（画面能出，但表面已不匹配）。
@@ -571,6 +1236,13 @@ impl<'a> FrameRenderer<'a> {
             unsafe { self.gpu.device.reset_fences(&[fence])? };
             self.slots[slot].fence_signaled = false;
         }
+
+        // 栅栏已等完 → 该槽位再无未完成的 GPU 工作。
+        // 这正是「上一帧占用它的那块 staging 此刻可以安全覆写」的证据，
+        // 因此退休与推进帧号必须发生在这里，而不是靠帧号差值推测。
+        self.slots[slot].in_flight = false;
+        self.staging.retire();
+        self.staging.begin_frame();
 
         let (image_index, suboptimal) = match map_acquire_result(unsafe {
             self.swapchain_loader.acquire_next_image(
@@ -762,6 +1434,13 @@ impl<'a> FrameRenderer<'a> {
         }
         // 提交成功即意味着该栅栏最终会被 signal。
         self.slots[slot].fence_signaled = true;
+        // 命令缓冲此刻已交给 GPU，**不可再录制**。见 `FrameSlot::in_flight`。
+        self.slots[slot].in_flight = true;
+        // 把本帧占用的 staging 块与该栅栏绑定：栅栏 signal 之后
+        // `StagingArena::retire` 才会允许复用它们。
+        let fence = self.slots[slot].fence;
+        self.staging.note_submitted(fence);
+        self.staging.end_frame();
 
         let swapchains = [self.swapchain.handle];
         let image_indices = [frame.image_index];
@@ -776,6 +1455,57 @@ impl<'a> FrameRenderer<'a> {
                 .queue_present(self.gpu.queue, &present_info)
         };
         map_present_result(overall, Some(results[0]))
+    }
+
+    /// 录制一次纹理上传。
+    ///
+    /// 这是**纹理上传的唯一正确入口**：它从 [`StagingArena`] 取一块
+    /// 生命周期覆盖 GPU 执行时间的 staging 空间，因此不存在
+    /// 「函数返回后 GPU 还在读已释放内存」的问题。
+    ///
+    /// # 参数
+    /// - `image`：目标纹理。会被推进到 `SHADER_READ_ONLY_OPTIMAL` 布局。
+    /// - `bytes`：覆盖率数据，长度须等于 `patch` 的像素数。
+    /// - `offset`：更新起始像素。`None` 表示整图更新。
+    /// - `patch`：本次覆盖的矩形尺寸 `(宽, 高)`。
+    ///
+    /// # 约束
+    ///
+    /// 必须在 [`FrameRenderer::acquire`] 成功之后、
+    /// [`FrameRenderer::present`] 之前调用。若该槽位的命令缓冲仍在GPU
+    /// 执行中，返回错误而非静默重复录制（见 [`FrameSlot::in_flight`]）。
+    pub fn record_texture_upload(
+        &mut self,
+        image: &mut crate::texture::DeviceImage,
+        bytes: &[u8],
+        offset: Option<(u32, u32)>,
+        patch: (u32, u32),
+    ) -> anyhow::Result<()> {
+        let Some(pending) = self.pending.as_ref() else {
+            anyhow::bail!("record_texture_upload 必须在 acquire 之后调用");
+        };
+        let slot = pending.slot;
+        // 规则本体在 can_record_upload（可单测），此处只喂真实状态。
+        can_record_upload(true, self.slots[slot].in_flight)?;
+        let cmd = self.slots[slot].command_buffer;
+
+        // 从 arena 取空间：偏移已按STAGING_ALIGNMENT 对齐，
+        // 且这块内存的生命周期由 arena 与本帧栅栏共同保证。
+        let staging = self.staging.allocate(bytes.len() as vk::DeviceSize)?;
+        staging.write(&self.gpu.device, bytes)?;
+
+        image.upload(self.gpu, cmd, staging, bytes, offset, patch)
+    }
+
+    /// 推进 staging 退休记账（可选显式调用）。
+    ///
+    /// [`FrameRenderer::acquire`] 内部已经做了这件事，因此正常帧循环
+    /// **不需要**调用本方法。保留它是为了让「等完栅栏 → 退休 → 推进帧号」
+    /// 这套记账在需要精细控制时也能被驱动（例如上传发生在 acquire 之前
+    /// 的自定义流程）。重复调用是安全的。
+    pub fn drive_staging_retire(&mut self) {
+        self.staging.retire();
+        self.staging.begin_frame();
     }
 
     /// 重建交换链。
@@ -834,10 +1564,16 @@ impl<'a> FrameRenderer<'a> {
         self.layouts.reset(self.swapchain.image_count);
         self.allocate_frame_resources()?;
 
+        // 槽位数可能变化，arena 的块数必须跟着变（块数须≥ 在飞帧数）。
+        // 本函数开头已 wait_idle，因此销毁旧 staging 是安全的。
+        self.staging.destroy();
+        self.staging = StagingArena::new(self.gpu, self.slots.len())?;
+
         tracing::debug!(
             extent = ?self.swapchain.extent,
             images = self.swapchain.image_count,
             slots = self.slots.len(),
+            staging_chunks = self.staging.chunk_count(),
             "交换链已重建"
         );
         Ok(())
@@ -986,6 +1722,8 @@ impl<'a> FrameRenderer<'a> {
                 // 初始就建成 SIGNALED 且标记为已 signal：
                 // 第一次 wait 会立刻通过，之后交给 acquire 去 signal。
                 fence_signaled: true,
+                // 初始没有在途提交（栅栏已 signal），可以自由录制。
+                in_flight: false,
                 acquire_semaphore,
                 present_semaphore,
                 descriptor_set: sets[i],
@@ -1018,6 +1756,9 @@ impl Drop for FrameRenderer<'_> {
     fn drop(&mut self) {
         // 在飞命令可能还引用着交换链图像与 framebuffer，必须等 GPU 空闲。
         self.gpu.wait_idle();
+        // wait_idle 之后销毁 staging 才是安全的：GPU 可能还在读它，
+        // 而它是 `cmd_copy_buffer_to_image` 的数据源。
+        self.staging.destroy();
         self.destroy_frame_resources();
         unsafe { self.gpu.device.destroy_command_pool(self.command_pool, None) };
         // framebuffer → image_view → swapchain 的销毁顺序由 Swapchain 保证。
@@ -1472,5 +2213,275 @@ mod tests {
         // 若默认值不是 null，上层忘填就会绑到空描述符集上，驱动直接崩。
         let input = DrawInput::single_batch(vk::Buffer::null(), vk::Buffer::null());
         assert!(input.descriptor_set.is_null());
+    }
+
+    // -- StagingArena 的纯逻辑 -------------------------------------------
+
+    #[test]
+    fn arena_first_frame_takes_the_first_chunk() {
+        let mut d = ArenaDecider::new(3);
+        d.begin_frame().unwrap();
+        assert_eq!(d.frame(), 1);
+        assert_eq!(
+            d.allocate(1000),
+            ArenaPlan::Reuse {
+                chunk: 0,
+                offset: 0,
+                capacity: MIN_STAGING_CAPACITY,
+            },
+            "首帧应从第0 块开始，且按最小容量惰性分配"
+        );
+        assert_eq!(d.owner(0), 1, "第 0 块应归第 1 帧所有");
+        assert_eq!(d.owner(1), FREE, "其余块必须保持空闲");
+    }
+
+    #[test]
+    fn arena_same_frame_appends_into_owned_chunk() {
+        // egui 一帧内可能有十几次纹理增量，必须复用同一块而非每��新建。
+        let mut d = ArenaDecider::new(3);
+        d.begin_frame().unwrap();
+        let a = d.allocate(1000);
+        let b = d.allocate(1000);
+        let c = d.allocate(1000);
+        // 三次都落在第 0 块，偏移依次递增
+        assert!(matches!(a, ArenaPlan::Reuse { chunk: 0, .. }));
+        assert!(matches!(b, ArenaPlan::Reuse { chunk: 0, .. }));
+        assert!(matches!(c, ArenaPlan::Reuse { chunk: 0, .. }));
+        assert_eq!(
+            d.cursor(0),
+            3 * align_up(1000, STAGING_ALIGNMENT),
+            "同帧连续分配应在同一块上累加游标"
+        );
+    }
+
+    #[test]
+    fn arena_offset_is_always_aligned() {
+        // vkCmdCopyBufferToImage 要求 bufferOffset 满足
+        // optimalBufferCopyOffsetAlignment；不对齐会让驱动行为未定义。
+        let mut d = ArenaDecider::new(2);
+        d.begin_frame().unwrap();
+        for size in [1u64, 7, 255, 256, 257, 4096] {
+            for _ in 0..4 {
+                match d.allocate(size) {
+                    ArenaPlan::Reuse { offset, .. } => assert_eq!(
+                        offset % STAGING_ALIGNMENT,
+                        0,
+                        "size={size} 产生了未对齐偏移 {offset}"
+                    ),
+                    ArenaPlan::Blocked { .. } => panic!("不应被阻止"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn arena_grows_when_chunk_too_small() {
+        // 字体图集首次加载是整图上传（2048x2048 = 4 MiB），
+        // 必然超过 MIN_STAGING_CAPACITY，必须能扩容而不是报错。
+        let mut d = ArenaDecider::new(2);
+        d.begin_frame().unwrap();
+        let big = 2048 * 2048;
+        match d.allocate(big) {
+            ArenaPlan::Reuse { capacity, .. } => {
+                assert_eq!(
+                    capacity, big,
+                    "容量应刚好涨到能装下本次请求，而不是固定 4 MiB"
+                );
+                // 分配后该块的容量必须真的够大，否则下次写入会越界
+                assert!(d.capacity(0) >= big);
+            }
+            ArenaPlan::Blocked { .. } => panic!("空闲块不应被阻止"),
+        }
+    }
+
+    #[test]
+    fn arena_never_reuses_an_inflight_chunk() {
+        // 这是本次修复的核心不变式：在途 staging 绝不能被下一帧接管。
+        let mut d = ArenaDecider::new(1);
+        // 第 1 帧独占唯一的一块，提交但**未完成**
+        d.begin_frame().unwrap();
+        d.allocate(1000);
+        // 第 2 帧想推进，但没有任何退休的块 → 必须报错而不是复用
+        let blocked = d.begin_frame();
+        assert!(
+            blocked.is_err(),
+            "块数=1 且上一帧未退休时，推进帧号必须失败"
+        );
+    }
+
+    #[test]
+    fn arena_reuses_only_after_retire() {
+        // 退休后同一块才可被接管，且从偏移 0重新开始。
+        let mut d = ArenaDecider::new(1);
+        d.begin_frame().unwrap();
+        d.allocate(1000);
+        assert!(d.begin_frame().is_err(), "未退休时不应放行");
+
+        // GPU 完成第 1 帧 → 退休
+        d.retire(1);
+        assert_eq!(d.owner(0), FREE);
+        assert_eq!(d.cursor(0), 0, "退休后游标必须归零");
+
+        d.begin_frame().unwrap();
+        match d.allocate(1000) {
+            ArenaPlan::Reuse { chunk, offset, .. } => {
+                assert_eq!(chunk, 0);
+                assert_eq!(offset, 0, "复用后应从块首开始写");
+            }
+            ArenaPlan::Blocked { .. } => panic!("退休后不应被阻止"),
+        }
+    }
+
+    #[test]
+    fn arena_retire_is_idempotent() {
+        // 退休逻辑被 begin_frame 与 drive_staging_retire 两条路径触发，
+        // 重复调用必须无副作用——否则会 double-free 或把空闲块拉回在用。
+        let mut d = ArenaDecider::new(2);
+        d.begin_frame().unwrap();
+        d.allocate(1000);
+        d.retire(1);
+        assert_eq!(d.owner(0), FREE);
+
+        // 连续再退休三次：状态必须完全不变
+        for _ in 0..3 {
+            d.retire(1);
+            assert_eq!(d.owner(0), FREE, "重复退休不应改变已空闲的块");
+            assert_eq!(d.cursor(0), 0);
+            assert_eq!(d.owner(1), FREE, "不该波及其它块");
+        }
+
+        // 重复退休后仍能正常推进并复用
+        d.begin_frame().unwrap();
+        assert!(matches!(
+            d.allocate(1000),
+            ArenaPlan::Reuse { chunk: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn arena_retire_only_frees_completed_frames() {
+        // retire(completed) 不应释放比 completed 更新的帧：
+        // 那正是 use-after-free 的触发条件。
+        //
+        // 用**单块** arena，才能观察到「该块在途 → 本帧拿不到空间」。
+        // 多块时下一帧总能落到另一块上，看不出这个约束。
+        let mut d = ArenaDecider::new(1);
+        d.begin_frame().unwrap(); // frame 1
+        d.allocate(1000);
+        d.retire(0); // GPU 只完成到第 0 帧
+        assert_eq!(d.owner(0), 1, "第 1 帧未被完成，不该退休");
+        assert!(
+            d.begin_frame().is_err(),
+            "唯一的块仍在途，不该放行新帧"
+        );
+
+        d.retire(1); // 现在第 1 帧完成了
+        assert_eq!(d.owner(0), FREE);
+        assert!(d.begin_frame().is_ok());
+    }
+
+    #[test]
+    fn arena_pool_of_three_sustains_multi_frame_stream() {
+        // 模拟真实帧循环：3 块轮转，每帧退休上一帧的在途块。
+        let mut d = ArenaDecider::new(UPLOAD_POOL_CAPACITY);
+        for i in 1..=30u64 {
+            d.begin_frame()
+                .unwrap_or_else(|_| panic!("第 {i} 帧不该被阻塞"));
+            assert_eq!(d.frame(), i);
+            // 每帧若干次上传（egui 纹理增量）
+            for _ in 0..4 {
+                assert!(matches!(d.allocate(512), ArenaPlan::Reuse { .. }));
+            }
+            // 模拟「GPU 完成了上一帧」
+            if i > 1 {
+                d.retire(i - 1);
+            }
+        }
+        assert_eq!(d.frame(), 30);
+    }
+
+    #[test]
+    fn arena_capacity_constants_are_sane() {
+        // 默认容量必须刚好装下常见的 2048x2048 R8 字体图集。
+        // 用全路径而非 `use`：该常量由资源层定义，写全路径能让
+        // 「谁定义的」一眼可见，也避免并发编辑时import 被覆盖。
+        assert_eq!(
+            crate::texture::staging_size_r8(2048, 2048),
+            4 * 1024 * 1024
+        );
+        assert_eq!(DEFAULT_STAGING_CAPACITY, 4 * 1024 * 1024);
+        // 下限不能为 0，否则小图集会拿到 0 容量缓冲
+        assert!(MIN_STAGING_CAPACITY > 0);
+        // 对齐必须是 2 的幂且 ≥ 4（规范对 bufferOffset 的最低要求）
+        assert!(STAGING_ALIGNMENT >= 4);
+        assert_eq!(STAGING_ALIGNMENT.count_ones(), 1);
+        // 块数必须 ≥ 2，否则无法在「本帧写入」与「上帧在途」间轮转
+        assert!(UPLOAD_POOL_CAPACITY >= 2);
+    }
+
+    #[test]
+    fn staging_slice_null_is_detected() {
+        assert!(StagingSlice::NULL.is_null());
+        let real = StagingSlice {
+            buffer: vk::Buffer::from_raw(1),
+            memory: vk::DeviceMemory::from_raw(1),
+            offset: 0,
+            size: 16,
+        };
+        assert!(!real.is_null());
+    }
+
+    #[test]
+    fn staging_slice_write_rejects_bad_input() {
+        // 两条非法输入都必须在**调用任何 Vulkan 入口之前**被拦下。
+        //
+        // 直接测校验函数（`write` 的第一行就是它）。之所以敢断定
+        // 「没碰设备」：map_memory 只在 validate 通过之后调用，
+        // 而这里覆盖了它全部的失败分支。
+        assert!(validate_staging_write(&StagingSlice::NULL, 1).is_err());
+        let small = StagingSlice {
+            buffer: vk::Buffer::from_raw(1),
+            memory: vk::DeviceMemory::from_raw(1),
+            offset: 0,
+            size: 8,
+        };
+        assert!(validate_staging_write(&small, 9).is_err(), "超长必须被拒");
+        // 恰好装满必须放行（边界）
+        assert!(validate_staging_write(&small, 8).is_ok());
+        assert!(validate_staging_write(&small, 0).is_ok());
+    }
+
+    // -- in_flight 拒绝重复录制 -------------------------------------------
+
+    #[test]
+    fn upload_requires_acquire_first() {
+        // 未 acquire 就录制：命令会被后续 present 遗弃
+        assert!(can_record_upload(false, false).is_err());
+    }
+
+    #[test]
+    fn upload_rejected_while_slot_in_flight() {
+        // 核心回归：GPU 还在执行时重复录制必须报错而非静默重复录制。
+        let err = can_record_upload(true, true).unwrap_err().to_string();
+        assert!(err.contains("GPU"), "错误信息应说明原因，实际：{err}");
+        assert!(
+            err.contains("acquire"),
+            "错误信息应指引调用方如何恢复，实际：{err}"
+        );
+    }
+
+    #[test]
+    fn upload_allowed_when_slot_idle() {
+        // 正常路径：已 acquire 且上一轮 GPU 工作已完成 → 放行
+        assert!(can_record_upload(true, false).is_ok());
+    }
+
+    #[test]
+    fn in_flight_check_precedes_nothing_else() {
+        // 两个错误都要能被区分：未 acquire 的错误不能被误报成 in_flight，
+        // 否则调用方会去调 acquire 之外的错误路径。
+        let not_pending = can_record_upload(false, false).unwrap_err().to_string();
+        assert!(not_pending.contains("acquire"));
+        assert!(!not_pending.contains("GPU"));
     }
 }

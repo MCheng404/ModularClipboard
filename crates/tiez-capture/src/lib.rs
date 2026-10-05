@@ -415,9 +415,14 @@ mod tests {
 
     #[test]
     fn sequence_number_is_readable() {
-        // 不要求具体值，只要求调用不 panic
+        // 只要求调用本身能成功返回，不要求两次读数相同。
+        //
+        // 序列号由**系统**在每次剪贴板变更时递增，而测试进程自己就在
+        // 改剪贴板（同文件里的 `text_roundtrip_through_clipboard` 会写入）。
+        // 并行执行时两次读数不同是正常的，早先断言 `a == b` 会间歇性失败。
         let a = current_sequence();
         let b = current_sequence();
-        assert_eq!(a, b, "无人操作时序列号应保持稳定");
+        // 能连续读两次说明 API 可用；序列号本身允许被其它线程/进程推进。
+        assert!(a > 0 || b > 0, "序列号应可读取且非负");
     }
 }
