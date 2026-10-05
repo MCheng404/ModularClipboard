@@ -676,19 +676,54 @@ impl<'a> StagingArena<'a> {
         }
     }
 
-    /// 回收已退休（栅栏已 signal）的块。
+    /// 退休与 `fence` 关联的块：该栅栏已 signal，GPU 读完了其中的数据。
     ///
-    /// **幂等**：判定条件是「持有栅栏且栅栏已 signal」，而空闲块不持有
-    /// 任何栅栏，因此重复调用不会二次释放，也不会把已判空闲的块
-    /// 重新拉回在用状态。
-    pub fn retire(&mut self) {
-        let gpu = self.gpu;
+    /// # 为什么按「栅栏身份」而不是「查栅栏状态」
+    ///
+    /// 直觉写法是遍历所有块、对每个块调 `get_fence_status`。但那要求
+    /// **在 `reset_fences` 之前**查询——而 `FrameRenderer::acquire` 的
+    /// 流程是「wait → reset」，顺序一旦放错（比如为了代码整洁把退休
+    /// 写在 reset 之后），`get_fence_status` 读到的永远是未 signal，
+    /// 于是**没有任何块会被退休**，arena 在几帧内耗尽并报
+    /// 「全部在途，无可分配空间」。
+    ///
+    /// 实际上等栅栏这件事本身就是退休凭据：[`FrameRenderer::acquire`]
+    /// 在 `wait_for_fences` 返回后调用本方法，等价于宣告
+    /// 「这个栅栏关联的工作已完成」。因此按栅栏身份退休既避免了
+    /// 顺序陷阱，也省掉了逐块查询。
+    ///
+    /// # 幂等
+    ///
+    /// 已空闲的块没有栅栏，直接跳过；重复传入同一栅栏不会二次释放。
+    pub fn retire_frame(&mut self, fence: vk::Fence) {
+        if fence.is_null() {
+            return;
+        }
         for c in &mut self.chunks {
             if c.owner_frame == FREE {
                 continue; // 已空闲
             }
-            if c.fence.is_null() {
-                continue; // 本帧尚未提交/记账
+            if c.fence != fence {
+                continue; // 属于其它帧，等各自的栅栏
+            }
+            c.owner_frame = FREE;
+            c.fence = vk::Fence::null();
+            c.cursor = 0;
+        }
+    }
+
+    /// 退休所有「栅栏已 signal」的块。
+    ///
+    /// 供不方便拿到具体栅栏的场景使用（如 [`FrameRenderer`] 重建
+    /// 交换链后统一回收）。**常规帧循环不需要它**——`acquire` 走的是
+    /// 语义更明确的 [`StagingArena::retire_frame`]。
+    ///
+    /// 必须在 `reset_fences` 之前调用，见该方法的说明。
+    pub fn retire(&mut self) {
+        let gpu = self.gpu;
+        for c in &mut self.chunks {
+            if c.owner_frame == FREE || c.fence.is_null() {
+                continue;
             }
             // 非阻塞查询：只有真正 signal 了才敢复用。
             let signaled = unsafe { gpu.device.get_fence_status(c.fence) }.unwrap_or(false);
@@ -775,6 +810,15 @@ impl<'a> StagingArena<'a> {
         guard.memory = Some(memory);
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }
             .map_err(|e| anyhow::anyhow!("绑定 staging 显存失败: {e:?}"))?;
+
+        // 所有权移交：buffer 与 memory 都已创建且绑定成功。
+        //
+        // **漏掉这两行会让守卫在函数返回时 free_memory**，
+        // 于是 `old.memory` 变成悬空句柄，后续 `map_memory` 报
+        // ERROR_MEMORY_MAP_FAILED（或更糟：驱动崩）。
+        // `BufferGuard` 同理——守卫的价值正在于「成功时交出、失败时清理」。
+        guard.buffer = None;
+        guard.memory = None;
 
         // 旧资源此刻可安全销毁：调用方已确认该块「本帧占用」或
         // 「完全空闲」，不存在在途读取。
@@ -1067,6 +1111,13 @@ impl<'a> FrameRenderer<'a> {
         };
         this.allocate_frame_resources()?;
 
+        // 布局跟踪表必须按交换链图像数建立。
+        // 漏了这一步（曾写成 `LayoutTracker::new(0)`）会让**首帧**
+        // acquire 直接失败：「图像索引 0 超出布局跟踪表」——
+        // 而单测与 pipeline_probe 都碰不到 FrameRenderer::acquire，
+        // 因此这个缺陷能一路活到接UI 才暴露。
+        this.layouts.reset(this.swapchain.image_count);
+
         // 交换链建好才知道在飞帧数，按它重建 arena 的块数。
         // 必须 ≥ slot_count：每个在飞帧各占一块，否则下一帧会覆写
         // GPU 尚未读完的 staging 内存。
@@ -1217,6 +1268,51 @@ impl<'a> FrameRenderer<'a> {
         Ok(())
     }
 
+    /// 交换链重建后，把「绑定到交换链图像」的资源重新绑一遍。
+    ///
+    /// # 为什么必须显式调用
+    ///
+    /// 顶点/索引缓冲若被绑定到某个交换链图像视图（Opaque 资源用法），
+    /// 重建后那张图像视图已被销毁——继续用会读到已释放的资源，
+    /// 表现为崩溃或画面变花（字体变豆腐块）。
+    ///
+    /// Vulkan 没有「自动重绑」这种机制：描述符是**静态绑定**，
+    /// 图像视图销毁后不会自动指向新视图。所以这里选择**显式失败**
+    /// 而不是静默失效——宁可让上层立刻知道，也别让画面坏得莫名其妙。
+    ///
+    /// 调用时机：`rebuild_swapchain` 成功之后、下一帧 `acquire` 之前。
+    ///
+    /// # 参数
+    ///
+    /// - `sampler`：字体图集的采样器。
+    /// - `font_view` / `font_layout`：字体图集的图像视图与布局。
+    ///
+    /// 注意：顶点/索引缓冲若曾通过描述符绑定到交换链图像，
+    /// 调用方需自行用 [`Self::update_texture_binding`] 之外的途径重绑——
+    /// 本项目当前的绘制路径**不**把顶点缓冲绑到交换链图像
+    /// （顶点缓冲是独立 device-local 资源，经 `vk::CmdBufferBindVertexBuffers`
+    /// 绑定，不走描述符），因此交换链重建不影响它们。
+    ///
+    /// # 示例
+    ///
+    /// ```ignore
+    /// fr.rebuild_swapchain(new_extent)?;
+    /// fr.rebind_after_rebuild(sampler, font_view, font_layout)?;
+    /// ```
+    pub fn rebind_after_rebuild(
+        &self,
+        sampler: vk::Sampler,
+        font_view: vk::ImageView,
+        font_layout: vk::ImageLayout,
+    ) -> anyhow::Result<()> {
+        // 每个帧槽位有独立的描述符集，必须逐个重绑。
+        for slot in 0..self.slots.len() {
+            self.update_texture_binding(slot, sampler, font_view, font_layout)?;
+        }
+        tracing::debug!(slots = self.slots.len(), "交换链重建后已完成描述符重绑");
+        Ok(())
+    }
+
     /// 取下一张可绘制的交换链图像。
     ///
     /// 返回 `Ok(None)` 表示交换链已过期（或本次没抢到图像），
@@ -1230,18 +1326,23 @@ impl<'a> FrameRenderer<'a> {
 
         // 等 GPU 用完这个槽位（上一帧的提交 + 本帧的 acquire 都已完成）。
         // 不等就会在 GPU 还在读命令缓冲时 reset 它——未定义行为。
+        //
+        // 注意顺序：**先退休，后 reset**。
+        // `wait_for_fences` 返回即证明「该槽位上一轮提交的 GPU 工作
+        // 全部完成」，这是最可靠的退休凭据。而 `get_fence_status` 在
+        // reset 之后读到的永远是未 signal——若把退休放在 reset 之后，
+        // staging 块将永远查不到signal，arena 会在几帧内耗尽。
         if self.slots[slot].fence_signaled {
             let fence = self.slots[slot].fence;
             unsafe { self.gpu.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT)? };
+
+            // 栅栏已 signal：占用该槽位的那一帧 staging 可以安全复用。
+            self.staging.retire_frame(fence);
+            self.slots[slot].in_flight = false;
+
             unsafe { self.gpu.device.reset_fences(&[fence])? };
             self.slots[slot].fence_signaled = false;
         }
-
-        // 栅栏已等完 → 该槽位再无未完成的 GPU 工作。
-        // 这正是「上一帧占用它的那块 staging 此刻可以安全覆写」的证据，
-        // 因此退休与推进帧号必须发生在这里，而不是靠帧号差值推测。
-        self.slots[slot].in_flight = false;
-        self.staging.retire();
         self.staging.begin_frame();
 
         let (image_index, suboptimal) = match map_acquire_result(unsafe {
@@ -1678,7 +1779,14 @@ impl<'a> FrameRenderer<'a> {
             unsafe { device.create_descriptor_pool(&pool_info, None) }
                 .map_err(|e| anyhow::anyhow!("创建描述符池失败: {e:?}"))?;
 
-        let layouts = [self.bundle.descriptor_set_layout];
+        // 描述符集要按**在飞帧数**各分配一份（GPU 可能还在读上一帧的
+        // 那一份，见 `update_uniform_binding` 的说明）。
+        //
+        // ash 0.38 的坑 15：`set_layouts()` 的**切片长度就是分配数量**。
+        // 只写 `&[layout]`（长度 1）会只分配出 1 个描述符集，
+        // 而下面断言期望 `count` 个 —— 于是 `FrameRenderer::new` 直接失败。
+        // 因此这里必须把布局重复 `count` 次。
+        let layouts = vec![self.bundle.descriptor_set_layout; count as usize];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(&layouts);

@@ -86,6 +86,44 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // GPU 自检：打印设备名与设备类型。
+    //
+    // 为什么这一行不能省：本探针此前只打印「GPU 实际执行了命令」，
+    // 但没说明**是哪块 GPU**。驱动坏了、或跑到了软件光栅器
+    // （llvmpipe 的 device_type 报 CPU），输出看起来一样正常——
+    // 那是自欺欺人。设备名必须让人一眼看出是硬件还是软件。
+    //
+    // `device_name` 是 `[c_char; 256]`（i8），需逐字节 as u8 并在
+    // 首个 NUL 处截断（坑 10）。
+    let device_name: String = {
+        let bytes: Vec<u8> = gpu
+            .properties
+            .device_name
+            .iter()
+            .map(|c| *c as u8)
+            .take_while(|b| *b != 0)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let kind = match gpu.device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => "hardware",
+        vk::PhysicalDeviceType::INTEGRATED_GPU => "hardware",
+        vk::PhysicalDeviceType::VIRTUAL_GPU => {
+            "virtual GPU - 不能证明本机硬件驱动正常"
+        }
+        // llvmpipe / lavapipe 等软件光栅器都报 CPU。
+        vk::PhysicalDeviceType::CPU => "software rasterizer - 不能证明硬件驱动正常",
+        _ => "未知设备类型 - 不能证明硬件驱动正常",
+    };
+    println!("GPU: {device_name} ({kind})");
+    if gpu.device_type == vk::PhysicalDeviceType::CPU {
+        println!(
+            "警告: 当前是软件渲染。下面所有「OK」只能证明代码路径正确，\
+             不能证明显卡驱动正常。"
+        );
+    }
+
     println!(
         "OK Gpu::new  queue_family={} present_modes={} formats={}",
         gpu.queue_family,

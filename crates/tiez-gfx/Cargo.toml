@@ -32,6 +32,11 @@ name = "probe"
 [[example]]
 name = "pipeline_probe"
 
+# 纹理上传路径的实机验证：staging arena跨帧退休/复用 + 布局过渡
+# + cmd_copy_buffer_to_image。拒绝在软件光栅器上运行。
+[[example]]
+name = "upload_probe"
+
 # 着色器在编译期由 naga 编译为 SPIR-V，不进最终二进制。
 # 这样无需 glslc / glslang 等 C++ 工具链，保持纯 Rust 构建链。
 [build-dependencies]

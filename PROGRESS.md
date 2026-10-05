@@ -318,3 +318,6 @@ A 组报告 `texture.rs:390` 存在 use-after-free，理由是
 2. 删除「`clear` 之前必须重置绑定」这类防御性检查——前提不成立。
 3. 泄漏的验证方式：`upload_probe` 跑 2000 帧后
    `vkGetResourceInfo` 或直接对比内存占用，应保持平稳而非线性增长。
+
+- 2026-10-05 | B | **实机`upload_probe` 抓出并修复 2 个真bug**（单测全绿时溜过去了）：<br>① **描述符集只拿到 1 份**：查 ash 源码（`vk/definitions.rs:3734`）确认 `set_layouts()` 会**主动把 `descriptor_set_count` 覆盖成切片长度**，而 `allocate_descriptor_sets` 按该 count 决定返回几份。必须在其**之后**直接写字段（该字段无 builder 方法）。这是 MEMORY.md 坑 15 的**后半段**——之前只记「不设 count 返空 Vec」，没意识到 slice 构造器会主动写入。症状会是多帧共用一份描述符集 → GPU 读到被改写的数据 → **随机花屏**。<br>② **`LayoutTracker` 初始化为 0**：`reset(image_count)` 只在 `rebuild_swapchain` 里调，初始化路径不经过 → 首次 `acquire` 时 `layouts.get()` 越界。修法：在 `swapchain` 被移进结构体前先取 `image_count`（`Swapchain` 无 `Clone`）。 | `upload_probe` 实机报错「期望 3，实际 1」→ 修复后 lib **76 passed / 0 failed 零警告**；`pipeline_probe` 退出码 0 / `ALL OK` 不回归。**教训：这两个 bug 在 76 个单测全绿的情况下漏过，只有真跑GPU 才暴露——A 坚持做实机probe 的判断正确。** |
+- 2026-10-05 | B | **补完 arena 接线并修好并发编辑造成的破坏**：`frame.rs` 被第三方加入约 700 行 `StagingArena` 但两处接线未完成（`align_up` 未import、`FrameRenderer` 缺 `staging` 字段）→ 已补齐，`Drop` 中`staging.destroy()` 位置正确（在 `wait_idle` 之后）未改。同时修 `examples/upload_probe.rs` 3 处编译错误（漏 `mut`、借用冲突、传 `GraphicsPipeline` 而非 `.handle`）。**未加 `#[allow(dead_code)]` 消警**——消警不等于解决。 | `cargo test -p tiez-gfx --lib` 76 passed / 零警告 |
