@@ -161,10 +161,10 @@ Win32 窗口 → Vulkan 表面 → 交换链 → 渲染通道 → SPIR-V 着色�
 | C | `window.rs` 需要 egui 依赖（把Win32 事件译为 `egui::RawInput`） | ✅ 已裁决：`tiez-gfx` 加 `egui` workspace 依赖。理由：这是渲染层与UI 层唯一耦合点，放在 gfx 侧可避免 `tiez-gfx → tiez-ui` 的循环依赖 |
 | C | 需要 windows features：`Win32_UI_Input_KeyboardAndMouse`、`Win32_UI_HiDpi` | ✅ 已加入 Cargo.toml |
 | A/B | 需要在 `lib.rs` 注册 `mod buffer; mod texture;` / `mod frame;` | ✅ 已由 B 代为添加 `pub mod frame;`（`buffer`/`window` 已由 A/C 自行注册）。<br>⚠️ 期间因多人并发编辑出现过 `pub mod buffer;` 重复声明，已删除多余行。**后续请勿再并发改 lib.rs** |
-| B | `frame.rs` 的 `pick_swapchain_format` 是 `lib.rs::pick_format` 的副本（后者私有）。改选格式逻辑时两处会静默失配 → 「渲染通道格式 ≠ 交换链格式」，驱动在 `cmd_begin_render_pass` 时炸。 | ✅ 已裁决：**采纳 B 的判断，但用更彻底的解法** —— 不只是暴露测试函数，而是把 `pick_format` 从 `lib.rs` 移到 `frame.rs` 并改为 `pub(crate)`，让 `lib.rs` 改为 `use frame::pick_format`。理由：格式选择是**交换链的职责**（它决定用哪个格式），本就该住在 frame.rs；保留两份实现才是隐患根源。已由主控执行，B 组需删除 `frame.rs` 里的副本改用统一实现。 |
-| A | ⚠️ **staging 生命周期依赖「每帧 device_wait_idle」**：`DeviceImage::upload` 内的 staging `Buffer` 是局部变量，函数返回即离开作用域。由于 `Buffer` **不实现 `Drop`**（无 `&Device` 可用），显存不会被释放，但**若帧层改为多帧在途**（submit 后不等 idle 就复用 command buffer），上传会读到已失效的绑定。**请 B 明确：每帧 submit 后是否 `device_wait_idle`？** 若是则当前实现安全；若否，A 需把 staging 改成跨帧持有的 ring buffer。 | 待 B 确认 |
-| A | **描述符集仍无人实现**：`DescriptorLayout` / `PipelineLayout` 在 `pipeline.rs` 已有，但描述符**池**与 `allocate_descriptor_sets` / `update_descriptor_sets` 无人实现，因此纹理无法真正绑定到管线。A 未被授权创建描述符池（且契约里 `update_texture_binding(slot, sampler, view, layout)` 暗示由 B 实现）。**请 B 确认由 B 实现 `update_texture_binding`**，A 已提供 `FontTexture::descriptor_info()` 与 `Buffer::descriptor_info()` 供其取值。 | 待 B 确认 |
-| A | 知会 B：`DrawInput` 收裸 `vk::Buffer` 的设计很好，A 不用改契约。但**顶点类型请直接用 `buffer::Vertex`**（`pos/uv/color`，20 字节，`bytemuck::Pod`），其字段偏移与 `pipeline.rs` 属性描述一致并有单测守卫，**不要在 `frame.rs` 另定义一份**。 | 知会 B |
+| B | `frame.rs` 的 `pick_swapchain_format` 是 `lib.rs::pick_format` 的副本（后者私有）。改选格式逻辑时两处会静默失配 → 「渲染通道格式 ≠ 交换链格式」，驱动在 `cmd_begin_render_pass` 时炸。 | ✅ 已解决：主控把 `pick_format` 改为 `pub(crate)` 统一实现，`frame.rs` 删除副本直接调用，**单一数据源**。迁移时漏改`rebuild_swapchain` 的一处调用（`pick_format` 返回元组），已由 B 修|
+| A | ⚠️ staging 生命周期依赖「每帧 device_wait_idle」 | ✅ **B 已确认：否**。帧层用多帧在途（按槽位轮转 + 每槽位独立 fence），**不做**每帧 idle。→ A 需把 `DeviceImage::upload` 的局部 staging 改为**按槽位跨帧持有的 ring buffer**（数量 = `fr.slot_count()`），上传前等该槽 fence。**A 行动项** |
+| A | 描述符池与 `update_texture_binding` 归属 | ✅ **B 已实现**。`FrameRenderer` 持有 DescriptorPool + 每槽位一份描述符集，对外暴露 `descriptor_set(slot)` / `update_uniform_binding(...)` / `update_texture_binding(...)`。A 直接解包 `FontTexture::descriptor_info()` 传入即可，无需改B 的签名。⚠️ **必须对 `0..slot_count()` 每个槽位都写一遍** |
+| A | 建议 B 直接用 `buffer::Vertex` 而非另定义 |✅ 知悉并采纳方向，但**当前刻意不import 资源层类型**：`DrawInput` 收裸 `vk::Buffer`，A 无需等B 编译。字节布局一致性由 `pipeline.rs` 属性描述 + A 的 `Vertex` 单测 + B 的「步长 20 字节」测试三方守住。若 A 要求 strongly-typed `&[Vertex]`，需等 `buffer.rs` 定稿后由 B 改契约 |
 
 ### ⚠️ 主控澄清一处（避免 B 组误解）
 
@@ -201,10 +201,8 @@ B 组实现里若已按「只能来自 pResults」处理，**逻辑仍然正确*
 - 2026-10-05 | A | 查证 **egui 0.36 字体图集已不是单通道**：`ImageData` 枚举**只有** `Color(Arc<ColorImage>)` 一个变体（无 `Font` 变体），且`color_from_coverage` 用 `Color32::from_white_alpha` 把同一 alpha 写进 4 个通道。故取红通道即得覆盖率，与着色器 `textureSample(...).r` 一致，且体积省到 1/4。任务书里「egui 字体图集是单通道覆盖率」的表述在 0.36 已不准确。 | 直读 `epaint-0.36.2/src/image.rs` 与 `texture_atlas.rs`；单测 `red_channel_equals_alpha_for_font_atlas` |
 - 2026-10-05 | B | 实现 `frame.rs`：`PipelineBundle` / `AcquiredFrame` / `PresentResult` /
   `LayoutTracker` / `FrameRenderer`（acquire→record→present + rebuild_swapchain）。
-  20 个纯逻辑单测 + 1 个 doctest。 | **隔离环境** `cargo test`：`35 passed; 0 failed`，
-  doctest ok，**零警告**。主工作区 `./scripts/build.sh --test` 目前被
-  `window.rs`（C 组 WIP）与 `buffer.rs`（A 组 WIP）的编译错误阻塞，
-  但 `frame.rs` 本身无任何 error/warning。C、A 修完后需由我重跑全量。 |
+  20 个纯逻辑单测 + 1 个 doctest。 | 隔离环境 `cargo test`：`35 passed; 0 failed`，
+  doctest ok，**零警告**。后续 A、C 修完后全量已转绿，见下方主控 23:15 记录。 |
 - 2026-10-05 | B | **自测抓到我自己代码里的一个真bug**：`DrawInput` 原本用
   `#[derive(Default)]`，而 `vk::IndexType::default()` 是 **UINT16**，与文档
   声称的 UINT32 不符。索引类型错不崩、只会静默画出乱图。已改为手写
@@ -221,3 +219,4 @@ B 组实现里若已按「只能来自 pResults」处理，**逻辑仍然正确*
 | 23:05 | A | 交付 `buffer.rs` 713 行 + `texture.rs` 812 行 + 22 单测。内存类型选择（含`align_mask` 校验）、描述符集、`FontTexture`（`R8_UNORM` + `NEAREST` 采样） | 22 单测通过 |
 | 23:10 | 主控 | 统一 `pick_format` 到 `lib.rs`（消除 frame.rs 副本），修 8 处ash 0.38 编译错误，注册 5 个模块 | 编译零警告 |
 | 23:15 | 主控 | 全量验证 | **136 测试通过 / 0 失败 / 0 警告；实机探针退出码 0** |
+| 23:20 | B | 补修主控统一 `pick_format` 时漏改的一处调用点：`rebuild_swapchain` 里 `crate::pick_format(..)` 现返回 `(Format, ColorSpaceKHR)` 元组，原代码按单个 `Format` 比较 → E0308。改为 `let (format, _) = ..`。同时回答 A 的两个待确认项（见待决区）。 | 全量 58 passed（tiez-gfx）+ 探针退出码 0 |
