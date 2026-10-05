@@ -5,30 +5,30 @@
 依赖严格单向向下，无环：
 
 ```
-tiez-bin  (二进制入口、命令行、启动顺序)
+modular-clipboard  (二进制入口、命令行、启动顺序)
    │
    ▼
-tiez-ui   (egui 渲染；只依赖 tiez-app 的服务接口)
+modular-clipboard-ui   (egui 渲染；只依赖 modular-clipboard-app 的服务接口)
    │
    ▼
-tiez-app  (服务编排、联动引擎)
+modular-clipboard-app  (服务编排、联动引擎)
    │        │
    │        ▼
-   │     tiez-capture (剪贴板读取)
-   │     tiez-platform (系统集成)
+   │     modular-clipboard-capture (剪贴板读取)
+   │     modular-clipboard-platform (系统集成)
    │        │
    ▼        ▼
-tiez-store (SQLite 持久化)
+modular-clipboard-store (SQLite 持久化)
    │
    ▼
-tiez-core  (领域模型、事件、配置；零 IO 依赖)
+modular-clipboard-core  (领域模型、事件、配置；零 IO 依赖)
 ```
 
 **为什么这样切**
 
-- `tiez-core` 不依赖任何 IO/GUI/平台 crate，因此可被全部下游引用，不会引入循环依赖。领域模型的定义只有一处。
-- `tiez-ui` 不接触数据库与剪贴板，全部经 `tiez-app` 的 `Service`。换掉整个界面不影响任何业务逻辑。
-- `tiez-capture` 与 `tiez-platform` 把平台 API 收敛在一处。移植到 macOS/Linux 只需重写这两个 crate。
+- `modular-clipboard-core` 不依赖任何 IO/GUI/平台 crate，因此可被全部下游引用，不会引入循环依赖。领域模型的定义只有一处。
+- `modular-clipboard-ui` 不接触数据库与剪贴板，全部经 `modular-clipboard-app` 的 `Service`。换掉整个界面不影响任何业务逻辑。
+- `modular-clipboard-capture` 与 `modular-clipboard-platform` 把平台 API 收敛在一处。移植到 macOS/Linux 只需重写这两个 crate。
 
 ## 线程模型
 
@@ -37,7 +37,7 @@ tiez-core  (领域模型、事件、配置；零 IO 依赖)
 | 线程 | 职责 | 禁止做的事 |
 |---|---|---|
 | UI 线程（egui 事件循环） | 绘制、所有 SQLite 读写、响应用户操作 | 不阻塞等待剪贴板 |
-| 捕获线程 `tiez-capture` | 轮询序列号、读取剪贴板内容、投递给 UI | 不碰数据库 |
+| 捕获线程 `modular-clipboard-capture` | 轮询序列号、读取剪贴板内容、投递给 UI | 不碰数据库 |
 
 通信用 `rtrb` 无锁环形队列（容量 128，溢出丢弃而非阻塞）。
 
@@ -136,7 +136,7 @@ registry.register(Box::new(SendToPhoneAction))?;
 
 - **密码管理器屏蔽**：`blocked_apps` 默认含 1Password、Bitwarden、KeePass、KeePassXC，按前缀不区分大小写匹配。
 - **密码框启发式**：检查前台窗口类名是否含 `Credential` / `Password` / `Logon` / `Security` / `Consent`。这是**尽力而为**，Windows 无公开 API 直接查询，因此默认还需配合进程黑名单。
-- **加密存储**：未实现。载荷以明文存于 `%APPDATA%/tiez/blobs/`。这是已知缺口。
+- **加密存储**：未实现。载荷以明文存于 `%APPDATA%/modular-clipboard/blobs/`。这是已知缺口。
 
 ## 构建环境说明
 
@@ -148,11 +148,11 @@ registry.register(Box::new(SendToPhoneAction))?;
 
 ## 已知限制
 
-1. **无托盘常驻**。目前是普通窗口，关闭窗口即退出进程，尚无系统托盘图标。`tiez-platform` 已实现注册表自启读写，但 UI 未接入。
-2. **无全局快捷键**。`tiez-core` 已定义 `Hotkey` 配置项，但 `global-hotkey` 尚未接入服务层——因此当前没有 `Ctrl+Shift+V` 唤出。
+1. **无托盘常驻**。目前是普通窗口，关闭窗口即退出进程，尚无系统托盘图标。`modular-clipboard-platform` 已实现注册表自启读写，但 UI 未接入。
+2. **无全局快捷键**。`modular-clipboard-core` 已定义 `Hotkey` 配置项，但 `global-hotkey` 尚未接入服务层——因此当前没有 `Ctrl+Shift+V` 唤出。
 3. **图片无缩略图预览**。详情面板只显示尺寸描述，未渲染实际图片。
 4. **单页加载上限 2000 条**，未实现分页加载。
-5. **载荷未加密**，明文存于 `%APPDATA%/tiez/blobs/`。
+5. **载荷未加密**，明文存于 `%APPDATA%/modular-clipboard/blobs/`。
 6. **中文字体常驻 35MB**，见上文实测与取舍说明。
 7. **仅在 Windows 上验证过**。其他平台的 `#[cfg(not(windows))]` 分支为最小实现，未实测。
 8. **自动粘贴未做焦点校验**。`auto_paste` 依赖 250ms 固定延迟，在个别卡顿场景下可能丢失按键。
