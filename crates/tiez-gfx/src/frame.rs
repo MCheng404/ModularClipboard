@@ -627,10 +627,8 @@ impl<'a> StagingArena<'a> {
         // 优先本帧已占用的块（追加），其次**真正空闲**的块（接管）。
         //
         // 这里的「空闲」必须严格是 `owner_frame == FREE`。
-        // 「本帧已占用的块可追加」是安全的，**前提是退休按帧号差值进行**
-        // （见 retire_previous_slots）。若改成按 fence 身份退休则不安全：
-        // allocate 发生在 note_submitted 之前，分配时 chunk.fence 还是
-        // null，漏记的块永远退休不掉 ⇒ 每帧都被当作可追加 ⇒ use-after-free。
+        // 「本帧已占用的块可追加」是安全的：同帧的写入都还没提交，
+        // GPU 不可能读到。跨帧复用则必须等退休（见 retire_frame）。
         let pick = self
             .chunks
             .iter()
@@ -650,10 +648,20 @@ impl<'a> StagingArena<'a> {
             }
         };
 
-        let need_new = self.chunks[i].capacity < aligned;
+        // 剩余空间不够**本次追加**时才重建。
+        //
+        // 必须减掉 cursor：同帧内多次上传会往同一块追加，只比较
+        // `capacity < aligned` 会在cursor 已接近容量时判定「够用」，
+        // 随后返回的切片size 变成 0（`capacity - cursor` 下溢），
+        // 写入被validate_staging_write 拒绝或更糟——越界写。
+        let used = self.chunks[i].cursor;
+        let need_new = self.chunks[i].capacity.saturating_sub(used) < aligned;
         if need_new {
-            // 目标容量：至少装下本次请求，且不低于下限。
-            let want = aligned.max(MIN_STAGING_CAPACITY);
+            // 目标容量：既要装下「已用 + 本次」，也不低于下限。
+            let want = used
+                .checked_add(aligned)
+                .unwrap_or(vk::DeviceSize::MAX)
+                .max(MIN_STAGING_CAPACITY);
             self.rebuild_chunk(i, want, frame)?;
         }
 
@@ -737,7 +745,7 @@ impl<'a> StagingArena<'a> {
     ///
     /// 供不方便拿到具体栅栏的场景使用（如 [`FrameRenderer`] 重建
     /// 交换链后统一回收）。**常规帧循环不需要它**——`acquire` 走的是
-    /// [`StagingArena::retire_previous_slots`]，更快且不依赖 fence 记账。
+    /// [`StagingArena::retire_frame`]，有精确的帧号凭据，无需查询栅栏。
     ///
     /// 必须在 `reset_fences` 之前调用，见该方法的说明。
     pub fn retire(&mut self) {
@@ -796,6 +804,24 @@ impl<'a> StagingArena<'a> {
     ) -> anyhow::Result<()> {
         let gpu = self.gpu;
         let device = &gpu.device;
+
+        // 不变式守卫：重建会 `free_memory` 掉旧块，而旧块若仍被在途命令
+        // 引用（属于别的、尚未退休的帧），释放它就是 use-after-free，
+        // 症状为随机花屏或设备丢失。
+        //
+        // 允许的两种情况：
+        // - 块从未物化过（首次分配）；
+        // - 块属于当前帧（同一帧内追加写，尚未提交，GPU 不可能读到）。
+        //
+        // 属于**其它**帧时直接拒绝，而不是「反正没人读」——
+        // 那种情况下限一旦被绕过，后果是驱动层崩溃，很难归因。
+        let owner = self.chunks[i].owner_frame;
+        anyhow::ensure!(
+            !self.chunks[i].materialized || owner == FREE || owner == frame,
+            "拒绝重建在途 staging 块 {i}：它属于帧 {owner}，而当前是帧 {frame}。\
+             该块的显存可能仍被在途命令引用，释放会导致 use-after-free"
+        );
+
         let info = vk::BufferCreateInfo::default()
             .size(capacity)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
@@ -2686,5 +2712,102 @@ mod tests {
         let not_pending = can_record_upload(false, false).unwrap_err().to_string();
         assert!(not_pending.contains("acquire"));
         assert!(!not_pending.contains("GPU"));
+    }
+
+    // -- retire_frame：多帧在途下 arena 不会耗尽 ---------------------------
+
+    /// 用纯逻辑块复现 arena 的「选块 + 按帧号退休」两层规则。
+    ///
+    /// 真实 `StagingArena` 需要 `&Gpu`，无法在单测里构造。
+    /// 这两层值得单测：它们曾让 arena **每帧新占一块、N 帧后必然耗尽**
+    /// （`cutoff = current_frame - N` 恒小于当前帧，永远追不上），
+    /// 症状是第 4 帧就`ERROR_DEVICE_LOST`，极难回溯到退休策略。
+    struct FakeArena {
+        /// (owner_frame, cursor)；`F_FREE` 表示空闲。
+        chunks: Vec<(u64, vk::DeviceSize)>,
+    }
+    const F_FREE: u64 = u64::MAX;
+
+    impl FakeArena {
+        fn new(n: usize) -> Self {
+            Self {
+                chunks: vec![(F_FREE, 0); n],
+            }
+        }
+        /// 与 `StagingArena::allocate` 的选块规则一致。
+        fn pick(&self, frame: u64) -> Option<usize> {
+            self.chunks
+                .iter()
+                .position(|c| c.0 == frame)
+                .or_else(|| self.chunks.iter().position(|c| c.0 == F_FREE))
+        }
+        /// 与 `StagingArena::retire_frame` 一致。
+        fn retire_frame(&mut self, frame: u64) {
+            for c in &mut self.chunks {
+                if c.0 != F_FREE && c.0 <= frame {
+                    *c = (F_FREE, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retire_frame_keeps_arena_from_exhausting() {
+        // 3 块 / 3 槽位跑 10 帧：每帧退休「上一轮占用本槽位」的那一帧。
+        let mut a = FakeArena::new(3);
+        let mut last = [F_FREE; 3];
+        for f in 1..=10u64 {
+            let slot = (f as usize - 1) % 3;
+            if last[slot] != F_FREE {
+                a.retire_frame(last[slot]);
+                last[slot] = F_FREE;
+            }
+            let i = a
+                .pick(f)
+                .unwrap_or_else(|| panic!("帧 {f} 无可用 staging 块（arena 耗尽）"));
+            a.chunks[i].0 = f;
+            last[slot] = f;
+        }
+    }
+
+    #[test]
+    fn retire_frame_does_not_free_newer_frames() {
+        // 退休帧 3 绝不能放掉帧 4/5 的块——那些块的 GPU 工作还没完成，
+        // 复用它们就是 use-after-free。
+        let mut a = FakeArena::new(4);
+        a.chunks[0] = (3, 10);
+        a.chunks[1] = (4, 20);
+        a.chunks[2] = (5, 30);
+        a.retire_frame(3);
+        assert_eq!(a.chunks[0].0, F_FREE, "帧 3 应被退休");
+        assert_eq!(a.chunks[0].1, 0, "退休后游标必须归零");
+        assert_eq!(a.chunks[1].0, 4, "帧 4 更新，不该被牵连");
+        assert_eq!(a.chunks[2].0, 5, "帧 5 最新，不该被牵连");
+    }
+
+    #[test]
+    fn retire_frame_is_idempotent() {
+        let mut a = FakeArena::new(2);
+        a.chunks[0] = (2, 5);
+        for _ in 0..3 {
+            a.retire_frame(2);
+        }
+        assert_eq!(a.chunks[0].0, F_FREE, "重复退休应保持幂等");
+        assert_eq!(a.chunks[0].1, 0);
+    }
+
+    #[test]
+    fn arena_growth_accounts_for_cursor_not_just_request() {
+        // 回归：`need_new` 曾只比较 `capacity < aligned`，忽略 cursor。
+        // 同帧内多次追加时 cursor 接近容量、remaining 不足却被判为够用
+        // ⇒ 返回 size = capacity - cursor（下溢为 0）或越界写。
+        let cap: vk::DeviceSize = 65536;
+        let cursor: vk::DeviceSize = 60000;
+        let aligned: vk::DeviceSize = 8192;
+        assert!(cap >= aligned, "只看请求会误判够用");
+        assert!(
+            cap - cursor < aligned,
+            "扣掉 cursor 后必须判定需要扩容"
+        );
     }
 }
