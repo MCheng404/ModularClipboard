@@ -413,21 +413,16 @@ fn run() -> anyhow::Result<()> {
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
         // upload 的收尾已把布局推到 SHADER_READ_ONLY_OPTIMAL，
         // 读回需要 TRANSFER_SRC_OPTIMAL。
-        let mut bar = modular_clipboard_gfx::image_barrier(
-            image.image,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        // 必须走库 API：裸调image_barrier 不会回写 `image.layout`，
+        // 状态失同步后下一次 upload 会用过期的oldLayout 算屏障 ⇒ 设备丢失。
+        image.transition_to(
+            cmd,
+            &gpu.device,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::AccessFlags::SHADER_READ,
             vk::AccessFlags::TRANSFER_READ,
-        );
-        gpu.device.cmd_pipeline_barrier(
-            cmd,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            std::slice::from_mut(&mut bar),
         );
         gpu.device.cmd_copy_image_to_buffer(
             cmd,
@@ -671,22 +666,19 @@ fn run_mode_c() -> anyhow::Result<()> {
                     vk::AccessFlags::SHADER_READ,
                 )
             };
-            let mut b1 = modular_clipboard_gfx::image_barrier(
-                image.image,
-                old_layout,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                src_access,
-                vk::AccessFlags::TRANSFER_WRITE,
-            );
             unsafe {
-                gpu.device.cmd_pipeline_barrier(
+                // 走transition_to 而非裸 image_barrier：前者会自动从
+                // self.layout 取old_layout 并回写新布局。手写屏障漏掉回写
+                // 会让 layout 字段与图像实际布局失同步——这类缺陷不报错、
+                // 只是屏障静默失效，必须靠 API 约束而非人工纪律来防。
+                image.transition_to(
                     cmd,
+                    &gpu.device,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    src_access,
+                    vk::AccessFlags::TRANSFER_WRITE,
                     src_stage,
                     vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    std::slice::from_mut(&mut b1),
                 );
                 let copy = modular_clipboard_gfx::texture::buffer_image_copy(Some((x, y)), w, h)
                     .buffer_offset(cursor);
@@ -697,21 +689,14 @@ fn run_mode_c() -> anyhow::Result<()> {
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &[copy],
                 );
-                let mut b2 = modular_clipboard_gfx::image_barrier(
-                    image.image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                image.transition_to(
+                    cmd,
+                    &gpu.device,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     vk::AccessFlags::TRANSFER_WRITE,
                     vk::AccessFlags::SHADER_READ,
-                );
-                gpu.device.cmd_pipeline_barrier(
-                    cmd,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    std::slice::from_mut(&mut b2),
                 );
             }
             image.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
@@ -735,27 +720,24 @@ fn run_mode_c() -> anyhow::Result<()> {
         }
     }
 
+    // 读回后转回着色器可读状态，同样必须走库 API。
+    image.restore_after_readback(&gpu, cmd)?;
     // 读回校验：与模式 A 共用同一个比对函数。
     unsafe {
         gpu.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         gpu.device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
-        let mut bar = modular_clipboard_gfx::image_barrier(
-            image.image,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        // 必须走库 API：裸调image_barrier 不会回写 `image.layout`，
+        // 状态失同步后下一次 upload 会用过期的oldLayout 算屏障 ⇒ 设备丢失。
+        image.transition_to(
+            cmd,
+            &gpu.device,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::AccessFlags::SHADER_READ,
             vk::AccessFlags::TRANSFER_READ,
-        );
-        gpu.device.cmd_pipeline_barrier(
-            cmd,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            std::slice::from_mut(&mut bar),
         );
         let copy = vk::BufferImageCopy::default()
             .buffer_offset(0)
