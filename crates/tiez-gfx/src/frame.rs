@@ -624,7 +624,13 @@ impl<'a> StagingArena<'a> {
         let aligned = align_up(size, STAGING_ALIGNMENT);
         let frame = self.current_frame;
 
-        // 优先本帧已占用的块（追加），其次空闲块（接管）。
+        // 优先本帧已占用的块（追加），其次**真正空闲**的块（接管）。
+        //
+        // 这里的「空闲」必须严格是 `owner_frame == FREE`。
+        // 「本帧已占用的块可追加」是安全的，**前提是退休按帧号差值进行**
+        // （见 retire_previous_slots）。若改成按 fence 身份退休则不安全：
+        // allocate 发生在 note_submitted 之前，分配时 chunk.fence 还是
+        // null，漏记的块永远退休不掉 ⇒ 每帧都被当作可追加 ⇒ use-after-free。
         let pick = self
             .chunks
             .iter()
@@ -695,28 +701,49 @@ impl<'a> StagingArena<'a> {
     /// # 幂等
     ///
     /// 已空闲的块没有栅栏，直接跳过；重复传入同一栅栏不会二次释放。
-    pub fn retire_frame(&mut self, fence: vk::Fence) {
-        if fence.is_null() {
-            return;
-        }
+    /// 退休一块 staging：标记为空闲、游标归零。
+    pub fn retire_chunk(&mut self, index: usize) {
+        let c = &mut self.chunks[index];
+        c.owner_frame = FREE;
+        c.fence = vk::Fence::null();
+        c.cursor = 0;
+    }
+
+    /// 退休「上一轮槽位」占用的所有块。
+    ///
+    /// # 为什么按槽位而不是按栅栏身份退休
+    ///
+    /// 曾用「按 fence 身份匹配」的做法，但那条路是错的：
+    /// `allocate` 发生在 `note_submitted` **之前**，所以分配时
+    /// `chunk.fence` 还是 null。若某块没被正确记上 fence，
+    /// 它就永远退休不掉，于是每帧都会被当作可追加的块——
+    /// 而 GPU 可能仍在读上上帧写入的数据 ⇒ use-after-free，
+    /// 表现为随机花屏或设备丢失。
+    ///
+    /// 槽位轮转是**可推算**的：`acquire` 里等完栅栏后，
+    /// 上一轮占用的那些块必然已经安全。块数≥ 槽位数保证有空闲块可用。
+    pub fn retire_previous_slots(&mut self, slots_in_flight: usize) {
+        let cutoff = self.current_frame.saturating_sub(slots_in_flight as u64);
         for c in &mut self.chunks {
             if c.owner_frame == FREE {
-                continue; // 已空闲
+                continue;
             }
-            if c.fence != fence {
-                continue; // 属于其它帧，等各自的栅栏
+            // 落后足够的块，其栅栏早已等过（acquire 里等的是本槽位的）。
+            if c.owner_frame <= cutoff {
+                c.owner_frame = FREE;
+                c.fence = vk::Fence::null();
+                c.cursor = 0;
             }
-            c.owner_frame = FREE;
-            c.fence = vk::Fence::null();
-            c.cursor = 0;
         }
     }
 
     /// 退休所有「栅栏已 signal」的块。
     ///
+    /// 按 `get_fence_status` 实际查询来退休：只有真正 signal 的块才敢复用。
+    ///
     /// 供不方便拿到具体栅栏的场景使用（如 [`FrameRenderer`] 重建
     /// 交换链后统一回收）。**常规帧循环不需要它**——`acquire` 走的是
-    /// 语义更明确的 [`StagingArena::retire_frame`]。
+    /// [`StagingArena::retire_previous_slots`]，更快且不依赖 fence 记账。
     ///
     /// 必须在 `reset_fences` 之前调用，见该方法的说明。
     pub fn retire(&mut self) {
@@ -1315,6 +1342,17 @@ impl<'a> FrameRenderer<'a> {
 
     /// 取下一张可绘制的交换链图像。
     ///
+    /// **重要**：`FrameRenderer::new` 分配描述符集后**不会**填充它们——
+    /// 因为此时还没有字体纹理。调用方必须在第一次 `acquire` 之前调用
+    /// [`Self::update_uniform_binding`] 与 [`Self::update_texture_binding`]。
+    ///
+    /// 跳过这一步的后果不是「画错」，而是**设备丢失**：未初始化的描述符集
+    /// 内容是未定义值，着色器一旦解引用就是 UB，驱动会返回
+    /// `ERROR_DEVICE_LOST`。这是实测踩过的坑（`upload_probe` 崩在
+    /// `acquire`，报 "descriptor set not updated"）。
+    ///
+    /// 交换链重建后同理要重绑，见 [`Self::rebind_after_rebuild`]。
+    ///
     /// 返回 `Ok(None)` 表示交换链已过期（或本次没抢到图像），
     /// 调用方**必须**先 [`FrameRenderer::rebuild_swapchain`] 再继续。
     /// 成功时本帧的命令录制已经开始（布局转换 + 渲染通道开启 + 管线绑定）。
@@ -1336,8 +1374,11 @@ impl<'a> FrameRenderer<'a> {
             let fence = self.slots[slot].fence;
             unsafe { self.gpu.device.wait_for_fences(&[fence], true, FENCE_TIMEOUT)? };
 
-            // 栅栏已 signal：占用该槽位的那一帧 staging 可以安全复用。
-            self.staging.retire_frame(fence);
+            // 栅栏已 signal：占用该槽位的那几帧 staging 可以安全复用。
+            // 按帧号差值退休（落后 >= 槽位数即安全），而不是按 fence 身份——
+            // 见retire_previous_slots 的说明：fence 身份记账不可靠。
+            let n = self.slots.len();
+            self.staging.retire_previous_slots(n);
             self.slots[slot].in_flight = false;
 
             unsafe { self.gpu.device.reset_fences(&[fence])? };
@@ -1391,11 +1432,24 @@ impl<'a> FrameRenderer<'a> {
     }
 
     /// 录制绘制命令。必须紧跟在成功的 [`FrameRenderer::acquire`] 之后。
+    ///
+    /// # 前置条件
+    ///
+    /// `batches` 非空时，**必须**已经对该帧槽位调用过
+    /// [`FrameRenderer::update_uniform_binding`] 与
+    /// [`FrameRenderer::update_texture_binding`]。
+    /// `allocate_descriptor_sets` 分配出的集合内容是未初始化的，
+    /// 绑定后交给 GPU 会解引用垃圾值（UB → 丢设备）。
+    /// 本方法不代为校验这一点——它无法知道资源层是否已写入。
+    ///
+    /// `batches` 为空时只清屏、不绑定任何描述符集，因此是安全的。
     pub fn record(&mut self, input: &DrawInput<'_>) -> anyhow::Result<()> {
         let Some(pending) = self.pending.as_ref() else {
             anyhow::bail!("record 必须在 acquire 之后调用");
         };
         let slot = pending.slot;
+        // 先取出再borrow self：下面 begin_render_pass 需要 &mut self。
+        let framebuffer = pending.frame.framebuffer;
         let device = &self.gpu.device;
         let cmd = self.slots[slot].command_buffer;
 
@@ -1419,6 +1473,38 @@ impl<'a> FrameRenderer<'a> {
             device.cmd_set_scissor(cmd, 0, std::slice::from_ref(&scissor));
         }
 
+        // 没有批次就只清屏。
+        //
+        // ⚠️ 渲染通道**此刻才开启**（而非在 acquire 时）：纹理上传必须录在
+        // 渲染通道作用域**之外**，Vulkan 不允许在通道内录传输命令。
+        //
+        // ⚠️ 描述符集绑定必须放在 `drawable.is_empty()` 判断**之后**。
+        // `allocate_descriptor_sets` 分配出的集合内容是**未初始化**的，
+        // 着色器又声明了 binding 0/1/2，绑上去GPU 就会解引用垃圾值
+        // （UB → 丢设备）。「不绑定」严格优于「绑定一个假的」。
+        let drawable: Vec<DrawBatch> = input
+            .batches
+            .iter()
+            .copied()
+            .filter(|b| b.index_count > 0)
+            .collect();
+
+        // 通道总是要开——即使无批次也要走一遍 clear + present，
+        // 否则交换链图像内容未定义。
+        self.begin_render_pass(framebuffer);
+        if drawable.is_empty() {
+            return Ok(());
+        }
+
+        let cmd = self.slots[slot].command_buffer;
+        unsafe {
+            device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.bundle.pipeline,
+            );
+        }
+
         let set = if input.descriptor_set.is_null() {
             self.slots[slot].descriptor_set
         } else {
@@ -1435,19 +1521,6 @@ impl<'a> FrameRenderer<'a> {
                 &[],
             );
         }
-
-        // 没有批次就只清屏。此时不绑定缓冲——绑定空句柄虽不崩，
-        // 但会让调试器里的抓帧变得难以解释。
-        let drawable: Vec<DrawBatch> = input
-            .batches
-            .iter()
-            .copied()
-            .filter(|b| b.index_count > 0)
-            .collect();
-        if drawable.is_empty() {
-            return Ok(());
-        }
-
         let buffers = [input.vertex_buffer];
         let offsets = [input.vertex_offset];
         let index_buffer = input.index_buffer;
@@ -1720,6 +1793,27 @@ impl<'a> FrameRenderer<'a> {
             );
         }
 
+        // 渲染通道**不在这里**开启。
+        //
+        // Vulkan 规定：渲染通道作用域内只能录制绘制/丢弃类命令，
+        // `vkCmdCopyBufferToImage` 等传输命令在渲染通道内是**非法**的，
+        // 驱动会报验证错误甚至直接丢设备（实测 ERROR_DEVICE_LOST）。
+        // 而纹理上传必须在 acquire 之后、record 之前发生——若此处开了
+        // 通道，上传命令就一定落在作用域内。
+        //
+        // 因此改为延迟到 [`FrameRenderer::record`] 再开启，
+        // 让 acquire 与 record 之间的上传录制处于通道之外。
+        let _ = frame;
+        Ok(())
+    }
+
+    /// 开启本帧的渲染通道（由 [`FrameRenderer::record`] 调用）。
+    fn begin_render_pass(&mut self, framebuffer: vk::Framebuffer) {
+        let device = &self.gpu.device;
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        let cmd = self.slots[pending.slot].command_buffer;
         let clear = vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: self.clear_color,
@@ -1733,18 +1827,12 @@ impl<'a> FrameRenderer<'a> {
         let begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.bundle.render_pass)
             // 绝不能传空 framebuffer：未定义行为，驱动直接崩。
-            .framebuffer(frame.framebuffer)
+            .framebuffer(framebuffer)
             .render_area(area)
             .clear_values(&clear_values);
         unsafe {
-            device.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.bundle.pipeline,
-            );
             device.cmd_begin_render_pass(cmd, &begin, vk::SubpassContents::INLINE);
         }
-        Ok(())
     }
 
     /// 按当前交换链的图像数重建命令缓冲 / 栅栏 / 信号量 / 描述符集。

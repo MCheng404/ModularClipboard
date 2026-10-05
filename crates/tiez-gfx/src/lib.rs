@@ -20,6 +20,7 @@ pub mod frame;
 pub mod pipeline;
 pub mod shader;
 pub mod texture;
+pub mod window;
 
 use ash::{Device, Entry, Instance as AshInstance, khr, vk};
 use khr::surface::Instance as SurfaceLoader;

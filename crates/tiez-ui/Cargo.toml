@@ -8,7 +8,11 @@ license.workspace = true
 tiez-core = { workspace = true }
 tiez-store = { workspace = true }
 tiez-app = { workspace = true }
+# 渲染后端：ash 直驱的原生 Vulkan（原先经 eframe/wgpu，现已移除）。
+tiez-gfx = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-eframe = { workspace = true }
 egui = { workspace = true }
+# 与渲染桥直接交互的句柄类型；顶点数据用 bytemuck 投递给缓冲。
+ash = { workspace = true }
+bytemuck = { workspace = true }

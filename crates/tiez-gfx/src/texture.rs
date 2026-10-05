@@ -308,15 +308,12 @@ impl DeviceImage {
         let old_layout = self.layout;
 
         // 第一次过渡：进入传输目标布局。
+        let (src_stage, src_access) = upload_barrier_scope(old_layout);
         let to_transfer = image_barrier(
             image,
             old_layout,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            match old_layout {
-                // UNDEFINED 表示内容无需保留，此前没有任何访问需要等待。
-                vk::ImageLayout::UNDEFINED => vk::AccessFlags::empty(),
-                _ => vk::AccessFlags::SHADER_READ,
-            },
+            src_access,
             vk::AccessFlags::TRANSFER_WRITE,
         );
         // 第二次过渡：交给片元着色器读。
@@ -336,7 +333,7 @@ impl DeviceImage {
         unsafe {
             device.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                src_stage,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -465,6 +462,50 @@ pub fn buffer_image_copy(
             height,
             depth: 1,
         })
+}
+
+/// 计算「转入 `TRANSFER_DST_OPTIMAL`」这道屏障的源阶段与源访问掩码。
+///
+/// # 为什么 srcStage 必须随布局变化
+///
+/// 屏障的 `srcStageMask` 决定**等谁**，`srcAccessMask` 决定**等什么**。
+/// 两者必须匹配：若srcAccess 声明了「要等片元着色器的读」，而 srcStage
+/// 却是 `TOP_OF_PIPE`，这道屏障就成了空操作——`TOP_OF_PIPE` 在规范里
+/// 逻辑上早于所有其它阶段，**不等待任何东西**。
+///
+/// 这属于「依赖驱动宽容」而非「规范正确」：桌面驱动往往仍然正确地
+/// 完成排障，但换驱动 / 开验证层（`VK_LAYER_KHRONOS_validation` 的
+/// `SYNC-HAZARD-READ-WRITE`）就会报同步错误。
+///
+/// # 三种情形
+///
+/// - `UNDEFINED`：内容无需保留，此前没有任何访问，**无需等待**。
+/// - `SHADER_READ_ONLY_OPTIMAL`：上一帧的片元着色器可能还在读，
+///   **必须等片元阶段**。
+/// - `TRANSFER_DST_OPTIMAL`：上一次拷贝的 `TRANSFER_WRITE` 可能还在进行，
+///   **必须等传输阶段**。这一分支平时走不到（每次 `upload` 收尾都会转到
+///   `SHADER_READ_ONLY_OPTIMAL`），但若将来有人在两次 upload 之间插入
+///   拷贝，没有这个分支就会用错误的访问掩码静默出错。
+///
+/// 纯函数，可脱离 GPU 单测。
+fn upload_barrier_scope(
+    old_layout: vk::ImageLayout,
+) -> (vk::PipelineStageFlags, vk::AccessFlags) {
+    match old_layout {
+        vk::ImageLayout::UNDEFINED => (
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::empty(),
+        ),
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL => (
+            vk::PipelineStageFlags::TRANSFER,
+            vk::AccessFlags::TRANSFER_WRITE,
+        ),
+        // 其余（主要是 SHADER_READ_ONLY_OPTIMAL）：按片元着色器读处理。
+        _ => (
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        ),
+    }
 }
 
 /// 校验一次局部更新是否落在图像范围内。
@@ -903,6 +944,77 @@ mod tests {
     }
 
     #[test]
+    /// 屏障的 srcStage 与 srcAccess 必须匹配。
+    ///
+    /// 这是本组最重要的不变量：`TOP_OF_PIPE` 不等待任何东西，
+    /// 若同时声明了非空 srcAccess，屏障就是空操作。
+    /// 曾经的 bug 正是「srcAccess=SHADER_READ 却配TOP_OF_PIPE」。
+    #[test]
+    fn barrier_scope_pairs_stage_with_access() {
+        // UNDEFINED：无需等待
+        let (stage, access) = upload_barrier_scope(vk::ImageLayout::UNDEFINED);
+        assert_eq!(stage, vk::PipelineStageFlags::TOP_OF_PIPE);
+        assert!(
+            access.is_empty(),
+            "UNDEFINED 表示内容无需保留，不应等待任何访问"
+        );
+
+        // SHADER_READ_ONLY_OPTIMAL：等片元着色器的读
+        let (stage, access) = upload_barrier_scope(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        assert_eq!(stage, vk::PipelineStageFlags::FRAGMENT_SHADER);
+        assert_eq!(access, vk::AccessFlags::SHADER_READ);
+
+        // TRANSFER_DST_OPTIMAL：等上一次的传输写
+        let (stage, access) = upload_barrier_scope(vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        assert_eq!(stage, vk::PipelineStageFlags::TRANSFER);
+        assert_eq!(access, vk::AccessFlags::TRANSFER_WRITE);
+    }
+
+    /// 穷举所有布局，断言「srcAccess 非空 ⇒ srcStage 不是 TOP_OF_PIPE」。
+    ///
+    /// 上一条测的是具体取值；这条测的是**不变式本身**——
+    /// 将来有人新增分支、错配了阶段与访问掩码，这里立刻发现。
+    #[test]
+    fn barrier_never_pairs_access_with_top_of_pipe() {
+        let layouts = [
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::PREINITIALIZED,
+        ];
+        for l in layouts {
+            let (stage, access) = upload_barrier_scope(l);
+            if !access.is_empty() {
+                assert!(
+                    !stage.contains(vk::PipelineStageFlags::TOP_OF_PIPE),
+                    "布局 {l:?} 声明了等待 {access:?}，却用 TOP_OF_PIPE 作srcStage——\
+                     这道屏障不会等待任何东西，是空操作"
+                );
+            }
+        }
+    }
+
+    /// `GENERAL` 等布局也不能漏——旧实现用 `_ =>`兜底，
+    /// 任何非UNDEFINED 布局都拿 SHADER_READ。这里明确 GENERAL 走等待分支。
+    #[test]
+    fn non_undefined_layouts_all_wait() {
+        for l in [
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        ] {
+            let (_, access) = upload_barrier_scope(l);
+            assert!(
+                !access.is_empty(),
+                "布局 {l:?} 不是 UNDEFINED，必须等待之前的访问完成"
+            );
+        }
+    }
+
     fn region_validation_uses_wide_arithmetic() {
         // u32 加法若在 u32 下做，u32::MAX + 1 会回绕成 0 而误判为合法。
         // 这里确认实现用的是不会回绕的运算。

@@ -93,8 +93,15 @@ fn run() -> anyhow::Result<()> {
     }?;
     println!("OK CreateWindowExW");
 
-    // 跑消息循环让窗口完成显示。Win32 要求窗口真正可见后表面才可用。
+    // 跑消息循环让窗口完成显示。
+    //
+    // ⚠️ `ShowWindow` 不能省。窗口在不可见状态时，Win32 的表面
+    // 无法呈现，`acquire_next_image` 会让驱动进入不可恢复的状态——
+    // 实测症状是**首次 acquire 就报「逻辑设备已丢失」**，而不是任何
+    // 指向「窗口没显示」的错误信息。`pipeline_probe` 早就有这一行，
+    // 本探针最初漏了，排查了很久。
     unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
         let mut msg: MSG = std::mem::zeroed();
         for _ in 0..100 {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -104,7 +111,7 @@ fn run() -> anyhow::Result<()> {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
-    println!("OK message loop pumped");
+    println!("OK window shown + message loop pumped");
 
     let gpu = Gpu::new("ModularClipboardUploadProbe", hinstance.into(), hwnd.into())?;
     let device_name = device_name_of(&gpu);
@@ -163,7 +170,9 @@ fn run() -> anyhow::Result<()> {
     );
     println!("OK pipeline bundle (RenderPass+Layout+SPIR-V)");
 
+    alive(&gpu, "建管线后");
     let mut fr = tiez_gfx::frame::FrameRenderer::new(&gpu, bundle)?;
+    alive(&gpu, "FrameRenderer::new 后");
     println!(
         "OK FrameRenderer  extent={}x{}  在飞槽位={}",
         fr.extent().width,
@@ -184,6 +193,7 @@ fn run() -> anyhow::Result<()> {
             | vk::ImageUsageFlags::TRANSFER_SRC,
     )?;
     println!("OK DeviceImage {TEX}x{TEX} {FONT_FORMAT:?}（含 TRANSFER_SRC 供读回）");
+    alive(&gpu, "创建 DeviceImage 后");
 
     // 读回缓冲必须是**主机可见**的。`Buffer::new` 要求 DEVICE_LOCAL，
     // 在独显上那是不可映射的显存，`map_memory` 会直接失败。
@@ -195,9 +205,11 @@ fn run() -> anyhow::Result<()> {
         vk::SharingMode::EXCLUSIVE,
     )?;
     println!("OK readback buffer（{tex_bytes} 字节，主机可见）");
+    alive(&gpu, "创建 readback 后");
 
     // CPU 侧影子缓冲：记录「GPU 上应该是什么样」。最终逐字节比对。
     let mut shadow = vec![0u8; (TEX * TEX) as usize];
+    alive(&gpu, "进入帧循环前");
 
     // ---- 逐帧上传 ----------------------------------------------------
     let t0 = Instant::now();
@@ -408,6 +420,18 @@ fn print_in_flight_is_unreachable() {
 // ---------------------------------------------------------------------------
 // 上传计划（纯逻辑，可离线复核）
 // ---------------------------------------------------------------------------
+
+/// 打印一个标记，并检查设备是否仍然存活。
+///
+/// 设备丢失（`ERROR_DEVICE_LOST`）在后续所有调用里都表现为同一个错误，
+/// 但**根因**往往在更早的某一步。不逐段检查的话，只会看到
+/// 「acquire 报设备丢失」这种把矛头指向错误位置的假象。
+fn alive(gpu: &Gpu, tag: &str) {
+    match unsafe { gpu.device.device_wait_idle() } {
+        Ok(()) => println!("   [存活] {tag}"),
+        Err(e) => println!("   [设备已丢失] {tag}: {e:?}"),
+    }
+}
 
 /// 线性同余发生器。
 ///

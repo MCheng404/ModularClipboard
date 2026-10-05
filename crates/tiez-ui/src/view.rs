@@ -39,12 +39,12 @@ const ROW_HEIGHT: f32 = 46.0;
 
 /// 主视图。返回 `true` 表示请求退出应用。
 ///
-/// eframe 0.36 已经提供了可直接绘制的中央 `Ui`，因此这里不再自行创建
-/// `Window`，也无需处理视口命令。
+/// 由 `Context::run_ui` 提供的根 `Ui` 覆盖整个客户区，本函数直接往里画，
+/// 不再自行创建 `Window`，也无需处理视口命令。
 pub fn draw(ui: &mut Ui, svc: &mut Service, local: &mut UiLocal) -> bool {
     let dark = match svc.state.config.ui.dark_mode {
         Some(v) => v,
-        None => ui.ctx().style_of(eframe::egui::Theme::Dark).visuals.dark_mode,
+        None => ui.ctx().style_of(egui::Theme::Dark).visuals.dark_mode,
     };
     let pal = if dark { Palette::dark() } else { Palette::light() };
     let scale = svc.state.config.ui.font_scale;
