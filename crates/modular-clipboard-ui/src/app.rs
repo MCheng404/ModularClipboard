@@ -61,10 +61,10 @@ const TRAY_TOOLTIP: &str = "模块化剪切板 — 正在后台记录剪贴板";
 
 /// 启动图形界面。`config` 为初始配置。
 pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
-    run_with_capture_override(config, false)
+    run_with_options(config, false, None)
 }
 
-/// 同[`run`]，但显式声明 `config.capture.enabled` 是否为命令行临时覆盖。
+/// 同 [`run`]，但显式声明 `config.capture.enabled` 是否为命令行临时覆盖。
 ///
 /// `--no-capture` 会把它置false 以便调试时不动真实剪贴板；
 /// 若这个临时值被 [``Service::save_config``] 写进config.json，
@@ -73,6 +73,18 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
 pub fn run_with_capture_override(
     config: modular_clipboard_core::Config,
     capture_is_override: bool,
+) -> anyhow::Result<()> {
+    run_with_options(config, capture_is_override, None)
+}
+
+/// 同 [`run`]，并接受 `--data-dir` 指定的���据目录。
+///
+/// `data_dir` 一路传到 [`Service::with_data_dir`]：数据库、载荷目录、
+/// 配置文件三者都由它派生。传 `None` 时用 `%APPDATA%/modular-clipboard`。
+pub fn run_with_options(
+    config: modular_clipboard_core::Config,
+    capture_is_override: bool,
+    data_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     // `Window::new` 的宽高是**物理像素**，而配置里存的是逻辑点。
     // DPI 缩放在窗口创建后才可查，因此先按 1.0 换算——创建后第一帧的
@@ -157,7 +169,7 @@ pub fn run_with_capture_override(
     tracing::info!(extent = ?fr.extent(), slots = fr.slot_count(), "渲染器就绪");
 
     // ---- egui -----------------------------------------------------------
-    let mut app = App::new(config, capture_is_override);
+    let mut app = App::new(config, capture_is_override, data_dir);
     let ctx = app.ctx.clone();
 
     // ---- 托盘常驻--------------------------------------------------------
@@ -420,14 +432,17 @@ pub struct App {
 
 impl App {
     /// 按配置初始化业务状态与视觉风格。
+    ///
+    /// `data_dir` 对应 `--data-dir`：`None` 时用默认数据目录。
     pub fn new(
         config: modular_clipboard_core::Config,
         capture_is_override: bool,
+        data_dir: Option<&std::path::Path>,
     ) -> Self {
         let ctx = egui::Context::default();
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
 
-        let mut svc = match Service::new(config) {
+        let mut svc = match Service::with_data_dir(config, data_dir) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(%e, "服务初始化失败，界面将以空状态运行");

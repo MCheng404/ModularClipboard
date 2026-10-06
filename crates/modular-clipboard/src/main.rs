@@ -6,7 +6,7 @@
 //! 3. 初始化日志；
 //! 4. 启动界面与后台捕获。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use modular_clipboard_core::Config;
 
@@ -67,10 +67,41 @@ fn print_help() {
     );
 }
 
-fn config_path() -> PathBuf {
-    directories::ProjectDirs::from("", "", "modular-clipboard")
-        .map(|d| d.config_dir().join("config.json"))
-        .unwrap_or_else(|| PathBuf::from("modular-clipboard-config.json"))
+fn config_path(data_dir: Option<&Path>) -> PathBuf {
+    match data_dir {
+        // `--data-dir` 指定时，配置与数据库同目录。
+        // 否则读配置在 A 盘、写配置在 B 盘，用户改设置会「不生效」。
+        Some(dir) => modular_clipboard_app::config_path_in(dir),
+        None => directories::ProjectDirs::from("", "", "modular-clipboard")
+            .map(|d| d.config_dir().join("config.json"))
+            .unwrap_or_else(|| PathBuf::from("modular-clipboard-config.json")),
+    }
+}
+
+/// 校验并规范化 `--data-dir`。
+///
+/// 返回绝对路径。三件事必须在这里做，缺一用户都会踩坑：
+/// 1. **空白拒绝**——静默回退默认目录最坏：用户以为在隔离目录做测试，
+///    实际却在污染真实剪贴板历史，且没有任何提示。
+/// 2. **相对路径转绝对**——`--data-dir foo` 之后若进程工作目录变了
+///    （例如从快捷方式启动），同一个参数会指向不同位置。
+/// 3. **提前建目录**——把「路径不可写」这类问题暴露在启动阶段，
+///    而不是等到首次写入载荷时才失败。
+fn resolve_data_dir(raw: &Path) -> Result<PathBuf, String> {
+    if raw.as_os_str().is_empty() || raw.to_string_lossy().trim().is_empty() {
+        return Err("--data-dir 不能为空，请指定一个目录路径".into());
+    }
+    let abs = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("无法获取当前工作目录以解析相对路径 {raw:?}：{e}"))?
+            .join(raw)
+    };
+    std::fs::create_dir_all(&abs).map_err(|e| {
+        format!("无法创建数据目录 {}：{e}", abs.display())
+    })?;
+    Ok(abs)
 }
 
 fn main() {
@@ -88,6 +119,19 @@ fn main() {
         return;
     }
 
+    // `--data-dir` 在这里定型（校验 + 转绝对 + 建目录），
+    // 后面所有层都只接受已经规范化的路径。
+    let data_dir = match args.data_dir.as_deref() {
+        Some(raw) => match resolve_data_dir(raw) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("参数错误: {e}");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+
     // 单实例保护。
     //
     // 剪贴板工具必须后台常驻，用户可能反复双击 exe。
@@ -97,12 +141,16 @@ fn main() {
     //
     // 用命名互斥体实现：内核对象随进程退出自动释放，
     // 崩溃/强杀也不会留下「僵死锁」。
+    //
+    // 互斥体名**不含数据目录**：剪贴板监听是系统级的，全局只能有一个，
+    // 与数据目录无关。若把路径混进名字，用户用两个 `--data-dir` 各启一个
+    // 就会同时监听剪贴板，重复记录——那才是真 bug。
     match SingleInstanceGuard::acquire() {
         Ok(guard) => {
             // 保持 guard 存活到main 返回
             let _guard = guard;
             init_tracing();
-            run_app(args);
+            run_app(args, data_dir);
             return;
         }
         Err(e) => {
@@ -112,9 +160,10 @@ fn main() {
     }
 }
 
-fn run_app(args: Args) {
+fn run_app(args: Args, data_dir: Option<PathBuf>) {
+    let cfg_path = config_path(data_dir.as_deref());
 
-    let mut config = Config::load(&config_path()).unwrap_or_default();
+    let mut config = Config::load(&cfg_path).unwrap_or_default();
     // `--no-capture` 是调试开关：让程序启动但不监听剪贴板。
     // 早前它被解析后从未使用——`app.rs` 无条件调`start_capture()`，
     // 于是加这个 flag 完全没有效果。现在通过 config 传递。
@@ -124,13 +173,16 @@ fn run_app(args: Args) {
     }
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        data_dir = ?config_path().parent(),
+        data_dir = ?data_dir.as_deref().map(|d| d.display().to_string()),
+        config = ?cfg_path,
         "ModularClipboard 启动"
     );
 
-    if let Err(e) =
-        modular_clipboard_ui::run_with_capture_override(config, args.no_capture)
-    {
+    if let Err(e) = modular_clipboard_ui::run_with_options(
+        config,
+        args.no_capture,
+        data_dir.as_deref(),
+    ) {
         tracing::error!(%e, "启动失败");
         eprintln!("启动失败: {e}");
         std::process::exit(1);
@@ -157,6 +209,17 @@ fn init_tracing() {
 // 单实例保护
 // ---------------------------------------------------------------------------
 
+/// 单实例互斥体名。
+///
+/// 全局固定，**不嵌入数据目录**：剪贴板监听是系统级资源，
+/// 同一台机器只应有一个监听者，与数据目录无关。
+///
+/// 早期考虑过「按数据目录哈希」以支持多实例并行——但那会让
+/// `--data-dir A` 和 `--data-dir B` 两个进程同时监听系统剪贴板，
+/// 同一段内容被记录两次，且两个托盘图标抢同一块通知区。
+/// 隔离测试数据靠 `--data-dir` 即可，不需要并行跑两个实例。
+const INSTANCE_MUTEX_NAME: &str = r#"Global\ModularClipboard.SingleInstance"#;
+
 /// 命名互斥体守卫。
 ///
 /// 持有期间本进程独占「实例名」。**drop 时不显式释放**——
@@ -175,9 +238,10 @@ impl SingleInstanceGuard {
         use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
         use windows::Win32::System::Threading::CreateMutexW;
 
-        const NAME: &str = r#"Global\ModularClipboard.SingleInstance"#;
-
-        let wide: Vec<u16> = NAME.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = INSTANCE_MUTEX_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         //签名：CreateMutexW(attributes: Option<&SECURITY_ATTRIBUTES>,
         //                   initial_owner: bool, name: PCWSTR)
         let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) };
@@ -203,6 +267,101 @@ impl Drop for SingleInstanceGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 独占的临时目录名（进程 ID + 原子序号）。
+    ///
+    /// 不能用 `now_ms()`：毫秒精度下并发测试会拿到同名目录、互相删除。
+    fn unique_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "modular-clipboard-main-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    /// 空白路径必须报错退出，不能静默回退默认目录。
+    #[test]
+    fn blank_data_dir_is_rejected() {
+        for blank in ["", " ", "\t", "\n "] {
+            assert!(
+                resolve_data_dir(Path::new(blank)).is_err(),
+                "空白路径 {blank:?} 必须报错而不是回退默认目录"
+            );
+        }
+    }
+
+    /// 目录不存在时自动创建。
+    #[test]
+    fn missing_dir_is_created() {
+        let base = unique_dir("missing").join("nested").join("deeper");
+        let resolved = resolve_data_dir(&base).expect("多级缺失目录应被创建");
+        assert!(resolved.is_dir(), "{} 应被创建", resolved.display());
+        let _ = std::fs::remove_dir_all(resolved.parent().unwrap().parent().unwrap());
+    }
+
+    /// 相对路径按当前工作目录解析成绝对路径。
+    ///
+    /// 不转绝对的话，进程工作目录一变（快捷方式启动、任务计划启动）
+    /// 同一个参数会指向不同位置，用户完全无法预测数据写到哪。
+    #[test]
+    fn relative_dir_is_resolved_to_absolute() {
+        let base = unique_dir("relative");
+        let rel = format!("{}\\{}", base.display(), "sub");
+        let resolved = resolve_data_dir(Path::new(&rel)).expect("相对路径应能解析");
+        assert!(resolved.is_absolute(), "应转成绝对路径，实际：{resolved:?}");
+        assert_eq!(
+            resolved,
+            std::env::current_dir().unwrap().join(rel),
+            "应基于当前工作目录拼接"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 指定数据目录时，配置路径必须落在同一目录（否则读 A 写 B）。
+    #[test]
+    fn config_path_follows_data_dir() {
+        let dir = unique_dir("cfg");
+        let p = config_path(Some(&dir));
+        assert_eq!(p, dir.join("config.json"));
+    }
+
+    /// 未指定时配置仍在 `%APPDATA%/modular-clipboard/config.json`。
+    #[test]
+    fn config_path_defaults_to_project_dirs() {
+        let p = config_path(None);
+        assert!(
+            p.ends_with("config.json"),
+            "默认配置路径应以 config.json 结尾，实际：{p:?}"
+        );
+        let expected = directories::ProjectDirs::from("", "", "modular-clipboard")
+            .map(|d| d.config_dir().join("config.json"));
+        if let Some(expected) = expected {
+            assert_eq!(p, expected, "未传 --data-dir 时行为不应改变");
+        }
+    }
+
+    /// 互斥体名不含数据目录——否则两个 `--data-dir` 会同时监听剪贴板。
+    #[test]
+    fn mutex_name_is_global_and_path_free() {
+        assert!(
+            INSTANCE_MUTEX_NAME.starts_with(r"Global\"),
+            "应为全局命名空间，实际：{INSTANCE_MUTEX_NAME}"
+        );
+        assert!(
+            !INSTANCE_MUTEX_NAME.contains(':'),
+            "互斥体名不应含盘符/路径分隔的实际路径，实际：{INSTANCE_MUTEX_NAME}"
+        );
+        // 除了 `Global\` 前缀这一个分隔符，不得再有反斜杠——
+        // 多一个就意味着名字里塞进了目录层级。
+        assert_eq!(
+            INSTANCE_MUTEX_NAME.matches('\\').count(),
+            1,
+            "互斥体名只应含`Global\\` 前缀一处反斜杠，实际：{INSTANCE_MUTEX_NAME}"
+        );
+    }
 
     #[test]
     fn second_acquire_fails_while_first_is_held() {

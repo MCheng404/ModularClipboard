@@ -27,7 +27,7 @@ pub mod theme;
 pub mod thumbnail;
 pub mod view;
 
-pub use app::{run, run_with_capture_override, App};
+pub use app::{run, run_with_capture_override, run_with_options, App};
 pub use presence::Resident;
 pub use view::UiLocal;
 

@@ -79,24 +79,38 @@ pub struct Service {
     /// 当前 `capture.enabled` 是否为命令行临时覆盖（如 `--no-capture`）。
     /// 保存配置时会被还原，避免永久改写用户的监听开关。
     capture_override: bool,
+    /// 配置落盘路径。`None` 表示无法确定（`save_config` 静默跳过）。
+    ///
+    /// 存字段而非每次现算：`--data-dir` 生效后配置写在指定目录下，
+    /// 现算会退回 `%APPDATA%`，导致「读 A 写 B」。
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl Service {
-    /// 打开存储并载入初始状态。
+    /// 打开**默认**数据目录下的存储并载入初始状态。
     pub fn new(config: Config) -> Result<Self> {
-        let store = Store::open_default()?;
-        Self::with_store(store, config)
+        Self::with_data_dir(config, None)
     }
 
-    /// 使用内存存储构造。仅在默认数据目录不可用时作为降级方案，
-    /// 保证界面仍能启动（历史不会保留）。
-    pub fn in_memory() -> Self {
-        let store = Store::open_in_memory()
-            .unwrap_or_else(|_| unreachable!("内存库创建不应失败"));
-        Self::with_store(store, Config::default()).expect("内存库初始化不应失败")
+    /// 同 [`Self::new`]，但可指定数据目录（对应 `--data-dir`）。
+    ///
+    /// `data_dir` 为 `None` 时退回 `%APPDATA%/modular-clipboard`。
+    pub fn with_data_dir(config: Config, data_dir: Option<&std::path::Path>) -> Result<Self> {
+        // 存储与配置必须落在**同一个**目录，否则会出现
+        // 「库在 D 盘、配置在 C 盘」的半生效状态。
+        let config_path = data_dir.map(|d| d.join(CONFIG_FILE_NAME));
+        let store = match data_dir {
+            Some(dir) => Store::open_in(dir)?,
+            None => Store::open_default()?,
+        };
+        Self::build(store, config, config_path)
     }
 
-    fn with_store(store: Store, config: Config) -> Result<Self> {
+    fn build(
+        store: Store,
+        config: Config,
+        config_path: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
         store.apply_config(&config);
 
         if config.storage.cleanup_on_start {
@@ -129,7 +143,20 @@ impl Service {
             capture: None,
             last_self_write: Arc::new(AtomicU64::new(0)),
             capture_override: false,
+            config_path,
         })
+    }
+
+    /// 使用内存存储构造。仅在默认数据目录不可用时作为降级方案，
+    /// 保证界面仍能启动（历史不会保留）。
+    ///
+    /// 配置路径仍走默认位置：内存库只是存储降级，
+    /// 用户在设置界面改的选项不该跟着丢失。
+    pub fn in_memory() -> Self {
+        let store = Store::open_in_memory()
+            .unwrap_or_else(|_| unreachable!("内存库创建不应失败"));
+        Self::build(store, Config::default(), default_config_path())
+            .expect("内存库初始化不应失败")
     }
 
     // ---------- 捕获线程 ----------
@@ -479,7 +506,7 @@ impl Service {
     /// 故用 [`Self::set_capture_override`] 标记的临时值
     /// 在保存时还原为磁盘上的真实配置。
     pub fn save_config(&mut self) -> Result<()> {
-        if let Some(path) = config_path() {
+        if let Some(path) = self.config_path.clone() {
             // 临时覆盖不落盘：读回磁盘上的真实值。
             let persisted = self
                 .capture_override
@@ -520,8 +547,22 @@ const DEFAULT_GROUP_COLOR: &str = "#5B8DEF";
 /// 后台事件队列容量。溢出时丢弃新事件而非阻塞剪贴板读取。
 const EVENT_QUEUE_CAPACITY: usize = 128;
 
-fn config_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("", "", "modular-clipboard").map(|d| d.config_dir().join("config.json"))
+/// 配置文件名。
+pub const CONFIG_FILE_NAME: &str = "config.json";
+
+/// 未指定 `--data-dir` 时的配置路径（`%APPDATA%/modular-clipboard/config.json`）。
+fn default_config_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "modular-clipboard")
+        .map(|d| d.config_dir().join(CONFIG_FILE_NAME))
+}
+
+/// 数据目录内的配置文件路径。
+///
+/// 与 [`default_config_path`] 分开而不是「有data_dir 就 join、否则 ProjectDirs」：
+/// `--data-dir` 指定的是**数据**目录，配置跟着走才能保证
+/// 「读配置」与「写配置」在同一处（`save_config` 的读回逻辑依赖这一点）。
+pub fn config_path_in(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join(CONFIG_FILE_NAME)
 }
 
 /// 生成预览文本。
@@ -647,5 +688,96 @@ mod tests {
     #[test]
     fn text_preview_is_verbatim() {
         assert_eq!(build_preview(&payload(ClipKind::Text, "abc")), "abc");
+    }
+
+    /// 独占的临时目录名（进程 ID + 原子序号）。
+    ///
+    /// 不能用 `now_ms()`：毫秒精度下并发测试会拿到同名目录、互相删除。
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "modular-clipboard-svc-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    /// `Service` 必须把数据库开在 `--data-dir` 指定目录下。
+    ///
+    /// 回归测试：此前 `Service::new` 无条件 `Store::open_default()`，
+    /// `--data-dir` 传了也无效。
+    #[test]
+    fn service_opens_store_in_given_data_dir() {
+        let dir = unique_dir("open");
+        let mut svc = Service::with_data_dir(Config::default(), Some(&dir)).unwrap();
+
+        let p = payload(ClipKind::Text, "in data dir");
+        assert!(svc.ingest(p), "入库应成功");
+        svc.stop_capture();
+
+        assert!(
+            dir.join("history.db").is_file(),
+            "数据库应在 {} 下",
+            dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 配置写入必须跟着 `--data-dir` 走。
+    ///
+    /// 若 `save_config` 仍写 `%APPDATA%`，用户在隔离目录里改的设置
+    /// 会写进真实配置——这正是 `--no-capture` 覆盖保护要防的那类事故。
+    #[test]
+    fn save_config_writes_into_given_data_dir() {
+        let dir = unique_dir("save");
+        let mut svc = Service::with_data_dir(Config::default(), Some(&dir)).unwrap();
+        svc.state.config.capture.enabled = true;
+        svc.save_config().unwrap();
+
+        let cfg = dir.join(CONFIG_FILE_NAME);
+        assert!(cfg.is_file(), "配置应写到 {} 下", cfg.display());
+        let on_disk: Config =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert!(on_disk.capture.enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--no-capture` 的临时覆盖不能落进 `--data-dir` 指定的配置。
+    ///
+    /// 两条保护同时生效：目录跟着参数走，且覆盖值不持久化。
+    #[test]
+    fn capture_override_not_persisted_into_custom_dir() {
+        let dir = unique_dir("override");
+        // 先落一份 enabled=true 的真实配置。
+        let mut seed = Service::with_data_dir(Config::default(), Some(&dir)).unwrap();
+        seed.state.config.capture.enabled = true;
+        seed.save_config().unwrap();
+
+        // 新会话模拟 `--data-dir X --no-capture`。
+        let mut svc = Service::with_data_dir(Config::default(), Some(&dir)).unwrap();
+        svc.state.config.capture.enabled = false;
+        svc.set_capture_override(true);
+        svc.save_config().unwrap();
+
+        let raw = std::fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
+        let on_disk: Config = serde_json::from_str(&raw).unwrap();
+        assert!(
+            on_disk.capture.enabled,
+            "临时覆盖不应被写入 {}，实际 capture.enabled={}",
+            dir.join(CONFIG_FILE_NAME).display(),
+            on_disk.capture.enabled
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 空白数据目录直接报错，不静默落到默认目录。
+    #[test]
+    fn service_rejects_blank_data_dir() {
+        assert!(
+            Service::with_data_dir(Config::default(), Some(std::path::Path::new("  "))).is_err(),
+            "空白数据目录必须报错"
+        );
     }
 }

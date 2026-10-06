@@ -52,20 +52,51 @@ pub const DATA_DIR_NAME: &str = "modular-clipboard";
 ///
 /// 帮助文本用它，避免文档与实现漂移。
 pub fn default_data_dir_display() -> String {
-    match directories::ProjectDirs::from("", "", DATA_DIR_NAME) {
-        Some(d) => d.data_dir().display().to_string(),
+    match default_data_dir() {
+        Some(d) => d.display().to_string(),
         None => DATA_DIR_NAME.to_string(),
     }
 }
 
+/// 默认数据目录（`%APPDATA%/modular-clipboard`）。
+///
+/// 抽成函数是为了让 [`default_data_dir_display`] 与 [`Store::open_default`]
+/// 共用同一份推导逻辑，避免「展示的路径」与「实际打开的路径」再次漂移。
+pub fn default_data_dir() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", DATA_DIR_NAME)
+        .map(|d| d.data_dir().to_path_buf())
+}
+
+/// 数据目录下的数据库文件名。
+pub const DB_FILE_NAME: &str = "history.db";
+
+/// 数据目录下的载荷子目录名。
+pub const BLOB_DIR_NAME: &str = "blobs";
+
 impl Store {
     /// 在标准数据目录下打开或创建库。
     pub fn open_default() -> Result<Self> {
-        let dir = directories::ProjectDirs::from("", "", DATA_DIR_NAME)
-            .ok_or_else(|| anyhow::anyhow!("无法确定数据目录"))?
-            .data_dir()
-            .to_path_buf();
-        Self::open(&dir.join("history.db"), &dir.join("blobs"))
+        Self::open_in(
+            &default_data_dir().ok_or_else(|| anyhow::anyhow!("无法确定数据目录"))?,
+        )
+    }
+
+    /// 在**指定**数据目录下打开或创建库。
+    ///
+    /// 这是 `--data-dir` 真正落地的地方：数据库与载荷目录都由传入的
+    /// `data_dir` 派生，而不是各自去问 `ProjectDirs`。
+    ///
+    /// 目录不存在时创建；路径为空白直接报错——静默回退到默认目录会让
+    /// 用户以为数据写进了 `--data-dir` 指定的位置，实际却在 `%APPDATA%`。
+    pub fn open_in(data_dir: &Path) -> Result<Self> {
+        let raw = data_dir.to_string_lossy();
+        if raw.trim().is_empty() {
+            anyhow::bail!("数据目录不能为空");
+        }
+        Self::open(
+            &data_dir.join(DB_FILE_NAME),
+            &data_dir.join(BLOB_DIR_NAME),
+        )
     }
 
     /// 在内存中打开，仅用于降级模式与测试。
@@ -732,6 +763,124 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let s = Store::open(&base.join("t.db"), &base.join("blobs")).unwrap();
         (s, base)
+    }
+
+    /// 独占的临时目录名（进程 ID + 原子序号）。
+    ///
+    /// 不能只用 `now_ms()`：毫秒精度下并发测试会拿到同名目录，
+    /// 互相 `remove_dir_all`，表现为随机的「表不存在」失败。
+    fn unique_dir(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "{DATA_DIR_NAME}-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        base
+    }
+
+    /// `--data-dir` 的核心保证：数据库文件真的落在传入目录下。
+    ///
+    /// 回归测试。此前 `open_default` 内部无条件问 `ProjectDirs`，
+    /// `--data-dir` 传了也被忽略，用户以为隔离了数据、实际写进了 `%APPDATA%`。
+    #[test]
+    fn open_in_creates_db_under_given_dir() {
+        let base = unique_dir("open-in");
+        assert!(!base.exists(), "前置条件：目录此刻应不存在");
+
+        let store = Store::open_in(&base).expect("指定数据目录应能打开");
+        drop(store);
+
+        assert!(
+            base.join(DB_FILE_NAME).is_file(),
+            "数据库应创建在 {} 下，实际内容：{:?}",
+            base.display(),
+            std::fs::read_dir(&base)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            base.join(BLOB_DIR_NAME).is_dir(),
+            "载荷目录应创建在 {} 下",
+            base.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 目录不存在时必须创建，而不是报错退出。
+    ///
+    /// 用户传 `--data-dir D:\clip` 时期望的是「程序自己建好」。
+    #[test]
+    fn open_in_creates_missing_dir_tree() {
+        let base = unique_dir("open-in-missing").join("a").join("b");
+        assert!(!base.exists());
+
+        let store = Store::open_in(&base).expect("多级缺失目录应被自动创建");
+        drop(store);
+
+        assert!(base.join(DB_FILE_NAME).is_file());
+        let _ = std::fs::remove_dir_all(base.parent().unwrap().parent().unwrap());
+    }
+
+    /// 载荷文件也必须写入指定目录下的 `blobs`。
+    #[test]
+    fn open_in_writes_payload_into_given_dir() {
+        let base = unique_dir("open-in-blob");
+        let mut store = Store::open_in(&base).unwrap();
+        store.set_payload_limit(1 << 20);
+
+        let item = ClipItem::new(ClipKind::Text, "hh".into(), "in-dir".into(), "app".into());
+        let saved = store.insert(item, b"in-dir".to_vec()).unwrap();
+        assert!(saved.payload.is_some());
+
+        let loaded = store.get(saved.id).unwrap().unwrap();
+        assert_eq!(store.load_payload(&loaded).unwrap(), b"in-dir");
+        assert!(
+            std::fs::read_dir(base.join(BLOB_DIR_NAME))
+                .unwrap()
+                .next()
+                .is_some(),
+            "载荷应落到 {} 下",
+            base.join(BLOB_DIR_NAME).display()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 空白路径必须报错，**不能**静默回退到默认目录。
+    ///
+    /// 静默回退最坏：用户以为在用隔离目录做测试，实际却在污染真实历史库。
+    #[test]
+    fn open_in_rejects_blank_dir() {
+        for blank in ["", " ", "\t", "\n  "] {
+            let err = Store::open_in(Path::new(blank))
+                .err()
+                .unwrap_or_else(|| panic!("空白路径 {blank:?} 应被拒绝"));
+            assert!(
+                err.to_string().contains("数据目录"),
+                "错误信息应指明是数据目录有问题，实际：{err}"
+            );
+        }
+    }
+
+    /// `open_default` 仍落在 `%APPDATA%/modular-clipboard`——
+    /// 固定住「未传 `--data-dir` 时行为不变」。
+    #[test]
+    fn open_default_uses_project_dirs() {
+        let Some(expected) = default_data_dir() else {
+            eprintln!("跳过：无法确定默认数据目录");
+            return;
+        };
+        let store = Store::open_default().expect("默认数据目录应能打开");
+        drop(store);
+        assert!(
+            expected.join(DB_FILE_NAME).is_file(),
+            "默认数据库应在 {} 下",
+            expected.display()
+        );
     }
 
     #[test]
