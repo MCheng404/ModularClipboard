@@ -39,6 +39,28 @@ pub struct Store {
     db_path: PathBuf,
     /// 载荷体积上限，由 [`Store::set_payload_limit`] 从配置注入。
     payload_limit: std::sync::atomic::AtomicU64,
+    /// 载荷目录是否由本 store 独占拥有（临时目录）。
+    ///
+    /// 只有 `true` 时 [`Drop`] 才会删除它。为 `false` 时目录属于用户
+    /// 真实数据（`%APPDATA%` 或 `--data-dir`），**任何情况下都不能删**。
+    owns_blob_dir: bool,
+}
+
+impl Drop for Store {
+    /// 清理本 store 独占创建的临时载荷目录。
+    ///
+    /// 只在 `owns_blob_dir` 为真时动手：
+    /// - `open_in_memory()` 的目录是进程私有的、名字带唯一序号，
+    ///   随 store 一起消失才不会在 `%TEMP%` 留下垃圾。
+    /// - `open()` / `open_in()` 的目录是用户历史数据，删掉等于清空用户剪贴板历史。
+    ///
+    /// 降级模式（进程长期存活）不受影响：目录只在 `Store` **被 drop 时**
+    /// 才删除，而 store 活着时目录始终有效。
+    fn drop(&mut self) {
+        if self.owns_blob_dir && self.blob_dir.exists() {
+            let _ = std::fs::remove_dir_all(&self.blob_dir);
+        }
+    }
 }
 
 /// 数据目录名（`ProjectDirs` 的第三参数）。
@@ -100,14 +122,24 @@ impl Store {
     }
 
     /// 在内存中打开，仅用于降级模式与测试。
+    ///
+    /// blob 目录必须**每次调用都独占**：只带进程 ID 时，同一进程内的多个实例
+    /// 会共用一个目录，而 [`Store::clear_all`] 会删掉目录下所有文件——
+    /// 于是并行测试之间互相删对方载荷，表现为随机的「载荷读不到」失败。
+    /// 这里与测试里的 `unique_dir` 一样用「进程 ID + 原子序号」。
     pub fn open_in_memory() -> Result<Self> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let blob_dir = std::env::temp_dir()
+            .join(format!("{DATA_DIR_NAME}-mem-{}-{n}", std::process::id()));
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
             conn,
-            blob_dir: std::env::temp_dir().join(format!("{DATA_DIR_NAME}-mem-{}", std::process::id())),
+            blob_dir,
             db_path: std::path::PathBuf::from(":memory:"),
             payload_limit: std::sync::atomic::AtomicU64::new(MAX_PAYLOAD_DEFAULT),
+            owns_blob_dir: true,
         };
         std::fs::create_dir_all(&store.blob_dir)?;
         store.migrate()?;
@@ -132,6 +164,8 @@ impl Store {
             payload_limit: std::sync::atomic::AtomicU64::new(
                 crate::MAX_PAYLOAD_DEFAULT,
             ),
+            // 目录属于调用方（通常是用户真实数据目录），Store 无权删除。
+            owns_blob_dir: false,
         };
         store.migrate()?;
         Ok(store)
@@ -1013,5 +1047,100 @@ mod tests {
         let after = store.get(saved.id).unwrap().unwrap();
         assert_eq!(after.group_id, None);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 回归测试：两次 `open_in_memory()` 必须拿到不同的blob 目录。
+    ///
+    /// 修复前目录名只带进程 ID，同进程内所有实例共用一个目录。
+    /// 而 `clear_all()` 会删掉目录下**所有**文件，于是并行测试之间
+    /// 互相删对方载荷，表现为随机的「载荷读不到」失败
+    /// （`app/tests/integration.rs` 的 24 个测试全部经
+    /// `Service::in_memory()` 走这条路，其中两个还会调 `clear_all`）。
+    #[test]
+    fn open_in_memory_gives_each_instance_its_own_blob_dir() {
+        let a = Store::open_in_memory().unwrap();
+        let b = Store::open_in_memory().unwrap();
+
+        assert_ne!(
+            a.blob_dir, b.blob_dir,
+            "两个内存库实例共用同一载荷目录 {}，并行测试会互相删对方载荷",
+            a.blob_dir.display()
+        );
+        assert!(a.blob_dir.is_dir(), "载荷目录应被自动创建");
+        assert!(b.blob_dir.is_dir(), "载荷目录应被自动创建");
+    }
+
+    /// 隔离性必须是真的：清空 A 不能删掉 B 的载荷。
+    ///
+    /// 只断言路径不同是不够的——万一两个目录名不同却仍指向同一处，
+    /// 上面的断言会绿但数据照样被踩。这里实际写文件再验证存活。
+    #[test]
+    fn clearing_one_memory_store_keeps_other_payloads() {
+        let mut a = Store::open_in_memory().unwrap();
+        let mut b = Store::open_in_memory().unwrap();
+        a.set_payload_limit(1 << 20);
+        b.set_payload_limit(1 << 20);
+
+        let in_a = a
+            .insert(
+                ClipItem::new(ClipKind::Text, "ka".into(), "in-a".into(), "app".into()),
+                b"in-a".to_vec(),
+            )
+            .unwrap();
+        let in_b = b
+            .insert(
+                ClipItem::new(ClipKind::Text, "kb".into(), "in-b".into(), "app".into()),
+                b"in-b".to_vec(),
+            )
+            .unwrap();
+
+        a.clear_all().unwrap();
+
+        assert!(a.get(in_a.id).unwrap().is_none(), "A 自己应被清空");
+        assert_eq!(
+            b.load_payload(&in_b).unwrap(),
+            b"in-b",
+            "清空 A 删掉了 B 的载荷文件"
+        );
+    }
+
+    /// in-memory store 的载荷目录随 store 一起消失，不在 `%TEMP%` 留垃圾。
+    ///
+    /// 用显式作用域观察 drop 前后的目录状态。
+    #[test]
+    fn memory_store_blob_dir_is_cleaned_when_store_drops() {
+        let dir;
+        {
+            let store = Store::open_in_memory().unwrap();
+            dir = store.blob_dir.clone();
+            assert!(dir.is_dir(), "drop 前目录应存在");
+        }
+        assert!(
+            !dir.exists(),
+            "in-memory store 的载荷目录 {} 应随 store 一起清理",
+            dir.display()
+        );
+    }
+
+    /// 反向保证：`open_in()` 用的是用户真实数据目录，**绝不能**被 drop 删掉。
+    ///
+    /// 这是本次加 `Drop` 最危险的地方——一旦误删，用户剪贴板历史当场清空。
+    #[test]
+    fn on_disk_store_blob_dir_survives_drop() {
+        let base = unique_dir("drop-keeps-data");
+        let blob_dir;
+        {
+            let store = Store::open_in(&base).unwrap();
+            blob_dir = store.blob_dir.clone();
+            assert!(blob_dir.is_dir());
+        }
+        assert!(
+            blob_dir.is_dir(),
+            "真实数据载荷目录 {} 不应被 Store::drop 删除",
+            blob_dir.display()
+        );
+        assert!(base.join(DB_FILE_NAME).is_file(), "数据库文件也不应被删");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
