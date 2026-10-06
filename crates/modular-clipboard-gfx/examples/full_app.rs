@@ -226,7 +226,9 @@ fn run() -> anyhow::Result<()> {
             // **原样采用**（规范要求如此），而窗口完全离开桌面时
             // DWM 报告的 extent 不在表面能力范围内。
             // 真实用户不会把窗口移出桌面，所以这是探针环境的产物。
-            unsafe {
+            // `MoveWindow` 的 Result 必须处理（否则 unused_must_use 警告）。
+            // 失败时只警告不中断——resize 是辅助路径，不该让探针整体失败。
+            let moved = unsafe {
                 MoveWindow(
                     window.hwnd(),
                     8,
@@ -235,7 +237,10 @@ fn run() -> anyhow::Result<()> {
                     nh as i32,
                     // 不重绘：避免额外的 WM_PAINT 干扰事件顺序
                     false,
-                );
+                )
+            };
+            if moved.is_err() {
+                tracing::warn!("MoveWindow 到 {nw}x{nh} 失败，resize 可能未生效");
             }
             println!("[resize] 请求改为 {nw}x{nh}（桌面内，不抢焦点）");
         }
@@ -1269,9 +1274,18 @@ mod tests {
 
     #[test]
     fn vertex_layout_matches_pipeline_stride() {
-        // pipeline.rs 声明的步长是 pos(8)+uv(8)+color(4)=20 字节。
+        // 步长必须是 pos(8)+uv(8)+color(4)+tex_id(4) = 24 字节。
         // 布局不符时驱动不会报错，只会画出乱码。
-        assert_eq!(std::mem::size_of::<Vertex>(), 20);
+        //
+        // 从 `VERTEX_STRIDE` 派生而非硬编码：硬编码的那版在
+        // `Vertex` 加 `tex_id` 后**仍然通过**（它验证的是自己算的 20，
+        // 不是真实步长）。这已是同一处漂移的第三个副本
+        // （另两处在 `pipeline.rs` 与 `buffer.rs`，均已修）。
+        assert_eq!(
+            std::mem::size_of::<Vertex>() as u64,
+            modular_clipboard_gfx::buffer::VERTEX_STRIDE,
+            "顶点结构体大小必须与管线步长一致"
+        );
     }
 
     #[test]
