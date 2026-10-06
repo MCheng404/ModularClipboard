@@ -131,8 +131,22 @@ impl Service {
     // ---------- 捕获线程 ----------
 
     /// 启动后台捕获。重复调用无副作用。
+    /// 启动剪贴板监听。
+    ///
+    /// 若配置里 `capture.enabled == false`（例如命令行 `--no-capture`），
+    /// **本方法为空操作**。
+    ///
+    /// 早前 `App::new` 无条件调用本函数，完全不检查该标志，
+    /// 于是 `--no-capture` 这个调试开关**形同虚设**——
+    /// 用户以为不会记录剪贴板，实际照常记录。
+    /// 检查放在这里而非调用方，是因为本方法是唯一的启动入口，
+    /// 放这里才能保证任何调用者都绕不过去。
     pub fn start_capture(&mut self) {
         if self.capture.is_some() {
+            return;
+        }
+        if !self.state.config.capture.enabled {
+            tracing::info!("capture.enabled = false，不启动剪贴板监听");
             return;
         }
         let running = Arc::new(AtomicBool::new(true));

@@ -17,3 +17,10 @@ modular-clipboard-ui = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
+# 单实例保护用命名互斥体（见 main.rs 的 SingleInstanceGuard）。
+# 版本与 gfx/platform 一致（0.62），不引��� workspace 条目以免影响其他 crate。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
