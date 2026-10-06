@@ -11,3 +11,9 @@
 # 各 Agent 的隔离构建目录（避免文件锁冲突 +确保测的是当前源码）
 target-lead-verify/
 target-split-*/
+
+# 各类隔离构建目录与Agent 临时目录（动态产生，统一忽略）
+target-*/
+.racehunt/
+.vuidfix/
+.perimage/
