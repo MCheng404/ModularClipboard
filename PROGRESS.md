@@ -768,3 +768,52 @@ full_app     : 20 / 20   （每次 600 帧，共 12000 帧）
 文件处于半编辑坏状态、跑的是**没重新编译的旧二进制**——
 而那个旧二进制修前也是 30/30。它主动指出「0/50 是假数据，
 真实基线是 30/30」。这种诚实比任何成绩都重要。
+
+---
+
+## 验证层安装成功，竞态 100% 可复现（13:50）
+
+之前 8 轮都卡在「验证层需要管理员权限」。**正确解法是官方文档里的
+`copy_only=1`** —— 只复制文件，不做注册表 / 快捷方式 / PATH 操作：
+
+    vulkan-sdk.exe --root "C:/Users/Cookies/VulkanSDK" \
+      --accept-licenses --default-answer --confirm-command \
+      install com.lunarg.vulkan.core copy_only=1
+
+装到用户目录，无需提权。
+
+### 立刻抓到的三个 VUID
+
+| VUID | 含义 | 优先级 |
+|---|---|---|
+| VkImageMemoryBarrier-oldLayout-01197 | oldLayout 非图像当前布局 => image.layout 失同步 | P0 |
+| vkQueueSubmit-fence-00063 | 提交时 fence 仍 signaled => acquire_fence 未复位 | P0 |
+| vkDestroyDevice-device-05137 | 交换链重建泄漏 3 ImageView + 3 Framebuffer + 1 Swapchain | P1 |
+
+前两个 **10/10 每次必现**，竞态从「12% 概率、无法归因」
+变成「确定可复现、有规范编号」。
+
+### 复现方式
+
+需要设四个环境变量后再跑探针：
+
+- `VK_LAYER_PATH` =验证层安装目录下的 `Bin`（含 JSON 清单，**不是 DLL 本身**）
+- `VK_INSTANCE_LAYERS` = `VK_LAYER_KHRONOS_validation`
+- `VK_DEBUG_UTILS_MESSAGE_SEVERITY` = `error`
+- `VK_LAYER_VALIDATE_SYNC` = `1`
+
+注意：旧写法 `VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`
+已废弃，新版 SDK 会报 Deprecated 警告（但仍生效）。
+
+### 另一条官方诊断路径（尚未使用）
+
+`VK_EXT_device_fault`：device lost 后可向驱动查询 fault 描述 +
+出错 GPU 地址；配合 `VK_EXT_device_address_binding_report` 可把地址
+映射回具体资源。比验证层更底层，能查验证层看不到的 GPU 侧执行错误。
+
+### 流程教训
+
+**8 轮盲试不如一次查文档。** 装不上验证层时我一直在解权限问题，
+而官方文档明写有免权限的安装方式，我没去读。
+
+黑盒二分实验的效率远低于工具。**先找对工具，再做实验。**
