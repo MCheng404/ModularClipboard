@@ -21,11 +21,13 @@
 
 pub mod app;
 pub mod icons;
+pub mod presence;
 pub mod renderer;
 pub mod theme;
 pub mod view;
 
 pub use app::{run, App};
+pub use presence::Resident;
 pub use view::UiLocal;
 
 /// 默认数据目录的展示字符串。

@@ -28,6 +28,7 @@ use modular_clipboard_gfx::frame::{FrameRenderer, PipelineBundle, PresentResult}
 use modular_clipboard_gfx::window::{EventLoop, Window, WindowEvent};
 use modular_clipboard_gfx::Gpu;
 
+use crate::presence::{self, CloseDecision, Resident};
 use crate::renderer::{Painter, WINDOW_TITLE};
 use crate::view::UiLocal;
 use crate::{theme, view};
@@ -50,6 +51,13 @@ impl Drop for DeltaGuard {
         self.0.clear();
     }
 }
+
+/// 托盘图标的悬停提示。
+///
+/// 放在标题后面而非直接用 `WINDOW_TITLE`：托盘提示要告诉用户
+/// 「东西还在后台跑着」，而不只是产品名——这是托盘常驻类程序
+/// 与普通窗口程序的体感差别。
+const TRAY_TOOLTIP: &str = "模块化剪切板 — 正在后台记录剪贴板";
 
 /// 启动图形界面。`config` 为初始配置。
 pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
@@ -118,17 +126,44 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
     let mut app = App::new(config);
     let ctx = app.ctx.clone();
 
+    // ---- 托盘常驻--------------------------------------------------------
+    //
+    // 托盘自带独立线程与消息循环（见 `presence` 模块文档），
+    // 这里只是每帧收一次事件。启动失败**不阻断应用**：
+    // 托盘只是入口方式，没有它界面照样能用，只是关掉就没了。
+    let resident = match Resident::start(TRAY_TOOLTIP) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::error!(%e, "托盘启动失败，关闭按钮将直接退出程序");
+            None
+        }
+    };
+
     // ---- 帧循环 --------------------------------------------------------
     let mut frame_no: u64 = 0;
     let mut quit = false;
+    // 窗口隐藏到托盘后仍在跑帧循环（要继续接收托盘事件），
+    // 但不再渲染。`GetClientRect` 对隐藏窗口仍返回原尺寸，
+    // 靠尺寸判断不出隐藏态，必须显式记这个标志。
+    let mut hidden = false;
 
     while !quit {
         // ---- 1. 事件 ----
+        //
+        // `saw_close` 与 `wm_quit` 必须分开记：`gfx::window` 把
+        // `WM_CLOSE` 与 `WM_QUIT` 都翻译成同一个 `CloseRequested`，
+        // 而两者处置完全相反——前者隐藏到托盘，后者退出。
+        // 区分依据是 `quit_requested()`，它**只在** `WM_QUIT` 时置位。
+        let mut saw_close = false;
         for ev in events.poll() {
             match ev {
                 WindowEvent::CloseRequested => {
-                    tracing::info!("收到关闭请求");
-                    quit = true;
+                    saw_close = true;
+                    tracing::info!(
+                        wm_quit = events.quit_requested(),
+                        tray = resident.is_some(),
+                        "收到关闭请求"
+                    );
                 }
                 WindowEvent::Resized { .. } => {
                     // 客户区尺寸变了 → 交换链必须重建。`rebuild_swapchain`
@@ -138,14 +173,63 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
                 _ => {}
             }
         }
-        if events.quit_requested() {
-            break;
+
+        // 刻意**不**对 `quit_requested()` 提前 break：`WM_QUIT` 的退出
+        // 语义由下面的 `decide_on_close` 统一处理，提前 break 会让
+        // 那条分支永远走不到，只存在于单测里。
+
+        // ---- 1.5 托盘与全局快捷键 ----
+        //
+        // 放在窗口事件之后、业务 UI 之前：唤起动作要在本帧绘制出内容，
+        // 否则用户会看到「窗口弹出来了但还是空的，下一帧才有东西」。
+        if let Some(r) = resident.as_ref() {
+            let f = r.poll();
+            if f.clear_history {
+                if let Err(e) = app.clear_history() {
+                    tracing::warn!(%e, "托盘清空历史失败");
+                }
+            }
+            if f.show {
+                presence::focus_window(window.hwnd());
+                hidden = false;
+                // 窗口刚恢复，尺寸可能已变（最大化/还原切换）。
+                // 立刻同步一次，避免用旧尺寸 present 一帧。
+                rebuild(&mut fr, &mut painter)?;
+                ctx.request_repaint();
+            }
+            if f.quit {
+                tracing::info!("收到托盘退出请求");
+                quit = true;
+            }
+        }
+
+        // 关闭请求：托盘可用时隐藏到托盘，否则退出。
+        //
+        // 这里**不能**无条件 break——`WM_CLOSE` 不销毁窗口，
+        // 隐藏后循环要继续跑，否则托盘事件再也没人收。
+        if saw_close {
+            match presence::decide_on_close(resident.is_some(), events.quit_requested()) {
+                CloseDecision::HideToTray => {
+                    presence::hide_window(window.hwnd());
+                    hidden = true;
+                    tracing::info!("已隐藏到托盘，后台继续监听剪贴板");
+                }
+                CloseDecision::Quit => {
+                    tracing::info!("无托盘兜底，关闭即退出");
+                    quit = true;
+                }
+            }
         }
         if quit {
             break;
         }
 
         // ---- 2. 业务 UI ----
+        //
+        // **隐藏时也要跑**：业务 UI 里的 `svc.pump()` 才是把后台捕获
+        // 的剪贴板内容写进数据库的那一步。隐藏后跳过它等于
+        // 「窗口看不见 = 停止记录」，与后台常驻的初衷正好相反。
+        //
         // `poll` 已在上面填好缓冲，`egui_input` 读的就是本帧事件。
         let raw_input = events.egui_input(&ctx);
         let mut output = ctx.run_ui(raw_input, |ui| {
@@ -154,6 +238,24 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
         let ppp = output.pixels_per_point;
         // 在移动 output.shapes 之前先把重绘延时取出来。
         let delay = crate::renderer::repaint_delay(&output);
+
+        // ---- 2.5 隐藏态：不渲染，只保持循环 ----
+        //
+        // 窗口隐藏时 `GetClientRect` **仍返回原尺寸**（非 0），
+        // 所以下面第3 步的尺寸检查抓不到隐藏态——必须单独判。
+        //
+        // 不跳过渲染的代价是实打实的：present 不产生任何可见输出，
+        // 却仍在跑完整的 tessellate + queue_submit + device_wait_idle，
+        // 等于纯烧 CPU 与带宽。
+        if hidden {
+            // 增量由守卫在离开作用域时清空。
+            let _guard = DeltaGuard(std::mem::take(&mut output.textures_delta));
+            drop(output);
+            // 睡固定间隔而非用 egui 的 delay：隐藏时没有下一次绘制，
+            // egui 也不会请求重绘，用它的 delay 会退化成 0 延时忙等。
+            events.poll_for(Some(presence::HIDDEN_POLL_INTERVAL));
+            continue;
+        }
 
         // ---- 3. 尺寸兜底检查 ----
         // 客户区可能被最小化到 0×0，此时交换链拿不到可呈现的图像。
@@ -213,7 +315,11 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
 
     // ---- 清理 ------------------------------------------------------------
     //
-    // 顺序：先停捕获并保存配置（业务），再销毁渲染资源。
+    // 顺序要紧：先撤托盘图标（用户能立刻看到它消失），
+    // 再停捕获并保存配置，最后才销毁渲染资源。
+    if let Some(mut r) = resident {
+        r.shutdown();
+    }
     app.shutdown();
     // `painter` 与 `fr` 借用 `gpu`，必须在 `gpu` 之前 drop。
     drop(painter);
@@ -331,6 +437,14 @@ impl App {
     /// 是否收到退出请求。
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    /// 清空全部历史（托盘菜单「清空历史」入口）。
+    ///
+    /// 与界面上的「清空」按钮走同一个 [`Service::clear_all`]，
+    /// 保证两条入口的行为完全一致——包括失败时的提示方式。
+    pub fn clear_history(&mut self) -> anyhow::Result<()> {
+        self.svc.clear_all()
     }
 
     /// 退出前保存状态。
