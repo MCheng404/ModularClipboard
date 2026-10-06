@@ -794,9 +794,21 @@ mod tests {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base = std::env::temp_dir().join(format!("{DATA_DIR_NAME}-store-test-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&base).unwrap();
-        let s = Store::open(&base.join("t.db"), &base.join("blobs")).unwrap();
+        let s = Store::open(&base.join("t.db"), &prepare_dir(&base)).unwrap();
         (s, base)
+    }
+
+    /// 清空并重建测试目录，返回其中的载荷子目录。
+    ///
+    /// 必须先清空再建：进程 ID 会被操作系统复用，目录名
+    /// `store-test-<pid>-<n>` 因此可能撞上历史残留。曾只用
+    /// `create_dir_all`，旧的 `t.db` 被保留下来，`Store::open`
+    /// 直接打开旧库，旧条目混进当前测试，表现为随机的
+    /// 「命中数不对」（实测：`fts_search_finds_text` 期望 1 条却拿到 2 条）。
+    fn prepare_dir(base: &Path) -> PathBuf {
+        let _ = std::fs::remove_dir_all(base);
+        std::fs::create_dir_all(base).unwrap();
+        base.join(BLOB_DIR_NAME)
     }
 
     /// 独占的临时目录名（进程 ID + 原子序号）。
@@ -1046,6 +1058,52 @@ mod tests {
         // 组删除后条目仍在，但变为未分组
         let after = store.get(saved.id).unwrap().unwrap();
         assert_eq!(after.group_id, None);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 回归测试：`temp_store()` 不得复用上一次运行残留的数据库。
+    ///
+    /// 进程 ID 会被操作系统复用，目录名 `store-test-<pid>-<n>` 因此可能
+    /// 撞上历史残留。`temp_store()` 曾用 `create_dir_all` 直接建目录，
+    /// 旧的 `t.db` 就被保留下来，`Store::open` 会打开旧库——
+    /// 于是旧条目混进当前测试，表现为随机的「命中数不对」
+    /// （实测：`fts_search_finds_text` 期望 1 条却拿到 2 条）。
+    ///
+    /// 这里手工造一个「残留库」，再确认新 store 看不到它的数据。
+    #[test]
+    fn temp_store_ignores_leftover_db_from_previous_run() {
+        let base = unique_dir("leftover-db");
+        // 先造一个「上次运行的残留」：目录里有 t.db 与旧条目。
+        {
+            let mut stale = Store::open(&base.join("t.db"), &base.join(BLOB_DIR_NAME)).unwrap();
+            stale.set_payload_limit(1 << 20);
+            stale
+                .insert(
+                    ClipItem::new(ClipKind::Text, "old".into(), "剪贴板历史记录".into(), "old".into()),
+                    b"stale".to_vec(),
+                )
+                .unwrap();
+        } // 故意不删——这正是上次运行留下的残留
+
+        // 走`temp_store()` 用的同一条准备路径。
+        let blobs = prepare_dir(&base);
+        let mut fresh = Store::open(&base.join("t.db"), &blobs).unwrap();
+        fresh.set_payload_limit(1 << 20);
+        fresh
+            .insert(
+                ClipItem::new(ClipKind::Text, "new".into(), "totally different".into(), "new".into()),
+                b"fresh".to_vec(),
+            )
+            .unwrap();
+
+        let hits = fresh.search("剪贴板", 10).unwrap();
+        assert!(
+            hits.is_empty(),
+            "新store 读到了上次运行的残留数据，实际命中 {} 条：{:?}",
+            hits.len(),
+            hits.iter().map(|i| i.preview.clone()).collect::<Vec<_>>()
+        );
+
         let _ = std::fs::remove_dir_all(base);
     }
 
