@@ -125,9 +125,12 @@ const NIN_SELECT: u32 = 1024;
 /// 主程序可执行文件的文件名（位于 `target/<triple>/debug/` 下）。
 const EXE_NAME: &str = "modular-clipboard.exe";
 
-/// 全局硬上限。超时即杀掉子进程并退出，绝不留下悬挂窗口。
-const GLOBAL_DEADLINE: Duration = Duration::from_secs(25);
-
+/// 不设全局计时器：终止保证由每步各自的 `wait_until` 上限
+/// 加上 [`ChildGuard`]（Drop 时杀子进程）共同提供。
+/// 早前一版有个 `GLOBAL_DEADLINE` 只用于把判据标成 SKIP，
+/// 并不真的中断流程——文档说「超时即杀掉子进程」而代码没做，
+/// 属于「注释承诺了实现没有的事」，已删。
+///
 /// 等待主窗口出现的上限。Vulkan 初始化 + 字体加载在慢机器上要几秒。
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -167,35 +170,28 @@ impl Verdict {
 /// 判据清单。
 struct Checks {
     rows: Vec<(String, Verdict, String)>,
-    deadline: Instant,
+    start: Instant,
 }
 
 impl Checks {
     fn new() -> Self {
         Self {
             rows: Vec::new(),
-            deadline: Instant::now() + GLOBAL_DEADLINE,
+            start: Instant::now(),
         }
     }
 
     /// 记录一条判据。`ok == None` 表示不适用/跳过。
     ///
-    /// 时间预算耗尽时，尚未执行的判据一律记为 `Skipped` 并说明原因——
-    /// 绝不让它们「因为没跑到」而显示成通过。
+    /// 「没跑到」绝不能显示成通过：判据要么真的执行并给出结论，
+    /// 要么显式 `None` 记为 SKIP。超时中断由每步各自的 `wait_until` 上限
+    /// 与 [`ChildGuard`] 保证，不在这里另设一套全局计时器。
     fn record(&mut self, name: &str, ok: Option<bool>, detail: impl Into<String>) {
         let detail = detail.into();
         let verdict = match ok {
-            Some(true) if Instant::now() >= self.deadline => {
-                Verdict::Skipped
-            }
             Some(true) => Verdict::Pass,
             Some(false) => Verdict::Fail,
             None => Verdict::Skipped,
-        };
-        let detail = if verdict == Verdict::Skipped && ok == Some(true) {
-            format!("{detail}（但已超出全局时间预算，记为未验证）")
-        } else {
-            detail
         };
         println!("  [{}] {name}\n         {detail}", verdict.tag());
         self.rows.push((name.to_string(), verdict, detail));
@@ -224,7 +220,7 @@ impl Checks {
         println!(
             "\n通过 {} 条，失败 {f} 条，未验证 {s} 条（耗时 {:.1}s）",
             self.passed(),
-            self.deadline.saturating_duration_since(Instant::now()).as_secs_f64()
+            self.start.elapsed().as_secs_f64()
         );
         if f > 0 {
             println!("=== FAIL：{f} 条判据不成立，托盘交互链路存在缺陷 ===");
