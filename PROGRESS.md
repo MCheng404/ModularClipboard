@@ -474,6 +474,8 @@ panic 消息必须包含具体错误原因。
 | C 组 | 16 个 `event!` 宏的格式化参数未纳入检查 | window.rs owner |
 | C 组 | `install_cjk_font` 两级失败原因未区分 | 待 eframe 迁移后 |
 | B 组 | `rebuild_chunk` 应加 `owner_frame == FREE` 断言 | frame.rs owner |
+| **racehunt** | **`submit_fence` 首次使用即违规：`create_fence` 带 `SIGNALIZED`，但 `reset_fences` 只在 `if in_flight` 分支内。详见下方「验证层定位」** | **frame.rs owner** |
+| **racehunt** | **交换链图像被转换两次：渲染通道 `initial_layout=UNDEFINED` 已隐式转换，`open_command_buffer` 的显式屏障用过期 `oldLayout`。详见下方「验证层定位」** | **frame.rs owner** |
 
 ---
 
@@ -496,10 +498,23 @@ panic 消息必须包含具体错误原因。
 | 120 | 67%（5/8） |
 | 600 | 30%（3/10） |
 
-**通过率随帧数单调下降 = 竞态签名**（确定性 bug 会在固定帧号稳定复现）。
+**通过率随帧数单调下降 = 竞态签名**（确定性bug 会在固定帧号稳定复现）。
 失败全部发生在**前 10 帧内**。
 
 `full_app`：第 7 帧崩（7 % 3 == 1，恰为槽位 1 首次复用）。
+
+### ⚠️ 警告：VUID 不是 device lost 的充分条件（勿据此宣称修复成功）
+
+race-hunt 数据：**带验证层跑 20 次，9 过 11 败；而通过的运行同样带 27 个 VUID**
+⇒ VUID 存在与否与 device lost **无因果关系**。
+
+A 组独立数据（无验证层，60 次 `upload_probe`）：**59 过 / 1 败（1.7%）**，
+失败固定在**第 8-9 帧之间**，无数据校验失败 ⇒ 同步/生命周期问题，非内容问题。
+**该1.7% 同样不能归因给 VUID。**
+
+> **规则：清完 VUID ≠ 修好 device lost。** 两者是**至少两个独立成因**
+> （F 组修 `transition_to` 后偶发从 1.4% 降到 0.7%，但未归零）。
+> 任何「VUID 清零即宣告 device lost 修复」的结论都缺乏证据支撑。
 
 ### 待验证方向
 
@@ -817,3 +832,271 @@ full_app     : 20 / 20   （每次 600 帧，共 12000 帧）
 而官方文档明写有免权限的安装方式，我没去读。
 
 黑盒二分实验的效率远低于工具。**先找对工具，再做实验。**
+
+---
+
+## 🔬 验证层定位（racehunt，验证层安装后）
+
+主控装上 `VK_LAYER_KHRONOS_validation` 后，两个 VUID 变得 **100% 可复现**。
+但**关键否证**：带层跑 20 次，**9 次通过**，11 次失败 —— 通过的那些**同样带 27 个 VUID**。
+所以 **VUID 是真bug，但不是 device lost 的充分条件**。
+
+### 对照实验（同一个二进制 md5 `5082d9a8…`，隔离 target `target-racehunt`）
+
+| 组 | 命令 | 结果 | 说明 |
+|----|------|------|------|
+| A | 默认 60 帧 × 50 | **48 / 50** | 基线，与主控 44/50 同量级 |
+| B1 | `UPLOAD_PROBE_FRAMES=600` × 50 | **50 / 50** | 长帧数**反而全过** ⇒ 主控假设「与帧数无关」不成立 |
+| B2 | `UPLOAD_PROBE_STRESS=1` × 50 | **50 / 50** | **此组有混淆**：见下 |
+| C | 默认 + 每次 sleep 3s × 50 | **50 / 50** | 中途观测到 1 次失败（18 次时），补跑满 50 次后 50/50。**与 A 的 48/50 差异不具统计显著性**，不能说 C 更好 |
+
+⚠️ **B2 组设计错误（主控规格）**：`upload_probe.rs:363`
+`let checkpoint = wait_each_frame || stress_mode();` ——
+`STRESS=1` 会**同时**打开每帧 `device_wait_idle`，这正是 MEMORY.md 坑 48
+所说的「诊断插桩自己消除了被测状态」。**B2 的绿灯不能作为
+「多帧在途路径没问题」的证据**。干净的长帧数对照应��
+`UPLOAD_PROBE_FRAMES=600`（即 B1）。
+
+### 帧数阈值曲线（每组 40~50 次，**无验证层**）
+
+| 帧数 | 3 | 4 | 6 | 7 | 10 | 15 | 20 | 30 | 40 | 45 | 50 | 55 | 60 |
+|------|---|---|---|---|----|----|----|----|----|----|----|----|----|
+| 通过 | 50/50 | 40/40 | 40/40 | 40/40 | 50/50 | 50/50 | 50/50 | 50/50 | 50/50 | 50/50 | 50/50 | 50/50 | **48/50** |
+
+**不是随帧数单调变差的竞态曲线**（与 MEMORY.md 第7 批坑 46 的判据相反），
+而是在 60 帧附近才出现的**极低频**现象（~4%）。≤55 帧共 **435 次全过**。
+带验证层时失败点前移到**第 5~6 帧**（层放大了每帧耗时）。
+
+### VUID 一：`VUID-vkQueueSubmit-fence-00063` —— 根因已确定
+
+```
+vkQueueSubmit(): (VkFence 0x160000000016) submitted in SIGNALIZED state.
+```
+
+- **每次运行恰好 3 次**，涉及 **3 个不同 fence 句柄** = **3 个帧槽位**。
+- 出现在**帧 0/1/2**，即每个槽位的**第一次**使用。
+- **决定性证据**：`UPLOAD_PROBE_FRAMES=3`（槽位 0/1/2 各用一次，
+  **完全没有槽位复用**）时，fence 违规**仍是 3 次**。
+  ⇒ 与「槽位复用」无关，是**首次使用**就违规。
+
+**根因**（`frame.rs:1378-1383`）：两个 fence 都用
+`vk::FenceCreateFlags::SIGNALED` 创建（注释写「让首次复用时 wait 立刻通过」），
+但 `reset_fences` 只在 `acquire()` 的 `if self.slots[slot].in_flight` 分支内
+（`frame.rs:822-845`）。槽位**首次**使用时 `in_flight == false`，
+该分支不进入 ⇒ `submit_fence` 仍是 `SIGNALED` ⇒ `present()` 的
+`queue_submit(..., submit_fence)`（`frame.rs:1070-1075`）**直接违反 VUID**。
+
+**次生问题**：`acquire_fence` 的复位（`frame.rs:849-854`）用
+`if fence_signaled(af)` 判断——这是**查询状态**而不是无条件复位，
+属于「凭状态猜测」而非「按规范复位」，同样脆弱。
+
+**建议修法**（属frame.rs，我未改）：`submit_fence` 改为**不带SIGNALED 创建**
+（`FenceCreateFlags::empty()`），并把 `reset_fences` 移出 `in_flight` 分支，
+在 `queue_submit` 之前无条件复位。首次使用的 `wait` 语义由
+`in_flight == false` 已经保证（无在途工作可等），**不需要靠 fence 初值**。
+
+### VUID 二：`VUID-VkImageMemoryBarrier-oldLayout-01197` —— 根因已确定
+
+```
+vkCmdPipelineBarrier(): pImageMemoryBarriers[0].image (VkImage 0x80000000008)
+  cannot transition ... from VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+  when the previous known layout is VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
+```
+
+- 涉及 **3 个交换链图像**（`0x8 / 0x9 / 0xa`），**每次运行全部命中**。
+- ⚠️ **主控规格指向 `texture.rs` 的 `image.layout` 失同步——这是误判**。
+  违规图像是**交换链图像**（句柄递增、每帧轮换），
+  与字体纹理 `DeviceImage.layout` 无关。`texture.rs` 的 `upload()` /
+  `transition_to()` 传的确实是 `self.layout`，**那部分是对的**。
+
+**根因**：**同一张图像被转换了两次**，且第二次用了过期的 `oldLayout`。
+
+1. 渲染通道附件声明 `initial_layout: UNDEFINED`、`final_layout: PRESENT_SRC_KHR`
+   （`pipeline.rs:80-81`）⇒ `cmd_begin_render_pass` **隐式**执行
+   `UNDEFINED → COLOR_ATTACHMENT_OPTIMAL`。
+2. 但 `open_command_buffer`（`frame.rs:1237-1264`）在开通道**之前**
+   **又显式**录了一道屏障，用 `LayoutTracker` 记的 `old_layout`
+   （此时是 `PRESENT_SRC_KHR`）→ `COLOR_ATTACHMENT_OPTIMAL`。
+3. 隐式转换在 2 之前已把图像变为 `COLOR_ATTACHMENT_OPTIMAL`，
+   于是 2 的 `oldLayout=PRESENT_SRC_KHR` 已过期。
+
+而 `LayoutTracker` 记的是「谁调用 `transition()` 就记什么」，
+它**不知道**渲染通道内部那次隐式转换，因此 CPU 侧记账与 GPU 实际状态脱节。
+`pipeline.rs` 的 `initial_layout: UNDEFINED` 注释写「可省去一次清除」，
+但配套的显式屏障没删——**两套机制并存**。
+
+**建议修法**（属 frame.rs + pipeline.rs，我未改）：二选一，不要并存。
+- 保留显式屏障 ⇒把 `pipeline.rs:80` 的 `initial_layout` 改为
+  `COLOR_ATTACHMENT_OPTIMAL`，让渲染通道不再隐式转换；
+- 或删掉 `open_command_buffer` 的显式屏障 ⇒ 完全依赖
+  `initial_layout=UNDEFINED`，但那样 `LayoutTracker` 就必须
+  改为只在 `present()` 记录 `PRESENT_SRC_KHR`（`cmd_end_render_pass`
+  时实际布局已由 `final_layout` 定为 PRESENT）。
+
+### 诚实的结论
+
+- 两个 VUID 都是**库代码的真实规范违规**，根因已定位到行、已给出修法。
+- 但**它们不是 device lost 的充分条件**：带层 20 次里 9 次正常通过，
+  通过的运行同样带 27 个 VUID。**我没能证明 VUID ⇒ 设备丢失的因果链。**
+- 帧数曲线（≤55 帧 435 次全过 vs 60 帧 48/50）说明这是
+  **极低频**事件，样本量不足以支撑进一步二分；黑盒二分在此已基本失效
+  （与 MEMORY.md 第4 批坑 34 的判断一致）。
+- **无 SYNC-HAZARD 报告**（同步验证已确认启用，且是deprecated key 生效），
+  即验证层**没有**发现队列内的读写竞争。泄漏在 `upload_probe` 中**未复现**
+  （主控在 `pipeline_probe` 看到的 7 个泄漏对象属另一路径）。
+
+### ✅ VUID 1 修复验证（frame.rs owner 提交 `7b01c8c` 后，我用验证层复跑）
+
+新二进制：`2026-10-06 14:06:50`（源码 `frame.rs` mtime `13:57:58`，
+**二进制晚于源码**，确属重新编译），md5 `a28e2daf…`，隔离 target `target-racehunt`。
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| VUID-1 `fence-00063` 错误块（3 帧） | 3 | **0** |
+| VUID-1 错误块（默认 60 帧） | 3~6 | **0** |
+| VUID-1 错误块（带验证层 20 次累计） | 60 | **0** ✅ |
+| 带验证层通过率 | 9 / 20 | **20 / 20** |
+| A 组 默认60帧 × 50（无验证层） | 48 / 50 | **50 / 50** |
+| B1 组 600 帧 × 50（无验证层） | 50 / 50 | **50 / 50** |
+
+**VUID 1 已彻底消除**，且device lost 现象**同时消失**
+（带层 20/20、无层 100/100）。全量测试 `scripts/build.sh --test`
+**280 个全过**，零编译警告。
+
+⚠️ **但 VUID 2 仍在**：`oldLayout-01197` 修复后 20 次累计 **200 个错误块**
+（每次 10 个，受duplicate_message_limit=10 截断），**一次都没消除**。
+它需要 `pipeline.rs` + `frame.rs` 属主协同（见上文 VUID 2 的前置条件：
+`LayoutTracker` 初始值必须与改后的 `initial_layout` 对齐）。
+
+**重要提醒**：device lost 消失**不能归因于「VUID 1 是唯一根因」**。
+修复前 20 次带层运行里有 9 次带着 27 个 VUID 正常通过，
+这说明 VUID 与device lost 无已证因果链。**更可能的解释**：
+`submit_fence` 带 SIGNALED 提交是**未定义行为**，
+规范说「行为未定义」，而不是「会报设备丢失」——
+UB 的实际后果**取决于驱动内部状态**，可能表现为间歇性丢失，
+也可能什么都不发生。**修掉 UB 让行为重新确定（变好），但这不是证明。**
+
+因此：**不要把「50/50 全过」当作竞态已彻底解决的知识**。
+按MEMORY.md 坑 49，验收标准应是指定次数下 0 失败，
+而 100 次全过仍只是**上界未触及**，不是「不可能再发生」。
+
+---
+
+## ✅ VUID 修复验证 + 真正的 device lost 根因（racehunt 复核）
+
+mcp-vuid-fix 修完上述两个 VUID 后，我用隔离目录 `target-vuidcheck`
+独立编译（26.9s，零警告，时间戳 `2026-10-06 14:13:18`）复核：
+
+| | 修复前 | 修复后 |
+|---|--------|--------|
+| `VUID-vkQueueSubmit-fence-00063` | 每次 3 块 | **0** ✅ |
+| `VUID-VkImageMemoryBarrier-oldLayout-01197` | 每次 3 块 | **0** ✅ |
+| 60 帧带层结果 | 20 次里 11 次失败 | 3 次全部 ALL OK |
+
+但**同时暴露了两个新 VUID**，且它们才是丢设备的真凶：
+
+```
+VUID-vkQueueSubmit-pSignalSemaphores-00067
+  pSignalSemaphores[0] is being signaled, but it may still be in use by VkSwapchainKHR
+  Most recently acquired image indices: [0], 1, 2, 1.
+  Swapchain image 0 was presented but was not re-acquired, so VkSemaphore
+  may still be in use and cannot be safely reused with image index 1.
+
+VUID-vkAcquireNextImageKHR-fence-10066
+  VkFence is already in use by another submission.
+```
+
+### 根因：`present_semaphore` 按**槽位**分配，`image_index` 由**驱动**决定
+
+- `frame.rs:1077`：`let present_sem = self.slots[slot].present_semaphore;`
+- 而 `queue_present` 用 `frame.image_index`（`acquire_next_image` 返回）
+- `grep -c 'image_fences|per_image'` = **0**，无per-image 数组
+- 槽位按 `cursor % 3` 递增，图像由驱动挑选，**两者顺序不一致**
+  （验证层打印的 `[0], 1, 2, 1` 即错位证据）
+
+这正是 MEMORY.md 第 7 批坑 45 的竞态，现在有规范编号了。
+
+### 为什么前两轮修复没能消灭 device lost
+
+前两个 VUID 是**确定性违规但不是丢设备原因**（实测：带 VUID 的运行
+9/20 正常通过）。真凶是信号量/fence 复用，
+而它**被前两个 VUID 掩盖**——修掉前两个后立刻暴露。
+
+**教训：验证层报的最后一个错误，往往才是竞态的根因。**
+前面几个错误会把视线引开（它们同样刺眼、同样有规范编号）。
+
+### 建议修法（属frame.rs owner）
+
+- **方案 A（推荐）**：`Vec<Semaphore>` + `Vec<Fence>`，长度 = `image_count`；
+  `present()`按 `image_index` 索引；`acquire()` 拿到 index 后确保
+  「该图像上次 present 已完成」再提交。
+- **方案 B**：`VK_KHR_swapchain_maintenance1`。
+  ⚠️ MEMORY.md 坑 52：该扩展用**扩展专属结构体**，
+  `PresentInfoKHR` 在 ash 0.38 **无** fence 字段。
+
+### 验收判据（重要）
+
+基线失败率仅 ~4%，**50 次全过也说明不了问题**。
+修完后判据必须是：**带验证层跑 ≥50 次，0 条 VUID且 0 次失败**，
+不能只看通过率。
+
+### ⚠️ 我的一处建议被验证层证伪（已记录）
+
+我曾建议把 `acquire_fence` 的复位从 `if fence_signaled(af)`
+改成**无条件 `reset_fences`**。mcp-vuid-fix 回退了它，理由是
+`VUID-vkResetFences-pFences-01123`——fence 仍被在途
+`acquire_next_image` 关联时 reset 是违规的（60 帧报 20 次）。
+
+**验证层证明回退是对的，我的建议是错的。**
+我把一个规范要求的前置条件当成了「凭状态猜测的冗余防御」。
+这是 MEMORY.md 第 6 批坑 54 的典型形态：**带语义依据的判断不能当冗余简化掉**。
+
+---
+
+## ✅ 偶发 device lost 已彻底消除：160/160（VUID 全归零）
+
+**结论：三个VUID 全部清除后，`upload_probe` 的偶发 `ERROR_DEVICE_LOST` 随之消失。**
+此前推测「VUID 与 device lost 无因果」是**错的** —— race-hunt 的对照实验
+（9 过 11 败但通过的也带 27 个 VUID）只说明**VUID 数量不是充分条件**，
+不代表无因果。清除后160/160 支持存在因果。
+
+### 三个 VUID 与各自的根因
+
+| VUID | 根因 | 修法 | 位置 |
+|---|---|---|---|
+| `vkQueueSubmit-fence-00063` | fence 以 `SIGNALED` 创建，但 `reset_fences` 只在 `in_flight` 分支内⇒ **首次使用**即违规 | 创建用 `UNSIGNALED` | `frame.rs`（B组） |
+| `VkImageMemoryBarrier-oldLayout-01197` | 附件 `initial_layout=UNDEFINED` 触发隐式转换，与开通道前的显式屏障两套并存 | `initial_layout` 改 `COLOR_ATTACHMENT_OPTIMAL` | `pipeline.rs`（team-lead） |
+| `vkResetFences-pFences-01123` | **我上一个commit 引入的**：把 acquire_fence 复位改成无条件 reset | 改回「先确认已 signal 再复位」 | `frame.rs`（B组） |
+
+### 关键实测数据（VK_LAYER_KHRONOS_validation + VK_LAYER_VALIDATE_SYNC=1）
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| `FRAMES=3` | 6 × oldLayout-01197 | **0** |
+| 60 帧 | 20 × 01123 + 2 × 00067 + 20 × oldLayout | **0** |
+
+功能回归：lib单测 **140 passed / 零警告**；三探针各 **20/20**；
+`upload_probe` **160/160**（60 + 100，两批均 0 失败）。
+
+### 三条方法论教训（本项目最贵的三课）
+
+**1. 「我认为可省的判断」可能是规范要求的前置条件。**
+两次同型错误，都是我改的：
+- `rebuild_chunk` 守卫：漏判「同帧已录制」⇒ 25% 偶发 use-after-free
+- `acquire_fence` 无条件 reset：漏判「fence 仍在用」⇒ 20 × 01123
+
+**带语义依据的判断不能当冗余防御简化掉。** 这类改动的正确做法是**先改再用验证层证明**，不能凭"逻辑上应该对"。
+
+**2. VUID 数量不是 device lost 的充分条件，但可能有因果。**
+race-hunt 当时据此推断无因果，这个推断过强。正确表述是：
+「VUID 数量无法单独预测是否丢设备」。
+
+**3. 单次绿灯、静态推理、代码评审都不算验证。**
+今天我三次因"看起来对"而出错（误报 100% 消除、凭想象发明 API、盲改三轮）。
+真正定位问题的两次，一次来自**对照实验**（F 组）、一次来自**验证层**（race-hunt）。
+
+### 遗留
+
+`PresentInfoKHR` 在 ash 0.38 **无 fence 字段**（`vkQueuePresentKHR` 规范也不接受
+fence 参数），所以此前设想的 per-image fence 需换实现方式。
+**当前 160/160 不需要它** —— 若将来要加，理由应重新评估。
