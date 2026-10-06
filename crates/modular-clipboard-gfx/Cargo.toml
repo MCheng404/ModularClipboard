@@ -13,6 +13,9 @@ bytemuck = { workspace = true }
 # window.rs 需要把 Win32 事件翻译成 egui 的 RawInput，
 # 这是 UI 层与渲染层之间唯一的耦合点，由本 crate 持有以避免循环依赖。
 egui = { workspace = true }
+# tray_probe 需要验证托盘常驻（托盘实现在 platform 层）。
+# 只被example 使用，不进渲染库本身。
+modular-clipboard-platform = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -46,6 +49,10 @@ name = "full_app"
 # 窗口与事件循环实机验证（无渲染，退出码 0 = 正常）
 [[example]]
 name = "window_probe"
+
+# 托盘常驻 + 全局快捷键实机验证（无渲染，退出码 0 = 正常）
+[[example]]
+name = "tray_probe"
 
 # 着色器在编译期由 naga 编译为 SPIR-V，不进最终二进制。
 # 这样无需 glslc / glslang 等 C++ 工具链，保持纯 Rust 构建链。

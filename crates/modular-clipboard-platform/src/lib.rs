@@ -5,6 +5,9 @@
 use anyhow::Result;
 use std::time::Duration;
 
+pub mod hotkey;
+pub mod tray;
+
 /// 复用捕获层的窗口探测能力，避免重复实现 Win32 调用。
 use modular_clipboard_capture::{foreground_class_name, source_process_name};
 
