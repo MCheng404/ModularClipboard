@@ -1255,3 +1255,57 @@ Most recently acquired image indices: 0, [1], 2, 0, 0.
 本项目 device lost 基线失败率约 4%（2/50）。
 要「上界抬高」到可信水平，采样量至少要能覆盖该量级——
 160 次全过只能说明「上界未触及」，**不能推断不再发生**。
+
+---
+
+## ✅ 复核最终结果：四个 VUID 全部归零（HEAD `245bb2f`）
+
+B 组按racehunt 定位连续修复了 4 个 VUID。本轮独立复核（隔离 target
+`target-racehunt3`，全新编译零警告）：
+
+二进制：`target-racehunt3/…/upload_probe.exe`
+`2026-10-06 14:36:23`  md5 `f2963891…`
+`frame.rs 9d4f6063…`  HEAD `245bb2f`
+
+| VUID | 最初 | 现在 |
+|------|------|------|
+| `VUID-VkImageMemoryBarrier-oldLayout-01197` | 每次 20 | **0** |
+| `VUID-vkQueueSubmit-fence-00063` | 每次 3 | **0** |
+| `VUID-vkAcquireNextImageKHR-fence-10066` | 每次 20 | **0** |
+| `VUID-vkQueueSubmit-pSignalSemaphores-00067` | 每次 20 | **0** |
+
+**带验证层 15 次：15/15 通过，15/15 零 VUID**，零 SYNC-HAZARD、零泄漏。
+
+### 验收强度
+
+| 版本 | 次数 | 结果 |
+|------|------|------|
+| `7c638ad`（修fence+布局，未修 semaphore） | 300 | **300 / 300** |
+| `245bb2f`（含 per-image semaphore） | 200 在跑 | 前 5 次 0 失败 |
+
+gfx 库 **143 个测试全过**（比修复前 140 个多 3 个——B 组补了测试）。
+
+### 关键判断：`PresentResult::Presented` 的语义已被真正修正
+
+这是本轮**最实质的进展**，不是「VUID 归零」本身。
+
+修复前`frame.rs:151-152` 断言「present 已被消费，该槽位可安全复用」——
+验证层证伪了它。现在 `present()` 改为
+`self.image_semaphores[present_semaphore_index(frame.image_index, …)]`，
+**按 image_index 取信号量**，并在 `frame.rs:1125-1127` 留下注释说明
+「image_index 由驱动挑选，与 `cursor % slot_count` 无对应关系」。
+
+即：**从「按槽位推测」改成「按图像事实」**。
+这消除了 MEMORY.md 第 7 批坑 45 记录的核心隐患，
+且该改动有独立单测（`present_semaphore_index`）守护，不是靠注释约束。
+
+### 仍然诚实标注的边界
+
+- **「未复现」≠「已修复」**（`cee9749` 已立此纪律，我遵守）。
+  200~300 次 0 失败**只**说明失败率上界被抬高，
+  **不足以证明** 4 个 UB 就是device lost 的根因。
+  只能说：**4 个真实规范违规已消除，且device lost 在~500 次样本内未复现**。
+- 本机仍有 `VK_KHR_present_wait` / `swapchain_maintenance1`
+  可用（实测 revision 1），**但现在不需要了**——
+  per-image semaphore 已解决 signal 复用问题，
+  不必再上机制（避免「用复杂度换安全感」）。
