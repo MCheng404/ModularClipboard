@@ -43,6 +43,10 @@ fn main() {
             WINDOW_EX_STYLE(0),
             class_p,
             title_p,
+            // 探针只验证管线，不需要给人看窗口，
+            // 所以用 `WS_OVERLAPPEDWINDOW` 但**不调用 ShowWindow**。
+            //
+            // 早前它会弹出可见窗口骚扰用户；验证类探针应当静默运行。
             WS_OVERLAPPEDWINDOW,
             100,
             100,
@@ -70,7 +74,15 @@ fn main() {
                 DispatchMessageW(&msg);
             }
             if !shown {
-                let _ = ShowWindow(hwnd, SW_SHOW);
+                // 刻意**不调用 ShowWindow**。
+                //
+                // 验证类探针不该在用户桌面上弹窗。
+                // 但也不能用 SW_SHOWMINIMIZED —— 最小化会触发 WM_SIZE
+                // 把 client rect 压成 0×0，而本探针用 client rect 尺寸
+                // 建交换链 ⇒ imageExtent=0 ⇒ VUID-…-01689。
+                //
+                // 未显示的窗口仍有非零 client rect（由 CreateWindowExW
+                // 的 W/H 决定），交换链可正常创建。
                 shown = true;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -236,8 +248,47 @@ fn main() {
     println!("OK command pool + buffer");
 
     // 实际录制并提交一帧
-    let img = swapchain.images[0];
-    let fb = swapchain.framebuffers[0];
+    //
+    // ⚠️ 必须先 `acquire_next_image` —— 规范要求：
+    // 「对 presentable 图像的使用（含布局转换与渲染命令）
+    // 只能发生在 `vkAcquireNextImageKHR` 返回它之后、
+    // `vkQueuePresentKHR` 释放它之前」。
+    //
+    // 早期版本直接取 `swapchain.images[0]` 而不 acquire，
+    // 触发 `UNASSIGNED-non-acquired-swapchain-image-used`：
+    // 「performs a layout transition on presentable VkImage,
+    //  but the image has not been acquired from VkSwapchainKHR」。
+    //
+    // 注意 `gpu.swapchain_loader` 是 `khr::swapchain::Device`（非 `Copy`），
+    // 而 `gpu` 是 `&Gpu`——这里只能**借用**它，不能移动。
+    let acquire_sem = unsafe {
+        gpu.device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            .expect("创建 acquire 信号量")
+    };
+    let acquire_fence = unsafe {
+        gpu.device
+            // 必须 UNSIGNALED —— 规范要求传给 acquire 的 fence
+            // 在调用前处于未signal 状态。
+            // （早前用 SIGNALED 会触发 VUID-vkAcquireNextImageKHR-fence-01287。
+            //  与 frame.rs 里submit_fence 的问题是同一类。）
+            .create_fence(&vk::FenceCreateInfo::default(), None)
+            .expect("创建 acquire 栅栏")
+    };
+    let (image_index, _suboptimal) = unsafe {
+        gpu.swapchain_loader
+            .acquire_next_image(
+                swapchain.handle,
+                u64::MAX, // 一直等到有图像可用
+                acquire_sem,
+                acquire_fence,
+            )
+            .expect("acquire_next_image 失败")
+    };
+    println!("OK acquire_next_image  image_index={image_index}");
+
+    let img = swapchain.images[image_index as usize];
+    let fb = swapchain.framebuffers[image_index as usize];
 
     let begin = vk::CommandBufferBeginInfo::default();
     unsafe { gpu.device.begin_command_buffer(cmd, &begin) }.expect("begin cmd");
@@ -296,7 +347,17 @@ fn main() {
     unsafe { gpu.device.end_command_buffer(cmd) }.expect("end cmd");
     println!("OK command buffer recorded (barriers + render pass)");
 
-    let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+    // 提交时必须 wait `acquire_sem` ——
+    // acquire 返回图像意味着「该图像已可被 GPU 使用」这个信号
+    // 由该信号量发出。不wait 它会引入新违规
+    // （VUID-vkQueueSubmit-pWaitSemaphores-00684：
+    //  waitSemaphoreCount=0 但 acquire 传了非 null 的信号量）。
+    let submit = vk::SubmitInfo::default()
+        .wait_semaphores(std::slice::from_ref(&acquire_sem))
+        // 有 wait_semaphores 就**必须**给 wait_dst_stage_mask，
+        // 否则 VUID-VkSubmitInfo-pWaitDstStageMask-parameter。
+        .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+        .command_buffers(std::slice::from_ref(&cmd));
     unsafe { gpu.device.queue_submit(gpu.queue, std::slice::from_ref(&submit), vk::Fence::null()) }
         .expect("queue_submit");
     println!("OK queue_submit  <-- GPU 实际执行了命令");
@@ -307,6 +368,10 @@ fn main() {
     unsafe {
         gpu.device.destroy_command_pool(cmd_pool, None);
         gpu.device.destroy_descriptor_pool(pool, None);
+        // acquire 创建的信号量与栅栏也必须销毁，否则
+        // `vkDestroyDevice` 会报 VUID-vkDestroyDevice-device-05137 泄漏。
+        gpu.device.destroy_semaphore(acquire_sem, None);
+        gpu.device.destroy_fence(acquire_fence, None);
     }
     pipeline.destroy(&gpu.device);
     shader.destroy(&gpu.device);
