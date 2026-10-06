@@ -58,9 +58,17 @@ name = "tray_probe"
 [[example]]
 name = "thumb_probe"
 
-# 交换链重建验证（真实触发 resize；含 A/B 像素反证）
+# 交换链重建路径验证（零像素校验、零离屏靶面）
+# 旧 resize_probe 因同时承担「主循环」与「像素校验」两个职责而删除：
+# 它借用生产管线的描述符集，无法跟随 pipeline.rs 演进；且负对照的
+# BG 常量与清屏色不一致，检查结果就是噪声。见 MEMORY 第 19 批坑 91~93。
+# resize 序列默认关闭，设 SWAPCHAIN_RESIZE=1 开启。
 [[example]]
-name = "resize_probe"
+name = "swapchain_resize"
+
+# 像素渲染验证（自建完整离屏管线，不碰交换链、不借生产资源）
+[[example]]
+name = "pixels_probe"
 
 # 着色器在编译期由 naga 编译为 SPIR-V，不进最终二进制。
 # 这样无需 glslc / glslang 等 C++ 工具链，保持纯 Rust 构建链。

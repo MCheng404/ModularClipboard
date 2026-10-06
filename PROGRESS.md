@@ -1386,3 +1386,238 @@ gfx 库 **143 个测试全过**（比修复前 140 个多 3 个——B 组补了
   可用（实测 revision 1），**但现在不需要了**——
   per-image semaphore 已解决 signal 复用问题，
   不必再上机制（避免「用复杂度换安全感」）。
+
+---
+
+## 🔀 探针拆分：`resize_probe` → `swapchain_resize` + `pixels_probe`（mcp-split-probe）
+
+### 为什么要拆
+
+旧 `examples/resize_probe.rs`（1555 行 / 19 个测试）同时承担两个不相关职责：
+
+1. **主循环探针**：借 `FrameRenderer` 的交换链跑帧循环 + 触发 resize，
+   检查 extent 一致性、交换链重建次数、资源泄漏；
+2. **像素探针**：**自建**离屏靶面做 A/B 像素校验，**却借用生产管线的
+   `fr.descriptor_set(0)` 与生产渲染通道**。
+
+两个后果（MEMORY 第 19 批坑 90~93 的直接落实）：
+
+- **无法跟随生产代码演进**：`pipeline.rs` 改 `final_layout` 后立刻报
+  `VUID-vkCmdDraw-None-09600`（描述符的 `imageLayout` 与实际不符）——
+  这是「借用生产管线」的必然结果，不是库的 bug。
+- **判据与被测实现不一致 ⇒ 检查结果就是噪声**：`BG = [0x1E,0x1E,0x22]`
+  而清屏色是 `[0,0,0]`，差 `0x1E` ⇒ 每个像素都算「非背景」⇒
+  负对照检出 576000（全屏像素数）。同时 MEMORY 坑 90 记录的
+  「35 个泄漏」也是探针自己 `bail!` 跳过清理的后果，不是库的问题。
+
+### 交付物
+
+| 文件 | 职责 | 借生产资源？ | 像素校验 | 测试数 |
+|------|------|------------|---------|-------|
+| `examples/swapchain_resize.rs`（新） | 交换链重建路径 | 是（`FrameRenderer`，**这正是被测对象**） | **零** | 8 |
+| `examples/pixels_probe.rs`（新） | 像素渲染 | **零**（全套自建） | 有 | 32 |
+| `examples/resize_probe.rs`（**已删**） | — | — | — | −19 |
+
+两个新文件都已在 `crates/modular-clipboard-gfx/Cargo.toml` 注册 `[[example]]`
+（MEMORY 坑 37：不注册就不会参与编译，「0 error」是假的）。
+
+### 探针 A：`swapchain_resize` —— 只验交换链重建，零像素
+
+**四条硬判据**（任一不过即 `FAIL`，退出码 1）：
+
+1. **重建次数 > 0**——为 0 说明 resize 没生效，探针等于没测
+   （`full_app` 实测一直打印「交换链重建 0 次」，这条路径此前从未被触发过）；
+2. `fr.extent() == GetClientRect` 真实客户区；
+3. 每帧 present 成功、无 device lost；出现 `Err` 由 `?` 直接退出，
+   另有「全帧 Outdated」与「present 次数 ≠ 帧数」两条兜底断言；
+4. 收尾时验证层无泄漏（销毁顺序 framebuffer → image_view → swapchain）。
+
+**额外不变量**（`check_invariants`）：重建后
+`image_semaphore_count() == swapchain_image_count() == slot_count()`。
+这两个访问器**已存在**，本探针**没有为验证改过 `frame.rs` 一行**——
+它们存在的唯一理由就是这个判据（见 `frame.rs` 注释）。
+
+**刻意不画任何图元**：每帧 `record(&DrawInput::default())` 只清屏。
+不引入字体图集 / 描述符写入 / 顶点缓冲，少一个变量就少一个误判来源。
+画面是否正确由探针 B 负责。
+
+**每尺寸 60 帧**（`FRAMES_PER_SIZE`）：足以让「每交换链图像一个信号量」的
+轮转走完一圈（典型 image_count 2~3），覆盖索引错配的失效路径。
+
+**resize 默认关闭**：设 `SWAPCHAIN_RESIZE=1` 开启。
+`resize_enabled_from` 是纯函数且有单测锁住解析规则
+（未设置 / 空串 / `0` / `false` / `off` / `no` → 关闭）。
+默认关闭是为了让 CI 或他人运行时「什么都不发生」——resize 会改动用户窗口尺寸。
+
+**窗口位置固定在桌面内 (8, 8)**：早前移到 `(-32000,-32000)` 想让用户看不见，
+结果验证层报 `VUID-VkSwapchainCreateInfoKHR-pNext-07781`
+（`resolve_extent` 在 `current_extent` 非 0 时原样采用，而窗口完全离开桌面时
+DWM 报告的 extent 超出表面能力范围）。**也不最小化**：最小化把客户区压成
+0×0，`resolve_extent` 原样采用 0 直接违规。客户区意外为 0×0 时容忍
+50 次连续帧（≈1 秒抖动）后**明确失败**，而不是无限 `continue` 变无声挂起
+（MEMORY：「WARN 不是通过条件」）。
+
+### 探针 B：`pixels_probe` —— 只验像素，自建全套管线
+
+**自建清单**（不借用 `FrameRenderer` 的任何东西）：渲染通道、描述符集布局、
+管线布局、图形管线、着色器模块、描述符池、描述符集、命令池、命令缓冲、
+栅栏、读回缓冲、离屏图像、离屏 framebuffer、uniform 缓冲、采样器、
+字体图集、用户纹理、顶点/索引缓冲。
+
+**渲染通道按离屏自己的格式 `R8G8B8A8_UNORM` 创建**，不跟随交换链格式——
+生产侧改格式选择逻辑时本探针判据不受影响。
+
+`update_after_bind = false`：本探针每个描述符集只写一次且每次渲染后等栅栏，
+不存在「被 pending 命令缓冲使用中就被改写」的情形。
+layout flags / pool flags / device feature **三处一致地都不加**，
+省掉一整类配对失误（MEMORY 第 16 批记录过「三处改动缺一即违规」）。
+
+**判据自洽（核心）**：清屏色是唯一来源，两者不允许各写一份。
+
+```rust
+const CLEAR: [f32; 4] = [0x1E/255, 0x1E/255, 0x22/255, 1.0];
+const fn unorm8(v: f32) -> u8 { /* v*255+0.5 后截断，兼容驱动的两种舍入 */ }
+const BG: [u8; 3] = [unorm8(CLEAR[0]), unorm8(CLEAR[1]), unorm8(CLEAR[2])];
+```
+
+界面铺的背景矩形用 `bg_as_egui_color()`（同一组分量），
+于是「清屏」与「绘制的背景」在像素上完全一致。
+`bg_matches_clear_byte_for_byte` / `clear_and_bg_agree_byte_for_byte` /
+`ui_background_is_byte_identical_to_clear` 三条单测 + 运行期 `ensure!` 锁死。
+
+**A/B 走完全相同的代码路径**：正负对照都调同一个 `Pixels::render_and_read`，
+同一描述符集、同一管线、同一对缓冲、同一读回流程。
+空批次时**仍然绑定管线 / 描述符集 / 顶点缓冲 / 索引缓冲**，只是不发
+`cmd_draw_indexed`——这样「差异」必然来自绘制本身，
+而不是「少绑了东西导致画面不同」。
+
+| 对照 | 批次 | 期望「非背景像素」 |
+|------|------|------------------|
+| 负对照 | 空 | **恰好 0** |
+| 正对照 | 真实 egui 图元 | **> 0 且 < 全屏像素数** |
+
+- 负对照检出内容 ⇒ **主动 bail 并说明检查失效**，绝不降级判据让它通过；
+- 正对照的上界同样重要：背景矩形没画出来时计数会接近全屏 ⇒
+  判据能同时抓到「画太多」与「画太少」两种坏法。
+
+**判据本身可单测（不依赖 GPU）**：`classify` / `count_non_background` 是纯函数。
+
+| 单测 | 断言 |
+|------|------|
+| `negative_control_bytes_are_empty` | 纯背景字节 → `Empty`，计数 0 |
+| `positive_control_bytes_are_drawn` | 正对照字节 → `Drawn`，计数恰等于内容面积 |
+| `criterion_separates_positive_from_negative` | 同一判据对两组字节给出**相反**结论 |
+| `broken_rendering_would_be_detected` | 渲染坏掉 ⇒ 正对照退化为空 ⇒ 主判据必失败 |
+| `missing_background_would_be_detected` | 背景没画 ⇒ 计数 == 全屏 ⇒ 上界判据必失败 |
+
+后三条直接回答「**如果渲染真的坏了，检出会不会变？**」——
+若哪天 `classify` 变成恒真或恒假，测试立刻失败。
+
+**尺寸序列** `[(640,480), (320,240), (800,600), (640,480)]`：
+覆盖变大与变小两个方向（只单向变化时某些驱动可能不真正重建资源），
+最后一档回到第一档（验证「改回去」）。每换一档都**重建离屏图像 /
+framebuffer / 读回缓冲**并重写描述符，销毁顺序与创建相反。
+
+**读回长度必须先卡住**：`classify` 用 `chunks_exact(4)`，
+长度不对会**静默丢掉尾部余数**并给出看似合理的结论（MEMORY 坑 86）。
+
+**等栅栏而不是 `device_wait_idle`**：后者把整条队列强行串行化，
+而 MEMORY 第 7/10 批反复记录「诊断用的同步点会改变被诊断的系统」。
+栅栏超时 5 秒——无限等待会把「设备卡住」变成无声挂起。
+
+### 实机预期输出格式
+
+```text
+# swapchain_resize（默认，resize 未开启）
+OK Window  客户区 900x640  scale_factor=1  位置 (8,8)（桌面内，不抢焦点）
+OK Gpu  NVIDIA ... (DiscreteGpu)
+OK FrameRenderer  extent=900x640  槽位=3  图像=3
+[resize] SWAPCHAIN_RESIZE 未设置：只在初始尺寸跑 60 帧，不触发 resize
+  帧 60/60  extent 900x640 = 客户区 900x640  本段重建 0 次（累计 1）
+  present: 60 presented / 0 outdated  槽位 3 = 图像数 3  信号量 3 = 图像数 3
+ALL OK - 60 帧，交换链重建 1 次（resize 序列未开启）
+
+# swapchain_resize（SWAPCHAIN_RESIZE=1，每尺寸一段）
+---- resize #0：目标客户区 640x480 ----
+  帧 60/60  extent 640x480 = 客户区 640x480  本段重建 2 次（累计 3）
+  present: 60 presented / 0 outdated  槽位 3 = 图像数 3  信号量 3 = 图像数 3
+（#1 1200x800 / #2 900x640 同格式；含初始尺寸共 4 段 240 帧）
+
+# pixels_probe
+---- 靶面 #0  640x480（离屏资源重建 #1）----
+  几何: 1234 顶点 / 3702 索引 / 12 draw call
+  负对照（空批次，只清屏）: 非背景 0 / 307200 像素 -> Empty
+  正对照（真实图元）      : 非背景 15203 / 307200 像素 -> Drawn
+ALL OK - 4 个尺寸，离屏资源重建 4 次；非背景像素 负对照 [0, 0, 0, 0] / 正对照 [...]
+```
+
+**A/B 判据的具体数值**：负对照**必须是 0**（4 个尺寸全部）；
+正对照的具体数字取决于字体与 egui 版本，量级为**数千 ~ 数万**
+（文字笔画 + 3 个 70×40 色块），且**必须 < 全屏像素数**。
+
+### 编译与测试状态（已实测，非推测）
+
+- `cargo build -p modular-clipboard-gfx --examples`：**两个新文件零警告**。
+- `cargo test -p modular-clipboard-gfx --example swapchain_resize`：**8 通过 0 失败**。
+- `cargo test -p modular-clipboard-gfx --example pixels_probe`：**32 通过 0 失败**。
+- `cargo test --workspace`：**341 通过 0 失败**（基线 341，未回归）。
+
+开发过程中我自己的两条单测**先失败过**，修正的是数据不是判据：
+`zero_client_grace_is_bounded`（100 > 60 帧，改成 50）
+与 `target_sequence_covers_both_directions`（原序列没有比首项更小的尺寸，
+改成 `640,480 → 320,240 → 800,600 → 640,480`）。
+这正是「判据与被测实现不一致 ⇒ 检查结果就是噪声」在**探针自己身上**的一次复现。
+
+### ⚠️ 预先存在的问题（非本次引入，已在 HEAD 复现）
+
+`cargo test -p modular-clipboard-gfx --examples` 会暴露 `full_app` 的
+**一条既有失败**（我在 HEAD `48e7719` 上 stash 掉全部改动复现确认）：
+
+```text
+test tests::vertex_layout_matches_pipeline_stride ... FAILED
+  left: 24   right: 20      （full_app.rs:1274）
+```
+
+`full_app.rs:1274` 硬编码 `assert_eq!(size_of::<Vertex>(), 20)`，
+而 `Vertex` 加 `tex_id` 后已是 24 字节。这与 `pipeline.rs` 早就修好的
+那条测试**是同一个漂移**（MEMORY 第 17 批坑 84：「重复的常量必然各自漂移，
+要 grep 全部出现点」）——`pipeline.rs` 那处改了，`full_app.rs` 这处漏了。
+
+`full_app.rs` 不在我的可写范围，**未擅自修改**，登记在此待主控裁决。
+建议改法与 `pipeline.rs` 一致：断言 `size_of::<Vertex>()`（或 `VERTEX_STRIDE`）
+而不是硬编码 20。注意这条测试**不在 `--workspace` 基线里**
+（examples 的测试只有 `--examples` 才跑），所以基线 341 一直是绿的。
+
+**另注**：`full_app.rs:230` 有一条 `unused_must_use` 警告
+（`MoveWindow` 的 `Result` 未处理），同样预先存在，我未改。
+
+### 待主控实机验证（我没有自己跑任何带窗口的程序）
+
+按纪律（MEMORY 第 15 批坑 73/74）**未在用户桌面弹窗**。
+请主控在受控环境依次执行并核对：
+
+```bash
+export CARGO_TARGET_DIR="D:/WorkBuddy/Tiez/target-splitprobe"
+
+# 1. 默认模式：应安静跑 60 帧后退出（不触发 resize）
+./scripts/agent_cargo.sh run -p modular-clipboard-gfx --example swapchain_resize
+
+# 2. resize 序列：3 段 × 60 帧，每段重建次数必须 > 0
+SWAPCHAIN_RESIZE=1 ./scripts/agent_cargo.sh run -p modular-clipboard-gfx --example swapchain_resize
+
+# 3. 像素探针：负对照 4/4 必须为 0，正对照 4/4 必须 > 0 且 < 全屏
+./scripts/agent_cargo.sh run -p modular-clipboard-gfx --example pixels_probe
+```
+
+**带验证层跑**（用 `scripts/verify_layers.sh`，MEMORY 坑 67：
+「0 个 Validation Error」不能自证层生效，必须附 loader 日志证明层真的加载了）：
+
+```bash
+VK_LOADER_DEBUG=layer ... 2>&1 | grep "LAYER: Loading layer library"
+```
+
+关注点：
+- `swapchain_resize` 重建后是否零 VUID（重点看
+  `VUID-vkDestroyDevice-device-05137`：重建时泄漏 ImageView / Semaphore）；
+- `pixels_probe` 全流程零 VUID（它自建描述符集且 `update_after_bind = false`，
+  是「UPDATE_AFTER_BIND 三处配套」的独立对照实验）。
