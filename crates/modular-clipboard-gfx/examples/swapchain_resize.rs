@@ -306,7 +306,11 @@ fn run_phase(
 
     while stats.frames < frames {
         // ---- 1. 事件 + resize ------------------------------------------
-        for ev in events.poll() {
+        //
+        // 用 `take_pending()` 而非 `poll()` 的返回值：本循环末尾的
+        // `poll_for`（:373）也读消息并丢弃返回值，只取 `poll()` 自己的
+        // 返回值会把那些事件永久漏掉——包括 `CloseRequested`。
+        for ev in events.take_pending() {
             match ev {
                 WindowEvent::CloseRequested => {
                     anyhow::bail!("收到关闭请求，探针不应被手动关闭");

@@ -512,10 +512,19 @@ impl EventLoop {
             let _ = unsafe { DispatchMessageW(&msg) };
         }
 
+        self.absorb(events.clone());
+        events
+    }
+
+    /// 把一轮读到的事件并入累积缓冲。
+    ///
+    /// 抽成独立方法是为了让测试能走**与`poll()` 完全相同的写路径**：
+    /// 早先的测试直接调`Vec::extend_from_slice`，把这里的实现改回
+    /// 覆盖语义（`self.pending = events`）测试照样通过，属于假守卫。
+    fn absorb(&mut self, events: Vec<WindowEvent>) {
         // ⚠️ 必须**追加**而非覆盖：`poll_for` 也会走到这里，
         // 覆盖会把上一轮累积的未交付事件抹掉（见 `poll` 的说明）。
         self.pending.extend_from_slice(&events);
-        events
     }
 
     /// 睡眠式轮询：有消息立即返回，空闲时最多阻塞 `timeout`。
@@ -683,33 +692,61 @@ impl EventLoop {
 
     /// 构造本帧的 [`egui::RawInput`]。
     ///
-    /// 读取 [`Self::poll`] 填好的事件缓冲。D 组每帧开头调用一次，
-    /// 把结果交给 `egui::Context::run` 即可。
+    /// `events` 是本帧要翻译的事件，通常来自 [`Self::take_pending`]。
+    /// D 组每帧开头调用一次，把结果交给 `egui::Context::run` 即可。
+    ///
+    /// # ⚠️ 为什么事件是参数而不是读`self.pending`
+    ///
+    /// 事件缓冲是**累积**的（见 [`Self::poll`] 的说明）：节流路径
+    /// `poll_for` 也会读消息，其返回值被调用方丢弃，事件只能留在
+    /// 缓冲里等主循环来取。
+    ///
+    /// 若`egui_input` 读 `self.pending`、而主循环用 `take_pending()`
+    /// 取走事件，两者是**先后顺序相反且互不知情**的两份状态：
+    /// 只要主循环先取走（正常做法），`egui_input` 就永远读到空——
+    /// 实测后果是**整个 UI 收不到任何鼠标/键盘输入**，比它修的缺陷
+    /// 更严重。
+    ///
+    /// 改为显式传参后，「本帧事件」只有一份，且类型上不可能再取错。
     ///
     /// `screen_rect` 用逻辑点，`time` 是自事件循环创建起的秒数，
     /// `predicted_dt` 取 `set_repaint_after` 设的间隔。
-    pub fn egui_input(&self, ctx: &egui::Context) -> egui::RawInput {
-        let mut events: Vec<EguiEvent> = Vec::with_capacity(self.pending.len() + 4);
+    pub fn egui_input(&self, ctx: &egui::Context, events: &[WindowEvent]) -> egui::RawInput {
+        let mut out: Vec<EguiEvent> = Vec::with_capacity(events.len() + 4);
 
         // 指针位置每帧都要报。没有移动消息时用系统光标位置兜底，
         // 否则 egui 无法判断「鼠标在窗口内但没动」的悬停。
         if let Some(pos) = self.pointer_in_points(self.scale_factor) {
-            events.push(EguiEvent::PointerMoved(pos));
+            out.push(EguiEvent::PointerMoved(pos));
         }
 
-        let mut modifiers = self.modifiers;
+        // 兜底修饰键用**实时查询**而非 `self.modifiers`。
+        //
+        // `self.modifiers` 只在收到按键消息时更新，而事件缓冲是累积的
+        // （见 `poll` 的说明）：跨帧累积下来的 `MouseButton` 事件本身
+        // 不带修饰键字段，若起点是上一帧的残值，就会把「按住 Ctrl 的点击」
+        // 报成「无修饰键的点击」，让右键菜单一类交互带上错误的按键状态。
+        // `GetAsyncKeyState` 查的是此刻的真实物理状态，没有跨帧问题。
+        //
+        // 循环内遇到 `Key` 事件时仍会被事件自带的 modifiers 覆盖
+        // （那是按下瞬间的精确状态，更可靠）。
+        let mut modifiers = if events.iter().any(is_key_event) {
+            self.modifiers
+        } else {
+            current_modifiers()
+        };
 
-        for ev in &self.pending {
+        for ev in events {
             match ev {
                 WindowEvent::MouseMoved { pos } => {
-                    events.push(EguiEvent::PointerMoved(*pos));
+                    out.push(EguiEvent::PointerMoved(*pos));
                 }
                 WindowEvent::MouseButton {
                     button,
                     pressed,
                     pos,
                 } => {
-                    events.push(EguiEvent::PointerButton {
+                    out.push(EguiEvent::PointerButton {
                         pos: *pos,
                         button: *button,
                         pressed: *pressed,
@@ -717,7 +754,7 @@ impl EventLoop {
                     });
                 }
                 WindowEvent::Scroll(lines) => {
-                    events.push(EguiEvent::MouseWheel {
+                    out.push(EguiEvent::MouseWheel {
                         // Win32 给的是行数。egui 原生支持 Line 单位，
                         // 由它按 line_scroll_speed 换算成点。
                         unit: MouseWheelUnit::Line,
@@ -736,7 +773,7 @@ impl EventLoop {
                     modifiers: m,
                 } => {
                     modifiers = *m;
-                    events.push(EguiEvent::Key {
+                    out.push(EguiEvent::Key {
                         key: *keycode,
                         // 同时填 physical_key：留空会让部分 IME 分支走不到。
                         physical_key: Some(*keycode),
@@ -746,10 +783,10 @@ impl EventLoop {
                     });
                 }
                 WindowEvent::TextInput(s) => {
-                    events.push(EguiEvent::Text(s.clone()));
+                    out.push(EguiEvent::Text(s.clone()));
                 }
                 WindowEvent::Focused(b) => {
-                    events.push(EguiEvent::WindowFocused(*b));
+                    out.push(EguiEvent::WindowFocused(*b));
                 }
                 // 尺寸与缩放通过 screen_rect 表达；关闭是应用层语义。
                 WindowEvent::Resized { .. }
@@ -760,7 +797,7 @@ impl EventLoop {
 
         // egui 靠这个事件更新修饰键状态（含 Win 键 → command）。
         if modifiers != ctx.input(|i| i.modifiers) {
-            events.push(EguiEvent::ModifiersChanged(modifiers));
+            out.push(EguiEvent::ModifiersChanged(modifiers));
         }
 
         egui::RawInput {
@@ -771,7 +808,7 @@ impl EventLoop {
                 .map(|d| d.as_secs_f32())
                 .unwrap_or(DEFAULT_PREDICTED_DT)
                 .clamp(MIN_PREDICTED_DT, MAX_PREDICTED_DT),
-            events,
+            events: out,
             focused: self.focused,
             ..Default::default()
         }
@@ -889,6 +926,15 @@ pub fn modifiers_from(shift: bool, ctrl: bool, alt: bool, windows_key: bool) -> 
         mac_cmd: false,
         command: windows_key,
     }
+}
+
+/// 该事件是否自带精确的修饰键状态。
+///
+/// 自带状态的按键事件比`GetAsyncKeyState` 的实时查询更可靠：
+/// 它反映的是「按下那一刻」的组合（例如 Shift+Ctrl 同时按下），
+/// 而实时查询在某些键盘布局下无法区分左右修饰键的组合意图。
+fn is_key_event(ev: &WindowEvent) -> bool {
+    matches!(ev, WindowEvent::Key { .. })
 }
 
 /// 查询当前修饰键状态。
@@ -1042,11 +1088,14 @@ mod tests {
         }
     }
 
-    /// 把 `pending` 灌入并产出 `RawInput`。
-    fn raw_of(pending: Vec<WindowEvent>) -> egui::RawInput {
-        let mut e = fake_loop();
-        e.pending = pending;
-        e.egui_input(&egui::Context::default())
+    /// 把给定事件灌入并产出 `RawInput`。
+    ///
+    /// 事件必须**显式传入**而不是靠 `pending`：这正是本次修复的方向
+    /// （见 `egui_input` 的文档注释）——事件缓冲是累积的，
+    /// 让函数自己读 `pending` 会把「事件从哪来」这个决定藏起来，
+    /// 正是它导致过一次「UI 收不到任何输入」的回归。
+    fn raw_of(events: Vec<WindowEvent>) -> egui::RawInput {
+        fake_loop().egui_input(&egui::Context::default(), &events)
     }
 
     // ---------------- key_from_vk ----------------
@@ -1490,8 +1539,7 @@ mod tests {
     fn focus_change_reaches_egui() {
         let mut e = fake_loop();
         e.focused = false;
-        e.pending = vec![WindowEvent::Focused(false)];
-        let raw = e.egui_input(&egui::Context::default());
+        let raw = e.egui_input(&egui::Context::default(), &[WindowEvent::Focused(false)]);
         assert!(!raw.focused, "RawInput::focused 必须为 false");
         assert!(
             raw.events
@@ -1505,7 +1553,7 @@ mod tests {
         // 1920x1080 物理像素、200% 缩放 → 960x540 逻辑点
         let mut e = fake_loop();
         e.inner_size = Vec2::new(960.0, 540.0);
-        let raw = e.egui_input(&egui::Context::default());
+        let raw = e.egui_input(&egui::Context::default(), &[]);
         let r = raw.screen_rect.expect("screen_rect 必须设置");
         assert_eq!(r.width(), 960.0);
         assert_eq!(r.height(), 540.0);
@@ -1516,14 +1564,14 @@ mod tests {
     fn predicted_dt_follows_repaint_after() {
         let mut e = fake_loop();
         e.repaint_after = Some(Duration::from_millis(16));
-        let raw = e.egui_input(&egui::Context::default());
+        let raw = e.egui_input(&egui::Context::default(), &[]);
         assert!((raw.predicted_dt - 0.016).abs() < 1e-4, "{}", raw.predicted_dt);
     }
 
     #[test]
     fn predicted_dt_defaults_to_60hz() {
         let e = fake_loop();
-        let raw = e.egui_input(&egui::Context::default());
+        let raw = e.egui_input(&egui::Context::default(), &[]);
         assert!((raw.predicted_dt - 1.0 / 60.0).abs() < 1e-6);
     }
 
@@ -1532,21 +1580,21 @@ mod tests {
         // 0 间隔会让动画除零；10 秒间隔会让动画瞬移
         let mut e = fake_loop();
         e.repaint_after = Some(Duration::ZERO);
-        let raw = e.egui_input(&egui::Context::default());
+        let raw = e.egui_input(&egui::Context::default(), &[]);
         assert!(raw.predicted_dt >= 1.0 / 1000.0, "{}", raw.predicted_dt);
 
         let mut e2 = fake_loop();
         e2.repaint_after = Some(Duration::from_secs(10));
-        let raw2 = e2.egui_input(&egui::Context::default());
+        let raw2 = e2.egui_input(&egui::Context::default(), &[]);
         assert!(raw2.predicted_dt <= 0.1, "{}", raw2.predicted_dt);
     }
 
     #[test]
     fn time_is_monotonic_seconds() {
         let e = fake_loop();
-        let t1 = e.egui_input(&egui::Context::default()).time.unwrap();
+        let t1 = e.egui_input(&egui::Context::default(), &[]).time.unwrap();
         std::thread::sleep(Duration::from_millis(5));
-        let t2 = e.egui_input(&egui::Context::default()).time.unwrap();
+        let t2 = e.egui_input(&egui::Context::default(), &[]).time.unwrap();
         assert!(t2 > t1, "{t2} 应大于 {t1}");
         assert!(t1 < 1.0, "起点应接近 0，实际 {t1}");
     }
@@ -1589,7 +1637,7 @@ mod tests {
     fn modifiers_changed_emitted_on_change() {
         // 修饰键变化必须通知 egui，否则 Win 键快捷键不生效
         let mut e = fake_loop();
-        e.pending = vec![WindowEvent::Key {
+        let events = vec![WindowEvent::Key {
             keycode: Key::C,
             pressed: true,
             repeat: false,
@@ -1602,7 +1650,7 @@ mod tests {
             command: true,
             ..Default::default()
         };
-        let raw = e.egui_input(&egui::Context::default());
+        let raw = e.egui_input(&egui::Context::default(), &events);
         assert!(
             raw.events
                 .iter()
@@ -1666,29 +1714,72 @@ mod tests {
         assert!(!is_close(0), "空wParam");
     }
 
-    /// 事件累积缓冲的语义守卫：`poll_for` 丢弃返回值，
-    /// 靠的是 `pending` 累积而不是「每帧清空 + 只留本帧」。
+    /// 事件累积缓冲的语义守卫。
     ///
-    /// 回归守卫：早先 `poll()` 开头 `pending.clear()`，
-    /// 导致从节流路径读到的 `CloseRequested` 在下一帧被静默丢弃，
-    /// 实测表现为**用户点标题栏 X 完全没反应**。
+    /// 回归守卫：早先 `poll()` 开头`pending.clear()`，
+    /// 导致从节流路径 `poll_for` 读到的 `CloseRequested`
+    /// 在下一帧被静默丢弃，实测表现为**用户点标题栏 X 完全没反应**。
     ///
-    /// 这里不构造真实窗口（那需要消息循环），只验证累积语义本身：
-    /// 取走前缓冲不为空，取走后为空。
+    /// ⚠️ 这个测试必须走 `absorb()`——即 `poll()` 真正使用的写路径。
+    /// 用局部 `Vec` 或直接 `extend_from_slice` 都测不到被测代码：
+    /// 那样只测了 `Vec::push` 与 `mem::take` 两个标准库行为，把
+    /// `absorb` 改回覆盖语义也照样通过（已实测确认，属于假守卫）。
     #[test]
-    fn pending_events_accumulate_until_taken() {
-        let mut pending: Vec<WindowEvent> = Vec::new();
-        pending.push(WindowEvent::CloseRequested);
-        // 模拟 poll_for 读到第二条：追加而非覆盖
-        pending.push(WindowEvent::Resized {
+    fn pending_events_accumulate_across_polls() {
+        let mut e = fake_loop();
+
+        // 走 `absorb()`——与 `poll()` 完全相同的写路径。
+        // 若把 `absorb` 实现改回覆盖语义（`self.pending = events`），
+        // 本测试必须失败。
+        e.absorb(vec![WindowEvent::CloseRequested]);
+        assert_eq!(e.pending.len(), 1);
+
+        // 模拟节流路径 poll_for() 又读到一条，且调用方丢弃其返回值。
+        // 关键：这条**必须仍然留在缓冲里**。
+        e.absorb(vec![WindowEvent::Resized {
             width: 1.0,
             height: 1.0,
-        });
-        assert_eq!(pending.len(), 2, "两条事件都应保留");
+        }]);
 
-        let taken = std::mem::take(&mut pending);
-        assert_eq!(taken.len(), 2, "take 应取走全部累积事件");
+        // 主循环 take_pending() 应一次拿到两条。
+        let taken = e.take_pending();
+        assert_eq!(taken.len(), 2, "累积事件不该被丢弃");
         assert!(matches!(taken[0], WindowEvent::CloseRequested));
-        assert!(pending.is_empty(), "take 后缓冲应为空");
+        assert!(matches!(taken[1], WindowEvent::Resized { .. }));
+        assert!(
+            e.pending.is_empty(),
+            "take后缓冲应为空，否则下帧会重复喂给 egui"
+        );
+    }
+
+    /// 守卫「事件既喂应用层、也喂 egui」这件事不会再次走偏。
+    ///
+    /// 回归守卫：`take_pending()` 与 `egui_input()` 若都读/写
+    /// `self.pending`，且主循环先取走再翻译，egui 就永远拿到空输入——
+    /// 实测后果是**整个 UI 收不到任何鼠标与键盘输入**，
+    /// 比它修的「点 X 无反应」更严重。
+    ///
+    /// 现在的签名让这件事在类型上无法搞错：`egui_input` 收`&[WindowEvent]`，
+    /// 事件只有一份、由调用方持有。本测试固定住该契约。
+    #[test]
+    fn taken_events_reach_egui_input() {
+        let mut e = fake_loop();
+        e.pending.push(WindowEvent::MouseMoved {
+            pos: Pos2::new(7.0, 9.0),
+        });
+
+        let taken = e.take_pending();
+        // 主循环把同一份事件交给 egui
+        let raw = e.egui_input(&egui::Context::default(), &taken);
+
+        assert!(
+            raw.events.iter().any(|ev| matches!(
+                ev,
+                EguiEvent::PointerMoved(p) if *p == Pos2::new(7.0, 9.0)
+            )),
+            "take_pending 取出的事件必须能翻译进 RawInput，             否则 UI 收不到任何输入（真实回归过一次）"
+        );
+        // 再取一次应为空——事件已被交付，不能重复喂。
+        assert!(e.take_pending().is_empty(), "事件不应被交付两次");
     }
 }

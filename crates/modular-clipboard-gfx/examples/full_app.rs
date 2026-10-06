@@ -174,7 +174,13 @@ fn run() -> anyhow::Result<()> {
     println!("进入主循环…");
     while running {
         // ---- 1. 收事件 + 处理 resize ---------------------------------
-        for ev in events.poll() {
+        //
+        // 用 `take_pending()` 而非 `poll()` 的返回值：节流路径
+        // `poll_for`（本例第406 行）也会读消息并丢弃其返回值，
+        // 事件只能留在累积缓冲里等这里取走。只取 `poll()` 的返回值
+        // 会漏掉那部分——实测曾导致关闭请求被静默丢弃。
+        let frame_events = events.take_pending();
+        for ev in &frame_events {
             match ev {
                 WindowEvent::CloseRequested => {
                     println!("收到关闭请求，正常退出");
@@ -246,9 +252,9 @@ fn run() -> anyhow::Result<()> {
         }
 
         // ---- 2. 跑 egui ----------------------------------------------
-        // `EventLoop::egui_input` 读的是 `poll` 填好的缓冲，因此顺序
-        // 必须是 poll → egui_input → run。
-        let raw_input = events.egui_input(&ctx);
+        // 事件只有一份（`frame_events`）：既喂上面的应用层判断，
+        // 也喂 egui。必须 poll → egui_input → run。
+        let raw_input = events.egui_input(&ctx, &frame_events);
         let mut output = ctx.run_ui(raw_input, |ui| draw_ui(ui, frame_no));
 
         // 后续不再整体借用 output（shapes 已被 tessellate 移走），

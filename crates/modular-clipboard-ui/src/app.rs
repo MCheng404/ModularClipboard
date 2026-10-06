@@ -204,7 +204,11 @@ pub fn run_with_options(
         // `take_pending` 而非 `poll()` 的返回值：节流路径 `poll_for` 也会读
         // 消息并把事件记进累积缓冲，把它们一起取走才能保证关闭请求不丢。
         // 见 `gfx::window::EventLoop::poll` 的说明。
-        for ev in events.take_pending() {
+        //
+        // 取出的事件**必须**留到 `egui_input` 一起用（见第 2 步）。
+        // 只喂应用层而不喂 egui 的话，UI 会收不到任何鼠标/键盘输入。
+        let frame_events = events.take_pending();
+        for ev in &frame_events {
             match ev {
                 WindowEvent::CloseRequested => {
                     saw_close = true;
@@ -279,8 +283,10 @@ pub fn run_with_options(
         // 的剪贴板内容写进数据库的那一步。隐藏后跳过它等于
         // 「窗口看不见 = 停止记录」，与后台常驻的初衷正好相反。
         //
-        // `poll` 已在上面填好缓冲，`egui_input` 读的就是本帧事件。
-        let raw_input = events.egui_input(&ctx);
+        // `frame_events` 是上面 `take_pending()` 取出的本帧事件，
+        // 事件**只有这一份**：既喂应用层（第 1 步的关闭/resize 判断），
+        // 也喂 egui。漏掉后者会让 UI 收不到任何鼠标/键盘输入。
+        let raw_input = events.egui_input(&ctx, &frame_events);
         let mut output = ctx.run_ui(raw_input, |ui| {
             app.draw_frame(ui);
         });

@@ -356,16 +356,19 @@ fn main() -> anyhow::Result<()> {
 
     for frame in 1..=EXIT_AFTER_FRAMES {
         // 有事件立即返回；空闲时按上限睡眠，避免空转烧 CPU。
-        let events = event_loop.poll_for(Some(FRAME_WAIT));
-        if !events.is_empty() {
-            for ev in &events {
+        //注意 `poll_for` 内部也读消息，故累积缓冲里可能已有上一轮
+        // 未取走的事件——统一用 `take_pending` 取，别只取本次返回值。
+        let _ = event_loop.poll_for(Some(FRAME_WAIT));
+        let frame_events = event_loop.take_pending();
+        if !frame_events.is_empty() {
+            for ev in &frame_events {
                 println!("  帧 {frame} 事件 {ev:?}");
             }
-            all_events.extend(events);
+            all_events.extend(frame_events.iter().cloned());
         }
 
-        // 关键顺序：poll 之后才能 egui_input（它读的是 poll 填好的缓冲）。
-        let raw = event_loop.egui_input(&ctx);
+        // 关键顺序：先取事件，再把它们交给 egui_input。
+        let raw = event_loop.egui_input(&ctx, &frame_events);
 
         // screen_rect 决定 egui 布局，必须有面积。
         let Some(rect) = raw.screen_rect else {
