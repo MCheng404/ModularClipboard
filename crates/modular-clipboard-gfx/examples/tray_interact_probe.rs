@@ -137,8 +137,14 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
 /// 等待托盘窗口出现的上限。托盘在 Vulkan 初始化之后才启动，可能偏晚。
 const TRAY_WAIT: Duration = Duration::from_secs(3);
 
-/// 注入 `WM_CLOSE` 后等待隐藏生效的时间。
-const HIDE_SETTLE: Duration = Duration::from_millis(1500);
+/// 等待窗口变隐藏的上限。
+///
+/// 用轮询而非固定 sleep：主程序帧尾 `poll_for(delay)` 按 egui 的
+/// `repaint_delay` 阻塞等待，该值随重绘请求变化，固定 sleep 会误判。
+const HIDE_POLL_LIMIT: Duration = Duration::from_secs(5);
+
+/// 等待关键日志出现的上限。主程序的状态变化与写日志无同步保证。
+const LOG_POLL_LIMIT: Duration = Duration::from_secs(3);
 
 /// 等待托盘唤起生效的上限。隐藏态每 `HIDDEN_POLL_INTERVAL`(200ms) 醒一次。
 const WAKE_TIMEOUT: Duration = Duration::from_secs(4);
@@ -495,20 +501,26 @@ fn main() {
     let pid = child.id();
     let mut guard = ChildGuard(child);
     // 接管 stderr：主程序把 tracing 写在这里，是它「自己说走了哪条分支」的证据。
+    //
+    // ⚠️ 每次 `read` 拿到一块就**立刻**追加进共享缓冲，不能像初版那样
+    // 先攒在局部 `buf`、等 read 循环结束（进程退出）后才一次性写入。
+    // 初版那样写会让链路 1/2 执行期间共享缓冲恒为空——因为主进程还活着，
+    // stderr 没 EOF，读取线程还卡在 `read` 上。这不是「竞态」，
+    // 而是「在进程存活期间根本读不到任何日志」，
+    // 表现为链路 1e 恒 FAIL，且**重试与加等待都无效**。
     let log: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     if let Some(mut err) = guard.0.stderr.take() {
         let sink = Arc::clone(&log);
         std::thread::spawn(move || {
-            let mut buf = String::new();
             let mut chunk = [0u8; 4096];
             while let Ok(n) = err.read(&mut chunk) {
                 if n == 0 {
                     break;
                 }
-                buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-            }
-            if let Ok(mut s) = sink.lock() {
-                s.push_str(&buf);
+                let text = String::from_utf8_lossy(&chunk[..n]).into_owned();
+                if let Ok(mut s) = sink.lock() {
+                    s.push_str(&text);
+                }
             }
         });
     }
@@ -563,22 +575,38 @@ fn main() {
     );
 
     if posted {
-        std::thread::sleep(HIDE_SETTLE);
+        // 轮询而非「固定 sleep + 单次检查」。
+        //
+        // 主程序的帧尾是 `events.poll_for(delay)`，它按 egui 给的
+        // `repaint_delay` 用 `MsgWaitForMultipleObjects` **阻塞**等待。
+        // 无重绘请求时该延时可能明显长于固定 sleep，
+        // 于是「sleep 1.5s 后查一次」会把「还没隐藏」误判成「隐藏失败」——
+        // 同一份二进制时 PASS 时 FAIL，正是这个原因。
+        let became_hidden = wait_until(HIDE_POLL_LIMIT, || {
+            !unsafe { IsWindowVisible(main_hwnd) }.as_bool()
+        });
         let visible = unsafe { IsWindowVisible(main_hwnd) }.as_bool();
         let alive = process_alive(pid);
         let still_window = unsafe { IsWindow(Some(main_hwnd)) }.as_bool();
-        let logs = log_text(&log);
+        // 日志判定也轮询：隐藏动作发生在主程序帧内，
+        // 它打日志的时刻与窗口状态变化之间没有同步保证。
+        let logs = wait_for_log(&log, LOG_POLL_LIMIT, &["已隐藏到托盘", "收到关闭请求"]);
         let said_hide = logs.contains("已隐藏到托盘");
         let said_close = logs.contains("收到关闭请求");
         let said_hide_not_tray = logs.contains("无托盘兜底，关闭即退出");
 
         println!("         可见={visible} 进程存活={alive} 窗口未销毁={still_window}");
+        println!("         已捕获主程序日志 {} 字节", logs.len());
 
         // 关键：窗口**没被销毁**。只看「不可见」无法区分隐藏与销毁。
         checks.record(
             "链路 1b：窗口被隐藏（IsWindowVisible=false）",
-            Some(!visible),
-            format!("IsWindowVisible={visible}（期望 false）"),
+            Some(became_hidden),
+            format!(
+                "轮询 {HIDE_POLL_LIMIT:?} 内 IsWindowVisible 变为 false → {became_hidden}；\
+                 终值={visible}。用轮询而非固定 sleep：主程序帧尾按 egui 的 \
+                 repaint_delay 阻塞等待，固定 sleep 会把「尚未隐藏」误判为失败"
+            ),
         );
         checks.record(
             "链路 1c：窗口**未被销毁**（区分隐藏 vs 销毁）",
@@ -703,7 +731,9 @@ fn main() {
 
             if posted {
                 let exited = wait_until(QUIT_TIMEOUT, || !process_alive(pid));
-                let logs = log_text(&log);
+                // 进程刚死时 stderr 读取线程可能还没读到 EOF、没收完尾部。
+                // 这里等「正常退出」落盘，而不是读一次就下结论。
+                let logs = wait_for_log(&log, LOG_POLL_LIMIT, &["正常退出"]);
                 let said_quit = logs.contains("收到托盘退出请求");
                 let said_normal = logs.contains("正常退出");
 
@@ -749,4 +779,23 @@ fn main() {
 /// 读一份子进程日志快照。
 fn log_text(log: &Arc<Mutex<String>>) -> String {
     log.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+/// 轮询直到日志里出现 `needles` 全部片段（或超时），返回当时的日志全文。
+///
+/// 主程序的状态变化与它写日志之间**没有同步保证**：
+/// 窗口已隐藏 ≠ 日志已落盘。所以日志类判据一律经此函数取，
+/// 不可直接 `log_text` 读一次。
+fn wait_for_log(log: &Arc<Mutex<String>>, timeout: Duration, needles: &[&str]) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = log_text(log);
+        if needles.iter().all(|n| snapshot.contains(n)) {
+            return snapshot;
+        }
+        if Instant::now() >= deadline {
+            return snapshot;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
