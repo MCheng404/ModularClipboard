@@ -844,13 +844,16 @@ impl<'a> FrameRenderer<'a> {
             // staging 块将永远查不到 signal，arena 会在几帧内耗尽。
             unsafe { self.gpu.device.reset_fences(&[fence])? };
         }
-        // acquire_fence 同样复位到未signal，好让下次 acquire 拿到干净状态。
+        // acquire_fence 复位到未 signal，好让下次 acquire 拿到干净状态。
         // （它由本次 acquire signal，槽位再次被复用前必须复位。）
+        //
+        // **无条件**复位，不先查 `get_fence_status`：查状态再决定复位是
+        // 「凭状态猜测」—— 若查询本身出错，就会漏掉复位，让下一个
+        // `acquire_next_image` 拿到已 signal 的 fence。规范允许对未
+        // signal 的 fence 调用 reset（无副作用），所以直接复位更可靠。
         {
             let af = self.slots[slot].acquire_fence;
-            if self.fence_signaled(af) {
-                unsafe { self.gpu.device.reset_fences(&[af])? };
-            }
+            unsafe { self.gpu.device.reset_fences(&[af])? };
         }
         self.staging.begin_frame();
 
@@ -1373,10 +1376,17 @@ impl<'a> FrameRenderer<'a> {
             // acquire_next_image signal。绝不让两者共用一个——
             // 共用会产生两个 signal 源，使「是否已完成」的判断不可靠。
             //
-            // 初始建成 SIGNALED：让首次复用该槽位时 wait 立刻通过
-            // （此时确实没有在途工作，符合实际状态）。
-            let fence_info = vk::FenceCreateInfo::default()
-                .flags(vk::FenceCreateFlags::SIGNALED);
+            // ⚠️ 两者都必须以 **UNSIGNALED** 创建。
+            //
+            // 曾建成 SIGNALED（想让首次复用槽位时 wait 立刻通过），但那是
+            // 多余且有害的：`in_flight == false` 已经表达了「没有在途工作、
+            // 不必等」，不需要靠 fence 初值来让 `wait_for_fences` 通过。
+            //
+            // 更糟的是规范禁止把 SIGNALED 的 fence 传给 `queue_submit`：
+            // // VUID-vkQueueSubmit-fence-00063
+            // 实测每个槽位首次使用都触发一次（3 槽位 = 3 次，出现在帧 0/1/2），
+            // 与「槽位复用前没 reset」无关——是**首次使用**即违规。
+            let fence_info = vk::FenceCreateInfo::default();
             let submit_fence = unsafe { device.create_fence(&fence_info, None) }
                 .map_err(|e| anyhow::anyhow!("创建 submit 栅栏失败: {e:?}"))?;
             let acquire_fence = unsafe { device.create_fence(&fence_info, None) }
