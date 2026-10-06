@@ -206,6 +206,8 @@ Win32 窗口 → Vulkan 表面 → 交换链 → 渲染通道 → SPIR-V 着色�
 | F | ~~`upload_probe` 第 4 帧丢设备~~ | ✅ **已解决，退出码 0**。根因是**探针自身的逐帧 `device_wait_idle`**：它强制等所有队列工作完成，破坏了被测的「多帧在途」状态。去掉插桩后 60 帧稳定、连跑 4 次输出一致、65536 字节逐字节比对全部一致。**教训：诊断代码会改变被诊断系统的行为**，插桩引入的同步点可能正是成因而非窗口 |
 | F | `DeviceImage::upload` 第一次屏障 `srcStage=TOP_OF_PIPE` 但 `srcAccess=SHADER_READ`（`texture.rs:337`）。`TOP_OF_PIPE` 不等待任何阶段，该屏障实为空操作。**非本次崩因**（复刻 upload 连跑 4 轮实机通过），但属真实规范缺陷 | 🟡 已私发 mcp-arch-resource，建议改为按 `old_layout` 选 `TOP_OF_PIPE`/`FRAGMENT_SHADER` |
 | F | `can_record_upload` 的 `in_flight` 分支在当前 API 下**不可达**（`present` 会 `take()` 掉 `pending`，撞不上这道门）。真正拦住重复录制的是 `pending`。mcp-arch-frame 文档已写明是「有意的冗余防线」 | ✅ 不改（冗余防线为将来新增提交路径预留） |
+| 主控 | **`UiConfig.start_minimized` 是死配置**：字段存在（默认 `false`），但 grep 整个 ui crate 找不到任何读取处。用户改该设置无效 | 🟡 待产品决策：「启动即最小化到任务栏」还是「直接进托盘不显示窗口」。定了再接 |
+| 主控 | `present()` 之后帧循环仍跑（`hidden` 标志），但**隐藏时是否该停 `pump()`**？停了窗口隐藏后不再记录剪贴板（违背常驻初衷）；不停则空转 CPU | ✅ 已确认不停（`app.rs` 注释说明），保持现状 |
 | B | `frame.rs` 的 `pick_swapchain_format` 是 `lib.rs::pick_format` 的副本（后者私有）。改选格式逻辑时两处会静默失配 → 「渲染通道格式 ≠ 交换链格式」，驱动在 `cmd_begin_render_pass` 时炸。 | ✅ 已解决：主控把 `pick_format` 改为 `pub(crate)` 统一实现，`frame.rs` 删除副本直接调用，**单一数据源**。迁移时漏改`rebuild_swapchain` 的一处调用（`pick_format` 返回元组），已由 B 修|
 | A |⚠️ staging 生命周期依赖「每帧 device_wait_idle」 | ✅ **B 已确认：否**。帧层是**多帧在途**（按槽位轮转+ 每槽位独立 fence），**不做**每帧 idle。 |
 | A | ⚠️ **staging 泄漏的定性有误，需纠正** |✅ **B 已核实并纠正**：`Buffer` 无 `Drop` ⇒ staging 的 `vk::Buffer`/`vk::DeviceMemory` **从未被销毁**⇒ 是**良性内存泄漏**（句柄始终有效、GPU 读到的数据正确、`write()` 内部已 `map`→`unmap` 故无 use-after-free），**不是** A 担心的 use-after-free。**真实风险是泄漏量**：`apply_delta` 每delta 调一次，中文首载逐字形上传≈上千次 ⇒ 上千块 staging 泄漏。**修法应为「常驻 staging 字段」而非 ring buffer**（ring buffer 是为解决复用覆写，而此处根本无复用）。**→ A 行动项** |
@@ -1621,3 +1623,37 @@ VK_LOADER_DEBUG=layer ... 2>&1 | grep "LAYER: Loading layer library"
   `VUID-vkDestroyDevice-device-05137`：重建时泄漏 ImageView / Semaphore）；
 - `pixels_probe` 全流程零 VUID（它自建描述符集且 `update_after_bind = false`，
   是「UPDATE_AFTER_BIND 三处配套」的独立对照实验）。
+
+---
+
+## 端到端验证（20:20，主控实机）
+
+六个探针全绿之后，我做了两件之前没做的事：
+**跑真正的 exe、看 `MainWindowTitle` 而不只是退出码**。
+
+### 发现的三个 bug（探针全都测不到）
+
+| # | 问题 | 探针为何测不到 |
+|---|---|---|
+| 1 | `VUID-VkSwapchainCreateInfoKHR-imageExtent-01689`：窗口未显示时交换链 extent 为 0，启动 **exit 101崩溃** | 探针都在窗口已显示后才建交换链 |
+| 2 | **窗口从不显示**——`CreateWindowExW` 建的窗口默认不可见，而 `run()` 从未调 `ShowWindow`。用户只见托盘图标，以为没启动 | 探针不模拟真实应用启动 |
+| 3 | 全局快捷键注册偶发失败（残留注册） | 探针不跑完整启动流程 |
+
+三个都已修。修后实测：
+
+    modular-clipboard.exe 启动 → MainWindowTitle='ModularClipboard'  VE=0
+    托盘已就绪 hotkey=Ctrl+Shift+V
+
+### 方法论教训（今天第四次）
+
+**探针覆盖不到真实启动路径。**
+
+| # | 盲区 | 只有什么能发现 |
+|---|---|---|
+| 1 | `full_app` 只画字体图集 | 真实图片数据 |
+| 2 | `grep -c FAILED` 编译失败也返回 0 | 检查编译状态 |
+| 3 | 探针都在窗口显示后跑 | 启动瞬间的 0×0 |
+| 4 | 探针不模拟应用启动 | 跑 exe + 看窗口标题 |
+
+**结论：端到端验证不能被探针替代。**
+探针验证的是「每个函数正确」，exe 验证的是「组合起来正确」。
