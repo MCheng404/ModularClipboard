@@ -15,6 +15,7 @@ use modular_clipboard_core::{ClipKind, EntryId, now_ms};
 use modular_clipboard_store::GroupFilter;
 
 use crate::theme::{Palette, sized};
+use crate::thumbnail::{self, CacheKey, ThumbnailCache};
 
 /// 界面状态：不属于业务数据的临时状态（展开项、悬停等）。
 #[derive(Default)]
@@ -25,6 +26,18 @@ pub struct UiLocal {
     pub show_detail: bool,
     /// 需要在下一帧执行的操作。
     pending: Option<PendingOp>,
+    /// 图片缩略图缓存（按条目 id + 内容指纹）。
+    thumbs: ThumbnailCache,
+    /// 已上传到 egui 的缩略图纹理：`条目 id → TextureId`。
+    ///
+    /// 为什么与 CPU 缓存分开记：CPU 侧 `ThumbnailCache` 按字节预算淘汰，
+    /// 而**纹理一旦上传就无法单独释放**（egui 的纹理管理器不提供
+    /// 「回收某个 TextureId」的接口，只能整体释放）。两个生命周期不同，
+    /// 合成一个结构会导致「缓存驱逐了但显存还在」或「纹理被复用但像素已变」。
+    ///
+    /// 同一帧内重复上传同一张图会产生重复的 `TexturesDelta`，
+    /// 因此这里记录已经传过的 `(条目 id, 像素指纹)`。
+    thumb_textures: Vec<(EntryId, u64, egui::TextureHandle)>,
 }
 
 enum PendingOp {
@@ -332,11 +345,7 @@ fn draw_detail(
                     }
                 }
                 ClipKind::Image => {
-                    ui.label(
-                        RichText::new(&item.preview)
-                            .color(pal.text_dim)
-                            .size(sized(12.0, scale).size),
-                    );
+                    draw_image_preview(ui, svc, local, pal, scale, &item);
                 }
             }
         });
@@ -404,6 +413,147 @@ fn draw_detail(
             }
         }
     });
+}
+
+/// 图片详情区：显示真实缩略图。
+///
+/// # 降级链
+///
+/// 每一级失败都退回「文字摘要」，**不显示空白面板**——
+/// 用户无法区分「图片坏了」和「程序没画出来」。
+///
+/// 1. 缩略图可解码 → 显示图像 + 尺寸摘要；
+/// 2. 载荷已被淘汰（`item.payload == None`）→ 明确告知「载荷已淘汰」；
+/// 3. 载荷在但解不开（非图片/ 损坏）→ 告知解码失败原因。
+///
+/// # 为什么解码失败不弹错误框
+///
+/// 本函数每帧被调用（详情面板开着时）。弹框会阻塞在模态循环里，
+/// 且同一个坏载荷会反复弹。用一行灰色说明即可。
+fn draw_image_preview(
+    ui: &mut egui::Ui,
+    svc: &mut Service,
+    local: &mut UiLocal,
+    pal: &Palette,
+    scale: f32,
+    item: &modular_clipboard_core::ClipItem,
+) {
+    let note = |ui: &mut egui::Ui, text: &str| {
+        ui.label(
+            RichText::new(text)
+                .color(pal.text_dim)
+                .size(sized(12.0, scale).size),
+        );
+    };
+
+    // 载荷被淘汰时 `load_payload` 会直接报错，不必先读磁盘。
+    if item.payload.is_none() {
+        note(ui, "图片载荷已被淘汰，仅保留元数据");
+        note(ui, &item.preview);
+        return;
+    }
+
+    let key = CacheKey::new(item.id, item.hash.clone());
+    let loaded = local.thumbs.get_or_load(key, || {
+        svc.store
+            .load_payload(item)
+            .map_err(|e| format!("读取图片载荷失败: {e}"))
+    });
+
+    match loaded {
+        Ok(thumb) => {
+            let handle = upload_thumbnail(ui.ctx(), local, item.id, &thumb);
+            // 按缩略图的**真实**长宽比给显示区域，定宽不缩放。
+            let avail_w = ui.available_width();
+            let w = thumb.width as f32;
+            let h = thumb.height as f32;
+            let scale_fit = if w > 0.0 { (avail_w / w).min(1.0) } else { 1.0 };
+            ui.add(
+                egui::Image::new(&handle)
+                    .fit_to_exact_size(egui::vec2(w * scale_fit, h * scale_fit)),
+            );
+            note(
+                ui,
+                &format!(
+                    "{} · 显示 {}×{}",
+                    item.preview, thumb.width, thumb.height
+                ),
+            );
+        }
+        Err(thumbnail::ThumbError::TooLarge) => {
+            note(ui, "图片数据过大，无法生成缩略图");
+            note(ui, &item.preview);
+        }
+        Err(thumbnail::ThumbError::NotAnImage) => {
+            note(ui, "载荷内容不是可识别的图片格式");
+            note(ui, &item.preview);
+        }
+        Err(thumbnail::ThumbError::DecodeFailed) => {
+            note(ui, "图片解码失败（文件可能已损坏）");
+            note(ui, &item.preview);
+        }
+    }
+}
+
+/// 把缩略图上传到 egui，返回可绘制的纹理句柄。
+///
+/// # 上传去重
+///
+/// egui 的 `load_texture` 每次调用都会往 `TexturesDelta` 里塞一条增量，
+/// 而同一帧内若重复上传会产生冗余的GPU 拷贝。这里按
+/// `(条目 id, 像素指纹)` 记一笔，命中就直接复用上次的句柄。
+///
+/// # 指纹为什么用像素内容而不是 `item.hash`
+///
+/// `item.hash` 是**原始载荷**的指纹，而缓存里保存的是**缩放后**的像素。
+/// 两者不是同一份数据；若只按 `hash` 去重，将来若缓存策略变化
+/// （例如按视口大小重算缩略图），就会拿到尺寸过期的纹理句柄。
+///对缩略后的实际像素取指纹才是真正的自变量。
+fn upload_thumbnail(
+    ctx: &egui::Context,
+    local: &mut UiLocal,
+    id: EntryId,
+    thumb: &thumbnail::Thumbnail,
+) -> egui::TextureHandle {
+    let fingerprint = thumb_fingerprint(thumb);
+    if let Some((_, _fp, handle)) = local
+        .thumb_textures
+        .iter()
+        .find(|(eid, fp, _)| *eid == id && *fp == fingerprint)
+    {
+        return handle.clone();
+    }
+    let handle = ctx.load_texture(
+        format!("thumb-{id}"),
+        thumb.to_color_image(),
+        egui::TextureOptions::LINEAR,
+    );
+    local.thumb_textures.retain(|(eid, _, _)| *eid != id);
+    local.thumb_textures.push((id, fingerprint, handle.clone()));
+    // 纹理显存不可单独回收，超出上限时丢弃最旧的句柄。
+    // 丢弃只解除本模块的引用，真正的释放要等 egui 的纹理管理器整体回收。
+    const MAX_TEX: usize = 32;
+    if local.thumb_textures.len() > MAX_TEX {
+        // `remove` 返回被移除的元组（含`TextureHandle`）。`TextureHandle`
+        // 是 `must_use`：这里**故意**让它随语句结束而析构，从而解除本模块
+        // 对该纹理的引用——这正是「淘汰」要做的事，因此不能写成 `let _`，
+        // 那样读起来像「丢弃返回值」而非「主动释放」。
+        drop(local.thumb_textures.remove(0));
+    }
+    handle
+}
+
+/// 缩略图像素指纹（FNV-1a 64位）。
+///
+/// 不需要密码学强度：只用于「同一份像素是否已上传过」这种
+/// 缓存自检。碰撞的后果至多是复用一张视觉上相近的图。
+fn thumb_fingerprint(thumb: &thumbnail::Thumbnail) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for b in &thumb.pixels {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn draw_status_bar(

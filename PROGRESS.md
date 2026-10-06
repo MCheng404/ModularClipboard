@@ -478,6 +478,83 @@ panic 消息必须包含具体错误原因。
 | **racehunt** | **交换链图像被转换两次：渲染通道 `initial_layout=UNDEFINED` 已隐式转换，`open_command_buffer` 的显式屏障用过期 `oldLayout`。详见下方「验证层定位」** | **frame.rs owner** |
 | **racehunt** | **`present_semaphore` 按槽位分配，但 `image_index` 由驱动决定 ⇒ `VUID-vkQueueSubmit-pSignalSemaphores-00067`（每次必现）。验证层建议 per-image semaphore 或 `VK_KHR_swapchain_maintenance1`。本机四个相关扩展均已暴露** | **frame.rs owner** |
 | **racehunt** | **`acquire_fence` 两难：复位触发 01123、不复位触发 10066。`frame.rs:854-859` 注释说已改传 `Fence::null()`，但 HEAD 仍传 `acquire_fence`——注释与代码不同步** | **frame.rs owner** |
+| **mcp-thumb** | **缩略图 GPU 接线：当前渲染器只绑定一张纹理（字体图集），用户纹理被显式丢弃。CPU 侧（解码/降采样/缓存）已完成并有 26 个单测，但缩略图**还画不到屏幕上**。详见下方「缩略图 GPU 接线」。** | **主控裁决（需改 shader + pipeline + frame）** |
+
+---
+
+## 🖼️ 缩略图 GPU 接线（mcp-thumb，2026-10-06）
+
+### 结论先说
+
+**CPU 侧已完成并验证；GPU 侧被现有渲染架构挡住，需要主控裁决。**
+
+任务书里说「项目没有 `image` crate 依赖（托盘图标是手写 RGBA 数组）」——
+**这条前提不成立**。`Cargo.toml` workspace 段早已声明
+`image = { version = "0.25", default-features = false, features = ["png","jpeg","webp","bmp"] }`，
+且 `modular-clipboard-store`（`compute_dims`）与 `modular-clipboard-app`
+（`image_dimensions` / `decode_to_rgba`）**都已在用它**。所以方案 A 的边际成本
+只是 ui crate 多一行 `image = { workspace = true }`，二进制体积**零增长**
+（符号本来就被链接进来了）。托盘图标确实是手写 RGBA，但那是「图标形状」
+而非「解码任意格式图片」，两件事不冲突。
+
+### 阻断点：渲染器只支持一张纹理
+
+四处证据（均已grep 核实，非推测）：
+
+| 位置 | 事实 |
+|------|------|
+| `shaders/egui.wgsl:24` | 只声明 `@binding(2) var font_tex: texture_2d<f32>`；片元着色器 `fs_main` 写死 `textureSample(font_tex, ...)`，并把结果当**单通道覆盖率**用（`in.color * vec4(1,1,1,texel.r)`） |
+| `pipeline.rs:190-207` | `DescriptorLayout` 只有 3 个绑定：`UNIFORM_BUFFER` / `SAMPLER` / `COMBINED_IMAGE_SAMPLER`，**计数均为 1** |
+| `renderer.rs:425-429` | `upload_font_delta` 对非字体纹理 `tracing::warn!("忽略非字体纹理")` 后 `continue` —— **用户纹理被显式丢弃** |
+| `frame.rs:1395-1408` | 描述符池 `COMBINED_IMAGE_SAMPLER` 的 `descriptor_count = count`（= 交换链图像数 = 槽位数），**每槽位恰好 1 个**，放不下第二张纹理 |
+
+⇒ `ctx.load_texture()` 产生的 `TexturesDelta` 目前会被 `upload_font_delta`
+丢掉。**即使解码完全正确，屏幕上也不会出现图。**
+这不是「还没写」，是「写了也会被丢」。
+
+### 三条可选路线（需主控裁决，我未擅自实施）
+
+| 方案 | 改动面 | 代价 / 风险 |
+|------|--------|------------|
+| **A. 加第二个绑定** | `egui.wgsl` 增 `binding(3) var user_tex` + 一个「用哪张纹理」的顶点标记；`pipeline.rs` 增绑定；`frame.rs` 池计数 `count` → `count * 2`；`buffer.rs` 的 `Vertex` 增一个字段（**步长 20 → 24，会影响所有 example 的顶点数据**） | 最正统。但要动 `frame.rs`（他人维护），且 `Vertex` 步长变更会波及 `draw_probe` / `full_app` / `upload_probe` 三个 example。**改完必须全部实机重跑** |
+| **B. 纹理数组** | 把字体图集与缩略图合并进一张 `texture_2d_array`（层 0 = 字体，层 1..N = 缩略图）；`Vertex` 增「层号」字段 | 只需一张图像、一个绑定 ⇒ **描述符池不用改**，`frame.rs` 改动最小。代价：`DeviceImage::new` 写死 `array_layers(1)` / `view_type(TYPE_2D)`，需扩展（⇒动 `texture.rs`，也是他人维护） |
+| **C. CPU 侧绘制** | 把缩略图当作 egui mesh 的顶点色/ 或用 egui 内置图片控件走软件光栅 | 绕过整个渲染层改动，但每张图要生成上万个顶点，**与项目选 Vulkan 的初衷相悖**，不推荐 |
+
+**我的倾向是 B**：它把 `frame.rs` 的改动压到最小（不动描述符池这条最敏感的
+路径），代价集中在 `texture.rs` 的数组图像支持上。但 A 更符合 Vulkan 惯例。
+**两条都要动他人维护的文件，故交主控裁决。**
+
+### 我已交付的部分（不依赖上述裁决，可直接验收）
+
+`crates/modular-clipboard-ui/src/thumbnail.rs`（纯 CPU，26 个单测）：
+
+- `fit_within(w, h, max_edge)` —— 保长宽比、最长边限 256px、**不放大**小图、
+  极端长宽比下每边至少 1px（零尺寸纹理会让上传路径直接报错）、
+  用整数运算避免浮点抖动；
+- `decode(bytes, max_edge)` —— `image` crate解码，格式靠**魔数嗅探**
+  （剪贴板不带文件名/扩展名），带 `max_alloc` 防解压炸弹；
+- `ThumbnailCache` —— 按**字节预算**（默认 32MiB）做 LRU。
+  刻意不按「张数」限流：16×16 与 256×256 差 256 倍，按张数会在前者
+  多时看似宽松、后者多时把内存撑爆。
+
+`view.rs` 的 `draw_image_preview` 已接好完整降级链：
+缩略图 → 「载荷已淘汰」/「不是可识别格式」/「解码失败」三态文字说明，
+**任何失败都不 panic、不弹框**（该函数每帧被调用，弹框会卡在模态循环里）。
+
+### 两个我在开发中实际踩到并修掉的 bug（留档）
+
+1. **缩放后尺寸报错**：我曾把**原图**尺寸（1920×1080）填进 `Thumbnail`，
+   而像素是缩放后的（256×144）。`to_color_image` 按声明宽度切分
+   `chunks_exact(4)` 时数量对不上 ⇒ 渲染层按 1920 宽读会越界。
+   已修，并加回归测试 `decode_reports_post_resize_dimensions_not_source`。
+2. **长宽比断言本身写错了**：我最初断言「两边缩放比例之差 < 1/256」。
+   这对极端长宽比是**错误要求**——1000×3 缩到 256 宽时理想高度是 0.768px，
+   只能取整到 1px，此时比例偏差 0.077 远大于 1/256，但它已是整数缩放下的
+   **最优解**。已改为正确判据「每维与理想值偏差 ≤ 0.5px」。
+
+> 这两条印证 MEMORY 的「测试全绿 ≠ 功能可用」：第 1 个bug 是被
+> `decode_downscales_large_png` 抓到后才发现的，若只测「解码成功」
+> 就会漏过去。
 
 ---
 

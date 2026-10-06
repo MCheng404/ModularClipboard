@@ -15,6 +15,9 @@ modular-clipboard-platform = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 egui = { workspace = true }
+# 缩略图解码。已在 workspace 中声明（store / app 也在用），此处只复用，
+# 不引入新的依赖来源。
+image = { workspace = true }
 # 与渲染桥直接交互的句柄类型；顶点数据用 bytemuck 投递给缓冲。
 ash = { workspace = true }
 bytemuck = { workspace = true }

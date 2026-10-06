@@ -24,6 +24,7 @@ pub mod icons;
 pub mod presence;
 pub mod renderer;
 pub mod theme;
+pub mod thumbnail;
 pub mod view;
 
 pub use app::{run, App};
