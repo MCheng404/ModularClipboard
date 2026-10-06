@@ -1403,7 +1403,18 @@ impl<'a> FrameRenderer<'a> {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: count,
+                // 每槽位需要**两张**图：binding 2 = 字体图集，
+                // binding 3 = 用户纹理（缩略图）。
+                //
+                // 着色器早前只绑定字体图集，`renderer.rs` 会显式丢弃
+                // egui 的其它纹理（`TexturesDelta` 里非 FONT_TEXTURE_ID
+                // 的项直接 `continue`）——即「图片条目只显示文字摘要，
+                // 看不到图」。加上第二个绑定后，缩略图才有地方落。
+                //
+                // 纹理数组方案在此不可行：egui 纹理尺寸任意，
+                // 而数组要求所有层同尺寸（要么按最大尺寸 pad、
+                // 要么按尺寸分组），都比多一个绑定复杂得多。
+                descriptor_count: count * 2,
             },
         ];
         // 用了 `UPDATE_AFTER_BIND` 的绑定，其描述符池**必须**带
