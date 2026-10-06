@@ -54,6 +54,12 @@ name = "window_probe"
 [[example]]
 name = "tray_probe"
 
+# 托盘交互端到端验证：起真实的 modular-clipboard.exe 子进程，
+# 用 Win32 消息注入验证「关窗口 ≠ 退出」四条链路。
+# 破坏性判据（清空历史）默认跳过，需 TRAY_E2E_ALLOW_CLEAR=1 才执行。
+[[example]]
+name = "tray_interact_probe"
+
 # 缩略图上屏验证（含 A/B 像素反证）
 [[example]]
 name = "thumb_probe"

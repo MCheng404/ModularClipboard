@@ -1657,3 +1657,56 @@ VK_LOADER_DEBUG=layer ... 2>&1 | grep "LAYER: Loading layer library"
 
 **结论：端到端验证不能被探针替代。**
 探针验证的是「每个函数正确」，exe 验证的是「组合起来正确」。
+
+---
+
+## 托盘交互端到端探针（tray_interact_probe，静态审查发现两个真实缺陷）
+
+新探针 `crates/modular-clipboard-gfx/examples/tray_interact_probe.rs`：
+起真实 `modular-clipboard.exe --no-capture` 子进程，用 Win32 消息注入
+验证「关窗口 ≠ 退出」。**探针代码本身已编译零警告，但尚未实机运行**
+（按纪律由主控执行）。以下是**读代码发现**的问题，未改动主程序。
+
+### 🔴 缺陷 1：`--data-dir` 解析了但从未被使用
+
+| 项 | 内容 |
+|---|---|
+| 证据 | `main.rs:34` 写入 `args.data_dir`；`grep 'args\.' main.rs` 只有 `version`（:86）与 `no_capture`（:121）被读，**`data_dir` 无任何读取处** |
+| 后果 | 用户传 `--data-dir /tmp/x` 以为数据落在那里，实际仍在 `%APPDATA%/modular-clipboard/history.db`。**`--help` 里还宣称该参数有效** |
+| 影响面 | ① 用户数据隔离手段失效（无法为测试/多实例指定目录）；② 想清空历史只能删真实文件；③ 这是**死参数**，与 MEMORY 坑「`start_minimized` 从未被读取」同类 |
+| 探针的处理 | 链路 3（清空历史）**默认跳过**，需 `TRAY_E2E_ALLOW_CLEAR=1` 显式开启。因为无法把数据重定向到临时目录，执行它就是删用户真实历史 |
+| 建议修复 | `run_app` 里把 `args.data_dir` 写进 `config.storage`（需先给 `StorageConfig` 加字段），或在 `Store::open_default` 前用 `ProjectDirs` 之外的值 |
+
+### 🔴 缺陷 2：`--no-capture` 会被持久化，永久关掉用户真实的剪贴板监听
+
+| 项 | 内容 |
+|---|---|
+| 证据 | `run_app` 把 `config.capture.enabled = false` 后交给 `ui::run`；`App::shutdown → Service::save_config` 在退出时把这份 config 写回 `%APPDATA%/modular-clipboard/config.json` |
+| 后果 | **任何以 `--no-capture` 跑一次主程序，用户的剪贴板监听就永久关闭了**，且没有任何提示。调试开关污染了持久化配置 |
+| 探针的处理 | 启动前备份 `config.json`，退出后原样还原（含「原本不存在则删除」分支）。探针自身不留痕 |
+| 建议修复 | `--no-capture` 应是**运行期**开关，不进 `config`：可在 `Service` 里加 `runtime_capture_off` 标志，或让 `save_config` 前恢复原值 |
+
+### 探针的判据设计（区分两条路径）
+
+`WM_CLOSE` 与托盘「退出」是**结果相反**的两条路径，判据如下：
+
+| 判据 | 期望 | 为什么这样判 |
+|---|---|---|
+| 1b 窗口隐藏 | `IsWindowVisible == false` | — |
+| 1c **窗口未销毁** | `IsWindow == true` | **只看「不可见」无法区分「隐藏」与「销毁」**——两者对用户意义完全相反 |
+| 1d **进程存活** | `WaitForSingleObject(h,0) == WAIT_TIMEOUT` | 这是「进程还活着」的唯一可靠外部证据；进程内探针永远测不出 |
+| 1e 日志自述 | 出现「已隐藏到托盘」且**不**出现「无托盘兜底，关闭即退出」 | 让程序自己说走了哪条分支，而不是我们猜 |
+| 2b 重新可见 | 4s 内 `IsWindowVisible` 变 true | 隐藏态轮询间隔 200ms，需留多个周期 |
+| 4b **进程结束** | 进程退出 | **与 1d 构成对照**——两者同真才证明「关窗口 ≠ 退出」 |
+| 4d 正常收尾 | 日志出现「正常退出」 | 区分「优雅退出」与「崩溃后恰好死掉」 |
+
+### 已知限制（如实报告，未掩盖）
+
+1. **托盘右键菜单本身无法自动化**。真实链路
+   `WM_RBUTTONUP → PostMessage(WM_TRAY_MENU) → show_context_menu → TrackPopupMenu(TPM_RETURNCMD)`
+   中 `TrackPopupMenu` 是**模态阻塞**的，无人值守会永久卡死托盘线程
+   （`tray_probe` 也因此避开）。探针注入 `WM_COMMAND` 覆盖的是
+   **回退分支**（无 `TPM_RETURNCMD` 时的路径），**真实右键菜单未被验证**。
+2. 探针需在**有交互桌面**的环境运行；无桌面时窗口不会出现，链路 1~4 全部 SKIP。
+3. `--data-dir` 缺陷导致链路 3 默认跳过 ⇒ 默认跑完是 `PARTIAL` 而非 `ALL OK`，
+   这是刻意的：**有跳过项时不能宣布全部通过**（MEMORY 坑 85）。
