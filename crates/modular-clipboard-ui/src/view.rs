@@ -224,7 +224,7 @@ fn draw_list(
 
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
-                    ui.label(kind_icon(item.kind));
+                    icons::paint_inline(ui, kind_icon(item.kind), pal.text_dim);
                     ui.vertical(|ui| {
                         ui.add(
                             egui::Label::new(
@@ -295,7 +295,7 @@ fn draw_detail(
     };
 
     ui.horizontal(|ui| {
-        ui.label(kind_icon(item.kind));
+        icons::paint_inline(ui, kind_icon(item.kind), pal.text_dim);
         ui.label(
             RichText::new(format!("{:?}", item.kind))
                 .size(sized(12.0, scale).size)
@@ -470,13 +470,13 @@ pub fn parse_hex_color(hex: &str) -> egui::Color32 {
     )
 }
 
-fn kind_icon(kind: ClipKind) -> &'static str {
-    match kind {
-        ClipKind::Text => "T",
-        ClipKind::Html => "H",
-        ClipKind::Image => "I",
-        ClipKind::Files => "F",
-    }
+/// 条目类型对应的图标。
+///
+/// 早前这里返回 `"T"` / `"H"` / `"I"` / `"F"` 四个字母 ——
+/// 违反项目 P0 规则（禁止用字符代替功能图标）：字母形状依赖字体、
+/// 各平台粗细不一致、也无法随主题着色。现统一走 [`icons`] 的矢量绘制。
+fn kind_icon(kind: ClipKind) -> icons::Icon {
+    icons::Icon::for_kind(kind)
 }
 
 fn execute(svc: &mut Service, op: PendingOp) {
@@ -533,9 +533,20 @@ mod tests {
 
     #[test]
     fn icons_are_distinct() {
-        let all = [kind_icon(ClipKind::Text), kind_icon(ClipKind::Html), kind_icon(ClipKind::Image), kind_icon(ClipKind::Files)];
-        let unique: std::collections::HashSet<_> = all.iter().collect();
-        assert_eq!(unique.len(), 4, "各类型应有可区分的标识");
+        // P0 规则：类型标识必须是矢量图标，不能是字符。
+        let all = [
+            kind_icon(ClipKind::Text),
+            kind_icon(ClipKind::Html),
+            kind_icon(ClipKind::Image),
+            kind_icon(ClipKind::Files),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "不同类型的图标必须可区分");
+                }
+            }
+        }
     }
 
     #[test]
