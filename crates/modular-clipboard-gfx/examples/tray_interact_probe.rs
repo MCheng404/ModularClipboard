@@ -535,15 +535,20 @@ fn main() {
     // 下游 `Some(tray)` 拿到的会是 `Option<HWND>`，编译期才发现。
     let tray_ready = wait_until(TRAY_WAIT, || find_tray_window(pid).is_some());
     let tray_hwnd = tray_ready.then(|| find_tray_window(pid)).flatten();
+    // 托盘窗口找不到是**缺陷**而非「无法验证」：`Resident::start` 失败时
+    // `app.rs` 只记一条 error 就继续跑（resident=None），程序仍会启动。
+    // 若此处记成 SKIP，会把「托盘没挂上」伪装成「没条件测」——
+    // 这正是 MEMORY坑 85「在自己没测的东西上通过」的变体。
     checks.record(
         "前置：托盘窗口已创建（属本进程）",
-        tray_hwnd.map(|h| !h.0.is_null()),
+        Some(tray_hwnd.is_some()),
         match tray_hwnd {
-            Some(h) => format!(
-                "message-only 窗口 hwnd={:?}，类名匹配 {TRAY_CLASS}",
-                h.0
+            Some(h) => format!("message-only 窗口 hwnd={:?}，类名匹配 {TRAY_CLASS}", h.0),
+            None => format!(
+                "{TRAY_WAIT:?} 内未找到本进程的托盘 message-only 窗口。\
+                 主程序在 Resident::start 失败时只记 error 并继续启动，\
+                 因此这是**托盘未挂上**的缺陷，不是环境问题"
             ),
-            None => "未找到托盘 message-only 窗口——后续托盘链路无法验证".to_string(),
         },
     );
 
