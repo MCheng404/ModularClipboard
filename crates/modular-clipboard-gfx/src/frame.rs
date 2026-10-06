@@ -297,13 +297,35 @@ pub fn resolve_extent(
 /// 越界才是真正的违规，clamp 到合法区间是唯一可行选择。
 fn clamp_axis(caps: &vk::SurfaceCapabilitiesKHR, want: vk::Extent2D) -> vk::Extent2D {
     let axis = |want: u32, min: u32, max: u32| {
-        // 上限小于下限是驱动报告异常数据。`clamp` 在这种输入下会 panic，
-        // 因此退化为「取下限」，保证函数总是不崩。
-        if max < min { min } else { want.clamp(min, max) }
+        let base = if max < min {
+            // 上限小于下限是驱动报告异常数据。
+            // `clamp` 在这种输入下会 panic，退化为「取下限」。
+            min
+        } else {
+            want.clamp(min, max)
+        };
+        // **最终兜底：规范要求 width/height 非零**
+        // （VUID-VkSwapchainCreateInfoKHR-imageExtent-01689）。
+        //
+        // 实测踩坑：窗口尚未显示时（首次启动、`SW_SHOWMINIMIZED`、
+        // 被 DWM 最小化到 0），`current_extent` 与 `min_image_extent`
+        // 都是 0 ⇒clamp 后仍为 0 ⇒
+        // `vkCreateSwapchainKHR` 报 imageExtent 为零并使程序
+        // 以 exit 101 崩溃。
+        //
+        // Vulkan 规范允许 `current_extent == 0`（意为「应用自行决定」），
+        // 并不保证 `min_image_extent > 0`。所以必须在clamp 之后再兜一次。
+        if base == 0 {
+            FALLBACK_EXTENT.width.min(2048).max(1)
+        } else {
+            base
+        }
     };
+    let w = axis(want.width, caps.min_image_extent.width, caps.max_image_extent.width);
+    let h = axis(want.height, caps.min_image_extent.height, caps.max_image_extent.height);
     vk::Extent2D {
-        width: axis(want.width, caps.min_image_extent.width, caps.max_image_extent.width),
-        height: axis(want.height, caps.min_image_extent.height, caps.max_image_extent.height),
+        width: w,
+        height: if h == 0 { 1 } else { h },
     }
 }
 
