@@ -72,13 +72,50 @@ impl RenderPass {
             format,
             flags: vk::AttachmentDescriptionFlags::empty(),
             samples: vk::SampleCountFlags::TYPE_1,
-            // 初始布局 UNDEFINED 表示「内容无需保留」，可省去一次清除。
+            // load_op 用 CLEAR：每帧重绘背景色，不依赖图像原有内容。
             load_op: vk::AttachmentLoadOp::CLEAR,
             store_op: vk::AttachmentStoreOp::STORE,
             stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
             stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-            initial_layout: vk::ImageLayout::UNDEFINED,
-            final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+            // `initial_layout` 必须是 COLOR_ATTACHMENT_OPTIMAL，不能是 UNDEFINED。
+            //
+            // `cmd_begin_render_pass` 会按 `initial_layout` **隐式**转换布局。
+            // 若此处写 UNDEFINED，它会先做一次 `UNDEFINED → COLOR_ATTACHMENT_OPTIMAL`；
+            // 而 `FrameRenderer::open_command_buffer` 在开通道**之前**已用
+            // `LayoutTracker` 显式录了一道屏障转到 COLOR_ATTACHMENT_OPTIMAL。
+            // 两套机制并存 ⇒ 显式屏障的 `oldLayout`（PRESENT_SRC_KHR）已过期
+            // ⇒ `VUID-VkImageMemoryBarrier-oldLayout-01197`。
+            //
+            // 改成 COLOR_ATTACHMENT_OPTIMAL 后只剩**一套**转换机制：
+            // 显式屏障是权威，渲染通道不再隐式转换，两者一致。
+            //
+            // 之所以**不**同时改 `LayoutTracker` 的初值：
+            // 交换链图像在首次 acquire 前真实布局就是 UNDEFINED
+            // （`vkCreateSwapchainKHR` 不保留上一帧内容）。
+            // 若谎报为 COLOR_ATTACHMENT_OPTIMAL，
+            // `open_command_buffer` 里 `old_layout == UNDEFINED` 的分支
+            // 就永远走不到，首帧会去等待一个**不存在的写入**。
+            initial_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            // `final_layout` 故意**不**设 PRESENT_SRC_KHR，
+            // 而是保持 COLOR_ATTACHMENT_OPTIMAL。
+            //
+            // `final_layout` 若为 PRESENT_SRC_KHR，渲染通道**结束时**
+            // 会隐式做一次 `COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR`；
+            // 而 `FrameRenderer::present` 在 `cmd_end_render_pass` 之后
+            // 又录了一道**显式**屏障做同样的转换。
+            // 隐式那次已执行 ⇒ 显式屏障的 `oldLayout` 过期
+            // ⇒ `VUID-VkImageMemoryBarrier-oldLayout-01197`。
+            //
+            // 设为 COLOR_ATTACHMENT_OPTIMAL 后，渲染通道**完全不做**
+            // 隐式转换，转到 PRESENT 的责任全交给 `present()` 的显式屏障
+            // ——它还带访问掩码与阶段掩码，隐式转换做不到这些。
+            //
+            // 规范上这仍然合法：`queue_present` 要求图像在
+            // PRESENT_SRC_KHR，而 `present()` 的显式屏障正好做到这一点。
+            //
+            // 这样 `LayoutTracker` 成为布局记账的**唯一权威**，
+            // CPU 记账与 GPU 实际状态不再有两套机制打架。
+            final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         };
 
         let color_ref = vk::AttachmentReference {
