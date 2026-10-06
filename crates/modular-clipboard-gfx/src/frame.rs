@@ -437,20 +437,31 @@ impl LayoutTracker {
 /// 我们无法提前知道，因此「等栅栏」只能按槽位轮转。
 struct FrameSlot {
     command_buffer: vk::CommandBuffer,
-    /// **只**交给 `queue_submit`。
-    ///
-    /// # 为什么必须与 `acquire_fence` 分开
+    /// # 为什么只保留 `submit_fence` 一个栅栏
     ///
     /// 曾让同一个 fence 同时传给 `acquire_next_image` 与 `queue_submit`。
-    /// 规范允许这么做，但该fence 会有**两个** signal 来源：
+    /// 规范允许这么做，但该 fence 会有**两个** signal 来源：
     /// acquire 成功时驱动 signal 一次，submit 完成时再 signal 一次。
     /// 配合「等完就`reset_fences`」的写法，手工维护的 `fence_signaled`
     /// 标志必然与驱动实际状态错位——某帧的 wait 会提前返回，
-    /// 于是reset 了GPU 仍在读的命令缓冲，表现为随机丢设备。
+    /// 于是 reset 了GPU 仍在读的命令缓冲，表现为随机丢设备。
     ///
-    /// 拆开后每个 fence 只有一个 signal 源，配合
-    /// [`FrameRenderer::fence_signaled`] 直接查驱动状态，
-    /// 就不需要任何手工标志了。
+    /// 后来拆成 `submit_fence` + `acquire_fence` 两个，但**多出来的那个
+    /// acquire_fence 从未被等待过**——acquire 的等待已由
+    /// `acquire_semaphore`（submit 侧wait）与槽位轮转天然保证。
+    /// 于是它成了一个「只 signal、没人等、还得复位」的死对象，
+    /// 而**复位它本身就是两种违规的来源**（验证层实测，60 帧）：
+    ///
+    /// - 复位时它仍被在途 `acquire_next_image` 关联
+    ///   ⇒ `VUID-vkResetFences-pFences-01123`（20 次）
+    /// - 不复位则下一个 `acquire_next_image` 拿到已 signal 的 fence
+    ///   ⇒ `VUID-vkAcquireNextImageKHR-fence-10066`（20 次）
+    ///
+    /// 两者是同一根因的两面：**规范允许 `acquire_next_image` 的 fence
+    /// 传 `Fence::null()`**（信号量与 fence 至少给一个即可，本项目已给
+    /// `acquire_semaphore`）。删掉这个死对象，两个VUID 一起消失。
+    ///
+    /// 这也印证了 MEMORY.md 第54 条：不为「也许用得上」保留机制。
     submit_fence: vk::Fence,
     /// acquire signal → submit wait。
     acquire_semaphore: vk::Semaphore,
@@ -838,31 +849,20 @@ impl<'a> FrameRenderer<'a> {
             // staging 块将永远查不到 signal，arena 会在几帧内耗尽。
             unsafe { self.gpu.device.reset_fences(&[fence])? };
         }
-        // acquire_fence 复位到未 signal，好让下次 acquire 拿到干净状态。
-        // （它由本次 acquire signal，槽位再次被复用前必须复位。）
-        //
-        // ⚠️ 必须**先确认已 signal 再复位**，不能无条件 reset。
-        // // VUID-vkResetFences-pFences-01123
-        // 「fence is in use」——该 fence 仍被在途的 `acquire_next_image`
-        // 关联时reset 它是违规的（60 帧下报 20 次）。
-        //
-        // 曾改成无条件 reset，理由是「查状态再决定是凭状态猜测」。
-        // 验证层证明：**那个判断不是猜测，而是规范要求的前置条件。**
-        // 教训：带语义依据的判断不能当冗余防御简化掉。
-        {
-            let af = self.slots[slot].acquire_fence;
-            if self.fence_signaled(af) {
-                unsafe { self.gpu.device.reset_fences(&[af])? };
-            }
-        }
         self.staging.begin_frame();
 
+        // fence 传 `Fence::null()`：同步由 `acquire_semaphore` 承担
+        // （submit 侧会 wait 它）。曾额外传一个 `acquire_fence`，但那个
+        // fence 从未被等待过，复位它反而稳定触发
+        // `VUID-vkResetFences-pFences-01123`；而不复位又触发
+        // `VUID-vkAcquireNextImageKHR-fence-10066`。详见
+        // [`FrameSlot::submit_fence`] 的说明。
         let (image_index, suboptimal) = match map_acquire_result(unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain.handle,
                 ACQUIRE_TIMEOUT,
                 self.slots[slot].acquire_semaphore,
-                self.slots[slot].acquire_fence,
+                vk::Fence::null(),
             )
         })? {
             AcquireOutcome::Ready {
@@ -1371,26 +1371,21 @@ impl<'a> FrameRenderer<'a> {
 
         let mut slots = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
-            // 两个 fence 各自**只有一个** signal 来源：
-            // submit_fence 由 queue_submit signal，acquire_fence 由
-            // acquire_next_image signal。绝不让两者共用一个——
-            // 共用会产生两个 signal 源，使「是否已完成」的判断不可靠。
+            // ⚠️ fence 必须以 **UNSIGNALED** 创建
+            // （`FenceCreateInfo::default()` 即无 flags）。
             //
-            // ⚠️ 两者都必须以 **UNSIGNALED** 创建。
+            // 曾建成SIGNALED，理由是「让首次复用槽位时 wait 立刻通过」。
+            // 那是多余的：`in_flight == false` 已经表达了「没有在途工作、
+            // 不必等」，首次使用的 wait 语义由 `in_flight` 保证，
+            // 不需要靠 fence 初值。
             //
-            // 曾建成 SIGNALED（想让首次复用槽位时 wait 立刻通过），但那是
-            // 多余且有害的：`in_flight == false` 已经表达了「没有在途工作、
-            // 不必等」，不需要靠 fence 初值来让 `wait_for_fences` 通过。
-            //
-            // 更糟的是规范禁止把 SIGNALED 的 fence 传给 `queue_submit`：
-            // // VUID-vkQueueSubmit-fence-00063
-            // 实测每个槽位首次使用都触发一次（3 槽位 = 3 次，出现在帧 0/1/2），
-            // 与「槽位复用前没 reset」无关——是**首次使用**即违规。
+            // 更糟的是规范禁止把已 signal 的 fence 传给 `queue_submit`
+            // （`VUID-vkQueueSubmit-fence-00063`）：`in_flight == false`
+            // 的槽位从未走过 `reset_fences`，首次 `present` 时 fence 仍是
+            // SIGNALED。
             let fence_info = vk::FenceCreateInfo::default();
             let submit_fence = unsafe { device.create_fence(&fence_info, None) }
                 .map_err(|e| anyhow::anyhow!("创建 submit 栅栏失败: {e:?}"))?;
-            let acquire_fence = unsafe { device.create_fence(&fence_info, None) }
-                .map_err(|e| anyhow::anyhow!("创建 acquire 栅栏失败: {e:?}"))?;
             let semaphore_info = vk::SemaphoreCreateInfo::default();
             let acquire_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
                 .map_err(|e| anyhow::anyhow!("创建 acquire 信号量失败: {e:?}"))?;
@@ -1399,7 +1394,6 @@ impl<'a> FrameRenderer<'a> {
             slots.push(FrameSlot {
                 command_buffer: buffers[i],
                 submit_fence,
-                acquire_fence,
                 // 初始没有在途提交，可以自由录制。
                 in_flight: false,
                 // 从未使用过，没有可退休的上一轮帧。
@@ -1419,7 +1413,6 @@ impl<'a> FrameRenderer<'a> {
         for slot in &self.slots {
             unsafe {
                 device.destroy_fence(slot.submit_fence, None);
-                device.destroy_fence(slot.acquire_fence, None);
                 device.destroy_semaphore(slot.acquire_semaphore, None);
                 device.destroy_semaphore(slot.present_semaphore, None);
             }
