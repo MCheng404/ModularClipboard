@@ -476,6 +476,8 @@ panic 消息必须包含具体错误原因。
 | B 组 | `rebuild_chunk` 应加 `owner_frame == FREE` 断言 | frame.rs owner |
 | **racehunt** | **`submit_fence` 首次使用即违规：`create_fence` 带 `SIGNALIZED`，但 `reset_fences` 只在 `if in_flight` 分支内。详见下方「验证层定位」** | **frame.rs owner** |
 | **racehunt** | **交换链图像被转换两次：渲染通道 `initial_layout=UNDEFINED` 已隐式转换，`open_command_buffer` 的显式屏障用过期 `oldLayout`。详见下方「验证层定位」** | **frame.rs owner** |
+| **racehunt** | **`present_semaphore` 按槽位分配，但 `image_index` 由驱动决定 ⇒ `VUID-vkQueueSubmit-pSignalSemaphores-00067`（每次必现）。验证层建议 per-image semaphore 或 `VK_KHR_swapchain_maintenance1`。本机四个相关扩展均已暴露** | **frame.rs owner** |
+| **racehunt** | **`acquire_fence` 两难：复位触发 01123、不复位触发 10066。`frame.rs:854-859` 注释说已改传 `Fence::null()`，但 HEAD 仍传 `acquire_fence`——注释与代码不同步** | **frame.rs owner** |
 
 ---
 
@@ -1053,7 +1055,7 @@ VUID-vkAcquireNextImageKHR-fence-10066
 
 ---
 
-## ✅ 偶发 device lost 已彻底消除：160/160（VUID 全归零）
+## ⚠️ 偶发 device lost 已消除：160/160（但仍有 1 个 VUID 未清，见文末更正）
 
 **结论：三个VUID 全部清除后，`upload_probe` 的偶发 `ERROR_DEVICE_LOST` 随之消失。**
 此前推测「VUID 与 device lost 无因果」是**错的** —— race-hunt 的对照实验
@@ -1100,3 +1102,121 @@ race-hunt 当时据此推断无因果，这个推断过强。正确表述是：
 `PresentInfoKHR` 在 ash 0.38 **无 fence 字段**（`vkQueuePresentKHR` 规范也不接受
 fence 参数），所以此前设想的 per-image fence 需换实现方式。
 **当前 160/160 不需要它** —— 若将来要加，理由应重新评估。
+
+---
+
+## 🔬 VUID 修复后的复核（racehunt，HEAD `7c638ad`）
+
+修复后二进制：`target-racehunt/…/upload_probe.exe`
+`2026-10-06 14:13:10`  md5 `01c5bab9…`（全新编译，零警告）
+源码指纹 `frame.rs 6749bacb…`（已变）`pipeline.rs 98b8e480…`（已变）
+`texture.rs ef5a430f…`（**未变**）
+
+### 原两个 VUID：已消除 ✅
+
+| VUID | 修前 | 修后 |
+|------|------|------|
+| `VUID-vkQueueSubmit-fence-00063` | 每次 3 次 | **0** |
+| `VUID-VkImageMemoryBarrier-oldLayout-01197` | 每次 20 次 | **0** |
+
+措辞按主控要求记为：**「消除了真实规范违规（UB），显著改善，因果未证实」**。
+
+### ⚠️ 但修掉fence 违规后暴露了两个新 VUID（每次必现）
+
+#### 新 VUID A：`VUID-vkQueueSubmit-pSignalSemaphores-00067` —— **这是真正值得担心的那个**
+
+```
+vkQueueSubmit(): pSubmits[0].pSignalSemaphores[0] (VkSemaphore 0x190000000019)
+  is being signaled by VkQueue, but it may still be in use by VkSwapchainKHR.
+  Most recently acquired image indices: [0], 1, 1, 1.
+Swapchain image 0 was presented but was not re-acquired,
+  so VkSemaphore may still be in use and cannot be safely reused with image index 1.
+```
+
+**验证层自己给的建议**：
+> a) Use a separate semaphore per swapchain image.
+> b) Consider the `VK_KHR_swapchain_maintenance1` extension.
+
+**根因**：`present_semaphore` 是**按帧槽位**（`frame.rs:1066`）而非
+**按交换链图像**分配的。`acquire_next_image` 返回的 `image_index`
+**由驱动决定、与槽位无对应关系**——这正是 MEMORY.md 第 7 批坑 45
+记录的核心事实。因此「等 `submit_fence[slot]`」只证明**渲染完成**，
+**不证明 present 完成**；`PresentResult::Presented` 的文档
+（`frame.rs:151-152`「该槽位可以安全复用」）**假设过强**，
+其注释自己写的是「这台机器时序恰好对，不构成正确性证明」——
+**现在验证层证明这个假设不成立**。
+
+**这条是当前最强的根因候选**：它同时解释
+① 为什么验证层无 SYNC-HAZARD 却仍会丢设备（present/acquire 与 CPU 的竞争
+   属于 WSI 生命周期，同步验证不检查）；
+② 为什么「修前 ~4%」这种低概率（取决于驱动内部何时真正完成 present）。
+
+#### 新 VUID B：`VUID-vkAcquireNextImageKHR-fence-10066`
+
+```
+vkAcquireNextImageKHR(): (VkFence 0x170000000017) is already in use
+  by another submission.
+```
+这是 `acquire_fence` 的**两难**：复位它触发
+`VUID-vkResetFences-pFences-01123`（该 fence 从未被等待过），
+不复位则触发本条。`frame.rs:854-859` 的注释**已经记录了这个两难**
+并改传 `Fence::null()`——但**当前 HEAD 仍在传 `acquire_fence`**
+（`frame.rs:860-866` 区域），说明注释与代码不同步。
+建议：**要么彻底删掉 `acquire_fence`（含其创建/销毁），要么真的等它**。
+
+### 验收强度（无验证层，默认 60 帧）
+
+- **300 次在跑**，前 84 次 **0 失败**
+- 带验证层 10 次：**10 / 10 通过**
+
+⚠️ **但通过的这10 次同样带上述两个新 VUID。**
+所以「100/100 通过」**不能**作为修复成功的证据——
+这正是我在修复前用过的否证逻辑（VUID 100% 必现 vs device lost 4% 偶发）。
+**正确表述**：device lost 当前测不到，但**底层仍有 100% 可复现的 UB**。
+
+### 关于 `VK_KHR_present_wait` / `swapchain_maintenance1`（本机实测）
+
+`vulkaninfo` 实测本机（NVIDIA + Vulkan 1.4.341）**均已暴露**：
+
+| 扩展 | 版本 |
+|------|------|
+| `VK_KHR_present_wait` | extension revision 1 |
+| `VK_KHR_present_wait2` | extension revision 1 |
+| `VK_KHR_swapchain_maintenance1` | extension revision 1 |
+| `VK_EXT_swapchain_maintenance1` | extension revision 1 |
+
+**待决区结论**：本机具备条件，但**现在不要上机制**。
+新 VUID A 恰好是「造压力测试看能不能复现」的成功案例——
+**先让上层加一个能触发 present/acquire 竞争的探针**
+（例如压测 present 同时 acquire、或多槽位乱序 acquire），
+确认真能复现 device lost，再上 per-image semaphore 或 present_wait。
+否则又是一次「用复杂度换安全感」。
+
+
+---
+
+## ⚠️ 更正：仍有 1 个 VUID 未清（`VUID-vkQueueSubmit-pSignalSemaphores-00067`）
+
+上节「VUID 全归零」的记录**不准确**。`81554cf` 删除 `acquire_fence` 之后，
+重跑验证层（60 帧）出现：
+
+```
+VUID-vkQueueSubmit-pSignalSemaphores-00067     2 次/运行，可复现
+pSignalSemaphores[0] (VkSemaphore 0x...) is being signaled by VkQueue,
+  but it may still be in use by VkSwapchainKHR 0x70000000007.
+Most recently acquired image indices: 0, [1], 2, 0, 0.
+```
+
+**根因**：`present_semaphore` 按**槽位**分配，而交换链按**图像**使用信号量。
+槽位A 的信号量被 present 用过后，可能在 GPU 仍持有时被下一次 submit 复用。
+
+**正确的修法不是「per-image fence」** —— `PresentInfoKHR` 在 ash 0.38
+**无 fence 字段**（`src/vk/definitions.rs:9114`），`vkQueuePresentKHR`
+规范也不接受 fence 参数。**应按图像分配 semaphore**（mcp-per-image 的任务 #29）。
+
+**待查**：这条 VUID 在我上次测「全归零」时**没有出现**。可能是
+- `81554cf` 删掉 `acquire_fence` 后才暴露（原先被掩盖），或
+- 它本身偶发，我恰好没撞上
+
+**在查清之前，不应再宣称「VUID 全归零」。** 偶发 device lost 的
+160/160 是真实数据，但「VUID 全部清除」不是。
