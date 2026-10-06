@@ -41,9 +41,9 @@ pub const FONT_TEXTURE_ID: egui::TextureId = egui::TextureId::Managed(0);
 
 /// 一次绘制批次。
 ///
-/// 比 [`modular_clipboard_gfx::frame::DrawBatch`] 多带一个 `clip`：合并判定需要知道相邻
-/// 两段是否属于同一裁剪区，而 `frame::DrawBatch` 不暴露这个信息。
-/// 提交前用 [`Batch::to_draw`] 转换。
+/// 比 [`modular_clipboard_gfx::frame::DrawBatch`] 多带 `clip` 与 `tex_id`：
+/// 合并判定需要知道相邻两段是否属于同一裁剪区、同一张纹理，
+/// 而 `frame::DrawBatch` 不暴露这两个信息。提交前用 [`Batch::to_draw`] 转换。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Batch {
     /// 索引缓冲中的起始索引。
@@ -52,6 +52,21 @@ pub struct Batch {
     pub index_count: u32,
     /// 本段的裁剪矩形，仅用于合并判定，不提交给 GPU。
     pub clip: egui::Rect,
+    /// 本段采样的纹理。
+    ///
+    /// # 为什么必须逐批记录
+    ///
+    /// 引入用户纹理（图片缩略图）后，一次绘制里会存在**两种**纹理：
+    /// 字体图集与缩略图。若合批时只看 clip 与索引连续性，
+    /// 两块不同纹理的图元会被并进同一批，而该批只绑一张纹理
+    /// ⇒ 其中一半图元采样到错误纹理。
+    ///
+    /// 症状是「缩略图位置显示成字体图集里的某个字形」，
+    /// **不报任何 GPU 错误、验证层也是干净的**——最难查的一类。
+    ///
+    /// egui 已经把每块 mesh 的纹理 ID 交给我们（`epaint::Mesh::texture_id`），
+    /// 这里只是此前一直没读它。
+    pub tex_id: egui::TextureId,
 }
 
 impl Batch {
@@ -114,9 +129,16 @@ pub fn tessellate_into(
         }
         indices.extend(mesh.indices.iter().map(|&i| base + i));
 
-        // 「clip 相同且索引连续」才并入上一批。索引连续由上面的追加式写入保证。
+        // 合批的三个条件：同裁剪区、同纹理、索引连续。
+        // 索引连续由上面的追加式写入保证。
+        //
+        // `tex_id` 这条是引入用户纹理后**必须**加的：漏掉它会让不同纹理的
+        // 图元并进同一批，而该批只绑一张纹理 ⇒ 采样到错误纹理，
+        // 且不产生任何 GPU 错误。见 `Batch::tex_id` 的说明。
         let merge = batches.last().is_some_and(|b| {
-            b.clip == prim.clip_rect && b.index_offset + b.index_count == index_start
+            b.clip == prim.clip_rect
+                && b.tex_id == mesh.texture_id
+                && b.index_offset + b.index_count == index_start
         });
         if merge {
             let last = batches.last_mut().expect("刚判定过非空");
@@ -126,6 +148,7 @@ pub fn tessellate_into(
                 index_offset: index_start,
                 index_count,
                 clip: prim.clip_rect,
+                tex_id: mesh.texture_id,
             });
         }
     }
@@ -931,6 +954,104 @@ mod tests {
     fn font_texture_id_is_managed_zero() {
         // epaint 约定：Managed(0) 恒为字体图集。改错会让所有文字变豆腐块。
         assert_eq!(FONT_TEXTURE_ID, egui::TextureId::Managed(0));
+    }
+
+    // ---- 多纹理：合批必须按 texture_id 分组 ----
+
+    /// 造一个指定纹理的图元。`clip` 固定，便于构造
+    /// 「clip 相同 + 索引连续」这个最容易触发误合并的组合。
+    fn prim_with_tex(clip: egui::Rect, verts: usize, indices: usize, tex: egui::TextureId) -> ClippedPrimitive {
+        let mesh = Mesh {
+            indices: (0..indices as u32).collect(),
+            vertices: (0..verts)
+                .map(|i| EVertex {
+                    pos: egui::pos2(i as f32, 0.0),
+                    uv: egui::pos2(0.0, 0.0),
+                    color: egui::Color32::WHITE,
+                })
+                .collect(),
+            texture_id: tex,
+        };
+        ClippedPrimitive {
+            clip_rect: clip,
+            primitive: Primitive::Mesh(mesh),
+        }
+    }
+
+    /// 缩略图用的非字体纹理 ID。
+    const THUMB_TEX: egui::TextureId = egui::TextureId::Managed(7);
+
+    #[test]
+    fn different_textures_are_never_merged() {
+        // 回归测试：合批曾只看 clip + 索引连续，漏掉纹理判定。
+        // 引入用户纹理后，字体图元与缩略图图元会被并进同一批，
+        // 而该批只绑一张纹理 ⇒ 缩略图位置显示成字体图集里的字形。
+        // 该错误不产生任何 GPU 错误、验证层也干净。
+        let clip = rect_at(0.0);
+        let prims = vec![
+            // clip 相同、索引连续（同clip_rect + 追加式写入），
+            // 只有纹理不同——这正是必须拆开的情形。
+            prim_with_tex(clip, 3, 3, FONT_TEXTURE_ID),
+            prim_with_tex(clip, 3, 3, THUMB_TEX),
+        ];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+
+        assert_eq!(b.len(), 2, "不同纹理绝不能合批：{b:?}");
+        assert_eq!(b[0].tex_id, FONT_TEXTURE_ID);
+        assert_eq!(b[1].tex_id, THUMB_TEX);
+    }
+
+    #[test]
+    fn same_texture_still_merges() {
+        // 反向约束：修「漏判纹理」不能顺手把合批优化也干掉。
+        // 同纹理 + 同 clip + 索引连续 ⇒ 必须仍然合并成一批。
+        let clip = rect_at(0.0);
+        let prims = vec![
+            prim_with_tex(clip, 3, 3, FONT_TEXTURE_ID),
+            prim_with_tex(clip, 3, 3, FONT_TEXTURE_ID),
+        ];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+
+        assert_eq!(b.len(), 1, "同纹理应继续合批：{b:?}");
+        assert_eq!(b[0].index_count, 6, "合并后索引数应累加");
+    }
+
+    #[test]
+    fn same_texture_across_interleaved_primitives_groups_correctly() {
+        // 字体 / 缩略图交替出现时应得到 4 批，而不是 1 批也不是 2 批。
+        // 覆盖「相邻性」判定的正确性：只有**相邻且同纹理**才能合并。
+        let clip = rect_at(0.0);
+        let prims = vec![
+            prim_with_tex(clip, 3, 3, FONT_TEXTURE_ID),
+            prim_with_tex(clip, 3, 3, THUMB_TEX),
+            prim_with_tex(clip, 3, 3, FONT_TEXTURE_ID),
+            prim_with_tex(clip, 3, 3, THUMB_TEX),
+        ];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+
+        assert_eq!(b.len(), 4, "交替纹理应逐个成批：{b:?}");
+        assert_eq!(b[0].tex_id, FONT_TEXTURE_ID);
+        assert_eq!(b[1].tex_id, THUMB_TEX);
+        assert_eq!(b[2].tex_id, FONT_TEXTURE_ID);
+        assert_eq!(b[3].tex_id, THUMB_TEX);
+    }
+
+    #[test]
+    fn batch_tex_id_defaults_survive_to_draw_conversion() {
+        // `to_draw` 不提交 tex_id（GPU 侧接线未定案），
+        // 但转换本身不能因此丢批次或崩。
+        let b = Batch {
+            index_offset: 4,
+            index_count: 6,
+            clip: rect_at(0.0),
+            tex_id: THUMB_TEX,
+        };
+        let d = b.to_draw();
+        assert_eq!(d.index_offset, 4);
+        assert_eq!(d.index_count, 6);
     }
 
     #[test]

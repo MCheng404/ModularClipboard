@@ -370,10 +370,10 @@ impl ThumbnailCache {
             return Ok(hit);
         }
         // 仍在抑制期内：直接复用上次的错误，不再付读盘+解码的代价。
-        if let Some((at, err)) = self.failures.get(&key) {
-            if now_ms().saturating_sub(*at) < FAILURE_SUPPRESS_MS {
-                return Err(*err);
-            }
+        if let Some((at, err)) = self.failures.get(&key)
+            && now_ms().saturating_sub(*at) < FAILURE_SUPPRESS_MS
+        {
+            return Err(*err);
         }
 
         let result = load()
@@ -402,15 +402,14 @@ impl ThumbnailCache {
     /// 满了就丢掉**最旧**的一条（`HashMap` 无序，故取 `at` 最小者）。
     /// 淘汰旧失败是安全的：最坏后果只是某个坏条目被多试一次。
     fn remember_failure(&mut self, key: CacheKey, err: ThumbError) {
-        if self.failures.len() >= MAX_TRACKED_FAILURES {
-            if let Some(oldest) = self
+        if self.failures.len() >= MAX_TRACKED_FAILURES
+            && let Some(oldest) = self
                 .failures
                 .iter()
                 .min_by_key(|(_, (at, _))| *at)
                 .map(|(k, _)| k.clone())
-            {
-                self.failures.remove(&oldest);
-            }
+        {
+            self.failures.remove(&oldest);
         }
         self.failures.insert(key, (now_ms(), err));
     }
