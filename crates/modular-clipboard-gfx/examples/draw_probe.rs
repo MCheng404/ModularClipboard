@@ -61,6 +61,8 @@ fn full_screen_triangle(w: f32, h: f32) -> [Vertex; 3] {
             uv: [x / w, y / h],
             // 不透明白色，ABGR 小端序。
             color: 0xFFFF_FFFF,
+            // 只画字体图集。
+            tex_id: 0,
         })
 }
 

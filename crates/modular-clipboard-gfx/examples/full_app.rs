@@ -575,6 +575,10 @@ fn tessellate_into(
                 pos: [v.pos.x, v.pos.y],
                 uv: [v.uv.x, v.uv.y],
                 color: pack_color(v.color),
+                // 本探针只画字体图集，不画用户纹理。
+                // 0 = 字体图集。不能用 ui crate 的常量——gfx 不能依赖 ui
+                // （分层是 ui -> gfx，反向会成环）。
+                tex_id: 0,
             });
         }
         indices.extend(mesh.indices.iter().map(|&i| base + i));

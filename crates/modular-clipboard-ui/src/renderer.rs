@@ -35,6 +35,34 @@ pub const INITIAL_INDEX_CAPACITY: usize = 12288;
 /// 而图集左上角那个「纯白像素」正是 `WHITE_UV` 指向的位置。
 pub const FONT_TEXTURE_ID: egui::TextureId = egui::TextureId::Managed(0);
 
+/// 着色器里的「采样哪张纹理」：`0` = 字体图集，`1` = 用户纹理。
+pub const TEX_SLOT_FONT: u32 = 0;
+/// 见 [`TEX_SLOT_FONT`]。
+pub const TEX_SLOT_USER: u32 = 1;
+
+/// 把 egui 的 [`egui::TextureId`] 映射到着色器用的纹理槽位号。
+///
+/// # 为什么压成 0/1 而不是透传 `TextureId`
+///
+/// egui 的 `TextureId` 是 `Managed(u64) | Viewport(u32)`，直接传下去需要
+/// 着色器侧再解一次枚举。缩略图只有「字体」与「非字体」两类，
+/// 着色器一个 `if` 就够⇒ 顶点里带一个 `u32` 槽位号即可。
+///
+/// # 未知纹理一律当作用户纹理
+///
+/// 字体图集是 `Managed(0)`（egui 的硬约定）。其余任何纹理都归到
+/// 「用户纹理」槽——出错时表现为**采样一张空白/错误图**，
+/// 而静默把字体当用户纹理会让**所有文字消失**（字体图集是
+/// 单通道覆盖率图，当彩色图采样出来几乎全黑）。
+/// 两种错法都不报错，但后者影响面大得多。
+pub fn texture_slot(id: egui::TextureId) -> u32 {
+    if id == FONT_TEXTURE_ID {
+        TEX_SLOT_FONT
+    } else {
+        TEX_SLOT_USER
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 批次
 // ---------------------------------------------------------------------------
@@ -125,6 +153,7 @@ pub fn tessellate_into(
                 pos: [v.pos.x, v.pos.y],
                 uv: [v.uv.x, v.uv.y],
                 color: pack_color(v.color),
+                tex_id: texture_slot(mesh.texture_id),
             });
         }
         indices.extend(mesh.indices.iter().map(|&i| base + i));
@@ -244,6 +273,27 @@ pub struct Painter<'a> {
     sampler: Sampler,
     /// 字体图集（覆盖率图，`R8_UNORM`）。
     font: Option<DeviceImage>,
+    /// 用户纹理（图片缩略图，RGBA）。
+    ///
+    /// 与字体图集分开的理由：两者格式不同（覆盖率 vs 彩色），
+    /// 且片元着色器对它们的合成方式不同——字体图集取单通道
+    /// 乘顶点色，缩略图直接用 RGBA。
+    ///
+    /// 只存**一张**：详情区当前只显示一张图。
+    /// 若要同时显示多张，需按纹理分批（每批绑不同纹理）。
+    user_tex: Option<DeviceImage>,
+    /// 1×1 白色占位纹理，绑在 `BINDING_USER_TEXTURE` 上当没有缩略图时用。
+    ///
+    /// # 为什么必须有占位
+    ///
+    /// 描述符**绝不能留空**——未初始化的描述符是未定义行为
+    /// （读到垃圾纹理、采样越界，或直接设备丢失）。
+    /// 而 `BINDING_USER_TEXTURE` 在着色器里是硬编码的，
+    /// 每帧都要有值。所以没有缩略图时也得绑一张合法的图。
+    ///
+    /// 用纯白而非黑：白图乘顶点色后与清屏色叠加看不出差别，
+    /// 而黑图在深色主题下会形成可见的黑色方块。
+    placeholder: Option<DeviceImage>,
     uniform: UniformBuffer,
     slots: SlotBuffers,
     // CPU 侧复用缓冲，避免每帧重新分配。
@@ -287,10 +337,14 @@ impl<'a> Painter<'a> {
             INITIAL_VERTEX_CAPACITY,
             INITIAL_INDEX_CAPACITY,
         )?;
+        // 占位纹理在首帧上传（需acquire 后的命令缓冲），见 paint()。
         Ok(Self {
             gpu,
             sampler,
             font: None,
+            user_tex: None,
+            // 首帧上传，见 paint()。
+            placeholder: None,
             uniform,
             slots,
             vertices: Vec::with_capacity(INITIAL_VERTEX_CAPACITY),
@@ -344,6 +398,30 @@ impl<'a> Painter<'a> {
             .write(self.gpu, slot, &self.vertices, &self.indices)?;
 
         // ---- 字体图集上传 -----------------------------------------------
+        // 首帧创建 1×1 白色占位纹理。
+        //
+        // `BINDING_USER_TEXTURE` 在着色器里是硬编码的，**每帧都要有值**。
+        // 若从未写入，该描述符保持未初始化状态 = 未定义行为
+        // （读到垃圾纹理、采样越界，或设备丢失）。
+        // 即使没有任何缩略图，也必须绑一张合法的图。
+        //
+        // 选白色而非黑色：白图乘顶点色后与背景叠加看不出差别；
+        // 黑图在深色主题下会形成可见的黑色方块。
+        if self.placeholder.is_none() {
+            let mut img = DeviceImage::new(
+                self.gpu,
+                vk::Extent2D {
+                    width: 1,
+                    height: 1,
+                },
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            fr.record_texture_upload(&mut img, &[255u8, 255, 255, 255], None, (1, 1))?;
+            self.placeholder = Some(img);
+            self.bindings_dirty = true;
+        }
+
         let uploaded = self.upload_font_delta(fr, textures_delta)?;
         if uploaded > 0 {
             self.stats.texture_uploads += uploaded;
@@ -415,6 +493,16 @@ impl<'a> Painter<'a> {
     fn bind_all(&self, fr: &FrameRenderer<'a>, font: &DeviceImage) -> anyhow::Result<()> {
         for slot in 0..fr.slot_count() {
             fr.update_texture_binding(slot, self.sampler.handle(), font.view, font.layout)?;
+            // 用户纹理（缩略图）。缺省时绑 1×1 白色占位图——
+            // 描述符绝不能留空，未初始化是 UB。
+            if let Some(t) = self.user_tex.as_ref().or(self.placeholder.as_ref()) {
+                fr.update_user_texture_binding(
+                    slot,
+                    self.sampler.handle(),
+                    t.view,
+                    t.layout,
+                )?;
+            }
             fr.update_uniform_binding(
                 slot,
                 self.uniform.buffer().handle(),
@@ -447,7 +535,61 @@ impl<'a> Painter<'a> {
 
         for (id, deltas) in &delta.set {
             if *id != FONT_TEXTURE_ID {
-                tracing::warn!("忽略非字体纹理 {id:?}：当前着色器只绑定字体图集");
+                // 用户纹理（图片缩略图）。与字体图集走不同的绑定与格式。
+                //
+                // 只取**最后一个** delta：着色器的 `BINDING_USER_TEXTURE`
+                // 只有一张，而详情区一次只显示一张图。
+                // 若 egui 送多个，取最新的那个（与 egui 语义一致：
+                // 同一 TextureId 的后一次增量覆盖前一次）。
+                let Some(last) = deltas.last() else { continue };
+                // 局部更新（pos != None）无法处理：我们只有一张独立纹理，
+                // 没有「纹理子区域」的概念。缩略图总是整图更新
+                // （`Thumbnail` 走 `ctx.load_texture` 的整图路径）。
+                let Some(_pos) = last.pos else {
+                    tracing::debug!("跳过用户纹理 {id:?} 的局部更新");
+                    continue;
+                };
+                let [w, h] = last.image.size();
+                let (w, h) = (w as u32, h as u32);
+                if w == 0 || h == 0 {
+                    tracing::debug!("用户纹理 {id:?} 尺寸为 0，跳过");
+                    continue;
+                }
+                // 尺寸变了就重建纹理。
+                let need_new = match self.user_tex.as_ref() {
+                    None => true,
+                    Some(t) => t.size.width != w || t.size.height != h,
+                };
+                if need_new {
+                    if let Some(mut old) = self.user_tex.take() {
+                        // 旧纹理可能仍被在途命令读取，必须等GPU 空闲再销毁。
+                        self.gpu.wait_idle();
+                        old.destroy(&self.gpu.device);
+                    }
+                    self.user_tex = Some(DeviceImage::new(
+                        self.gpu,
+                        vk::Extent2D {
+                            width: w,
+                            height: h,
+                        },
+                        vk::Format::R8G8B8A8_UNORM,
+                        vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::SAMPLED,
+                    )?);
+                }
+                // egui 的 `ColorImage.pixels` 是预乘 alpha 的 `Color32`，
+                // 直接展平为 RGBA 字节（与 `coverage_bytes` 同样的取法，
+                // 只是保留全部 4 通道而非取单通道）。
+                let rgba: Vec<u8> = match &last.image {
+                    egui::ImageData::Color(img) => {
+                        img.pixels.iter().flat_map(|p| p.to_array()).collect()
+                    }
+                };
+                if let Some(tex) = self.user_tex.as_mut() {
+                    fr.record_texture_upload(tex, &rgba, None, (w, h))?;
+                    uploads += 1;
+                }
+                self.bindings_dirty = true;
                 continue;
             }
             for d in deltas {
@@ -956,6 +1098,108 @@ mod tests {
         assert_eq!(FONT_TEXTURE_ID, egui::TextureId::Managed(0));
     }
 
+    #[test]
+    fn texture_slot_maps_font_to_zero_and_others_to_one() {
+        // 着色器只需二分：0 = 字体图集，1 = 用户纹理。
+        assert_eq!(texture_slot(FONT_TEXTURE_ID), TEX_SLOT_FONT);
+        assert_eq!(texture_slot(egui::TextureId::Managed(1)), TEX_SLOT_USER);
+        assert_eq!(texture_slot(egui::TextureId::Managed(7)), TEX_SLOT_USER);
+        // epaint 0.36 的 `TextureId` 只有 `Managed` / `User` 两个变体，
+        // 没有 `Viewport`（那是更早版本的形状）。两者都必须落到用户槽。
+        assert_eq!(texture_slot(egui::TextureId::User(0)), TEX_SLOT_USER);
+    }
+
+    #[test]
+    fn vertices_carry_tex_id_matching_their_mesh() {
+        // 端到端验证 `tessellate_into` 真的把纹理写进了顶点。
+        // 单看 `texture_slot` 的单测不够——映射对了但没接上，
+        // 或者接反了，这里才抓得住。
+        let clip = rect_at(0.0);
+        let prims = vec![
+            prim_with_tex(clip, 3, 3, FONT_TEXTURE_ID),
+            prim_with_tex(clip, 3, 3, THUMB_TEX),
+        ];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+
+        assert_eq!(v.len(), 6, "两个三角形共 6 个顶点");
+        // 前 3 个来自字体图集，后 3 个来自缩略图。
+        for vert in &v[..3] {
+            assert_eq!(vert.tex_id, TEX_SLOT_FONT, "字体图元应带槽位 0");
+        }
+        for vert in &v[3..] {
+            assert_eq!(vert.tex_id, TEX_SLOT_USER, "缩略图元应带槽位 1");
+        }
+    }
+
+    #[test]
+    fn real_egui_text_stays_on_the_font_slot() {
+        // 用真实 egui 跑一帧：真实文字的 mesh 一定带字体图集 ID，
+        // 顶点必须全是槽位 0。
+        //
+        // 回归意义：若 `texture_slot` 反了（字体判成 1），
+        // 字体图集会被当彩色图采样 ⇒ **所有文字消失**且不报错。
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            ui.heading("标题");
+            ui.label("正文");
+        });
+        out.textures_delta.clear();
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+        assert!(!v.is_empty(), "egui 应产出顶点");
+        assert!(
+            v.iter().all(|x| x.tex_id == TEX_SLOT_FONT),
+            "纯文字界面的所有顶点都应走字体图集"
+        );
+    }
+
+    #[test]
+    fn uploaded_image_uses_the_user_slot() {
+        // 真实走一次 `load_texture` + `Image`，确认 egui 派发的图元
+        // 带的是**用户**纹理 ID，且被映射成槽位 1。
+        // 这覆盖了「egui 怎么给用户纹理分配 TextureId」这个我无法预设的细节。
+        let ctx = egui::Context::default();
+        let img = egui::ColorImage::new([2, 2], egui::Color32::WHITE);
+        let handle = ctx.load_texture(
+            "unit-test-thumb",
+            img,
+            egui::TextureOptions::LINEAR,
+        );
+        let tex_id = handle.id();
+
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            ui.image((handle, egui::vec2(64.0, 64.0)));
+        });
+        out.textures_delta.clear();
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+
+        assert_ne!(tex_id, FONT_TEXTURE_ID, "用户纹理不应与字体图集同 ID");
+        assert!(
+            v.iter().any(|x| x.tex_id == TEX_SLOT_USER),
+            "图片图元应带槽位 1（tex_id = {tex_id:?}）"
+        );
+    }
+
     // ---- 多纹理：合批必须按 texture_id 分组 ----
 
     /// 造一个指定纹理的图元。`clip` 固定，便于构造
@@ -1056,9 +1300,13 @@ mod tests {
 
     #[test]
     fn vertex_layout_matches_pipeline_stride() {
-        // pipeline.rs 声明的步长是 pos(8)+uv(8)+color(4)=20 字节。
+        // pipeline.rs 声明的步长是 pos(8)+uv(8)+color(4)+tex_id(4)=24 字节。
         // 布局不符时驱动不会报错，只会画出乱码。
-        assert_eq!(std::mem::size_of::<Vertex>(), 20);
+        //
+        // 这条断言在本项目改过两次：加 `tex_id` 前是 20 字节。
+        // 两次都是「Rust 侧改了、忘了同步管线」的类型——
+        // 由本测试当场抓住，而不是等到实机看见乱码。
+        assert_eq!(std::mem::size_of::<Vertex>(), 24);
     }
 
     #[test]

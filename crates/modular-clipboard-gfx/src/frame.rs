@@ -57,7 +57,9 @@ use ash::vk::Handle;
 use ash::{Device, khr, vk};
 use std::time::Instant;
 
-use crate::pipeline::{BINDING_SAMPLER, BINDING_TEXTURE, BINDING_UNIFORM};
+use crate::pipeline::{
+    BINDING_SAMPLER, BINDING_TEXTURE, BINDING_UNIFORM, BINDING_USER_TEXTURE,
+};
 use crate::{Gpu, Swapchain, image_barrier};
 
 // staging 内存的分配与退休已独立成模块，但调用方（含 `texture.rs` 与各
@@ -809,6 +811,41 @@ impl<'a> FrameRenderer<'a> {
                 .image_info(std::slice::from_ref(&info)),
         ];
         unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
+        Ok(())
+    }
+
+    /// 把**用户纹理**（图片缩略图）绑到该槽位的 `BINDING_USER_TEXTURE`。
+    ///
+    /// # 为什么单独一个方法
+    ///
+    /// 字体图集（`BINDING_TEXTURE`）是单通道覆盖率图，
+    /// 缩略图（`BINDING_USER_TEXTURE`）是 RGBA 彩色图——
+    /// 片元着色器对两者的合成方式不同，必须各占一个绑定。
+    ///
+    /// 绑定集合数量是有限的：着色器里 `user_tex` 只有一张，
+    /// 所以**同一时刻只能显示一张用户纹理**。若要显示多张缩略图，
+    /// 需要按纹理分批（每批绑不同纹理）——那是更大的改动，
+    /// 当前需求（详情区单张大图）不需要。
+    pub fn update_user_texture_binding(
+        &self,
+        slot: usize,
+        sampler: vk::Sampler,
+        image_view: vk::ImageView,
+        layout: vk::ImageLayout,
+    ) -> anyhow::Result<()> {
+        let set = self.descriptor_set(slot)?;
+        let info = vk::DescriptorImageInfo {
+            sampler,
+            image_view,
+            image_layout: layout,
+        };
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(BINDING_USER_TEXTURE)
+            .descriptor_count(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&info));
+        unsafe { self.gpu.device.update_descriptor_sets(&[write], &[]) };
         Ok(())
     }
 

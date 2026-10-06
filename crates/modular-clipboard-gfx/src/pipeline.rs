@@ -15,6 +15,10 @@ pub const BINDING_UNIFORM: u32 = 0;
 pub const BINDING_SAMPLER: u32 = 1;
 /// 字体图集纹理的绑定槽。
 pub const BINDING_TEXTURE: u32 = 2;
+/// 用户纹理（图片缩略图）。与 `BINDING_TEXTURE`（字体图集）分开的理由：
+/// 字体图集是单通道覆盖率图，缩略图是 RGBA 彩色图，
+/// 片元着色器对两者的合成方式不同。
+pub const BINDING_USER_TEXTURE: u32 = 3;
 
 /// 顶点属性位置。
 mod location {
@@ -24,6 +28,8 @@ mod location {
     pub const UV: u32 = 1;
     /// 顶点色（u32，打包为 ABGR）
     pub const COLOR: u32 = 2;
+    /// 纹理索引（u32）：0 = 字体图集，1 = 用户纹理（缩略图）
+    pub const TEX_ID: u32 = 3;
 }
 
 /// uniform 数据布局。
@@ -207,6 +213,13 @@ impl DescriptorLayout {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // 用户纹理：图片缩略图。与字体图集分绑的原因见常量注释。
+            // 顶点的 `tex_id`（0/1）在片元着色器里分支选择采样哪张。
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_USER_TEXTURE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
 
         // 标志数组与 bindings 一一对应，长度必须相同（由构造器按切片长度设置）。
@@ -287,7 +300,8 @@ impl GraphicsPipeline {
         shader: &ShaderModule,
     ) -> anyhow::Result<Self> {
         // 单一顶点缓冲，交错布局
-        let stride = (2 * 4 + 2 * 4 + 4) as u32;
+        // pos(8) + uv(8) + color(4) + tex_id(4) = 24 字节
+        let stride = (2 * 4 + 2 * 4 + 4 + 4) as u32;
         let binding = vk::VertexInputBindingDescription::default()
             .binding(0)
             .stride(stride)
@@ -309,6 +323,13 @@ impl GraphicsPipeline {
                 .binding(0)
                 .format(vk::Format::R32_UINT)
                 .offset(16),
+            //纹理索引。放在顶点里而非「按纹理分批」，
+            //这样一次 draw 内可混字体与缩略图图元，批次数不增。
+            vk::VertexInputAttributeDescription::default()
+                .location(location::TEX_ID)
+                .binding(0)
+                .format(vk::Format::R32_UINT)
+                .offset(20),
         ];
 
         let bindings = [binding];
@@ -451,11 +472,18 @@ mod tests {
 
     #[test]
     fn vertex_stride_matches_attribute_offsets() {
-        // pos(8) + uv(8) + color(4) = 20 字节
-        let stride = 2 * 4 + 2 * 4 + 4;
-        assert_eq!(stride, 20);
-        // 最后一个属性必须落在步长之内
-        assert!(16 + 4 <= stride);
+        // 步长必须等于 `Vertex` 的真实字节数。
+        //
+        // 早前这里硬编码 `20`，与 `GraphicsPipeline::new` 里的步长各自
+        // 维护一份。加 `tex_id` 字段时只改了后者，这个测试**仍然通过**
+        // （它验证的是自己算的 20，不是实际步长）—— 正是它本该防住的漂移。
+        let real = std::mem::size_of::<crate::buffer::Vertex>();
+        assert_eq!(
+            real, 24,
+            "Vertex 现在是 pos(8)+uv(8)+color(4)+tex_id(4)"
+        );
+        // 最后一个属性（tex_id @ offset 20，占 4 字节）必须落在步长之内
+        assert!(20 + 4 <= real);
     }
 
     #[test]

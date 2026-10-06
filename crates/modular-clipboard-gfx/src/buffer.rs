@@ -473,7 +473,7 @@ impl Drop for BufferGuard<'_> {
 /// 顶点缓冲。内部委托给 [`Buffer`]。
 ///
 /// 数据布局与 `pipeline.rs` 中声明的顶点输入一致：
-/// `pos: vec2<f32>` + `uv: vec2<f32>` + `color: u32`，共 20 字节。
+/// `pos: vec2<f32>` + `uv: vec2<f32>` + `color: u32` + `tex_id: u32`，共 24 字节。
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Vertex {
@@ -483,6 +483,22 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// 顶点色，打包为 ABGR 小端序的 `u32`。
     pub color: u32,
+    /// 采样哪张纹理：`0` = 字体图集，`1` = 用户纹理（图片缩略图）。
+    ///
+    /// # 为什么用顶点属性而不是「按纹理分批」
+    ///
+    /// 早先只有字体图集一张纹理，纹理选择是硬编码在着色器里的。
+    /// 引入缩略图后一次绘制里会出现两种纹理。两种方案：
+    ///
+    /// - **按纹理分批**（`DrawBatch` 带描述符集，绑定移进批次循环）：
+    ///   需改 `frame.rs` 三处，且批次数随缩略图数量增长。
+    /// - **本方案**（顶点携带 `tex_id`）：批内可混两种纹理，
+    ///   批次数不增反减，`frame.rs` 只需把描述符池计数从
+    ///   `count` 改成 `count * 2`（一处）。
+    ///
+    /// 代价是顶点从 20 字节涨到 24 字节（`pos` 8 + `uv` 8 +
+    /// `color` 4 + `tex_id` 4，无 padding，4 字节对齐正好）。
+    pub tex_id: u32,
 }
 
 /// 顶点步长（字节）。
