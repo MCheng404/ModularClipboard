@@ -76,6 +76,9 @@ pub struct Service {
     capture: Option<CaptureHandle>,
     /// 最近一次自写剪贴板的时刻（Unix 毫秒，0 表示从未写过）。
     last_self_write: Arc<AtomicU64>,
+    /// 当前 `capture.enabled` 是否为命令行临时覆盖（如 `--no-capture`）。
+    /// 保存配置时会被还原，避免永久改写用户的监听开关。
+    capture_override: bool,
 }
 
 impl Service {
@@ -125,6 +128,7 @@ impl Service {
             rx: Some(rx),
             capture: None,
             last_self_write: Arc::new(AtomicU64::new(0)),
+            capture_override: false,
         })
     }
 
@@ -463,12 +467,43 @@ impl Service {
     }
 
     /// 保存配置到磁盘。
+    /// 保存配置到磁盘。
+    ///
+    /// # `--no-capture` 覆盖必须跳过
+    ///
+    /// 命令行 `--no-capture` 会把 `capture.enabled` 置 false
+    /// 以便调试时不动真实剪贴板。但这个覆盖是**临时**的——
+    /// 若被写进 config.json，用户下次启动监听就是关的，
+    /// **且没有任何提示**（这会静默破坏产品的核心功能）。
+    ///
+    /// 故用 [`Self::set_capture_override`] 标记的临时值
+    /// 在保存时还原为磁盘上的真实配置。
     pub fn save_config(&mut self) -> Result<()> {
         if let Some(path) = config_path() {
+            // 临时覆盖不落盘：读回磁盘上的真实值。
+            let persisted = self
+                .capture_override
+                .then(|| std::fs::read_to_string(&path).ok())
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<Config>(&raw).ok());
+            if let Some(real) = persisted {
+                if real.capture.enabled != self.state.config.capture.enabled {
+                    tracing::info!(
+                        persisted = real.capture.enabled,
+                        "不把 --no-capture 临时覆盖写入 config.json"
+                    );
+                    self.state.config.capture.enabled = real.capture.enabled;
+                }
+            }
             self.state.config.save(&path)?;
             self.store.apply_config(&self.state.config);
         }
         Ok(())
+    }
+
+    /// 标记当前 `capture.enabled` 是命令行临时覆盖，保存配置时应跳过。
+    pub fn set_capture_override(&mut self, is_override: bool) {
+        self.capture_override = is_override;
     }
 
     /// 在状态栏显示一条消息，3 秒后过期。

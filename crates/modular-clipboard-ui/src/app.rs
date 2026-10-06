@@ -61,6 +61,19 @@ const TRAY_TOOLTIP: &str = "模块化剪切板 — 正在后台记录剪贴板";
 
 /// 启动图形界面。`config` 为初始配置。
 pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
+    run_with_capture_override(config, false)
+}
+
+/// 同[`run`]，但显式声明 `config.capture.enabled` 是否为命令行临时覆盖。
+///
+/// `--no-capture` 会把它置false 以便调试时不动真实剪贴板；
+/// 若这个临时值被 [``Service::save_config``] 写进config.json，
+/// 用户的剪贴板监听会**永久关闭**且无任何提示。
+/// 传 `true` 让它跳过落盘。
+pub fn run_with_capture_override(
+    config: modular_clipboard_core::Config,
+    capture_is_override: bool,
+) -> anyhow::Result<()> {
     // `Window::new` 的宽高是**物理像素**，而配置里存的是逻辑点。
     // DPI 缩放在窗口创建后才可查，因此先按 1.0 换算——创建后第一帧的
     // `Resized` 事件（或帧循环里的尺寸兜底检查）会把交换链纠正到真实尺寸。
@@ -144,7 +157,7 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
     tracing::info!(extent = ?fr.extent(), slots = fr.slot_count(), "渲染器就绪");
 
     // ---- egui -----------------------------------------------------------
-    let mut app = App::new(config);
+    let mut app = App::new(config, capture_is_override);
     let ctx = app.ctx.clone();
 
     // ---- 托盘常驻--------------------------------------------------------
@@ -407,7 +420,10 @@ pub struct App {
 
 impl App {
     /// 按配置初始化业务状态与视觉风格。
-    pub fn new(config: modular_clipboard_core::Config) -> Self {
+    pub fn new(
+        config: modular_clipboard_core::Config,
+        capture_is_override: bool,
+    ) -> Self {
         let ctx = egui::Context::default();
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
 
@@ -419,6 +435,10 @@ impl App {
                 Service::in_memory()
             }
         };
+        // 标记 `--no-capture` 这类临时覆盖，使 save_config 跳过落盘——
+        // 否则退出时会把 false 写进用户的 config.json，
+        // 让剪贴板监听**永久关闭**且无任何提示。
+        svc.set_capture_override(capture_is_override);
 
         // 载入界面偏好。未指定时跟随系统（Windows 上取深色，
         // 与旧 eframe 默认一致）。

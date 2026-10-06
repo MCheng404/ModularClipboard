@@ -119,7 +119,7 @@ fn run_app(args: Args) {
     // 早前它被解析后从未使用——`app.rs` 无条件调`start_capture()`，
     // 于是加这个 flag 完全没有效果。现在通过 config 传递。
     if args.no_capture && config.capture.enabled {
-        tracing::warn!("--no-capture 已启用：本次运行不监听剪贴板");
+        tracing::warn!("--no-capture 已启用：本次运行不监听剪贴板（不影响持久配置）");
         config.capture.enabled = false;
     }
     tracing::info!(
@@ -128,7 +128,9 @@ fn run_app(args: Args) {
         "ModularClipboard 启动"
     );
 
-    if let Err(e) = modular_clipboard_ui::run(config) {
+    if let Err(e) =
+        modular_clipboard_ui::run_with_capture_override(config, args.no_capture)
+    {
         tracing::error!(%e, "启动失败");
         eprintln!("启动失败: {e}");
         std::process::exit(1);
