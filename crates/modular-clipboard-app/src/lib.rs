@@ -141,6 +141,18 @@ impl Service {
     /// 用户以为不会记录剪贴板，实际照常记录。
     /// 检查放在这里而非调用方，是因为本方法是唯一的启动入口，
     /// 放这里才能保证任何调用者都绕不过去。
+    /// 剪贴板监听当前是否在运行。
+    ///
+    /// 两个用途：
+    /// - 测试判定「`capture.enabled=false` 时确实没启动监听」——
+    ///   否则只能间接观察，测试会写得脆弱
+    /// - 托盘集成判断「窗口隐藏后后台是否还在记录」——
+    ///   隐藏态必须继续 pump，否则「看不见 = 停止记录」，
+    ///   与后台常驻的初衷相反
+    pub fn is_capturing(&self) -> bool {
+        self.capture.is_some()
+    }
+
     pub fn start_capture(&mut self) {
         if self.capture.is_some() {
             return;

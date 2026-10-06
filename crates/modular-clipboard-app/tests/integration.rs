@@ -323,19 +323,22 @@ fn pump_without_capture_is_harmless() {
 /// 结果用户以为不会记录剪贴板，实际照常记录。
 #[test]
 fn disabled_capture_never_starts_listener() {
+    // 正向：启用时 start_capture 确实会启动监听
+    let mut on = svc();
+    on.start_capture();
+    assert!(on.is_capturing(), "enabled=true 时应启动监听");
+
+    // 反向：禁用时**不**启动——这是 `--no-capture` 曾经失效的根因
     let mut s = svc();
     s.state.config.capture.enabled = false;
     s.start_capture();
-
-    // 若start_capture 忽略了 enabled，capture 句柄会被创建。
-    // 这里验证「禁用时不会创建」——用公开可见的副作用判断：
-    // 启用时 start_capture 会启动后台线程并push 事件通道；
-    // 禁用时不该有这些。用 pump 的行为差异做间接但可靠的判定。
     assert!(
-        s.pump(),
-        "禁用捕获时 pump 仍应正常工作（只是无新事件）"
+        !s.is_capturing(),
+        "capture.enabled=false 时不应启动监听（--no-capture 曾经完全失效）"
     );
-    // 记录一条，确认 Service 本身仍可用（测试的是「不启动监听」而非「不能用」）
-    assert!(s.ingest(text_payload("仍可手动记录", "test")));
-    assert_eq!(s.state.items.len(), 1);
+
+    // 不再断言「仍可手动记录」——`ingest` 自身也检查
+    // `capture.enabled`（`lib.rs:271`），禁用时返回 false 是**正确行为**。
+    // 我最初把它当「Service 是否可用」的探针，那是误判：
+    // 该路径的语义本就是「禁用时不接受任何来源的条目」。
 }
