@@ -16,6 +16,7 @@
 use std::ffi::CString;
 
 pub mod buffer;
+pub mod chrome;
 pub mod frame;
 pub mod pipeline;
 pub mod shader;

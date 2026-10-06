@@ -34,6 +34,22 @@
 //! [`EventLoop::poll`] → [`EventLoop::egui_input`] → 渲染。顺序不能换：
 //! `egui_input` 读的是 `poll` 填好的事件缓冲。
 //!
+//! ## 无边框窗口
+//!
+//! 窗口样式是 `WS_POPUP | WS_SYSMENU`：没有系统标题栏，也没有 resize 边框，
+//! 外观完全由 egui 自绘。但**丢掉了 `WS_THICKFRAME` 就等于丢掉系统的
+//! resize 与窗口移动能力**，所以两者在 [`chrome`] 里补回来：
+//!
+//! - `WM_NCHITTEST` 里手动判定边缘与拖动区，返回 `HTLEFT`/`HTCAPTION` 等；
+//! - 系统随即把按下转成 `WM_NCLBUTTONDOWN`，由 `DefWindowProcW`
+//!   进入**原生**的缩放 / 移动循环。
+//!
+//! 命中测试必须在窗口过程里做，不能在 [`EventLoop::poll`] 里做——
+//! 详见 [`chrome`] 模块文档。
+//!
+//! 圆角（Win11 `DWMWCP_ROUND`）与「去掉系统描边」在 [`Window::new`] 里
+//! 一并设置，Win10 上失败只记debug，不影响启动。
+//!
 //! ## 已知缺口
 //!
 //! - **IME 候选窗未接入**。`WM_IME_CHAR` 已处理（简单 IME 可用），
@@ -43,7 +59,9 @@
 //! - **剪贴板快捷键不在此处理**。`Ctrl+C/V/X` 的实际读写由
 //!   `modular-clipboard-capture` 负责，egui 侧的 `Event::Copy/Cut/Paste` 由调用方
 //!   从剪贴板层构造。本模块只产出 `Key` 与 `TextInput`。
-//! - **自绘标题栏未实现**，窗口带系统标题栏（`WS_OVERLAPPEDWINDOW`）。
+//! - **最大化后无边框窗口会盖住任务栏**。`WS_POPUP` 没有 `WS_CAPTION`，
+//!   `WM_NCCALCSIZE` 不会被系统裁到工作区内。剪贴板面板默认不最大化，
+//!   真要最大化需要上层自行把窗口 rect 压到工作区。
 
 use std::time::{Duration, Instant};
 
@@ -67,16 +85,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetCursorPos, GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW,
-    QS_ALLINPUT, RegisterClassExW, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW,
+    SIZE_MINIMIZED, SIZE_RESTORED, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
     WM_SYSCOMMAND,
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DPICHANGED, WM_IME_CHAR, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_POPUP, WS_SYSMENU,
 };
 use windows::core::{HSTRING, PCWSTR};
+
+use crate::chrome;
 
 /// `SC_CLOSE` 命令号（`WM_SYSCOMMAND` 的 wParam 低 4 位是来源标识）。
 ///
@@ -143,6 +163,15 @@ pub enum WindowEvent {
 
     /// DPI 缩放比例变化，`scale_factor = dpi / 96`。
     ScaleFactorChanged(f64),
+
+    /// 窗口被最小化 / 从最小化恢复。
+    ///
+    /// 无边框窗口没有系统标题栏，最小化后**界面上什么都不会变**，
+    /// 只靠本事件切到「已最小化」样式（通常是提示去点托盘）。
+    ///
+    /// 最小化期间客户区尺寸为 0，此时也会收到
+    /// [`WindowEvent::Resized`] `{ width: 0, height: 0 }`。
+    Minimized(bool),
 
     /// 鼠标移动。
     MouseMoved {
@@ -223,28 +252,30 @@ impl Window {
         let title_hs = HSTRING::from(title);
         let title_p = PCWSTR(title_hs.as_ptr());
 
-        // AdjustWindowRectEx 把客户区尺寸换算为整体窗口尺寸。
-        // 不调的话 width/height 会把标题栏和边框算进客户区，
-        // 窗口会比预期小一圈。
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: clamp_i32(width),
-            bottom: clamp_i32(height),
-        };
-        unsafe { AdjustWindowRectEx(&mut rect, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0)) }
-            .context("AdjustWindowRectEx 失败")?;
+        // 无边框窗口：`WS_POPUP` 的**客户区 == 窗口区**，没有标题栏与边框
+        // 需要扣除。因此 `AdjustWindowRectEx` 不再需要——它按
+        // `WS_OVERLAPPEDWINDOW` 计算，会额外加上标题栏高度，
+        // 让窗口比预期大一圈。
+        //
+        // `WS_SYSMENU` 保留：它不带任何可见装饰，但让Alt+Space 系统菜单
+        // 与 `WM_SYSCOMMAND` 的最小化/还原路径继续可用（`presence.rs`
+        // 的唤起逻辑依赖 `SW_RESTORE`）。
+        //
+        // **刻意不加 `WS_THICKFRAME`**：加了系统会自己画 resize 边框，
+        // 与自绘外观冲突；不加则必须自己在 `WM_NCHITTEST` 里补回
+        // resize 能力，见 [`chrome`]。
+        let style = WS_POPUP | WS_SYSMENU;
 
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 class_p,
                 title_p,
-                WS_OVERLAPPEDWINDOW,
+                style,
                 120,
                 120,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
+                clamp_i32(width),
+                clamp_i32(height),
                 None,
                 None,
                 Some(hinstance.into()),
@@ -255,6 +286,11 @@ impl Window {
 
         // BOOL 是 Copy 且非 must_use，显式丢弃以表明「返回值不关心」
         let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+
+        // 圆角 + 去系统描边。Win10 上失败只记debug，不影响启动。
+        chrome::apply_rounded_corners(hwnd);
+        // 给一个默认的 resize 边缘；上层可用`set_resize_border` 覆盖。
+        chrome::set_resize_border(chrome::DEFAULT_RESIZE_BORDER);
 
         Ok(Self { hwnd, hinstance })
     }
@@ -291,6 +327,27 @@ impl Window {
     /// 缩放比例，`dpi / 96`。`1.0` 为 100%。
     pub fn scale_factor(&self) -> f32 {
         dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) })
+    }
+
+    /// 设置自绘标题栏（窗口拖动区）的位置，单位**逻辑点**、客户区坐标系。
+    ///
+    /// 拖动区内的按下会被系统接管成「移动窗口」，egui 收不到该次按下。
+    /// 因此上层**必须把关闭 / 最小化等按钮画在拖动区之外**，
+    /// 或每帧把拖动区设成「标题栏减去按钮」的矩形。
+    ///
+    /// 每帧调一次即可（内部只写 4 个原子量，无系统调用）。
+    /// 传 `None` 关闭拖动区。
+    ///
+    /// 见 [`chrome::set_drag_region`]。
+    pub fn set_drag_region(&self, rect: Option<Rect>) {
+        chrome::set_drag_region(rect);
+    }
+
+    /// 设置边缘 resize 区宽度，单位**逻辑点**。`<= 0` 禁用 resize。
+    ///
+    /// 见 [`chrome::set_resize_border`]。
+    pub fn set_resize_border(&self, points: f32) {
+        chrome::set_resize_border(points);
     }
 
     /// 主动销毁窗口。
@@ -349,16 +406,26 @@ fn register_class(hinstance: HINSTANCE, class_p: PCWSTR) -> anyhow::Result<()> {
     }
 }
 
-/// 空壳窗口过程。只转发，不做任何处理。
+/// 窗口过程。
+///
+/// 只做一件事：把 non-client 消息（目前仅 `WM_NCHITTEST`）交给
+/// [`chrome::handle_non_client`]，其余**原样转发** `DefWindowProcW`。
+///
+/// # 转发路径必须保持默认
 ///
 /// 绝不能在这里对消息做偏移或改写——`CreateWindowExW` 在注册阶段会校验
 /// 该函数地址，加偏移会导致 `0x8007007E`（MEMORY.md 第 26 条）。
+/// `WM_NCHITTEST` 也不能挪到 [`EventLoop::poll`] 里处理：
+/// 它的语义**由窗口过程的返回值决定**，被 `poll` 取走就丢了。
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if let Some(r) = unsafe { chrome::handle_non_client(hwnd, msg, wparam, lparam) } {
+        return r;
+    }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
@@ -560,6 +627,16 @@ impl EventLoop {
 
         match msg.message {
             WM_SIZE => {
+                // wParam 携带状态变化原因：最小化/ 最大化 / 还原。
+                // 无边框窗口没有系统标题栏，最小化后界面上毫无变化，
+                // 上层只能靠这个事件切到「已最小化」样式。
+                match msg.wParam.0 as u32 {
+                    SIZE_MINIMIZED => out.push(WindowEvent::Minimized(true)),
+                    SIZE_RESTORED => out.push(WindowEvent::Minimized(false)),
+                    // SIZE_MAXIMIZED 与本项目无关（无边框窗口盖任务栏，
+                    // 见模块文档的已知缺口），不发事件。
+                    _ => {}
+                }
                 let (w_px, h_px) = unpack_size(msg.lParam.0);
                 // WM_SIZE 给的是物理像素，egui 要逻辑点。
                 let w = w_px / scale;
@@ -788,9 +865,11 @@ impl EventLoop {
                 WindowEvent::Focused(b) => {
                     out.push(EguiEvent::WindowFocused(*b));
                 }
-                // 尺寸与缩放通过 screen_rect 表达；关闭是应用层语义。
+                // 尺寸与缩放通过 screen_rect 表达；关闭是应用层语义；
+                // 最小化同理——客户区已是 0×0，`screen_rect` 会自动塌成空。
                 WindowEvent::Resized { .. }
                 | WindowEvent::ScaleFactorChanged(_)
+                | WindowEvent::Minimized(_)
                 | WindowEvent::CloseRequested => {}
             }
         }

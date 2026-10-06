@@ -27,6 +27,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     # DPI 感知：SetProcessDpiAwarenessContext
     "Win32_UI_HiDpi",
+    # chrome.rs 的 Win11 圆角：DwmSetWindowAttribute
+    # （在 windows 0.62 里它只依赖 Win32_Graphics，是纯增量，不会
+    #   因为 feature 交集问题影响其它 crate）
+    "Win32_Graphics_Dwm",
 ] }
 
 [[example]]
