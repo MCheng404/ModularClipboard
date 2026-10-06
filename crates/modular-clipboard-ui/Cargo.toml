@@ -18,6 +18,11 @@ egui = { workspace = true }
 # 缩略图解码。已在 workspace 中声明（store / app 也在用），此处只复用，
 # 不引入新的依赖来源。
 image = { workspace = true }
+# layout.rs 的布局状态要落进 config.json，因此自身可序列化。
+# workspace 已统一声明版本（见根 Cargo.toml），此处只复用。
+serde = { workspace = true }
+# 布局持久化往返测试用；生产路径由 app 层的 save_config 写盘。
+serde_json = { workspace = true }
 # 与渲染桥直接交互的句柄类型；顶点数据用 bytemuck 投递给缓冲。
 ash = { workspace = true }
 bytemuck = { workspace = true }

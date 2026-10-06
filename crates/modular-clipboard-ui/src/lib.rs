@@ -21,13 +21,17 @@
 
 pub mod app;
 pub mod icons;
+pub mod layout;
+pub mod panels;
 pub mod presence;
 pub mod renderer;
 pub mod theme;
 pub mod thumbnail;
+pub mod titlebar;
 pub mod view;
 
 pub use app::{run, run_with_capture_override, run_with_options, App};
+pub use layout::{LayoutState, Panel};
 pub use presence::Resident;
 pub use view::UiLocal;
 
