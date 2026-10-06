@@ -258,6 +258,13 @@ fn run() -> anyhow::Result<()> {
     println!("OK readback buffer（{tex_bytes} 字节，主机可见）");
     alive(&gpu, "创建 readback 后");
 
+    // 密集上传模式：确定性触发「已写入块需扩容」路径。
+    // 见 plan_patches_dense 的说明（用于定向复现 0.7% 偶发）。
+    let dense_uploads = std::env::var_os("UPLOAD_PROBE_DENSE").is_some();
+    if dense_uploads {
+        println!("   [模式] 密集上传：每帧恰好 2 次，强制走need_new 分支");
+    }
+
     // CPU 侧影子缓冲：记录「GPU 上应该是什么样」。最终逐字节比对。
     let mut shadow = vec![0u8; (TEX * TEX) as usize];
     alive(&gpu, "进入帧循环前");
@@ -286,7 +293,12 @@ fn run() -> anyhow::Result<()> {
         };
 
         // 本帧的上传计划：位置与尺寸都随帧号变化。
-        let plan = plan_patches(done, TEX);
+        // `UPLOAD_PROBE_DENSE=1` 换成确定性密集模式（见 plan_patches_dense）。
+        let plan = if dense_uploads {
+            plan_patches_dense(done, TEX)
+        } else {
+            plan_patches(done, TEX)
+        };
         let mut pending_data = Vec::with_capacity(plan.len());
         for (slot_in_frame, &(x, y, w, h)) in plan.iter().enumerate() {
             let data = make_pattern(done, slot_in_frame as u32, w, h);
@@ -827,6 +839,36 @@ impl Lcg {
 /// 其余帧是 1~3 块随机位置/随机尺寸的局部更新，且**强制轮流贴住
 /// 四条边**——边界处的 `image_offset + image_extent` 越界是最容易
 /// 被忽略的地方，只测中心区域永远测不到。
+/// 密集上传计划：**确定性**地撑满 staging 块，强制走「已写入块需扩容」路径。
+///
+/// # 为什么需要它
+///
+/// 随机上传（`plan_patches`）只有**恰好**在同帧内把块剩余空间撑到不足时
+/// 才会触发 `need_new` 分支，而帧 0 是整图上传、其余帧是 8..=96 的小块，
+/// 命中概率极低——实测 139 次里只中 1 次。
+///
+/// 这个模式把变量固定住：
+/// - **每帧恰好 2 次上传**（不是随机的 1~3 次）
+/// - 第 1 次：占掉块的大部分空间
+/// - 第 2 次：请求**大于剩余空间**的尺寸，必然触发 `need_new`
+///
+/// 此时 `used != 0`，`staging.rs:308` 会走「改用空闲块」分支——
+/// 也就是上一轮 use-after-free 的同一位置。
+///
+/// 若修复真的有效，这个模式应当**稳定通过**（走空闲块，正常返回）；
+/// 若仍会丢设备，就能立刻归因到这条路径。
+fn plan_patches_dense(frame: u32, tex: u32) -> Vec<(u32, u32, u32, u32)> {
+    // 第 1 次：约3/4 块（TEX=256 时 65536 字节的块→ 留1/4 余量）
+    let big = (tex * 3 / 4).max(8);
+    // 第 2 次：请求超过剩余空间的尺寸。
+    // MIN_STAGING_CAPACITY = 64 KiB = 65536；tex*tex 恰为 65536，
+    // 因此整图请求必然 > 任何已被占用的剩余空间。
+    let full = tex;
+    // 两块都贴左上角，第2 次完全覆盖第 1 次——像素校验仍能验证最终状态。
+    let _ = frame;
+    vec![(0, 0, big, big), (0, 0, full, full)]
+}
+
 fn plan_patches(frame: u32, tex: u32) -> Vec<(u32, u32, u32, u32)> {
     if frame == 0 {
         return vec![(0, 0, tex, tex)];

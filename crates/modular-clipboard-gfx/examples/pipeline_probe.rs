@@ -230,25 +230,23 @@ fn main() {
     unsafe { gpu.device.begin_command_buffer(cmd, &begin) }.expect("begin cmd");
 
     // 1) 交换链图像转 COLOR_ATTACHMENT_OPTIMAL
-    let mut barrier = modular_clipboard_gfx::image_barrier(
-        img,
-        vk::ImageLayout::UNDEFINED,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::AccessFlags::empty(),
-        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-    );
-    let b = std::slice::from_mut(&mut barrier);
+    //
+    // 用 `record_one_shot_image_barrier`（语义明确、声明为 unsafe），
+    // 而不是 crate 内部的裸 `image_barrier` —— 后者已设为 crate 私有，
+    // 因为绕过 `DeviceImage::transition_to` 会导致 `layout` 字段失同步。
     unsafe {
-        gpu.device.cmd_pipeline_barrier(
+        modular_clipboard_gfx::record_one_shot_image_barrier(
+            &gpu.device,
             cmd,
+            img,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags::empty(),
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            b,
-        )
-    };
+        );
+    }
 
     // 2) 开始渲染通道
     let clear = vk::ClearValue {
@@ -268,25 +266,19 @@ fn main() {
     unsafe { gpu.device.cmd_end_render_pass(cmd) };
 
     // 3) 图像转 PRESENT_SRC_KHR
-    let mut barrier2 = modular_clipboard_gfx::image_barrier(
-        img,
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::ImageLayout::PRESENT_SRC_KHR,
-        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        vk::AccessFlags::empty(),
-    );
-    let b2 = std::slice::from_mut(&mut barrier2);
     unsafe {
-        gpu.device.cmd_pipeline_barrier(
+        modular_clipboard_gfx::record_one_shot_image_barrier(
+            &gpu.device,
             cmd,
+            img,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::AccessFlags::empty(),
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            b2,
-        )
-    };
+        );
+    }
 
     unsafe { gpu.device.end_command_buffer(cmd) }.expect("end cmd");
     println!("OK command buffer recorded (barriers + render pass)");

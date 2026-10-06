@@ -530,8 +530,7 @@ impl<'a> FrameRenderer<'a> {
     /// 否则 [`Swapchain::new`] 建出的 framebuffer 与渲染通道不兼容。
     pub fn new(gpu: &'a Gpu, pipeline_bundle: PipelineBundle) -> anyhow::Result<Self> {
         // 自行建一套 Entry/SurfaceLoader：Gpu 的 surface_caps 是启动时快照，
-        // 重建交换链必须重新查询。Entry::load 只是再取一次已加载的
-        // vulkan-1.dll 的函数地址，开销可忽略。
+        // 重建交换链必须重新查询。
         let entry = unsafe { ash::Entry::load()? };
         let surface_loader = khr::surface::Instance::new(&entry, &gpu.instance);
         let swapchain_loader = khr::swapchain::Device::new(&gpu.instance, &gpu.device);

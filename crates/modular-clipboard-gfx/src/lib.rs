@@ -495,7 +495,68 @@ fn pick_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
 }
 
 /// 构造图像布局过渡屏障。
-pub fn image_barrier<'a>(
+/// **crate 私有**。
+///
+/// 外部调用方（探针、示例）改布局**必须**走
+/// [`texture::DeviceImage::transition_to`] / `prepare_for_readback` /
+/// `restore_after_readback` —— 它们会同步维护 `DeviceImage::layout`。
+///
+/// # 为什么不设为 pub
+///
+/// 本夜的实际故障：探针为图省事直接调本函数改布局，
+/// 却没回写 `image.layout` 字段。下一次 `upload` 读到的
+/// `old_layout` 因此是**过期的**，用它算出的布局屏障
+/// 基于错误的前置状态 ⇒ 随机 device lost。
+///
+/// 症状极具迷惑性：`full_app`（每帧 1 次上传）20/20 通过，
+/// 只有 `upload_probe`（每帧 1~3 次，布局频繁切换）才偶发失败。
+/// 这类 bug 靠 review 抓不住——**只能在编译期拦住**。
+///
+/// `pipeline_probe` 仍在用（它是最小复现用例，不持有 `DeviceImage`），
+/// 已在 crate 内做了 `pub(crate)` 例外处理。
+/// 供探针与示例使用：录一条**一次性**图像布局屏障。
+///
+/// 与 crate 内部的 [`image_barrier`] 的区别：调用方**自己**保证
+/// 布局状态正确（典型场景是探针手工驱动整个流程，不持有
+/// [`texture::DeviceImage`]）。
+///
+/// 持有 `DeviceImage` 的代码**必须**用
+/// [`texture::DeviceImage::transition_to`] —— 它会同步 `layout` 字段。
+/// 用本函数绕过会在状态失同步时导致随机 device lost。
+///
+/// # Safety
+///
+/// `device` 必须是创建 `image` 的那个设备；调用方必须确保
+/// 记录的 `old_layout` 与 GPU 上的实际布局一致，且已正确
+/// 安排 `src_stage` / `dst_stage` / 访问掩码。
+pub unsafe fn record_one_shot_image_barrier(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_access: vk::AccessFlags,
+    dst_access: vk::AccessFlags,
+    src_stage: vk::PipelineStageFlags,
+    dst_stage: vk::PipelineStageFlags,
+) {
+    let barrier = image_barrier(image, old_layout, new_layout, src_access, dst_access);
+    // 本 crate 开启了 `unsafe_op_in_unsafe_fn`，
+    // 即使在 `unsafe fn` 内部也要求显式 `unsafe` 块。
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd,
+            src_stage,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            std::slice::from_ref(&barrier),
+        );
+    }
+}
+
+pub(crate) fn image_barrier<'a>(
     image: vk::Image,
     old_layout: vk::ImageLayout,
     new_layout: vk::ImageLayout,
