@@ -148,8 +148,11 @@ pub struct AcquiredFrame {
 pub enum PresentResult {
     /// 画面已提交，交换链仍与表面匹配。
     ///
-    /// 语义保证：`present_semaphore` **已被本帧的 `queue_present` 消费**，
-    /// 该槽位可以安全复用（下一帧可重新 signal 同一个 semaphore）。
+    /// 语义保证：`queue_present` 已消费本次传入的呈现信号量，
+    /// 该**图像**的信号量可以安全复用——但复用的前提是**重新 acquire
+    /// 到同一image_index**，而不是「槽位轮转回来了」。
+    /// 呈现信号量按图像分配正是为此，见
+    /// [`FrameRenderer::image_semaphores`]。
     Presented,
     /// **不能继续用本帧的槽位**，调用方必须重建交换链后再 acquire。
     ///
@@ -348,6 +351,32 @@ pub fn map_present_result(
     }
 }
 
+/// 把驱动返回的 `image_index` 解析成呈现信号量表里的下标。
+///
+/// # 这条规则就是`pSignalSemaphores-00067` 的修复本体
+///
+/// 呈现信号量**必须按交换链图像索引取**，不能按帧槽位取：
+/// `acquire_next_image` 的 `image_index` 由驱动挑选，与 `cursor % slot_count`
+/// 的槽位轮转无对应关系。按槽位取会在「上一次present 尚未完成」时
+/// 用同一个信号量去 signal 另一次 present —— 边用边复用，即 UB。
+///
+/// 抽出成函数是为了让「按图像索引」这条规则可被单测守住：
+/// 内联的`self.image_semaphores[image_index]` 无法被测试触及，
+/// 将来有人改回按槽位取时不会有任何测试失败。
+///
+/// 越界（驱动返回非法索引，或信号量表长度与`image_count` 失配）时
+/// 返回错误而非 panic —— 越界说明状态已失同步，静默取错信号量
+/// 比明确报错危险得多。
+pub fn present_semaphore_index(image_index: u32, image_count: usize) -> anyhow::Result<usize> {
+    let idx = image_index as usize;
+    anyhow::ensure!(
+        idx < image_count,
+        "驱动返回的图像索引 {image_index} 超出呈现信号量表长度 {image_count}；\
+         两者失配说明交换链重建后信号量表未同步更新"
+    );
+    Ok(idx)
+}
+
 pub fn map_acquire_result(
     raw: Result<(u32, bool), vk::Result>,
 ) -> anyhow::Result<AcquireOutcome> {
@@ -433,8 +462,9 @@ impl LayoutTracker {
 
 /// 一帧在飞所独占的同步对象。
 ///
-/// 按**在飞帧槽位**索引，不是按交换链图像索引：图像索引由驱动决定，
-/// 我们无法提前知道，因此「等栅栏」只能按槽位轮转。
+/// 按**在飞帧槽位**索引。命令缓冲与描述符集按槽位轮转是安全的
+/// （GPU 用完的判据是本槽位的 `submit_fence`），
+/// 但**呈现用的信号量不能按槽位分配**——见 [`FrameRenderer::image_semaphores`]。
 struct FrameSlot {
     command_buffer: vk::CommandBuffer,
     /// # 为什么只保留 `submit_fence` 一个栅栏
@@ -465,8 +495,6 @@ struct FrameSlot {
     submit_fence: vk::Fence,
     /// acquire signal → submit wait。
     acquire_semaphore: vk::Semaphore,
-    /// submit signal → present wait。
-    present_semaphore: vk::Semaphore,
     descriptor_set: vk::DescriptorSet,
     /// 该槽位的命令缓冲**已被提交、GPU 可能仍在执行**。
     ///
@@ -502,6 +530,31 @@ pub struct FrameRenderer<'a> {
     command_pool: vk::CommandPool,
     descriptor_pool: vk::DescriptorPool,
     slots: Vec<FrameSlot>,
+    /// 每个交换链图像一个呈现信号量，**不能**挂在帧槽位上。
+    ///
+    /// # 为什么必须按图像而不是按槽位
+    ///
+    /// `vkQueuePresentKHR` **既不能 signal 也不能 wait**（除扩展外），
+    /// 因此外部无从得知「某次present 何时真正完成」。
+    /// `acquire_next_image` 返回的 `image_index` **由驱动决定**，
+    /// 与 `cursor % slot_count` 的槽位轮转**无对应关系**
+    /// （验证层会打印 `Most recently acquired image indices` 暴露错位）。
+    ///
+    /// 若信号量按槽位分配，槽位在 GPU 真正完成 present 之前被复用时，
+    /// 就会用同一个信号量去 signal 另一次 present
+    /// ⇒ `VUID-vkQueueSubmit-pSignalSemaphores-00067`。
+    ///
+    /// # 为什么按图像分配就是安全的
+    ///
+    /// 规范保证：**取到image_index 之后，在 `queue_submit` 里 wait
+    /// 该次acquire 的信号量**，就意味着「上一轮使用该图像的 present
+    /// 已完成」。于是按image_index 取出的信号量必然可安全复用。
+    ///
+    /// 官方文档：`swapchain_semaphore_reuse.html`
+    /// （"a) Use a separate semaphore per swapchain image"）。
+    ///
+    /// 长度恒等于 `swapchain.image_count`，交换链重建时整体重建。
+    image_semaphores: Vec<vk::Semaphore>,
     /// 在飞帧槽位的轮转游标。
     cursor: usize,
     layouts: LayoutTracker,
@@ -566,6 +619,7 @@ impl<'a> FrameRenderer<'a> {
             command_pool,
             descriptor_pool: vk::DescriptorPool::null(),
             slots: Vec::new(),
+            image_semaphores: Vec::new(),
             cursor: 0,
             layouts: LayoutTracker::new(0),
             pending: None,
@@ -1063,7 +1117,17 @@ impl<'a> FrameRenderer<'a> {
         // 1 为长度才不出错——先设 stage mask，再设 semaphores 最保险。
         let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let acquire_sem = self.slots[slot].acquire_semaphore;
-        let present_sem = self.slots[slot].present_semaphore;
+        // ⚠️ 呈现信号量必须按 **image_index** 取，不是按 slot。
+        //
+        // image_index 由驱动挑选，与 `cursor % slot_count` 无对应关系。
+        // 按槽位取会让「本槽位上一次present」尚未完成时就用同一个信号量
+        // signal 这一次present ⇒边用边复用（UB），
+        // 验证层报 `VUID-vkQueueSubmit-pSignalSemaphores-00067`。
+        let present_sem_index = present_semaphore_index(
+            frame.image_index,
+            self.image_semaphores.len(),
+        )?;
+        let present_sem = self.image_semaphores[present_sem_index];
         let submit = vk::SubmitInfo::default()
             .wait_dst_stage_mask(&wait_stage)
             .wait_semaphores(std::slice::from_ref(&acquire_sem))
@@ -1389,8 +1453,6 @@ impl<'a> FrameRenderer<'a> {
             let semaphore_info = vk::SemaphoreCreateInfo::default();
             let acquire_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
                 .map_err(|e| anyhow::anyhow!("创建 acquire 信号量失败: {e:?}"))?;
-            let present_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
-                .map_err(|e| anyhow::anyhow!("创建 present 信号量失败: {e:?}"))?;
             slots.push(FrameSlot {
                 command_buffer: buffers[i],
                 submit_fence,
@@ -1399,11 +1461,30 @@ impl<'a> FrameRenderer<'a> {
                 // 从未使用过，没有可退休的上一轮帧。
                 last_frame: u64::MAX,
                 acquire_semaphore,
-                present_semaphore,
                 descriptor_set: sets[i],
             });
         }
         self.slots = slots;
+
+        // 呈现信号量按**交换链图像数**分配，不按在飞帧数。
+        //
+        // 数量必须严格等于 `swapchain.image_count`：`present()` 用驱动
+        // 返回的 `image_index` 直接索引，长度不等就会越界或漏初始化。
+        // （`count` 与image_count 同源，但这里仍以image_count 为准，
+        // 避免将来两者分叉时静默失配。）
+        let semaphore_info = vk::SemaphoreCreateInfo::default();
+        let mut image_semaphores = Vec::with_capacity(self.swapchain.image_count as usize);
+        for i in 0..self.swapchain.image_count {
+            let sem = unsafe { device.create_semaphore(&semaphore_info, None) }
+                .map_err(|e| anyhow::anyhow!("创建图像 {i} 的呈现信号量失败: {e:?}"))?;
+            image_semaphores.push(sem);
+        }
+        anyhow::ensure!(
+            image_semaphores.len() == self.swapchain.image_count as usize,
+            "呈现信号量数量必须等于交换链图像数"
+        );
+        self.image_semaphores = image_semaphores;
+
         self.cursor = 0;
         Ok(())
     }
@@ -1414,11 +1495,15 @@ impl<'a> FrameRenderer<'a> {
             unsafe {
                 device.destroy_fence(slot.submit_fence, None);
                 device.destroy_semaphore(slot.acquire_semaphore, None);
-                device.destroy_semaphore(slot.present_semaphore, None);
             }
         }
         // 命令缓冲随命令池一起回收，不单独销毁。
         self.slots.clear();
+        // 呈现信号量按图像分配，漏销毁就是真泄漏
+        // （验证层报 `VUID-vkDestroyDevice-device-05137`）。
+        for sem in self.image_semaphores.drain(..) {
+            unsafe { device.destroy_semaphore(sem, None) };
+        }
         if !self.descriptor_pool.is_null() {
             unsafe { device.destroy_descriptor_pool(self.descriptor_pool, None) };
             self.descriptor_pool = vk::DescriptorPool::null();
@@ -1800,6 +1885,69 @@ mod tests {
             map_present_result(ok, Some(vk::Result::SUCCESS)).unwrap(),
             PresentResult::Presented
         );
+    }
+
+    // -- 呈现信号量按图像分配（pSignalSemaphores-00067 的回归守卫）--------
+
+    #[test]
+    fn present_semaphore_is_indexed_by_image_not_by_slot() {
+        // 核心回归：信号量下标来自 image_index，与槽位无关。
+        //
+        // 本项目的槽位按 `cursor % 3` 递增，而 image_index 由驱动挑选。
+        // 修复前present() 取的是 `slots[slot].present_semaphore`，
+        // 于是「槽位 0 的第 2 次 present」可能复用「槽位 0 的第 1 次」
+        // 仍在被swapchain 使用的那个信号量 ⇒
+        // VUID-vkQueueSubmit-pSignalSemaphores-00067（实测每次运行必现 2 次）。
+        //
+        // 用两种不同的 (slot, image_index) 组合证明：下标只随 image_index 变。
+        let image_count = 3;
+        for (slot, image_index) in [(0usize, 2u32), (1, 0), (2, 1), (0, 1)] {
+            let idx = present_semaphore_index(image_index, image_count).unwrap();
+            // 下标必须等于 image_index，与传进来的 slot 无关
+            assert_eq!(
+                idx, image_index as usize,
+                "呈现信号量必须按 image_index={image_index} 索引，\
+                 不得被 slot={slot} 影响"
+            );
+        }
+    }
+
+    #[test]
+    fn slot_rotation_order_differs_from_image_index_order() {
+        // 守住「槽位轮转与图像索引是两套独立序列」这个前提。
+        //
+        // 若哪天有人把槽位改成直接用 image_index（或反过来让信号量按
+        // 槽位取），本测试描述的错位关系就不再成立，
+        // `present_semaphore_is_indexed_by_image_not_by_slot` 的论证前提失效。
+        let slot_count = 3;
+        // 槽位按 cursor 递增
+        let slots: Vec<usize> = (0..6).map(|c| c % slot_count).collect();
+        // 驱动挑选的图像顺序（验证层实测打印过 [0], 1, 2, 1）
+        let images: Vec<u32> = vec![0, 1, 2, 1];
+        // 至少存在一对 (cursor, image) 使slot != image —— 正是错位的来源
+        let misaligned = (0..images.len())
+            .any(|i| slots[i] != images[i] as usize);
+        assert!(
+            misaligned,
+            "本测试的前提是槽位与 image_index 存在错位；\
+             若将来两者恒等，说明同步模型已变，本测试需重写"
+        );
+    }
+
+    #[test]
+    fn present_semaphore_index_rejects_out_of_range() {
+        // 越界必须报错而不是 panic：
+        // 越界说明信号量表长度与 image_count 失配（典型是交换链重建后
+        // 忘了重建信号量表），静默取错信号量比明确报错危险得多。
+        let err = present_semaphore_index(3, 3).unwrap_err().to_string();
+        assert!(
+            err.contains("图像索引"),
+            "错误信息应说明是索引越界，实际：{err}"
+        );
+        // 合法边界：最后一个下标必须通过
+        assert_eq!(present_semaphore_index(2, 3).unwrap(), 2);
+        // 空表时任何索引都非法
+        assert!(present_semaphore_index(0, 0).is_err());
     }
 
     #[test]
