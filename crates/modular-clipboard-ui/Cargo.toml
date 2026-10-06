@@ -31,4 +31,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     # presence.rs：AttachThreadInput / GetCurrentThreadId
     "Win32_System_Threading",
+    # theme.rs：读 AppsUseLightTheme 以跟随系统主题。
+    # 必须显式声明——cargo feature 是**交集**，不能依赖
+    # modular-clipboard-platform 顺带开启（MEMORY.md 有记录）。
+    "Win32_System_Registry",
 ] }
