@@ -54,6 +54,10 @@ name = "window_probe"
 [[example]]
 name = "tray_probe"
 
+# 缩略图上屏验证（含 A/B 像素反证）
+[[example]]
+name = "thumb_probe"
+
 # 着色器在编译期由 naga 编译为 SPIR-V，不进最终二进制。
 # 这样无需 glslc / glslang 等 C++ 工具链，保持纯 Rust 构建链。
 [build-dependencies]
