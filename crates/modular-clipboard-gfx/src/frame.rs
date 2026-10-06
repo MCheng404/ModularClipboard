@@ -452,12 +452,6 @@ struct FrameSlot {
     /// [`FrameRenderer::fence_signaled`] 直接查驱动状态，
     /// 就不需要任何手工标志了。
     submit_fence: vk::Fence,
-    /// **只**交给 `acquire_next_image`。语义与 [`Self::submit_fence`] 对称。
-    ///
-    /// 实测中它从未被等待过——acquire 的等待由 `acquire_semaphore` 与
-    /// 槽位轮转天然保证。保留它是为了满足「信号量与 fence 至少给一个」
-    /// 的显式契约，并让两处 signal 来源在结构上就分开。
-    acquire_fence: vk::Fence,
     /// acquire signal → submit wait。
     acquire_semaphore: vk::Semaphore,
     /// submit signal → present wait。
@@ -847,13 +841,19 @@ impl<'a> FrameRenderer<'a> {
         // acquire_fence 复位到未 signal，好让下次 acquire 拿到干净状态。
         // （它由本次 acquire signal，槽位再次被复用前必须复位。）
         //
-        // **无条件**复位，不先查 `get_fence_status`：查状态再决定复位是
-        // 「凭状态猜测」—— 若查询本身出错，就会漏掉复位，让下一个
-        // `acquire_next_image` 拿到已 signal 的 fence。规范允许对未
-        // signal 的 fence 调用 reset（无副作用），所以直接复位更可靠。
+        // ⚠️ 必须**先确认已 signal 再复位**，不能无条件 reset。
+        // // VUID-vkResetFences-pFences-01123
+        // 「fence is in use」——该 fence 仍被在途的 `acquire_next_image`
+        // 关联时reset 它是违规的（60 帧下报 20 次）。
+        //
+        // 曾改成无条件 reset，理由是「查状态再决定是凭状态猜测」。
+        // 验证层证明：**那个判断不是猜测，而是规范要求的前置条件。**
+        // 教训：带语义依据的判断不能当冗余防御简化掉。
         {
             let af = self.slots[slot].acquire_fence;
-            unsafe { self.gpu.device.reset_fences(&[af])? };
+            if self.fence_signaled(af) {
+                unsafe { self.gpu.device.reset_fences(&[af])? };
+            }
         }
         self.staging.begin_frame();
 
