@@ -69,6 +69,27 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
         config.ui.window_width.max(1.0) as u32,
         config.ui.window_height.max(1.0) as u32,
     )?;
+    // ⚠️ `CreateWindowExW` 创建的窗口**默认不可见**，
+    // 必须显式 `ShowWindow` 才会出现在桌面上。
+    //
+    // 实测踩坑：早前这里从不调用它，窗口**从不显示**——
+    // 实机启动 `modular-clipboard.exe` 后 `MainWindowTitle` 为空，
+    // 用户只看到托盘图标，会以为程序没启动。
+    //
+    // `start_minimized` 配置项此前**从未被读取**（字段存在于
+    // `UiConfig` 但代码里grep 不到），现已接上。
+    // 必须显式显示窗口：`CreateWindowExW` 创建的窗口**默认不可见**。
+    //
+    // 实测踩坑：早前这里从不显示，窗口**从不出现**——
+    // 启动 `modular-clipboard.exe` 后 `MainWindowTitle` 为空，
+    // 用户只看到托盘图标，会以为程序没启动。
+    //
+    // 用 `presence::focus_window` 而非裸 ShowWindow：它已处理
+    // Windows 的前台窗口限制（`SetForegroundWindow` 失败时
+    // 走 `AttachThreadInput`），托盘点击唤起也需要它。
+    //
+    presence::focus_window(window.hwnd());
+
     let mut events = EventLoop::new(&window);
     tracing::info!(
         width = window.inner_size_physical().0,
