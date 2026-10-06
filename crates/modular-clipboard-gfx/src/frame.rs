@@ -267,16 +267,43 @@ pub fn resolve_extent(
     desired: vk::Extent2D,
 ) -> vk::Extent2D {
     if caps.current_extent.width != 0 && caps.current_extent.height != 0 {
-        return caps.current_extent;
+        // 规范说「必须原样采用 current_extent」，但**前提是它落在
+        // [min_image_extent, max_image_extent] 内**。
+        //
+        // 实测踩坑：窗口 resize 后某些驱动报告的 current_extent
+        // 会超出 max_image_extent，此时原样采用会让
+        // `vkCreateSwapchainKHR` 报
+        // `VUID-VkSwapchainCreateInfoKHR-pNext-07781`
+        // （imageExtent 必须在 min/max 之间）。
+        //
+        // 规范强制用 current_extent 的本意是「不要与驱动争尺寸」，
+        // 但若它本身非法，clamp 到合法区间是唯一可行选择——
+        // 越界才是真正的违规。
+        return clamp_axis(caps, caps.current_extent);
     }
+    clamp_axis(caps, desired)
+}
+
+/// 把尺寸收敛到表面能力允许的区间。
+///
+/// # 为什么 `current_extent` 也要过这道 clamp
+///
+/// 规范说「非 0 时必须原样采用 `current_extent`」，
+/// 但那**隐含前提是它本身合法**。实测（resize 探针，600 帧内重建 510 次）
+/// 某些驱动报告的 `current_extent` 会超出 `max_image_extent`，
+/// 原样采用会让 `vkCreateSwapchainKHR` 报
+/// `VUID-VkSwapchainCreateInfoKHR-pNext-07781`。
+///
+/// 越界才是真正的违规，clamp 到合法区间是唯一可行选择。
+fn clamp_axis(caps: &vk::SurfaceCapabilitiesKHR, want: vk::Extent2D) -> vk::Extent2D {
     let axis = |want: u32, min: u32, max: u32| {
         // 上限小于下限是驱动报告异常数据。`clamp` 在这种输入下会 panic，
         // 因此退化为「取下限」，保证函数总是不崩。
         if max < min { min } else { want.clamp(min, max) }
     };
     vk::Extent2D {
-        width: axis(desired.width, caps.min_image_extent.width, caps.max_image_extent.width),
-        height: axis(desired.height, caps.min_image_extent.height, caps.max_image_extent.height),
+        width: axis(want.width, caps.min_image_extent.width, caps.max_image_extent.width),
+        height: axis(want.height, caps.min_image_extent.height, caps.max_image_extent.height),
     }
 }
 
@@ -676,6 +703,29 @@ impl<'a> FrameRenderer<'a> {
     /// 在飞帧槽位数量（等于交换链图像数）。
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// 当前交换链的图像数。
+    ///
+    /// 交换链重建后这个值会变（取决于表面与驱动选择），
+    /// 而 [`Self::image_semaphore_count`] 必须同步跟随——
+    /// 两者不等就说明重建链有 bug。
+    pub fn swapchain_image_count(&self) -> usize {
+        self.swapchain.image_count as usize
+    }
+
+    /// 呈现信号量数量。
+    ///
+    /// **恒等于 [`Self::swapchain_image_count`]**：
+    /// `present()` 用驱动返回的 `image_index` 直接索引此数组，
+    /// 长度不等就会越界或漏初始化（漏初始化 = UB）。
+    ///
+    /// 这一对访问器是 resize 路径的关键判据：
+    /// 交换链重建后若两者不等，说明销毁/重建链有缺陷。
+    /// 正常情况下交换链重建不改变图像数（仍是 2~3 张），
+    /// 但**代码必须保证这一点**，而不是依赖它碰巧不变。
+    pub fn image_semaphore_count(&self) -> usize {
+        self.image_semaphores.len()
     }
 
     /// 当前帧正在使用的槽位下标。

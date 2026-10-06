@@ -17,6 +17,7 @@
 use std::time::Duration;
 
 use ash::vk;
+use windows::Win32::UI::WindowsAndMessaging::MoveWindow;
 use modular_clipboard_gfx::Gpu;
 use modular_clipboard_gfx::buffer::{Buffer, UniformBuffer, Vertex};
 use modular_clipboard_gfx::frame::{DrawInput, FrameRenderer, PipelineBundle, PresentResult};
@@ -157,6 +158,12 @@ fn run() -> anyhow::Result<()> {
     let mut batches: Vec<Batch> = Vec::new();
     let mut draw_batches: Vec<modular_clipboard_gfx::frame::DrawBatch> = Vec::new();
 
+    // 强制 resize 模式：验证交换链重建路径（默认关闭）
+    let resize_mode = std::env::var_os("FULL_APP_RESIZE").is_some();
+    if resize_mode {
+        println!("[resize] 强制 resize 模式已开启");
+    }
+
     let mut frame_no: u64 = 0;
     let mut rebuilds: u32 = 0;
     let mut texture_uploads: u64 = 0;
@@ -191,6 +198,46 @@ fn run() -> anyhow::Result<()> {
         }
         if !running {
             break;
+        }
+
+        // ---- 1.5 强制 resize（验证交换链重建路径）-------------------
+        //
+        // `full_app` 默认从不触发 resize（实测「交换链重建 0 次」），
+        // 于是 `rebuild_swapchain` 及其销毁链**从未被实机验证**。
+        // 设 `FULL_APP_RESIZE=1` 开启：每90 帧改一次窗口尺寸。
+        //
+        // 窗口移到屏幕外，避免抢用户焦点；但**不最小化**——
+        // 最小化会触发 `WM_SIZE` 把客户区压成 0×0
+        // （我今天栽过这个坑，会得到 50 个假违规）。
+        if resize_mode && frame_no > 0 && frame_no % 90 == 0 {
+            let phase = (frame_no / 90) % 4;
+            let (nw, nh) = match phase {
+                0 => (640, 480),
+                1 => (1200, 800),
+                2 => (800, 600),
+                _ => (W, H),
+            };
+            // 位置保持在桌面内（8,8）。
+            //
+            // 早前试过移到 -32000，结果验证层报
+            // VUID-VkSwapchainCreateInfoKHR-pNext-07781
+            // （imageExtent 超出 min/max 范围）——
+            // 那是因为  在 current_extent 非 0 时
+            // **原样采用**（规范要求如此），而窗口完全离开桌面时
+            // DWM 报告的 extent 不在表面能力范围内。
+            // 真实用户不会把窗口移出桌面，所以这是探针环境的产物。
+            unsafe {
+                MoveWindow(
+                    window.hwnd(),
+                    8,
+                    8,
+                    nw as i32,
+                    nh as i32,
+                    // 不重绘：避免额外的 WM_PAINT 干扰事件顺序
+                    false,
+                );
+            }
+            println!("[resize] 请求改为 {nw}x{nh}（桌面内，不抢焦点）");
         }
 
         // ---- 2. 跑 egui ----------------------------------------------
@@ -1050,7 +1097,7 @@ mod tests {
         let full = egui::Color32::from_rgb(200, 100, 40);
         let half = full.gamma_multiply(0.5);
         let got = unpremultiply(half.r(), half.g(), half.b(), half.a());
-        for (g, want) in got.into_iter().zip([200u8, 100, 40]) {
+        for (g, want) in [got.0, got.1, got.2].into_iter().zip([200u8, 100, 40]) {
             assert!(
                 (g as i32 - want as i32).abs() <= 2,
                 "反预乘误差过大：得到 {g}，期望约 {want}"
@@ -1164,7 +1211,11 @@ mod tests {
             clip_rect: rect_at(0.0),
             primitive: Primitive::Callback(egui::epaint::PaintCallback {
                 rect: rect_at(0.0),
-                callback: std::sync::Arc::new(|_| {}),
+                // PaintCallback 期望 `Arc<dyn Fn(&PaintCallbackInfo) + Send + Sync>`
+                // （epaint 0.36 里叫 PaintCallbackInfo，不是 PaintCallbackInput）
+                callback: std::sync::Arc::new(
+                    |_: &egui::epaint::PaintCallbackInfo| {},
+                ),
             }),
         };
         let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
