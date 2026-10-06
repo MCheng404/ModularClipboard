@@ -630,7 +630,7 @@ impl<'a> FrameRenderer<'a> {
 
         let caps = gpu.surface_caps;
         let extent = resolve_extent(&caps, FALLBACK_EXTENT);
-        let swapchain = Swapchain::new(gpu, extent.width, extent.height, pipeline_bundle.render_pass)?;
+        let swapchain = Swapchain::new(gpu, extent.width, extent.height, pipeline_bundle.render_pass, &caps)?;
 
         // 渲染通道是按某个格式建的。若交换链最终选中的格式不同，
         // framebuffer 与渲染通道不兼容——直接失败，别让驱动在运行时炸。
@@ -1362,7 +1362,7 @@ impl<'a> FrameRenderer<'a> {
         // 反序会留下悬空引用。
         self.swapchain.destroy(&self.gpu.device);
         self.swapchain =
-            Swapchain::new(self.gpu, extent.width, extent.height, self.bundle.render_pass)?;
+            Swapchain::new(self.gpu, extent.width, extent.height, self.bundle.render_pass, &caps)?;
         if self.swapchain.format != self.pipeline_format {
             anyhow::bail!("重建后交换链格式与渲染通道不一致");
         }

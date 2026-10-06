@@ -160,7 +160,13 @@ fn main() {
     println!("OK RenderPass (format={probe_format:?})");
 
     // 交换链（依赖渲染通道来创建 framebuffer）
-    let mut swapchain = match modular_clipboard_gfx::Swapchain::new(&gpu, W as u32, H as u32, rp.handle) {
+    let mut swapchain = match modular_clipboard_gfx::Swapchain::new(
+        &gpu,
+        W as u32,
+        H as u32,
+        rp.handle,
+        &gpu.surface_caps,
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("FAIL Swapchain::new: {e:#}");

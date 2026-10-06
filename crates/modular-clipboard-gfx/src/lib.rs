@@ -429,13 +429,27 @@ impl Swapchain {
     /// 为给定尺寸创建交换链。
     ///
     /// `render_pass` 需已创建——framebuffer 依赖它的附件描述。
+    /// `caps` 必须是**当前**的表面能力。
+    ///
+    /// # 为什么不能退回用 `gpu.surface_caps`
+    ///
+    /// `gpu.surface_caps` 是 `Gpu::new` 时的**快照**。
+    /// 窗口 resize 后某些驱动会改变 `min/max_image_extent`
+    /// （例如最小尺寸随窗口装饰、DPI 变化而调整）。
+    /// 用旧快照 clamp 会得到一个**按过期范围裁剪过的**尺寸，
+    /// `vkCreateSwapchainKHR` 于是报
+    /// `VUID-VkSwapchainCreateInfoKHR-pNext-07781`
+    /// （imageExtent 必须在**当前**的 min/max 之间）。
     pub fn new(
         gpu: &Gpu,
         width: u32,
         height: u32,
         render_pass: vk::RenderPass,
+        caps: &vk::SurfaceCapabilitiesKHR,
     ) -> anyhow::Result<Self> {
-        let caps = &gpu.surface_caps;
+        // 调用方（`resolve_extent`）已按 caps clamp 过，
+        // 这里再clamp 一次作为纵深防御——
+        // 用**传入的** caps，不是快照。
         let extent = vk::Extent2D {
             width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
             height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
