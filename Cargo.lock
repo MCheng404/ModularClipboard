@@ -782,6 +782,7 @@ dependencies = [
  "modular-clipboard-ui",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]
@@ -872,11 +873,14 @@ dependencies = [
  "ash",
  "bytemuck",
  "egui",
+ "image",
  "modular-clipboard-app",
  "modular-clipboard-core",
  "modular-clipboard-gfx",
+ "modular-clipboard-platform",
  "modular-clipboard-store",
  "tracing",
+ "windows",
 ]
 
 [[package]]

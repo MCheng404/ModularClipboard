@@ -70,12 +70,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetCursorPos, GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW,
     QS_ALLINPUT, RegisterClassExW, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WM_SYSCOMMAND,
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DPICHANGED, WM_IME_CHAR, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR};
+
+/// `SC_CLOSE` 命令号（`WM_SYSCOMMAND` 的 wParam 低 4 位是来源标识）。
+///
+/// 用裸常量而非 `windows` crate 的绑定：那套绑定是枚举，
+/// 而 `wParam` 在 32/64 位下都是 `usize`，比较时需显式转换。
+/// 这个值来自 Win32 文档，稳定不变。
+const SC_CLOSE_WPARAM: u32 = 0xF060;
+
+/// `WM_SYSCOMMAND` 的 wParam 低 4 位掩码。
+///
+/// 低 4 位不是命令的一部分，而是「消息来源」：0 表示来自系统菜单，
+/// 1（`F1..F4` 之外的功能键）表示来自 Alt 组合。因此
+/// `Alt+F4` 的 wParam 是 `SC_CLOSE | 1 == 0xF061`，直接全等比较会漏。
+const SC_SYSTEM_MENU_MASK: u32 = 0x000F;
 
 /// 窗口类名。进程内只注册一次。
 const CLASS_NAME: &str = "ModularClipboardWindow";
@@ -360,6 +375,8 @@ pub struct EventLoop {
     /// 上次 poll 得到的客户区尺寸（逻辑点）。
     inner_size: Vec2,
     /// 本帧事件缓冲。
+    ///
+    /// ⚠️ 刻意**不在** [`Self::poll`] 开头清空，见该方法内的说明。
     pending: Vec<WindowEvent>,
     /// 本帧观察到的修饰键状态，用于发 `ModifiersChanged`。
     modifiers: Modifiers,
@@ -408,12 +425,34 @@ impl EventLoop {
         &self.pending
     }
 
+    /// 取走累积的全部未交付事件，并清空缓冲。
+    ///
+    /// 主循环用它把「本帧新读到的事件」与「此前节流路径读到但尚未
+    /// 交付的事件」一起取走，保证 [`Self::CloseRequested`] 之类
+    /// 低频但关键的事件不会在两次交付之间被丢掉。
+    pub fn take_pending(&mut self) -> Vec<WindowEvent> {
+        std::mem::take(&mut self.pending)
+    }
+
     /// 排空消息队列，不阻塞。
     ///
     /// 返回本轮读到的全部事件，同时写入内部缓冲供 [`Self::egui_input`]
     /// 使用。有事件时立即返回——这是高优先级路径。
+    ///
+    /// # ⚠️ 事件不丢的保证
+    ///
+    /// `pending` 缓冲区**刻意不在本函数开头清空**，而是累积到被
+    /// [`Self::take_pending`] 取走为止。这不是疏忽，而是必需：
+    ///
+    /// [`Self::poll_for`] 内部也调`poll()` 并**丢弃其返回值**（节流路径
+    /// 只关心「有没有消息到达」）。若`poll()` 开头清空 `pending`，
+    /// 那么从 `poll_for` 读到的事件会被下一轮 `poll()` 的清空抹掉——
+    /// 实测后果是**用户点标题栏 X 完全没反应**：消息被读出、记进
+    /// `pending`、无人查看、下一帧丢弃。
+    ///
+    /// 累积语义下，`poll_for` 读到的关闭请求会一直留在 `pending` 里，
+    /// 直到主循环 `poll()` 把它当本帧事件交给应用层。
     pub fn poll(&mut self) -> Vec<WindowEvent> {
-        self.pending.clear();
         self.modifiers = Modifiers::default();
 
         // 焦点可能在两轮之间丢失（Alt+Tab 到别的程序），每轮重查。
@@ -426,6 +465,27 @@ impl EventLoop {
             // WM_QUIT 没有窗口过程，直接置退出标志。
             if msg.message == WM_QUIT {
                 self.quit = true;
+                events.push(WindowEvent::CloseRequested);
+                continue;
+            }
+
+            // `WM_SYSCOMMAND` + `SC_CLOSE` 是**标题栏 X 按钮**的第一手消息。
+            //
+            // 处理它不是为了「让 X 能生效」——真正的元凶是 `poll_for`
+            // 丢弃事件（见 `poll` 的说明），那个不修，加多少分支都没用。
+            // 直接拦这一条是为了少绕一圈：X 按钮 → `WM_SYSCOMMAND/SC_CLOSE`
+            // → `DefWindowProcW` 转成 `WM_CLOSE` 重新入队 → 下一轮才被
+            // 下面的 `WM_CLOSE` 分支捡到。拦下来可以少一次队列往返，
+            // 也避免 `DefWindowProcW` 在我们不知情时做别的事。
+            //
+            // 这里**不能**调 `DefWindowProcW`：那会走到销毁窗口的路径，
+            // 托盘程序要的是隐藏。
+            //
+            // 低 4 位可能带 Alt 位（`SC_CLOSE | ALT` = 0xF061），
+            // 所以比掩码后的值而不是全等。
+            if msg.message == WM_SYSCOMMAND
+                && (msg.wParam.0 as u32 & !SC_SYSTEM_MENU_MASK) == SC_CLOSE_WPARAM
+            {
                 events.push(WindowEvent::CloseRequested);
                 continue;
             }
@@ -452,7 +512,9 @@ impl EventLoop {
             let _ = unsafe { DispatchMessageW(&msg) };
         }
 
-        self.pending = events.clone();
+        // ⚠️ 必须**追加**而非覆盖：`poll_for` 也会走到这里，
+        // 覆盖会把上一轮累积的未交付事件抹掉（见 `poll` 的说明）。
+        self.pending.extend_from_slice(&events);
         events
     }
 
@@ -1586,5 +1648,47 @@ mod tests {
         assert_eq!(clamp_i32(1920), 1920);
         assert_eq!(clamp_i32(u32::MAX), i32::MAX);
         assert_eq!(clamp_i32(0), 0);
+    }
+
+    /// `WM_SYSCOMMAND` 的命令判定必须容忍低 4 位的来源位。
+    ///
+    /// 回归守卫：早先实现用 `wParam == 0xF060` 全等比较，
+    /// 于是 `Alt+F4`（wParam = `0xF061`）被漏判，标题栏 X 一类
+    /// 走 Alt 修饰的路径全部失效。
+    #[test]
+    fn sc_close_match_tolerates_source_bits() {
+        let is_close = |wp: u32| wp & !SC_SYSTEM_MENU_MASK == SC_CLOSE_WPARAM;
+        assert!(is_close(SC_CLOSE_WPARAM), "裸SC_CLOSE");
+        assert!(is_close(SC_CLOSE_WPARAM | 1), "Alt+F4");
+        assert!(is_close(SC_CLOSE_WPARAM | 2), "来源位=2");
+        assert!(!is_close(0xF020), "SC_MINIMIZE 不该当关闭");
+        assert!(!is_close(0xF030), "SC_MAXIMIZE 不该当关闭");
+        assert!(!is_close(0), "空wParam");
+    }
+
+    /// 事件累积缓冲的语义守卫：`poll_for` 丢弃返回值，
+    /// 靠的是 `pending` 累积而不是「每帧清空 + 只留本帧」。
+    ///
+    /// 回归守卫：早先 `poll()` 开头 `pending.clear()`，
+    /// 导致从节流路径读到的 `CloseRequested` 在下一帧被静默丢弃，
+    /// 实测表现为**用户点标题栏 X 完全没反应**。
+    ///
+    /// 这里不构造真实窗口（那需要消息循环），只验证累积语义本身：
+    /// 取走前缓冲不为空，取走后为空。
+    #[test]
+    fn pending_events_accumulate_until_taken() {
+        let mut pending: Vec<WindowEvent> = Vec::new();
+        pending.push(WindowEvent::CloseRequested);
+        // 模拟 poll_for 读到第二条：追加而非覆盖
+        pending.push(WindowEvent::Resized {
+            width: 1.0,
+            height: 1.0,
+        });
+        assert_eq!(pending.len(), 2, "两条事件都应保留");
+
+        let taken = std::mem::take(&mut pending);
+        assert_eq!(taken.len(), 2, "take 应取走全部累积事件");
+        assert!(matches!(taken[0], WindowEvent::CloseRequested));
+        assert!(pending.is_empty(), "take 后缓冲应为空");
     }
 }

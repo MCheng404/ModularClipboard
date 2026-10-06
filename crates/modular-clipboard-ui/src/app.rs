@@ -201,7 +201,10 @@ pub fn run_with_options(
         // 而两者处置完全相反——前者隐藏到托盘，后者退出。
         // 区分依据是 `quit_requested()`，它**只在** `WM_QUIT` 时置位。
         let mut saw_close = false;
-        for ev in events.poll() {
+        // `take_pending` 而非 `poll()` 的返回值：节流路径 `poll_for` 也会读
+        // 消息并把事件记进累积缓冲，把它们一起取走才能保证关闭请求不丢。
+        // 见 `gfx::window::EventLoop::poll` 的说明。
+        for ev in events.take_pending() {
             match ev {
                 WindowEvent::CloseRequested => {
                     saw_close = true;
