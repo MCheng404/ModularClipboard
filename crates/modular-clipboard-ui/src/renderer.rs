@@ -1169,7 +1169,8 @@ mod tests {
         // 带的是**用户**纹理 ID，且被映射成槽位 1。
         // 这覆盖了「egui 怎么给用户纹理分配 TextureId」这个我无法预设的细节。
         let ctx = egui::Context::default();
-        let img = egui::ColorImage::new([2, 2], egui::Color32::WHITE);
+        // ColorImage::new 需要像素数组，不是单个颜色
+        let img = egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]);
         let handle = ctx.load_texture(
             "unit-test-thumb",
             img,
@@ -1185,7 +1186,9 @@ mod tests {
             ..Default::default()
         };
         let mut out = ctx.run_ui(raw, |ui| {
-            ui.image((handle, egui::vec2(64.0, 64.0)));
+            // egui 0.36 只为 (TextureId, Vec2) 实现了 From，
+            // 不为 (TextureHandle, Vec2) 实现
+            ui.image((handle.id(), egui::vec2(64.0, 64.0)));
         });
         out.textures_delta.clear();
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);

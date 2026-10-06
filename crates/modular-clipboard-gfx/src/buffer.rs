@@ -780,12 +780,14 @@ mod tests {
     fn vertex_layout_matches_pipeline_attributes() {
         // pipeline.rs 声明：location0 offset 0、location1 offset 8、
         // location2 offset 16，步长 = 2*4+2*4+4 = 20。
-        assert_eq!(size_of::<Vertex>(), 20, "顶点结构体大小与管线步长不符");
-        assert_eq!(VERTEX_STRIDE, 20);
+        // 加了 tex_id 后是 24 字节（pos8 + uv8 + color4 + tex_id4）。
+        assert_eq!(size_of::<Vertex>(), 24, "顶点结构体大小与管线步长不符");
+        assert_eq!(VERTEX_STRIDE, 24);
         let v = Vertex {
             pos: [1.0, 2.0],
             uv: [0.5, 0.25],
             color: 0xFF00_00FF,
+            tex_id: 0,
         };
         let base = &v as *const Vertex as usize;
         let pos = &v.pos as *const _ as usize - base;
@@ -803,10 +805,12 @@ mod tests {
 
     #[test]
     fn buffer_sizes_scale_with_capacity() {
-        // 1000 个顶点 = 20000 字节；1024 个索引 = 4096 字节
+        // 期望值从 `VERTEX_STRIDE` 派生，不硬编码字节数。
+        // 硬编码的那版在Vertex 加字段后**仍然通过**——
+        // 它验证的是自己重算的 20_000，不是真实步长。
         let vb = 1000u64 * VERTEX_STRIDE;
-        assert_eq!(vb, 20_000);
+        assert_eq!(vb, 1000 * size_of::<Vertex>() as u64);
         let ib = 1024u64 * size_of::<u32>() as u64;
-        assert_eq!(ib, 4096);
+        assert_eq!(ib, 4096, "索引缓冲：1024 × 4 字节");
     }
 }

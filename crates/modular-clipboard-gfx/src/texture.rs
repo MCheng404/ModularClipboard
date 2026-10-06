@@ -375,11 +375,19 @@ impl DeviceImage {
         let (w, h) = patch;
         validate_region(self.size, (x, y), patch)?;
 
-        let needed = staging_size_r8(w, h);
+        // 按**本图像的格式**算字节数，不是硬编码 R8。
+        //
+        // 早前这里固定用 `staging_size_r8`（= w*h），
+        // 于是上传 RGBA 缩略图（4*w*h 字节）时校验必然失败——
+        // 表现是 GPU 命令一条都没录制就 `bail`，
+        // 而 `full_app` 只画字体图集（永远传 R8），
+        // **这条断路从未被跑出来过**。
+        let needed = staging_size(self.format, w, h);
         anyhow::ensure!(
             bytes.len() as vk::DeviceSize == needed,
-            "staging 数据 {} 字节，与 {w}x{h} 的 R8 区域（需 {needed} 字节）不符",
-            bytes.len()
+            "staging 数据 {} 字节，与 {w}x{h} 的 {:?} 区域（需 {needed} 字节）不符",
+            bytes.len(),
+            self.format
         );
         anyhow::ensure!(!staging.is_null(), "必须提供有效的 staging 切片");
         anyhow::ensure!(
@@ -651,8 +659,38 @@ pub const TIGHTLY_PACKED: u32 = 0;
 ///
 /// R8 每纹素 1 字节且紧密排列，故无需行对齐 padding。
 /// 这是纯函数，可直接单测。
+/// 单通道 8 位图像的 staging 字节数（保留给字体图集这类 R8 路径）。
 pub fn staging_size_r8(width: u32, height: u32) -> vk::DeviceSize {
     width as vk::DeviceSize * height as vk::DeviceSize
+}
+
+/// 按格式计算 staging 区域字节数。
+///
+/// 只支持**无压缩**的格式——带 block 压缩的格式需要按块对齐算，
+/// 超出当前需求（字体图集 R8 + 缩略图 RGBA）。
+///
+/// # 为什么需要它
+///
+/// 早前 `upload` 硬编码按 R8 算（`w * h`），
+/// 于是上传 RGBA 缩略图（`4 * w * h`）时**校验必然失败**。
+/// 由于字体图集一直是 R8，这条断路在实机里从未暴露。
+pub fn staging_size(format: vk::Format, width: u32, height: u32) -> vk::DeviceSize {
+    let bpp: vk::DeviceSize = match format {
+        // 单通道
+        vk::Format::R8_UNORM => 1,
+        // 双通道
+        vk::Format::R8G8_UNORM => 2,
+        // 三通道 Vulkan 没有原生格式（BGR 在扩展里），此处不列
+        // 四通道
+        vk::Format::R8G8B8A8_UNORM
+        | vk::Format::R8G8B8A8_SRGB
+        | vk::Format::B8G8R8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB => 4,
+        other => panic!(
+            "staging_size 不支持压缩或未知格式 {other:?}：             请改用按 block 大小计算的路径"
+        ),
+    };
+    bpp * width as vk::DeviceSize * height as vk::DeviceSize
 }
 
 /// 构造一次上传用的 [`vk::BufferImageCopy`]。
@@ -1076,7 +1114,30 @@ impl Default for TextureStore {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests {    /// 按格式算 staging 字节数——R8 与 RGBA 必须不同。
+    ///
+    /// 回归测试：`upload` 早前硬编码按 R8 算，
+    /// 上传 RGBA 缩略图时校验必然失败（GPU 命令一条都没录制）。
+    /// 该断路在实机里从未暴露，因为字体图集一直是 R8。
+    #[test]
+    fn staging_size_depends_on_format() {
+        let w = 4u32;
+        let h = 4u32;
+        assert_eq!(staging_size(vk::Format::R8_UNORM, w, h), 16);
+        assert_eq!(staging_size(vk::Format::R8G8B8A8_UNORM, w, h), 64);
+        assert_eq!(staging_size(vk::Format::B8G8R8A8_UNORM, w, h), 64);
+        // 旧函数保留给 R8 路径，但结果必须与按格式算的一致
+        assert_eq!(staging_size_r8(w, h), staging_size(vk::Format::R8_UNORM, w, h));
+    }
+
+    /// 非压缩格式不能panic——未知格式必须显式失败。
+    #[test]
+    #[should_panic(expected = "不支持压缩或未知格式")]
+    fn staging_size_rejects_unknown_format() {
+        staging_size(vk::Format::BC7_UNORM_BLOCK, 4, 4);
+    }
+
+
     use super::*;
     use std::sync::Arc;
 
