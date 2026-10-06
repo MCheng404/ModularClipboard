@@ -26,6 +26,75 @@ pub mod window;
 use ash::{Device, Entry, Instance as AshInstance, khr, vk};
 use khr::surface::Instance as SurfaceLoader;
 
+/// 逻辑设备启用的描述符更新能力。
+///
+/// # 为什么需要它
+///
+/// 本项目每个在飞帧槽位各有独立的描述符集，而槽位的 GPU 工作与 CPU 的
+/// 下一帧是**并行**的——`full_app` 在若干帧在途的同时会重写所有槽位的
+/// 描述符（字体图集重建、交换链重建、uniform 内容变化时）。
+/// 这在 Vulkan 1.1 下是 `VUID-vkUpdateDescriptorSets-None-03047` 违规：
+///
+/// > 绑定若创建时未带 `UPDATE_AFTER_BIND_BIT` 或
+/// `UPDATE_UNUSED_WHILE_PENDING_BIT`，其描述符集就不得被处于
+/// > pending 状态的命令缓冲使用中的描述符集。
+///
+/// # 为什么不能靠等fence 规避
+///
+/// `UPDATE_UNUSED_WHILE_PENDING` 的语义是「更新时保证该绑定尚未被使用」，
+/// 而本项目的多帧在途**正是**「已被使用」的状态。要满足它就得在每次
+/// 重写前把全部在飞槽位等一遍，等于放弃多帧并行——用同步换规范合规，
+/// 是把设计退回到`device_wait_idle`。而`UPDATE_AFTER_BIND` 恰好
+/// 描述的正是我们的用法：绑定之后仍可更新。
+///
+/// # ash 0.38 陷阱
+///
+/// `PhysicalDeviceVulkan12Features` **没有 builder 构造器**（相邻的
+/// `PhysicalDeviceFeatures2` 才有 `.features()`），只能逐字段赋值。
+/// 且它是 Vulkan 1.2 核心结构体，常量位于 `vk::feature_extensions`
+/// 而非 `vk::bitflags`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorUpdateCaps {
+    /// 可给UNIFORM_BUFFER 绑定加 `UPDATE_AFTER_BIND`。
+    pub uniform_buffer_update_after_bind: bool,
+    /// 可给 SAMPLER / COMBINED_IMAGE_SAMPLER 绑定加 `UPDATE_AFTER_BIND`。
+    pub sampled_image_update_after_bind: bool,
+    /// 设备本身是否支持 Vulkan 1.2（未启用任何 1.2 特性时为 false）。
+    pub vulkan_1_2: bool,
+}
+
+impl DescriptorUpdateCaps {
+    /// 三个绑定（uniform / sampler / texture）是否都能加 `UPDATE_AFTER_BIND`。
+    ///
+    /// 缺任一项时，**必须**由调用方保证「重写描述符时该槽位GPU 已完成」
+    /// （例如只在交换链重建、全局 `wait_idle` 之后写），否则仍会违规。
+    pub fn all_bindings_update_after_bind(&self) -> bool {
+        self.uniform_buffer_update_after_bind && self.sampled_image_update_after_bind
+    }
+}
+
+/// 查询设备支持的描述符更新能力。
+///
+/// 只**查询**不启用——启用发生在 [`Gpu::new`] 创建逻辑设备时。
+fn query_descriptor_update_caps(
+    instance: &AshInstance,
+    physical_device: vk::PhysicalDevice,
+) -> DescriptorUpdateCaps {
+    let mut feats12 = vk::PhysicalDeviceVulkan12Features::default();
+    // ash 0.38用 `push_next`（不是 `p_next`）挂 pNext 链。
+    let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut feats12);
+    // 入口属实例级 1.1 核心，本项目已申请 API_VERSION_1_1，可安全调用。
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+
+    DescriptorUpdateCaps {
+        uniform_buffer_update_after_bind: feats12.descriptor_binding_uniform_buffer_update_after_bind
+            != vk::FALSE,
+        sampled_image_update_after_bind: feats12.descriptor_binding_sampled_image_update_after_bind
+            != vk::FALSE,
+        vulkan_1_2: feats12.descriptor_indexing != vk::FALSE,
+    }
+}
+
 /// 首选 GPU 类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuPreference {
@@ -75,6 +144,8 @@ pub struct Gpu {
     pub surface_caps: vk::SurfaceCapabilitiesKHR,
     pub surface_formats: Vec<vk::SurfaceFormatKHR>,
     pub present_modes: Vec<vk::PresentModeKHR>,
+    /// 设备支持的描述符更新能力（决定能否加 `UPDATE_AFTER_BIND`）。
+    pub desc_caps: DescriptorUpdateCaps,
 }
 
 impl Gpu {
@@ -95,8 +166,19 @@ impl Gpu {
             .application_version(vk::make_api_version(0, 1, 0, 0))
             .engine_name(c"modular-clipboard")
             .engine_version(vk::make_api_version(0, 1, 0, 0))
-            // 只请求 1.1 基线，保证旧驱动也能启动
-            .api_version(vk::API_VERSION_1_1);
+            // 请求 1.2：描述符的 `UPDATE_AFTER_BIND` 是 1.2 核心特性，
+            // 而本项目每帧在多帧在途的同时会重写所有槽位的描述符
+            // （见 `DescriptorUpdateCaps`）。
+            //
+            // 保持 1.1 会让验证层报
+            // `VUID-VkDescriptorSetLayoutCreateInfo-flags-parameter`
+            // ——「这些标志位需要 VK_EXT_descriptor_indexing 扩展」：
+            // 1.1 实例下这些 1.2 核心标志位不被识别，被当作扩展才有的。
+            //
+            // `load()` 不校验版本，`create_instance` 才校验；设备实际支持到
+            // 1.4（已实测），1.2 是安全下限。真要退回 1.1，得同时改用
+            // `VK_EXT_descriptor_indexing` 扩展路径，不能只降版本号。
+            .api_version(vk::API_VERSION_1_2);
 
         // 实例级扩展：只有「表面」相关的两个。
         // 注意 VK_KHR_swapchain 是**设备级**扩展，不能在实例创建时启用——
@@ -177,10 +259,27 @@ impl Gpu {
             .queue_family_index(queue_family)
             .queue_priorities(&queue_priorities);
 
+        // ---- 描述符更新能力：查询后再按实际支持启用 ----
+        //
+        // 不查询就无条件置位会得到 `VK_ERROR_FEATURE_NOT_PRESENT`（设备创建直接失败）；
+        // 不启用就加 `UPDATE_AFTER_BIND_BIT` 则是「使用未启用的 feature」——
+        // 违规从 `03047` 换成另一个 VUID，等于没修。
+        let desc_caps = query_descriptor_update_caps(&instance, physical_device);
+        // 只启用**确实需要**的那两项：uniform 与 sampled image（采样器 + 纹理）。
+        // `descriptor_binding_update_unused_while_pending` 本项目用不到
+        // （见 `DescriptorUpdateCaps` 的说明），故不启用。
+        let mut feats12 = vk::PhysicalDeviceVulkan12Features::default();
+        feats12.descriptor_binding_uniform_buffer_update_after_bind =
+            desc_caps.uniform_buffer_update_after_bind.into();
+        feats12.descriptor_binding_sampled_image_update_after_bind =
+            desc_caps.sampled_image_update_after_bind.into();
+
         let device_exts = [c"VK_KHR_swapchain".as_ptr()];
         let device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(std::slice::from_ref(&device_info))
-            .enabled_extension_names(&device_exts);
+            .enabled_extension_names(&device_exts)
+            // 链入 1.2 特性。结构体须存活到 create_device 返回，故绑定为局部变量。
+            .push_next(&mut feats12);
 
         let device = unsafe { instance.create_device(physical_device, &device_create, None)? };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
@@ -201,6 +300,7 @@ impl Gpu {
             surface_caps: caps,
             surface_formats: formats,
             present_modes,
+            desc_caps,
         })
     }
 
@@ -584,6 +684,46 @@ pub(crate) fn image_barrier<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desc_caps_require_both_features() {
+        // 三 个绑定（uniform / sampler / texture）都要能加标志，
+        // 缺任一项就不能加——否则该绑定在多帧在途时重写仍会违规。
+        let both = DescriptorUpdateCaps {
+            uniform_buffer_update_after_bind: true,
+            sampled_image_update_after_bind: true,
+            vulkan_1_2: true,
+        };
+        assert!(both.all_bindings_update_after_bind());
+
+        // 缺 sampler 侧（COMBINED_IMAGE_SAMPLER 走 sampled image 特性）
+        let no_sampler = DescriptorUpdateCaps {
+            uniform_buffer_update_after_bind: true,
+            sampled_image_update_after_bind: false,
+            vulkan_1_2: true,
+        };
+        assert!(!no_sampler.all_bindings_update_after_bind());
+
+        let no_uniform = DescriptorUpdateCaps {
+            uniform_buffer_update_after_bind: false,
+            sampled_image_update_after_bind: true,
+            vulkan_1_2: true,
+        };
+        assert!(!no_uniform.all_bindings_update_after_bind());
+    }
+
+    #[test]
+    fn desc_caps_default_to_no_update_after_bind() {
+        // 能力全无时必须退回「不加标志」，而不是乐观假设支持。
+        // 乐观假设的后果是设备创建直接失败（VK_ERROR_FEATURE_NOT_PRESENT）
+        // 或布局创建违规。
+        let none = DescriptorUpdateCaps {
+            uniform_buffer_update_after_bind: false,
+            sampled_image_update_after_bind: false,
+            vulkan_1_2: false,
+        };
+        assert!(!none.all_bindings_update_after_bind());
+    }
 
     #[test]
     fn gpu_preference_parsing_rules() {

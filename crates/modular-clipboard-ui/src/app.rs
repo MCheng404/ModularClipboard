@@ -83,7 +83,10 @@ pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
     // 预选，真实的一致性由那一道校验兜底。
     let surface_format = pick_surface_format(&gpu)?;
     let render_pass = modular_clipboard_gfx::pipeline::RenderPass::new(&gpu.device, surface_format)?;
-    let desc_layout = modular_clipboard_gfx::pipeline::DescriptorLayout::new(&gpu.device)?;
+    let desc_layout = modular_clipboard_gfx::pipeline::DescriptorLayout::new(
+        &gpu.device,
+        gpu.desc_caps.all_bindings_update_after_bind(),
+    )?;
     let pipe_layout = modular_clipboard_gfx::pipeline::PipelineLayout::new(
         &gpu.device,
         std::slice::from_ref(&desc_layout.handle),

@@ -567,6 +567,12 @@ pub struct FrameRenderer<'a> {
     /// 上传函数里的局部变量。块数与在飞槽位数一致，提交时由栅栏记账，
     /// 确保「GPU 读完之后才允许复用」。
     staging: StagingArena<'a>,
+    /// 描述符集布局是否带 `UPDATE_AFTER_BIND` 标志。
+    ///
+    /// 决定描述符池是否必须带 `DescriptorPoolCreateFlags::UPDATE_AFTER_BIND`
+    /// （规范强制）。由 `PipelineBundle` 的布局在创建时固定下来，
+    /// 保证「布局加了标志 ⇔ 池也加了标志」，两者不会失配。
+    desc_update_after_bind: bool,
 }
 
 /// 正在录制中的帧。
@@ -626,6 +632,10 @@ impl<'a> FrameRenderer<'a> {
             clear_color: [0.10, 0.10, 0.12, 1.0],
             // 块数随后按交换链图像数确定，见下方。
             staging: StagingArena::new(gpu, 1)?,
+            // 描述符池是否必须带 UPDATE_AFTER_BIND，取决于布局有没有加标志，
+            // 而布局是调用方用同一份 `gpu.desc_caps` 建的——两边同源，
+            // 因此不会出现「布局加了池没加」的失配。
+            desc_update_after_bind: gpu.desc_caps.all_bindings_update_after_bind(),
         };
         this.allocate_frame_resources()?;
 
@@ -1396,7 +1406,20 @@ impl<'a> FrameRenderer<'a> {
                 descriptor_count: count,
             },
         ];
+        // 用了 `UPDATE_AFTER_BIND` 的绑定，其描述符池**必须**带
+        // `UPDATE_AFTER_BIND` 标志（规范强制要求，不是可选优化）。
+        // 不加会报 `VUID-vkCreateDescriptorPool-pPoolCreateInfo-03111`。
+        //
+        // ash 0.38 陷阱：`DescriptorPoolCreateFlags` 在 `vk::bitflags` 里
+        // 只暴露了 `FREE_DESCRIPTOR_SET`，`UPDATE_AFTER_BIND` 属于
+        // Vulkan 1.2 段（在 `vk::feature_extensions`），照抄 0.37 示例找不到。
+        let pool_flags = if self.desc_update_after_bind {
+            vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
+        } else {
+            vk::DescriptorPoolCreateFlags::empty()
+        };
         let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .flags(pool_flags)
             .max_sets(count)
             .pool_sizes(&pool_sizes);
         self.descriptor_pool =

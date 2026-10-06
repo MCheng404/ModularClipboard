@@ -148,7 +148,7 @@ fn main() {
     println!("OK RenderPass (format={probe_format:?})");
 
     // 交换链（依赖渲染通道来创建 framebuffer）
-    let swapchain = match modular_clipboard_gfx::Swapchain::new(&gpu, W as u32, H as u32, rp.handle) {
+    let mut swapchain = match modular_clipboard_gfx::Swapchain::new(&gpu, W as u32, H as u32, rp.handle) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("FAIL Swapchain::new: {e:#}");
@@ -162,7 +162,11 @@ fn main() {
     );
     assert_eq!(swapchain.format, probe_format, "交换链格式应与渲染通道一致");
 
-    let layout = modular_clipboard_gfx::pipeline::DescriptorLayout::new(&gpu.device).expect("DescriptorLayout");
+    let layout = modular_clipboard_gfx::pipeline::DescriptorLayout::new(
+        &gpu.device,
+        gpu.desc_caps.all_bindings_update_after_bind(),
+    )
+    .expect("DescriptorLayout");
     let pipe_layout = modular_clipboard_gfx::pipeline::PipelineLayout::new(
         &gpu.device,
         std::slice::from_ref(&layout.handle),
@@ -188,7 +192,16 @@ fn main() {
         vk_pool_size(vk::DescriptorType::SAMPLER),
         vk_pool_size(vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
     ];
+    // 池的 `UPDATE_AFTER_BIND` 标志必须与上面布局加的绑定标志配套：
+    // 布局带了 `UPDATE_AFTER_BIND_POOL`，池却不带，会报
+    // `VUID-vkAllocateDescriptorSets-pSetLayouts-03044`（验证层实测）。
+    let pool_flags = if gpu.desc_caps.all_bindings_update_after_bind() {
+        vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
+    } else {
+        vk::DescriptorPoolCreateFlags::empty()
+    };
     let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .flags(pool_flags)
         .max_sets(1)
         .pool_sizes(&sizes);
     let pool = unsafe { gpu.device.create_descriptor_pool(&pool_info, None) }.expect("descriptor pool");
@@ -299,6 +312,20 @@ fn main() {
     shader.destroy(&gpu.device);
     pipe_layout.destroy(&gpu.device);
     layout.destroy(&gpu.device);
+
+    // ⚠️ 交换链必须在 `rp.destroy()` **之前**销毁。
+    //
+    // `Swapchain::destroy` 内部按 framebuffer → image_view → swapchain
+    // 的顺序销毁（framebuffer 引用了图像视图，反序会留悬空引用）。
+    // 而 framebuffer 又引用了渲染通道，因此整条链的销毁顺序必须是
+    // swapchain 在前、render_pass 在后。
+    //
+    // 漏掉这一步会稳定触发 `VUID-vkDestroyDevice-device-05137`：
+    // 3 个 ImageView + 3 个 Framebuffer + 1 个 Swapchain 正好等于
+    // 本探针创建的那一个交换链（`FrameRenderer` 路径零泄漏，
+    // 说明库的 `rebuild_swapchain` 销毁逻辑是完整的）。
+    swapchain.destroy(&gpu.device);
+
     rp.destroy(&gpu.device);
     println!("ALL OK - 渲染器核心链路全部工作");
 }

@@ -201,7 +201,10 @@ fn run() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("表面无可用格式"))?;
 
     let rp = modular_clipboard_gfx::pipeline::RenderPass::new(&gpu.device, probe_format)?;
-    let layout = modular_clipboard_gfx::pipeline::DescriptorLayout::new(&gpu.device)?;
+    let layout = modular_clipboard_gfx::pipeline::DescriptorLayout::new(
+        &gpu.device,
+        gpu.desc_caps.all_bindings_update_after_bind(),
+    )?;
     let pipe_layout = modular_clipboard_gfx::pipeline::PipelineLayout::new(
         &gpu.device,
         std::slice::from_ref(&layout.handle),

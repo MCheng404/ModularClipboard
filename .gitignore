@@ -17,3 +17,4 @@ target-*/
 .racehunt/
 .vuidfix/
 .perimage/
+.verify-logs/

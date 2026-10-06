@@ -161,7 +161,34 @@ pub struct DescriptorLayout {
 
 impl DescriptorLayout {
     /// 创建布局：uniform buffer + sampler + combined image sampler。
-    pub fn new(device: &Device) -> anyhow::Result<Self> {
+    ///
+    /// `update_after_bind` 决定是否给全部绑定加
+    /// [`vk::DescriptorBindingFlags::UPDATE_AFTER_BIND`]。它由调用方
+    /// （通常是 [`crate::Gpu`]）按设备**实际支持**传入——
+    /// 对未启用的 feature 使用该标志会把`VUID-vkUpdateDescriptorSets-None-03047`
+    /// 换成「feature 未启用」的违规，等于没修。
+    ///
+    /// # 为什么需要 `UPDATE_AFTER_BIND`
+    ///
+    /// 本项目每个在飞帧槽位各有独立的描述符集，且槽位的 GPU 工作与 CPU
+    /// 的下一帧并行。`full_app` 在若干帧在途时会重写**所有**槽位的描述符
+    /// （字体图集重建 / 交换链重建 / uniform 内容变化）。
+    /// 规范禁止更新「被 pending 命令缓冲使用中」的描述符集，除非该绑定
+    /// 创建时带了 `UPDATE_AFTER_BIND_BIT`或
+    /// `UPDATE_UNUSED_WHILE_PENDING_BIT`。
+    ///
+    /// 选前者而非后者：后者的语义是「更新时保证该绑定尚未被使用」，
+    /// 而多帧在途**恰恰**就是「已被使用」。要满足它只能每次重写前
+    /// 等完所有在飞槽位——等于放弃多帧并行。
+    ///
+    /// # ash 0.38 陷阱
+    ///
+    /// `DescriptorSetLayoutBinding` **结构体里没有 `binding_flags` 字段**
+    /// （任何 Vulkan 版本都没有）。绑定标志只能通过
+    /// `DescriptorSetLayoutBindingFlagsCreateInfo` 挂在
+    /// `DescriptorSetLayoutCreateInfo` 的 `p_next` 上，
+    /// 且其数组长度必须与 `bindings` 一致。
+    pub fn new(device: &Device, update_after_bind: bool) -> anyhow::Result<Self> {
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_UNIFORM)
@@ -182,8 +209,32 @@ impl DescriptorLayout {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
 
-        let info = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&bindings);
+        // 标志数组与 bindings 一一对应，长度必须相同（由构造器按切片长度设置）。
+        let binding_flags: Vec<vk::DescriptorBindingFlags> = bindings
+            .iter()
+            .map(|_| {
+                if update_after_bind {
+                    vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                } else {
+                    vk::DescriptorBindingFlags::empty()
+                }
+            })
+            .collect();
+        let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+            .binding_flags(&binding_flags);
+
+        let mut info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        if update_after_bind {
+            // 加了绑定的 UPDATE_AFTER_BIND_BIT，**布局本身**就必须带
+            // `UPDATE_AFTER_BIND_POOL`（规范强制，验证层实测报
+            // `VUID-VkDescriptorSetLayoutCreateInfo-flags-03000`）。
+            // 这与描述符池那侧的 `DescriptorPoolCreateFlags::UPDATE_AFTER_BIND`
+            // 是**两处独立**的要求，漏任何一处都违规。
+            info = info.flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL);
+            // 仅在真的加标志时挂 pNext —— 空标志数组会让验证层报
+            // 「flags 数量与 bindings 不符」类问题，且毫无收益。
+            info = info.push_next(&mut flags_info);
+        }
 
         let handle = unsafe { device.create_descriptor_set_layout(&info, None) }
             .map_err(|e| anyhow::anyhow!("创建描述符集布局失败: {e:?}"))?;
@@ -422,5 +473,58 @@ mod tests {
         // 因此 Rust 侧结构体末尾的填充必须存在（否则着色器越界读）。
         // 这里确认当前定义没有多余填充导致的对齐浪费。
         assert_eq!(size_of::<Uniforms>() % 4, 0);
+    }
+
+    #[test]
+    fn binding_flag_count_must_match_binding_count() {
+        // `DescriptorSetLayoutBindingFlagsCreateInfo.binding_flags()` 用切片长度
+        // 决定 `binding_count`。若两者不等，验证层会报
+        // 「flags 数量与 bindings 不符」——而这在无 GPU 的单测里测不到。
+        // 本函数与 `DescriptorLayout::new` 里的map 逻辑一一对应。
+        let binding_count = 3usize;
+        let flags_for = |update_after_bind: bool| -> Vec<vk::DescriptorBindingFlags> {
+            (0..binding_count)
+                .map(|_| {
+                    if update_after_bind {
+                        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                    } else {
+                        vk::DescriptorBindingFlags::empty()
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(flags_for(true).len(), binding_count);
+        assert_eq!(flags_for(false).len(), binding_count);
+    }
+
+    #[test]
+    fn update_after_bind_requires_no_dynamic_offset() {
+        // `UPDATE_AFTER_BIND` 的硬性约束：带该标志的绑定**不得**使用
+        // dynamic offset。本项目的 uniform 用 `DescriptorBufferInfo`
+        // 里写死的 offset（非 dynamic），dynamic states 只有
+        // VIEWPORT/SCISSOR——没有 DYNAMIC_OFFSET，因此该约束成立。
+        //
+        // 这条测试的价值是**记录前提**：若将来有人给管线加了
+        // DYNAMIC_OFFSET state，本测试会立刻失败，提示
+        // 「加UPDATE_AFTER_BIND 的前提被破坏了」。
+        const DYNAMIC_STATES: [vk::DynamicState; 2] =
+            [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        // ash 0.38 的 `DynamicState` 常量只列到 STENCIL_REFERENCE(8)，
+        // 没有导出 DYNAMIC_OFFSET——但规范里它是 9。用 from_raw 构造，
+        // 免得「枚举缺常量」被误当成「不存在这个动态状态」。
+        let dynamic_offset = vk::DynamicState::from_raw(9);
+        for s in DYNAMIC_STATES {
+            assert_ne!(
+                s.as_raw(),
+                dynamic_offset.as_raw(),
+                "带 UPDATE_AFTER_BIND 的 uniform 绑定不得使用 DYNAMIC_OFFSET"
+            );
+        }
+        assert_eq!(
+            DYNAMIC_STATES.len(),
+            2,
+            "dynamic states 列表被改动——若新增了 DYNAMIC_OFFSET，\
+             uniform 绑定的 UPDATE_AFTER_BIND 就不再合法"
+        );
     }
 }
