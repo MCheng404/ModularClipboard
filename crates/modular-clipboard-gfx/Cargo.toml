@@ -84,6 +84,11 @@ name = "pixels_probe"
 [[example]]
 name = "units_probe"
 
+# 点击位置 vs 渲染位置的双端实测：同一帧里同时抓 tessellate 顶点
+# 与PointerButton 命中，输出可断言的错位量（纯 CPU，不建窗口）
+[[example]]
+name = "coord_probe"
+
 # 着色器在编译期由 naga 编译为 SPIR-V，不进最终二进制。
 # 这样无需 glslc / glslang 等 C++ 工具链，保持纯 Rust 构建链。
 [build-dependencies]
