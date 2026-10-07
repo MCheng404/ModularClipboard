@@ -551,8 +551,21 @@ struct Titlebar {
 
 /// `titlebar.rs::TitlebarLayout::new` 的**逐行复刻**。
 ///
-/// `gfx` 不能依赖 `ui`（会成环），故此处照抄实现；每个分支都与源文件
-/// 对照过。`title_text_w` 由真实字体度量得到，与 `view.rs:249` 一致。
+/// `gfx` 不能依赖 `ui`（会成环），故此处照抄实现。
+///
+/// # ⚠️ 同步要求
+///
+/// 这份复刻必须与 `titlebar.rs::TitlebarLayout::new` 的 `drag` 计算
+/// 保持一致。两者曾经漂移过一次：生产代码把拖动区右界从
+/// `settings.min.x` 改成 `search.min.x - inset`（因为旧写法会吞掉
+/// 搜索框），而这份复刻还在用旧写法，于是探针报
+/// `titlebar_drag_swallow=true` 而真实程序已经修好——
+/// **判据与被测系统不同源**，比没有判据更糟。
+///
+/// 因此：`titlebar.rs` 改了拖动区算法后**必须**回来改这里，
+/// 生产侧的权威断言是 `titlebar.rs` 里的
+/// `search_box_never_swallowed_by_drag_region`（它调用真实的
+/// `TitlebarLayout::new`），本探针只作交叉验证。
 fn titlebar_layout(bar: Rect, scale: f32, title_text_w: f32) -> Titlebar {
     let btn = tb::BUTTON_SIZE * scale;
     let close_w = tb::CLOSE_BUTTON_WIDTH * scale;
@@ -582,7 +595,11 @@ fn titlebar_layout(bar: Rect, scale: f32, title_text_w: f32) -> Titlebar {
         pos2(search_x0, bar.min.y + (bar.height() - btn) / 2.0),
         vec2(search_w, btn),
     );
-    let drag = Rect::from_min_max(pos2(bar.min.x, bar.min.y), pos2(settings.min.x, bar.max.y));
+    // 与生产代码一致：右界止于**搜索框**左缘（不是设置按钮），
+    // 并夹在最左按钮之内（极窄窗口下按钮会从右往左溢出）。
+    let leftmost_btn = settings.min.x.min(minimize.min.x).min(close.min.x);
+    let drag_right = (search.min.x - inset).max(bar.min.x).min(leftmost_btn);
+    let drag = Rect::from_min_max(pos2(bar.min.x, bar.min.y), pos2(drag_right, bar.max.y));
     Titlebar {
         full: bar,
         title,

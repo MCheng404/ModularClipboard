@@ -145,14 +145,30 @@ impl TitlebarLayout {
             pos2(text_lo, search.min.y),
             pos2(text_hi, search.max.y),
         );
-        // 拖动区 = 标题栏扣掉**所有**按钮（含设置）。
+        // 拖动区 = 标题栏扣掉**所有**交互控件。
         //
-        // 这里减去设置按钮是有代价的：设置按钮左侧那段也拖不动窗口了。
-        // 但反过来把设置按钮放进拖动区，用户点设置就会变成拖窗口——
+        // ⚠️ 右界必须取 `search.min.x - gap`，**不是** `settings.min.x`。
+        //
+        // 实测踩坑：早先取 `settings.min.x`，于是拖动区是 `[0, 180]`，
+        // 而搜索框在 `[104, 172]` —— **搜索框 100% 落在拖动区内**。
+        // `chrome::hit_test` 命中拖动区就返回 `HTCAPTION`，
+        // `WM_LBUTTONDOWN` 被系统接管成拖窗口，**egui 根本收不到这次点击**。
+        // 症状是「点搜索框没反应、点别处反而触发了搜索框」——
+        // 用户看到的「点击位置与渲染位置不对」，根因在这里，
+        // 与坐标换算无关（那条链路实测差值 0.0000 物理像素）。
+        //
+        // 代价：标题与搜索框之间那一小段也拖不动窗口了。
+        // 反过来把搜索框放进拖动区，用户点搜索框就变成拖窗口——
         // 后者是不能接受的。
+        // ⚠️ 极窄窗口下按钮会从右往左溢出，最左那个（设置）可能落到
+        // `bar.min.x` 之外甚至为负。此时拖动区右界必须再夹一次，
+        // 否则「拖动区右界 = search.min.x - inset」算出的值可能
+        // 大于最左按钮的左缘，把按钮圈进拖动区。
+        let leftmost_btn = self_leftmost_button(settings, minimize, close);
+        let drag_right = ((search.min.x - inset).max(bar.min.x)).min(leftmost_btn);
         let drag = Rect::from_min_max(
             pos2(bar.min.x, bar.min.y),
-            pos2(settings.min.x, bar.max.y),
+            pos2(drag_right, bar.max.y),
         );
         Self {
             full: bar,
@@ -171,20 +187,42 @@ impl TitlebarLayout {
         self.drag
     }
 
-    /// 校验：拖动区不与任何按钮**重叠**。
+    /// 校验：拖动区不与任何**交互控件**重叠。
     ///
-    /// 这是本文件最重要的一条：按钮落进拖动区 = 点按钮变成拖窗口。
+    /// 这是本文件最重要的一条：控件落进拖动区 = 点它变成拖窗口。
+    ///
+    /// ⚠️ 检查对象必须包含**搜索框**，不能只查按钮。早先只查
+    /// `[settings, minimize, close]` 三个按钮，搜索框漏在检查之外，
+    /// 而它恰恰是标题栏里唯一的输入控件、也是最常被点的那个。
+    /// 这就是「点搜索框没反应、点别处却触发了搜索框」的成因。
     ///
     /// 注意用的是「重叠」而非 `Rect::intersects`：后者用 `<=` 比较，
-    /// **边界相接也算相交**。而拖动区右缘恰好就是设置按钮的左缘
-    /// （这正是本文件里`drag_region_stops_before_settings_button`
-    /// 那条测试要求的），用 `intersects` 会永远得到「相交」——
-    /// 那样的断言要么恒失败，要么逼人加容差蒙混过去。
-    /// 真正要禁止的是**有面积的重叠**，即按钮的面积落进拖动区内。
+    /// **边界相接也算相交**。而拖动区右缘本就该紧贴搜索框左缘
+    /// （这正是 `drag_region_stops_before_search` 那条测试要求的），
+    /// 用 `intersects` 会永远得到「相交」——那样的断言要么恒失败，
+    /// 要么逼人加容差蒙混过去。真正要禁止的是**有面积的重叠**。
     pub fn buttons_inside_drag(&self) -> bool {
-        let b = [self.settings, self.minimize, self.close];
-        b.iter().all(|r| !rects_overlap(self.drag, *r))
+        [self.search, self.settings, self.minimize, self.close]
+            .iter()
+            .all(|r| !rects_overlap(self.drag, *r))
     }
+
+    /// 拖动区是否有正面积落在搜索框里。
+    ///
+    /// 单独给出是因为它是最严重的那个：搜索框是唯一的输入控件，
+    /// 被吞掉等于「搜索功能完全不可用」，且用户会误以为是坐标错位。
+    pub fn search_inside_drag(&self) -> bool {
+        rects_overlap(self.drag, self.search)
+    }
+}
+
+/// 三个窗口按钮里最靠左的那个的左缘。
+///
+/// 极窄窗口下按钮从右往左排会溢出，最左的设置按钮可能越过 `bar.min.x`
+/// 甚至变成负值。拖动区右界必须夹在它左缘之内，否则按钮会被圈进
+/// 拖动区——点设置按钮变成拖窗口。
+fn self_leftmost_button(settings: Rect, minimize: Rect, close: Rect) -> f32 {
+    settings.min.x.min(minimize.min.x).min(close.min.x)
 }
 
 /// 两个矩形是否有**正面积**重叠。
@@ -493,12 +531,50 @@ mod tests {
     }
 
     #[test]
-    fn drag_region_stops_before_settings_button() {
+    fn drag_region_stops_before_search_box() {
+        // 拖动区右界必须止于**搜索框**左缘，不是设置按钮。
+        //
+        // 回归守卫：早先取 `settings.min.x`，拖动区是 `[0, 180]` 而搜索框
+        // 在 `[104, 172]` —— 搜索框整个落在拖动区里，点它变成拖窗口。
         let l = TitlebarLayout::new(bar(), 1.0, 84.0);
         assert!(
-            l.drag.max.x <= l.settings.min.x + 0.01,
-            "拖动区右边界应止于设置按钮左缘"
+            l.drag.max.x <= l.search.min.x + 0.01,
+            "拖动区右边界应止于搜索框左缘，drag.max.x={} search.min.x={}",
+            l.drag.max.x,
+            l.search.min.x
         );
+        assert!(
+            !l.search_inside_drag(),
+            "搜索框绝不能落进拖动区：它是唯一的输入控件，被吞掉等于搜索不可用"
+        );
+    }
+
+    #[test]
+    fn search_box_never_swallowed_by_drag_region() {
+        // 这条是本缺陷的权威判据。它必须走 `TitlebarLayout::new`
+        // 的真实计算路径，不是复刻一遍布局逻辑。
+        for &(w, scale) in &[
+            (420.0f32, 1.0f32),
+            (420.0, 1.5),
+            (420.0, 2.0),
+            (280.0, 1.0),
+            (600.0, 1.0),
+            (900.0, 2.0),
+        ] {
+            let b = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, 36.0));
+            let l = TitlebarLayout::new(b, scale, 84.0 * scale);
+            assert!(
+                !l.search_inside_drag(),
+                "w={w} scale={scale}: 搜索框 {:?} 落进拖动区 {:?}",
+                l.search,
+                l.drag
+            );
+            assert!(
+                l.buttons_inside_drag(),
+                "w={w} scale={scale}: 有控件落进拖动区 {:?}",
+                l.drag
+            );
+        }
     }
 
     #[test]
