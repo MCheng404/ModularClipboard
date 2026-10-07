@@ -107,6 +107,12 @@ enum PendingOp {
 
 const ROW_HEIGHT: f32 = panels::ROW_HEIGHT;
 
+/// 标题栏显示的应用标题。
+///
+/// 绘制与拖动区上报**共用**这一个常量：两处若各写一份字面量，
+/// 改了一处就可能出现「画的是 A、量的是 B」，标题宽度又算错。
+pub(crate) const APP_TITLE: &str = "模块化剪切板";
+
 /// 主视图。返回 `true` 表示请求退出应用。
 ///
 /// 由 `Context::run_ui` 提供的根 `Ui` 覆盖整个客户区，本函数直接往里画，
@@ -172,7 +178,7 @@ pub fn draw(ui: &mut Ui, svc: &mut Service, local: &mut UiLocal, pal: &Palette) 
     }
 
     draw_status_bar(ui, svc, local, pal, scale, narrowed);
-    local.drag_region = titlebar_drag_region(&solved, scale);
+    local.drag_region = titlebar_drag_region(ui, &solved, pal, scale, APP_TITLE);
     false
 }
 
@@ -212,7 +218,7 @@ fn draw_topbar(
         pal,
         scale,
         &mut query,
-        "模块化剪切板",
+        APP_TITLE,
     );
     if query != svc.state.query {
         svc.search(query);
@@ -229,8 +235,19 @@ fn draw_topbar(
 ///
 /// 复用 [`titlebar::TitlebarLayout`] 的同一个计算结果，不二次推导——
 /// 绘制时按钮画在哪，拖动区就避开哪。
-fn titlebar_drag_region(solved: &Solved, scale: f32) -> Option<Rect> {
-    let l = TitlebarLayout::new(solved.topbar, scale);
+///
+/// 标题宽度同样实测传入：虽然当前拖动区右界只由设置按钮决定
+/// （不依赖标题宽度），但让两条路径**用完全相同的输入**跑同一个
+/// `new`，将来标题布局一变也不会出现「画的和上报的不一致」。
+fn titlebar_drag_region(
+    ui: &Ui,
+    solved: &Solved,
+    pal: &Palette,
+    scale: f32,
+    app_title: &str,
+) -> Option<Rect> {
+    let title_w = titlebar::measure_text(ui, app_title, &sized(pal.font_md, scale));
+    let l = TitlebarLayout::new(solved.topbar, scale, title_w);
     let r = l.drag_region();
     // 零面积 / 零高度的拖动区会让 hit_test 判定为无效（它要求
     // width > 0 && height > 0），上报 `None` 而不是退化矩形。
@@ -495,17 +512,12 @@ fn draw_virtual_list(
                     scale,
                     row % 2 == 1,
                     meta,
+                    is_pinned_list,
                 );
                 // 行内工具画在行右侧，不占行的点击区域。
-                let tools_w = if is_pinned_list {
-                    pal.control_height * scale
-                } else {
-                    pal.control_height * 2.0 * scale
-                };
-                let tools = Rect::from_min_size(
-                    pos2(row_rect.max.x - tools_w - pal.space_xs, row_rect.min.y),
-                    vec2(tools_w, row_rect.height()),
-                );
+                // 矩形来自 panels 的共享函数——`draw_row` 内部按同一个
+                // 函数给文字留出避让区，两者不会各算各的。
+                let tools = panels::row_tools_rect(row_rect, pal, scale, is_pinned_list);
                 at_rect(ui, tools, |ui| {
                     ui.horizontal_centered(|ui| {
                         if let Some(tool) =
@@ -1095,37 +1107,26 @@ fn draw_status_bar(
             rect.min.y,
             Stroke::new(pal.stroke_thin, pal.border_subtle),
         );
-        ui.horizontal(|ui| {
-            // 窄窗口降级提示优先占左侧：它解释的是「详情去哪了」，
-            // 与临时通知相比更影响用户对界面的理解。
-            if narrowed {
-                ui.label(
-                    RichText::new("窗口较窄 · 详情转为浮层，拉宽窗口可恢复三栏")
-                        .size(sized(pal.font_sm, scale).size)
-                        .color(pal.text_dim),
-                );
-            }
-            // 提示信息 3 秒后自动消失
-            if let Some((msg, at)) = &svc.state.notice {
-                let age = at.elapsed();
-                if age < Duration::from_secs(3) {
-                    let text = if !msg.is_empty() {
-                        msg.clone()
-                    } else {
-                        String::new()
-                    };
-                    if !text.is_empty() {
-                        ui.label(
-                            RichText::new(text)
-                                .color(pal.accent)
-                                .size(sized(pal.font_sm, scale).size),
-                        );
-                    }
-                } else {
-                    svc.state.notice = None;
-                }
-            }
+        // ⚠️ 左右两侧必须**先各自量宽、再各占一块矩形**，不能塞进同一个
+        // `ui.horizontal` 让 egui 分配。
+        //
+        // 早先把右侧按钮组用 `with_layout(right_to_left)` 放在同一个
+        // `horizontal` 末尾：左侧提示是 `ui.label`，它**只按自身内容要宽度、
+        // 不会因为右边还有东西而收缩**。于是提示文字直接铺过「设置」按钮，
+        // 右侧组被挤出客户区右缘（实测提示文字 x=0..249，设置按钮 x=255..288
+        // 越界 8pt，且提示左端被窗口边界裁掉）。
+        //
+        // 现在右侧宽度先算出来，左侧预算 = 总宽 - 右侧宽 - 间隙，再按预算截断。
+        // 两块矩形由各自持有，物理上不可能重叠。
+        let right_w = status_right_width(pal, scale);
+        let left_limit = (rect.width() - right_w - pal.space_md).max(0.0);
 
+        // ---- 右侧：监听状态 + 清空 + 设置，固定占右端 ----
+        let right_rect = Rect::from_min_max(
+            pos2(rect.max.x - right_w, rect.min.y),
+            pos2(rect.max.x, rect.max.y),
+        );
+        at_rect(ui, right_rect, |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // 「清空」是破坏性操作：垃圾桶图标 + 悬停说明，
                 // 悬停时用 danger 色与旁边的「设置」区分开。
@@ -1163,14 +1164,77 @@ fn draw_status_bar(
                 } else {
                     "监听已停止".to_string()
                 };
-                ui.label(
-                    RichText::new(text)
-                        .color(pal.text_dim)
-                        .size(sized(pal.font_xs, scale).size),
+                // 状态文字同样要按右侧预算截断，否则「监听中 · 拦截 10000」
+                // 这种长文案会把右侧区撑破。
+                let font = sized(pal.font_xs, scale);
+                let shown = titlebar::elide_text(ui, &text, &font, right_w);
+                ui.painter().text(
+                    pos2(right_rect.max.x, right_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    shown,
+                    font,
+                    pal.text_dim,
                 );
             });
         });
+
+        // ---- 左侧：窄窗口降级提示 + 临时通知 ----
+        //
+        // 提示优先（它解释的是「详情去哪了」，与临时通知相比更影响用户对
+        // 界面的理解），两者合并成一串后按 `left_limit` 截断：
+        // 窄窗口下预算可能只够几个字，这时它会变成「窗口…」，
+        // 而不是被裁掉左半边或压到右侧按钮上。
+        let mut hint = String::new();
+        let mut hint_is_notice = false;
+        if narrowed {
+            hint.push_str("窗口较窄 · 详情转为浮层，拉宽窗口可恢复三栏");
+        }
+        // 提示信息 3 秒后自动消失
+        if let Some((msg, at)) = &svc.state.notice {
+            let age = at.elapsed();
+            if age < Duration::from_secs(3) {
+                if !msg.is_empty() {
+                    if !hint.is_empty() {
+                        hint.push_str("  ·  ");
+                        hint_is_notice = true;
+                    }
+                    hint.push_str(msg);
+                }
+            } else {
+                svc.state.notice = None;
+            }
+        }
+        if !hint.is_empty() {
+            let font = sized(pal.font_sm, scale);
+            let shown = titlebar::elide_text(ui, &hint, &font, left_limit);
+            if !shown.is_empty() {
+                ui.painter().text(
+                    pos2(rect.min.x, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    shown,
+                    font,
+                    // 纯降级提示用弱化的 text_dim；混了通知则整体用 accent，
+                    // 与原来「通知是强调色」一致。
+                    if hint_is_notice { pal.accent } else { pal.text_dim },
+                );
+            }
+        }
     });
+}
+
+/// 状态栏右侧固定区（监听状态 + 清空 + 设置）的宽度（逻辑点）。
+///
+/// 左侧提示的预算由它减出来，所以它必须**覆盖所有右侧元素**，
+/// 且宁可略宽——略宽只是让提示早一点省略，宽了则会让提示压到按钮上。
+/// 与 [`draw_status_bar`] 里实际画的三样东西一一对应。
+fn status_right_width(pal: &Palette, scale: f32) -> f32 {
+    // 「设置」按钮：两个中文字 + 按钮内边距，与 egui small_button 观感一致。
+    let settings_w = (pal.font_sm * 2.0 + pal.space_md * 2.0) * scale;
+    // 监听状态文字，最坏情况「监听中 · 拦截 1024」（约 8 个全角 + 空格）。
+    let status_w = pal.font_xs * 9.0 * scale;
+    // 清空（垃圾桶）图标。
+    let trash_w = pal.icon_size * scale;
+    settings_w + status_w + trash_w + pal.space_sm * 2.0
 }
 
 /// 解析 `#RRGGBB`，失败时回退到默认强调色。

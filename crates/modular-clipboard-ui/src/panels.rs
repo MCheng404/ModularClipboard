@@ -201,6 +201,33 @@ pub struct RowTools {
     pub lock: bool,
 }
 
+/// 行右侧工具条占用的宽度（逻辑点）。
+///
+/// 文字截断与工具条定位**必须用同一个函数**算宽度：
+/// 早先两处各写一份 `control_height * 2.0`，一旦某边改了，
+/// 文字就会从按钮底下穿过去或者提前被截短。
+/// `pinned` 对应置顶列表（只有一个工具），与 [`draw_row`] 的调用方一致。
+pub fn row_tools_width(_ui: &Ui, _rect: Rect, pal: &Palette, scale: f32, pinned: bool) -> f32 {
+    if pinned {
+        pal.control_height * scale
+    } else {
+        pal.control_height * 2.0 * scale
+    }
+}
+
+/// 行右侧工具条的矩形。与 [`row_tools_width`] 同源。
+pub fn row_tools_rect(rect: Rect, pal: &Palette, scale: f32, pinned: bool) -> Rect {
+    let w = if pinned {
+        pal.control_height * scale
+    } else {
+        pal.control_height * 2.0 * scale
+    };
+    Rect::from_min_size(
+        pos2(rect.max.x - w - pal.space_xs, rect.min.y),
+        vec2(w, rect.height()),
+    )
+}
+
 /// 画行内工具条，返回用户触发了哪个。
 ///
 /// 未置顶时「取消置顶」置灰：点它不会有任何变化，
@@ -291,6 +318,7 @@ pub fn draw_row(
     scale: f32,
     alt: bool,
     meta: String,
+    pinned: bool,
 ) -> egui::Response {
     let bg = if selected {
         pal.row_selected
@@ -314,18 +342,50 @@ pub fn draw_row(
     }
 
     let inner = rect.shrink2(vec2(pal.space_sm, pal.space_xs * 0.5));
+
+    // ⚠️ 两行文字必须**各占一条水平带**，不能各自按 rect 定位。
+    //
+    // 早先这里把 preview 画在 `inner.center().y`（行正中）、meta 画在
+    // `inner.max.y - font_xs`（贴近行底）。行高 48pt 时这两条基线只差
+    // 约 16pt，而两行字号分别是 14pt 与 11pt —— **行高装不下两行**，
+    // 于是 preview 与 meta 纵向重叠。实机截图里那条
+    // `unigpxidc…` 与 `设置自定名…` 糊在一起的墨带就是这么来的。
+    //
+    // 现在显式分带：上带给 preview（较宽的字），下带给 meta，
+    // 两者都不允许越过各自带的边界。
+    let preview_font = sized(pal.font_md, scale);
+    let meta_font = sized(pal.font_xs, scale);
+    let band_gap = pal.space_xs * 0.5;
+    // meta 带的高度按其字号给足；剩下的全给 preview。
+    let meta_h = meta_font.size.max(1.0);
+    let meta_band = Rect::from_min_max(
+        pos2(inner.min.x, inner.max.y - meta_h),
+        pos2(inner.max.x, inner.max.y),
+    );
+    let preview_band = Rect::from_min_max(
+        inner.min,
+        pos2(inner.max.x, meta_band.min.y - band_gap),
+    );
+
+    // 文字区还要避开行右侧的工具按钮区，否则长文本会从按钮底下穿过。
+    let text_max_x =
+        (rect.max.x - row_tools_width(ui, rect, pal, scale, pinned)).max(inner.min.x);
+    let text_w = (text_max_x - preview_band.min.x - pal.icon_size).max(0.0);
+
+    let preview = crate::titlebar::elide_text(ui, &item.one_line_preview(), &preview_font, text_w);
     ui.painter().text(
-        pos2(inner.min.x + pal.icon_size, inner.center().y),
+        pos2(preview_band.min.x + pal.icon_size, preview_band.center().y),
         Align2::LEFT_CENTER,
-        item.one_line_preview(),
-        sized(pal.font_md, scale),
+        preview,
+        preview_font,
         if selected { pal.text_bright } else { pal.text },
     );
+    let meta_shown = crate::titlebar::elide_text(ui, &meta, &meta_font, text_w);
     ui.painter().text(
-        pos2(inner.min.x + pal.icon_size, inner.max.y - pal.font_xs),
-        Align2::LEFT_BOTTOM,
-        meta,
-        sized(pal.font_xs, scale),
+        pos2(meta_band.min.x + pal.icon_size, meta_band.center().y),
+        Align2::LEFT_CENTER,
+        meta_shown,
+        meta_font,
         pal.text_dim,
     );
 
