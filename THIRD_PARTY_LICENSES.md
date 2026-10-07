@@ -61,6 +61,25 @@ THE SOFTWARE.
   ascender=300 / descender=0 / lineGap=27。**注意**：epaint 读OS/2
   而非 `hhea`，`icons.rs` 的 `BASELINE_FACTOR` 正是基于这一点标定的。
 
+#### 本仓库对子集字体做的一处修复（`hmtx.lsb`）
+
+字体ello 导出的这份子集里，`hmtx` 表的 `leftSideBearing` **全部写成了 0**
+（个别 −4），而 `glyf` 里字形轮廓的真实 `xMin` 是 37/ 94/ 75 /……
+两者矛盾。后果是渲染器读到的 bearing为 0，`Drag`(grip-vertical，
+真实 bearing 19.65px) 被贴到笔尖上，在 64px 框里**横向偏左 21px（33%）**；
+`Close` 偏 7.7px、`Collapse`/`Expand` 各偏 15.7px。受影响的共 13 个字形。
+
+已按 `lsb == glyf.xMin` 修正 `hmtx`（13 个条目，字节数不变、文件仍4144
+字节；`glyf`/`cmap`/轮廓等一概未动）。修复后 `Drag` 的横向偏差降到
+-1.88px —— 那不再是错误，而是 `grip-vertical` 这个图标**自身**的设计
+不对称（竖排三列点阵本身就偏左 9 个字体单位）。
+
+⚠️ **重新生成字体时必须重做这件事**：fontello 的导出结果不可直接用，
+否则上面那13 个图标会重新横向错位。
+回归判据见 `crates/modular-clipboard-ui/src/icons.rs` 的
+`glyph_ink_is_centred_horizontally`（及配套的变异测试
+`horizontal_centering_would_catch_a_broken_lsb`）。
+
 #### 为什么不用其他图标集
 
 调研阶段评估过Feather / Lucide / Phosphor，最终选 Bootstrap Icons：

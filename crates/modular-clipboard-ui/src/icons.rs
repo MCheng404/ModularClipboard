@@ -483,6 +483,197 @@ mod tests {
         assert_ne!(Icon::Collapse.label(), Icon::Expand.label());
     }
 
+    /// epaint 排版后，某个码位的**墨迹四边形**（逻辑点）。
+    ///
+    /// 口径与 `epaint::text_layout::tessellate_glyphs` 完全一致：
+    /// `left_top = round(glyph.pos + glyph.uv_rect.offset)`，
+    /// 尺寸 `= glyph.uv_rect.size`。这是提交给 GPU 的原始四边形，
+    /// 不含任何推断——纵向的 [`glyph_ink_is_centred_in_its_box`] 用图集
+    /// 像素反推墨迹，而**横向**必须走这里：`uv_rect.offset.x` 就是字形的
+    /// bearing（左边距），它是「墨迹相对笔尖的位置」的唯一来源。
+    ///
+    /// 历史上这里出过一次真实事故：字体子集的 `hmtx` 表里lsb 全被写成 0
+    /// （而 `glyf` 里字形真实 xMin 是 37/94/75/…），epaint 读到的
+    /// `uv_rect.offset.x` 因此为 0，`Drag`（bearing 19.65px）被贴到笔尖上，
+    /// 在 64px 框里横向偏左 21px（-33%）。纵向断言完全测不到这个问题，
+    /// 所以必须有这条独立判据。
+    fn glyph_ink_quad(ctx: &egui::Context, cp: char, size: f32) -> Rect {
+        let text = cp.to_string();
+        let job = egui::text::LayoutJob {
+            text: text.clone(),
+            sections: vec![egui::text::LayoutSection {
+                leading_space: 0.0,
+                byte_range: egui::text::ByteIndex(0)..egui::text::ByteIndex(text.len()),
+                format: egui::TextFormat {
+                    font_id: egui::FontId::proportional(size),
+                    ..Default::default()
+                },
+            }],
+            wrap: egui::text::TextWrapping {
+                max_width: f32::INFINITY,
+                max_rows: usize::MAX,
+                overflow_character: Some('\u{2026}'),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let galley = ctx.fonts_mut(|f| f.layout_job(job));
+        let g = &galley.rows[0].row.glyphs[0];
+        let left_top: egui::Pos2 = (g.pos + g.uv_rect.offset).round();
+        Rect::from_min_max(left_top, left_top + g.uv_rect.size)
+    }
+
+    #[test]
+    fn glyph_ink_is_centred_horizontally() {
+        // 横向居中回归测试。纵向有 [`glyph_ink_is_centred_in_its_box`]，
+        // 但那条走图集像素反推，**测不到 bearing 丢失**——墨迹整体平移
+        // 不会改变它量出的上下留白。这里直接读 epaint 摆好的四边形。
+        //
+        // # 阈值 3.0px 的来源（不是「放宽到能过」）
+        //
+        // 字体**自身固有**的墨迹 x 中心与 em 中心（150）的偏差，
+        // 从 `glyf` 直读后换算到 64px 框：
+        //
+        // | 图标| 墨迹 x 中心 | 偏差 |
+        // |---|---|---|
+        // | `Drag`（grip-vertical） | 141.0 | **-1.88px** |
+        // | `Pinned` / `Unpinned` | 154.5 | +0.94px |
+        // | `Text` | 152.5 | +0.52px |
+        // | 其余 14 个 | 150.0 | 0 |
+        //
+        // `Drag` 的竖排三列点阵本身就偏左 9 个字体单位（3%），这是
+        // Bootstrap Icons 的设计意图，**不该被补偿抹平**——补偿只能整体
+        // 平移。所以阈值必须 ≥ 1.88 + 取整余量 ≈ 2.4px，这里取 3.0px。
+        //
+        // 3.0px 仍远小于真正的事故量级：`hmtx.lsb` 被写坏时 `Drag`
+        // 实测 -21px（占边长 33%）。两者有 7 倍差距，且下面那条变异
+        // 测试证明它真能抓到那种情况。
+        let ctx = icon_ctx();
+        let side = 64.0f32;
+        let font_size = side * INK_FIT;
+
+        for &icon in Icon::ALL {
+            let ink = glyph_ink_quad(&ctx, icon.codepoint(), font_size);
+            // `layout_job` 返回的 galley 已按`Align2::CENTER_CENTER`
+            // 对齐好，单字形 galley 宽度 = advance = em = font_size。
+            // galley 坐标里「墨迹中心 - 布局中心」= `ink_left + w/2 - adv/2`，
+            // 其中 `ink_left = pos.x + uv_rect.offset.x`，`offset.x` 即 bearing。
+            let adv = ctx
+                .fonts_mut(|f| f.glyph_width(&egui::FontId::proportional(font_size), icon.codepoint()));
+            let dx = (ink.min.x + ink.width() / 2.0) - adv / 2.0;
+            assert!(
+                dx.abs() <= 3.0,
+                "{icon:?} 墨迹横向偏心 {dx:.2}px（超过 3.0px；若达十几 px \
+                 多半是 hmtx.lsb 丢失，即 bearing 未生效）\
+                 墨迹盒 {ink:?}，advance {adv:.2}"
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_centering_would_catch_a_broken_lsb() {
+        // 变异测试：把 `hmtx` 的 lsb 写坏（复现子集化事故）后，
+        // 上面那条**必须**失败。否则它就是一条假测试。
+        //
+        // 手法：直接改字节。`ICON_TTF` 里`hmtx` 的位置由表目录给出，
+        // 这里不硬编码偏移，而是搜索 `glyf` 表里每个字形头部的 xMin，
+        // 再把 `hmtx` 对应条目置 0——与事故现场的写法一致。
+        let mut bytes = ICON_TTF.to_vec();
+
+        // 定位 hmtx 表：表目录里tag == "hmtx"。
+        let num_tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+        let mut hmtx: Option<(usize, usize)> = None;
+        for i in 0..num_tables {
+            let rec = 12 + 16 * i;
+            if &bytes[rec..rec + 4] == b"hmtx" {
+                let off = u32::from_be_bytes([
+                    bytes[rec + 8],
+                    bytes[rec + 9],
+                    bytes[rec + 10],
+                    bytes[rec + 11],
+                ]) as usize;
+                let len = u32::from_be_bytes([
+                    bytes[rec + 12],
+                    bytes[rec + 13],
+                    bytes[rec + 14],
+                    bytes[rec + 15],
+                ]) as usize;
+                hmtx = Some((off, len));
+            }
+        }
+        let (hmtx_off, hmtx_len) = hmtx.expect("字体里没有 hmtx 表");
+
+        // 把 lsb 全清零。`numHMetrics` 之前的条目是 (advance:i16, lsb:i16)，
+        // 之后是纯 lsb 数组——两种布局都要覆盖。
+        let hhea_off = {
+            let mut o = None;
+            for i in 0..num_tables {
+                let rec = 12 + 16 * i;
+                if &bytes[rec..rec + 4] == b"hhea" {
+                    o = Some(u32::from_be_bytes([
+                        bytes[rec + 8],
+                        bytes[rec + 9],
+                        bytes[rec + 10],
+                        bytes[rec + 11],
+                    ]) as usize);
+                }
+            }
+            o.expect("字体里没有 hhea 表")
+        };
+        let num_h_metrics = u16::from_be_bytes([
+            bytes[hhea_off + 34],
+            bytes[hhea_off + 35],
+        ]) as usize;
+        for i in 0..hmtx_len / 2 {
+            let p = if i < num_h_metrics {
+                hmtx_off + 4 * i + 2
+            } else {
+                hmtx_off + 4 * num_h_metrics + 2 * (i - num_h_metrics)
+            };
+            bytes[p] = 0;
+            bytes[p + 1] = 0;
+        }
+
+        // 用这份「坏字体」重建 Context，重复横向判据。
+        let broken = egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
+            y_offset_factor: BASELINE_FACTOR,
+            ..Default::default()
+        });
+        let ctx = egui::Context::default();
+        let mut defs = egui::FontDefinitions::default();
+        defs.font_data.insert(
+            ICON_FONT_NAME.to_string(),
+            std::sync::Arc::new(broken),
+        );
+        defs.families.insert(
+            egui::FontFamily::Proportional,
+            vec![ICON_FONT_NAME.to_string()],
+        );
+        ctx.set_fonts(defs);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+
+        let side = 64.0f32;
+        let mut worst = 0.0f32;
+        let mut worst_icon = Icon::Close;
+        for &icon in Icon::ALL {
+            let ink = glyph_ink_quad(&ctx, icon.codepoint(), side * INK_FIT);
+            let adv = ctx.fonts_mut(|f| {
+                f.glyph_width(&egui::FontId::proportional(side * INK_FIT), icon.codepoint())
+            });
+            let dx = (ink.center().x - adv / 2.0) - (side - adv) / 2.0;
+            if dx.abs() > worst {
+                worst = dx.abs();
+                worst_icon = icon;
+            }
+        }
+        assert!(
+            worst > 1.5,
+            "把 hmtx.lsb 清零后横向判据仍然通过（最差 {worst:.2}px @ {worst_icon:?}）——\
+             glyph_ink_is_centred_horizontally 是假测试"
+        );
+    }
+
     /// 某个图标渲染出来的四边形在屏幕上的矩形，以及它在图集里的 UV 矩形。
     ///
     /// 返回 `(屏幕矩形, UV 矩形)`。两者缺一不可：
