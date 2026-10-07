@@ -19,7 +19,7 @@
 //! let input = DrawInput {
 //!     vertex_buffer: vk::Buffer::null(),
 //!     index_buffer: vk::Buffer::null(),
-//!     batches: &[DrawBatch { index_offset: 0, index_count: 3 }],
+//!     batches: &[DrawBatch { index_offset: 0, index_count: 3, clip: None }],
 //!     ..Default::default()
 //! };
 //! fr.record(&input)?;
@@ -187,14 +187,37 @@ pub enum AcquireOutcome {
 
 /// 绘制批次：索引缓冲上的一段连续区间，对应一次 `draw_indexed`。
 ///
-/// egui 的裁剪矩形在 CPU 侧 tessellation 时就已反映为「被裁掉的顶点
-/// 不进入网格」，因此这里不需要逐批次的 scissor。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// # ⚠️ 裁剪必须由 GPU scissor 逐批次设置
+///
+/// 早前的假设是「egui 的裁剪矩形在 CPU 侧 tessellation 时就已反映为
+/// 被裁掉的顶点不进入网格」。**这个假设是错的**，代价是整个 UI 的裁剪
+/// 全部失效：
+///
+/// 1. epaint 0.36 的 tessellator **不裁剪几何**。`tessellate_path` 只把
+///    路径展平成三角形，`clip_rect` 仅作为 `ClippedPrimitive` 的元数据
+///    存在（`TessellationOptions::debug_ignore_clip_rects` 只是调试开关，
+///    默认路径不做几何裁剪）。
+/// 2. 官方后端（egui-wgpu / egui_glow）靠**逐批次 `set_scissor_rect`** 生效。
+/// 3. 本项目原先只发一次**全屏** scissor（跟随交换链尺寸），
+///    等于谁的裁剪都不生效。
+///
+/// 症状：所有 `ui.painter_at(rect)` 的裁剪形同虚设——文字溢出面板、
+/// 浮层压住下层内容、滚动区内容画到区外，且**不产生任何 GPU 错误**
+/// （scissor 本来就是合法状态，只是范围给大了）。
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DrawBatch {
     /// 索引缓冲中的起始索引。
     pub index_offset: u32,
     /// 索引个数。为 0 的批次会被跳过（`draw_indexed` 传 0 是未定义行为）。
     pub index_count: u32,
+    /// 本批次的裁剪矩形，**已是物理像素**、客户区坐标系、原点左上。
+    ///
+    /// 换算由调用方（`modular-clipboard-ui::renderer`）完成：那里同时
+    /// 持有 `ppp` 与交换链尺寸，换算成物理像素后本模块无需知道 ppp，
+    /// `DrawInput` 签名也就不必变。
+    ///
+    /// `None` 表示「不额外裁剪」（沿用全屏 scissor）。
+    pub clip: Option<vk::Rect2D>,
 }
 
 /// 一帧的绘制输入。
@@ -245,6 +268,8 @@ impl<'a> DrawInput<'a> {
             batches: &[DrawBatch {
                 index_offset: 0,
                 index_count: 3,
+                // 不额外裁剪（沿用全屏 scissor）。仅测试/便捷构造用。
+                clip: None,
             }],
             ..Default::default()
         }
@@ -1175,7 +1200,14 @@ impl<'a> FrameRenderer<'a> {
             device.cmd_bind_index_buffer(cmd, index_buffer, index_offset, index_type);
         }
         for batch in drawable {
+            // ⚠️ 逐批次 scissor：这是 UI 裁剪**唯一**生效的地方。
+            //
+            // 上面那次全屏 scissor 只是给「清屏后第一批」一个合理初值；
+            // 每个批次开始前必须按自己的 clip 重设，否则所有
+            // `ui.painter_at(rect)` 的裁剪都会被全屏范围覆盖掉。
+            let rect = batch.clip.unwrap_or(scissor);
             unsafe {
+                device.cmd_set_scissor(cmd, 0, std::slice::from_ref(&rect));
                 device.cmd_draw_indexed(cmd, batch.index_count, 1, batch.index_offset, 0, 0);
             }
         }
@@ -2112,10 +2144,12 @@ mod tests {
                 DrawBatch {
                     index_offset: 0,
                     index_count: 0,
+                    clip: None,
                 },
                 DrawBatch {
                     index_offset: 3,
                     index_count: 6,
+                    clip: None,
                 },
             ],
             ..Default::default()

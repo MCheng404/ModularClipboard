@@ -98,10 +98,55 @@ pub struct Batch {
 }
 
 impl Batch {
-    pub fn to_draw(self) -> modular_clipboard_gfx::frame::DrawBatch {
+    /// 转成提交给渲染层的批次，并把裁剪矩形换算成**物理像素**。
+    ///
+    /// # 为什么必须在这里换算
+    ///
+    /// `prim.clip_rect` 是**逻辑点**，而 `vk::Rect2D` 要的是物理像素且
+    /// 取整。渲染层（`gfx::frame`）不持有 `ppp`，所以换算只能在这里做。
+    ///
+    /// #⚠️ 换算里的三个坑
+    ///
+    /// 1. **负坐标必须钳到 0**。`painter_at` 允许传入屏幕外/负值的矩形
+    ///    （例如浮层被拖到窗口左侧），`offset` 为负会让 `cmd_set_scissor`
+    ///    触发 Vulkan 的 `vk::Scissor` 非法值（`x + extent <= x`），
+    ///    规范下属于**未定义行为**——可能整帧不渲染或校验层报错。
+    /// 2. **宽高必须至少 1 像素**。宽度为 0 的 scissor 是合法的「什么都不画」，
+    ///    但 `extent` 为 0 且 `offset` 也为 0 时同样踩到上面的边界条件；
+    ///    钳成 0×0 会被下面 `if w == 0` 分支整体跳过，语义更明确。
+    /// 3. **必须与交换链尺寸求交**。裁剪矩形超出视口时 Vulkan 会把
+    ///    矩形裁到视口内（这是合法的），但显式求交能让「整块被裁掉」
+    ///    的情形走跳过分支，省掉一次 `draw_indexed`。
+    pub fn to_draw(self, extent: vk::Extent2D, pixels_per_point: f32) -> modular_clipboard_gfx::frame::DrawBatch {
+        let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            pixels_per_point
+        } else {
+            1.0
+        };
+        let c = self.clip;
+        let x0 = (c.min.x * ppp).floor().max(0.0) as i32;
+        let y0 = (c.min.y * ppp).floor().max(0.0) as i32;
+        let x1 = (c.max.x * ppp).ceil().max(0.0) as i32;
+        let y1 = (c.max.y * ppp).ceil().max(0.0) as i32;
+        // 与视口求交（extent 是 u32，转 i64 避免溢出）。
+        let vw = extent.width as i64;
+        let vh = extent.height as i64;
+        let x0 = x0.clamp(0, vw as i32);
+        let y0 = y0.clamp(0, vh as i32);
+        let x1 = x1.clamp(0, vw as i32);
+        let y1 = y1.clamp(0, vh as i32);
+        let w = (x1 - x0).max(0) as u32;
+        let h = (y1 - y0).max(0) as u32;
+
         modular_clipboard_gfx::frame::DrawBatch {
             index_offset: self.index_offset,
             index_count: self.index_count,
+            // 宽或高为 0 ⇒ 整批被裁掉，用零 scissor（合法的「不画」）
+            // 而不是 `None`：后者会退回全屏，等于裁剪没生效。
+            clip: Some(vk::Rect2D {
+                offset: vk::Offset2D { x: x0, y: y0 },
+                extent: vk::Extent2D { width: w, height: h },
+            }),
         }
     }
 }
@@ -481,7 +526,11 @@ impl<'a> Painter<'a> {
 
         // ---- 录制绘制 ----------------------------------------------------
         self.draw_batches.clear();
-        self.draw_batches.extend(self.batches.iter().map(|b| b.to_draw()));
+        self.draw_batches.extend(
+            self.batches
+                .iter()
+                .map(|b| b.to_draw(fr.extent(), pixels_per_point)),
+        );
         let input = DrawInput {
             vertex_buffer: self.slots.vertex_buffer(slot),
             index_buffer: self.slots.index_buffer(slot),
@@ -1325,9 +1374,204 @@ mod tests {
             clip: rect_at(0.0),
             tex_id: THUMB_TEX,
         };
-        let d = b.to_draw();
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        let d = b.to_draw(extent, 1.0);
         assert_eq!(d.index_offset, 4);
         assert_eq!(d.index_count, 6);
+    }
+
+    // ---- 裁剪矩形换算 --------------------------------------------------
+    //
+    // 这组测试守的是「UI 裁剪真的生效」这条链路的换算端。
+    // 缺陷历史：clip_rect 曾被完全忽略（只用于合批判定），
+    // 导致所有 painter_at 裁剪形同虚设、文字溢出面板。
+
+    fn clip_of(r: egui::Rect) -> egui::Rect {
+        r
+    }
+
+    #[test]
+    fn clip_scales_by_ppp_into_physical_pixels() {
+        // 逻辑点 (10,20)-(110,70)，ppp=1.5 ⇒ 物理 (15,30)-(165,105)
+        let b = Batch {
+            index_offset: 0,
+            index_count: 3,
+            clip: clip_of(egui::Rect::from_min_max(
+                egui::pos2(10.0, 20.0),
+                egui::pos2(110.0, 70.0),
+            )),
+            tex_id: FONT_TEXTURE_ID,
+        };
+        let d = b.to_draw(
+            vk::Extent2D {
+                width: 900,
+                height: 800,
+            },
+            1.5,
+        );
+        let c = d.clip.expect("必须带裁剪矩形，否则裁剪等于没做");
+        assert_eq!((c.offset.x, c.offset.y), (15, 30));
+        assert_eq!((c.extent.width, c.extent.height), (150, 75));
+    }
+
+    #[test]
+    fn clip_negative_origin_is_clamped_to_zero() {
+        // 浮层被拖到窗口左侧：x 为负。
+        // Vulkan 的 scissor 要求 x + width > x，负 offset 属未定义行为，
+        // 必须钳到 0 而不是原样传下去。
+        let b = Batch {
+            index_offset: 0,
+            index_count: 3,
+            clip: clip_of(egui::Rect::from_min_max(
+                egui::pos2(-50.0, -20.0),
+                egui::pos2(30.0, 40.0),
+            )),
+            tex_id: FONT_TEXTURE_ID,
+        };
+        let d = b.to_draw(
+            vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+            1.0,
+        );
+        let c = d.clip.expect("必须带裁剪矩形");
+        assert_eq!(c.offset.x, 0, "负 x 必须钳到 0");
+        assert_eq!(c.offset.y, 0, "负 y 必须钳到 0");
+        // 原矩形 x∈[-50,30]、y∈[-20,40]；钳位后可见部分
+        // 是 x∈[0,30]、y∈[0,40] ⇒ 宽 30、高 40。
+        // ⚠️ 期望值是「钳位后的可见区域」，不是原矩形的宽高——
+        //   写成 80/60（原点 + 原宽高）会算出一个延伸到 x=80 的
+        //   矩形，把本该被裁掉的部分又画回来。
+        assert_eq!(c.extent.width, 30, "宽度应是钳位后与视口相交的部分");
+        assert_eq!(c.extent.height, 40);
+    }
+
+    #[test]
+    fn clip_fully_outside_viewport_becomes_zero_area_not_fullscreen() {
+        // ⚠️ 这一条是「裁剪失效」与「裁剪生效」的分界：
+        // 整块被裁掉时若退回 `None`（= 全屏），文字就会重新画到窗口上。
+        let b = Batch {
+            index_offset: 0,
+            index_count: 3,
+            clip: clip_of(egui::Rect::from_min_max(
+                egui::pos2(5000.0, 5000.0),
+                egui::pos2(6000.0, 6000.0),
+            )),
+            tex_id: FONT_TEXTURE_ID,
+        };
+        let d = b.to_draw(
+            vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+            1.0,
+        );
+        let c = d.clip.expect("必须是 Some(零面积)，不能是 None");
+        assert_eq!((c.offset.x, c.offset.y), (800, 600));
+        assert_eq!((c.extent.width, c.extent.height), (0, 0));
+    }
+
+    #[test]
+    fn clip_is_intersected_with_viewport() {
+        // 右侧超出视口：显式求交，避免依赖 Vulkan 的隐式裁剪。
+        let b = Batch {
+            index_offset: 0,
+            index_count: 3,
+            clip: clip_of(egui::Rect::from_min_max(
+                egui::pos2(700.0, 100.0),
+                egui::pos2(2000.0, 200.0),
+            )),
+            tex_id: FONT_TEXTURE_ID,
+        };
+        let d = b.to_draw(
+            vk::Extent2D {
+                width: 800,
+                height: 600,
+            },
+            1.0,
+        );
+        let c = d.clip.expect("必须带裁剪矩形");
+        assert_eq!(c.extent.width, 100, "右缘应被视口右边界截断");
+        assert_eq!(c.extent.height, 100);
+    }
+
+    #[test]
+    fn clip_survives_degenerate_ppp() {
+        // ppp 传0 / NaN / 负数时不能变成 0 宽或 panic，
+        // 否则整个界面会在一次异常 ppp 后变成空白。
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            let b = Batch {
+                index_offset: 0,
+                index_count: 3,
+                clip: clip_of(egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(100.0, 50.0),
+                )),
+                tex_id: FONT_TEXTURE_ID,
+            };
+            let d = b.to_draw(
+                vk::Extent2D {
+                    width: 800,
+                    height: 600,
+                },
+                bad,
+            );
+            let c = d.clip.expect("退化 ppp 也必须带裁剪矩形");
+            assert!(
+                c.extent.width > 0 && c.extent.height > 0,
+                "ppp={bad} 时裁剪矩形退化为零面积，界面会变空白"
+            );
+        }
+    }
+
+    #[test]
+    fn every_batch_carries_a_clip_rect() {
+        // 合批后每个批次都必须有 clip：漏一个就等于那一段不裁剪。
+        let prims = vec![
+            prim_with_clip(egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(50.0, 50.0),
+            )),
+            prim_with_clip(egui::Rect::from_min_max(
+                egui::pos2(60.0, 0.0),
+                egui::pos2(120.0, 50.0),
+            )),
+        ];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+        assert!(b.len() >= 2, "不同 clip 不应合批");
+        let extent = vk::Extent2D {
+            width: 800,
+            height: 600,
+        };
+        for batch in &b {
+            assert!(
+                batch.to_draw(extent, 1.0).clip.is_some(),
+                "每个批次都必须带 clip，否则该段不裁剪"
+            );
+        }
+    }
+
+    /// 造一个带指定裁剪矩形的最小图元（一个 2x2 的矩形网格）。
+    fn prim_with_clip(clip: egui::Rect) -> egui::epaint::ClippedPrimitive {
+        use egui::epaint::{Color32, Mesh, Primitive, Vertex};
+        let mut mesh = Mesh::default();
+        for (x, y) in [(0.0f32, 0.0f32), (10.0, 0.0), (0.0, 10.0), (10.0, 10.0)] {
+            mesh.vertices.push(Vertex {
+                pos: egui::pos2(x, y),
+                uv: egui::pos2(0.0, 0.0),
+                color: Color32::WHITE,
+            });
+        }
+        mesh.indices.extend_from_slice(&[0, 1, 2, 1, 3, 2]);
+        egui::epaint::ClippedPrimitive {
+            primitive: Primitive::Mesh(mesh),
+            clip_rect: clip,
+        }
     }
 
     #[test]

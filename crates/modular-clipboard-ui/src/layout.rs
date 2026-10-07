@@ -50,6 +50,14 @@ pub const DOCK_ZONE_THRESHOLD: f32 = 48.0;
 /// 比不允许拖更糟。
 pub const MIN_FLOAT_SIZE: Vec2 = Vec2::new(160.0, 100.0);
 
+/// 详情浮层必须给历史列表留出的最小宽度比例。
+///
+/// 浮层盖住部分停靠面板是浮层的本职，但**必须给历史列表留一条可视带**：
+/// 否则在窄窗口里浮层会占满整个客户区，列表既看不见也点不到，
+/// 降级就退化成了「什么都干不了」。窗口宽裕时按
+/// [`MIN_HISTORY_WIDTH`] 给足，窄时退化成这个比例。
+pub const FLOAT_DETAIL_MIN_LIST_RATIO: f32 = 0.3;
+
 /// 停靠槽位最小宽度（逻辑点）。
 ///
 /// 窄于此值时列表里的预览文字会被压成竖条，此时折叠比压窄更好。
@@ -511,43 +519,135 @@ impl Tier {
     /// **阈值由它算出来**，而不是另拍一组魔数：三段保底 + 分隔条。
     /// 这样改了 [`Panel::min_width`] 阶梯会自动跟着变，
     /// 不会出现「保底改了、阈值忘了改」的错位。
+    ///
+    /// # 分隔条口径必须与 `solve` 完全一致
+    ///
+    /// 本函数数出的分隔条总数交给 [`Occupancy::n_splitters`]，
+    /// 而 `solve` 从 `usable` 里扣的**也是**同一个值。两者一旦分叉，
+    /// 就会出现「`tier_for` 以为这档装得下、`solve` 却分配不出来」的错位——
+    /// 表现为面板被压到低于自己的保底，或直接越出客户区。
+    ///
+    /// ⚠️ 早前版本只数段内分隔条、**漏了「左|中」「中|右」两条段间分隔条**，
+    /// 于是每个阈值系统性偏低 12 逻辑点：`tier_for` 在 338 逻辑点就选中
+    /// 「三栏全展开」，而那一档实际需要 350。实测在 600 逻辑点、
+    /// 详情与侧栏都展开时右段越过 `body.max.x` 6 点。
     pub fn min_required_width(self, state: &LayoutState) -> f32 {
-        let mut total = 0.0;
-        let mut n_splitters = 0usize;
-        for slot in [Slot::Left, Slot::Center, Slot::Right] {
-            let mut seg = 0.0;
-            // 段内**占位**成员数：折叠成员也占位（把手），
-            // 但宽度为 0 的不算——它不需要分隔条。
-            let mut n_occupied = 0usize;
-            for p in Panel::ALL {
-                let i = panel_index(p);
-                let Placement::Docked { slot: s, .. } = state.placement[i] else {
-                    continue;
-                };
-                if s != slot {
-                    continue;
-                }
-                let w = match self.visibility(state, p) {
-                    Visibility::Docked => {
-                        n_occupied += 1;
-                        p.min_width()
-                    }
-                    Visibility::Collapsed => {
-                        let w = p.collapsed_width();
-                        if w > 0.0 {
-                            n_occupied += 1;
-                        }
-                        w
-                    }
-                    Visibility::Hidden => 0.0,
-                };
-                seg += w;
-            }
-            n_splitters += n_occupied.saturating_sub(1);
-            total += seg;
-        }
-        total + n_splitters as f32 * SPLITTER_WIDTH
+        let groups = groups_of(state, self);
+        let occ = occupancy(&groups, state, self);
+        // `segment_floor` **已经**把每段的段内分隔条算进去了，
+        // 因此这里只补**段间**那两条（`left|中`、`中|右`）。
+        // 早前版本补的是 `n_splitters` 全量，等于把段内分隔条重复计入
+        // ——详情与侧栏都折叠的右段有 1 条段内缝，会被数成 2 条，
+        // 阈值多出 6 逻辑点（「三栏全展开」从应有的 350 被抬到 356）。
+        segments_floor(&groups, state, self).iter().sum::<f32>()
+            + occ.n_inter_splitters() as f32 * SPLITTER_WIDTH
     }
+}
+
+/// 按槽位把仍在主布局里的模块分组（**同一套可见性判据**）。
+///
+/// `solve`、`tier_for` 与 `min_required_width` 都必须经由它取分组：
+/// 三处各写一份过滤条件，历史上已经因此算错过分隔条数量。
+fn groups_of(state: &LayoutState, tier: Tier) -> [Vec<Panel>; 3] {
+    let mut groups: [Vec<Panel>; 3] = [vec![], vec![], vec![]];
+    for p in Panel::ALL {
+        let i = panel_index(p);
+        let Placement::Docked { slot, .. } = state.placement[i] else {
+            continue;
+        };
+        if tier.visibility(state, p) == Visibility::Hidden {
+            continue;
+        }
+        let idx = match slot {
+            Slot::Left => 0,
+            Slot::Center => 1,
+            Slot::Right => 2,
+        };
+        groups[idx].push(p);
+    }
+    groups
+}
+
+/// 某档下三段的占位情况与分隔条计数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Occupancy {
+    /// 每段「占位」成员数（索引 0/1/2 = 左/中/右）。
+    pub per_segment: [usize; 3],
+    /// **段间**分隔条数（「左|中」「中|右」各一条，最多 2）。
+    ///
+    /// 段内分隔条不在这里：它由 [`segment_floor`] 逐段计入，
+    /// 两处都算就会重复。
+    pub n_inter: usize,
+}
+
+impl Occupancy {
+    /// 某段是否占位（至少有一个宽度 > 0 的成员）。
+    fn occupied(&self, seg: usize) -> bool {
+        self.per_segment[seg] > 0
+    }
+
+    /// 段间分隔条数。
+    fn n_inter_splitters(&self) -> usize {
+        self.n_inter
+    }
+
+    /// 分隔条**总数**（段内 + 段间）。
+    ///
+    /// 这是 `solve` 从 `usable` 里要扣掉的量：`split_within` 逐段扣段内那部分，
+    /// 段间那两条由 `gap_left_center` / `gap_center_right` 扣。
+    pub fn n_splitters(&self, groups: &[Vec<Panel>; 3], state: &LayoutState, tier: Tier) -> usize {
+        let intra: usize = groups
+            .iter()
+            .map(|g| occupied_count(g, state, tier).saturating_sub(1))
+            .sum();
+        intra + self.n_inter
+    }
+}
+
+/// 数出每段占位成员数与段间分隔条数。
+///
+/// # 为什么不把段内分隔条也算在这里
+///
+/// 段内分隔条已经由 [`segment_floor`] 计入每一段的保底。
+/// 若这里再计一次，`Tier::min_required_width` 就会把段内缝数两遍，
+/// 阈值凭空多出 6 逻辑点/段。
+fn occupancy(groups: &[Vec<Panel>; 3], state: &LayoutState, tier: Tier) -> Occupancy {
+    let per_segment = [
+        occupied_count(&groups[0], state, tier),
+        occupied_count(&groups[1], state, tier),
+        occupied_count(&groups[2], state, tier),
+    ];
+    let inter = usize::from(per_segment[0] > 0 && per_segment[1] > 0)
+        + usize::from(per_segment[1] > 0 && per_segment[2] > 0);
+    Occupancy {
+        per_segment,
+        n_inter: inter,
+    }
+}
+
+/// 一段里「占位」的成员数：展开的算，折叠后宽度 > 0 的算，隐藏的不算。
+fn occupied_count(members: &[Panel], state: &LayoutState, tier: Tier) -> usize {
+    members
+        .iter()
+        .filter(|p| match tier.visibility(state, **p) {
+            Visibility::Docked => true,
+            Visibility::Collapsed => p.collapsed_width() > 0.0,
+            Visibility::Hidden => false,
+        })
+        .count()
+}
+
+/// 三段各自的保底宽度（含各自段内分隔条）。
+fn segments_floor(
+    groups: &[Vec<Panel>; 3],
+    state: &LayoutState,
+    tier: Tier,
+) -> [f32; 3] {
+    [
+        segment_floor(&groups[0], state, tier),
+        segment_floor(&groups[1], state, tier),
+        segment_floor(&groups[2], state, tier),
+    ]
 }
 
 /// 按可用宽度选出降级档位。
@@ -659,9 +759,28 @@ pub fn solve(area: Rect, state: &LayoutState, dragging: Option<Rect>) -> Solved 
     // 详情在窄窗口下自动转浮层：给它一个「贴着右边缘、居中 vertically」
     // 的矩形。位置每次都从 `body` 现算，因此窗口变大后档位回到 Full，
     // 它自然回到右段——用户不需要做任何撤销操作。
+    //
+    // ⚠️ 浮层宽度**必须给历史列表留一条可视带**。
+    // 「浮层盖住部分停靠面板」是浮层的本职（它就是浮在上面），
+    // 但它不能盖住**整个**窗口：早前版本宽度只按
+    // `MIN_DETAIL_WIDTH.min(body.width())` 取小、随后又用
+    // `.max(MIN_FLOAT_SIZE.x.min(body.width()))` 兜底，
+    // 于是在 160 逻辑点宽的窗口里浮层恰好 160 = 整个客户区宽，
+    // 历史列表被完全遮住——既看不见也点不到，
+    // 「降级」退化成了「什么都干不了」。
+    //
+    // 上下界的**先后顺序是关键**：先减去「必须留给列表的条」，
+    // 再在这之内取舒适宽。若反过来用 `.max(MIN_FLOAT_SIZE.x)` 兜底，
+    // 兜底会直接把封顶顶掉——极窄窗口下正是如此。
     if tier.detail_is_floating(state) {
         let i = panel_index(Panel::Detail);
-        let w = MIN_DETAIL_WIDTH.min(body.width()).max(MIN_FLOAT_SIZE.x.min(body.width()));
+        // 必须留给历史列表的宽度：能显示内容时给足保底，
+        // 窗口太窄则退化成按比例给 30%。
+        let keep = MIN_HISTORY_WIDTH.min(body.width() * FLOAT_DETAIL_MIN_LIST_RATIO);
+        let w = MIN_DETAIL_WIDTH
+            .min(body.width())
+            .min((body.width() - keep).max(0.0))
+            .max(MIN_FLOAT_SIZE.x.min((body.width() - keep).max(0.0)));
         let h = (body.height() * 0.8).max(MIN_FLOAT_SIZE.y).min(body.height());
         out.floating[i] = Some(Rect::from_min_size(
             egui::pos2(
@@ -673,85 +792,23 @@ pub fn solve(area: Rect, state: &LayoutState, dragging: Option<Rect>) -> Solved 
     }
 
     // ---- 停靠模块：按槽位分组 ----
-    // 槽内按 Panel::ALL 顺序排，保证同一槽位的相对次序不随拖动而乱。
     //
-    // ⚠️ `docked` 必须按**同一套可见性判据**过滤。旧版这里只过滤
-    // 「非浮动」，而分配宽度时用的是「非折叠」的成员数，两个集合大小不同，
-    // 于是 `splitter_total` 多算了分隔条，`usable` 偏小，
-    // 三段宽度之和必然超出 `body.width()`。
-    let docked: Vec<Panel> = Panel::ALL
-        .iter()
-        .copied()
-        .filter(|p| {
-            !state.placement[panel_index(*p)].is_floating()
-                && tier.visibility(state, *p) != Visibility::Hidden
-        })
-        .collect();
+    // ⚠️ 分组与分隔条计数必须与 [`Tier::min_required_width`] **同源**。
+    // 旧版这里自己写了一份过滤 + 一份分隔条计数，与阈值侧口径不同
+    // （阈值侧漏数段间那两条），于是 `tier_for` 选出的档位比实际
+    // 可用的多 12 逻辑点，表现为面板被压到低于保底或越出客户区。
+    let groups = groups_of(state, tier);
 
-    let mut groups: Vec<(Slot, Vec<Panel>)> = vec![
-        (Slot::Left, vec![]),
-        (Slot::Center, vec![]),
-        (Slot::Right, vec![]),
-    ];
-    for p in docked.iter().copied() {
-        let slot = match state.placement[panel_index(p)] {
-            Placement::Docked { slot, .. } => slot,
-            Placement::Floating { .. } => continue,
-        };
-        if let Some(g) = groups.iter_mut().find(|(s, _)| *s == slot) {
-            g.1.push(p);
-        }
-    }
-
-    // 分隔条总数：**只数真正占位的相邻对**。
-    //
-    // ⚠️ 必须按**同一套可见性判据**数。旧版用 `docked.len() - 1`，
-    // 而 `docked` 当时只过滤了「非浮动」——把 `Hidden`（被降级隐藏）
-    // 和宽度为 0 的折叠成员也算进去了，`usable` 因此被多扣几个
-    // `SPLITTER_WIDTH`，三段之和必然超出 `body.width()`。
-    //
-    // 这里数的是「每段内占位成员的相邻对」，与下面真正画出的分隔条一一对应。
-    let n_splitters: usize = [&groups[0].1, &groups[1].1, &groups[2].1]
-        .iter()
-        .map(|members| {
-            let n_occupied = members
-                .iter()
-                .filter(|p| match tier.visibility(state, **p) {
-                    Visibility::Docked => true,
-                    Visibility::Collapsed => p.collapsed_width() > 0.0,
-                    Visibility::Hidden => false,
-                })
-                .count();
-            n_occupied.saturating_sub(1)
-        })
-        .sum::<usize>()
-        // **段间**分隔条：「左|中」「中|右」两条。
-        //
-        // 漏掉它们会让三段**首尾相接**（中间没有 6 逻辑点的缝），
-        // 于是相邻两段的边界只靠浮点凑巧对上；一旦某段宽度
-        // 经过 `shrink_to_fit` 的按比例缩放，误差就会让两段
-        // 真的重叠 1e-5 —— 实测在 308 逻辑点、用户把置顶拖到右槽时触发。
-        + {
-            // 某段「占位」= 它至少有一个宽度 > 0 的成员。
-            let occupied = |members: &[Panel]| {
-                members.iter().any(|p| match tier.visibility(state, *p) {
-                    Visibility::Docked => true,
-                    Visibility::Collapsed => p.collapsed_width() > 0.0,
-                    Visibility::Hidden => false,
-                })
-            };
-            usize::from(occupied(&groups[0].1) && occupied(&groups[1].1))
-                + usize::from(occupied(&groups[1].1) && occupied(&groups[2].1))
-        };
-    let splitter_total = n_splitters as f32 * SPLITTER_WIDTH;
+    let occ = occupancy(&groups, state, tier);
+    let splitter_total = occ.n_splitters(&groups, state, tier) as f32 * SPLITTER_WIDTH;
     let usable = body.width() - splitter_total;
 
     // 三段分配。`allocate` 保证 `left + center + right <= usable`。
     let seg = allocate(
         usable,
-        &groups[0].1,
-        &groups[1].1,
-        &groups[2].1,
+        &groups[0],
+        &groups[1],
+        &groups[2],
         state,
         tier,
     );
@@ -768,20 +825,13 @@ pub fn solve(area: Rect, state: &LayoutState, dragging: Option<Rect>) -> Solved 
     // `body.min.x + left_w` 开始画——右段与中央区 100% 重叠。
     // 这是「所有元素挤在一起」的第二条根因，与宽度溢出叠加后
     // 表现为整片糊在窗口左上角。修法就是给每段自己的起点。
-    let occupied = |members: &[Panel]| {
-        members.iter().any(|p| match tier.visibility(state, *p) {
-            Visibility::Docked => true,
-            Visibility::Collapsed => p.collapsed_width() > 0.0,
-            Visibility::Hidden => false,
-        })
-    };
     // 段间分隔条占掉的缝：左段右边界到中央段左边界之间。
-    let gap_left_center = if occupied(&groups[0].1) && occupied(&groups[1].1) {
+    let gap_left_center = if occ.occupied(0) && occ.occupied(1) {
         SPLITTER_WIDTH
     } else {
         0.0
     };
-    let gap_center_right = if occupied(&groups[1].1) && occupied(&groups[2].1) {
+    let gap_center_right = if occ.occupied(1) && occ.occupied(2) {
         SPLITTER_WIDTH
     } else {
         0.0
@@ -793,7 +843,7 @@ pub fn solve(area: Rect, state: &LayoutState, dragging: Option<Rect>) -> Solved 
     ];
 
     // 段内分隔条：按成员逐个画。
-    for (gi, members) in [&groups[0].1, &groups[2].1].into_iter().enumerate() {
+    for (gi, members) in [&groups[0], &groups[2]].into_iter().enumerate() {
         if members.is_empty() {
             continue;
         }
@@ -835,7 +885,7 @@ pub fn solve(area: Rect, state: &LayoutState, dragging: Option<Rect>) -> Solved 
 
     // 中央段起点：左段总宽之后。
     let center_x = seg_origin[1];
-    let center_members = &groups[1].1;
+    let center_members = &groups[1];
     if center_members.is_empty() {
         // 中央空着也要给主区一个可点击的底板，否则窗口中央是死区。
         // 宽度用 `center_w` 而不是「到 body.max」——否则左段把中央区
@@ -910,11 +960,11 @@ pub fn solve(area: Rect, state: &LayoutState, dragging: Option<Rect>) -> Solved 
         // 宽度列表需重算一次：段内宽度在上面已算过，但这里只需要
         // 「最后一个/第一个占位成员是谁」，重新算代价可忽略，
         // 而缓存两份宽度列表容易在改动后不同步。
-        let lw = split_within(left_w, &groups[0].1, state, tier);
-        let cw = split_within(center_w, &groups[1].1, state, tier);
+        let lw = split_within(left_w, &groups[0], state, tier);
+        let cw = split_within(center_w, &groups[1], state, tier);
         if let (Some((lp, _)), Some((cp, _))) = (
-            last_occupied(&groups[0].1, &lw),
-            first_occupied(&groups[1].1, &cw),
+            last_occupied(&groups[0], &lw),
+            first_occupied(&groups[1], &cw),
         ) {
             out.splitters.push(Rect::from_min_size(
                 egui::pos2(seg_origin[1] - gap_left_center, body.min.y),
@@ -924,11 +974,11 @@ pub fn solve(area: Rect, state: &LayoutState, dragging: Option<Rect>) -> Solved 
         }
     }
     if gap_center_right > 0.0 {
-        let cw = split_within(center_w, &groups[1].1, state, tier);
-        let rw = split_within(right_w, &groups[2].1, state, tier);
+        let cw = split_within(center_w, &groups[1], state, tier);
+        let rw = split_within(right_w, &groups[2], state, tier);
         if let (Some((cp, _)), Some((rp, _))) = (
-            last_occupied(&groups[1].1, &cw),
-            first_occupied(&groups[2].1, &rw),
+            last_occupied(&groups[1], &cw),
+            first_occupied(&groups[2], &rw),
         ) {
             out.splitters.push(Rect::from_min_size(
                 egui::pos2(seg_origin[2] - gap_center_right, body.min.y),
@@ -1202,7 +1252,16 @@ fn split_within(total: f32, members: &[Panel], state: &LayoutState, tier: Tier) 
     // 只在计算 `each` 时减掉、却没算进最终的硬钳制上限，
     // 于是「成员宽度和 == total」但再加一条 6 逻辑点的分隔条就超出了
     // 段的额度——右段因此越过 `body.max.x`。
-    let n_occupied = widths.iter().filter(|w| w.is_some_and(|v| v > 0.0)).count();
+    //
+    // ⚠️⚠️ 占位成员数必须按**可见性**数，不能按 `widths` 里的 `Option` 数。
+    // 展开的成员在这一步是 `None`（待均分占位），折叠的才是 `Some(w)`；
+    // 早前版本用 `is_some_and` 过滤 `widths`，于是**一个展开成员都没数进去**
+    // ——「详情 + 侧栏都展开」时 `n_occupied = 0`、`saturating_sub(1) = 0`，
+    // 分隔条一分钱没预留，两个成员各拿满 `min_width`（180 + 88 = 268）
+    // 再加一条 6 逻辑点的缝，段宽凭空多出 6。
+    // 实测在 600 逻辑点（详情+侧栏全展开）：侧栏矩形 x=518..606，
+    // 而客户区右边界是 600 —— **越界 6 逻辑点**，与这里少算的量精确吻合。
+    let n_occupied = occupied_count(members, state, tier);
     let inner_splitters = n_occupied.saturating_sub(1) as f32 * SPLITTER_WIDTH;
     // 成员可用的总宽（已扣掉分隔条）。
     let budget = (total - inner_splitters).max(0.0);
@@ -2941,6 +3000,231 @@ fn collapsed_handles_keep_their_nominal_width_when_affordable() {
                 "宽 {w}: 中央段起点 {center_x} 与分配不符（left={} gap={gap}，档位 {tier:?}）",
                 seg.left
             );
+        }
+    }
+    // ================================================================
+    // 下面这组测试针对实机故障补写，判据一律**直接调 solve()**。
+    //
+    // 为什么旧测试没抓到：它们只跑 `LayoutState::default()`，
+    // 而默认布局里详情与侧栏都是**折叠**的（各占 24 / 28 逻辑点），
+    // 段内分隔条因此被计入、误差恰好被别的分支吸收。
+    // 用户一旦把详情与侧栏**展开**（点一下侧栏即可），
+    // 同一份代码立刻越界 6 逻辑点——而旧测试永远走不到那条路径。
+    // ================================================================
+
+    /// 把指定模块设为「停靠 + 展开」。
+    fn expanded(state: &mut LayoutState, panels: &[Panel]) {
+        for p in panels {
+            let i = panel_index(*p);
+            state.placement[i] = Placement::Docked {
+                slot: p.default_slot(),
+                collapsed: false,
+            };
+        }
+    }
+
+    /// 一个宽度下求解，返回全部停靠矩形（不含浮层）。
+    fn docked_rects(w: f32, st: &LayoutState) -> (Vec<(Panel, Rect)>, Tier) {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, 600.0));
+        let s = solve(area, st, None);
+        let v = Panel::ALL
+            .iter()
+            .filter_map(|p| s.rects[panel_index(*p)].map(|r| (*p, r)))
+            .collect();
+        (v, s.tier)
+    }
+
+    /// **核心判据**：任何布局状态、任何宽度下，停靠矩形都两两不相交。
+    ///
+    /// 直接调 [`solve`]，不复现分配逻辑——本项目吃过「测试里自己写了
+    /// 一份分配，于是真实代码改坏了测试照样通过」的亏。
+    #[test]
+    fn docked_rects_never_overlap_under_any_state() {
+        //覆盖「默认 / 详情展开 / 侧栏展开 / 两者展开 / 全部展开」五种状态。
+        // 后四种正是旧测试的盲区。
+        let mut states: Vec<(String, LayoutState)> = Vec::new();
+        states.push(("default".into(), LayoutState::default()));
+
+        let mut only_detail = LayoutState::default();
+        expanded(&mut only_detail, &[Panel::Detail]);
+        states.push(("detail_expanded".into(), only_detail));
+
+        let mut only_rail = LayoutState::default();
+        expanded(&mut only_rail, &[Panel::Rail]);
+        states.push(("rail_expanded".into(), only_rail));
+
+        let mut both = LayoutState::default();
+        expanded(&mut both, &[Panel::Detail, Panel::Rail]);
+        states.push(("detail_and_rail_expanded".into(), both));
+
+        let mut all = LayoutState::default();
+        expanded(&mut all, &[Panel::Detail, Panel::Rail, Panel::Pinned]);
+        states.push(("all_expanded".into(), all));
+
+        for (name, st) in &states {
+            // 逐逻辑点扫描，覆盖每一档降级阈值两侧。
+            for w in 100..=900 {
+                let w = w as f32;
+                let (rects, tier) = docked_rects(w, st);
+                for i in 0..rects.len() {
+                    for j in (i + 1)..rects.len() {
+                        let (pa, ra) = rects[i];
+                        let (pb, rb) = rects[j];
+                        assert!(
+                            !rects_overlap(ra, rb),
+                            "{name} 宽 {w}（档位 {tier:?}）下 {pa:?} {ra:?} 与 {pb:?} {rb:?} 重叠"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **越界判据**：任何状态、任何宽度下，停靠矩形都不越出客户区。
+    ///
+    /// 这条单独存在是因为「重叠」与「越界」是两种不同的失败：
+    /// 段内分隔条少算 6 逻辑点时，段内成员**互不重叠**（各自都拿到保底），
+    /// 但整段**越过了右边界**——正是旧判据「三段之和 <= 可用宽度」漏掉的那一种。
+    #[test]
+    fn docked_rects_stay_inside_client_area_under_any_state() {
+        let mut both = LayoutState::default();
+        expanded(&mut both, &[Panel::Detail, Panel::Rail]);
+
+        let mut all = LayoutState::default();
+        expanded(&mut all, &[Panel::Detail, Panel::Rail, Panel::Pinned]);
+
+        let states: Vec<(String, LayoutState)> = vec![
+            ("default".into(), LayoutState::default()),
+            ("detail_and_rail_expanded".into(), both),
+            ("all_expanded".into(), all),
+        ];
+
+        for (name, st) in &states {
+            for w in 100..=1000 {
+                let w = w as f32;
+                let (rects, tier) = docked_rects(w, st);
+                for (p, r) in &rects {
+                    assert!(
+                        r.max.x <= w + 0.01,
+                        "{name} 宽 {w}（档位 {tier:?}）下 {p:?} 越过右边界: {r:?}（客户区宽 {w}）"
+                    );
+                    assert!(
+                        r.min.x >= -0.01,
+                        "{name} 宽 {w}（档位 {tier:?}）下 {p:?} 越过左边界: {r:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **降级阶梯阈值必须真的装得下**。
+    ///
+    /// 实机诊断提的是「阈值 333 < 保底和 160+120+88=368，一旦决定三栏全展开
+    /// 就必然不够宽」。方向对，但结论要由算术给出：
+    ///
+    /// - 阈值不是硬编码的 333，而是**算出来的** [`Tier::min_required_width`]；
+    /// - 它的正确口径是「三段保底 + 段间分隔条」（段内那条已含在段保底里）。
+    ///
+    /// 早前 [`Tier::min_required_width`] 漏了段间那两条，
+    /// 于是每个阈值系统性偏低 12 逻辑点。本测试盯住这个不变式：
+    /// **选中的那一档，其最小需求必须真的 <= 可用宽度。**
+    ///
+    /// ⚠️ 唯一例外是 [`Tier::HistoryOnly`]：它是「全都装不下」时的兜底档，
+    /// `tier_for` 无条件返回它（见该函数文档）。窗口窄到连历史保底都
+    /// 装不下时，它的需求当然超过可用宽度——此时由 [`allocate`]
+    /// 的硬钳制保证不重叠，而不是靠阈值。因此这里从「最窄那档的需求」
+    /// 开始扫描。
+    #[test]
+    fn chosen_tier_actually_fits_the_available_width() {
+        let mut both = LayoutState::default();
+        expanded(&mut both, &[Panel::Detail, Panel::Rail]);
+
+        let states: Vec<(String, LayoutState)> = vec![
+            ("default".into(), LayoutState::default()),
+            ("detail_and_rail_expanded".into(), both),
+        ];
+
+        for (name, st) in &states {
+            // 从「最窄那档的需求」起扫：比它更窄时 tier_for 必然兜底到
+            // HistoryOnly，那种情况的合法性由 docked_rects_* 两条判据保证。
+            let narrowest = Tier::HistoryOnly.min_required_width(st).ceil() as i32;
+            for w in narrowest..=1000 {
+                let w = w as f32;
+                let tier = tier_for(st, w);
+                let need = tier.min_required_width(st);
+                assert!(
+                    need <= w + 0.01,
+                    "{name} 宽 {w} 下选中的档位 {tier:?} 需要 {need}，超出可用宽度 —— 阈值与实际需求不同源"
+                );
+            }
+        }
+    }
+
+    /// 段间分隔条必须计入阈值。
+    ///
+    /// 把「含段间」与「不含段间」的差值钉死为 2 × [`SPLITTER_WIDTH`] = 12。
+    /// 这条测试让「漏算段间」这个具体回归一旦复现就必然报警。
+    #[test]
+    fn tier_threshold_includes_inter_segment_splitters() {
+        let st = LayoutState::default();
+        let tier = Tier::Full;
+        let groups = groups_of(&st, tier);
+        let occ = occupancy(&groups, &st, tier);
+        // 三段保底（各自已含段内分隔条）。
+        let floors: f32 = segments_floor(&groups, &st, tier).iter().sum();
+        // 默认布局三段都占位，因此段间恰有 2 条。
+        assert_eq!(occ.n_inter_splitters(), 2, "默认布局下段间应有 2 条分隔条");
+        assert!(
+            (tier.min_required_width(&st) - floors - 2.0 * SPLITTER_WIDTH).abs() < 0.01,
+            "阈值应= 三段保底 + 2 条段间分隔条，实际 {} vs 保底 {floors}",
+            tier.min_required_width(&st)
+        );
+    }
+
+    /// 浮层不能盖住整个客户区。
+    ///
+    /// 「详情转浮层」是**产品要求**的降级行为，浮层盖住部分停靠面板
+    /// 正是它的样子；但盖住**整个**窗口就是缺陷——历史列表既看不见
+    /// 也点不到，降级等于把软件锁死。
+    ///
+    /// 早前浮层宽度只按 `min(MIN_DETAIL_WIDTH, body.width())` 取小、
+    /// 随后又用 `.max(MIN_FLOAT_SIZE.x.min(body.width()))` 兜底，
+    /// 于是在 160 逻辑点宽的窗口里恰好 160 = 整个客户区宽。
+    /// 这条测试盯住 [`FLOAT_DETAIL_MAX_WIDTH_RATIO`] 那个上限：
+    /// 删掉它、或把兜底放在封顶之后，本条立即失败。
+    #[test]
+    fn floating_detail_never_covers_the_whole_window() {
+        let mut st = LayoutState::default();
+        expanded(&mut st, &[Panel::Detail]);
+        for w in 100..=900 {
+            let w = w as f32;
+            let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, 600.0));
+            let s = solve(area, &st, None);
+            let Some(fr) = s.floating[panel_index(Panel::Detail)] else {
+                continue;
+            };
+            assert!(
+                fr.width() < w - 0.01,
+                "宽 {w} 下详情浮层宽 {} 盖住了整个客户区",
+                fr.width()
+            );
+            assert!(
+                fr.max.x <= w + 0.01 && fr.min.x >= -0.01,
+                "宽 {w} 下详情浮层越出客户区: {fr:?}"
+            );
+            // 必须给历史列表留一条**可见的**条带。
+            //
+            // 注意判据不是「浮层与历史不相交」——浮层盖住部分停靠面板
+            // 正是浮层的本职；判据是「历史至少还有一段露在浮层之外」，
+            // 否则用户既看不到列表也点不到条目。
+            if let Some(hr) = s.rects[panel_index(Panel::History)] {
+                let visible = (hr.min.x.max(fr.min.x) - hr.min.x).max(0.0)
+                    + (hr.max.x - hr.min.x.max(fr.min.x)).max(0.0);
+                assert!(
+                    visible > 1.0,
+                    "宽 {w} 下浮层 {fr:?} 完全遮住历史列表 {hr:?}（可见宽度 {visible}）"
+                );
+            }
         }
     }
 }

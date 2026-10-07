@@ -487,6 +487,28 @@ impl EventLoop {
         self.quit
     }
 
+    /// 客户区尺寸（**逻辑点**），直接问系统取当前真实值。
+    ///
+    /// 不用缓存的 [`Self::inner_size`]：那个字段只在收到 `WM_SIZE`
+    /// 时更新，而跨进程 `MoveWindow` 触发的 `WM_SIZE` **不进本进程队列**
+    /// （见 [`Self::poll`] 的说明），于是缓存会停在旧值。
+    /// 这里每次都走 `GetClientRect`，是唯一可靠的来源。
+    ///
+    /// 客户区为 0x0（最小化 / 被 resize 到 0）时返回 `(0.0, 0.0)`，
+    /// 调用方据此跳过渲染。
+    fn client_size_points(&self) -> (f32, f32) {
+        let mut r = RECT::default();
+        if unsafe { GetClientRect(self.hwnd, &mut r) }.is_err() {
+            return (0.0, 0.0);
+        }
+        let w = (r.right - r.left).max(0) as f32;
+        let h = (r.bottom - r.top).max(0) as f32;
+        let s = self.scale_factor;
+        if s <= 0.0 {
+            return (0.0, 0.0);
+        }
+        (w / s, h / s)    }
+
     /// 本帧事件缓冲（供调试与测试）。
     pub fn pending_events(&self) -> &[WindowEvent] {
         &self.pending
@@ -527,6 +549,44 @@ impl EventLoop {
 
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         let mut events: Vec<WindowEvent> = Vec::new();
+
+        // ---- 尺寸主动同步（不能只依赖 WM_SIZE）--------------------------
+        //
+        // ⚠️ 这是「UI 只画在客户区左上角、不随窗口缩放」的真根因。
+        //
+        // `translate` 里的 `WM_SIZE` 分支是对的，但**它经常收不到**：
+        // `MoveWindow` / `SetWindowPos` 这类改变窗口尺寸的调用，若来自
+        // **另一个进程**（本项目的 `scripts/verify_render.ps1` 与
+        // `measure_layout.ps1` 就是这样驱动窗口的），系统会用
+        // `SendMessage` 把 `WM_SIZE` **直接发给窗口过程**，
+        // 它**不经过本进程的消息队列**，`PeekMessageW` 永远读不到。
+        // 实测：把客户区从 420x560 拖到 900x800 后，队列里出现过
+        // `WM_NCCALCSIZE`(0x60) 与 `WM_WINDOWPOSCHANGED`(0x47)，
+        // **唯独没有 `WM_SIZE`(0x5)**——于是 `inner_size` 永远停在
+        // 创建时的 280x373.3 逻辑点。
+        //
+        // 后果链：`screen_rect` 恒为旧尺寸 → egui 按 280x373.3 布局 →
+        // 顶点只覆盖视口左上角，右侧与底部留着 clear color，
+        // 且**不产生任何 GPU 错误**，只是「画小了」。
+        //
+        // 修法：每轮用 `GetClientRect` 直接问系统真实尺寸（O(1) 系统调用），
+        // 与消息无关，任何来源的 resize 都能跟上。
+        // 消息分支保留，它额外携带 `wParam` 的最小化/还原语义。
+        let scale_now = dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) });
+        if (scale_now - self.scale_factor).abs() > f32::EPSILON {
+            self.scale_factor = scale_now;
+            events.push(WindowEvent::ScaleFactorChanged(scale_now as f64));
+        }
+        let (cur_w, cur_h) = self.client_size_points();
+        let size_changed = (cur_w - self.inner_size.x).abs() > f32::EPSILON
+            || (cur_h - self.inner_size.y).abs() > f32::EPSILON;
+        if cur_w > 0.0 && cur_h > 0.0 && size_changed {
+            self.inner_size = Vec2::new(cur_w, cur_h);
+            events.push(WindowEvent::Resized {
+                width: cur_w,
+                height: cur_h,
+            });
+        }
 
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             // WM_QUIT 没有窗口过程，直接置退出标志。

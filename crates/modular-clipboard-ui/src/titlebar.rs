@@ -334,7 +334,7 @@ pub fn draw(
     // 画在 `l.title` 内并按实测宽度截断：标题 rect 是布局分给它的**上限**，
     // 真文字比上限长时（字体回退、字号调大）必须裁，否则会压到搜索框上。
     if l.title.width() > 8.0 {
-        ui.painter().text(
+        ui.painter_at(l.title).text(
             l.title.left_center(),
             Align2::LEFT_CENTER,
             elide_text(ui, app_title, &title_font, l.title.width()),
@@ -390,7 +390,7 @@ pub fn draw(
             elide_text(ui, query, &sized(pal.font_md, scale), l.search_text.width())
         };
         if !text.is_empty() {
-            ui.painter().text(
+            ui.painter_at(l.search_text).text(
                 pos2(l.search_text.min.x, l.search.center().y),
                 Align2::LEFT_CENTER,
                 text,

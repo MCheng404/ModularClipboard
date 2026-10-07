@@ -371,7 +371,11 @@ fn run() -> anyhow::Result<()> {
 
         // ---- 9. 录制绘制 + 呈现 ---------------------------------------
         draw_batches.clear();
-        draw_batches.extend(batches.iter().map(|b| b.to_draw()));
+        draw_batches.extend(
+            batches
+                .iter()
+                .map(|b| b.to_draw(fr.extent(), pixels_per_point)),
+        );
         let input = DrawInput {
             vertex_buffer: slots.vertex_buffer(slot),
             index_buffer: slots.index_buffer(slot),
@@ -889,10 +893,33 @@ struct Batch {
 }
 
 impl Batch {
-    fn to_draw(self) -> modular_clipboard_gfx::frame::DrawBatch {
+    /// ⚠️ 这里必须与生产 `modular_clipboard_ui::renderer::Batch::to_draw`
+    /// 做**同样的裁剪换算**，否则探针会得出与产品相反的结论。
+    ///
+    /// 曾因漏掉 `clip` 字段（不裁剪）而让探针"通过"，而实机产品里
+    /// 所有 `painter_at` 裁剪全是失效的——探针验证的不是同一条路径。
+    fn to_draw(self, extent: ash::vk::Extent2D, ppp: f32) -> modular_clipboard_gfx::frame::DrawBatch {
+        let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+        let c = self.clip;
+        let x0 = (c.min.x * ppp).floor().max(0.0) as i32;
+        let y0 = (c.min.y * ppp).floor().max(0.0) as i32;
+        let x1 = (c.max.x * ppp).ceil().max(0.0) as i32;
+        let y1 = (c.max.y * ppp).ceil().max(0.0) as i32;
+        let (vw, vh) = (extent.width as i64, extent.height as i64);
+        let x0 = x0.clamp(0, vw as i32);
+        let y0 = y0.clamp(0, vh as i32);
+        let x1 = x1.clamp(0, vw as i32);
+        let y1 = y1.clamp(0, vh as i32);
         modular_clipboard_gfx::frame::DrawBatch {
             index_offset: self.index_offset,
             index_count: self.index_count,
+            clip: Some(ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: x0, y: y0 },
+                extent: ash::vk::Extent2D {
+                    width: (x1 - x0).max(0) as u32,
+                    height: (y1 - y0).max(0) as u32,
+                },
+            }),
         }
     }
 }

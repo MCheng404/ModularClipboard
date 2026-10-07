@@ -170,12 +170,18 @@ pub fn draw(ui: &mut Ui, svc: &mut Service, local: &mut UiLocal, pal: &Palette) 
     draw_pinned_panel(ui, &solved, svc, local, pal, scale);
     draw_history_panel(ui, &solved, svc, local, pal, scale);
     draw_rail_panel(ui, &solved, svc, local, pal, scale);
-    // 详情两种来源都要看：停靠矩形（宽窗口）或浮层矩形（窄窗口降级）。
-    // `rects` 与 `floating` 同时为空说明该档位下详情已完全让位，
-    // `draw_detail_panel` 内部会直接返回。
-    if local.show_detail || solved.floating[layout::panel_index(Panel::Detail)].is_some() {
-        draw_detail_panel(ui, &solved, svc, local, pal, scale);
-    }
+    // ⚠️ 必须**无条件**调用详情面板。
+    //
+    // 早前写成 `if local.show_detail || floating.is_some()`，于是详情默认收起
+    // （`Panel::Detail` 的默认态就是折叠）时整个函数被跳过——
+    // 可布局层照样给��分配了一个 24 逻辑点宽的停靠矩形。
+    // 结果那块矩形**没有任何人绘制**：底色是窗口底色（实测 RGB 25,25,31），
+    // 与右侧「视图」折叠栏同色，两个把手糊成一片、看不出边界，
+    // 像素探针按「边框色跳变」找详情栏左右缘时两处都找不到。
+    //
+    // 画什么由 `draw_detail_panel` 内部按 `is_veiled` 决定：
+    // 收起时画折叠把手（可点回来），展开时画完整内容。
+    draw_detail_panel(ui, &solved, svc, local, pal, scale);
 
     draw_status_bar(ui, svc, local, pal, scale, narrowed);
     local.drag_region = titlebar_drag_region(ui, &solved, pal, scale, APP_TITLE);
@@ -518,22 +524,16 @@ fn draw_virtual_list(
                 // 矩形来自 panels 的共享函数——`draw_row` 内部按同一个
                 // 函数给文字留出避让区，两者不会各算各的。
                 let tools = panels::row_tools_rect(row_rect, pal, scale, is_pinned_list);
-                at_rect(ui, tools, |ui| {
-                    ui.horizontal_centered(|ui| {
-                        if let Some(tool) =
-                            panels::draw_row_tools(ui, pal, scale, item)
-                        {
-                            match tool {
-                                RowTool::Unpin | RowTool::PinLeft => {
-                                    local.pending = Some(PendingOp::TogglePin(item.id));
-                                }
-                                RowTool::Lock => {
-                                    local.pending = Some(PendingOp::TogglePin(item.id));
-                                }
-                            }
+                if let Some(tool) = panels::draw_row_tools(ui, tools, pal, scale, item) {
+                    match tool {
+                        RowTool::Unpin | RowTool::PinLeft => {
+                            local.pending = Some(PendingOp::TogglePin(item.id));
                         }
-                    });
-                });
+                        RowTool::Lock => {
+                            local.pending = Some(PendingOp::TogglePin(item.id));
+                        }
+                    }
+                }
 
                 if hovered {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -577,6 +577,15 @@ fn draw_rail_panel(
         if resp.hovered() {
             ui.painter().rect_filled(inner, CornerRadius::ZERO, pal.row_hover);
         }
+        // ⚠️ 折叠态必须描边：它与左侧「详情」折叠把手紧邻，
+        // 两者底色都是 `surface`（实测 RGB 25,25,31），不描边就糊成一片。
+        // 停靠面板由 `panel_frame` 描边，折叠态这段是唯一的例外路径。
+        ui.painter_at(inner).rect_stroke(
+            inner,
+            CornerRadius::ZERO,
+            egui::Stroke::new(panels::PANEL_STROKE * scale, pal.border_subtle),
+            egui::StrokeKind::Inside,
+        );
         view_icon.paint(
             &ui.painter_at(inner),
             egui::Rect::from_center_size(
@@ -709,7 +718,7 @@ fn draw_rail_panel(
                         }
                     }
                 });
-            ui.painter().text(
+            ui.painter_at(body).text(
                 pos2(body.center().x, body.max.y - pal.font_xs * scale),
                 Align2::CENTER_BOTTOM,
                 "内容已遮罩",
@@ -747,6 +756,18 @@ fn draw_detail_panel(
         (Some(r), None) => (r, false),
         (None, None) => return,
     };
+    // ⚠️ 停靠态下必须先判折叠，否则会在 24 逻辑点宽的柱子里画完整详情。
+    //
+    // 实测症状：900px 宽窗口里详情栏被收成 24pt 宽（物理 36px），
+    // 但这里仍往下走 `panel_frame` + 完整内容绘制 ⇒ 内容全被裁掉，
+    // 只剩一条与右侧「视图」栏**同色**的深色竖条（实测 x=795..858
+    // 整段 RGB 25,25,31 完全一致），两个把手糊成一片、看不出边界。
+    //
+    // `draw_rail_panel` 早就有这个判据，详情面板漏了。
+    if !floating && is_veiled(solved.tier, local, Panel::Detail) {
+        panels::draw_collapse_handle(ui, rect, pal, scale, Panel::Detail);
+        return;
+    }
     panels::panel_frame(ui, rect, pal, floating, scale);
     let mut inner = rect.shrink(panels_panel_pad(pal));
 
@@ -760,7 +781,15 @@ fn draw_detail_panel(
                 handle_float_drag(ui, local, Panel::Detail, pos);
             }
         }
-        ui.painter().text(
+        // 裁剪到「标题可用区」= 头部去掉右侧关闭按钮后的部分。
+        // 只裁到整个 `header` 还不够：浮层在窄窗口下只有 180pt 宽，
+        // 关闭按钮占掉右侧一格，标题不避开它就会与「✕」糊在一起。
+        let close_w = pal.control_height * scale;
+        let title_area = Rect::from_min_max(
+            header.min,
+            pos2((header.max.x - close_w).max(header.min.x), header.max.y),
+        );
+        ui.painter_at(title_area).text(
             header.left_center(),
             Align2::LEFT_CENTER,
             Panel::Detail.title(),
@@ -1122,9 +1151,21 @@ fn draw_status_bar(
         let left_limit = (rect.width() - right_w - pal.space_md).max(0.0);
 
         // ---- 右侧：监听状态 + 清空 + 设置，固定占右端 ----
+        //
+        // ⚠️ 内部子 Ui 要**缩进 `space_sm`**：否则 `right_to_left` 布局
+        // 会把最后一个控件（此处是 `ui.small_button("设置")`）的右边缘
+        // 正好贴在 `rect.max.x` 上，也就是客户区最右缘。
+        //
+        // 实机症状：状态栏的「设置」按钮**紧贴窗口右缘、没有任何留白**，
+        // 无边框窗口外面就是桌面，按钮看上去像被切掉一截
+        // （实测最右内容区段一路延伸到 x=720 = 客户区宽度）。
+        //
+        // 缩进量必须同时加进 `right_w`，否则左侧提示的预算没跟着变，
+        // 两者会重新贴上。
+        let right_pad = pal.space_sm;
         let right_rect = Rect::from_min_max(
             pos2(rect.max.x - right_w, rect.min.y),
-            pos2(rect.max.x, rect.max.y),
+            pos2(rect.max.x - right_pad, rect.max.y),
         );
         at_rect(ui, right_rect, |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1168,7 +1209,10 @@ fn draw_status_bar(
                 // 这种长文案会把右侧区撑破。
                 let font = sized(pal.font_xs, scale);
                 let shown = titlebar::elide_text(ui, &text, &font, right_w);
-                ui.painter().text(
+                // ⚠️ 同样要 `painter_at`：`right_w` 只是**预算**，
+                // 字体实际 advance 偏大时文字会越过 `right_rect.max.x`，
+                // 画到窗口右缘外面去（无边框窗口外面就是桌面）。
+                ui.painter_at(right_rect).text(
                     pos2(right_rect.max.x, right_rect.center().y),
                     Align2::RIGHT_CENTER,
                     shown,
@@ -1208,7 +1252,20 @@ fn draw_status_bar(
             let font = sized(pal.font_sm, scale);
             let shown = titlebar::elide_text(ui, &hint, &font, left_limit);
             if !shown.is_empty() {
-                ui.painter().text(
+                // ⚠️ `left_limit` 是**预算**而不是边界：`elide_text` 按
+                // `measure_text` 的估计截断，字体实际 advance 一旦偏大
+                // （字号缩放 / 字体回退）文字就会越过 `rect.max.x`。
+                // 用 `painter_at` 把裁剪区钉在「提示可用矩形」上，
+                // 溢出最多表现为截断，不会画到窗口外或压到右侧按钮上。
+                //
+                // 窄窗口下 `left_limit` 可能为负或为 0（右侧区本身就占了
+                // 几乎全部宽度），此时矩形宽度为 0，painter 直接不画——
+                // 早前版本会画出「窗口…」三个字骑在右侧按钮上。
+                let hint_rect = Rect::from_min_max(
+                    pos2(rect.min.x, rect.min.y),
+                    pos2(rect.min.x + left_limit, rect.max.y),
+                );
+                ui.painter_at(hint_rect).text(
                     pos2(rect.min.x, rect.center().y),
                     Align2::LEFT_CENTER,
                     shown,
@@ -1234,6 +1291,13 @@ fn status_right_width(pal: &Palette, scale: f32) -> f32 {
     let status_w = pal.font_xs * 9.0 * scale;
     // 清空（垃圾桶）图标。
     let trash_w = pal.icon_size * scale;
+    // ⚠️ 这两个 `space_sm` 是**左右各一档留白**：一档给右缘
+    // （否则「设置」按钮紧贴客户区右缘、像被切掉一截），
+    // 一档给左侧提示与按钮组之间的间隙。
+    //
+    // 两侧都要算进来：`right_rect` 的右端已按`right_pad` 内缩，
+    // 宽度若不同步缩，左侧提示的预算就会多出`right_pad`，
+    // 重新贴到按钮上（这正是早前「提示压按钮」的成因）。
     settings_w + status_w + trash_w + pal.space_sm * 2.0
 }
 
@@ -1361,6 +1425,109 @@ pub fn should_show_empty(count: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 折叠态详情面板必须**画在布局分配的矩形内**，不能画到相邻面板上。
+    ///
+    /// 缺陷历史：`draw` 里写成
+    /// `if local.show_detail || floating.is_some() { draw_detail_panel(...) }`，
+    /// 而 `Panel::Detail` 的**默认态就是折叠**（`show_detail` 初值 false），
+    /// 于是整个函数被跳过——可布局层照样分配了 24 逻辑点宽的停靠矩形。
+    /// 那块矩形没人画，底色与相邻「视图」折叠栏同色（实测 RGB 25,25,31），
+    /// 两个把手糊成一片、边界消失。
+    ///
+    /// 这里直接验折叠把手的绘制产出，绕开 `Service`（它要开数据库，
+    /// 不适合放进这类纯几何单测）。判据两条：
+    /// ① 产出图元（否则那块矩形是空白）；
+    /// ② 最大右缘不超过把手矩形右缘（否则内容会压到相邻栏）。
+    #[test]
+    fn collapsed_detail_handle_is_painted_inside_its_rect() {
+        use crate::theme::ThemeMode;
+        let pal = ThemeMode::Light.palette();
+        let scale = 1.5_f32;
+        // 900x800 物理 /1.5 => 600x533.33 逻辑，正是实测出问题的宽度。
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 533.33));
+        let state = LayoutState::default();
+        let solved = layout::solve(area, &state, None);
+        let i = layout::panel_index(Panel::Detail);
+        let Some(rect) = solved.rects[i] else {
+            return; // 该档位下详情转浮层，没有停靠矩形，不适用本判据。
+        };
+        // 前置：确认该宽度下详情确实是折叠态，否则本测试测不到目标路径。
+        assert_eq!(
+            solved.tier.visibility(&state, Panel::Detail),
+            layout::Visibility::Collapsed,
+            "900px 宽下详情应折叠；降级阶梯若已改动，本测试需同步"
+        );
+
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            panels::draw_collapse_handle(ui, rect, &pal, scale, Panel::Detail);
+        });
+        let shape_count = out.shapes.len();
+
+        // ---- 判据 1：必须有描边 ----------------------------------------
+        //
+        // 判据的选择过程值得记下（两次踩坑）：
+        //
+        // 1. 「有没有网格图元」—— **无效**。`rect_filled` 同样产出网格，
+        //    删掉 `rect_stroke` 后断言照样通过（已实测）。
+        // 2. 「矩形外侧有没有顶点」—— **无效**。实测 `rect_filled` 的
+        //    四个角点同样略微外扩（541.5 vs min.x=542），与描边的
+        //    外扩量同量级，分不开（已实测）。
+        // 3. 「顶边线上有没有中间顶点」—— **恒失败**。`StrokeKind::Inside`
+        //    的描边被 egui 画成向外扩 0.5pt 的斜切环，顶边线上并没有
+        //    中间顶点（实测顶点是 (543,37)→(544,38) 这种斜角）。
+        //
+        // 唯一可靠的做法是**直接读 `RectShape.stroke` 字段**：
+        // egui 把 `rect_stroke` 原样记成带 `stroke: Stroke::new(w, color)`
+        // 的 `Shape::Rect`，而 `rect_filled` 产出的是 `Stroke::NONE`。
+        // 这是「声明了什么」而不是「几何上看起来像什么」，不依赖渲染细节。
+        //
+        // ⚠️ 必须在 `tessellate` **之前**读：`tessellate` 按值消耗
+        //    `out.shapes`，之后就没法再看形状类型了。
+        let stroked_rects = out
+            .shapes
+            .iter()
+            .filter(|sh| matches!(&sh.shape, egui::epaint::Shape::Rect(rs) if rs.stroke.width > 0.0))
+            .count();
+
+        // ---- 判据 2：绘制范围不得越出矩形 -------------------------------
+        //
+        // 判据必须基于 **tessellate 之后的顶点**：只有顶点坐标才是真正
+        // 送进 GPU 的东西，scissor 也按它裁。用 Shape 层的矩形反而
+        // 可能漏掉「顶点跑到矩形外」这一类真缺陷。
+        let prims = ctx.tessellate(out.shapes, 1.0);
+        let mut max_x = f32::NEG_INFINITY;
+        for p in &prims {
+            if let egui::epaint::Primitive::Mesh(m) = &p.primitive {
+                for v in &m.vertices {
+                    max_x = max_x.max(v.pos.x);
+                }
+            }
+        }
+        out.textures_delta.clear();
+
+        assert!(
+            shape_count > 0,
+            "折叠把手必须产出图元；0 个说明折叠态整段被跳过，\
+             24pt 宽的矩形会留成与相邻栏同色的空白"
+        );
+        assert!(
+            stroked_rects > 0,
+            "折叠把手必须描边：输出里没有任何 `stroke.width > 0` 的 Rect，\
+             说明只有填充没有描边——相邻两个把手会糊成一片、看不出边界"
+        );
+        assert!(
+            max_x > f32::NEG_INFINITY,
+            "tessellate 后没有顶点，无法验证绘制范围"
+        );
+        // 1.5pt 容差：抗锯齿会让边框外扩不到半像素，浮点误差再留一点余量。
+        assert!(
+            max_x <= rect.max.x + 1.5,
+            "折叠把手绘制越界：顶点最大 x={max_x:.2} > 矩形右缘 {:.2}",
+            rect.max.x
+        );
+    }
 
     #[test]
     fn icons_are_distinct() {

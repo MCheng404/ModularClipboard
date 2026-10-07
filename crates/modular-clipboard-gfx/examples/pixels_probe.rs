@@ -372,7 +372,11 @@ fn run() -> anyhow::Result<()> {
         px.set_geometry(&vertices, &indices)?;
 
         draws.clear();
-        draws.extend(batches.iter().map(|b| b.to_draw()));
+        draws.extend(
+            batches
+                .iter()
+                .map(|b| b.to_draw(extent, out.pixels_per_point)),
+        );
 
         // 6. 负对照：**同一函数**、同一描述符集、同一次读回，
         //    只把批次列表清空。
@@ -1387,10 +1391,31 @@ struct Batch {
 }
 
 impl Batch {
-    fn to_draw(self) -> DrawBatch {
+    /// 与生产 `modular_clipboard_ui::renderer::Batch::to_draw` 保持一致：
+    /// 裁剪矩形必须换算成物理像素并逐批提交 scissor，否则探针测的不是
+    /// 产品那条路径（见 full_app.rs 里同名的注释）。
+    fn to_draw(self, extent: ash::vk::Extent2D, ppp: f32) -> DrawBatch {
+        let ppp = if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+        let c = self.clip;
+        let x0 = (c.min.x * ppp).floor().max(0.0) as i32;
+        let y0 = (c.min.y * ppp).floor().max(0.0) as i32;
+        let x1 = (c.max.x * ppp).ceil().max(0.0) as i32;
+        let y1 = (c.max.y * ppp).ceil().max(0.0) as i32;
+        let (vw, vh) = (extent.width as i64, extent.height as i64);
+        let x0 = x0.clamp(0, vw as i32);
+        let y0 = y0.clamp(0, vh as i32);
+        let x1 = x1.clamp(0, vw as i32);
+        let y1 = y1.clamp(0, vh as i32);
         DrawBatch {
             index_offset: self.index_offset,
             index_count: self.index_count,
+            clip: Some(ash::vk::Rect2D {
+                offset: ash::vk::Offset2D { x: x0, y: y0 },
+                extent: ash::vk::Extent2D {
+                    width: (x1 - x0).max(0) as u32,
+                    height: (y1 - y0).max(0) as u32,
+                },
+            }),
         }
     }
 }

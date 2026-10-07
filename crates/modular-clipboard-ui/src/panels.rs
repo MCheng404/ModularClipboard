@@ -10,7 +10,7 @@
 //! `Service`，只接收已经取好的 `&[ClipItem]` 与回调。这让面板可以被
 //! 单独测试，也避免同一份数据被两个模块各取一次。
 
-use egui::{Align2, Color32, CornerRadius, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 
 use modular_clipboard_core::ClipItem;
 
@@ -28,7 +28,11 @@ pub const ROW_HEIGHT: f32 = 48.0;
 pub const COMPACT_ROW_HEIGHT: f32 = 26.0;
 
 /// 面板边框宽度。
-const PANEL_STROKE: f32 = 1.0;
+///
+/// 公开是因为 `view::draw_rail_panel` 的折叠态分支要自己描边
+/// （它不走 [`panel_frame`]），必须与停靠态用同一个值，
+/// 否则折叠把手与相邻面板的边框粗细不一致。
+pub const PANEL_STROKE: f32 = 1.0;
 
 /// 画一个面板的外框。
 ///
@@ -40,20 +44,25 @@ const PANEL_STROKE: f32 = 1.0;
 pub fn panel_frame(ui: &mut Ui, rect: Rect, pal: &Palette, floating: bool, scale: f32) {
     let radius = if floating { pal.radius_lg } else { 0.0 };
     let fill = if floating { pal.surface_raised } else { pal.surface };
-    ui.painter().rect_filled(rect, radius, fill);
+    // ⚠️ 用 `painter_at(rect)`：面板的底色与边框必须被**自己的矩形**裁住。
+    // 浮层的阴影 `rect.expand(shadow)` 会探出面板外，若painter 无裁剪，
+    // 它会盖到相邻停靠面板上；而边框一旦被裁掉，面板之间的分隔
+    // 视觉就消失了，看起来像两块面板糊在一起。
+    let painter = ui.painter_at(rect.expand(if floating { 4.0 * scale } else { 0.0 }));
+    painter.rect_filled(rect, radius, fill);
     if floating {
         // 浮动面板带阴影（用半透明黑矩形模拟），否则它和停靠区
         // 在视觉上分不开。
         let shadow = 3.0 * scale;
-        ui.painter().rect_filled(
+        painter.rect_filled(
             rect.expand(shadow),
             radius + shadow * 0.5,
             Color32::from_black_alpha(if pal.is_dark { 90 } else { 40 }),
         );
         // 阴影画在下面，需要重画一次面板底色盖住重叠部分。
-        ui.painter().rect_filled(rect, radius, fill);
+        painter.rect_filled(rect, radius, fill);
     }
-    ui.painter().rect_stroke(
+    painter.rect_stroke(
         rect,
         radius,
         Stroke::new(PANEL_STROKE * scale, pal.border_subtle),
@@ -79,7 +88,22 @@ pub fn draw_collapse_handle(
     );
     let resp = ui.interact(r, ui.id().with(("collapse_handle", panel)), Sense::click());
     let bg = if resp.hovered() { pal.row_hover } else { pal.surface_variant };
-    ui.painter().rect_filled(r, CornerRadius::ZERO, bg);
+    let painter = ui.painter_at(r);
+    painter.rect_filled(r, CornerRadius::ZERO, bg);
+    // ⚠️ 必须描边：折叠态下相邻的两个把手（详情 + 视图）会紧挨在一起，
+    // 而它们的底色 `surface_variant` 与相邻面板底色接近，不描边时
+    // 两块糊成一片、**看不出这里有两个可点的把手**。
+    //
+    // 实测症状：900px宽窗口里详情把手(x=813..849) 与视图把手(x=858..900)
+    // 之间的分隔完全消失，探针按「边框色跳变」找边界时两处都找不到。
+    // 停靠面板走 [`panel_frame`] 有描边，折叠把手这条路径早先漏了。
+    painter.rect_stroke(
+        r,
+        CornerRadius::ZERO,
+        Stroke::new(PANEL_STROKE * scale, pal.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+
     // 拖拽手柄图标（grip-vertical）：比三个手画圆点更像「可拖」，
     // 也与折叠把手的点击语义不冲突。
     Icon::Drag.paint(
@@ -201,71 +225,139 @@ pub struct RowTools {
     pub lock: bool,
 }
 
+/// 单个行内图标按钮的边长（逻辑点）。
+///
+/// 文字截断、工具条定位、按钮绘制**三者必须用同一个尺寸**。
+/// 早前 [`row_tools_width`] 按 `control_height` 算宽，
+/// 而按钮实际画的是 `control_height * 0.75`，两者差 25%：
+/// 文字以为让出了 `2 * control_height`，实际只有 `1.5 * control_height`，
+/// 于是文字从按钮底下穿过去——正是「`explorer` 被切掉」的成因。
+fn row_icon_size(pal: &Palette, scale: f32) -> f32 {
+    pal.control_height * 0.75 * scale
+}
+
 /// 行右侧工具条占用的宽度（逻辑点）。
 ///
 /// 文字截断与工具条定位**必须用同一个函数**算宽度：
-/// 早先两处各写一份 `control_height * 2.0`，一旦某边改了，
+/// 早前两处各写一份 `control_height * 2.0`，一旦某边改了，
 /// 文字就会从按钮底下穿过去或者提前被截短。
-/// `pinned` 对应置顶列表（只有一个工具），与 [`draw_row`] 的调用方一致。
-pub fn row_tools_width(_ui: &Ui, _rect: Rect, pal: &Palette, scale: f32, pinned: bool) -> f32 {
-    if pinned {
-        pal.control_height * scale
-    } else {
-        pal.control_height * 2.0 * scale
-    }
+///
+/// 两个分支都是 2 个图标（置顶列表是「取消置顶」+「固定」，
+/// 主列表是「置顶到左侧」+「固定」），因此宽度与 `pinned` 无关。
+/// 保留 `pinned` 参数是为了不改动 [`draw_row`] 的调用点签名。
+pub fn row_tools_width(pal: &Palette, scale: f32, _pinned: bool) -> f32 {
+    row_icon_size(pal, scale) * 2.0 + pal.space_xs
 }
 
 /// 行右侧工具条的矩形。与 [`row_tools_width`] 同源。
 pub fn row_tools_rect(rect: Rect, pal: &Palette, scale: f32, pinned: bool) -> Rect {
-    let w = if pinned {
-        pal.control_height * scale
-    } else {
-        pal.control_height * 2.0 * scale
-    };
+    let w = row_tools_width(pal, scale, pinned);
     Rect::from_min_size(
         pos2(rect.max.x - w - pal.space_xs, rect.min.y),
         vec2(w, rect.height()),
     )
 }
 
-/// 画行内工具条，返回用户触发了哪个。
+/// 画行内工具条（来源标签 + 图标），返回用户触发了哪个。
+///
+/// # ⚠️ 为什么完全自己摆位置，不用 `ui.horizontal`
+///
+/// 早前版本是 `ui.horizontal(|ui| { ui.label(src); icon_button(...); })`，
+/// 让 egui 分配宽度。问题出在 `ui.label`：**它只按自身内容要宽度，
+/// 不会因为右边还有东西而收缩**。于是窄面板下行右端被挤到边缘时，
+/// 来源文字直接铺过行右缘、把后面的图标顶出面板，
+/// 实机截图里 `explorer` 被切掉、按钮跑到面板外，就是这个成因。
+///
+/// 现在改成**显式分配**：先从右往左给图标留位，剩下的宽度才是来源标签的
+/// 预算，来源文字按预算 [`crate::titlebar::elide_text`] 省略。
+/// 图标区在右、来源在左，两块矩形互不重叠，边界由算术保证。
 ///
 /// 未置顶时「取消置顶」置灰：点它不会有任何变化，
 /// 一个点了没反应的按钮比不显示更让人困惑。
 pub fn draw_row_tools(
     ui: &mut Ui,
+    rect: Rect,
     pal: &Palette,
     scale: f32,
     item: &ClipItem,
 ) -> Option<RowTool> {
+    if rect.width() <= 1.0 || rect.height() <= 0.0 {
+        // 连一个图标都放不下：整条工具栏不画。
+        // 画半个图标 + 半截来源文字比不画更难懂。
+        return None;
+    }
     let mut hit = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing = vec2(pal.space_xs, 0.0);
+    let icon_sz = vec2(pal.control_height * 0.75, pal.control_height * 0.75) * scale;
+    let gap = pal.space_xs;
 
-        // 内容来源：只是文字标签，不可点。
-        let src = if item.source_app.is_empty() {
-            "未知来源"
+    // ---- 图标区：从右往左排 ----
+    // 两个分支都是 2 个图标（未置顶是「置顶到左侧」+「固定」），
+    // 因此图标区宽度固定，来源标签拿剩下的。
+    let n_icons = 2usize;
+    let icons_w = icon_sz.x * n_icons as f32 + gap * (n_icons as f32 - 1.0);
+    let icons_rect = Rect::from_min_size(
+        pos2(rect.max.x - icons_w, rect.min.y),
+        vec2(icons_w, rect.height()),
+    );
+    // 图标区必须完整落在 rect 内，否则说明 rect 太窄，按钮会被切掉一半。
+    if icons_rect.min.x < rect.min.x {
+        return None;
+    }
+
+    let icon_y = icons_rect.center().y - icon_sz.y / 2.0;
+    let btn = |ui: &mut Ui, k: usize| -> egui::Response {
+        let r = Rect::from_min_size(
+            pos2(icons_rect.min.x + (icon_sz.x + gap) * k as f32, icon_y),
+            icon_sz,
+        );
+        let icon = if item.pinned && k == 0 {
+            Icon::Unpinned
+        } else if k == 0 {
+            Icon::Pinned
         } else {
-            &item.source_app
+            Icon::Lock
         };
-        let src_text = RichText::new(src)
-            .size(sized(pal.font_xs, scale).size)
-            .color(pal.text_dim);
-        ui.label(src_text);
+        icon_button_at(ui, r, icon, pal, scale)
+    };
 
-        if item.pinned {
-            if icon_button(ui, Icon::Unpinned, pal, scale, "取消置顶").clicked() {
-                hit = Some(RowTool::Unpin);
-            }
-            if icon_button(ui, Icon::Lock, pal, scale, "固定在主区顶部").clicked() {
-                hit = Some(RowTool::Lock);
-            }
-        } else if icon_button(ui, Icon::Pinned, pal, scale, "置顶到左侧").clicked() {
-            hit = Some(RowTool::PinLeft);
-        } else if icon_button(ui, Icon::Unlock, pal, scale, "固定在主区顶部").clicked() {
+    if item.pinned {
+        if btn(ui, 0).on_hover_text("取消置顶").clicked() {
+            hit = Some(RowTool::Unpin);
+        }
+        if btn(ui, 1).on_hover_text("固定在主区顶部").clicked() {
             hit = Some(RowTool::Lock);
         }
-    });
+    } else {
+        if btn(ui, 0).on_hover_text("置顶到左侧").clicked() {
+            hit = Some(RowTool::PinLeft);
+        }
+        if btn(ui, 1).on_hover_text("固定在主区顶部").clicked() {
+            hit = Some(RowTool::Lock);
+        }
+    }
+
+    // ---- 来源标签：剩下的全部宽度，按预算省略 ----
+    let label_w = (icons_rect.min.x - gap - rect.min.x).max(0.0);
+    let src = if item.source_app.is_empty() {
+        "未知来源"
+    } else {
+        &item.source_app
+    };
+    let font: FontId = sized(pal.font_xs, scale);
+    let shown = crate::titlebar::elide_text(ui, src, &font, label_w);
+    if !shown.is_empty() {
+        let label_rect = Rect::from_min_size(
+            pos2(rect.min.x, rect.center().y - font.size / 2.0),
+            vec2(label_w, font.size),
+        );
+        ui.painter_at(label_rect).text(
+            label_rect.left_center(),
+            Align2::LEFT_CENTER,
+            shown,
+            font,
+            pal.text_dim,
+        );
+    }
     hit
 }
 
@@ -280,16 +372,19 @@ pub enum RowTool {
     Lock,
 }
 
-/// 图标按钮（受令牌控制颜色）。
-fn icon_button(
+/// 图标按钮（受令牌控制颜色）。位置由调用方指定。
+///
+/// ⚠️ 与 [`crate::titlebar::icons_close`] 一样走 `allocate_exact_size`，
+/// 但**矩形是给定的**而不是由布局分配——行内工具条必须自己算位置，
+/// 否则 egui 的分配会把按钮推到行右缘之外。
+fn icon_button_at(
     ui: &mut Ui,
+    rect: Rect,
     icon: Icon,
     pal: &Palette,
     scale: f32,
-    tip: &str,
 ) -> egui::Response {
-    let size = vec2(pal.control_height * 0.75, pal.control_height * 0.75) * scale;
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (_, resp) = ui.allocate_exact_size(rect.size(), Sense::click());
     let painter = ui.painter_at(rect);
     if resp.hovered() {
         painter.rect_filled(rect, pal.radius_sm, pal.row_hover);
@@ -300,7 +395,7 @@ fn icon_button(
         egui::Rect::from_center_size(rect.center(), vec2(pal.icon_size, pal.icon_size) * scale),
         color,
     );
-    resp.on_hover_text(tip)
+    resp
 }
 
 /// 画一个列表行。
@@ -369,11 +464,27 @@ pub fn draw_row(
 
     // 文字区还要避开行右侧的工具按钮区，否则长文本会从按钮底下穿过。
     let text_max_x =
-        (rect.max.x - row_tools_width(ui, rect, pal, scale, pinned)).max(inner.min.x);
+        (rect.max.x - row_tools_width(pal, scale, pinned)).max(inner.min.x);
     let text_w = (text_max_x - preview_band.min.x - pal.icon_size).max(0.0);
 
     let preview = crate::titlebar::elide_text(ui, &item.one_line_preview(), &preview_font, text_w);
-    ui.painter().text(
+    // ⚠️ 必须用 `painter_at(text_rect)` 而不是 `ui.painter()`。
+    //
+    // `ui.painter()` 是**根 painter，没有任何裁剪**，`elide_text` 算出的
+    // 宽度只是「打算画多宽」而不是「最多只能画到哪」：字体的实际
+    // advance 与 `measure_text` 的估计一旦有偏差（字号缩放、字体回退、
+    // 半角标点），文字就会**越过行的右缘继续画**，表现为
+    // `miniz_oxide-36a120ae…` 那条横跨面板右边界、`explorer` 被切掉。
+    //
+    // `painter_at` 把裁剪区设成给定矩形，与 painter 自身的 clip 相交，
+    // 于是「算错宽度」最多让文字少画，不会让它跑到面板外面去——
+    // 溢出被从「看不见的错误」变成「可见的截断」。
+    let text_rect = Rect::from_min_max(
+        pos2(preview_band.min.x, preview_band.min.y),
+        pos2(text_max_x.max(preview_band.min.x), preview_band.max.y),
+    );
+    let painter = ui.painter_at(text_rect);
+    painter.text(
         pos2(preview_band.min.x + pal.icon_size, preview_band.center().y),
         Align2::LEFT_CENTER,
         preview,
@@ -381,7 +492,7 @@ pub fn draw_row(
         if selected { pal.text_bright } else { pal.text },
     );
     let meta_shown = crate::titlebar::elide_text(ui, &meta, &meta_font, text_w);
-    ui.painter().text(
+    painter.text(
         pos2(meta_band.min.x + pal.icon_size, meta_band.center().y),
         Align2::LEFT_CENTER,
         meta_shown,
@@ -419,7 +530,9 @@ pub fn draw_compact_row(
     for (text, w) in cols {
         let cell = Rect::from_min_size(pos2(x, rect.min.y), vec2(*w, rect.height()));
         // 单元格里的文字要截断，否则长路径会把相邻列顶开。
-        ui.painter().text(
+        // 再用 `painter_at(cell)` 兜一道：`truncate_to` 按估算宽度截，
+        // 字体实际 advance 偏大时仍可能越过单元格右缘压到下一列。
+        ui.painter_at(cell).text(
             cell.left_center() + vec2(0.0, 0.0),
             Align2::LEFT_CENTER,
             truncate_to(text, *w, pal, scale),
@@ -467,8 +580,19 @@ fn is_wide(c: char) -> bool {
 }
 
 /// 空状态提示。
+///
+/// # ⚠️ 必须用 `painter_at(rect)` 而不是 `ui.painter()`
+///
+/// `ui.painter()` 是**根 painter，完全没有裁剪**。空状态文案是
+/// 居中绘制的，而文案长度与面板宽度无关：窄面板（置顶折叠后仅 24~200pt）
+/// 装不下「还没有置顶条目 / 在历史列表点「置顶左侧」试试」这种两行提示，
+/// 居中一画就**同时溢出左右两侧**，压到相邻面板的文字上。
+/// 实机截图里左栏那两行字横跨过分隔条、骑到历史列表上就是这么来的。
+///
+/// 裁剪后最坏结果是文字被切掉右半边——这比压到别的面板可接受得多，
+/// 且与行内文字、状态栏提示的处理方式一致。
 pub fn draw_empty_state(ui: &mut Ui, rect: Rect, message: &str, pal: &Palette, scale: f32) {
-    ui.painter().text(
+    ui.painter_at(rect).text(
         rect.center(),
         Align2::CENTER_CENTER,
         message,

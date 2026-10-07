@@ -215,6 +215,8 @@ fn run() -> anyhow::Result<()> {
         batches: &[DrawBatch {
             index_offset: 0,
             index_count: 3,
+            // 不额外裁剪（沿用全屏 scissor）。本探针只验描述符绑定。
+            clip: None,
         }],
         ..Default::default()
     };

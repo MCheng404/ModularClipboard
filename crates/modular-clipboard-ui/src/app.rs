@@ -315,6 +315,12 @@ pub fn run_with_options(
         // 事件**只有这一份**：既喂应用层（第 1 步的关闭/resize 判断），
         // 也喂 egui。漏掉后者会让 UI 收不到任何鼠标/键盘输入。
         let raw_input = events.egui_input(&ctx, &frame_events);
+        // 诊断用：`run_ui` 按值消费 `raw_input`，之后拿不到 `screen_rect`。
+        let diag_screen_rect = if std::env::var_os("MC_DIAG").is_some() {
+            raw_input.screen_rect
+        } else {
+            None
+        };
         let mut output = ctx.run_ui(raw_input, |ui| {
             app.draw_frame(ui);
         });
@@ -459,6 +465,17 @@ pub fn run_with_options(
                 draw_calls = painter.stats.draw_calls,
                 rebuilds = painter.stats.rebuilds,
                 "帧统计"
+            );
+        }
+        if std::env::var_os("MC_DIAG").is_some() && frame_no % 30 == 0 {
+            let (pw, ph) = window.inner_size_physical();
+            tracing::warn!(
+                frame = frame_no,
+                client_px = ?(pw, ph),
+                extent_px = ?(fr.extent().width, fr.extent().height),
+                ppp,
+                screen_rect = ?diag_screen_rect,
+                "DIAG 尺寸链路"
             );
         }
 
