@@ -48,14 +48,20 @@ export TARGET=x86_64-pc-windows-msvc
 
 MODE=debug
 ACTION=build
+# 探针（examples/）不在默认构建目标里，需显式 `--example <name>`。
+# 不加这个开关时 `cargo build` 只出库与主程序，探针 exe 不会生成，
+# 而排查渲染问题恰恰只能靠探针——这个缺口曾导致「探针不存在」的误判。
+EXAMPLE=""
 # 除下面几个自有开关外，其余参数原样透传给 cargo（如 --nocapture、-p <crate>）。
 EXTRA=()
-for arg in "$@"; do
-    case "$arg" in
-        --release) MODE=release ;;
-        --run)     ACTION=run ;;
-        --test)    ACTION=test ;;
-        *) EXTRA+=("$arg") ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --release) MODE=release; shift ;;
+        --run)     ACTION=run; shift ;;
+        --test)    ACTION=test; shift ;;
+        --example) EXAMPLE="$2"; ACTION=example; shift 2 ;;
+        --example=*) EXAMPLE="${1#--example=}"; ACTION=example; shift ;;
+        *) EXTRA+=("$1"); shift ;;
     esac
 done
 
@@ -72,5 +78,9 @@ case "$ACTION" in
     test)
         # 透传额外参数（如 --nocapture、icons::），便于单跑某个测试看诊断输出。
         cargo test --target "$TARGET" --workspace ${EXTRA[@]+"${EXTRA[@]}"}
+        ;;
+    example)
+        cargo build --target "$TARGET" ${MODE:+$( [ "$MODE" = release ] && echo --release )} \
+            --example "$EXAMPLE" ${EXTRA[@]+"${EXTRA[@]}"}
         ;;
 esac
