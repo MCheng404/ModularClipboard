@@ -20,6 +20,11 @@
 //! 渲染后端是 ash 直驱的原生 Vulkan，**不经过 eframe / wgpu**。
 
 pub mod app;
+// 新卡片架构（逐步替换 layout/panels/view/titlebar）。
+// 旧的四个模块仍���在用，待paint.rs 接管绘制后删除。
+pub mod card;
+pub mod solver;
+pub mod workspace;
 pub mod icons;
 pub mod layout;
 pub mod panels;
