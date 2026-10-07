@@ -613,6 +613,53 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
     false
 }
 
+/// 安装图标字体。返回是否成功。
+///
+/// # 为什么必须独立于 [`install_cjk_font`]
+///
+/// [`install_cjk_font`] 是「取第一个找到的就return」的逻辑：一旦某台机器上
+/// 存在任何一款候选中文字体，它就**不会**再往字体定义里加任何东西。
+/// 图标字体若寄生在它内部，中文字体不存在时图标就一起消失了——
+/// 而界面里那些图标恰恰是操作入口，缺了比缺字更糟。
+///
+/// 因此这里是独立函数，独立注册 [`crate::icons::ICON_FONT_NAME`]。
+///
+/// # 字体族与顺序
+///
+/// 挂在 [`FontFamily::Proportional`]，**排在已有字体之后**。
+///
+/// - 排在之后：CJK 字体被 `insert(0, ...)` 放在首位且字体庞大，
+///   让图标字体抢在前面会让每个图标的排版都先去问一遍 CJK 字体。
+/// - 但仍在同一字体族：图标码位是 PUA（`U+E000..=U+E011`），
+///   中文字体不覆盖这些码位（已核实 `msyh.ttc` / `Deng.ttf` 均无
+///   `U+E000..=U+E011`），因此回退一定能落到图标字体上。
+///
+/// 挂在 `Proportional` 而非新建字体族，是为了复用同一条纹理路径：
+/// 图集走 `TextureId::Managed(0)`，渲染器无需增加第二个纹理绑定。
+///
+/// 必须在 [`install_cjk_font`] **之后**调用——后者会整体替换
+/// `FontDefinitions`，把这里注册的字体一并丢掉。
+pub fn install_icon_font(ctx: &egui::Context) -> bool {
+    let mut defs = ctx.fonts(|f| f.definitions().clone());
+    let name = crate::icons::ICON_FONT_NAME.to_string();
+    defs.font_data
+        .entry(name.clone())
+        .or_insert_with(|| std::sync::Arc::new(crate::icons::icon_font_data()));
+
+    // 追加到 Proportional 末尾（保留既有回退顺序）。
+    let family = defs
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default();
+    if !family.iter().any(|n| *n == name) {
+        family.push(name);
+    }
+
+    ctx.set_fonts(defs);
+    tracing::info!("图标字体已注册");
+    true
+}
+
 fn insert_font(defs: &mut FontDefinitions, name: &str, bytes: &[u8], index: u32) -> bool {
     // egui 0.36 的 FontData 没有 with_index，直接设置公开的 index 字段。
     let mut data = FontData::from_owned(bytes.to_vec());

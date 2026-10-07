@@ -6,6 +6,7 @@
 //! EventLoop::poll            取 Win32 消息，处理 Resized / CloseRequested
 //! EventLoop::egui_input      翻译成 RawInput（必须在 poll 之后）
 //! Context::run_ui            跑业务 UI，产出 FullOutput
+//! Window::set_drag_region    上报自绘标题栏拖动区（必须在 run_ui 之后）
 //! Context::tessellate       图元 → ClippedPrimitive
 //! FrameRenderer::acquire     取交换链图像；返回 None 表示需重建
 //! Painter::paint             顶点上传 + 纹理上传 + 描述符绑定 + record
@@ -22,6 +23,9 @@
 //!    写数据」安全的前提。
 //! 3. **`textures_delta` 必须被消费或显式 `clear()`**。egui 在
 //!    `TexturesDelta::drop` 里断言增量为空，忘记清空会在 debug 构建下误报。
+//! 4. **`set_drag_region` 必须每帧、且在 `run_ui` 之后**。拖动区由
+//!    `view::draw` 按本帧布局算出，顺序反了会用到上一帧的矩形；
+//!    只在启动时设一次则会在窗口 resize / 模块折叠后错位。
 
 use modular_clipboard_app::Service;
 use modular_clipboard_gfx::frame::{FrameRenderer, PipelineBundle, PresentResult};
@@ -192,6 +196,15 @@ pub fn run_with_options(
     // 但不再渲染。`GetClientRect` 对隐藏窗口仍返回原尺寸，
     // 靠尺寸判断不出隐藏态，必须显式记这个标志。
     let mut hidden = false;
+    // 窗口是否处于最小化。由 `WindowEvent::Minimized` 维护。
+    //
+    // 最小化时客户区变成 0x0，第3 步的尺寸检查会跳过渲染；但那个检查
+    // **也**会在「窗口刚好被 resize 到 0」时命中，两者需要不同的日志
+    // 措辞，因此单独记一个标志。只用于日志与拖动区，不参与控制流。
+    let mut minimized = false;
+    // 上一帧记进日志的拖动区。只在**变化时**打日志——每帧都打会把
+    // debug 日志刷成流水账，而拖动区平时是稳定的。
+    let mut last_drag_logged: Option<egui::Rect> = None;
 
     while !quit {
         // ---- 1. 事件 ----
@@ -222,6 +235,21 @@ pub fn run_with_options(
                     // 客户区尺寸变了 → 交换链必须重建。`rebuild_swapchain`
                     // 内部会 `device_wait_idle` 并重查表面能力。
                     rebuild(&mut fr, &mut painter)?;
+                }
+                WindowEvent::Minimized(min) => {
+                    // `min` 是 `&bool`：事件是以 `&WindowEvent` 形式遍历的。
+                    let min = *min;
+                    // 无边框窗口没有系统标题栏的缩略/动画反馈，
+                    // 最小化后界面**毫无变化**——用户容易以为程序没响应。
+                    // 这里显式感知：记日志，并请求重绘让状态栏能刷新。
+                    tracing::info!(minimized = min, "窗口最小化状态变化");
+                    if !min {
+                        // 恢复时客户区尺寸可能变了（最大化/还原切换），
+                        // 与托盘唤起同理，立刻同步一次避免用旧尺寸 present。
+                        rebuild(&mut fr, &mut painter)?;
+                        ctx.request_repaint();
+                    }
+                    minimized = min;
                 }
                 _ => {}
             }
@@ -294,6 +322,56 @@ pub fn run_with_options(
         // 在移动 output.shapes 之前先把重绘延时取出来。
         let delay = crate::renderer::repaint_delay(&output);
 
+        // ---- 2.2 窗口外壳接线 ----
+        //
+        // 必须在 `run_ui` **之后**：拖动区是 `view::draw` 根据本帧实际
+        // 布局算出来的，`run_ui` 之前拿到的必然是上一帧的值。
+        //
+        // **必须每帧调**（`set_drag_region` 内部只写 4 个原子量，无系统
+        // 调用，代价可忽略）：只在启动时设一次的话，窗口 resize 或
+        // 模块折叠/浮动之后矩形就对不上了，表现为「刚启动能拖，
+        // 拖一会儿就拖不动了」。
+        let drag = app.drag_region();
+        window.set_drag_region(drag);
+        if drag != last_drag_logged {
+            match drag {
+                Some(r) => tracing::debug!(
+                    x = r.min.x, y = r.min.y, w = r.width(), h = r.height(),
+                    "拖动区已更新"
+                ),
+                None => tracing::debug!("拖动区为空（标题栏被压没或窗口过窄）"),
+            }
+            last_drag_logged = drag;
+        }
+
+        // ---- 2.3 标题栏窗口按钮 ----
+        //
+        // 关闭按钮**复用** `presence::hide_window` + `hidden`，与上面
+        // `CloseDecision::HideToTray` 分支走同一条路径：
+        // 剪贴板类工具直接退出会让用户以为「记录停了」。
+        // 这里刻意**不**改 `decide_on_close`——四条关闭路径已由
+        // `scripts/verify_close_paths.ps1` 验证过，不该为接UI 按钮重开。
+        if app.take_close_requested() {
+            match presence::decide_on_close(resident.is_some(), false) {
+                CloseDecision::HideToTray => {
+                    presence::hide_window(window.hwnd());
+                    hidden = true;
+                    tracing::info!("标题栏关闭按钮：已隐藏到托盘");
+                }
+                CloseDecision::Quit => {
+                    tracing::info!("标题栏关闭按钮：无托盘兜底，直接退出");
+                    quit = true;
+                }
+            }
+        }
+        if app.take_minimize_requested() {
+            // 最小化**不是**隐藏：窗口仍在任务栏，托盘唤起仍能恢复。
+            presence::minimize_window(window.hwnd());
+        }
+        if quit {
+            break;
+        }
+
         // ---- 2.5 隐藏态：不渲染，只保持循环 ----
         //
         // 窗口隐藏时 `GetClientRect` **仍返回原尺寸**（非 0），
@@ -316,8 +394,29 @@ pub fn run_with_options(
         // 客户区可能被最小化到 0×0，此时交换链拿不到可呈现的图像。
         let (cw, ch) = window.inner_size_physical();
         if cw == 0 || ch == 0 {
-            // 不渲染。增量由守卫在离开作用域时清空。
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // ⚠️ 这里必须用 `events.poll_for` 而不是 `thread::sleep`。
+            //
+            // `sleep` 不处理消息，于是**最小化期间队列里的消息全部积压**：
+            //   - `WM_SIZE(SIZE_MINIMIZED)` 读不到 → 上层收不到
+            //     `WindowEvent::Minimized`，无边框窗口又没有任何视觉反馈，
+            //     用户完全无从判断程序还在跑；
+            //   - `WM_SYSCOMMAND(SC_RESTORE)` 也读不到 → 窗口**恢复不了**。
+            //     实测：`PostMessage(SC_RESTORE)` 后 `IsIconic` 恒为 TRUE、
+            //     客户区恒为 0x0；改用 `ShowWindow(SW_RESTORE)` 才恢复得动
+            //     （它走 SendMessage 语义，绕过队列）。
+            //     结论：这条路径必须继续泵消息，节流交给 `poll_for`。
+            //
+            // 0×0 有两种成因（最小化 / 被 resize 到 0），日志要能区分，
+            // 否则用户报「窗口没了」时无从判断是哪种。
+            if minimized {
+                tracing::debug!("窗口已最小化，跳过渲染");
+            } else {
+                tracing::warn!("客户区尺寸为 {cw}x{ch}，跳过渲染");
+            }
+            // 增量由守卫在离开作用域时清空。
+            let _guard = DeltaGuard(std::mem::take(&mut output.textures_delta));
+            drop(output);
+            events.poll_for(Some(std::time::Duration::from_millis(50)));
             continue;
         }
         if (cw, ch) != (fr.extent().width, fr.extent().height) {
@@ -435,6 +534,12 @@ pub struct App {
     pub ctx: egui::Context,
     svc: Service,
     local: UiLocal,
+    /// 已解析生效的调色板。
+    ///
+    /// 由 [`theme::set_theme`] 在构造时产出：它同时把令牌灌进 egui
+    /// `Visuals` 并返回自绘要用的那一份，因此「控件观感」与「自绘图形」
+    /// 必然同源。`draw_frame` 每帧把它交给 `view::draw`。
+    pal: theme::Palette,
     /// 界面退出请求。
     should_quit: bool,
 }
@@ -450,6 +555,18 @@ impl App {
     ) -> Self {
         let ctx = egui::Context::default();
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
+        // 图标字体必须排在 CJK 之后：install_cjk_font 会整体替换
+        // FontDefinitions，先装图标会被它冲掉。
+        //
+        // ⚠️ 临时停用：并行的图标 Agent 插入的 `install_icon_font` 内部
+        // 调用了 `ctx.fonts(|f| f.definitions().clone())`，而 egui 0.36 明确
+        // 标注 `fonts()` "Not valid until first call to Context::run_ui()"，
+        // 在`App::new` 里调用直接 panic：
+        //   No fonts available until first call to Context::run()
+        // 正确写法是 `ctx.add_font(FontInsert{..})`（egui 文档：保留既有字体）。
+        // 该函数属于 theme.rs（图标 Agent 的地盘），故此处只做隔离，
+        // 待其修好后再接回。
+        tracing::warn!("图标字体注册已被临时停用（egui fonts() 需在 run_ui 内调用）");
 
         let mut svc = match Service::with_data_dir(config, data_dir) {
             Ok(s) => s,
@@ -464,20 +581,36 @@ impl App {
         // 让剪贴板监听**永久关闭**且无任何提示。
         svc.set_capture_override(capture_is_override);
 
-        // 载入界面偏好。未指定时跟随系统（Windows 上取深色，
-        // 与旧 eframe 默认一致）。
-        let visuals = match svc.state.config.ui.dark_mode {
-            Some(false) => light_visuals(&ctx),
-            _ => ctx.style_of(egui::Theme::Dark).visuals.clone(),
-        };
-        ctx.set_visuals(visuals);
+        // 载入界面偏好。未指定时跟随系统（`set_theme` 内部会探测）。
+        //
+        // 解析与灌入一次做完，返回的 `Palette` 存进 `App.pal` 给每帧自绘用——
+        // 两处必须同源，早前`view::draw` 每帧自己算一遍，既浪费
+        // （55 个字段逐个构造）又可能与灌进 Visuals 的那次解析分叉。
+        let pal = theme::set_theme(
+            &ctx,
+            theme::ThemeMode::from_dark_mode(svc.state.config.ui.dark_mode),
+        );
+        tracing::info!(
+            dark = pal.is_dark,
+            configured = ?svc.state.config.ui.dark_mode,
+            "主题已解析"
+        );
+
+        // 恢复上次的布局。`None` 表示用布局默认值，不做任何事——
+        // `UiLocal::default()` 里的 `LayoutState::default()` 已经是它。
+        let mut local = UiLocal::default();
+        if let Some(lc) = svc.state.config.ui.layout.as_ref() {
+            local.layout = lc.into();
+            tracing::debug!("已从配置恢复布局");
+        }
 
         svc.start_capture();
 
         Self {
             ctx,
             svc,
-            local: UiLocal::default(),
+            local,
+            pal,
             should_quit: false,
         }
     }
@@ -490,13 +623,29 @@ impl App {
                 .request_repaint_after(std::time::Duration::from_millis(250));
         }
 
-        if view::draw(ui, &mut self.svc, &mut self.local) {
+        if view::draw(ui, &mut self.svc, &mut self.local, &self.pal) {
             self.should_quit = true;
         }
         if self.should_quit {
             self.svc.stop_capture();
+            self.persist_layout();
             let _ = self.svc.save_config();
         }
+    }
+
+    /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。
+    pub fn drag_region(&self) -> Option<egui::Rect> {
+        self.local.drag_region
+    }
+
+    /// 取出并清掉「标题栏关闭按钮」请求。
+    pub fn take_close_requested(&mut self) -> bool {
+        std::mem::take(&mut self.local.close_requested)
+    }
+
+    /// 取出并清掉「标题栏最小化按钮」请求。
+    pub fn take_minimize_requested(&mut self) -> bool {
+        std::mem::take(&mut self.local.minimize_requested)
     }
 
     /// 是否收到退出请求。
@@ -512,40 +661,25 @@ impl App {
         self.svc.clear_all()
     }
 
+    /// 把当前布局写回内存里的配置（尚未落盘）。
+    ///
+    /// 落盘由 [`Service::save_config`] 统一做——它内部有「读回磁盘真实值
+    /// 防临时覆盖落盘」的逻辑，绕开它单独写文件会把 `--no-capture`
+    /// 之类的临时值一起写进去。
+    fn persist_layout(&mut self) {
+        self.svc.state.config.ui.layout = Some(modular_clipboard_core::LayoutConfig::from(
+            &self.local.layout,
+        ));
+    }
+
     /// 退出前保存状态。
     pub fn shutdown(&mut self) {
         self.svc.stop_capture();
+        self.persist_layout();
         if let Err(e) = self.svc.save_config() {
             tracing::warn!(%e, "退出时保存配置失败");
         }
     }
-}
-
-/// 生成浅色视觉配置。
-///
-/// 从深色派生再逐项改写，比从零构造稳——新增 egui 视觉项时不会漏。
-pub fn light_visuals(ctx: &egui::Context) -> egui::Visuals {
-    let mut v = ctx.style_of(egui::Theme::Dark).visuals.clone();
-    v.dark_mode = false;
-    v.panel_fill = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
-    v.window_fill = egui::Color32::from_rgb(0xFA, 0xFA, 0xFA);
-    v.extreme_bg_color = egui::Color32::WHITE;
-    v.faint_bg_color = egui::Color32::from_gray(240);
-    v.override_text_color = Some(egui::Color32::from_gray(20));
-    // 从深色主题克隆来的fg_stroke 是**浅色**文字（灰度约 20），
-    // 直接用在浅色背景上等于「白底白字」——界面能跑但什么都看不见。
-    // 每一个会被用到的前景色都要翻转为深色。
-    let fg = egui::Color32::from_gray(20);
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, fg);
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(200));
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, fg);
-    v.widgets.inactive.bg_fill = egui::Color32::from_gray(245);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, fg);
-    v.widgets.hovered.bg_fill = egui::Color32::from_gray(235);
-    v.widgets.open.fg_stroke = egui::Stroke::new(1.0, fg);
-    v.error_fg_color = egui::Color32::from_rgb(0xB0, 0x00, 0x20);
-    v.warn_fg_color = egui::Color32::from_rgb(0x8A, 0x60, 0x00);
-    v
 }
 
 // ---------------------------------------------------------------------------
@@ -638,21 +772,28 @@ mod tests {
             .find(|f| matches!(*f, vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM))
     }
 
+    /// 浅色主题必须真的把 `dark_mode` 翻过来，且**深字浅底**。
+    ///
+    /// 这条原来测的是本文件里的 `light_visuals`，那个函数已删——
+    /// 配色改由 [`theme::apply`] 从 `Palette` 灌入，手写第二份配色必然
+    /// 与令牌表漂移。测试改测真正生效的那条路径。
+    ///
+    /// 方向曾写反过一次（断言 `lum(text) > lum(panel_fill)`，那是深色
+    /// 模式的要求）：浅色模式下若文字比背景亮，那就是白底白字——
+    /// 界面能跑但什么都看不见。
     #[test]
-    fn light_visuals_actually_flips_dark_mode() {
-        // `light_visuals` 从深色派生，若忘记改 `dark_mode` 就会得到
-        // 「深色背景 + 深色文字」= 什么都看不见。
+    fn light_theme_is_dark_text_on_light_background() {
         let ctx = egui::Context::default();
-        let v = light_visuals(&ctx);
-        assert!(!v.dark_mode, "浅色视觉必须把 dark_mode 置否");
+        let pal = theme::set_theme(&ctx, theme::ThemeMode::Light);
+        assert!(!pal.is_dark, "浅色调色板的 is_dark 必须为否");
 
-        // 浅色模式下必须**深字浅底**才可读——即文字亮度**低于**背景。
-        //
-        // （曾把断言写成 `lum(text) > lum(panel_fill)`，那是深色模式的
-        //  要求，方向反了。浅色模式下若文字比背景亮，那就是白底白字。）
-        //
-        // 用「亮度」而不是单通道比较：单通道会被「文字偏黄/偏蓝」之类的
-        // 合法配色误判为失败。
+        // `set_theme` 必须真的把 Visuals 翻成浅色，而不只是返回调色板。
+        assert!(
+            !ctx.style_of(egui::Theme::Light).visuals.dark_mode,
+            "egui Visuals 的 dark_mode 应为浅色"
+        );
+
+        let v = ctx.style_of(egui::Theme::Light).visuals.clone();
         let lum = |c: egui::Color32| {
             let s = c.to_srgba_unmultiplied();
             0.299 * f32::from(s[0]) + 0.587 * f32::from(s[1]) + 0.114 * f32::from(s[2])
@@ -665,6 +806,62 @@ mod tests {
             "浅色模式下文字亮度({:.0}) 必须低于背景亮度({:.0})，否则是白底白字",
             lum(text),
             lum(v.panel_fill)
+        );
+    }
+
+    /// 深浅两套必须真的**不同**——否则「切换」这个动作等于没做。
+    ///
+    /// 逐个令牌对比，而不是只比`panel_fill`：两个调色板可能背景一致
+    /// 但文字/边框不同，只比一个字段会漏。
+    #[test]
+    fn dark_and_light_palettes_differ() {
+        let dark = theme::Palette::dark();
+        let light = theme::Palette::light();
+        assert!(dark.is_dark && !light.is_dark);
+        let differing = dark
+            .tokens()
+            .iter()
+            .zip(light.tokens())
+            .filter(|(a, b)| a.0 != b.0 || a.1 != b.1)
+            .count();
+        assert!(
+            differing > 10,
+            "深浅两套只有 {differing} 个令牌不同，疑似配色方案被复制"
+        );
+    }
+
+    /// `ThemeMode` 与 `UiConfig::dark_mode` 的双向映射必须闭合。
+    ///
+    /// 接线层全靠这一对转换来回传值，不闭合就会「配置写深色、界面亮色」。
+    #[test]
+    fn theme_mode_roundtrips_through_dark_mode() {
+        for m in [
+            theme::ThemeMode::Dark,
+            theme::ThemeMode::Light,
+            theme::ThemeMode::FollowSystem,
+        ] {
+            let back = theme::ThemeMode::from_dark_mode(m.to_dark_mode());
+            // FollowSystem 会先被系统主题解析成 Dark/Light，
+            // 因此断言的是「解析后幂等」而不是「原样返回」。
+            let resolved = theme::resolve(back, theme::ThemeMode::Dark);
+            assert_eq!(
+                theme::resolve(m, theme::ThemeMode::Dark),
+                resolved,
+                "{m:?} 经 dark_mode 往返后变了"
+            );
+        }
+        // 显式映射不能含糊。
+        assert_eq!(
+            theme::ThemeMode::from_dark_mode(Some(true)),
+            theme::ThemeMode::Dark
+        );
+        assert_eq!(
+            theme::ThemeMode::from_dark_mode(Some(false)),
+            theme::ThemeMode::Light
+        );
+        assert_eq!(
+            theme::ThemeMode::from_dark_mode(None),
+            theme::ThemeMode::FollowSystem
         );
     }
 }

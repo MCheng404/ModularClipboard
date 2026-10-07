@@ -70,14 +70,16 @@ pub fn draw_collapse_handle(ui: &mut Ui, rect: Rect, pal: &Palette, scale: f32) 
     let resp = ui.interact(r, ui.id().with("collapse_handle"), Sense::click());
     let bg = if resp.hovered() { pal.row_hover } else { pal.surface_variant };
     ui.painter().rect_filled(r, CornerRadius::ZERO, bg);
-    // 三个点：竖排的「⋮」，提示这里可以拖/点。
-    let dot = 2.0 * scale;
-    let n = 3;
-    for i in 0..n {
-        let y = r.center().y + (i as f32 - 1.0) * dot * 3.0;
-        ui.painter().circle_filled(pos2(r.center().x, y), dot, pal.text_dim);
-    }
-    let _ = resp;
+    // 拖拽手柄图标（grip-vertical）：比三个手画圆点更像「可拖」，
+    // 也与折叠把手的点击语义不冲突。
+    Icon::Drag.paint(
+        &ui.painter_at(r),
+        Rect::from_center_size(
+            r.center(),
+            vec2(pal.icon_size, pal.icon_size) * scale,
+        ),
+        if resp.hovered() { pal.text_bright } else { pal.text_dim },
+    );
     r
 }
 
@@ -206,11 +208,13 @@ pub fn draw_row_tools(
             if icon_button(ui, Icon::Unpinned, pal, scale, "取消置顶").clicked() {
                 hit = Some(RowTool::Unpin);
             }
-            if icon_button(ui, Icon::Pinned, pal, scale, "固定在主区顶部").clicked() {
+            if icon_button(ui, Icon::Lock, pal, scale, "固定在主区顶部").clicked() {
                 hit = Some(RowTool::Lock);
             }
         } else if icon_button(ui, Icon::Pinned, pal, scale, "置顶到左侧").clicked() {
             hit = Some(RowTool::PinLeft);
+        } else if icon_button(ui, Icon::Unlock, pal, scale, "固定在主区顶部").clicked() {
+            hit = Some(RowTool::Lock);
         }
     });
     hit
@@ -475,6 +479,17 @@ impl RailView {
         match self {
             RailView::Table => "表",
             RailView::Masked => "密",
+        }
+    }
+
+    /// 该视图对应的图标。
+    ///
+    /// 「表」「密」两个汉字已被图标取代：单字在窄条里只有 11px 高，
+    /// 且依赖中文字体一定存在；图标则一眼可辨。
+    pub fn icon(self) -> Icon {
+        match self {
+            RailView::Table => Icon::Table,
+            RailView::Masked => Icon::Mask,
         }
     }
 

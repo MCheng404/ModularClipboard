@@ -40,8 +40,10 @@ public static class W {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
   public const int GWL_STYLE = -16;
-  public const int WS_POPUP    = 0x80000000;
-  public const int WS_CAPTION  = 0x00C00000;   // WS_BORDER|WS_DLGFRAME
+  // ⚠️ 必须用 long：0x80000000 超出 int 正范围，C# 会报
+  // 「无法将类型 uint 隐式转换为 int」。
+  public const long WS_POPUP   = 0x80000000L;
+  public const long WS_CAPTION = 0x00C00000L;  // WS_BORDER|WS_DLGFRAME
   public const int WS_THICKFRAME = 0x00040000;
   public const uint WM_NCHITTEST = 0x0084;
   public static List<IntPtr> TopLevel(uint want) {
@@ -55,13 +57,24 @@ public static class W {
     IntPtr lp = (IntPtr)((sy << 16) | (sx & 0xFFFF));
     return SM(h, WM_NCHITTEST, IntPtr.Zero, lp);
   }
-  public static bool ClientToScreen(IntPtr h, ref POINT p) { return ScreenToClient(h, ref p); }
+  //⚠️ 必须绑真正的 ClientToScreen。曾误绑成 ScreenToClient（反了），
+  //    导致屏幕坐标被反向换算、指针落到负数区，命中测试全部退化成
+  //    HTCLIENT——看起来像「resize 坏了」，实际是测试自己的 bug。
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
 }
 '@
 
 function Say($ok, $label, $detail) {
-  if ($ok) { $script:pass++; Write-Host "[PASS] $label  $detail" -ForegroundColor Green }
-  else     { $script:fail++; Write-Host "[FAIL] $label  $detail" -ForegroundColor Red }
+  # ⚠️ 计数器不能用 `$script:pass++`：PowerShell 在这个上下文里会把
+  #    `$ok`（bool）卷进算术，抛 "The '++' operator works only on
+  #    numbers"。显式 [int] 赋值最省事，也无隐式转换的坑。
+  if ($ok) {
+    $script:pass = [int]$script:pass + 1
+    Write-Host "[PASS] $label  $detail" -ForegroundColor Green
+  } else {
+    $script:fail = [int]$script:fail + 1
+    Write-Host "[FAIL] $label  $detail" -ForegroundColor Red
+  }
 }
 
 Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue

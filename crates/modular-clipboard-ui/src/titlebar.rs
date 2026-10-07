@@ -263,7 +263,7 @@ pub fn draw(
     if title_button(ui, l.close, pal, Icon::Close, "关闭（隐藏到托盘）").clicked() {
         action = TitlebarAction::Close;
     }
-    if title_button(ui, l.minimize, pal, Icon::Search, "最小化").clicked() {
+    if title_button(ui, l.minimize, pal, Icon::Minimize, "最小化").clicked() {
         action = TitlebarAction::Minimize;
     }
     if title_button(ui, l.settings, pal, Icon::Settings, "设置").clicked() {

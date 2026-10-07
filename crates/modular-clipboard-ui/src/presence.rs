@@ -22,7 +22,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, ShowWindow,
-    SW_HIDE, SW_RESTORE,
+    SW_HIDE, SW_MINIMIZE, SW_RESTORE,
 };
 
 /// 窗口隐藏时的轮询间隔。
@@ -252,6 +252,25 @@ pub fn hide_window(hwnd: HWND) {
     }
     // BOOL 是 Copy 类型，`drop` 对它不做任何事且会告警，用 `let _ =`。
     let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+}
+
+/// 最小化主窗口（不销毁、不隐藏）。
+///
+/// # 与 `hide_window` 的区别
+///
+/// `SW_MINIMIZE` 只把窗口收进任务栏，**`IsWindowVisible` 仍为真**——
+/// 托盘的「显示主窗口」仍能把它恢复。反过来 `SW_HIDE` 会让窗口彻底
+/// 从任务栏与 Alt+Tab 消失，语义完全不同，两者不能互相顶替。
+///
+/// 无边框窗口（`WS_POPUP`）同样可以最小化：最小化是窗口管理器提供
+/// 的行为，与有没有系统标题栏无关。
+pub fn minimize_window(hwnd: HWND) {
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        tracing::warn!("最小化失败：主窗口句柄已失效");
+        return;
+    }
+    let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+    tracing::info!("窗口已最小化");
 }
 
 #[cfg(test)]

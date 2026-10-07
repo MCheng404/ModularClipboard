@@ -106,6 +106,59 @@ impl Default for CaptureConfig {
     }
 }
 
+/// 布局状态的磁盘表示（纯数字 DTO）。
+///
+/// # 为什么在 core 而不在 ui
+///
+/// 它是**用户配置的一部分**，必须与 [`UiConfig`] 的其余字段同处一个
+/// crate：`Config` 被 core 定义，ui 反过来依赖 core。若把 `LayoutConfig`
+/// 留在 ui crate，`UiConfig` 就没法持有它——要么 core 依赖 ui（形成
+/// 循环依赖），要么配置里存不成布局。
+///
+/// 与运行时的 [`LayoutState`](https://docs.rs) 分离的原因：布局用的
+/// `Rect` 是 egui 类型，直接序列化会把渲染库的内部结构写进配置文件，
+/// 换 egui 版本就得迁移用户数据。这层 DTO 只用原始数字，是**稳定格式**。
+///
+/// `From<&LayoutState>` 的转换实现留在 ui crate——`LayoutState` 是
+/// egui 侧的类型，core 不认识它。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayoutConfig {
+    /// 每个模块：`[是否浮动, 槽位, 是否折叠, x, y, w, h]`。
+    ///
+    /// 位置与尺寸**只在浮动时有效**，停靠时仍写入——
+    /// 停靠→浮动→停靠往返后能恢复原位置。
+    pub modules: [[f32; 7]; 4],
+    /// 宽度增量。
+    pub width_delta: [f32; 4],
+    /// 侧栏选中的视图下标。
+    pub rail_view: usize,
+    /// 顶栏高度。
+    pub topbar_height: f32,
+    /// 结构版本号，供将来迁移。
+    pub version: u32,
+}
+
+impl LayoutConfig {
+    /// 当前格式版本。
+    pub const VERSION: u32 = 1;
+
+    /// 全部为 0 的空布局。**不是**可用的默认布局。
+    ///
+    /// 真正的默认布局必须由 ui 侧的 `LayoutState::default()` 转换而来
+    ///（它要知道每个模块的默认槽位），因此没有 `Default` 实现——
+    /// 在这里给一个「看起来像默认」的全零值，调用方一旦误用就会得到
+    /// 「所有模块堆在中央槽」的用户可见故障，且没有任何编译期提示。
+    pub fn empty() -> Self {
+        Self {
+            modules: [[0.0; 7]; 4],
+            width_delta: [0.0; 4],
+            rail_view: 0,
+            topbar_height: 0.0,
+            version: Self::VERSION,
+        }
+    }
+}
+
 /// UI 偏好。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiConfig {
@@ -120,6 +173,14 @@ pub struct UiConfig {
     /// 自定义中文字体路径，`None` 时自动探测系统字体。
     pub font_path: Option<String>,
     pub font_scale: f32,
+    /// 面板布局（停靠 / 折叠 / 浮动位置）。`None` 表示用布局默认值。
+    ///
+    /// ⚠️ `#[serde(default)]` 不是可选的：没有它，serde 会要求这个
+    /// 字段**必须存在**，于是任何旧版config.json 解析失败，
+    /// [`Config::load`] 静默回退到 `Config::default()`——
+    /// 用户的窗口尺寸、主题、屏蔽名单**全部被抹掉**，且没有任何提示。
+    #[serde(default)]
+    pub layout: Option<LayoutConfig>,
 }
 
 impl Default for UiConfig {
@@ -134,6 +195,7 @@ impl Default for UiConfig {
             start_minimized: false,
             font_path: None,
             font_scale: 1.0,
+            layout: None,
         }
     }
 }
@@ -260,5 +322,87 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg, Config::default());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 旧版 config.json（**没有** `ui.layout` 字段）必须仍能完整读回。
+    ///
+    /// 这条守着 `#[serde(default)]`：字段漏了它，serde 会报
+    /// 「missing field」，`Config::load` 于是回退到 `Config::default()`——
+    /// 用户的窗口尺寸、主题、屏蔽名单被**静默抹掉**，且不报任何错。
+    /// 上线新字段时把它删掉，这条测试立刻失败。
+    #[test]
+    fn legacy_config_without_layout_field_still_loads() {
+        let legacy = r#"{
+          "storage": {"max_items": 500, "max_bytes": 1024, "max_payload_bytes": 2048,
+                      "cleanup_on_start": true},
+          "capture": {"enabled": false, "poll_interval_ms": 500, "track_source_app": false,
+                      "blocked_apps": ["钉钉"], "skip_password_fields": false,
+                      "dedup": false, "dedup_window_secs": 9},
+          "ui": {"dark_mode": false, "always_on_top": false, "hide_on_focus_lost": true,
+                 "window_width": 777.0, "window_height": 888.0, "show_tray": false,
+                 "start_minimized": true, "font_path": null, "font_scale": 1.5},
+          "hotkey_toggle": {"key": "V", "ctrl": true, "shift": true, "alt": false, "win": false},
+          "hotkey_paste_previous": {"key": "V", "ctrl": true, "shift": false, "alt": false, "win": true},
+          "rules": []
+        }"#;
+        let cfg: Config = serde_json::from_str(legacy).expect("旧配置不该解析失败");
+        assert_eq!(cfg.ui.layout, None, "缺失字段应落回 None（用布局默认值）");
+        // 其余字段必须**逐个**保留，而不是被默认值覆盖。
+        assert_eq!(cfg.ui.window_width, 777.0);
+        assert_eq!(cfg.ui.window_height, 888.0);
+        assert_eq!(cfg.ui.dark_mode, Some(false));
+        assert!(!cfg.ui.always_on_top);
+        assert!(!cfg.ui.show_tray);
+        assert!(!cfg.capture.enabled, "capture 段也必须原样读回");
+        assert_eq!(cfg.capture.poll_interval_ms, 500);
+        assert_eq!(cfg.capture.blocked_apps, vec!["钉钉".to_string()]);
+        assert_eq!(cfg.ui.font_scale, 1.5);
+    }
+
+    /// 布局字段存→取必须逐字段不变。
+    ///
+    /// 直接打 serde 与 [`Config::save`] / [`Config::load`] 两条路径，
+    /// 因为两者都可能因未来重构而漂移。
+    #[test]
+    fn layout_config_survives_json_roundtrip() {
+        let mut lay = LayoutConfig::empty();
+        lay.modules[0] = [1.0, 0.0, 1.0, 10.0, 20.0, 300.0, 400.0];
+        lay.width_delta = [1.5, -2.5, 0.0, 7.25];
+        lay.rail_view = 2;
+        lay.topbar_height = 44.0;
+
+        // 路径1：裸 serde
+        let text = serde_json::to_string(&lay).unwrap();
+        let back: LayoutConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(lay, back);
+
+        // 路径2：整个 Config 存盘再读回
+        let dir = std::env::temp_dir().join("tiez-cfg-layout-rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.json");
+        let mut cfg = Config::default();
+        cfg.ui.layout = Some(lay.clone());
+        cfg.save(&path).unwrap();
+        let read = Config::load(&path).unwrap();
+        assert_eq!(read.ui.layout, Some(lay));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `UiConfig::default()` 的布局必须是 `None`（= 用布局默认值）。
+    ///
+    /// 若默认给了某个具体布局，用户首次启动就会看到「模块已被安排好」的
+    /// 状态，且那份默认值无处可查。
+    #[test]
+    fn default_ui_config_has_no_layout_override() {
+        assert_eq!(UiConfig::default().layout, None);
+    }
+
+    /// 版本号必须稳定：它是将来做格式迁移的唯一依据。
+    ///
+    /// 一旦发布过就不能改——改了会让已存盘的旧版本号无法识别。
+    #[test]
+    fn layout_version_is_pinned() {
+        assert_eq!(LayoutConfig::VERSION, 1);
+        assert_eq!(LayoutConfig::empty().version, 1);
     }
 }
