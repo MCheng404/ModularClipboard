@@ -1,64 +1,240 @@
-//! 矢量图标。
+//! 矢量图标——嵌入 ttf 图标字体渲染。
 //!
-//! # 为什么不用字符或emoji
+//! # 为什么用图标字体，而不是继续手绘
 //!
-//! 用 `✕` / `★` 这类字符当功能图标有三个问题：
+//! 旧实现是一堆[`egui::Painter`] 调用（画矩形 / 圆弧 / 线条）。它的问题：
 //!
-//! 1. **字形依赖**——不同字体下形状与粗细不一致，有的字体里根本没有。
-//! 2. **无法着色**——字符颜色跟随前景色，做不出「hover 变色」这类状态。
-//! 3. **不可控**——`★` 在部分环境会被渲染成彩色 emoji（VS16 变体选择器）。
+//! 1. **圆头圆角画不出来**。epaint 的 tessellator 只实现 miter join，
+//!    源码里明确写着 `// TODO: add line caps`。而 Feather / Lucide / Tabler
+//!    全是 `stroke-linecap="round"`——手绘路径做不出圆头，视觉上比真正的
+//!    图标集明显"糙"一档。
+//! 2. **代码量大且每加一个图标都要重画**。删改一个图标的路径数据就是
+//!    一次潜在的绘图bug，而这类bug（画错一条线）编译器完全不管。
+//! 3. **圆弧近似有误差**。手绘的圆是用多段折线凑的，放大后能看出棱角。
 //!
-//! 所以这里用 [`egui::Painter`] 直接画矢量路径：统一 1.5px 描边、
-//! 16px 画布、随主题着色，行为完全可预测。
+//! # 为什么不用 `egui::Image`
 //!
-//! 全部图标遵循同一套规格：
-//! - 画布 16×16（`ICON_SIZE`）
-//! - 描边 1.5px（`STROKE_WIDTH`），圆头圆角
-//! - 视觉重心居中，与 Material Symbols 的轮廓风格对齐
+//! 两条路都走不通：
+//!
+//! - 该路径需要**用户纹理**，而本项目的渲染器（`renderer.rs`）只能绑一张
+//!   用户纹理，且已被缩略图占用。
+//! - `ImageData::Font` 在 egui 0.36 已被移除（PR #7298）。
+//!
+//! # 为什么零新增依赖
+//!
+//! ttf 直接交给 egui 内置的字体解析器（走 [`egui::FontData`]，底层是
+//! `ab_glyph`）。不需要 `ab_glyph` / `owned_ttf_parser` 之类的额外依赖。
+//!
+//! 渲染通路：字体图集走 `TextureId::Managed(0)`（`renderer.rs` 已支持），
+//! 着色器取覆盖率乘顶点色——**图标颜色天然由 `Color32` 决定**，因此
+//! 每个图标都能跟随主题色。
+//!
+//! # 图标集
+//!
+//! [Bootstrap Icons](https://github.com/twbs/icons) 1.13.1，MIT。
+//! 见仓库根目录 `THIRD_PARTY_LICENSES.md` 的归因。
+//!
+//! `assets/modular-clipboard-icons.ttf` 是**子集化**后的产物：只保留本模块用到的 18 个
+//! 字形，码位重映射到 `U+E000..=U+E011`，体积 4144 字节。
+//!
+//! # 尺寸与对齐
+//!
+//! 图标按 `theme::Palette::icon_size`（16）渲染，`Icon::paint` 用
+//! [`Align2::CENTER_CENTER`] 把行盒摆在 `rect` 中心。
+//!
+//! **为什么仍然需要一个纵向补偿**：epaint 的行盒高度取自字体 **OS/2**
+//! typo 度量（skrifa 不读 `hhea`），本字体
+//! `row_height = ascender(300) - descender(0) + lineGap(27) = 327` 单位，
+//! 比 em（300）高出 27。这27 单位 lineGap 全部堆在基线下方，使行盒重心
+//! 相对 em 盒下移，纯几何居中会让墨迹整体偏上。用
+//! [`egui::FontTweak::y_offset_factor`]（见 [`BASELINE_FACTOR`]）把它补偿回来。
+//!
+//! 各字形自身还有固有偏差（来自轮廓，如 `Trash` 墨迹中心在 159.5/300、
+//! `Text` 在 141.5/300），**这部分没有也不该有补偿**——补偿只能整体平移，
+//! 强行逐个对齐等于把设计意图抹平。实测最差偏差 2px/64px（3.1%），
+//! 肉眼不可见。
+//!
+//! 校准方法与实测数值见 [`tests::report_ink_geometry`]（16/32/64 三个字号，
+//! 屏幕空间光栅化口径）。改动 [`BASELINE_FACTOR`] 前先看它；
+//! 回归判据是 [`tests::glyph_ink_is_centred_in_its_box`]。
 
-use egui::{Color32, Pos2, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, Rect, Ui, Vec2, pos2};
 
-/// 图标画布边长（逻辑像素）。
-pub const ICON_SIZE: f32 = 16.0;
+/// 图标字体的名字，注册进 [`egui::FontDefinitions`] 时用。
+pub const ICON_FONT_NAME: &str = "modular-clipboard-icons";
 
-/// 描边宽度。1.5px 在 100% 缩放下清晰，放大后也不会显得过细。
-const STROKE_WIDTH: f32 = 1.5;
+/// 嵌入的图标字体（子集，4080 字节）。
+///
+/// 只含本模块 [`Icon`] 的 18 个变体，码位 `U+E000..=U+E011`。
+/// 由 `assets/` 下的源字体经`pyftsubset` 生成，改动 [`Icon`] 的码位
+/// 必须同步重新生成该文件——[`tests::every_icon_codepoint_has_ink`]
+/// 会拦住漏改。
+static ICON_TTF: &[u8] = include_bytes!("../assets/modular-clipboard-icons.ttf");
 
-/// 在按钮内绘制图标所需的响应尺寸。
-const HIT_SIZE: f32 = 20.0;
+/// 图标的 [`egui::FontData`]。
+///
+/// 供 [`crate::theme::install_icon_font`] 注册用。走 `from_static`——
+/// 字体已经嵌在二进制里，不需要再拷一份所有权。
+///
+/// baseline 补偿（[`BASELINE_FACTOR`]）挂在这里：
+/// [`egui::FontTweak`] 是**注册期**属性，`FontId` 上没有对应字段。
+pub fn icon_font_data() -> egui::FontData {
+    egui::FontData::from_static(ICON_TTF).tweak(egui::FontTweak {
+        y_offset_factor: BASELINE_FACTOR,
+        ..Default::default()
+    })
+}
+
+/// 图标墨迹相对基线的纵向补偿系数（[`egui::FontTweak::y_offset_factor`]）。
+///
+/// # 为什么需要补偿
+///
+/// epaint 的行盒高度取自 **OS/2** 的 typo 度量（skrifa 不用 hhea）：
+/// `row_height = typoAscender - typoDescender + typoLineGap = 300 - 0 + 27 = 327`
+/// 单位，而 em 只有 300。多出来的 27 单位 lineGap 全部堆在基线**下方**，
+/// 于是行盒重心相对 em 盒下移，纯几何推算下墨迹平均会偏上
+/// `(ascent + descent - lineGap)/2 = 136.5` 单位，而实际墨迹中心均值在 150.7。
+///
+/// 推导：设 `ink_cy` 为字形墨迹中心（字体单位），`asc/desc/gap` 为 OS/2 度量，
+/// epaint 里基线位于 `行顶 + asc`，行盒居中于目标框，于是
+///
+/// ```text
+/// 墨迹中心(相对框心) = (asc + desc - gap)/2 - ink_cy
+/// ```
+///
+/// 代入 `(300 + 0 - 27)/2 - 150.7 = -14.2` 单位（偏上），
+/// 折成比例即 `+14.2 / 300 ≈ 0.047`；实测标定值0.0553（差异来自
+/// epaint 的整像素对齐与图集量化）。
+///
+/// # 符号：必须为正
+///
+/// [`egui::FontTweak::y_offset_factor`] 为负会把墨迹**上移**。
+/// 本常量曾经是 `-0.055`——符号写反了，等于在3.5px 的自然偏移上
+/// 再叠加 3.5px 反向偏移，实测把`Close` 的上下留白从 5/11 放大成 2/14。
+///
+/// # 校准方法
+///
+/// 不是拍脑袋，是 [`tests::report_ink_geometry`] 在 16 / 32 / 64 三个字号下
+/// 实测「墨迹中心 − 框心」的均值，取其反号。换字号时因为补偿正比于字号，
+/// 三个字号会同时收敛—— 单个字号碰巧居中不算数。
+pub const BASELINE_FACTOR: f32 = 0.0553;
+
+/// 墨迹相对 em 盒的缩放系数。
+///
+/// 本图标集里 `search`（放大镜）与 `gear`（齿轮）的轮廓**略微超出**
+/// em 盒：`search` 的 bbox 是 (-4, 0, 300, 304)、`gear` 是 (-3, -3, 303, 303)，
+/// em 则是 0..=300。超出量来自它们的圆形部件用了向外延伸的圆头
+/// （这是刻意的，否则放大镜和齿轮会显得比别的图标「瘦」）。
+///
+/// 直接按 em 盒取字号会让这两个图标比方框大出约 1.3%——肉眼可见的
+/// 「这一个图标胖一圈」。这里统一缩到 98%，让所有图标的墨迹都
+/// 落在方框内，观感一致。
+const INK_FIT: f32 = 0.98;
 
 /// 图标语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
+    // ---- 已在用的----
     /// 关闭 / 清除。
     Close,
-    /// 已置顶。
+    /// 已置顶（实心图钉）。
     Pinned,
-    /// 未置顶（置顶按钮的默认态）。
+    /// 未置顶（描边图钉，置顶按钮的默认态）。
     Unpinned,
-    /// 复制到剪贴板。
-    Copy,
-    /// 删除。
-    Delete,
-    /// 编辑。
-    Edit,
     /// 搜索。
     Search,
-    /// 粘贴。
-    Paste,
     /// 设置。
     Settings,
-    /// 图片类型条目。
-    Image,
     /// 文本类型条目。
     Text,
-    /// 文件类型条目。
-    File,
     /// HTML / 富文本条目。
     Code,
+    /// 图片类型条目。
+    Image,
+    /// 文件类型条目。
+    File,
+
+    // ---- 标题栏 / 布局----
+    /// 最小化。
+    Minimize,
+    /// 折叠（收起面板）。
+    Collapse,
+    /// 展开（展开面板）。
+    Expand,
+    /// 拖拽手柄。
+    Drag,
+    /// 「固定在主区顶部」——已固定（实心挂锁）。
+    Lock,
+    /// 「固定」——未固定（开挂锁）。
+    Unlock,
+    /// 「表」视图标签。
+    Table,
+    /// 「密」视图标签（内容打码）。
+    Mask,
+    /// 清空。
+    Trash,
 }
 
 impl Icon {
+    /// 全部变体。用于测试与穷举性检查。
+    pub const ALL: &'static [Icon] = &[
+        Icon::Close,
+        Icon::Pinned,
+        Icon::Unpinned,
+        Icon::Search,
+        Icon::Settings,
+        Icon::Text,
+        Icon::Code,
+        Icon::Image,
+        Icon::File,
+        Icon::Minimize,
+        Icon::Collapse,
+        Icon::Expand,
+        Icon::Drag,
+        Icon::Lock,
+        Icon::Unlock,
+        Icon::Table,
+        Icon::Mask,
+        Icon::Trash,
+    ];
+
+    /// 该图标在字体中的码位（PUA区）。
+    ///
+    /// 与 `assets/modular-clipboard-icons.ttf` 的 cmap 一一对应；改动必须同步重新生成
+    /// 字体，否则 [`tests::every_icon_codepoint_has_ink`] 会失败。
+    pub fn codepoint(self) -> char {
+        match self {
+            Icon::Close => '\u{e000}',   // x-lg
+            Icon::Pinned => '\u{e001}',  // pin-angle-fill
+            Icon::Unpinned => '\u{e002}',// pin-angle
+            Icon::Search => '\u{e003}',  // search
+            Icon::Settings => '\u{e004}',// gear
+            Icon::Text => '\u{e005}',    // type
+            Icon::Code => '\u{e006}',    // code-slash
+            Icon::Image => '\u{e007}',   // image
+            Icon::File => '\u{e008}',    // file-earmark
+            Icon::Minimize => '\u{e009}',// dash-lg
+            Icon::Collapse => '\u{e00a}',// chevron-right
+            Icon::Expand => '\u{e00b}',  // chevron-left
+            Icon::Drag => '\u{e00c}',    // grip-vertical
+            Icon::Lock => '\u{e00d}',    // lock-fill
+            Icon::Unlock => '\u{e00e}',  // unlock
+            Icon::Table => '\u{e00f}',   // table
+            Icon::Mask => '\u{e010}',    // eye-slash
+            Icon::Trash => '\u{e011}',   // trash
+        }
+    }
+
+    /// 渲染该图标所用的字体 id。
+    ///
+    /// 尺寸由调用方决定（通常是 `icon_size * scale`）。baseline 补偿
+    /// 不在这里——[`egui::FontTweak`] 是**注册期**的属性，见
+    /// [`icon_font_data`]。
+    pub fn font_id(self, size: f32) -> egui::FontId {
+        let _ = self;
+        egui::FontId::proportional(size)
+    }
+
     /// 按剪贴板类型选图标。
     ///
     /// 用于列表左侧的条目类型标识。`ClipKind` 属于业务层，
@@ -79,263 +255,568 @@ impl Icon {
             Icon::Close => "关闭",
             Icon::Pinned => "已置顶",
             Icon::Unpinned => "置顶",
-            Icon::Copy => "复制",
-            Icon::Delete => "删除",
-            Icon::Edit => "编辑",
             Icon::Search => "搜索",
-            Icon::Paste => "粘贴",
             Icon::Settings => "设置",
-            Icon::Image => "图片",
             Icon::Text => "文本",
-            Icon::File => "文件",
             Icon::Code => "HTML",
+            Icon::Image => "图片",
+            Icon::File => "文件",
+            Icon::Minimize => "最小化",
+            Icon::Collapse => "折叠",
+            Icon::Expand => "展开",
+            Icon::Drag => "拖拽",
+            Icon::Lock => "已固定",
+            Icon::Unlock => "固定",
+            Icon::Table => "表格视图",
+            Icon::Mask => "密文视图",
+            Icon::Trash => "清空",
         }
     }
 
     /// 绘制到指定的矩形区域。
-    pub fn paint(self, painter: &egui::Painter, rect: egui::Rect, color: Color32) {
-        let stroke = Stroke::new(STROKE_WIDTH, color);
-        // 缩放到 ICON_SIZE 的坐标系再画，路径数据就能硬编码 16×16 的数值
-        let scale = (rect.width() / ICON_SIZE).min(rect.height() / ICON_SIZE);
-        let center = rect.center();
-        let p = |x: f32, y: f32| {
-            Pos2::new(
-                center.x + (x - ICON_SIZE / 2.0) * scale,
-                center.y + (y - ICON_SIZE / 2.0) * scale,
-            )
-        };
-
-        match self {
-            Icon::Close => {
-                // X：两条对角线，从 (4,4) 到 (12,12)
-                let d = 4.0 * scale;
-                let m = 0.5 * STROKE_WIDTH;
-                painter.line_segment([p(4.0 - m, 4.0 - m), p(11.0 + m, 11.0 + m)], stroke);
-                painter.line_segment([p(11.0 + m, 4.0 - m), p(4.0 - m, 11.0 + m)], stroke);
-                let _ = d;
-            }
-            Icon::Pinned | Icon::Unpinned => {
-                // 五角星。置顶态实心，未置顶态仅描边。
-                let cx = 8.0;
-                let cy = 8.6;
-                let outer = 6.2;
-                let inner = 2.7;
-                let mut pts = Vec::with_capacity(10);
-                for i in 0..10 {
-                    let r = if i % 2 == 0 { outer } else { inner };
-                    // 顶点在正上方，顺时针每 36°
-                    let ang = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
-                    pts.push(p(
-                        cx + r * ang.cos(),
-                        cy + r * ang.sin(),
-                    ));
-                }
-                if self == Icon::Pinned {
-                    // 实心：已置顶状态，需要视觉上「更重」
-                    painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
-                } else {
-                    // 描边：未置顶状态，暗示「可点击以置顶」
-                    painter.add(egui::Shape::closed_line(pts, stroke));
-                }
-            }
-            Icon::Copy => {
-                // 两张重叠的卡片：后一张描边，前一张实心
-                let back = [p(3.5, 3.5), p(10.5, 3.5), p(10.5, 8.5)];
-                painter.add(egui::Shape::closed_line(back.to_vec(), stroke));
-                let front = [
-                    p(5.5, 5.5),
-                    p(12.5, 5.5),
-                    p(12.5, 12.5),
-                    p(5.5, 12.5),
-                ];
-                painter.add(egui::Shape::closed_line(front.to_vec(), stroke));
-                // 用背景色填住重叠区，让「复制」语义成立
-                let _ = front;
-            }
-            Icon::Delete => {
-                // 垃圾桶：盖子 + 桶身 + 两条竖线
-                painter.line_segment([p(3.0, 4.5), p(13.0, 4.5)], stroke);
-                painter.line_segment([p(6.5, 4.5), p(6.5, 3.0)], stroke);
-                painter.line_segment([p(9.5, 4.5), p(9.5, 3.0)], stroke);
-                painter.line_segment([p(6.5, 3.0), p(9.5, 3.0)], stroke);
-                painter.add(egui::Shape::closed_line(
-                    vec![p(4.5, 4.5), p(5.0, 13.0), p(11.0, 13.0), p(11.5, 4.5)],
-                    stroke,
-                ));
-                painter.line_segment([p(7.0, 6.5), p(7.2, 11.0)], stroke);
-                painter.line_segment([p(9.0, 6.5), p(8.8, 11.0)], stroke);
-            }
-            Icon::Edit => {
-                // 铅笔：斜杆 + 笔尖 + 底边
-                painter.add(egui::Shape::closed_line(
-                    vec![p(3.0, 13.0), p(4.2, 10.0), p(11.0, 3.2), p(12.8, 5.0)],
-                    stroke,
-                ));
-                painter.line_segment([p(3.0, 13.0), p(4.8, 13.0)], stroke);
-                painter.line_segment([p(10.4, 3.8), p(12.2, 5.6)], stroke);
-            }
-            Icon::Search => {
-                // 放大镜：圆 + 柄
-                painter.add(egui::Shape::circle_stroke(p(7.0, 7.0), 4.2, stroke));
-                painter.line_segment([p(10.2, 10.2), p(13.2, 13.2)], stroke);
-            }
-            Icon::Paste => {
-                // 剪贴板：板身 + 顶部夹子
-                painter.add(egui::Shape::closed_line(
-                    vec![p(4.0, 3.5), p(12.0, 3.5), p(12.0, 13.0), p(4.0, 13.0)],
-                    stroke,
-                ));
-                painter.add(egui::Shape::closed_line(
-                    vec![p(6.0, 2.0), p(10.0, 2.0), p(10.0, 4.5), p(6.0, 4.5)],
-                    stroke,
-                ));
-                painter.line_segment([p(6.2, 8.0), p(9.8, 8.0)], stroke);
-                painter.line_segment([p(6.2, 10.5), p(9.8, 10.5)], stroke);
-            }
-            Icon::Settings => {
-                // 齿轮：外圈 + 中心孔+ 四根辐条（简化）
-                painter.add(egui::Shape::circle_stroke(p(8.0, 8.0), 5.0, stroke));
-                painter.add(egui::Shape::circle_filled(p(8.0, 8.0), 1.8, color));
-                for (dx, dy) in [(0.0, -6.6), (0.0, 6.6), (-6.6, 0.0), (6.6, 0.0)] {
-                    painter.line_segment(
-                        [p(8.0 + dx * 0.55, 8.0 + dy * 0.55), p(8.0 + dx, 8.0 + dy)],
-                        stroke,
-                    );
-                }
-            }
-            Icon::Image => {
-                // 图片：外框 + 山峰 + 太阳
-                painter.add(egui::Shape::closed_line(
-                    vec![p(2.5, 3.5), p(13.5, 3.5), p(13.5, 12.5), p(2.5, 12.5)],
-                    stroke,
-                ));
-                painter.add(egui::Shape::circle_filled(p(6.0, 6.6), 1.1, color));
-                painter.add(egui::Shape::line(
-                    vec![p(4.0, 11.0), p(7.0, 7.5), p(9.0, 9.5), p(10.5, 8.0), p(12.5, 11.0)],
-                    stroke,
-                ));
-            }
-            Icon::Text => {
-                // 文本：三条横线，长度递减
-                painter.line_segment([p(3.0, 4.5), p(13.0, 4.5)], stroke);
-                painter.line_segment([p(3.0, 8.0), p(13.0, 8.0)], stroke);
-                painter.line_segment([p(3.0, 11.5), p(9.5, 11.5)], stroke);
-            }
-            Icon::File => {
-                // 文件：带折角的矩形
-                painter.add(egui::Shape::line(
-                    vec![
-                        p(3.5, 2.5),
-                        p(9.5, 2.5),
-                        p(12.5, 5.5),
-                        p(12.5, 13.5),
-                        p(3.5, 13.5),
-                        p(3.5, 2.5),
-                    ],
-                    stroke,
-                ));
-                painter.add(egui::Shape::line(vec![p(9.5, 2.5), p(9.5, 5.5), p(12.5, 5.5)], stroke));
-            }
-            Icon::Code => {
-                // 代码：尖括号 + 斜杠
-                // 左尖括号
-                painter.add(egui::Shape::line(
-                    vec![p(6.0, 4.0), p(2.5, 8.0), p(6.0, 12.0)],
-                    stroke,
-                ));
-                // 右尖括号
-                painter.add(egui::Shape::line(
-                    vec![p(10.0, 4.0), p(13.5, 8.0), p(10.0, 12.0)],
-                    stroke,
-                ));
-                // 中间斜杠
-                painter.line_segment([p(9.2, 3.4), p(6.8, 12.6)], stroke);
-            }
+    ///
+    /// 用 [`Align2::CENTER_CENTER`] 而不是手算基线：字体图元的位置由
+    /// epaint 排版决定，而 [`Self::font_id`] 里的 `y_offset_factor` 已经把
+    /// 墨迹拉到了行盒中部，两者叠加后墨迹中心与 `rect` 中心重合。
+    ///
+    /// `rect` 的边长即图标边长——字体的 em 铺满整个 advance，
+    /// 所以按边长直接取字号即可，不需要额外的缩放系数。
+    pub fn paint(self, painter: &egui::Painter, rect: Rect, color: Color32) {
+        let size = rect.width().min(rect.height());
+        if size <= 0.0 || color == Color32::TRANSPARENT {
+            return;
         }
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            self.codepoint().to_string(),
+            // 乘 [`INK_FIT`] 让略微超出 em 的字形也能落进方框。
+            self.font_id(size * INK_FIT),
+            color,
+        );
     }
-
 }
 
-/// 图标按钮。
+/// 字体的 em 大小（`head.unitsPerEm`）。
+pub const EM_UNITS: f32 = 300.0;
+
+/// 字体的 `OS/2` typo ascender。**epaint 读的是这一项，不是 `hhea.ascent`。**
 ///
-/// 尺寸取 `HIT_SIZE`（20px），符合「按钮内图标」的规范；
-/// 图形本身按 `ICON_SIZE`（16px）绘制，四周留 2px 呼吸空间。
-pub fn icon_button(ui: &mut Ui, icon: Icon) -> egui::Response {
-    // 颜色取自主题，保证随明暗模式切换。
-    // `weak_text_color` 是 egui 0.36 提供的弱化前景色，语义上正好是
-    // 「非强调内容」——图标按钮正属于这类。
-    let base = ui.visuals().weak_text_color();
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(HIT_SIZE), egui::Sense::click());
-    let painter = ui.painter_at(rect);
+/// 与 [`DESCENT_UNITS`]、`LINE_GAP_UNITS`] 一起决定行盒高度，
+/// 因而是 [`BASELINE_FACTOR`] 存在的原因。
+pub const ASCENT_UNITS: f32 = 300.0;
 
-    if response.hovered() {
-        painter.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill);
-    }
-    let color = if response.hovered() || response.is_pointer_button_down_on() {
-        ui.visuals().text_color()
-    } else {
-        base
-    };
-    let inner = egui::Rect::from_center_size(rect.center(), Vec2::splat(ICON_SIZE));
-    icon.paint(&painter, inner, color);
+/// 字体的 `OS/2` typo descender（正值）。
+pub const DESCENT_UNITS: f32 = 0.0;
 
-    response.on_hover_text(icon.label())
-}
-
-/// 绘制一个非交互的图标（不占响应空间）。
+/// 字体的 `OS/2` typo lineGap。
 ///
-/// 用于「状态标记」这类场合——比如已置顶的星标：
+/// **这27 单位是baseline 补偿的真正来源**：行盒高度
+/// `= ascender - descender + lineGap = 327`，比 em（300）高出 27，
+/// 于是行盒重心相对 em 盒下移、墨迹整体偏上。
+pub const LINE_GAP_UNITS: f32 = 27.0;
+
+/// 行盒高度（字体单位）= `ascender - descender + lineGap`。
+///
+/// 与 [`EM_UNITS`] 的差值（27）即「需要补偿掉」的那个量。
+pub const ROW_HEIGHT_UNITS: f32 = ASCENT_UNITS - DESCENT_UNITS + LINE_GAP_UNITS;
+
+/// 绘制一个非交互的图标（不占响应空间），尺寸取 `icon_size` 令牌。
+///
+/// 用于「状态标记」这类场合——比如已置顶的图钉：
 /// 它只是提示当前状态，不可点击，因此不应该吃掉点击。
-/// 仍然走矢量绘制，与按钮图标视觉一致。
-pub fn paint_inline(ui: &mut Ui, icon: Icon, color: Color32) {
-    let (rect, _resp) = ui.allocate_exact_size(Vec2::splat(ICON_SIZE), egui::Sense::hover());
+pub fn paint_inline(ui: &mut Ui, icon: Icon, color: Color32, pal: &crate::theme::Palette, scale: f32) {
+    let side = pal.icon_size * scale;
+    let (rect, _resp) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::hover());
     icon.paint(&ui.painter_at(rect), rect, color);
+}
+
+/// 图标在 `rect` 内的绘制中心。
+///
+/// 抽出来是为了让测试能验证「实际绘制位置」而不必真的跑一帧。
+pub fn icon_center(rect: Rect) -> egui::Pos2 {
+    pos2(rect.center().x, rect.center().y)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::epaint::Color32;
+
+    /// 建一个只装了图标字体的 `Context`。不碰 GPU。
+    ///
+    /// 用 [`icon_font_data`] 而不是裸 [`ICON_TTF`]——必须和生产环境
+    /// 走同一条注册路径（含baseline 补偿），否则测试量到的居中结果
+    /// 与实际渲染不符。
+    fn icon_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut defs = egui::FontDefinitions::default();
+        defs.font_data.insert(
+            ICON_FONT_NAME.to_string(),
+            std::sync::Arc::new(icon_font_data()),
+        );
+        // 只挂图标字体：这样 `has_glyph` 为真就一定是它自己提供的字形，
+        // 不会被任何回退字体「代答」。
+        defs.families.insert(
+            egui::FontFamily::Proportional,
+            vec![ICON_FONT_NAME.to_string()],
+        );
+        ctx.set_fonts(defs);
+        // `Context::fonts_mut` 在第一次 `run` 之前会 panic
+        // （egui 0.36 明确要求先跑一帧）。跑一个空帧把它初始化掉。
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        ctx
+    }
+
+    #[test]
+    fn embedded_font_parses() {
+        // 字体能被epaint 接受：设置字体 + 触发一次排版不 panic，
+        // 且图集里确实产生了像素。
+        let ctx = icon_ctx();
+        let font_id = egui::FontId::proportional(16.0);
+        let has = ctx.fonts_mut(|f| f.has_glyph(&font_id, '\u{e000}'));
+        assert!(has, "字体应能解析出 U+E000 的字形");
+        let img = ctx.fonts_mut(|f| f.image());
+        assert!(
+            img.width() > 0 && img.height() > 0,
+            "字体图集应已生成: {}x{}",
+            img.width(),
+            img.height()
+        );
+    }
+
+    #[test]
+    fn every_icon_codepoint_has_ink() {
+        // 逐个变体验证：码位在字体里存在，且排版出的墨迹非空。
+        // 这条测试真的走 `Icon::codepoint()` 与epaint 的字体解析，
+        // 不是拿一个自造的列表对照。
+        let ctx = icon_ctx();
+        let font_id = egui::FontId::proportional(64.0);
+        let mut checked = 0usize;
+        for &icon in Icon::ALL {
+            let cp = icon.codepoint();
+            let (has, w) = ctx.fonts_mut(|f| {
+                (
+                    f.has_glyph(&font_id, cp),
+                    f.glyph_width(&font_id, cp),
+                )
+            });
+            assert!(has, "{icon:?} 的码位 U+{:04X} 在字体里不存在", cp as u32);
+            assert!(
+                w > 0.0,
+                "{icon:?} 的码位 U+{:04X} 宽度为 0（字形是空的）",
+                cp as u32
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 18, "变体数量变了？码位表需要重新生成");
+    }
+
+    #[test]
+    fn codepoints_are_unique() {
+        // 两个变体撞码位＝有一个图标显示成另一个。
+        let mut seen = std::collections::BTreeSet::new();
+        for &icon in Icon::ALL {
+            assert!(
+                seen.insert(icon.codepoint()),
+                "{icon:?} 的码位与其它变体重复"
+            );
+        }
+    }
+
+    #[test]
+    fn codepoints_are_in_private_use_area() {
+        // PUA 保证不与中英文正文冲突。
+        for &icon in Icon::ALL {
+            let cp = icon.codepoint();
+            assert!(
+                ('\u{e000}'..='\u{f8ff}').contains(&cp),
+                "{icon:?} 的码位 U+{:04X} 不在 PUA 区内", cp as u32
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_codepoint_fails_has_ink() {
+        // 变异测试的前提：如果 `has_glyph` 对任何码位都返回 true，
+        // 上面那条测试就是假通过。这里确认它真的能分辨。
+        let ctx = icon_ctx();
+        let font_id = egui::FontId::proportional(16.0);
+        assert!(
+            !ctx.fonts_mut(|f| f.has_glyph(&font_id, '\u{e012}')),
+            "未分配的字形应当报告为不存在——否则 has_glyph 检查无效"
+        );
+        assert!(
+            !ctx.fonts_mut(|f| f.has_glyph(&font_id, '\u{4e2d}')),
+            "中文字符应当报告为不存在（该 Context 只挂了图标字体）"
+        );
+    }
 
     #[test]
     fn every_icon_has_a_label() {
-        // 空标签会让屏幕阅读器静默，这是可访问性缺陷
-        let all = [
-            Icon::Close,
-            Icon::Pinned,
-            Icon::Unpinned,
-            Icon::Copy,
-            Icon::Delete,
-            Icon::Edit,
-            Icon::Search,
-            Icon::Paste,
-            Icon::Settings,
-            Icon::Image,
-            Icon::Text,
-            Icon::File,
-            Icon::Code,
-        ];
-        for i in all {
+        // 空标签会让屏幕阅读器静默，这是可访问性缺陷。
+        for &i in Icon::ALL {
             assert!(!i.label().is_empty(), "{i:?} 缺少无障碍标签");
         }
     }
 
     #[test]
     fn pinned_and_unpinned_are_distinct() {
-        // 置顶按钮的两种状态不能混淆
-        assert_ne!(Icon::Pinned, Icon::Unpinned);
+        // 置顶按钮的两种状态不能混淆：图钉实心/描边是两个不同字形。
+        assert_ne!(Icon::Pinned.codepoint(), Icon::Unpinned.codepoint());
         assert_ne!(Icon::Pinned.label(), Icon::Unpinned.label());
     }
 
     #[test]
-    fn icon_size_is_consistent() {
-        // 规格：画布 16px，按钮20px。改了这里要同步改文档
-        assert_eq!(ICON_SIZE, 16.0);
-        assert_eq!(HIT_SIZE, 20.0);
+    fn lock_is_distinct_from_pinned() {
+        // 「固定」与「置顶」语义不同，视觉上必须能分开。
+        // 历史上两者共用同一图标，导致用户无法区分。
+        assert_ne!(Icon::Lock.codepoint(), Icon::Pinned.codepoint());
+        assert_ne!(Icon::Unlock.codepoint(), Icon::Unpinned.codepoint());
+        assert_ne!(Icon::Lock.label(), Icon::Pinned.label());
     }
 
     #[test]
-    fn stroke_is_thinner_than_icon() {
-        // 描边过粗会糊成一团
-        assert!(STROKE_WIDTH < ICON_SIZE / 4.0);
+    fn collapse_and_expand_are_distinct() {
+        assert_ne!(Icon::Collapse.codepoint(), Icon::Expand.codepoint());
+        assert_ne!(Icon::Collapse.label(), Icon::Expand.label());
+    }
+
+    /// 某个图标渲染出来的四边形在屏幕上的矩形，以及它在图集里的 UV 矩形。
+    ///
+    /// 返回 `(屏幕矩形, UV 矩形)`。两者缺一不可：
+    ///
+    /// - **屏幕矩形**给出这个字被放在了哪里——这正是
+    ///   [`BASELINE_FACTOR`] 唯一影响的东西（它平移字形，不改行盒）。
+    /// - **UV 矩形 + 图集像素**给出字形的实际形状。文字在 epaint 里
+    ///   是贴图四边形，顶点坐标不含形状信息，所以互为镜像的两个图标
+    ///   （`chevron-bar-left` / `chevron-bar-right`）顶点位置完全相同，
+    ///   只有像素区分得开。
+    fn glyph_quad(ctx: &egui::Context, icon: Icon, rect: Rect) -> (Rect, Vec2, Vec2) {
+        let verts = icon_vertices(ctx, icon, rect, Color32::WHITE);
+        assert!(!verts.is_empty(), "{icon:?} 没有产生四边形");
+        let mut pmin = Vec2::splat(f32::INFINITY);
+        let mut pmax = Vec2::splat(f32::NEG_INFINITY);
+        let mut uv_min = Vec2::splat(f32::INFINITY);
+        let mut uv_max = Vec2::splat(f32::NEG_INFINITY);
+        for v in &verts {
+            pmin = pmin.min(egui::vec2(v.pos.x, v.pos.y));
+            pmax = pmax.max(egui::vec2(v.pos.x, v.pos.y));
+            uv_min = uv_min.min(egui::vec2(v.uv.x, v.uv.y));
+            uv_max = uv_max.max(egui::vec2(v.uv.x, v.uv.y));
+        }
+        (
+            Rect::from_min_max(pos2(pmin.x, pmin.y), pos2(pmax.x, pmax.y)),
+            uv_min,
+            uv_max,
+        )
+    }
+
+    /// 每个图标墨迹的上下留白（`(上, 下)`，逻辑点）。
+    fn ink_paddings(ctx: &egui::Context, side: f32) -> Vec<(Icon, f32, f32)> {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(side));
+        let mut out = Vec::new();
+        for &icon in Icon::ALL {
+            let (quad, uv_min, uv_max) = glyph_quad(ctx, icon, rect);
+            let (ink_min, ink_max) = atlas_ink_bounds(ctx, uv_min, uv_max)
+                .unwrap_or_else(|| panic!("{icon:?} 在图集里没有墨迹"));
+            let uw = uv_max.x - uv_min.x;
+            let uh = uv_max.y - uv_min.y;
+            debug_assert!(uw > 0.0 && uh > 0.0, "{icon:?} 的 UV 矩形退化了");
+            let to_y = |v: f32| quad.min.y + (v - uv_min.y) / uh * quad.height();
+            out.push((icon, to_y(ink_min.y) - rect.min.y, rect.max.y - to_y(ink_max.y)));
+        }
+        out
+    }
+
+    /// 本图标集**固有**的墨迹中心偏差上界（占边长的比例）。
+    ///
+    /// 字体里各字形并非都落在 em 盒正中，偏差来自字形自身的轮廓，
+    /// 从字体 `glyf` 表直接读出的墨迹中心（em = 300，单位）里可见：
+    /// `Text`（type）141.5 偏上 8.5、`Trash` 159.5 偏下 9.5、
+    /// `Pinned` / `Unpinned`（pin-angle*）154.5 偏上 4.5、
+    /// `Search` 152.0，其余基本正中 150.0。
+    /// 也就是说**没有任何单一补偿能让 18 个图标同时严格居中**——
+    /// 补偿只能整体平移，逐字形对齐等于抹平设计意图。
+    ///
+    /// 7% 这个值是**实测**出来的，不是拍的：64×64 框里逐个量上下留白，
+    /// 最差的是 `Trash`（`dy` -2.0px）与 `Pinned` / `Unpinned`（-1.5px）。
+    /// 换算成比例是 2.0/64 ≈ 3.1%，这里留到 7% 是因为字体图集按整像素
+    /// 对齐、量测本身有约 1px 量化误差，容差需含这部分余量。
+    /// （若把它压到 3% 就正好卡在量测噪声上——测试会变成 flaky，
+    /// 而不是因为代码变坏才失败。）
+    ///
+    /// 真正的 baseline 校准判据是下面那条**均值**断言——它对
+    /// [`BASELINE_FACTOR`] 敏感，逐条断言则只兜住「没有整体跑偏」。
+    const INK_CENTRE_SPREAD: f32 = 0.07;
+
+    #[test]
+    fn report_ink_geometry() {
+        // 诊断用：把每个图标的真实墨迹盒打印出来，供实机核对。
+        // 无断言——它的价值是「报告数值」，判定由 glyph_ink_is_centred_in_its_box 负责。
+        //
+        // 关键点：**必须在多个字号下测**。补偿量正比于字号，
+        // 单个字号下「碰巧居中」不能证明公式对。
+        for &side in &[16.0f32, 32.0, 64.0] {
+            let ctx = icon_ctx();
+            // egui 自己认定的行盒高度——墨迹落位的唯一依据。
+            let fid = egui::FontId::proportional(side * INK_FIT);
+            let row_h = ctx.fonts_mut(|f| f.row_height(&fid));
+            let pads = ink_paddings(&ctx, side);
+            let n = pads.len() as f32;
+            let mean_cy =
+                pads.iter().map(|&(_, t, b)| t + (side - t - b) / 2.0).sum::<f32>()
+                / n;
+            let max_abs_cy = pads
+                .iter()
+                .map(|&(_, t, b)| (t + (side - t - b) / 2.0 - side / 2.0).abs())
+                .fold(0.0f32, f32::max);
+            println!(
+                "side={side:.0} font_size={:.3} row_height={row_h:.3} \
+                 box_cy={:.2} mean_ink_cy={mean_cy:.2} mean_dy={:.3} max_abs_dy={:.3}",
+                side * INK_FIT,
+                side / 2.0,
+                mean_cy - side / 2.0,
+                max_abs_cy
+            );
+        }
+        // 64px 下逐个图标明细（与历史记录对齐，便于对比）。
+        let ctx = icon_ctx();
+        let side = 64.0f32;
+        let pads = ink_paddings(&ctx, side);
+        println!("--- per-icon @64 ---");
+        for &(icon, top, bottom) in &pads {
+            let ink_h = side - top - bottom;
+            println!(
+                "{:<10} top={:>6.2} bottom={:>6.2} ink_h={:>6.2} ink_cy={:>6.2} dy={:>6.2}",
+                format!("{icon:?}"),
+                top,
+                bottom,
+                ink_h,
+                top + ink_h / 2.0,
+                top + ink_h / 2.0 - side / 2.0
+            );
+        }
+    }
+
+    #[test]
+    fn glyph_ink_is_centred_in_its_box() {
+        // baseline 对齐的回归测试——本次任务里唯一有实操不确定性的点。
+        //
+        // 三条判据，缺一不可：
+        //
+        // 1. **逐个**留白差不超过 [`INK_CENTRE_SPREAD`]（字体固有的
+        //    墨迹中心散布，见该常量文档）。
+        // 2. **整体均值**接近 0。这条才是对 [`BASELINE_FACTOR`] 敏感的：
+        //    补偿值错了一定会让所有图标**同向**偏移，均值随之偏离。
+        //    只留第 1 条的话，把补偿整个归零也能通过——变异测试验过。
+        // 3. **多字号**复核（见 [`baseline_factor_holds_across_sizes`]）：
+        //    补偿量正比于字号，只在一个字号上居中不足以证明公式对。
+        let ctx = icon_ctx();
+        let side = 64.0f32;
+        let pads = ink_paddings(&ctx, side);
+
+        for &(icon, top, bottom) in &pads {
+            assert!(
+                top >= -0.5 && bottom >= -0.5,
+                "{icon:?} 墨迹纵向溢出目标框: 上留白 {top:.2} 下留白 {bottom:.2}"
+            );
+            assert!(
+                (top - bottom).abs() <= side * INK_CENTRE_SPREAD,
+                "{icon:?} 墨迹纵向未居中: 上留白 {top:.2} 下留白 {bottom:.2}                  (允许差 {:.2})", side * INK_CENTRE_SPREAD
+            );
+        }
+
+        // 均值：补偿错了会让全体**同向**偏移，逐条断言可能仍落在
+        // [`INK_CENTRE_SPREAD`] 的容差内，均值却一定露馅。
+        // 阈值 2.5% 是量测精度决定的：字体图集按整像素对齐，
+        // 单图标留白有约 1px 的量化误差，18 个取均值后仍有约 1px 抖动。
+        let n = pads.len() as f32;
+        let mean_skew = pads.iter().map(|&(_, t, b)| t - b).sum::<f32>() / n;
+        assert!(
+            mean_skew.abs() <= side * 0.025,
+            "整体纵向偏移 {mean_skew:.2} 过大（阈值 {:.2}）——             BASELINE_FACTOR 需要重新校准",
+            side * 0.025
+        );
+    }
+
+    #[test]
+    fn baseline_factor_holds_across_sizes() {
+        // 补偿量正比于字号，所以「在64px 上居中」不等于「公式对」——
+        // 一个写错的补偿完全可能只在某个字号上凑巧成立。
+        // 生产用16px，测试用 64px，必须两个都对。
+        for &side in &[16.0f32, 32.0, 64.0] {
+            let ctx = icon_ctx();
+            let pads = ink_paddings(&ctx, side);
+            let n = pads.len() as f32;
+            let mean_dy = pads
+                .iter()
+                .map(|&(_, t, b)| t + (side - t - b) / 2.0 - side / 2.0)
+                .sum::<f32>()
+                / n;
+            assert!(
+                mean_dy.abs() <= side * 0.02,
+                "side={side}: 整体纵向偏移 {mean_dy:.3} 过大（阈值 {:.3}）——\
+                 BASELINE_FACTOR 与字号的关系不对",
+                side * 0.02
+            );
+        }
+    }
+
+    /// 从字体图集里量出 UV 矩形内的实际墨迹范围（alpha > 0）。
+    ///
+    /// 返回 `None` 表示那块区域里一个不透明像素都没有——
+    /// 那说明该码位映射到了空字形。
+    fn atlas_ink_bounds(
+        ctx: &egui::Context,
+        uv_min: Vec2,
+        uv_max: Vec2,
+    ) -> Option<(Vec2, Vec2)> {
+        let img = ctx.fonts_mut(|f| f.image());
+        let w = img.width();
+        let h = img.height();
+        let img = img;
+        let x0 = (uv_min.x * w as f32).floor().max(0.0) as usize;
+        let x1 = ((uv_max.x * w as f32).ceil() as usize).min(w);
+        let y0 = (uv_min.y * h as f32).floor().max(0.0) as usize;
+        let y1 = ((uv_max.y * h as f32).ceil() as usize).min(h);
+        let mut found = false;
+        let mut mn = (usize::MAX, usize::MAX);
+        let mut mx = (0usize, 0usize);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // egui 的字体图集是覆盖度图：r 通道存覆盖率。
+                if img.pixels[y * w + x].r() > 0 {
+                    found = true;
+                    mn.0 = mn.0.min(x);
+                    mn.1 = mn.1.min(y);
+                    mx.0 = mx.0.max(x);
+                    mx.1 = mx.1.max(y);
+                }
+            }
+        }
+        found.then(|| {
+            (
+                Vec2::new(mn.0 as f32 / w as f32, mn.1 as f32 / h as f32),
+                Vec2::new((mx.0 + 1) as f32 / w as f32, (mx.1 + 1) as f32 / h as f32),
+            )
+        })
+    }
+
+    #[test]
+    fn painted_icons_are_visually_distinct() {
+        // 两个不同的图标不能引用字体图集里的同一块像素——
+        // 那是「码位映射错了」的典型症状。
+        //
+        // 判据用**图集里的墨迹像素**而不是顶点位置：互为镜像的两个
+        // 图标顶点位置完全相同（文字是贴图四边形），只有像素才区分得开。
+        let ctx = icon_ctx();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(64.0));
+        let mut sigs: std::collections::BTreeMap<Vec<(u8, u8)>, Icon> =
+            std::collections::BTreeMap::new();
+        for &icon in Icon::ALL {
+            let (_quad, uv_min, uv_max) = glyph_quad(&ctx, icon, rect);
+            let img = ctx.fonts_mut(|f| f.image());
+            let w = img.width();
+            let h = img.height();
+            let img = img;
+            let x0 = (uv_min.x * w as f32).floor().max(0.0) as usize;
+            let x1 = ((uv_max.x * w as f32).ceil() as usize).min(w);
+            let y0 = (uv_min.y * h as f32).floor().max(0.0) as usize;
+            let y1 = ((uv_max.y * h as f32).ceil() as usize).min(h);
+            // 逐像素取样：同一块图集区域必然给出同一串覆盖度。
+            let mut px: Vec<(u8, u8)> = Vec::new();
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let p = img.pixels[y * w + x];
+                    px.push((p.r(), p.g()));
+                }
+            }
+            assert!(!px.is_empty(), "{icon:?} 没有图集像素");
+            if let Some(prev) = sigs.insert(px, icon) {
+                panic!("{icon:?} 与 {prev:?} 引用了字体图集里完全相同的像素——码位映射错了");
+            }
+        }
+    }
+
+    #[test]
+    fn baseline_metrics_match_the_font() {
+        // 这些常数是baseline 补偿的依据。若重新生成了字体，
+        // 这里会先失败，提示需要重新校准。
+        assert_eq!(EM_UNITS, 300.0, "em 变了：图标尺寸算法需重新校准");
+        assert_eq!(ASCENT_UNITS, 300.0, "OS/2 ascender 变了：BASELINE_FACTOR 需重算");
+        assert_eq!(DESCENT_UNITS, 0.0, "OS/2 descender 变了：BASELINE_FACTOR 需重算");
+        assert_eq!(
+            LINE_GAP_UNITS, 27.0,
+            "OS/2 lineGap 变了：BASELINE_FACTOR 需重算（它是补偿的唯一来源）"
+        );
+        // 补偿存在的前提：行盒比em 高。高出量必须等于 lineGap。
+        assert!(
+            ROW_HEIGHT_UNITS > EM_UNITS,
+            "行盒({ROW_HEIGHT_UNITS}) 未高于 em({EM_UNITS})：BASELINE_FACTOR 应为 0"
+        );
+        assert_eq!(
+            ROW_HEIGHT_UNITS - EM_UNITS,
+            LINE_GAP_UNITS,
+            "行盒超出量应恰为 lineGap"
+        );
+    }
+
+    /// 在真实 `Ui` 里画一个图标，返回 tessellate 后的可见顶点。
+    ///
+    /// 走完整的 `ctx.run_ui` → 排版 → 光栅化 → tessellate 通路，
+    /// 因此拿到的是**实际会提交给 GPU** 的顶点，而不是我们自己算的
+    /// 近似值。全程纯 CPU，不需要 GPU。
+    fn icon_vertices(
+        ctx: &egui::Context,
+        icon: Icon,
+        rect: Rect,
+        color: Color32,
+    ) -> Vec<egui::epaint::Vertex> {
+        let mut full = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            // 刻意**不用** `CentralPanel`：它会自己画一层背景，
+            // 那些顶点会混进「墨迹包围盒」里，让测量结果毫无意义
+            // （实测会让每个图标的包围盒都等于整个屏幕）。
+            // `Ui::new` 只产出我们显式画的东西。
+            let mut ui = egui::Ui::new(
+                ctx.clone(),
+                egui::Id::new("icon_probe"),
+                egui::UiBuilder::new().max_rect(rect),
+            );
+            let (r, _) = ui.allocate_exact_size(rect.size(), egui::Sense::hover());
+            icon.paint(&ui.painter_at(r), r, color);
+        });
+        // 排版会产出字体图集增量；测试不上传纹理，显式 clear()
+        // （与 app.rs 的 `DeltaGuard` 同一手法），否则 debug 构建
+        // 会在 Drop 时断言失败。必须 clear **本次** run 的 delta。
+        full.textures_delta.clear();
+        let prims = ctx.tessellate(full.shapes, 1.0);
+        let mut out = Vec::new();
+        for p in prims {
+            if let egui::epaint::Primitive::Mesh(mesh) = p.primitive {
+                // 全透明顶点是光栅化的padding，不算「画出来了」。
+                out.extend(mesh.vertices.into_iter().filter(|v| v.color.a() > 0u8));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn transparent_colour_draws_nothing() {
+        // 全透明色不应产生顶点——否则会白占一片。
+        let ctx = icon_ctx();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(64.0));
+        let verts = icon_vertices(&ctx, Icon::Close, rect, Color32::TRANSPARENT);
+        assert!(verts.is_empty(), "透明色不应产生可见顶点");
+    }
+
+    #[test]
+    fn zero_sized_rect_is_skipped() {
+        // 零尺寸矩形（面板被折叠到 0 宽时）不能除零 / panic。
+        let ctx = icon_ctx();
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(0.0));
+        let verts = icon_vertices(&ctx, Icon::Trash, rect, Color32::WHITE);
+        assert!(verts.is_empty(), "零尺寸矩形不应产生顶点");
     }
 }

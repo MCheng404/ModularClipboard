@@ -48,12 +48,14 @@ export TARGET=x86_64-pc-windows-msvc
 
 MODE=debug
 ACTION=build
+# 除下面几个自有开关外，其余参数原样透传给 cargo（如 --nocapture、-p <crate>）。
+EXTRA=()
 for arg in "$@"; do
     case "$arg" in
         --release) MODE=release ;;
         --run)     ACTION=run ;;
         --test)    ACTION=test ;;
-        *) echo "未知参数: $arg" >&2; exit 2 ;;
+        *) EXTRA+=("$arg") ;;
     esac
 done
 
@@ -68,6 +70,7 @@ case "$ACTION" in
         cargo run --target "$TARGET" $( [ "$MODE" = release ] && echo --release )
         ;;
     test)
-        cargo test --target "$TARGET" --workspace
+        # 透传额外参数（如 --nocapture、icons::），便于单跑某个测试看诊断输出。
+        cargo test --target "$TARGET" --workspace ${EXTRA[@]+"${EXTRA[@]}"}
         ;;
 esac
