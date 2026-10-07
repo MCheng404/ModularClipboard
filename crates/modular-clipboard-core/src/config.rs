@@ -166,7 +166,12 @@ pub struct UiConfig {
     pub dark_mode: Option<bool>,
     pub always_on_top: bool,
     pub hide_on_focus_lost: bool,
+    /// 窗口宽度，单位**物理像素**（不是逻辑点）。
+    ///
+    /// `app.rs` 直接把它`as u32` 传给 `CreateWindowExW`，中间无任何
+    /// DPI 换算，所以在 1.5x 缩放的屏幕上 720 物理像素只有 480 逻辑点。
     pub window_width: f32,
+    /// 窗口高度，单位**物理像素**。语义同[`UiConfig::window_width`]。
     pub window_height: f32,
     pub show_tray: bool,
     pub start_minimized: bool,
@@ -189,8 +194,8 @@ impl Default for UiConfig {
             dark_mode: None,
             always_on_top: true,
             hide_on_focus_lost: false,
-            window_width: 420.0,
-            window_height: 560.0,
+            window_width: 720.0,
+            window_height: 800.0,
             show_tray: true,
             start_minimized: false,
             font_path: None,
@@ -404,5 +409,28 @@ mod tests {
     fn layout_version_is_pinned() {
         assert_eq!(LayoutConfig::VERSION, 1);
         assert_eq!(LayoutConfig::empty().version, 1);
+    }
+
+    /// 默认窗口尺寸必须容得下三栏布局。
+    ///
+    /// 这两个值是**物理像素**（`app.rs` 直接 `as u32` 传给
+    /// `CreateWindowExW`，中间没有 DPI 换算）。旧的 420x560 在 1.5x
+    /// 缩放下只剩 280x373 逻辑点，比三栏布局所需的 333 逻辑点还窄，
+    /// 于是置顶栏压住历史列表、列表行溢出右边界。
+    ///
+    /// 720x800 在 1.5x 下是 480x533 逻辑点，留有余量。
+    #[test]
+    fn default_window_size_fits_three_column_layout() {
+        let ui = UiConfig::default();
+        assert_eq!(ui.window_width, 720.0);
+        assert_eq!(ui.window_height, 800.0);
+        // 三栏布局的逻辑点下限（实测值）。1.5x 是当前最常见的缩放档，
+        // 低于它窗口就更宽裕，所以拿 1.5x 做最坏情况断言。
+        const MIN_LOGICAL_WIDTH: f32 = 333.0;
+        assert!(
+            ui.window_width / 1.5 >= MIN_LOGICAL_WIDTH,
+            "1.5x 缩放下窗口宽度必须 >= {MIN_LOGICAL_WIDTH} 逻辑点，当前 {} 物理像素",
+            ui.window_width
+        );
     }
 }
