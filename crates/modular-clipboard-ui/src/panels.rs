@@ -62,12 +62,22 @@ pub fn panel_frame(ui: &mut Ui, rect: Rect, pal: &Palette, floating: bool, scale
 }
 
 /// 面板的折叠把手（停靠模块折叠后仍显示，兼作展开按钮）。
-pub fn draw_collapse_handle(ui: &mut Ui, rect: Rect, pal: &Palette, scale: f32) -> Rect {
+///
+/// `panel` 只用于生成 widget ID：同一帧里可能同时有多个折叠把手
+/// （窄窗口降级会把几个模块一起收成把手），它们矩形不同，
+/// 因此 ID 必须带上模块身份，见 [`crate::panels::draw_splitter`] 的同类说明。
+pub fn draw_collapse_handle(
+    ui: &mut Ui,
+    rect: Rect,
+    pal: &Palette,
+    scale: f32,
+    panel: Panel,
+) -> Rect {
     let r = Rect::from_min_size(
         rect.min,
         vec2(rect.width().min(rail_handle_width(pal, scale)), rect.height()),
     );
-    let resp = ui.interact(r, ui.id().with("collapse_handle"), Sense::click());
+    let resp = ui.interact(r, ui.id().with(("collapse_handle", panel)), Sense::click());
     let bg = if resp.hovered() { pal.row_hover } else { pal.surface_variant };
     ui.painter().rect_filled(r, CornerRadius::ZERO, bg);
     // 拖拽手柄图标（grip-vertical）：比三个手画圆点更像「可拖」，
@@ -91,14 +101,26 @@ pub fn rail_handle_width(pal: &Palette, scale: f32) -> f32 {
 /// 分隔条的画法：默认不可见，悬停/拖动时才显形。
 ///
 /// 一直画出来会让整个界面布满竖线，视觉噪声大于收益。
+///
+/// # 为什么 ID 必须带 `index`
+///
+/// egui 的 `check_for_id_clash` 会在**同一 Id 于同一帧出现在两个不同矩形**时
+/// 画红字报错（egui 0.36 `context.rs` 的 `create_widget` → `check_for_id_clash`）。
+/// 分隔条是在 `view::handle_splitters` 的循环里逐条画的，最多四条
+/// （见 `layout::solve`），而它们共用同一个根 `Ui`——`ui.id()` 在整帧内不变。
+/// 于是固定 salt 会让第 2..N 条与第 1 条撞 Id：既有红字报错，
+/// 又因为 egui 的 hover/active 状态按 Id 存而串到别的分隔条上。
+/// 把序号并进 salt 才是正解（不是 `push_id` 遮掩：这里确实是同一命名空间
+/// 下的多个实例）。
 pub fn draw_splitter(
     ui: &mut Ui,
     rect: Rect,
     pal: &Palette,
     hovered: bool,
     dragging: bool,
+    index: usize,
 ) -> egui::Response {
-    let resp = ui.interact(rect, ui.id().with("splitter"), Sense::drag());
+    let resp = ui.interact(rect, ui.id().with(("splitter", index)), Sense::drag());
     let active = dragging || (hovered && resp.hovered());
     let color = if dragging {
         pal.accent_active

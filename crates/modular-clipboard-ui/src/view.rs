@@ -145,6 +145,16 @@ pub fn draw(ui: &mut Ui, svc: &mut Service, local: &mut UiLocal, pal: &Palette) 
 
     // 模块拖动要在画面板**之前**处理：拖动位置决定了这一帧画在哪。
     handle_splitters(ui, &solved, local, pal);
+    // ⚠️ 第二次 `solve` 是**必需的**，不是冗余计算。
+    //
+    // `handle_splitters` 在拖动中会通过 `layout::drag_splitter` 就地修改
+    // `local.layout` 的面板宽度。上面那份 `solved` 是**拖动前**算出来的，
+    // 直接拿去画面板，本帧就会画在旧位置——表现为分隔条与面板错位一帧。
+    // 因此拖动处理完必须重算一次，让这一帧画在拖动后的位置上。
+    //
+    // 它**不是** widget ID 冲突的来源：`solve` 是纯函数，只算矩形不碰egui
+    // 的 widget 注册；`handle_splitters` 也只在循环里按序号各画一次分隔条
+    // （见 `panels::draw_splitter` 的 `index` 参数），不存在重复绘制。
     let solved = layout::solve(area, &local.layout, dragging_rect);
 
     if let Some(preview) = solved.dock_preview {
@@ -239,7 +249,8 @@ fn handle_splitters(ui: &mut Ui, solved: &Solved, local: &mut UiLocal, pal: &Pal
             continue;
         }
         let hovered = pointer.is_some_and(|p| layout::hit(*rect, p));
-        let resp = panels::draw_splitter(ui, *rect, pal, hovered, local.hover_splitter == Some(i));
+        let resp =
+            panels::draw_splitter(ui, *rect, pal, hovered, local.hover_splitter == Some(i), i);
         if resp.dragged() || resp.drag_started() {
             local.hover_splitter = Some(i);
             let d = ui.input(|i| i.pointer.delta());
@@ -276,7 +287,7 @@ fn draw_pinned_panel(
     // 读原始状态会在 24 逻辑点宽的把手矩形里画完整列表，
     // 于是文字挤成竖条，正是本次要修的「所有元素挤在一起」的另一种形态。
     if is_veiled(solved.tier, local, Panel::Pinned) {
-        panels::draw_collapse_handle(ui, rect, pal, scale);
+        panels::draw_collapse_handle(ui, rect, pal, scale, Panel::Pinned);
         return;
     }
     panels::panel_frame(ui, rect, pal, false, scale);
@@ -344,7 +355,7 @@ fn draw_history_panel(
         return;
     };
     if is_veiled(solved.tier, local, Panel::History) {
-        panels::draw_collapse_handle(ui, rect, pal, scale);
+        panels::draw_collapse_handle(ui, rect, pal, scale, Panel::History);
         return;
     }
     panels::panel_frame(ui, rect, pal, false, scale);
@@ -448,7 +459,12 @@ fn draw_virtual_list(
         panels::draw_group_bar(ui, rect, pal, scale);
     }
     let hover = ui.input(|i| i.pointer.hover_pos());
+    // `id_salt` 必须给：egui 0.36 的 ScrollArea 默认用固定 salt
+    // `"scroll_area"`（`scroll_area.rs` 的 `IdSalt::new("scroll_area")`），
+    // 而本帧最多同时存在 4 个 ScrollArea，同一个根 `Ui` 下它们会共用一个
+    // Id，触发 `check_for_id_clash` 的红字报错，且滚动偏移会互相串。
     ScrollArea::vertical()
+        .id_salt("history_list")
         .max_height(rect.height())
         .auto_shrink([false, false])
         .show_rows(ui, ROW_HEIGHT, items.len(), |ui, rows| {
@@ -599,6 +615,7 @@ fn draw_rail_panel(
             ];
             let hover = ui.input(|i| i.pointer.hover_pos());
             ScrollArea::vertical()
+                .id_salt("rail_table_view")
                 .max_height(body.height())
                 .auto_shrink([false, false])
                 .show_rows(ui, panels::COMPACT_ROW_HEIGHT, items.len(), |ui, rows| {
@@ -636,6 +653,7 @@ fn draw_rail_panel(
             // 密文视图：只显示来源与时间，内容一律打码。
             let hover = ui.input(|i| i.pointer.hover_pos());
             ScrollArea::vertical()
+                .id_salt("rail_masked_view")
                 .max_height(body.height())
                 .auto_shrink([false, false])
                 .show_rows(ui, panels::COMPACT_ROW_HEIGHT, items.len(), |ui, rows| {
@@ -893,6 +911,7 @@ fn draw_detail(
 
         // 预览区：按类型分派
         egui::ScrollArea::vertical()
+            .id_salt("detail_preview")
             .max_height(rect.height() * 0.5)
             .show(ui, |ui| {
                 ui.add_space(pal.space_xs);
@@ -1338,5 +1357,91 @@ mod tests {
         let cfg = layout::LayoutConfig::from(&local.layout);
         let back: LayoutState = (&cfg).into();
         assert_eq!(local.layout, back, "UiLocal 里的布局必须能完整往返");
+    }
+
+    // ------------------------------------------------------------------
+    // widget ID 冲突回归（真实 run_ui 通路）
+    // ------------------------------------------------------------------
+
+    /// 在真实 `Context::run_ui` 里算出若干 widget Id 并返回。
+    ///
+    /// # 为什么必须跑真实 run_ui
+    ///
+    /// 冲突判据在 egui 内部（`context.rs` 的 `create_widget` →
+    /// `check_for_id_clash`），依赖 `pass_state.used_ids` 这张按帧填充的表。
+    /// 但反过来说：**只要一帧内用到的 Id 两两不同，就不可能触发冲突**，
+    /// 而「Id 是否唯一」不必读 egui 内部状态就能判定。
+    ///
+    /// 所以这里跑真帧拿到真实的 `ui.id()`（而不是自造一个 `Ui`），
+    /// 再比对唯一性—— 这样测的是**本项目的 ID 设计**，
+    /// 测的不是「egui 有没有报错」。
+    fn ids_in_real_pass(f: impl Fn(&egui::Ui) -> Vec<egui::Id>) -> Vec<egui::Id> {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = slot.clone();
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            *sink.lock().expect("Id 槽位不该被 Poison") = f(ui);
+        });
+        // 必须消费掉纹理增量，否则测试结束时留下未处理的 delta。
+        out.textures_delta.clear();
+        let ids = std::mem::take(&mut *slot.lock().expect("Id 槽位不该被 Poison"));
+        ids
+    }
+
+    /// 分隔条的 widget Id 必须随序号变化。
+    ///
+    /// `view::handle_splitters` 一帧里画最多 4 条分隔条，且共用同一个
+    /// 根 `Ui`（`ui.id()` 全帧不变）。固定 salt ⇒ 第 2..4 条与第 1 条
+    /// 撞 Id ⇒既有红字报错，又因 egui 把 hover/active 状态按 Id 存而互串。
+    #[test]
+    fn splitter_salts_are_unique_by_index() {
+        // 复制 `panels::draw_splitter` 内部的取 Id 方式。
+        let ids = ids_in_real_pass(|ui| (0..4).map(|i| ui.id().with(("splitter", i))).collect());
+        let uniq: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            4,
+            "4 条分隔条必须得到 4 个不同的 widget Id，实际 {ids:?}"
+        );
+    }
+
+    /// 折叠把手的 widget Id 必须随模块变化。
+    ///
+    /// `draw_collapse_handle` 被 `draw_pinned_panel` 与
+    /// `draw_history_panel` 等多处调用；窄窗口降级会让多个面板同时 veiled，
+    /// 于是同一帧内出现多个不同矩形 —— 固定 salt 必然冲突。
+    #[test]
+    fn collapse_handle_salts_are_unique_by_panel() {
+        let all = [Panel::Pinned, Panel::History, Panel::Detail, Panel::Rail];
+        let ids =
+            ids_in_real_pass(|ui| all.iter().map(|p| ui.id().with(("collapse_handle", *p))).collect());
+        let uniq: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            all.len(),
+            "各模块的折叠把手必须得到不同 Id，实际 {ids:?}"
+        );
+    }
+
+    /// 4 个 ScrollArea 的 `id_salt` 必须互不相同。
+    ///
+    /// egui 0.36 的 ScrollArea 默认用固定 salt `"scroll_area"`
+    /// （`scroll_area.rs` 的 `IdSalt::new("scroll_area")`），而本帧最多
+    /// 同时存在 4 个（历史列表 / 侧栏表视图 / 侧栏密文 / 详情预览）。
+    /// 共用一个 Id 会同时触发冲突红字**和**滚动偏移互串。
+    #[test]
+    fn scroll_area_salts_are_distinct() {
+        let salts = [
+            "history_list",
+            "rail_table_view",
+            "rail_masked_view",
+            "detail_preview",
+        ];
+        let uniq: std::collections::BTreeSet<_> = salts.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            salts.len(),
+            "4 个 ScrollArea 的 id_salt 必须互不相同"
+        );
     }
 }

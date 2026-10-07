@@ -555,18 +555,19 @@ impl App {
     ) -> Self {
         let ctx = egui::Context::default();
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
-        // 图标字体必须排在 CJK 之后：install_cjk_font 会整体替换
-        // FontDefinitions，先装图标会被它冲掉。
+        // 图标字体必须排在 CJK 之后：`install_cjk_font` 用 `set_fonts`
+        // 整体替换 `FontDefinitions`，先装图标会被它冲掉。
         //
-        // ⚠️ 临时停用：并行的图标 Agent 插入的 `install_icon_font` 内部
-        // 调用了 `ctx.fonts(|f| f.definitions().clone())`，而 egui 0.36 明确
-        // 标注 `fonts()` "Not valid until first call to Context::run_ui()"，
-        // 在`App::new` 里调用直接 panic：
+        // 早前这里因`install_icon_font` 内部调用 `ctx.fonts(|f| ..)`
+        // 而被临时停用——egui 0.36 明确标注 `fonts()`
+        // *"Not valid until first call to Context::run_ui()"*，
+        // 在 `App::new` 里调用直接 panic：
         //   No fonts available until first call to Context::run()
-        // 正确写法是 `ctx.add_font(FontInsert{..})`（egui 文档：保留既有字体）。
-        // 该函数属于 theme.rs（图标 Agent 的地盘），故此处只做隔离，
-        // 待其修好后再接回。
-        tracing::warn!("图标字体注册已被临时停用（egui fonts() 需在 run_ui 内调用）");
+        // 现已改用 `ctx.add_font(FontInsert{..})`（egui 文档：*keep the
+        // existing fonts*，即追加而非替换），因此可以在 `App::new` 里安全调用。
+        if !theme::install_icon_font(&ctx) {
+            tracing::warn!("图标字体注册失败，界面图标将缺失");
+        }
 
         let mut svc = match Service::with_data_dir(config, data_dir) {
             Ok(s) => s,

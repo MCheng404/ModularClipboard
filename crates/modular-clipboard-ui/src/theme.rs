@@ -626,9 +626,10 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
 ///
 /// # 字体族与顺序
 ///
-/// 挂在 [`FontFamily::Proportional`]，**排在已有字体之后**。
+/// 挂在 [`FontFamily::Proportional`]，**排在已有字体之后**
+/// （[`FontPriority::Lowest`]）。
 ///
-/// - 排在之后：CJK 字体被 `insert(0, ...)` 放在首位且字体庞大，
+/// - 排在之后：CJK 字体被 `insert_font` 放在首位且字体庞大，
 ///   让图标字体抢在前面会让每个图标的排版都先去问一遍 CJK 字体。
 /// - 但仍在同一字体族：图标码位是 PUA（`U+E000..=U+E011`），
 ///   中文字体不覆盖这些码位（已核实 `msyh.ttc` / `Deng.ttf` 均无
@@ -637,26 +638,46 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
 /// 挂在 `Proportional` 而非新建字体族，是为了复用同一条纹理路径：
 /// 图集走 `TextureId::Managed(0)`，渲染器无需增加第二个纹理绑定。
 ///
-/// 必须在 [`install_cjk_font`] **之后**调用——后者会整体替换
-/// `FontDefinitions`，把这里注册的字体一并丢掉。
+/// # 为什么用 `add_font` 而不是 `set_fonts`
+///
+/// 早前这里的写法是 `ctx.fonts(|f| f.definitions().clone())` 取出定义、
+/// 改完再 `ctx.set_fonts(defs)` 整体替换。但 egui 0.36 在
+/// [`egui::Context::fonts`] 上明确标注 *"Not valid until first call to
+/// `Context::run()`"*，而本函数是在 `App::new` 里调用的（那时还没有
+/// 任何 `run_ui`），直接 panic：
+///
+/// ```text
+/// No fonts available until first call to Context::run()
+/// ```
+///
+/// 正解是 [`egui::Context::add_font`]：egui 文档写明它 *"will keep the
+/// existing fonts"*——**追加**而非替换，这恰好就是「图标字体排在 CJK
+/// 之后」所需要的行为，且不依赖字体系统是否已就绪。
+///
+/// 另一个坑：`set_fonts` 会**整体替换** `FontDefinitions`，
+/// 所以本函数必须排在 [`install_cjk_font`] 之后，否则图标字体会被冲掉。
+/// `add_font` 不存在这个问题（它是增量追加），但顺序仍按原设计保留，
+/// 以免影响阅读者对「图标在 CJK 之后」的预期。
 pub fn install_icon_font(ctx: &egui::Context) -> bool {
-    let mut defs = ctx.fonts(|f| f.definitions().clone());
-    let name = crate::icons::ICON_FONT_NAME.to_string();
-    defs.font_data
-        .entry(name.clone())
-        .or_insert_with(|| std::sync::Arc::new(crate::icons::icon_font_data()));
+    let name = crate::icons::ICON_FONT_NAME;
+    // 直接复用 `icons::icon_font_data()`：它已经把基线偏移
+    // （`FontTweak::y_offset_factor`）调好了，这里再包一层
+    // `FontData::from_owned` 反而会把那个修正抹掉。
+    let insert = egui::epaint::text::FontInsert::new(
+        name,
+        crate::icons::icon_font_data(),
+        vec![egui::epaint::text::InsertFontFamily {
+            family: FontFamily::Proportional,
+            // 追加到回退链末尾：既有字体（含 CJK）优先命中，
+            // 图标码位是 PUA，CJK 不覆盖，最终必然回退到这里。
+            priority: egui::epaint::text::FontPriority::Lowest,
+        }],
+    );
 
-    // 追加到 Proportional 末尾（保留既有回退顺序）。
-    let family = defs
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default();
-    if !family.iter().any(|n| *n == name) {
-        family.push(name);
-    }
-
-    ctx.set_fonts(defs);
-    tracing::info!("图标字体已注册");
+    // `add_font` 无返回值：egui 只接受「同名字体已存在则不覆盖」的语义。
+    // 重复调用（例如测试里多次安装）是幂等的，不会产生第二份。
+    ctx.add_font(insert);
+    tracing::info!(font = name, "图标字体已注册");
     true
 }
 
@@ -1395,5 +1416,144 @@ mod tests {
     fn size_scale_is_clamped() {
         assert_eq!(sized(12.0, 0.1).size, 9.6);
         assert_eq!(sized(12.0, 5.0).size, 24.0);
+    }
+
+    // ------------------------------------------------------------------
+    // 图标字体注册（回归判据）
+    // ------------------------------------------------------------------
+
+    /// 建一个「已跑过一帧」的 Context，让 `fonts_mut` 可用。
+    ///
+    /// `install_icon_font` 本身在 `run` 之前调用是合法的（这正是
+    /// 改用 `add_font` 的原因），但**验证墨迹**必须先跑一帧，
+    /// 否则 `fonts_mut` 会 panic。
+    fn settled_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        ctx
+    }
+
+    /// 图标字体在**没有任何 CJK 字体**的机器上也能注册成功。
+    ///
+    /// 这条直接覆盖曾经的真实故障：早前实现调用 `ctx.fonts(|f| ..)`，
+    /// 在 `App::new`（即第一次 `run` 之前）里直接 panic
+    /// *"No fonts available until first call to Context::run()"*，
+    /// 于是图标注册被临时整条停用、界面全是豆腐块。
+    /// 现在用 `add_font`，**跑帧之前**调用也必须安全。
+    #[test]
+    fn icon_font_registers_before_first_run() {
+        let ctx = egui::Context::default();
+        // 关键：此时尚未调用过 run_ui，正是旧实现会 panic 的时机。
+        assert!(install_icon_font(&ctx), "图标字体注册应返回成功");
+        // 再注册一次也不应 panic（幂等）。
+        assert!(install_icon_font(&ctx), "重复注册应仍然成功");
+    }
+
+    /// `add_font` 是**追加**而非替换：注册图标字体不能把已有字体挤掉。
+    ///
+    /// 这条守住 `install_icon_font` 与 `install_cjk_font` 的共存契约——
+    /// 若哪天有人改回 `set_fonts`，这里会立刻失败。
+    ///
+    /// 判据用「注册图标字体后，内置 latin 字体的`A` 仍能命中」：
+    /// 内置字体是 egui 自带的，无需构造哨兵数据。
+    #[test]
+    fn icon_font_keeps_existing_fonts() {
+        let ctx = egui::Context::default();
+        let font_id = egui::FontId::proportional(16.0);
+
+        // 注册前：内置字体提供 'A'。
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font_id, 'A')),
+            "前提：内置 latin 字体应能提供 'A'"
+        );
+
+        install_icon_font(&ctx);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font_id, 'A')),
+            "注册图标字体后既有字体应仍然可用（add_font 是追加而非替换）"
+        );
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font_id, crate::icons::Icon::Close.codepoint())),
+            "图标码位应能命中图标字体"
+        );
+    }
+
+    /// 图标字体注册后，每个 `Icon` 变体在字体图集里**有非空墨迹**。
+    ///
+    /// 这是「图标真的会出现」的下界判据：`has_glyph` 为真只说明
+    /// 字体里有这个码位，仍可能是**空白字形**（豆腐块）。
+    /// 因此这里进一步走完整排版，拿字形的 `uv_rect` 去字体图集里
+    /// 数不透明像素。
+    ///
+    /// 与 `icons::tests::every_icon_codepoint_has_ink` 互补：那条直接
+    /// 构造 `FontDefinitions`，绕开了 `install_icon_font`；本条走的是
+    /// **真实注册路径**（`App::new` 用的就是它），因此能抓住
+    /// 「注册方式写错→ 图标退化成豆腐块」这类回归。
+    #[test]
+    fn every_icon_glyph_rasterises_to_ink_after_registration() {
+        let ctx = settled_ctx();
+        install_icon_font(&ctx);
+        // 注册发生在 settled_ctx 跑的那一帧之后，必须再跑一帧让它生效。
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+
+        for icon in crate::icons::Icon::ALL {
+            let cp = icon.codepoint();
+            // 排版 + 取图集。epaint 0.36 的 `layout` 收 4 个参数，
+            // 字形在 `galley.rows[].row.glyphs[]`（不是 `galley.glyphs`）。
+            // `FontId` 在本版本不是 `Copy`，所以在闭包内现建、不外传。
+            let (has, image, glyphs) = ctx.fonts_mut(|f| {
+                // `layout` 按值取 `FontId`（本版本不是 `Copy`），
+                // `has_glyph` 按引用，所以这里建两个等价实例。
+                let galley = f.layout(
+                    cp.to_string(),
+                    egui::FontId::proportional(64.0),
+                    egui::Color32::WHITE,
+                    f32::INFINITY,
+                );
+                let glyphs: Vec<egui::epaint::text::Glyph> = galley
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.row.glyphs.iter().cloned())
+                    .collect();
+                (
+                    f.has_glyph(&egui::FontId::proportional(64.0), cp),
+                    f.image().clone(),
+                    glyphs,
+                )
+            });
+            assert!(has, "{icon:?} U+{:04X} 未命中字体", cp as u32);
+
+            let (w, h) = (image.size[0], image.size[1]);
+            let mut inked = 0usize;
+            for g in &glyphs {
+                // epaint 0.36 的 `UvRect::min/max` 是 `[u16; 2]`（纹素坐标），
+                // 不是 `Pos2`——直接按 `Vec2` 用会编译不过。
+                let uv = g.uv_rect;
+                let x0 = (uv.min[0] as usize).min(w);
+                let y0 = (uv.min[1] as usize).min(h);
+                let x1 = ((uv.max[0] as usize) + 1).min(w);
+                let y1 = ((uv.max[1] as usize) + 1).min(h);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        if image.pixels[y * w + x].a() > 32 {
+                            inked += 1;
+                        }
+                    }
+                }
+            }
+            assert!(
+                inked > 20,
+                "{icon:?} U+{:04X} 栅格化后几乎无墨迹（{inked} px），\
+                 界面里会显示为豆腐块",
+                cp as u32
+            );
+        }
     }
 }
