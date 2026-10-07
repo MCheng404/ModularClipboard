@@ -111,12 +111,15 @@ const ROW_HEIGHT: f32 = panels::ROW_HEIGHT;
 ///
 /// 由 `Context::run_ui` 提供的根 `Ui` 覆盖整个客户区，本函数直接往里画，
 /// 不再自行创建 `Window`，也无需处理视口命令。
-pub fn draw(ui: &mut Ui, svc: &mut Service, local: &mut UiLocal) -> bool {
-    let dark = match svc.state.config.ui.dark_mode {
-        Some(v) => v,
-        None => ui.ctx().style_of(egui::Theme::Dark).visuals.dark_mode,
-    };
-    let pal = if dark { Palette::dark() } else { Palette::light() };
+///
+/// # `pal` 为什么由调用方传入
+///
+/// 调色板由 [`crate::App`] 在启动时经 [`crate::theme::set_theme`] 解析
+/// 一次并持有。早前这里每帧自己算 `Palette::dark()/light()`——
+/// 55 个字段逐个构造，每帧一次纯浪费，且**解析来源与灌进 egui Visuals
+/// 的那次解析可能分叉**（一个走 `config.dark_mode`，一个走系统探测）。
+/// 现在两者必然同源。
+pub fn draw(ui: &mut Ui, svc: &mut Service, local: &mut UiLocal, pal: &Palette) -> bool {
     let scale = svc.state.config.ui.font_scale;
 
     // 先处理上一帧排队的操作，避免在渲染过程中修改数据。
@@ -131,26 +134,53 @@ pub fn draw(ui: &mut Ui, svc: &mut Service, local: &mut UiLocal) -> bool {
         .and_then(|p| local.layout.placement[layout::panel_index(p)].float_rect());
     let solved = layout::solve(area, &local.layout, dragging_rect);
 
-    draw_topbar(ui, &solved, svc, local, &pal, scale);
+    // 窄窗口降级提示：只在详情转为浮层档位时出现。
+    //
+    // 它**不单独占一行**，而是复用状态栏的提示位（见 `draw_status_bar`）：
+    // 任何新增的浮层都会与面板争空间，而面板矩形是由 `layout::solve`
+    // 算出来的，绘制层私自加一条横幅必然造成重叠。
+    let narrowed = solved.tier >= layout::Tier::DetailFloating;
+
+    draw_topbar(ui, &solved, svc, local, pal, scale);
 
     // 模块拖动要在画面板**之前**处理：拖动位置决定了这一帧画在哪。
-    handle_splitters(ui, &solved, local, &pal);
+    handle_splitters(ui, &solved, local, pal);
     let solved = layout::solve(area, &local.layout, dragging_rect);
 
     if let Some(preview) = solved.dock_preview {
-        panels::draw_dock_preview(ui, preview.1, &pal, scale);
+        panels::draw_dock_preview(ui, preview.1, pal, scale);
     }
 
-    draw_pinned_panel(ui, &solved, svc, local, &pal, scale);
-    draw_history_panel(ui, &solved, svc, local, &pal, scale);
-    draw_rail_panel(ui, &solved, svc, local, &pal, scale);
-    if local.show_detail {
-        draw_detail_panel(ui, &solved, svc, local, &pal, scale);
+    draw_pinned_panel(ui, &solved, svc, local, pal, scale);
+    draw_history_panel(ui, &solved, svc, local, pal, scale);
+    draw_rail_panel(ui, &solved, svc, local, pal, scale);
+    // 详情两种来源都要看：停靠矩形（宽窗口）或浮层矩形（窄窗口降级）。
+    // `rects` 与 `floating` 同时为空说明该档位下详情已完全让位，
+    // `draw_detail_panel` 内部会直接返回。
+    if local.show_detail || solved.floating[layout::panel_index(Panel::Detail)].is_some() {
+        draw_detail_panel(ui, &solved, svc, local, pal, scale);
     }
 
-    draw_status_bar(ui, svc, local, &pal, scale);
+    draw_status_bar(ui, svc, local, pal, scale, narrowed);
     local.drag_region = titlebar_drag_region(&solved, scale);
     false
+}
+
+/// 模块在当前帧是否应画成「折叠把手」而不是完整面板。
+///
+/// # 为什么要看`tier` 而不是只看 `LayoutState`
+///
+/// [`layout::solve`] 会因为窗口太窄而**自动**把模块收成把手，
+/// 但它**不修改** [`LayoutState`]——用户的布局意图必须原样保留，
+/// 窗口一变宽就该自动恢复。若绘制层只读 `LayoutState`，
+/// 就会在一个 24 逻辑点宽的把手矩形里画完整列表，
+/// 文字挤成竖条：降级在布局层生效了，在绘制层却没生效。
+///
+/// 判定直接复用 [`layout::Tier::visibility`]，
+/// 保证「布局算出来的」与「绘制读到的」是同一个答案——
+/// 这与本项目「判定与绘制同源」的原则一致。
+fn is_veiled(tier: layout::Tier, local: &UiLocal, panel: Panel) -> bool {
+    tier.visibility(&local.layout, panel) == layout::Visibility::Collapsed
 }
 
 /// 画顶栏（= 自绘标题栏）。
@@ -241,8 +271,11 @@ fn draw_pinned_panel(
     let Some(rect) = solved.rects[layout::panel_index(Panel::Pinned)] else {
         return;
     };
-    let collapsed = layout::is_collapsed(&local.layout, Panel::Pinned);
-    if collapsed {
+    // ⚠️ 判据必须读**求解结果里的可见性**，而不是 `LayoutState` 的折叠位。
+    // 窄窗口下降级会把置顶收成把手，但 `LayoutState` 里它仍是展开的——
+    // 读原始状态会在 24 逻辑点宽的把手矩形里画完整列表，
+    // 于是文字挤成竖条，正是本次要修的「所有元素挤在一起」的另一种形态。
+    if is_veiled(solved.tier, local, Panel::Pinned) {
         panels::draw_collapse_handle(ui, rect, pal, scale);
         return;
     }
@@ -310,7 +343,7 @@ fn draw_history_panel(
     let Some(rect) = solved.rects[layout::panel_index(Panel::History)] else {
         return;
     };
-    if layout::is_collapsed(&local.layout, Panel::History) {
+    if is_veiled(solved.tier, local, Panel::History) {
         panels::draw_collapse_handle(ui, rect, pal, scale);
         return;
     }
@@ -506,21 +539,31 @@ fn draw_rail_panel(
     let view = RailView::from_index(local.layout.rail_view);
     panels::panel_frame(ui, rect, pal, false, scale);
     let inner = rect.shrink(2.0);
+    // 「表」「密」两个字已被 Table / Mask 图标取代：图标在小尺寸下
+    // 比单字表意更清楚，也不依赖中文字体一定存在。
+    let view_icon = view.icon();
 
     if rect.width() <= panels::rail_handle_width(pal, scale) + pal.space_xs {
-        // 折叠态：只画竖排标签，点一下展开。
+        // 折叠态：只画图标，点一下展开。
         let resp = ui.interact(inner, ui.id().with("rail_collapsed"), egui::Sense::click());
         if resp.hovered() {
             ui.painter().rect_filled(inner, CornerRadius::ZERO, pal.row_hover);
         }
-        panels::draw_vertical_text(ui, inner, view.label(), pal.text_bright, pal, scale);
+        view_icon.paint(
+            &ui.painter_at(inner),
+            egui::Rect::from_center_size(
+                inner.center(),
+                vec2(pal.icon_size, pal.icon_size) * scale,
+            ),
+            pal.text_bright,
+        );
         if resp.clicked() {
             layout::toggle_collapse(&mut local.layout, Panel::Rail);
         }
         return;
     }
 
-    // 展开态：上半是竖排标签区（点击切换），下半是该视图的列表。
+    // 展开态：上半是标签区（点击切换），下半是该视图的列表。
     let rail_w = panels::rail_handle_width(pal, scale) + pal.space_xs;
     let tag = Rect::from_min_size(inner.min, vec2(rail_w, inner.height()));
     let tab = Rect::from_min_size(tag.min, vec2(rail_w, pal.font_md * scale * 2.2));
@@ -528,7 +571,15 @@ fn draw_rail_panel(
     if resp.hovered() {
         ui.painter().rect_filled(tab, CornerRadius::ZERO, pal.row_hover);
     }
-    panels::draw_vertical_text(ui, tab, view.label(), pal.text_bright, pal, scale);
+    view_icon.paint(
+        &ui.painter_at(tab),
+        egui::Rect::from_center_size(
+            tab.center(),
+            vec2(pal.icon_size, pal.icon_size) * scale,
+        ),
+        pal.text_bright,
+    );
+    resp.clone().on_hover_text(view_icon.label());
     if resp.clicked() {
         // 在两种视图间循环。
         local.layout.rail_view = (local.layout.rail_view + 1) % RailView::all().len();
@@ -658,10 +709,14 @@ fn draw_detail_panel(
     pal: &Palette,
     scale: f32,
 ) {
-    let Some(rect) = solved.rects[layout::panel_index(Panel::Detail)] else {
-        return;
+    let i = layout::panel_index(Panel::Detail);
+    // 窄窗口下详情转为浮层，矩形只在 `floating` 里，`rects` 是 `None`。
+    // 两个来源都读，才不会在降级时「详情整个消失」。
+    let (rect, floating) = match (solved.rects[i], solved.floating[i]) {
+        (_, Some(r)) => (r, true),
+        (Some(r), None) => (r, false),
+        (None, None) => return,
     };
-    let floating = solved.floating[layout::panel_index(Panel::Detail)].is_some();
     panels::panel_frame(ui, rect, pal, floating, scale);
     let mut inner = rect.shrink(panels_panel_pad(pal));
 
@@ -820,7 +875,13 @@ fn draw_detail(
 
     at_rect(ui, rect, |ui| {
         ui.horizontal(|ui| {
-            icons::paint_inline(ui, icons::Icon::for_kind(item.kind), pal.text_dim);
+            icons::paint_inline(
+                ui,
+                icons::Icon::for_kind(item.kind),
+                pal.text_dim,
+                pal,
+                scale,
+            );
             ui.label(
                 RichText::new(kind_name(item.kind))
                     .size(sized(pal.font_sm, scale).size)
@@ -996,6 +1057,7 @@ fn draw_status_bar(
     local: &mut UiLocal,
     pal: &Palette,
     scale: f32,
+    narrowed: bool,
 ) {
     let root = ui.max_rect();
     let h = pal.font_md * scale * 1.6;
@@ -1015,30 +1077,59 @@ fn draw_status_bar(
             Stroke::new(pal.stroke_thin, pal.border_subtle),
         );
         ui.horizontal(|ui| {
+            // 窄窗口降级提示优先占左侧：它解释的是「详情去哪了」，
+            // 与临时通知相比更影响用户对界面的理解。
+            if narrowed {
+                ui.label(
+                    RichText::new("窗口较窄 · 详情转为浮层，拉宽窗口可恢复三栏")
+                        .size(sized(pal.font_sm, scale).size)
+                        .color(pal.text_dim),
+                );
+            }
             // 提示信息 3 秒后自动消失
             if let Some((msg, at)) = &svc.state.notice {
                 let age = at.elapsed();
-                let text = if age < Duration::from_secs(3) {
-                    msg.clone()
+                if age < Duration::from_secs(3) {
+                    let text = if !msg.is_empty() {
+                        msg.clone()
+                    } else {
+                        String::new()
+                    };
+                    if !text.is_empty() {
+                        ui.label(
+                            RichText::new(text)
+                                .color(pal.accent)
+                                .size(sized(pal.font_sm, scale).size),
+                        );
+                    }
                 } else {
                     svc.state.notice = None;
-                    String::new()
-                };
-                if !text.is_empty() {
-                    ui.label(
-                        RichText::new(text)
-                            .color(pal.accent)
-                            .size(sized(pal.font_sm, scale).size),
-                    );
                 }
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("清空").on_hover_text("清空全部历史").clicked() {
+                // 「清空」是破坏性操作：垃圾桶图标 + 悬停说明，
+                // 悬停时用 danger 色与旁边的「设置」区分开。
+                let (clear_rect, clear_resp) = ui.allocate_exact_size(
+                    egui::vec2(pal.icon_size, pal.icon_size) * scale,
+                    egui::Sense::click(),
+                );
+                let clear_icon_center = clear_rect.center();
+                let clear_hovered = clear_resp.hovered();
+                if clear_resp.clicked() {
                     if let Err(e) = svc.clear_all() {
                         svc.notify(format!("清空失败: {e}"));
                     }
                 }
+                icons::Icon::Trash.paint(
+                    &ui.painter_at(clear_rect),
+                    egui::Rect::from_center_size(
+                        clear_icon_center,
+                        egui::vec2(pal.icon_size, pal.icon_size) * scale,
+                    ),
+                    if clear_hovered { pal.danger } else { pal.text_dim },
+                );
+                clear_resp.on_hover_text("清空全部历史");
                 if ui.small_button("设置").clicked() {
                     local.show_settings = !local.show_settings;
                 }
