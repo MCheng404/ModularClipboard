@@ -63,7 +63,7 @@ THE SOFTWARE.
 
 #### 本仓库对子集字体做的一处修复（`hmtx.lsb`）
 
-字体ello 导出的这份子集里，`hmtx` 表的 `leftSideBearing` **全部写成了 0**
+fontello 导出的这份子集里，`hmtx` 表的 `leftSideBearing` **全部写成了 0**
 （个别 −4），而 `glyf` 里字形轮廓的真实 `xMin` 是 37/ 94/ 75 /……
 两者矛盾。后果是渲染器读到的 bearing为 0，`Drag`(grip-vertical，
 真实 bearing 19.65px) 被贴到笔尖上，在 64px 框里**横向偏左 21px（33%）**；
@@ -106,5 +106,15 @@ cargo install cargo-about   # 或 cargo-deny
 cargo about generate about.hbs
 ```
 
-当前依赖中与本文件相关的间接依赖字体为 `ab_glyph`（MIT），
-由 `egui` / `epaint` 引入。
+当前依赖中与图标渲染相关的字体栈由 `egui` / `epaint` 0.36 引入，
+均为宽松许可，版本以 `Cargo.lock` 为准：
+
+| crate | 版本 | 许可 | 作用 |
+|---|---|---|---|
+| `skrifa` | 0.44.0 | MIT OR Apache-2.0 | ttf 轮廓解析（epaint 实际使用者） |
+| `vello_cpu` / `vello_common` | 0.1.0 | MIT OR Apache-2.0 | 字形光栅化 |
+| `harfrust` | 0.12.0 | MIT | 文本整形 |
+
+注：epaint 0.36 已**不再**使用 `ab_glyph`，改用上表这套栈。
+图标字体由 `skrifa` 解析、`vello_cpu` 光栅化——`icons.rs` 模块文档里
+提到的「底层是 `ab_glyph`」是过时信息，以本表为准。

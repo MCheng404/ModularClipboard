@@ -22,8 +22,8 @@
 //!
 //! # 为什么零新增依赖
 //!
-//! ttf 直接交给 egui 内置的字体解析器（走 [`egui::FontData`]，底层是
-//! `ab_glyph`）。不需要 `ab_glyph` / `owned_ttf_parser` 之类的额外依赖。
+//! ttf 直接交给 egui 内置的字体解析器（走 [`egui::FontData`]，epaint 0.36
+//! 底层是 `skrifa` + `vello_cpu`）。不需要 `owned_ttf_parser` 之类的额外依赖。
 //!
 //! 渲染通路：字体图集走 `TextureId::Managed(0)`（`renderer.rs` 已支持），
 //! 着色器取覆盖率乘顶点色——**图标颜色天然由 `Color32` 决定**，因此
@@ -661,14 +661,14 @@ mod tests {
             let adv = ctx.fonts_mut(|f| {
                 f.glyph_width(&egui::FontId::proportional(side * INK_FIT), icon.codepoint())
             });
-            let dx = (ink.center().x - adv / 2.0) - (side - adv) / 2.0;
+            let dx = (ink.min.x + ink.width() / 2.0) - adv / 2.0;
             if dx.abs() > worst {
                 worst = dx.abs();
                 worst_icon = icon;
             }
         }
         assert!(
-            worst > 1.5,
+            worst > 3.0,
             "把 hmtx.lsb 清零后横向判据仍然通过（最差 {worst:.2}px @ {worst_icon:?}）——\
              glyph_ink_is_centred_horizontally 是假测试"
         );
