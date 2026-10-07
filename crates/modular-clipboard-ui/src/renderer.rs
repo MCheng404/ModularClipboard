@@ -222,6 +222,30 @@ pub fn unpremultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
 ///
 /// `clip_from_uv` 传单位矩阵：着色器内部已把像素坐标换算成 NDC（并做了 y 轴
 /// 翻转），再乘一个矩阵只会引入二次变换。
+///
+/// # ⚠️ 坐标系不变式（务必与 `EventLoop::egui_input` 成对阅读）
+///
+/// * `size_in_pixels` = **物理像素**（交换链尺寸），来自 [`Painter::paint`] 的
+///   `fr.extent()`；
+/// * `pixels_per_point` = egui 的**逻辑点→物理像素**比例，即
+///   [`egui::FullOutput::pixels_per_point`]；
+/// * 着色器算`ndc = 2 * (pos * dpr) / size_in_pixels`，其中 `pos` 是
+///   `epaint` 吐出的**逻辑点**（`epaint::Vertex::pos` 的文档即如此）。
+///
+/// 于是必须满足
+///
+/// ```text
+/// screen_rect.size() * pixels_per_point == size_in_pixels
+/// ```
+///
+/// 这与 egui 官方后端 `egui-wgpu` 0.36 的写法**完全等价**：官方把
+/// `size_in_pixels / ppp`（逻辑点）塞进 uniform，顶点着色器直接
+/// `2 * pos / screen_size` 而不乘 dpr。同一件事的两种写法，本项目选
+/// 「物理视口 + 乘 dpr」。
+///
+/// ⚠️ 只要 `ppp` 被漏设成 1.0（DPI 144 时真实值是 1.5），这条不变式就破了：
+/// 布局按逻辑点算好、换算按物理视口算，于是内容只占视口的 1/1.5，
+/// 右侧与底部各空 1/3，且**不产生任何 GPU 错误**。
 pub fn uniforms_for(extent: vk::Extent2D, pixels_per_point: f32) -> Uniforms {
     Uniforms::new(
         [
@@ -240,6 +264,11 @@ pub fn uniforms_for(extent: vk::Extent2D, pixels_per_point: f32) -> Uniforms {
 pub struct UniformKey {
     pub width: u32,
     pub height: u32,
+    /// egui 的逻辑点→物理像素比例。
+    ///
+    /// ⚠️ 注意命名不一致：本字段叫 `pixels_per_point`，而它写进去的
+    /// [`crate::pipeline::Uniforms`] 里对应字段叫 **`dpr`**。
+    /// 同一个值两个名字，改动时容易写错。
     pub pixels_per_point: f32,
 }
 
@@ -1343,6 +1372,124 @@ mod tests {
             ]
         );
         assert_eq!(u.size_in_pixels, [800.0, 600.0]);
+    }
+
+    /// **本缺陷的判据（渲染侧）**：顶点是逻辑点、视口是物理像素，
+    /// 而两者之间唯一的换算依据是 `dpr`。
+    ///
+    /// # 判据为什么必须是这个不变式
+    ///
+    /// 本项目吃过三次判据失效的亏（数字对了但用户看到重影、截图没开 DPI
+    /// 感知、数字判据与视觉判据不同源），所以这里明确选定**唯一**判据：
+    ///
+    /// ```text
+    /// screen_rect.size() * dpr == size_in_pixels
+    /// ```
+    ///
+    /// 它失败时画面整体缩放错（内容只占视口一部分），且**不产生任何
+    /// GPU 错误、验证层也干净**——靠「有没有报错」或「三段宽度之和 ≤
+    /// 可用宽度」都抓不到。
+    ///
+    /// 用真实的 `egui::Context` + `set_pixels_per_point`（与
+    /// `EventLoop::egui_input` 里同源）产出真实 `ppp`，而不是手写常量，
+    /// 这样本测试与`window.rs` 的守卫真的在同一条链路上。
+    #[test]
+    fn uniform_dpr_times_logical_canvas_equals_physical_viewport() {
+        // 实机遇到的组合：420x560 物理像素 @ DPI 144（ppp 应为 1.5）。
+        const PHYSICAL: vk::Extent2D = vk::Extent2D {
+            width: 420,
+            height: 560,
+        };
+
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let logical = egui::vec2(
+                PHYSICAL.width as f32 / scale,
+                PHYSICAL.height as f32 / scale,
+            );
+            let ctx = egui::Context::default();
+            // 与 window.rs 里的调用完全一致。
+            ctx.set_pixels_per_point(scale);
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, logical)),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |_ui| {});
+            out.textures_delta.clear();
+
+            // 真实 ppp 来自 egui 自身，而非我们手写。
+            let u = uniforms_for(PHYSICAL, out.pixels_per_point);
+            assert_eq!(
+                logical * u.dpr,
+                egui::vec2(PHYSICAL.width as f32, PHYSICAL.height as f32),
+                "scale={scale}: screen_rect{logical:?} * dpr({}) 必须等于物理视口 {PHYSICAL:?}",
+                u.dpr
+            );
+            // `size_in_pixels` 必须始终是**物理像素**，不能被顺手改成逻辑点
+            // （否则就与顶点侧的 dpr 换算重复乘一次）。
+            assert_eq!(
+                u.size_in_pixels,
+                [PHYSICAL.width as f32, PHYSICAL.height as f32],
+                "size_in_pixels 必须是物理像素"
+            );
+        }
+    }
+
+    /// 同一不变式的端到端版：真跑一帧 egui，铺满逻辑画布的矩形经着色器
+    /// 公式换算后必须正好铺满物理视口（`ndc` 落在 ±1）。
+    ///
+    /// 上一条验的是「输入之间自洽」，这条验的是「换算结果真的对」——
+    /// 它直接对应实机现象：改前`ndc` 只到 ±1/1.5，右侧/底部空1/3。
+    #[test]
+    fn full_canvas_rect_maps_to_ndc_edges() {
+        const PHYSICAL: vk::Extent2D = vk::Extent2D {
+            width: 420,
+            height: 560,
+        };
+        let scale = 1.5_f32;
+        let logical = egui::vec2(PHYSICAL.width as f32 / scale, PHYSICAL.height as f32 / scale);
+
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(scale);
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, logical)),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ctx| {
+            // 铺满整个逻辑画布的矩形——实机 UI 的背景就是这么画的。
+            let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, logical);
+            egui::Painter::new(ctx.clone(), egui::LayerId::background(), canvas)
+                .rect_filled(canvas, 0.0, egui::Color32::WHITE);
+        });
+        out.textures_delta.clear();
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let u = uniforms_for(PHYSICAL, out.pixels_per_point);
+
+        // 顶点最大坐标（逻辑点）应覆盖整个逻辑画布。
+        let mut max_x = 0.0_f32;
+        let mut max_y = 0.0_f32;
+        for p in &prims {
+            if let egui::epaint::Primitive::Mesh(m) = &p.primitive {
+                for v in &m.vertices {
+                    max_x = max_x.max(v.pos.x);
+                    max_y = max_y.max(v.pos.y);
+                }
+            }
+        }
+        assert!(max_x >= logical.x - 1.0, "背景矩形应铺满画布宽，实际 {max_x}");
+
+        // 复刻着色器 `vs_main` 的换算（egui.wgsl:53-55）。
+        let ndc_x = 2.0 * (max_x * u.dpr) / u.size_in_pixels[0] - 1.0;
+        let ndc_y = 1.0 - 2.0 * (max_y * u.dpr) / u.size_in_pixels[1];
+        assert!(
+            (ndc_x - 1.0).abs() < 0.01,
+            "右边缘 ndc 应为 1.0（铺满视口），实际 {ndc_x}——\
+             小于 1 即右侧留白"
+        );
+        assert!(
+            (ndc_y + 1.0).abs() < 0.01,
+            "下边缘 ndc 应为 -1.0（铺满视口），实际 {ndc_y}——\
+             大于 -1 即底部留白"
+        );
     }
 
     #[test]

@@ -788,7 +788,47 @@ impl EventLoop {
     ///
     /// `screen_rect` 用逻辑点，`time` 是自事件循环创建起的秒数，
     /// `predicted_dt` 取 `set_repaint_after` 设的间隔。
+    ///
+    /// # ⚠️ 坐标系不变式：`screen_rect * ppp` 必须等于客户区物理像素
+    ///
+    /// 本函数喂给 egui 的 `screen_rect` 是**逻辑点**，而渲染侧
+    /// [`crate::pipeline::Uniforms`] 的 `size_in_pixels` 是**物理像素**。
+    /// 着色器按`ndc = 2 * (pos * dpr) / size_in_pixels` 换算，所以三者必须
+    /// 满足
+    ///
+    /// ```text
+    /// screen_rect.size() * dpr == size_in_pixels
+    /// ```
+    ///
+    /// 这也是 egui 官方后端（`egui-wgpu` 0.36）的做法：顶点与
+    /// `screen_rect` 一律逻辑点，uniform 里放`size_in_pixels / ppp`
+    /// （即逻辑点），顶点着色器**不乘** dpr——两种写法等价。
+    ///
+    /// 实测踩坑：本函数早先只设了 `screen_rect`（逻辑点）却**从不调**
+    /// [`egui::Context::set_pixels_per_point`]，于是 egui 的 `ppp` 恒为
+    /// 默认的 1.0，`dpr` 传进 uniform 也是 1.0。280 点的内容被映射到
+    /// 420 像素宽的视口里，只占 2/3——**右侧 1/3 与底部 1/3 永远是
+    /// clear color**，看起来就像「UI 挤在左上角」。
+    ///
+    /// 这类缺陷不报任何 GPU 错误，只是「画小了」，因此必须靠上面那条
+    /// 不变式当判据，而不是靠肉眼看整体比例。
     pub fn egui_input(&self, ctx: &egui::Context, events: &[WindowEvent]) -> egui::RawInput {
+        // ⚠️ 必须与下面的 `screen_rect` **成对**设置，且用同一个
+        // `scale_factor`。少这一句就是「UI 只画左上角 2/3」的根因。
+        //
+        // egui 的 `ppp` 决定两件事：字体图集的栅格化分辨率，以及
+        // `tessellate` 的 feathering/对齐；它**不**缩放顶点坐标
+        // （`epaint::Vertex::pos` 的文档明确写的是逻辑点）。
+        // 顶点 → 物理像素的换算只发生在着色器里那一次 `* dpr`。
+        //
+        // `set_pixels_per_point` 内部会转成 `set_zoom_factor(ppp /
+        // native_ppp)`，而本项目从不设 `native_ppp`（恒为 1.0），
+        // 所以这里传 DPI 缩放即得`ppp == scale_factor`。
+        //
+        // 幂等：值没变时 `set_zoom_factor` 直接返回，不触发重绘请求，
+        // 因此每帧调用无代价。
+        ctx.set_pixels_per_point(self.scale_factor);
+
         let mut out: Vec<EguiEvent> = Vec::with_capacity(events.len() + 4);
 
         // 指针位置每帧都要报。没有移动消息时用系统光标位置兜底，
@@ -1175,6 +1215,151 @@ mod tests {
     /// 正是它导致过一次「UI 收不到任何输入」的回归。
     fn raw_of(events: Vec<WindowEvent>) -> egui::RawInput {
         fake_loop().egui_input(&egui::Context::default(), &events)
+    }
+
+    /// 造一个指定 DPI 缩放与客户区**逻辑点**尺寸的 `EventLoop`。
+    ///
+    /// 必须能调`scale_factor`：本缺陷只在 `scale != 1.0` 时显现，
+    /// 而默认的 1.0 会让任何坐标断言都恒真。
+    fn fake_loop_scaled(scale: f32, logical: Vec2) -> EventLoop {
+        EventLoop {
+            scale_factor: scale,
+            inner_size: logical,
+            ..fake_loop()
+        }
+    }
+
+    // ---------------- 坐标系一致性 ----------------
+
+    /// 实机客户区420×560 物理像素、DPI 144（`scale = 1.5`）⇒ 逻辑点 280×373。
+    const REAL_CLIENT_PX: Vec2 = Vec2::new(420.0, 560.0);
+
+    /// **回归守卫**：`egui_input` 必须把 egui 的 `ppp` 设成窗口 DPI 缩放。
+    ///
+    /// # 为什么这条能抓住「UI 只画在左上角 2/3」
+    ///
+    /// 布局按 `screen_rect`（逻辑点 280×373）算好，而着色器按物理视口
+    /// （420×560）换算。两者之间**唯一的换算依据就是 `ppp`**：
+    /// `ndc = 2 * (pos * dpr) / size_in_pixels`。
+    ///
+    /// 漏设 `ppp` 时它是 egui 默认的 1.0，于是 280 点被映射到 420 像素视口的
+    /// 2/3 处，右侧 140px、底部 187px 永远不被绘制，且**不报任何 GPU 错误**。
+    #[test]
+    fn ppp_follows_window_dpi_scale() {
+        let scale = 1.5_f32; // DPI 144
+        let logical = REAL_CLIENT_PX / scale;
+        let e = fake_loop_scaled(scale, logical);
+        let ctx = egui::Context::default();
+
+        let raw = e.egui_input(&ctx, &[]);
+        // `screen_rect` 保持**逻辑点**语义：交给 egui 的必须是点，不是像素。
+        // 若把它改成物理像素，等于告诉 egui「画布有 420 点宽」，
+        // 内部字体度量与控件尺寸会随之错乱。
+        assert_eq!(
+            raw.screen_rect.expect("必须给出 screen_rect").size(),
+            logical,
+            "screen_rect 必须是逻辑点尺寸"
+        );
+
+        // 关键断言：跑一帧后 egui 报告的 ppp 必须等于 DPI 缩放。
+        // `set_pixels_per_point` 在下一 pass 生效，所以这里看 `FullOutput`——
+        // 它正是被送进 `uniforms_for` 当 `dpr` 的那个值。
+        let mut out = ctx.run_ui(raw, |_ctx| {});
+        // 首帧会栅格化字体，`TexturesDelta` 的 drop 断言要求先消费掉。
+        // 不清空的话这个 panic 会**掩盖**下面的真实断言失败。
+        out.textures_delta.clear();
+        assert_eq!(
+            out.pixels_per_point, scale,
+            "egui 的 ppp 必须等于窗口 DPI 缩放（本次缺陷的根因：漏调 \
+             set_pixels_per_point，ppp 恒为 1.0，导致布局与换算差一个 \
+             scale 因子，右侧与底部各空 1/3）"
+        );
+    }
+
+    /// **不变式本体**：`screen_rect * ppp == 客户区物理像素`。
+    ///
+    /// 这是渲染侧 `uniforms_for` 依赖的契约：`size_in_pixels` 拿物理像素，
+    /// `dpr` 拿 egui 的 `ppp`，而顶点是逻辑点。三者任一不自洽，
+    /// 画面就整体缩放错误——且**始终不触发 GPU 错误或验证层报错**。
+    ///
+    /// 直接复用实机遇到的 420×560 @1.5，而不是随手编的数字。
+    #[test]
+    fn screen_rect_times_ppp_equals_physical_client_area() {
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let e = fake_loop_scaled(scale, REAL_CLIENT_PX / scale);
+            let ctx = egui::Context::default();
+            let raw = e.egui_input(&ctx, &[]);
+            let screen = raw.screen_rect.expect("必须给出 screen_rect").size();
+            let mut out = ctx.run_ui(raw, |_ctx| {});
+            out.textures_delta.clear();
+
+            assert_eq!(
+                screen * out.pixels_per_point,
+                REAL_CLIENT_PX,
+                "scale={scale}: screen_rect({screen:?}) * ppp({}) 必须等于物理客户区 {:?}",
+                out.pixels_per_point,
+                REAL_CLIENT_PX
+            );
+        }
+    }
+
+    /// `scale = 1.0`（无缩放）时不变式退化为恒等，必须照样成立。
+    ///
+    /// 单独列出来是因为它是最容易被「顺手乘个 scale」改坏的分支。
+    #[test]
+    fn coordinate_invariant_holds_at_scale_one() {
+        let e = fake_loop_scaled(1.0, REAL_CLIENT_PX);
+        let ctx = egui::Context::default();
+        let raw = e.egui_input(&ctx, &[]);
+        // `RawInput` 不是 `Copy`，先取出来再交给 `run_ui`。
+        let screen = raw.screen_rect.expect("必须给出 screen_rect").size();
+        let mut out = ctx.run_ui(raw, |_ctx| {});
+        out.textures_delta.clear();
+        assert_eq!(out.pixels_per_point, 1.0);
+        assert_eq!(screen, REAL_CLIENT_PX);
+    }
+
+    /// 指针坐标也必须是**逻辑点**，与 `screen_rect` 同一坐标系。
+    ///
+    /// `pointer_in_points` 把 `GetCursorPos` 的客户区像素坐标除以 `scale`。
+    /// 若改成物理坐标，等于在逻辑点画布里塞物理像素位置——
+    /// 光标会落在控件的 1.5 倍偏移处（点了A 结果触发 B）。
+    /// ⚠️ 判据不能是「坐标落在画布内」：测试用的 `HWND` 是空指针，
+    /// `ScreenToClient` 必然失败，于是坐标停留在**屏幕坐标**（可远大于画布），
+    /// 那是无头环境的预期降级，与本缺陷无关。
+    /// 要锁住的是「**做了除法**」这件事，故直接与 `GetCursorPos` 的
+    /// 原始读数比对：产出坐标必须等于原始物理坐标除以 `scale`。
+    #[test]
+    fn pointer_is_divided_by_scale() {
+        let scale = 1.5_f32;
+        let e = fake_loop_scaled(scale, Vec2::new(280.0, 373.0));
+
+        // 先取原始物理坐标再推导期望值——把屏幕坐标大小写死会 flaky。
+        let mut pt = POINT::default();
+        if unsafe { GetCursorPos(&mut pt) }.is_err() {
+            // 无光标设备（CI/无头）：没有基准就无从比对，跳过，
+            // 而不是写一个恒真的假断言。
+            return;
+        }
+
+        let raw = e.egui_input(&egui::Context::default(), &[]);
+        let moved = raw.events.iter().find_map(|ev| match ev {
+            egui::Event::PointerMoved(p) => Some(*p),
+            _ => None,
+        });
+        let Some(moved) = moved else {
+            // `pointer_in_points` 只在 `GetCursorPos` 失败时才提前返回，
+            // 既然上面成功了，这里就应拿得到坐标；拿不到说明降级路径变了。
+            panic!("应产出 PointerMoved（GetCursorPos 已成功）");
+        };
+
+        // 空 HWND 下 `ScreenToClient` 不生效，坐标即原始屏幕坐标，
+        // 所以期望值就是 `pt / scale`。
+        assert_eq!(
+            moved,
+            Pos2::new(pt.x as f32 / scale, pt.y as f32 / scale),
+            "指针坐标必须是原始物理坐标除以 scale"
+        );
     }
 
     // ---------------- key_from_vk ----------------
