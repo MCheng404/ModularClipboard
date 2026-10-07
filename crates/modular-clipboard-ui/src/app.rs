@@ -35,7 +35,7 @@ use modular_clipboard_gfx::Gpu;
 use crate::presence::{self, CloseDecision, Resident};
 use crate::renderer::{Painter, WINDOW_TITLE};
 use crate::view::UiLocal;
-use crate::{theme, view};
+use crate::theme;
 
 /// 离开作用域时自动清空 [`egui::TexturesDelta`]。
 ///
@@ -557,6 +557,12 @@ pub struct App {
     /// `Visuals` 并返回自绘要用的那一份，因此「控件观感」与「自绘图形」
     /// 必然同源。`draw_frame` 每帧把它交给 `view::draw`。
     pal: theme::Palette,
+    /// 新卡片架构的工作区（卡片的唯一权威来源）。
+    ws: crate::workspace::Workspace,
+    /// 新卡片架构的界面状态。
+    paint_state: crate::paint::UiState,
+    /// 诊断用帧计数（仅 `MC_DIAG` 打开时用）。
+    diag_frames: u64,
     /// 界面退出请求。
     should_quit: bool,
 }
@@ -629,6 +635,9 @@ impl App {
             svc,
             local,
             pal,
+            ws: crate::workspace::Workspace::default(),
+            paint_state: crate::paint::UiState::default(),
+            diag_frames: 0,
             should_quit: false,
         }
     }
@@ -641,19 +650,108 @@ impl App {
                 .request_repaint_after(std::time::Duration::from_millis(250));
         }
 
-        if view::draw(ui, &mut self.svc, &mut self.local, &self.pal) {
-            self.should_quit = true;
+        // ---- 新卡片架构 ------------------------------------------------
+        //
+        // 顺序是硬性的：**先求解、再应用、后绘制**。
+        // `solver::solve` 是纯函数（不改工作区），`apply` 才写入矩形。
+        // 绘制层只读 `card.rect`，不做任何二次判断——这正是新架构
+        // 消除「布局算一遍、绘制再判一遍」的关键。
+        let area = ui.max_rect();
+        let ppp = ui.ctx().pixels_per_point();
+        let sol = crate::solver::solve(&self.ws, area);
+        crate::solver::apply(&mut self.ws, &sol);
+
+        if std::env::var_os("MC_DIAG").is_some() {
+            self.diag_frames += 1;
+            if self.diag_frames % 60 == 0 {
+                let rs: Vec<String> = self
+                    .ws
+                    .cards
+                    .iter()
+                    .map(|c| format!("{:?}={:.1}", c.kind, c.rect.width()))
+                    .collect();
+                tracing::warn!(
+                    frame = self.diag_frames,
+                    area = ?area,
+                    ppp,
+                    card_w = ?rs,
+                    "DIAG 卡片布局"
+                );
+            }
         }
+
+        {
+            let mut frame = crate::paint::Frame {
+                ui,
+                state: &mut self.paint_state,
+                svc: &mut self.svc,
+                ws: &self.ws,
+                pal: &self.pal,
+                scale: ppp,
+                area,
+            };
+            crate::paint::draw(&mut frame);
+        }
+
+        // 绘制层只识别操作、不改布局：统一在这里落到工作区与服务上。
+        self.apply_ops();
+
         if self.should_quit {
             self.svc.stop_capture();
-            self.persist_layout();
             let _ = self.svc.save_config();
+        }
+    }
+
+    /// 把绘制层收集到的操作落到工作区与服务上。
+    ///
+    /// 绘制层**只识别、不改状态**——所有变更集中在这里，
+    /// 于是「点了折叠按钮」这件事不会散落在几十个绘制函数里。
+    fn apply_ops(&mut self) {
+        use crate::paint::Op;
+        for op in self.paint_state.take_ops() {
+            match op {
+                Op::ToggleCollapse(id) => {
+                    if let Some(c) = self.ws.get_mut(id) {
+                        c.toggle_collapse();
+                    }
+                }
+                Op::Detach(id) => {
+                    self.ws.detach(id);
+                }
+                Op::Dock(id) => {
+                    self.ws.dock(id);
+                }
+                Op::Select(id) => {
+                    self.svc.state.selected = Some(id);
+                }
+                Op::TogglePin(id) => {
+                    if let Err(e) = self.svc.toggle_pin(id) {
+                        self.svc.notify(format!("置顶失败: {e}"));
+                    }
+                }
+                Op::Delete(id) => {
+                    if let Err(e) = self.svc.delete_item(id) {
+                        self.svc.notify(format!("删除失败: {e}"));
+                    }
+                }
+                Op::Copy(id) => {
+                    if let Err(e) = self.svc.copy_item(id) {
+                        self.svc.notify(format!("复制失败: {e}"));
+                    }
+                }
+                Op::SetPinnedMode(mode) => {
+                    self.ws.set_pinned_mode(mode);
+                }
+            }
         }
     }
 
     /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。
     pub fn drag_region(&self) -> Option<egui::Rect> {
-        self.local.drag_region
+        // 新架构的拖动区由 `paint::draw_topbar` 每帧写入。
+        // 旧的 `local.drag_region` 已不再更新——保留读旧字段会拿到
+        // 永远为None 的值，表现为「窗口拖不动」。
+        self.paint_state.drag_region
     }
 
     /// 取出并清掉「标题栏关闭按钮」请求。
