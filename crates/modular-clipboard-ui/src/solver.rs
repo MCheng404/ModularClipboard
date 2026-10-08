@@ -110,12 +110,24 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
     // ---- 步骤 3：分配宽度 ----------------------------------------------
     // 注意：即便历史卡片也放不下（窗口极窄），也不再继续折叠——
     // 它不可折叠。此时所有卡片会平分可用宽度，各自尽可能窄。
+    // ⚠️ 判据必须与 [`crate::workspace::Workspace::docked`] 一致：
+    // **内嵌的置顶卡片宽度必须是 0**。
+    //
+    // 早前这里只看 `c.host == Docked`，于是置顶（停靠态）仍分到一栏
+    // 宽度，而 paint 又在历史栏顶部内嵌画了一份—— 实测界面左边
+    // 空出约 1/3 宽度、历史栏只占右边 2/3，正是这个不一致造成的。
+    //
+    // 抽成 `pinned_is_embedded()` 是为了让它与 paint 用**同一个**
+    // 判定函数，避免两处各自判断再次漂移。
+    let pinned_embedded = ws.pinned_is_embedded();
     let layout: Vec<f32> = ws
         .cards
         .iter()
         .enumerate()
         .map(|(idx, c)| {
-            if c.host != crate::card::CardHost::Docked {
+            if c.host != crate::card::CardHost::Docked
+                || (pinned_embedded && c.kind == crate::card::CardKind::Pinned)
+            {
                 0.0
             } else if collapsed[idx] {
                 c.kind.handle_width()
@@ -308,6 +320,40 @@ mod tests {
         600.0, 700.0, 800.0, 900.0, 1000.0, 1200.0,
     ];
 
+    /// 内嵌置顶时，历史栏必须**铺满整个可用宽度**。
+    ///
+    /// # 这条守住什么
+    ///
+    /// 内嵌的置顶卡片宽度必须是 0，历史栏才能吃掉全部剩余宽度。
+    /// 早前 `solve` 只看 `c.host == Docked`，给置顶也分了一栏——
+    /// 实测界面左边空出约 1/3、历史栏只占右边 2/3。
+    #[test]
+    fn embedded_pinned_leaves_history_full_width() {
+        let ws = Workspace::default();
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 533.33));
+        let sol = solve(&ws, area);
+        let body = card_area(area);
+
+        let idx = |ws: &Workspace, k: CardKind| {
+            ws.cards
+                .iter()
+                .position(|c| c.kind == k)
+                .expect("卡片存在")
+        };
+        let h = ws.by_kind(CardKind::History).expect("历史卡片");
+        let hr = sol.rects[idx(&ws, h.kind)];
+        assert!(
+            (hr.width() - body.width()).abs() < 0.5,
+            "历史栏应铺满可用宽度：期望 {}，实际 {}",
+            body.width(),
+            hr.width()
+        );
+        // 内嵌的置顶卡片矩形必须是零——它不占空间。
+        let p = ws.by_kind(CardKind::Pinned).expect("置顶卡片");
+        let pr = sol.rects[idx(&ws, p.kind)];
+        assert_eq!(pr.width(), 0.0, "内嵌置顶不应占宽度");
+    }
+
     #[test]
     fn invariants_hold_across_widths() {
         // I1 + I2：任意宽度下矩形都在区内且互不相交。
@@ -445,12 +491,33 @@ mod tests {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(600.0, 533.33));
         let ws = Workspace::default();
         let sol = solve(&ws, area);
-        for c in ws.cards.iter().filter(|c| c.is_visible()) {
+        //
+        // ⚠️ **内嵌的置顶卡片是刻意的例外**：它不占栏，内容由
+        // `draw_embedded_pinned` 画进历史栏顶部，矩形必须是零。
+        // 所以这里要排除它，否则会把「按设计为零」当成回归。
+        let pinned_embedded = ws.pinned_is_embedded();
+        for c in ws
+            .cards
+            .iter()
+            .filter(|c| c.is_visible())
+            .filter(|c| !(pinned_embedded && c.kind == CardKind::Pinned))
+        {
             let r = sol.rect_of(ws.cards.iter().position(|x| x.id == c.id).expect("在列表中"))
                 .expect("应有矩形");
             assert!(
                 r.width() >= 1.0 && r.height() >= 1.0,
                 "{c:?} 拿到零/负尺寸矩形 {r:?}，会导致该卡片整片不绘制"
+            );
+        }
+        // 反过来：内嵌置顶**必须**是零宽，否则又会占一栏。
+        if pinned_embedded {
+            let p = ws.by_kind(CardKind::Pinned).expect("置顶卡片");
+            let pr = sol.rect_of(ws.cards.iter().position(|x| x.id == p.id).expect("在列表中"))
+                .expect("应有矩形");
+            assert_eq!(
+                pr.width(),
+                0.0,
+                "内嵌的置顶卡片不应占宽度（否则与历史分栏）"
             );
         }
     }

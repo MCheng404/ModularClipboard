@@ -578,8 +578,14 @@ fn pinned_is_separate(ws: &Workspace) -> bool {
 }
 
 fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
-    // 置顶独立成窗 ⇒ 主窗只画历史栏（不画置顶栏，避免重复内容）。
-    let pinned_separate = pinned_is_separate(f.ws);
+    // 置顶**不占一栏**：要么独立成窗、要么内嵌在历史栏顶部。
+    // 两种情况主窗口都不画置顶卡片。
+    //
+    // ⚠️ 判据必须与 solver 用的一致（`pinned_is_embedded`），
+    // 否则会出现「solver 按占一栏分了宽度、paint 又在历史栏内画
+    // 一份」—— 实测界面就是这样：置顶与历史并排，
+    // 而用户要的是不分栏。
+    let skip_pinned = f.ws.pinned_is_embedded() || pinned_is_separate(f.ws);
 
     // 按 Z 序遍历。这里直接读 `card.rect`——**不做任何二次判断**，
     // 也不重新计算宽度。矩形是solver 算好的，绘制只负责照着画。
@@ -587,8 +593,7 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
         if card.host != CardHost::Docked {
             continue;
         }
-        // 置顶已独立成窗 ⇒ 主窗口跳过置顶卡片。
-        if pinned_separate && card.kind == CardKind::Pinned {
+        if skip_pinned && card.kind == CardKind::Pinned {
             continue;
         }
         let r = card.rect;
@@ -607,7 +612,7 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
 
     // 置顶**没有**独立成窗 ⇒ 在历史栏顶部内嵌一个置顶区，
     // 免得为了一两条置顶再开一个窗口。
-    if !pinned_separate {
+    if !pinned_is_separate(f.ws) {
         draw_embedded_pinned(f, _body);
     }
 }

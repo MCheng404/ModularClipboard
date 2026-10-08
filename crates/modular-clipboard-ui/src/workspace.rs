@@ -66,6 +66,29 @@ impl Default for Workspace {
 }
 
 impl Workspace {
+    /// 置顶内容当前是否**内嵌在历史栏里**（而非独立成窗/独立分栏）。
+    ///
+    /// # 为什么需要这个判定
+    ///
+    /// 用户要求「没有置顶窗口时在历史栏显示置顶，不用分栏」。
+    /// 于是置顶有**三种**呈现方式：
+    ///
+    /// | 状态 | 置顶在哪 | 主窗口画什么 |
+    /// |---|---|---|
+    /// | 独立成窗 | 自己的窗口 | 只画历史栏 |
+    /// | 停靠（内嵌） | 历史栏顶部 | 历史栏 + 内嵌置顶区 |
+    ///
+    /// solver 与 paint **都必须**问同一个问题，否则会出现
+    /// 「solver 给置顶分配了一栏宽度、paint 又在历史栏里画一份」
+    /// —— 实测正是这样，界面上置顶与历史并排出现，
+    /// 而用户要的是不分栏。
+    pub fn pinned_is_embedded(&self) -> bool {
+        self.cards
+            .iter()
+            .find(|c| c.kind == CardKind::Pinned)
+            .is_some_and(|c| c.host == CardHost::Docked)
+    }
+
     /// 把配置里持久化的窗口位置写回卡片。
     ///
     /// 必须在每次启动时调一次：置顶窗口独立成窗时靠它回到上次位置，
@@ -154,8 +177,23 @@ impl Workspace {
     /// 返回**具体迭代器类型**而非 `impl Iterator`：调用方需要
     /// `.rev()`（命中测试要从最上层往下找），那要求
     /// [`DoubleEndedIterator`]，用 `impl Iterator` 会把这个能力抹掉。
+    /// 停靠卡片。
+    ///
+    /// ⚠️ **不含内嵌的置顶卡片**。
+    ///
+    /// 置顶停靠时不单独占一栏（用户要求「不用分栏」），
+    /// 它由 [`Self::pinned_is_embedded`] 单独识别、
+    /// 画进历史栏顶部。solver 用本方法算总需求宽度——
+    /// 若这里仍返回置顶，就会「solver 分了一栏、paint 又内嵌画一份」，
+    /// 实测界面就是这样（置顶与历史并排 + 历史栏内又一份）。
     pub fn docked(&self) -> impl DoubleEndedIterator<Item = &Card> {
-        self.cards.iter().filter(|c| c.host == CardHost::Docked)
+        let pinned_embedded = self.pinned_is_embedded();
+        self.cards
+            .iter()
+            .filter(move |c| {
+                c.host == CardHost::Docked
+                    && !(pinned_embedded && c.kind == CardKind::Pinned)
+            })
     }
 
     /// 已分离成子窗口的卡片。
@@ -274,6 +312,35 @@ mod tests {
     use egui::{pos2, vec2};
 
     #[test]
+    fn docked_pinned_does_not_occupy_a_column() {
+        // 置顶停靠时**不占一栏**（用户要求「不用分栏」）。
+        //
+        // 若 solver 的 `docked()` 仍返回置顶，就会分给它一栏宽度，
+        // 界面上出现「置顶 | 历史」并排——实测正是如此。
+        let ws = Workspace::default();
+        assert!(ws.pinned_is_embedded(), "置顶默认停靠 ⇒ 视为内嵌");
+        let kinds: Vec<_> = ws.docked().map(|c| c.kind).collect();
+        assert!(
+            !kinds.contains(&CardKind::Pinned),
+            "停靠卡片里不应含置顶（它内嵌在历史栏顶部），实际={kinds:?}"
+        );
+        assert!(kinds.contains(&CardKind::History), "历史栏必须在");
+    }
+
+    #[test]
+    fn separated_pinned_also_excluded_from_columns() {
+        // 置顶独立成窗时同样不占主窗口的栏。
+        let mut ws = Workspace::default();
+        let id = ws.by_kind(CardKind::Pinned).expect("置顶").id;
+        ws.detach(id);
+        assert!(!ws.pinned_is_embedded(), "独立成窗后不再是内嵌态");
+        assert!(
+            !ws.docked().any(|c| c.kind == CardKind::Pinned),
+            "独立成窗后置顶不该出现在停靠列里"
+        );
+    }
+
+    #[test]
     fn saved_pinned_position_is_restored_on_startup() {
         // 用户拖动置顶窗口后，重启必须回到同一位置。
         //
@@ -364,7 +431,13 @@ mod tests {
             c.collapsed = false;
         }
         let n = ws.docked().count() as f32;
-        let sum: f32 = CardKind::ALL.iter().map(|k| k.min_width()).sum();
+        // ⚠️ `sum` 必须与 `n` **取自同一来源**：都用 `docked()`。
+        //
+        // 早前这里写 `CardKind::ALL.iter().map(min_width)`—— 那是
+        // 「全部四种卡片」的宽度和，而 `n` 是 `docked()` 的数量。
+        // 置顶内嵌后 `docked()` 少一张，两者口径不一致，
+        // 期望值凭空多出一张卡的宽度（实测 560 vs 440）。
+        let sum: f32 = ws.docked().map(|c| c.kind.min_width()).sum();
         let expect = sum + ws.gap * (n - 1.0);
         assert!(
             (ws.required_width() - expect).abs() < 0.01,
