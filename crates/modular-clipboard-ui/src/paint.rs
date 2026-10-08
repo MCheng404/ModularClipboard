@@ -29,6 +29,7 @@ use modular_clipboard_app::Service;
 use modular_clipboard_core::ClipItem;
 
 use crate::card::{Card, CardHost, CardKind, PinnedMode};
+use crate::icons::Icon;
 use crate::theme::{Palette, sized};
 use crate::workspace::Workspace;
 
@@ -103,6 +104,14 @@ pub enum Op {
     ToggleSettings,
     /// 清空全部历史。
     ClearAll,
+    /// 关闭按钮 ⇒ 隐藏到托盘。
+    ///
+    /// ⚠️ 语义是「隐藏」不是「退出」：剪贴板类工具直接退出会让
+    /// 用户以为「记录停了」。真实决策（隐藏 / 退出）由 `App` 侧结合
+    /// 有无托盘兜底判断，绘制层不决定。
+    CloseWindow,
+    /// 最小化按钮。
+    MinimizeWindow,
 }
 
 /// 配置分组。
@@ -308,7 +317,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
 
     let inner = bar.shrink2(vec2(pal.space_md, 0.0));
 
-    // ---- 右侧：清空 + 设置（图标按钮）--------------------------------
+    // ---- 右侧：窗口按钮 + 清空 + 设置（图标按钮）----------------------
     //
     // 从底部状态栏搬上来的。按钮用**图标**而非文字：顶栏高度只有
     // 44pt，中文「清空」两个字排在那里会又高又挤；图标在小尺寸下
@@ -316,19 +325,21 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     //
     // 尺寸取顶栏高度的 60%，留出上下呼吸空间。
     let btn = bar.height() * 0.62;
+    let gap = pal.space_sm * 2.0;
+    // 四枚按钮：关闭 / 最小化 / 清空 / 设置。
     let btn_area = Rect::from_min_size(
         pos2(
-            inner.max.x - btn * 2.0 - pal.space_sm * 2.0,
+            inner.max.x - btn * 4.0 - gap * 3.0,
             bar.center().y - btn * 0.5,
         ),
-        vec2(btn * 2.0 + pal.space_sm, btn),
+        vec2(btn * 4.0 + gap * 3.0, btn),
     );
-    draw_topbar_icons(f, btn_area);
+    draw_topbar_icons(f, btn_area, bar.center().y);
 
     // ---- 搜索框：占满剩余全部空间 --------------------------------------
     //
     // ⚠️ 顺序硬性：**先算右侧按钮区，再算搜索框**。反过来的话搜索框会
-    // 一路铺到顶栏右缘，把两个图标按钮压在下面（按钮不可点）。
+    // 一路铺到顶栏右缘，把图标按钮压在下面（按钮不可点）。
     let search = Rect::from_min_max(
         pos2(inner.min.x, bar.min.y + pal.space_sm),
         pos2(btn_area.min.x - pal.space_md, bar.max.y - pal.space_sm),
@@ -398,67 +409,111 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     f.state.drag_regions = drag;
 }
 
-/// 顶栏右侧的两个图标按钮：清空（垃圾桶）、设置（齿轮）。
+/// 顶栏右侧的四枚图标按钮：关闭 / 最小化 / 清空 / 设置。
 ///
-/// 从底部状态栏搬上来的。**必须用图标字体**（PUA 码位
-/// `U+E000..=U+E011`）而不是 Unicode 字形：后者在当前字体链里
-/// 缺字形，会渲染成方框（本项目已踩过一次，见行内按钮）。
-fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect) {
+/// **必须用图标字体**（PUA 码位 `U+E000..=U+E011`）而不是 Unicode
+/// 字形：后者在当前字体链里缺字形，会渲染成方框（本项目已踩过一次）。
+fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
+    let step = r.width() / 4.0;
+    let sq = step * 0.62;
+
+    // 自左向右：关闭 / 最小化 / 清空 / 设置。
+    //
+    // ⚠️ 关闭与最小化是仅有的两枚「窗口级」按钮，点击后果是隐藏或
+    // 最小化整个窗口；把它们放在最左，与卡片内的操作在视觉上分开。
+    icon_button(
+        f,
+        "topbar_close",
+        Icon::Close,
+        "关闭到托盘",
+        r.min.x,
+        step,
+        sq,
+        center_y,
+        false,
+        |f| f.state.push(Op::CloseWindow),
+    );
+    icon_button(
+        f,
+        "topbar_minimize",
+        Icon::Minimize,
+        "最小化",
+        r.min.x + step,
+        step,
+        sq,
+        center_y,
+        false,
+        |f| f.state.push(Op::MinimizeWindow),
+    );
+    // 破坏性操作（清空）用 danger 色，与「设置」区分开。
+    icon_button(
+        f,
+        "topbar_clear",
+        Icon::Trash,
+        "清空全部历史",
+        r.min.x + step * 2.0,
+        step,
+        sq,
+        center_y,
+        true,
+        |f| f.state.push(Op::ClearAll),
+    );
+    icon_button(
+        f,
+        "topbar_settings",
+        Icon::Settings,
+        "设置",
+        r.min.x + step * 3.0,
+        step,
+        sq,
+        center_y,
+        false,
+        |f| f.state.push(Op::ToggleSettings),
+    );
+}
+
+/// 顶栏的一枚方形图标按钮：在宽 `slot_w` 的槽位内居中画一个见方热区。
+///
+/// 四枚按钮形状完全相同，只有图标与点击后果不同，所以走这一个函数，
+/// 不各自复制「建热区 → interact → 悬停底色 → 画图标 → push Op」。
+/// 少写一遍就少一处可能漏掉悬停反馈或提示的地方。
+fn icon_button(
+    f: &mut Frame<'_>,
+    id: &'static str,
+    icon: Icon,
+    tip: &'static str,
+    slot_x: f32,
+    slot_w: f32,
+    size: f32,
+    center_y: f32,
+    danger: bool,
+    on_click: impl FnOnce(&mut Frame<'_>),
+) {
     let pal = f.pal;
     let scale = f.scale;
-    let half = r.width() / 2.0;
+    // 在槽位内水平居中。
+    let r = Rect::from_center_size(pos2(slot_x + slot_w * 0.5, center_y), vec2(size, size));
 
-    // 清空
-    let clear = Rect::from_min_size(r.min, vec2(half, r.height()));
     // 自报热区给测试用（见 `UiState::hit` 的说明）。
-    f.state.hit.insert("topbar_clear", clear);
-    let rc = f
-        .ui
-        .interact(clear, egui::Id::new("topbar_clear"), Sense::click());
-    if rc.hovered() {
-        f.ui.painter_at(clear).rect_filled(clear, pal.radius_sm, pal.row_hover);
+    f.state.hit.insert(id, r);
+    let resp = f.ui.interact(r, egui::Id::new(id), Sense::click());
+    if resp.hovered() {
+        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
     }
-    crate::icons::Icon::Trash.paint(
-        &f.ui.painter_at(clear),
-        Rect::from_center_size(
-            clear.center(),
-            vec2(pal.icon_size, pal.icon_size) * scale,
-        ),
-        // 破坏性操作用 danger 色，与「设置」在悬停时区分开。
-        if rc.hovered() { pal.danger } else { pal.text_dim },
+    icon.paint(
+        &f.ui.painter_at(r),
+        Rect::from_center_size(r.center(), vec2(pal.icon_size, pal.icon_size) * scale),
+        match (danger, resp.hovered()) {
+            (true, true) => pal.danger,
+            _ => pal.text_dim,
+        },
     );
-    // ⚠️ `on_hover_text` 按值消耗 `Response`，所以必须放在最后一次
-    // 使用 `rc` 之后；顺序反了会编译失败（E0382）。
-    if rc.clicked() {
-        f.state.push(Op::ClearAll);
+    if resp.clicked() {
+        on_click(f);
     }
-    rc.on_hover_text("清空全部历史");
-
-    // 设置
-    let set = Rect::from_min_size(
-        pos2(clear.max.x + pal.space_sm * 2.0, clear.min.y),
-        vec2(half, clear.height()),
-    );
-    f.state.hit.insert("topbar_settings", set);
-    let rs = f
-        .ui
-        .interact(set, egui::Id::new("topbar_settings"), Sense::click());
-    if rs.hovered() {
-        f.ui.painter_at(set).rect_filled(set, pal.radius_sm, pal.row_hover);
-    }
-    crate::icons::Icon::Settings.paint(
-        &f.ui.painter_at(set),
-        Rect::from_center_size(
-            set.center(),
-            vec2(pal.icon_size, pal.icon_size) * scale,
-        ),
-        if rs.hovered() { pal.text_bright } else { pal.text_dim },
-    );
-    if rs.clicked() {
-        f.state.push(Op::ToggleSettings);
-    }
-    // 同样：`on_hover_text` 消耗 `Response`，放最后。
-    rs.on_hover_text("设置");
+    // ⚠️ `on_hover_text` 按值消耗 `Response`，必须放在最后一次使用之后；
+    // 顺序反了会编译失败（E0382）。
+    resp.on_hover_text(tip);
 }
 
 fn draw_search(f: &mut Frame<'_>, r: Rect) {
@@ -651,7 +706,7 @@ fn draw_setting_row(f: &mut Frame<'_>, r: Rect, label: &str, desc: &str) -> Rect
     );
     if two_line {
         let d = Rect::from_min_size(pos2(text_area.min.x, lab.max.y), vec2(text_area.width(), r.height() - lh));
-        let shown = crate::titlebar::elide_text(f.ui, desc, &dfont, d.width());
+        let shown = crate::text::elide_text(f.ui, desc, &dfont, d.width());
         if !shown.is_empty() {
             f.ui.painter_at(d).text(d.left_center(), Align2::LEFT_CENTER, shown, dfont, pal.text_dim);
         }
@@ -879,7 +934,7 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
             }
             let la = Rect::from_min_max(pos2(dot.max.x + pal.space_sm, rr.min.y), pos2(rr.max.x - pal.space_xs, rr.max.y));
             let txt = format!("{label}    {desc}");
-            let shown = crate::titlebar::elide_text(f.ui, &txt, &sized(pal.font_sm, scale), la.width());
+            let shown = crate::text::elide_text(f.ui, &txt, &sized(pal.font_sm, scale), la.width());
             painter.text(la.left_center(), Align2::LEFT_CENTER, shown, sized(pal.font_sm, scale), if active { pal.text_bright } else { pal.text });
             if resp.clicked() {
                 f.state.push(Op::SetPinnedMode(mode));
@@ -1511,7 +1566,7 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     } else {
         item.preview.as_str()
     };
-    let shown = crate::titlebar::elide_text(f.ui, preview, &font, text_area.width());
+    let shown = crate::text::elide_text(f.ui, preview, &font, text_area.width());
     f.ui.painter_at(text_area).text(
         pos2(text_area.min.x, text_area.min.y + font.size),
         Align2::LEFT_TOP,
@@ -1530,7 +1585,7 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
         let meta_font = sized(pal.font_xs, scale);
         let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
         let meta_shown =
-            crate::titlebar::elide_text(f.ui, &meta, &meta_font, meta_area.width());
+            crate::text::elide_text(f.ui, &meta, &meta_font, meta_area.width());
         f.ui.painter_at(meta_area).text(
             meta_area.left_center(),
             Align2::LEFT_CENTER,
@@ -1558,7 +1613,7 @@ fn draw_rail_body(f: &mut Frame<'_>, body: Rect) {
             break;
         }
         let txt = format!("{} · {}", items[i].source_app, items[i].preview);
-        let shown = crate::titlebar::elide_text(f.ui, &txt, &font, r.width());
+        let shown = crate::text::elide_text(f.ui, &txt, &font, r.width());
         f.ui.painter_at(r).text(
             r.left_center(),
             Align2::LEFT_CENTER,
@@ -1693,7 +1748,7 @@ fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
 
     // 来源 · 时间
     let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
-    let meta_shown = crate::titlebar::elide_text(f.ui, &meta, &meta_font, meta_band.width());
+    let meta_shown = crate::text::elide_text(f.ui, &meta, &meta_font, meta_band.width());
     if !meta_shown.is_empty() {
         // ⚠️ painter_at(meta_band)：来源名可能很长（长 exe 路径），
         // 根 painter 会让它横跨到相邻卡片上。
@@ -1922,7 +1977,7 @@ mod tests {
             // 会让它在后面无法可变借用。
             let sol = crate::solver::solve(&self.ws, self.area);
             crate::solver::apply(&mut self.ws, &sol);
-            let (mut svc, ws, state, pal, area) =
+            let (svc, ws, state, pal, area) =
                 (&mut self.svc, &self.ws, &mut self.state, &self.pal, self.area);
             let ws = &*ws;
             let mut out = self.ctx.run_ui(input, |ui| {
@@ -1969,52 +2024,6 @@ mod tests {
         }
     }
 
-    /// 顶栏右侧两个图标按钮的位置（逻辑点）。
-    ///
-    /// ⚠️ 这些坐标必须与 `draw_topbar` 的算法**逐字一致**。
-    ///
-    /// 早前这里按「顶栏高度 × 0.7、间距 8」自己估，结果所有点击测试
-    /// 全失败（`ops` 为空）——估的坐标落在了按钮外。
-    /// 布局公式改了而这里没改，测试会**静默失效**（不报错、也不测
-    /// 任何东西），比没有测试更糟。
-    ///
-    /// 所以下面直接复刻 `draw_topbar` 的算式：
-    /// `btn = bar.height() * 0.62`，`btn_area` 从 `inner.max.x` 往左
-    /// 占 `btn*2 + space_sm`，两按钮各占一半。
-    fn topbar_icon_rects(bar: Rect, space_md: f32, space_sm: f32) -> (Rect, Rect) {
-        let inner = bar.shrink2(vec2(space_md, 0.0));
-        let btn = bar.height() * 0.62;
-        let area = Rect::from_min_size(
-            pos2(
-                inner.max.x - btn * 2.0 - space_sm * 2.0,
-                bar.center().y - btn * 0.5,
-            ),
-            vec2(btn * 2.0 + space_sm, btn),
-        );
-        let half = area.width() / 2.0;
-        (
-            Rect::from_min_size(area.min, vec2(half, area.height())), // 清空
-            Rect::from_min_size(
-                pos2(area.min.x + half, area.min.y),
-                vec2(half, area.height()),
-            ), // 设置
-        )
-    }
-
-    /// 顶栏矩形（客户区顶部的横条）。
-    ///
-    /// ⚠️ `topbar_icon_rects` 的参数必须是**顶栏**而非整个客户区。
-    /// 实测传客户区时算出的按钮矩形是 `[328,76]-[580,324]`
-    /// （横跨整个窗口），所有点击都落在按钮外，测试全失败而
-    /// 不报任何错——比没有测试更糟。
-    fn topbar_rect(h: &Harness) -> Rect {
-        // 高度取 `solver::TOPBAR_HEIGHT`——`draw` 就是用它切顶栏的，
-        // 这里必须用同一个来源，否则算出的按钮位置会偏。
-        Rect::from_min_size(
-            h.area.min,
-            egui::vec2(h.area.width(), crate::solver::TOPBAR_HEIGHT),
-        )
-    }
 
     /// 读回某个热区的矩形（逻辑点）。
     ///
@@ -2223,8 +2232,6 @@ mod tests {
         );
     }
 
-    /// 点已展开卡片的「拖出」把手 ⇒ 产生 `Detach`。
-    #[test]
     /// 点卡片头部的「折叠」按钮 ⇒ 产生 `ToggleCollapse`。
     ///
     /// # 为什么必须用热区而不是猜坐标
@@ -2417,7 +2424,17 @@ mod tests {
         );
 
         // 逐个控件验证：中心点必须**不**落在任何一段拖动区内。
-        for name in ["topbar_clear", "topbar_settings", "search"] {
+        //
+        // ⚠️ 名单必须**逐个列出**，不要用「遍历 hit表」的写法：
+        // 遍历只能验证「已存在的控件」，新加的按钮若忘了登记热区就会
+        // 静默漏测——而那正是「按钮存在却点不动」的成因。
+        for name in [
+            "topbar_close",
+            "topbar_minimize",
+            "topbar_clear",
+            "topbar_settings",
+            "search",
+        ] {
             let r = hit(&h, name);
             let c = r.center();
             let inside = drag.iter().any(|d| d.contains(c));
@@ -2427,6 +2444,81 @@ mod tests {
                  实机上点它不会产生 WM_LBUTTONDOWN，表现为「点不动」"
             );
         }
+    }
+
+    /// 点关闭按钮必须产生 `Op::CloseWindow`。
+    ///
+    /// 守着一条真实缺陷：`Op` 枚举里曾**没有**关闭/最小化变体，
+    /// 顶栏也只有清空与设置两枚按钮，于是 `App::take_close_requested`
+    /// 读的那个标志永远是 false——标题栏的关闭与最小化按钮
+    /// 根本不存在，点了没反应。
+    #[test]
+    fn clicking_close_button_emits_close_window() {
+        let mut h = Harness::new("close-btn", vec2(700.0, 500.0));
+        h.frame();
+        let p = hit(&h, "topbar_close").center();
+        let ops = h.click_at(p);
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::CloseWindow)),
+            "点关闭按钮应产生 CloseWindow，实际={ops:?}"
+        );
+    }
+
+    /// 点最小化按钮必须产生 `Op::MinimizeWindow`。语义同上一条。
+    #[test]
+    fn clicking_minimize_button_emits_minimize_window() {
+        let mut h = Harness::new("min-btn", vec2(700.0, 500.0));
+        h.frame();
+        let p = hit(&h, "topbar_minimize").center();
+        let ops = h.click_at(p);
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::MinimizeWindow)),
+            "点最小化按钮应产生 MinimizeWindow，实际={ops:?}"
+        );
+    }
+
+    /// 四枚按钮互不重叠，且都排在搜索框右侧。
+    ///
+    /// 顶栏按钮区是「先算按钮、再算搜索框」算出来的；一旦顺序颠倒，
+    /// 搜索框会铺到右缘把按钮压在下面——此时热区仍存在、点击仍能
+    /// 产生 Op，但**按钮被盖住**看不见。这条守住排版前提。
+    #[test]
+    fn topbar_buttons_do_not_overlap_each_other_or_search() {
+        let mut h = Harness::new("btn-layout", vec2(700.0, 500.0));
+        h.frame();
+
+        let names = [
+            "topbar_close",
+            "topbar_minimize",
+            "topbar_clear",
+            "topbar_settings",
+        ];
+        let rects: Vec<(&str, Rect)> = names.iter().map(|n| (*n, hit(&h, n))).collect();
+
+        for (i, (name, r)) in rects.iter().enumerate() {
+            assert!(
+                r.width() > 0.0 && r.height() > 0.0,
+                "{name} 的热区退化成了 {r:?}"
+            );
+            for (other_name, other) in rects.iter().skip(i + 1) {
+                assert!(
+                    !r.intersects(*other),
+                    "{name} {r:?} 与 {other_name} {other:?} 重叠"
+                );
+            }
+        }
+
+        let search = hit(&h, "search");
+        let rightmost = rects
+            .iter()
+            .map(|(_, r)| r.max.x)
+            .fold(f32::MIN, f32::max);
+        assert!(
+            search.max.x <= rightmost + 0.5,
+            "搜索框右缘 {} 越过最右按钮 {}，按钮会被盖住",
+            search.max.x,
+            rightmost
+        );
     }
 
     /// 拖动区本身必须真的能拖：空白处要判成 Caption。
@@ -2513,7 +2605,7 @@ mod tests {
         // ⚠️ `run_ui` 返回 `FullOutput`（不是闭包的返回值），
         // 所以要通过外部变量把结果取出来。
         let mut h = 0.0_f32;
-        let mut mk = |text: &str, h: &mut f32| {
+        let mk = |text: &str, h: &mut f32| {
             let item = modular_clipboard_core::ClipItem::new(
                 modular_clipboard_core::ClipKind::Text,
                 "h".into(),
