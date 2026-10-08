@@ -411,8 +411,29 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
 
 /// 顶栏右侧的四枚图标按钮：关闭 / 最小化 / 清空 / 设置。
 ///
-/// **必须用图标字体**（PUA 码位 `U+E000..=U+E011`）而不是 Unicode
-/// 字形：后者在当前字体链里缺字形，会渲染成方框（本项目已踩过一次）。
+/// # 为什么改用 egui 的 `Button` 而不再手写 `interact`
+///
+/// 手写版只调 `ui.interact` + `painter`，控件在 egui 的命中体系里
+/// 是「外人」：焦点环、键盘响应、命中排序都要自己照顾。历史上
+/// 「按钮画了但点不动」的根因正是命中判定被拖动区抢走——
+///
+/// ```text
+/// WM_NCHITTEST 命中拖动区 ⇒ 返回 HTCAPTION
+///                ⇒ 系统发 WM_NCLBUTTONDOWN（非客户区消息）
+///                ⇒ **不产生 WM_LBUTTONDOWN**
+///                ⇒ egui 收不到点击
+/// ```
+///
+/// 改用 `Button` 后控件走 egui 自己的登记与排序，配合 `draw_topbar`
+/// 里的「拖动区挖空」把控件矩形从 `HTCAPTION` 范围里剔除，
+/// 两者共同保证可点。
+///
+/// # 图标仍然自绘
+///
+/// `Button` 的**文本**走普通字体链，而图标在 PUA 码位
+/// （`U+E000..=U+E011`），那条字体链里没有字形，会渲染成方框（tofu）。
+/// 所以 `Button` 只负责命中与悬停底色，图标用 [`Icon::paint`] 叠在
+/// 它自己的矩形上。
 fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
     let step = r.width() / 4.0;
     let sq = step * 0.62;
@@ -421,82 +442,73 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
     //
     // ⚠️ 关闭与最小化是仅有的两枚「窗口级」按钮，点击后果是隐藏或
     // 最小化整个窗口；把它们放在最左，与卡片内的操作在视觉上分开。
-    icon_button(
-        f,
-        "topbar_close",
-        Icon::Close,
-        "关闭到托盘",
-        r.min.x,
-        step,
-        sq,
-        center_y,
-        false,
-        |f| f.state.push(Op::CloseWindow),
-    );
-    icon_button(
-        f,
-        "topbar_minimize",
-        Icon::Minimize,
-        "最小化",
-        r.min.x + step,
-        step,
-        sq,
-        center_y,
-        false,
-        |f| f.state.push(Op::MinimizeWindow),
-    );
+    let slot = |i: f32| Rect::from_center_size(pos2(r.min.x + step * (i + 0.5), center_y), vec2(sq, sq));
+    let r_close = slot(0.0);
+    let r_min = slot(1.0);
+    let r_clear = slot(2.0);
+    let r_set = slot(3.0);
+
+    // 登记热区给测试用（见 `UiState::hit` 的说明）。**必须在点击判定
+    // 之前登记**：`draw_topbar` 随后要读这张表来挖拖动区。
+    f.state.hit.insert("topbar_close", r_close);
+    f.state.hit.insert("topbar_minimize", r_min);
+    f.state.hit.insert("topbar_clear", r_clear);
+    f.state.hit.insert("topbar_settings", r_set);
+
+    if icon_button(f, "topbar_close", r_close, Icon::Close, "关闭到托盘", false) {
+        f.state.push(Op::CloseWindow);
+    }
+    if icon_button(f, "topbar_minimize", r_min, Icon::Minimize, "最小化", false) {
+        f.state.push(Op::MinimizeWindow);
+    }
     // 破坏性操作（清空）用 danger 色，与「设置」区分开。
-    icon_button(
-        f,
-        "topbar_clear",
-        Icon::Trash,
-        "清空全部历史",
-        r.min.x + step * 2.0,
-        step,
-        sq,
-        center_y,
-        true,
-        |f| f.state.push(Op::ClearAll),
-    );
-    icon_button(
-        f,
-        "topbar_settings",
-        Icon::Settings,
-        "设置",
-        r.min.x + step * 3.0,
-        step,
-        sq,
-        center_y,
-        false,
-        |f| f.state.push(Op::ToggleSettings),
-    );
+    if icon_button(f, "topbar_clear", r_clear, Icon::Trash, "清空全部历史", true) {
+        f.state.push(Op::ClearAll);
+    }
+    if icon_button(f, "topbar_settings", r_set, Icon::Settings, "设置", false) {
+        f.state.push(Op::ToggleSettings);
+    }
 }
 
-/// 顶栏的一枚方形图标按钮：在宽 `slot_w` 的槽位内居中画一个见方热区。
+/// 一枚方形图标按钮；返回是否被点击。
 ///
-/// 四枚按钮形状完全相同，只有图标与点击后果不同，所以走这一个函数，
-/// 不各自复制「建热区 → interact → 悬停底色 → 画图标 → push Op」。
-/// 少写一遍就少一处可能漏掉悬停反馈或提示的地方。
+/// 走 egui `Button` 拿命中与悬停，图标自己叠画（理由见
+/// [`draw_topbar_icons`]）。
+///
+/// # 为什么必须开子 `Ui` 而不能直接 `add_sized`
+///
+/// `add_sized` 只给**尺寸**，位置由父 `Ui` 的布局游标决定——四枚按钮
+/// 会并排排在顶栏左缘，而不是我们算好的槽位。于是 `Response.rect`
+/// 与登记进 `hit` 表的矩形不一致：测试按热区点击打不中，
+/// 拖动区挖空也挖错位置（表现为「点按钮 = 拖窗口」）。
+///
+/// `UiBuilder::max_rect` 才是绝对定位：子 `Ui` 的原点就是该矩形，
+/// 里面的 `Button` 落在矩形左上角，尺寸相同 ⇒ 两者完全重合。
 fn icon_button(
     f: &mut Frame<'_>,
     id: &'static str,
+    r: Rect,
     icon: Icon,
     tip: &'static str,
-    slot_x: f32,
-    slot_w: f32,
-    size: f32,
-    center_y: f32,
     danger: bool,
-    on_click: impl FnOnce(&mut Frame<'_>),
-) {
+) -> bool {
     let pal = f.pal;
     let scale = f.scale;
-    // 在槽位内水平居中。
-    let r = Rect::from_center_size(pos2(slot_x + slot_w * 0.5, center_y), vec2(size, size));
-
-    // 自报热区给测试用（见 `UiState::hit` 的说明）。
-    f.state.hit.insert(id, r);
-    let resp = f.ui.interact(r, egui::Id::new(id), Sense::click());
+    // `Button` 的文本留空：真正的内容是下面自绘的图标。
+    // `frame(false)` 去掉它自带的边框，只保留命中与悬停。
+    //
+    // ⚠️ `Button::frame` 收的是 **bool**（是否画框），而
+    // `TextEdit::frame` 收的是 `egui::Frame` 枚举。两者同名不同签名，
+    // 写反了会报 E0308。
+    let resp = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new(id))
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
+    );
+    let resp = resp.inner;
+    // 悬停底色叠在热区矩形上（`painter_at` 把裁剪限制在顶栏内）。
     if resp.hovered() {
         f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
     }
@@ -508,13 +520,13 @@ fn icon_button(
             _ => pal.text_dim,
         },
     );
-    if resp.clicked() {
-        on_click(f);
-    }
-    // ⚠️ `on_hover_text` 按值消耗 `Response`，必须放在最后一次使用之后；
-    // 顺序反了会编译失败（E0382）。
+    // ⚠️ 顺序硬性：`on_hover_text` 按**值**消耗 `Response`，所以
+    // `clicked()` 必须在它之前取。把两者写反会 E0382（值已移动）。
+    let clicked = resp.clicked();
     resp.on_hover_text(tip);
+    clicked
 }
+
 
 fn draw_search(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
