@@ -157,8 +157,8 @@ pub struct UiState {
     pub scroll_offset: f32,
     /// 设置界面是否打开。
     pub show_settings: bool,
-    /// 设置面板的滚动偏移（逻辑点）。
-    pub settings_scroll: f32,
+    // 注：原先这里有 `settings_scroll`（手写滚动偏移）。设置面板
+    // 改用 `ScrollArea` 后由 egui 自己管理滚动位置，该字段整体删除。
 
     // ---- 交互热区（供自动化测试定位）----
     //
@@ -641,104 +641,6 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
-/// 画一个「标签 + 描述 + 开关」的行。返回是否被切换。
-///
-/// # 为什么要自己画而不用 `egui::Checkbox`
-///
-/// 项目视觉语言是「**纯平毛玻璃**」：禁止一切装饰性拟物效果
-/// （渐变、光泽、内发光）。`egui::Checkbox` 自带的勾选框是
-/// 带立体感的控件，与整体观感不符。这里用 egui 的
-/// `Rect::show` 语义手画：纯色填充 + 描边，无渐变。
-///
-/// ⚠️ `id_suffix` 必须由调用方给**稳定且唯一**的字符串（通常是配置
-/// 字段名）：`Pos2` 不能作 `egui::Id`（不满足 `Hash`），而用矩形坐标
-/// 当 id 会因窗口 resize 变化，导致同一开关在不同帧拿到不同 id、
-/// 交互状态（hover/active）被反复丢弃。
-fn draw_switch(f: &mut Frame<'_>, r: Rect, on: bool, id_suffix: &str) -> bool {
-    let pal = f.pal;
-    let rr = f
-        .ui
-        .interact(r, egui::Id::new(("switch", id_suffix)), Sense::click());
-
-    // 开关本体：宽=高的两倍。
-    let h = (r.height() * 0.62).min(18.0);
-    let w = h * 1.8;
-    let knob_r = h * 0.5 - 2.0;
-    let track = Rect::from_center_size(
-        pos2(r.max.x - w * 0.5, r.center().y),
-        vec2(w, h),
-    );
-    let p = f.ui.painter_at(r);
-    if on {
-        p.rect_filled(track, h * 0.5, pal.accent);
-    } else {
-        p.rect_filled(track, h * 0.5, pal.surface_variant);
-        p.rect_stroke(
-            track,
-            h * 0.5,
-            Stroke::new(1.0, pal.border),
-            egui::StrokeKind::Inside,
-        );
-    }
-    // 滑块：开时靠右、关时靠左。
-    let knob_x = if on {
-        track.max.x - h * 0.5
-    } else {
-        track.min.x + h * 0.5
-    };
-    let knob = Rect::from_center_size(pos2(knob_x, track.center().y), vec2(knob_r * 2.0, knob_r * 2.0));
-    let knob_color = if on { pal.text_bright } else { pal.text_dim };
-    p.circle_filled(knob.center(), knob_r, knob_color);
-
-    rr.clicked()
-}
-
-/// 画一行「标签 + 说明」，右侧留出控件区。
-///
-/// 返回控件应占的矩形，供调用方放开关/输入框。
-fn draw_setting_row(f: &mut Frame<'_>, r: Rect, label: &str, desc: &str) -> Rect {
-    let pal = f.pal;
-    let font = sized(pal.font_sm, f.scale);
-    let dfont = sized(pal.font_xs, f.scale);
-
-    // 右侧预留控件宽度，标签只在左侧区域排布。
-    let ctrl_w = ((56.0 * f.scale).max(38.0)).min(r.width() * 0.4);
-    let text_area = Rect::from_min_max(r.min, pos2(r.max.x - ctrl_w - pal.space_sm, r.max.y));
-
-    // 标签与说明上下排布（说明可能很长，单行会溢出）。
-    let two_line = !desc.is_empty();
-    let lh = if two_line { r.height() * 0.5 } else { r.height() };
-    let lab = Rect::from_min_size(text_area.min, vec2(text_area.width(), lh));
-    f.ui.painter_at(lab).text(
-        lab.left_center(),
-        Align2::LEFT_CENTER,
-        label,
-        font,
-        pal.text,
-    );
-    if two_line {
-        let d = Rect::from_min_size(pos2(text_area.min.x, lab.max.y), vec2(text_area.width(), r.height() - lh));
-        let shown = crate::text::elide_text(f.ui, desc, &dfont, d.width());
-        if !shown.is_empty() {
-            f.ui.painter_at(d).text(d.left_center(), Align2::LEFT_CENTER, shown, dfont, pal.text_dim);
-        }
-    }
-    Rect::from_center_size(
-        pos2(r.max.x - ctrl_w * 0.5, r.center().y),
-        vec2(ctrl_w, r.height()),
-    )
-}
-
-/// 数值项的调节粒度。
-enum CaptureSlider {
-    /// 监听间隔，步长 50ms。
-    Ms,
-    /// 条数上限，步长 1000。
-    Items,
-    /// 去重窗口，步长 5 秒。
-    Secs,
-}
-
 /// 画放大镜图标（圆环 + 手柄），几何绘制而非字体字形。
 ///
 /// # 为什么不用 `Icon::Search` 字形
@@ -791,20 +693,42 @@ fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
 
 /// 设置界面（覆盖层）。
 ///
-/// 「置顶模式」的切换入口现在住在这里，不在顶栏——
-/// 顶栏只保留搜索与两个图标按钮，视觉噪声更低。
+/// # 重写要点
+///
+/// 旧实现把每一行都算成绝对矩形：手写遮罩、手绘开关、���写滚动条、
+/// 宏驱动的分组标题。约 300 行里大部分是「算矩形 + 画」，
+/// 而交互全靠 `ui.interact` 自己维护。
+///
+/// 现在整段跑在 egui 的布局系统里：
+/// - `ui.horizontal` 负责「标签在左、控件在右」，不再手算 `ctrl_w`；
+/// - `Checkbox` / `DragValue` / `selectable_label` 是真控件，
+///   自带命中、焦点、键盘调整；
+/// - `ScrollArea` 负责滚动与裁剪，`settings_scroll` 这个手写偏移量
+///   随之删除。
+///
+/// # 为什么开关仍是自绘
+///
+/// 项目视觉语言是「纯平毛玻璃」，明令禁止拟物装饰。`Checkbox`
+/// 自带的勾选框带立体感，与整体观感不符，所以保留 [`draw_switch`]
+/// 的自绘外观——但它现在只管**画**，命中交给 egui 的 `interact`
+/// （由 `add` 系列控件提供），不再自己算热区。
+///
+/// 「置顶模式」的切换入口在这里，不在顶栏——顶栏只保留搜索与图标
+/// 按钮，视觉噪声更低。
 fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     let pal = f.pal;
-    let scale = f.scale;
+    // `scale` 不再需要：面板尺寸改由 `area`（逻辑点）直接算，
+    // 而内容区的字号交给 egui 的 `RichText::size` 走样式系统。
+    let _ = f.scale;
 
     // ⚠️ **首帧的 `area` 可能荒谬**（实测 6666x6666）。
     //
-    // `ui.max_rect()` 取的是子`Ui` 的可用矩形，而首帧 `screen_rect`
+    // `ui.max_rect()` 取的是子 `Ui` 的可用矩形，而首帧 `screen_rect`
     // 尚未由 `egui_input` 正确设置（`RawInput.screen_rect` 是默认值）。
     // 此时按 `area` 居中的面板会被算到屏幕外，**看起来像设置界面没打开**。
     //
     // 这里显式拒绝明显不合理的尺寸：不画任何东西，等下一帧。
-    // 判断用「超过客户区常见上限」而非绝对值——不同 DPI 下客户区大小差异很大。
+    // 判断用「超过客户区常见上限」而非绝对值——不同 DPI 下差异很大。
     let reasonable = area.width() <= 4000.0 && area.height() <= 4000.0;
     if !reasonable {
         tracing::debug!(area = ?area, "客户区尺寸异常，本帧跳过设置界面");
@@ -812,7 +736,12 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     }
 
     // 遮罩：盖住下面的卡片，点击遮罩关闭。
-    let resp = f.ui.interact(area, egui::Id::new("settings_scrim"), Sense::click());
+    //
+    // ⚠️ 遮罩必须**先**画再开面板子 Ui：它要盖住卡片，而面板画在
+    // 遮罩之上。顺序反了面板会被遮罩盖住。
+    let resp = f
+        .ui
+        .interact(area, egui::Id::new("settings_scrim"), Sense::click());
     f.ui
         .painter()
         .rect_filled(area, 0.0, pal.overlay_scrim);
@@ -822,11 +751,8 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     }
 
     // 面板：居中，宽度按逻辑点定，不随窗口无限拉伸。
-    // 面板尺寸：宽度留足（标签 + 说明 + 开关要同排），
-    // 高度取可用区的 85%——设置项会随版本增加，
-    // 给固定高度不如「尽量高 + 内容滚动」。
     //
-    // ⚠️ 两处 `max(200.0, ...)` 是为了在**极小窗口**下不出现负宽度：
+    // ⚠️ 两处 `max(...)` 是为了在**极小窗口**下不出现负宽度：
     // 客户区可能只有 60pt（窗口被拉到极窄），`area.width() - 40` 会为负。
     // ⚠️ 这里**不能乘 `scale`**。
     //
@@ -834,128 +760,143 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     // 实测 1.5x 屏上客户区 420x560 物理像素，`area` 报 280x373。
     //
     // 早前写 `420.0 * scale` 得到 630「逻辑点」——比整个客户区还宽，
-    // 虽然被 `.min(area.width()-40)` 兜住不至于溢出，但那只是
-    // 恰好被夹住，语义是错的：一旦窗口够宽，面板就会宽到不合理。
-    //
-    // 同理高度直接用 `area.height()` 的比例。
+    // 虽然被 `.min(area.width()-40)` 兜住不至于溢出，但那只是恰好被夹住，
+    // 语义是错的：一旦窗口够宽，面板就会宽到不合理。
     let w = 420.0_f32.min(area.width() - 40.0).max(120.0);
     let h = (area.height() * 0.85).min(560.0).max(120.0);
     let panel = Rect::from_center_size(area.center(), vec2(w, h));
     draw_card_frame(f, panel);
 
     let pad = pal.space_md;
-    let mut y = panel.min.y + pad;
-
-    // 标题行 + 关闭按钮。
-    let title_font = sized(pal.font_md, scale);
-    let head = Rect::from_min_size(pos2(panel.min.x + pad, y), vec2(panel.width() - pad * 2.0, 24.0 * scale));
-    f.ui.painter_at(head).text(
-        head.left_center(),
-        Align2::LEFT_CENTER,
-        "设置",
-        title_font,
-        pal.text_bright,
-    );
-    let close = Rect::from_center_size(
-        pos2(head.max.x - 8.0 * scale, head.center().y),
-        vec2(16.0 * scale, 16.0 * scale),
-    );
-    let rc = f
-        .ui
-        .interact(close, egui::Id::new("settings_close"), Sense::click());
-    crate::icons::Icon::Close.paint(
-        &f.ui.painter_at(close),
-        Rect::from_center_size(close.center(), vec2(12.0, 12.0) * scale),
-        if rc.hovered() { pal.text_bright } else { pal.text_dim },
-    );
-    if rc.clicked() {
-        f.state.show_settings = false;
-    }
-    y = head.max.y + pal.space_sm;
-
-    // ---- 内容区（可滚动）----------------------------------------------
-    //
-    // ⚠️ 设置项会随版本增加，固定高度的面板迟早装不下。
-    // 这里用「内容高度 vs 可视高度」决定要不要滚动条，
-    // 并把滚动偏移夹在合法区间（不夹的话滚到底内容会整体上移）。
-    let view = Rect::from_min_max(pos2(panel.min.x + pad, y), pos2(panel.max.x - pad, panel.max.y - pad));
-    if view.height() <= 8.0 || view.width() <= 8.0 {
+    let view = panel.shrink2(vec2(pad, pad));
+    if view.width() <= 8.0 || view.height() <= 8.0 {
         return;
     }
-    // 先把内容画到一个**虚拟的**高矩形里，再按偏移取可见部分。
-    let mut content_y = view.min.y - f.state.settings_scroll;
-    let row_h = 34.0 * scale;
 
-    // ⚠️ `FontId` 在本版本**不是 `Copy`**，所以宏里每次现建而不能
-    // 闭包捕获外部的 `sec_font`（否则第二次展开就move 走了）。
-    macro_rules! section {
-        ($t:expr) => {{
-            let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), 18.0 * scale));
-            if r.max.y >= view.min.y && r.min.y <= view.max.y {
-                f.ui.painter_at(r).text(
-                    r.left_center(),
-                    Align2::LEFT_CENTER,
-                    $t,
-                    sized(pal.font_xs, scale),
-                    pal.text_dim,
-                );
-            }
-            content_y = r.max.y + pal.space_xs;
-        }};
-    }
+    // 在面板矩形里开子 Ui：下面所有控件都跑在 egui 的布局里，
+    // 由它负责换行、间距、滚动裁剪。
+    let mut ui = f.ui.new_child(
+        egui::UiBuilder::new()
+            .id(egui::Id::new("settings"))
+            .max_rect(view)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
 
-    // ⚠️ 不能写 `let cfg = &f.svc.state.config`：那是**不可变借用**整个 `f`，
-    // 之后调用 `draw_setting_row(f, ...)` 需要可变借用 → E0502。
+    settings_header(f, &mut ui);
+    ui.separator();
+
+    // 设置项会随版本增加，面板高度固定 ⇒ 必须能滚。
+    // `ScrollArea` 取代原先手写的 `settings_scroll` + 虚拟化 +
+    // 自绘滚动条（约 30 行）。
     //
-    // 所以把设置面板要读的字段**逐个复制成局部值**。
-    // 面板是一次性快照：用户点了开关后值下一帧才变，
-    // 这正是期望行为（不会出现「开关还没动、显示已翻转」）。
-    let ui_cfg = f.svc.state.config.ui.clone();
-    let cap_cfg = f.svc.state.config.capture.clone();
-    let sto_cfg = f.svc.state.config.storage.clone();
+    // ⚠️ 高度必须用「**剩余可用高度**」而不是估算常量。
+    // 早前写死 `view.height() - 28.0 * scale`，而标题行实际高度随
+    // 字号缩放变化，两者对不上：窗口越矮，误差越大，实测在 600x400
+    // 下开关被排到 y=444（**已在客户区之外**），设置项点不到。
+    // `ScrollArea` 会**扩展**到内容高度，所以这里必须显式封顶。
+    let head_h = ui.min_rect().height();
+    let body_max = (view.height() - head_h - ui.spacing().item_spacing.y).max(0.0);
+    egui::ScrollArea::vertical()
+        .id_salt("settings_scroll")
+        .auto_shrink([false, false])
+        .max_height(body_max)
+        .show(&mut ui, |ui| {
+            settings_body(f, ui);
+        });
+}
 
-    // ---- 界面 ---------------------------------------------------------
-    section!("置顶");
-    {
-        let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
-        content_y = r.max.y + pal.space_xs;
-        let cur = f.ws.pinned_mode();
-        let two: Vec<(PinnedMode, &str, &str)> = vec![
+/// 标题行 + 关闭按钮。
+fn settings_header(f: &mut Frame<'_>, ui: &mut Ui) {
+    let pal = f.pal;
+    let scale = f.scale;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("设置")
+                .size(pal.font_md * scale)
+                .color(pal.text_bright),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 自报热区供测试定位（见 `UiState::hit` 的说明）。
+            // 固定 16x16 的方形热区：用子 Ui 绝对定位（同顶栏做法），
+            // 不能用 allocate ——它会跟着布局游标走。
+            let r = Rect::from_min_size(
+                egui::pos2(ui.max_rect().max.x - 16.0 * scale, ui.max_rect().min.y),
+                egui::vec2(16.0, 16.0) * scale,
+            );
+            let btn = f.ui.scope_builder(
+                egui::UiBuilder::new()
+                    .id(egui::Id::new("settings_close"))
+                    .max_rect(r)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |u| u.add_sized(r.size(), egui::Button::new("").frame(false)),
+            );
+            let btn = btn.inner;
+            if btn.hovered() {
+                ui.painter_at(r).rect_filled(r, f.pal.radius_sm, f.pal.row_hover);
+            }
+            crate::icons::Icon::Close.paint(
+                &ui.painter_at(r),
+                egui::Rect::from_center_size(r.center(), egui::vec2(12.0, 12.0) * scale),
+                if btn.hovered() { f.pal.text_bright } else { f.pal.text_dim },
+            );
+            f.state.hit.insert("settings_close", r);
+            let clicked = btn.clicked();
+            btn.on_hover_text("关闭设置");
+            if clicked {
+                f.state.show_settings = false;
+            }
+        });
+    });
+}
+
+/// 设置项正文：置顶模式 + 开关组 + 数值组。
+///
+/// # 为什么逐项列出而不是遍历数据结构
+///
+/// 配置项会随版本增删（现在 20+ 项）。写死在这里换来的是
+/// 「新增一项只需改这一处 + `app.rs` 的字段处理器」，
+/// 而 `Op` 侧用「分组 + 字段名字符串」把新增成本降到两行。
+fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
+    let pal = f.pal;
+    let scale = f.scale;
+    let cur = f.ws.pinned_mode();
+
+    // ⚠️ 必须把配置值**逐个拷出来**，不能 `let cfg = &f.svc.state.config`
+    // 然后边遍历边调需要 `&mut Frame` 的函数。
+    //
+    // 那个借用会活到函数结束，于是后面每次 `draw_switch(f, ...)` /
+    // `number_row(f, ...)` 的可变借用都撞上它（E0502）。这类错误在
+    // 「先读配置、后统一处理」的写法里非常常见。
+    let (ui_cfg, cap_cfg, sto_cfg) = {
+        let c = &f.svc.state.config;
+        (c.ui.clone(), c.capture.clone(), c.storage.clone())
+    };
+
+    // ---- 置顶模式 -------------------------------------------------------
+    section(ui, "置顶");
+    ui.horizontal(|ui| {
+        for (mode, label, desc) in [
             (PinnedMode::SharedColumn, "共用单栏", "与历史列表在同一栏内"),
             (PinnedMode::OwnCard, "独立分栏", "单独一栏，可拖出成窗口"),
-        ];
-        // 横向排列两个选项。
-        let w = (r.width() - pal.space_xs) * 0.5;
-        for (i, (mode, label, desc)) in two.into_iter().enumerate() {
-            let rr = Rect::from_min_size(pos2(r.min.x + i as f32 * (w + pal.space_xs), r.min.y), vec2(w, r.height()));
-            let active = mode == cur;
-            let resp = f.ui.interact(rr, egui::Id::new(("pinned_mode", format!("{mode:?}"))), Sense::click());
-            let painter = f.ui.painter_at(rr);
-            if active {
-                painter.rect_filled(rr, pal.radius_sm, pal.accent.gamma_multiply(0.22));
-                painter.rect_stroke(rr, pal.radius_sm, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
-            } else if resp.hovered() {
-                painter.rect_filled(rr, pal.radius_sm, pal.row_hover);
-            }
-            let dot_r = 4.0 * scale;
-            let dot = Rect::from_center_size(pos2(rr.min.x + dot_r + pal.space_sm, rr.center().y), vec2(dot_r * 2.0, dot_r * 2.0));
-            if active {
-                painter.circle_filled(dot.center(), dot_r, pal.accent);
-            } else {
-                painter.circle_stroke(dot.center(), dot_r, Stroke::new(1.0, pal.border));
-            }
-            let la = Rect::from_min_max(pos2(dot.max.x + pal.space_sm, rr.min.y), pos2(rr.max.x - pal.space_xs, rr.max.y));
-            let txt = format!("{label}    {desc}");
-            let shown = crate::text::elide_text(f.ui, &txt, &sized(pal.font_sm, scale), la.width());
-            painter.text(la.left_center(), Align2::LEFT_CENTER, shown, sized(pal.font_sm, scale), if active { pal.text_bright } else { pal.text });
-            if resp.clicked() {
+        ] {
+            // `selectable_label` 自带选中态与键盘响应，替代原先
+            // 手绘的圆点 + 描边矩形。
+            if ui
+                .selectable_label(cur == mode, egui::RichText::new(label).size(pal.font_sm * scale))
+                .on_hover_text(desc)
+                .clicked()
+                && cur != mode
+            {
                 f.state.push(Op::SetPinnedMode(mode));
             }
         }
-    }
+    });
+    ui.add_space(4.0);
 
-    // ---- 开关组 --------------------------------------------------------
-    //每项：(分组, 字段, 标签, 说明, 当前值)
+    // ---- 开关组 ---------------------------------------------------------
+    //
+    // 每项：(分组, 字段, 标签, 说明, 当前值)
     let toggles: [(ConfigGroup, &'static str, &str, &str, bool); 7] = [
         (ConfigGroup::Ui, "always_on_top", "窗口置顶", "始终显示在其它窗口之上", ui_cfg.always_on_top),
         (ConfigGroup::Ui, "hide_on_focus_lost", "失焦时隐藏", "切换到别的程序后隐藏窗口", ui_cfg.hide_on_focus_lost),
@@ -966,158 +907,223 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
         (ConfigGroup::Capture, "dedup", "自动去重", "短时间内相同内容只留一条", cap_cfg.dedup),
     ];
 
-    let mut last_group = None;
+    let mut last_group: Option<ConfigGroup> = None;
     for (g, field, label, desc, on) in toggles {
         if last_group != Some(g) {
-            section!(g.title());
+            section(ui, g.title());
             last_group = Some(g);
         }
-        let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
-        content_y = r.max.y + pal.space_xs * 0.5;
-        if r.max.y < view.min.y || r.min.y > view.max.y {
-            continue;
-        }
-        let ctrl = draw_setting_row(f, r, label, desc);
-        if draw_switch(f, ctrl, on, field) {
-            f.state.push(Op::SetBool { group: g, field, value: !on });
+        let mut v = on;
+        if setting_row(ui, label, desc, |ui| draw_switch(f, ui, field, &mut v)) {
+            f.state.push(Op::SetBool { group: g, field, value: v });
         }
     }
 
-    // ---- 数值组 --------------------------------------------------------
-    section!("监听与存储");
-    {
-        let items: [(&str, &str, &str, String, CaptureSlider); 3] = [
-            (
-                "poll_interval_ms",
-                "监听间隔",
-                "越小越灵敏、越耗电",
-                format!("{} ms", cap_cfg.poll_interval_ms),
-                CaptureSlider::Ms,
-            ),
-            (
-                "max_items",
-                "历史条数上限",
-                "留空表示只按容量淘汰",
-                sto_cfg
-                    .max_items
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "不限".into()),
-                CaptureSlider::Items,
-            ),
-            (
-                "dedup_window_secs",
-                "去重窗口",
-                "该时长内的相同内容视为重复",
-                format!("{} 秒", cap_cfg.dedup_window_secs),
-                CaptureSlider::Secs,
-            ),
-        ];
-        for (field, label, desc, val, kind) in items {
-            let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
-            content_y = r.max.y + pal.space_xs * 0.5;
-            if r.max.y < view.min.y || r.min.y > view.max.y {
-                continue;
-            }
-            let ctrl = draw_setting_row(f, r, label, desc);
-            // 左半画当前值、右半画调节按钮。
-            let vw = ctrl.width() * 0.46;
-            let vb = Rect::from_min_max(ctrl.min, pos2(ctrl.min.x + vw, ctrl.max.y));
-            f.ui.painter_at(vb).text(
-                vb.center(),
-                Align2::CENTER_CENTER,
-                val,
-                sized(pal.font_xs, scale),
-                pal.text_dim,
-            );
-            // 「−」「+」两个按钮
-            let bw = (ctrl.height() * 0.9).min(20.0);
-            let plus = Rect::from_center_size(pos2(ctrl.max.x - bw * 0.5, ctrl.center().y), vec2(bw, bw));
-            let minus = Rect::from_center_size(pos2(plus.min.x - bw * 1.1, ctrl.center().y), vec2(bw, bw));
-            let delta = match kind {
-                CaptureSlider::Ms => 50.0,
-                CaptureSlider::Items => 1000.0,
-                CaptureSlider::Secs => 5.0,
-            };
-            for (rr, sign, cur) in [
-                (minus, -1.0f64, cap_cfg.dedup_window_secs as f64),
-                (plus, 1.0f64, cap_cfg.dedup_window_secs as f64),
-            ] {
-                let resp = f.ui.interact(rr, egui::Id::new(("num", field, sign > 0.0)), Sense::click());
-                let p = f.ui.painter_at(rr);
-                if resp.hovered() {
-                    p.rect_filled(rr, pal.radius_sm, pal.row_hover);
-                }
-                p.rect_stroke(rr, pal.radius_sm, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
-                p.text(rr.center(), Align2::CENTER_CENTER, if sign > 0.0 { "+" } else { "-" }, sized(pal.font_md, scale), pal.text);
-                if resp.clicked() {
-                    match kind {
-                        CaptureSlider::Ms => {
-                            let v = (cap_cfg.poll_interval_ms as f64 + sign * delta).clamp(50.0, 2000.0);
-                            f.state.push(Op::SetNumber { group: ConfigGroup::Capture, field, value: v });
-                        }
-                        CaptureSlider::Items => {
-                            // 0 = 不限（None）；递增到 0 时变回 Some
-                            let cur = sto_cfg.max_items;
-                            let next = match cur {
-                                None => Some(1000usize),
-                                Some(n) if n as f64 + sign * delta <= 0.0 => None,
-                                Some(n) => Some(((n as f64 + sign * delta).max(100.0)) as usize),
-                            };
-                            f.state.push(Op::SetOptNumber { group: ConfigGroup::Storage, field, value: next.map(|x| x as f64) });
-                        }
-                        CaptureSlider::Secs => {
-                            let v = (cur + sign * delta).max(0.0);
-                            f.state.push(Op::SetNumber { group: ConfigGroup::Capture, field, value: v });
-                        }
-                    }
-                }
-            }
-        }
+    // ---- 数值组 ---------------------------------------------------------
+    section(ui, "监听与存储");
+
+    // 监听间隔（ms）。下限 50：更小的值只会让 CPU 空转，
+    // 而剪贴板序列号不会更新得那么快。
+    number_row(
+        f, ui, "poll_interval_ms", "监听间隔", "越小越灵敏、越耗电",
+        cap_cfg.poll_interval_ms as f64, 50.0, 2000.0, 50.0, " ms",
+        ConfigGroup::Capture,
+    );
+    // 历史条数上限：`None` = 不限，所以默认显示一个代表值并在
+    // 「减到底」时变回 `None`（与旧实现语义一致）。
+    opt_number_row(
+        f, ui, "max_items", "历史条数上限", "留空表示只按容量淘汰",
+        sto_cfg.max_items, 1000.0, 100.0, " 条",
+    );
+    number_row(
+        f, ui, "dedup_window_secs", "去重窗口", "该时长内的相同内容视为重复",
+        cap_cfg.dedup_window_secs as f64, 0.0, 600.0, 5.0, " 秒",
+        ConfigGroup::Capture,
+    );
+
+    // ---- 存储分组 -------------------------------------------------------
+    section(ui, "存储");
+    let mut cleanup = sto_cfg.cleanup_on_start;
+    if setting_row(ui, "启动时清理临时文件", "删除上次退出遗留的临时文件", |ui| {
+        draw_switch(f, ui, "cleanup_on_start", &mut cleanup)
+    }) {
+        f.state.push(Op::SetBool {
+            group: ConfigGroup::Storage,
+            field: "cleanup_on_start",
+            value: cleanup,
+        });
     }
 
-    // ---- 存储分组开关（单独一个分组标题）------------------------------
-    section!("存储");
-    {
-        let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
-        let ctrl = draw_setting_row(f, r, "启动时清理临时文件", "删除上次退出遗留的临时文件");
-        let on = sto_cfg.cleanup_on_start;
-        if draw_switch(f, ctrl, on, "cleanup_on_start") {
-            f.state.push(Op::SetBool { group: ConfigGroup::Storage, field: "cleanup_on_start", value: !on });
-        }
-        content_y = r.max.y;
-    }
-
-    // ---- 滚动 --------------------------------------------------------
-    let content_h = content_y - (view.min.y - f.state.settings_scroll);
-    let max_scroll = (content_h - view.height()).max(0.0);
-    f.state.settings_scroll = f.state.settings_scroll.clamp(0.0, max_scroll);
-    if f.ui.rect_contains_pointer(view) {
-        let d = f.ui.input(|i| i.smooth_scroll_delta.y);
-        if d != 0.0 {
-            f.state.settings_scroll =
-                (f.state.settings_scroll - d * view.height() / 3.0).clamp(0.0, max_scroll);
-            f.ui.ctx().request_repaint();
-        }
-    }
-    // 滚动条
-    if max_scroll > 0.5 {
-        let track_w = 4.0;
-        let track = Rect::from_min_max(
-            pos2(view.max.x + 2.0, view.min.y),
-            pos2(view.max.x + 2.0 + track_w, view.max.y),
-        );
-        let p = f.ui.painter_at(track);
-        p.rect_filled(track, track_w * 0.5, pal.surface_variant);
-        let t = (f.state.settings_scroll / max_scroll).clamp(0.0, 1.0);
-        let h = (track.height() * (view.height() / content_h)).max(24.0).min(track.height());
-        let knob = Rect::from_min_size(
-            pos2(track.min.x, track.min.y + (track.height() - h) * t),
-            vec2(track_w, h),
-        );
-        p.rect_filled(knob, track_w * 0.5, pal.border);
-    }
-
+    let _ = pal;
 }
+
+/// 分组标题。
+fn section(ui: &mut Ui, title: &str) {
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(title)
+            .strong()
+            .size(12.0)
+            .color(ui.visuals().weak_text_color()),
+    );
+}
+
+/// 一行「标签 + 说明 + 右侧控件」。
+///
+/// `control` 闭包在右侧区域里放控件，返回 `true` 表示值被改动。
+/// 宽度分配交给 `ui.horizontal` + `with_layout(right_to_left)`，
+/// 不再手算 `ctrl_w`（旧实现那处 `min(r.width() * 0.4)` 的钳制
+/// 会在极窄面板里把标签挤没）。
+fn setting_row(ui: &mut Ui, label: &str, desc: &str, control: impl FnOnce(&mut Ui) -> bool) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(label);
+            if !desc.is_empty() {
+                ui.label(egui::RichText::new(desc).small().color(ui.visuals().weak_text_color()));
+            }
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            changed = control(ui);
+        });
+    });
+    changed
+}
+
+/// 开关：外观自绘（纯平毛玻璃），命中走 egui。
+///
+/// # 为什么要自己画而不用 `egui::Checkbox`
+///
+/// 项目视觉语言是「**纯平毛玻璃**」：禁止一切装饰性拟物效果
+/// （渐变、光泽、内发光）。`egui::Checkbox` 自带的勾选框是带立体感的
+/// 控件，与整体观感不符。这里保留自绘外观。
+///
+/// # `id_suffix` 必须稳定且唯一
+///
+/// `Pos2` 不能作 `egui::Id`（不满足 `Hash`），而用矩形坐标当 id
+/// 会因窗口 resize 变化，导致同一开关在不同帧拿到不同 id、
+/// 交互状态（hover/active）被反复丢弃。所以传配置**字段名**。
+fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut bool) -> bool {
+    let pal = f.pal;
+    let s = 18.0_f32;
+    // `allocate_exact_size` 返回 `(Rect, Response)` —— 不是单个 Response。
+    let (rect, _alloc) = ui.allocate_exact_size(egui::vec2(s * 1.8, s), Sense::click());
+    let resp = ui.interact(rect, egui::Id::new(("switch", id_suffix)), Sense::click());
+
+    // 开关本体：宽 = 高的 1.8 倍。
+    let h = s;
+    let w = h * 1.8;
+    let knob_r = h * 0.5 - 2.0;
+    let track = Rect::from_center_size(rect.center(), vec2(w, h));
+    let p = ui.painter_at(rect);
+    let on = *v;
+    if on {
+        p.rect_filled(track, h * 0.5, pal.accent);
+    } else {
+        p.rect_filled(track, h * 0.5, pal.surface_variant);
+        p.rect_stroke(
+            track,
+            h * 0.5,
+            Stroke::new(1.0, pal.border),
+            egui::StrokeKind::Inside,
+        );
+    }
+    // 滑块：开时靠右、关时靠左。
+    let knob_x = if on { track.max.x - h * 0.5 } else { track.min.x + h * 0.5 };
+    let knob = Rect::from_center_size(
+        pos2(knob_x, track.center().y),
+        vec2(knob_r * 2.0, knob_r * 2.0),
+    );
+    p.circle_filled(knob.center(), knob_r, if on { pal.text_bright } else { pal.text_dim });
+
+    if resp.clicked() {
+        *v = !*v;
+    }
+    // ⚠️ 热区 key 必须**带上字段名**。
+    //
+    // 早前所有开关都登记成同一个 `"settings_switch"`，而 `hit` 是
+    // `HashMap<&str, Rect>`——后写的覆盖先写的， map 里只剩**最后一个**
+    // 开关的矩形。于是自动化脚本按热区点击会「点 A 项却改了 B 项」，
+    // 而所有断言都通过（它们只读得到的那一个键）。
+    //
+    // 逐个登记还有一个好处：测试能逐项核对边界，而不是只看最后一个。
+    f.state.hit.insert(id_suffix, rect);
+    *v != on
+}
+
+/// 数值项：`DragValue`，改动时发 `Op::SetNumber`。
+#[allow(clippy::too_many_arguments)]
+fn number_row(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    field: &'static str,
+    label: &str,
+    desc: &str,
+    v: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    unit: &str,
+    group: ConfigGroup,
+) {
+    let mut val = v;
+    let changed = setting_row(ui, label, desc, |ui| {
+        ui.add(
+            egui::DragValue::new(&mut val)
+                .range(min..=max)
+                .speed(step)
+                .suffix(unit),
+        )
+        .changed()
+    });
+    let _ = field;
+    if changed {
+        f.state.push(Op::SetNumber { group, field, value: val });
+    }
+}
+
+/// 可清空的数值项（`None` = 不限）。
+///
+/// `DragValue` 本身表达不了「无限制」，所以映射为：
+/// 显示一个代表值（`min`），减到下界时变回 `None`——与旧实现
+/// 「0 = 不限」的语义一致。
+fn opt_number_row(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    field: &'static str,
+    label: &str,
+    desc: &str,
+    cur: Option<usize>,
+    default: f64,
+    step: f64,
+    unit: &str,
+) {
+    let mut val = cur.map(|n| n as f64).unwrap_or(default);
+    let changed = setting_row(ui, label, desc, |ui| {
+        ui.add(
+            egui::DragValue::new(&mut val)
+                .range(default..=1_000_000.0)
+                .speed(step)
+                .suffix(unit),
+        )
+        .changed()
+    });
+    if !changed {
+        return;
+    }
+    let next = if val <= default {
+        // 减到下界 ⇒ 恢复「不限」。
+        None
+    } else {
+        Some(val)
+    };
+    f.state.push(Op::SetOptNumber {
+        group: ConfigGroup::Storage,
+        field,
+        value: next,
+    });
+}
+
 
 /// 置顶卡片当前是否独立成窗。
 ///
@@ -2381,27 +2387,78 @@ mod tests {
         );
     }
 
-    /// 设置面板的滚动偏移必须夹在合法区间。
+    /// 设置面板必须真的被画出来，且内容在面板矩形内。
     ///
-    /// 不夹的话滚到底内容会整体上移（露出空白）。
+    /// # 这条替代了原来的 `settings_scroll_is_clamped`
+    ///
+    /// 旧实现手工维护 `settings_scroll`（手写偏移 + 手绘滚动条 +
+    /// 夹取），所以曾有一条测试专门守「偏移被夹回合法区间」。
+    /// 改用 `ScrollArea` 后那套状态**整体消失**——夹取由 egui 负责，
+    /// 不再有任何代码能把它写坏，测它等于测第三方库。
+    ///
+    /// 换成这条更有价值的断言：面板确实渲染了。设置界面打不开
+    /// （首帧 `area` 荒谬、面板被算出屏）是真实发生过的故障，
+    /// 而它不会让任何一条「偏移夹取」测试变红。
     #[test]
-    fn settings_scroll_is_clamped() {
-        let mut h = Harness::new("settings-scroll", vec2(600.0, 300.0));
+    fn settings_panel_renders_within_bounds() {
+        let mut h = Harness::new("settings-render", vec2(600.0, 400.0));
         h.state.show_settings = true;
-        // 人为给一个离谱的滚动值，跑几帧后应被夹回。
-        h.state.settings_scroll = 9999.0;
-        for _ in 0..3 {
-            h.frame();
-        }
+        h.frame();
+
+        // 至少要有一枚开关登记热区——那是开关真的被画出来的证据。
+        //
+        // ⚠️ 早前所有开关共用一个键（`"settings_switch"`），`hit` 是
+        // `HashMap` 会互相覆盖，map 里只剩最后一个，于是这条断言
+        // 永远只能看到一项。现在键是配置字段名，可以逐项核对。
+        let keys: Vec<&str> = h
+            .state
+            .hit
+            .keys()
+            .copied()
+            .filter(|k| {
+                matches!(
+                    *k,
+                    "always_on_top"
+                        | "hide_on_focus_lost"
+                        | "show_tray"
+                        | "start_minimized"
+                        | "enabled"
+                        | "skip_password_fields"
+                        | "dedup"
+                        | "cleanup_on_start"
+                )
+            })
+            .collect();
         assert!(
-            h.state.settings_scroll < 9999.0,
-            "滚动偏移应被夹到合法区间，实际 {}",
-            h.state.settings_scroll
+            !keys.is_empty(),
+            "设置面板应至少画出一枚开关，实际热区={:?}",
+            h.state.hit.keys().collect::<Vec<_>>()
         );
+
+        // 逐个登记 —— 共用键会静默覆盖，而任何断言都看不出来。
         assert!(
-            h.state.settings_scroll >= 0.0,
-            "滚动偏移不应为负，实际 {}",
-            h.state.settings_scroll
+            keys.len() >= 2,
+            "多枚开关应各自登记热区（否则 HashMap 互相覆盖），实际只有 {keys:?}"
+        );
+
+        // ⚠️ 这里**不能**断言「所有开关都在客户区内」。
+        //
+        // `ScrollArea` 里的控件按内容高度排布，超出可视区的那些矩形
+        // 本来就在客户区之外——它负责裁剪（用户滚一下才看得到）。
+        // 那是正确行为，不是缺陷。
+        //
+        // 真正要守的是：**至少第一枚开关可见**。若连它都跑到窗口外，
+        // 说明面板布局整体算错了（早前 `max_height` 写死估算值时
+        // 实测就是这样：600x400 下开关被排到 y=444，整排点不到）。
+        let first = keys
+            .iter()
+            .map(|k| h.state.hit[*k])
+            .min_by(|a, b| a.min.y.partial_cmp(&b.min.y).unwrap())
+            .expect("已断言非空");
+        assert!(
+            h.area.intersects(first),
+            "最靠上的开关 {first:?} 完全落在客户区 {:?} 之外，设置面板不可用",
+            h.area
         );
     }
 
