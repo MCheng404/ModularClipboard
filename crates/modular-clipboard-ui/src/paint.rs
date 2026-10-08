@@ -71,10 +71,60 @@ pub enum Op {
     Copy(modular_clipboard_core::EntryId),
     /// 置顶模式切换。
     SetPinnedMode(PinnedMode),
+
+    // ---- 设置界面 ----
+    //
+    // ⚠️ 配置项**不能**在 paint 里直接改：`Frame` 借的是 `&UiConfig`，
+    // 且改完还要落盘（`svc.save_config()`）。统一走 Op 由 `App` 落地。
+
+    /// 改一个布尔配置项。
+    SetBool {
+        /// 配置分组。
+        group: ConfigGroup,
+        /// 组内字段名（见 `set_bool_field`）。
+        field: &'static str,
+        /// 目标值。
+        value: bool,
+    },
+    /// 改一个数值配置项。
+    SetNumber {
+        group: ConfigGroup,
+        field: &'static str,
+        value: f64,
+    },
+    /// 改一个可选数值（`None` = 不限）。
+    SetOptNumber {
+        group: ConfigGroup,
+        field: &'static str,
+        /// `None` 表示「不限」。
+        value: Option<f64>,
+    },
     /// 打开/关闭设置界面。
     ToggleSettings,
     /// 清空全部历史。
     ClearAll,
+}
+
+/// 配置分组。
+///
+/// 设置界面的每个可调项都归到某一组；`App` 侧用
+/// [`ConfigGroup`] + 字段名定位到具体字段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigGroup {
+    Ui,
+    Capture,
+    Storage,
+}
+
+impl ConfigGroup {
+    /// 分组标题（设置界面里显示）。
+    pub fn title(self) -> &'static str {
+        match self {
+            ConfigGroup::Ui => "界面",
+            ConfigGroup::Capture => "捕获",
+            ConfigGroup::Storage => "存储",
+        }
+    }
 }
 
 /// 绘制上下文：跨帧保留的界面状态。
@@ -92,6 +142,8 @@ pub struct UiState {
     pub scroll_offset: f32,
     /// 设置界面是否打开。
     pub show_settings: bool,
+    /// 设置面板的滚动偏移（逻辑点）。
+    pub settings_scroll: f32,
     /// 关闭 / 最小化请求。
     pub close_requested: bool,
     pub minimize_requested: bool,
@@ -439,6 +491,104 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
+/// 画一个「标签 + 描述 + 开关」的行。返回是否被切换。
+///
+/// # 为什么要自己画而不用 `egui::Checkbox`
+///
+/// 项目视觉语言是「**纯平毛玻璃**」：禁止一切装饰性拟物效果
+/// （渐变、光泽、内发光）。`egui::Checkbox` 自带的勾选框是
+/// 带立体感的控件，与整体观感不符。这里用 egui 的
+/// `Rect::show` 语义手画：纯色填充 + 描边，无渐变。
+///
+/// ⚠️ `id_suffix` 必须由调用方给**稳定且唯一**的字符串（通常是配置
+/// 字段名）：`Pos2` 不能作 `egui::Id`（不满足 `Hash`），而用矩形坐标
+/// 当 id 会因窗口 resize 变化，导致同一开关在不同帧拿到不同 id、
+/// 交互状态（hover/active）被反复丢弃。
+fn draw_switch(f: &mut Frame<'_>, r: Rect, on: bool, id_suffix: &str) -> bool {
+    let pal = f.pal;
+    let rr = f
+        .ui
+        .interact(r, egui::Id::new(("switch", id_suffix)), Sense::click());
+
+    // 开关本体：宽=高的两倍。
+    let h = (r.height() * 0.62).min(18.0);
+    let w = h * 1.8;
+    let knob_r = h * 0.5 - 2.0;
+    let track = Rect::from_center_size(
+        pos2(r.max.x - w * 0.5, r.center().y),
+        vec2(w, h),
+    );
+    let p = f.ui.painter_at(r);
+    if on {
+        p.rect_filled(track, h * 0.5, pal.accent);
+    } else {
+        p.rect_filled(track, h * 0.5, pal.surface_variant);
+        p.rect_stroke(
+            track,
+            h * 0.5,
+            Stroke::new(1.0, pal.border),
+            egui::StrokeKind::Inside,
+        );
+    }
+    // 滑块：开时靠右、关时靠左。
+    let knob_x = if on {
+        track.max.x - h * 0.5
+    } else {
+        track.min.x + h * 0.5
+    };
+    let knob = Rect::from_center_size(pos2(knob_x, track.center().y), vec2(knob_r * 2.0, knob_r * 2.0));
+    let knob_color = if on { pal.text_bright } else { pal.text_dim };
+    p.circle_filled(knob.center(), knob_r, knob_color);
+
+    rr.clicked()
+}
+
+/// 画一行「标签 + 说明」，右侧留出控件区。
+///
+/// 返回控件应占的矩形，供调用方放开关/输入框。
+fn draw_setting_row(f: &mut Frame<'_>, r: Rect, label: &str, desc: &str) -> Rect {
+    let pal = f.pal;
+    let font = sized(pal.font_sm, f.scale);
+    let dfont = sized(pal.font_xs, f.scale);
+
+    // 右侧预留控件宽度，标签只在左侧区域排布。
+    let ctrl_w = ((56.0 * f.scale).max(38.0)).min(r.width() * 0.4);
+    let text_area = Rect::from_min_max(r.min, pos2(r.max.x - ctrl_w - pal.space_sm, r.max.y));
+
+    // 标签与说明上下排布（说明可能很长，单行会溢出）。
+    let two_line = !desc.is_empty();
+    let lh = if two_line { r.height() * 0.5 } else { r.height() };
+    let lab = Rect::from_min_size(text_area.min, vec2(text_area.width(), lh));
+    f.ui.painter_at(lab).text(
+        lab.left_center(),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        pal.text,
+    );
+    if two_line {
+        let d = Rect::from_min_size(pos2(text_area.min.x, lab.max.y), vec2(text_area.width(), r.height() - lh));
+        let shown = crate::titlebar::elide_text(f.ui, desc, &dfont, d.width());
+        if !shown.is_empty() {
+            f.ui.painter_at(d).text(d.left_center(), Align2::LEFT_CENTER, shown, dfont, pal.text_dim);
+        }
+    }
+    Rect::from_center_size(
+        pos2(r.max.x - ctrl_w * 0.5, r.center().y),
+        vec2(ctrl_w, r.height()),
+    )
+}
+
+/// 数值项的调节粒度。
+enum CaptureSlider {
+    /// 监听间隔，步长 50ms。
+    Ms,
+    /// 条数上限，步长 1000。
+    Items,
+    /// 去重窗口，步长 5 秒。
+    Secs,
+}
+
 /// 设置界面（覆盖层）。
 ///
 /// 「置顶模式」的切换入口现在住在这里，不在顶栏——
@@ -446,6 +596,20 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
 fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     let pal = f.pal;
     let scale = f.scale;
+
+    // ⚠️ **首帧的 `area` 可能荒谬**（实测 6666x6666）。
+    //
+    // `ui.max_rect()` 取的是子`Ui` 的可用矩形，而首帧 `screen_rect`
+    // 尚未由 `egui_input` 正确设置（`RawInput.screen_rect` 是默认值）。
+    // 此时按 `area` 居中的面板会被算到屏幕外，**看起来像设置界面没打开**。
+    //
+    // 这里显式拒绝明显不合理的尺寸：不画任何东西，等下一帧。
+    // 判断用「超过客户区常见上限」而非绝对值——不同 DPI 下客户区大小差异很大。
+    let reasonable = area.width() <= 4000.0 && area.height() <= 4000.0;
+    if !reasonable {
+        tracing::debug!(area = ?area, "客户区尺寸异常，本帧跳过设置界面");
+        return;
+    }
 
     // 遮罩：盖住下面的卡片，点击遮罩关闭。
     let resp = f.ui.interact(area, egui::Id::new("settings_scrim"), Sense::click());
@@ -458,8 +622,24 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     }
 
     // 面板：居中，宽度按逻辑点定，不随窗口无限拉伸。
-    let w = (360.0 * scale).min(area.width() - 40.0).max(200.0);
-    let h = (300.0 * scale).min(area.height() - 40.0).max(160.0);
+    // 面板尺寸：宽度留足（标签 + 说明 + 开关要同排），
+    // 高度取可用区的 85%——设置项会随版本增加，
+    // 给固定高度不如「尽量高 + 内容滚动」。
+    //
+    // ⚠️ 两处 `max(200.0, ...)` 是为了在**极小窗口**下不出现负宽度：
+    // 客户区可能只有 60pt（窗口被拉到极窄），`area.width() - 40` 会为负。
+    // ⚠️ 这里**不能乘 `scale`**。
+    //
+    // `area` 来自 `ui.max_rect()`，是**逻辑点**（DPI 无关）：
+    // 实测 1.5x 屏上客户区 420x560 物理像素，`area` 报 280x373。
+    //
+    // 早前写 `420.0 * scale` 得到 630「逻辑点」——比整个客户区还宽，
+    // 虽然被 `.min(area.width()-40)` 兜住不至于溢出，但那只是
+    // 恰好被夹住，语义是错的：一旦窗口够宽，面板就会宽到不合理。
+    //
+    // 同理高度直接用 `area.height()` 的比例。
+    let w = 420.0_f32.min(area.width() - 40.0).max(120.0);
+    let h = (area.height() * 0.85).min(560.0).max(120.0);
     let panel = Rect::from_center_size(area.center(), vec2(w, h));
     draw_card_frame(f, panel);
 
@@ -493,78 +673,250 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     }
     y = head.max.y + pal.space_sm;
 
-    // 「置顶显示方式」分组标题。
-    let sec_font = sized(pal.font_xs, scale);
-    let sec = Rect::from_min_size(pos2(panel.min.x + pad, y), vec2(panel.width() - pad * 2.0, 18.0 * scale));
-    f.ui.painter_at(sec).text(
-        sec.left_center(),
-        Align2::LEFT_CENTER,
-        "置顶显示方式",
-        sec_font,
-        pal.text_dim,
-    );
-    y = sec.max.y + pal.space_xs;
-
-    // 两个可选项：共用单栏 / 独立分栏。
-    let cur = f.ws.pinned_mode();
-    let row_h = 26.0 * scale;
-    for (mode, label, desc) in [
-        (PinnedMode::SharedColumn, "共用单栏", "与历史列表在同一栏内"),
-        (PinnedMode::OwnCard, "独立分栏", "单独一栏，可拖出成窗口"),
-    ] {
-        let r = Rect::from_min_size(
-            pos2(panel.min.x + pad, y),
-            vec2(panel.width() - pad * 2.0, row_h),
-        );
-        let active = mode == cur;
-        let rr = f.ui.interact(
-            r,
-            egui::Id::new(("setting_pinned_mode", format!("{mode:?}"))),
-            Sense::click(),
-        );
-        let painter = f.ui.painter_at(r);
-        if active {
-            painter.rect_filled(r, pal.radius_sm, pal.accent.gamma_multiply(0.22));
-            painter.rect_stroke(
-                r,
-                pal.radius_sm,
-                Stroke::new(1.0, pal.accent),
-                egui::StrokeKind::Inside,
-            );
-        } else if rr.hovered() {
-            painter.rect_filled(r, pal.radius_sm, pal.row_hover);
-        }
-
-        // 选中标记：实心圆点，避免用「✔」这类可能缺字形的符号。
-        let dot_r = 4.0 * scale;
-        let dot = Rect::from_center_size(
-            pos2(r.min.x + dot_r + pal.space_sm, r.center().y),
-            vec2(dot_r * 2.0, dot_r * 2.0),
-        );
-        if active {
-            f.ui.painter_at(dot).circle_filled(dot.center(), dot_r, pal.accent);
-        } else {
-            f.ui
-                .painter_at(dot)
-                .circle_stroke(dot.center(), dot_r, Stroke::new(1.0, pal.border));
-        }
-
-        let lab_area = Rect::from_min_max(
-            pos2(dot.max.x + pal.space_sm, r.min.y),
-            pos2(r.max.x - pal.space_sm, r.max.y),
-        );
-        f.ui.painter_at(lab_area).text(
-            lab_area.left_center(),
-            Align2::LEFT_CENTER,
-            format!("{label}    {desc}"),
-            sized(pal.font_sm, scale),
-            if active { pal.text_bright } else { pal.text },
-        );
-        if rr.clicked() {
-            f.state.push(Op::SetPinnedMode(mode));
-        }
-        y = r.max.y + pal.space_xs;
+    // ---- 内容区（可滚动）----------------------------------------------
+    //
+    // ⚠️ 设置项会随版本增加，固定高度的面板迟早装不下。
+    // 这里用「内容高度 vs 可视高度」决定要不要滚动条，
+    // 并把滚动偏移夹在合法区间（不夹的话滚到底内容会整体上移）。
+    let view = Rect::from_min_max(pos2(panel.min.x + pad, y), pos2(panel.max.x - pad, panel.max.y - pad));
+    if view.height() <= 8.0 || view.width() <= 8.0 {
+        return;
     }
+    // 先把内容画到一个**虚拟的**高矩形里，再按偏移取可见部分。
+    let mut content_y = view.min.y - f.state.settings_scroll;
+    let row_h = 34.0 * scale;
+
+    // ⚠️ `FontId` 在本版本**不是 `Copy`**，所以宏里每次现建而不能
+    // 闭包捕获外部的 `sec_font`（否则第二次展开就move 走了）。
+    macro_rules! section {
+        ($t:expr) => {{
+            let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), 18.0 * scale));
+            if r.max.y >= view.min.y && r.min.y <= view.max.y {
+                f.ui.painter_at(r).text(
+                    r.left_center(),
+                    Align2::LEFT_CENTER,
+                    $t,
+                    sized(pal.font_xs, scale),
+                    pal.text_dim,
+                );
+            }
+            content_y = r.max.y + pal.space_xs;
+        }};
+    }
+
+    // ⚠️ 不能写 `let cfg = &f.svc.state.config`：那是**不可变借用**整个 `f`，
+    // 之后调用 `draw_setting_row(f, ...)` 需要可变借用 → E0502。
+    //
+    // 所以把设置面板要读的字段**逐个复制成局部值**。
+    // 面板是一次性快照：用户点了开关后值下一帧才变，
+    // 这正是期望行为（不会出现「开关还没动、显示已翻转」）。
+    let ui_cfg = f.svc.state.config.ui.clone();
+    let cap_cfg = f.svc.state.config.capture.clone();
+    let sto_cfg = f.svc.state.config.storage.clone();
+
+    // ---- 界面 ---------------------------------------------------------
+    section!("置顶");
+    {
+        let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
+        content_y = r.max.y + pal.space_xs;
+        let cur = f.ws.pinned_mode();
+        let two: Vec<(PinnedMode, &str, &str)> = vec![
+            (PinnedMode::SharedColumn, "共用单栏", "与历史列表在同一栏内"),
+            (PinnedMode::OwnCard, "独立分栏", "单独一栏，可拖出成窗口"),
+        ];
+        // 横向排列两个选项。
+        let w = (r.width() - pal.space_xs) * 0.5;
+        for (i, (mode, label, desc)) in two.into_iter().enumerate() {
+            let rr = Rect::from_min_size(pos2(r.min.x + i as f32 * (w + pal.space_xs), r.min.y), vec2(w, r.height()));
+            let active = mode == cur;
+            let resp = f.ui.interact(rr, egui::Id::new(("pinned_mode", format!("{mode:?}"))), Sense::click());
+            let painter = f.ui.painter_at(rr);
+            if active {
+                painter.rect_filled(rr, pal.radius_sm, pal.accent.gamma_multiply(0.22));
+                painter.rect_stroke(rr, pal.radius_sm, Stroke::new(1.0, pal.accent), egui::StrokeKind::Inside);
+            } else if resp.hovered() {
+                painter.rect_filled(rr, pal.radius_sm, pal.row_hover);
+            }
+            let dot_r = 4.0 * scale;
+            let dot = Rect::from_center_size(pos2(rr.min.x + dot_r + pal.space_sm, rr.center().y), vec2(dot_r * 2.0, dot_r * 2.0));
+            if active {
+                painter.circle_filled(dot.center(), dot_r, pal.accent);
+            } else {
+                painter.circle_stroke(dot.center(), dot_r, Stroke::new(1.0, pal.border));
+            }
+            let la = Rect::from_min_max(pos2(dot.max.x + pal.space_sm, rr.min.y), pos2(rr.max.x - pal.space_xs, rr.max.y));
+            let txt = format!("{label}    {desc}");
+            let shown = crate::titlebar::elide_text(f.ui, &txt, &sized(pal.font_sm, scale), la.width());
+            painter.text(la.left_center(), Align2::LEFT_CENTER, shown, sized(pal.font_sm, scale), if active { pal.text_bright } else { pal.text });
+            if resp.clicked() {
+                f.state.push(Op::SetPinnedMode(mode));
+            }
+        }
+    }
+
+    // ---- 开关组 --------------------------------------------------------
+    //每项：(分组, 字段, 标签, 说明, 当前值)
+    let toggles: [(ConfigGroup, &'static str, &str, &str, bool); 7] = [
+        (ConfigGroup::Ui, "always_on_top", "窗口置顶", "始终显示在其它窗口之上", ui_cfg.always_on_top),
+        (ConfigGroup::Ui, "hide_on_focus_lost", "失焦时隐藏", "切换到别的程序后隐藏窗口", ui_cfg.hide_on_focus_lost),
+        (ConfigGroup::Ui, "show_tray", "显示托盘图标", "后台常驻，保留右键菜单入口", ui_cfg.show_tray),
+        (ConfigGroup::Ui, "start_minimized", "启动时最小化", "启动后隐藏到托盘", ui_cfg.start_minimized),
+        (ConfigGroup::Capture, "enabled", "记录剪贴板", "关闭后不再新增历史", cap_cfg.enabled),
+        (ConfigGroup::Capture, "skip_password_fields", "跳过密码字段", "疑似输入密码时不记录", cap_cfg.skip_password_fields),
+        (ConfigGroup::Capture, "dedup", "自动去重", "短时间内相同内容只留一条", cap_cfg.dedup),
+    ];
+
+    let mut last_group = None;
+    for (g, field, label, desc, on) in toggles {
+        if last_group != Some(g) {
+            section!(g.title());
+            last_group = Some(g);
+        }
+        let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
+        content_y = r.max.y + pal.space_xs * 0.5;
+        if r.max.y < view.min.y || r.min.y > view.max.y {
+            continue;
+        }
+        let ctrl = draw_setting_row(f, r, label, desc);
+        if draw_switch(f, ctrl, on, field) {
+            f.state.push(Op::SetBool { group: g, field, value: !on });
+        }
+    }
+
+    // ---- 数值组 --------------------------------------------------------
+    section!("监听与存储");
+    {
+        let items: [(&str, &str, &str, String, CaptureSlider); 3] = [
+            (
+                "poll_interval_ms",
+                "监听间隔",
+                "越小越灵敏、越耗电",
+                format!("{} ms", cap_cfg.poll_interval_ms),
+                CaptureSlider::Ms,
+            ),
+            (
+                "max_items",
+                "历史条数上限",
+                "留空表示只按容量淘汰",
+                sto_cfg
+                    .max_items
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "不限".into()),
+                CaptureSlider::Items,
+            ),
+            (
+                "dedup_window_secs",
+                "去重窗口",
+                "该时长内的相同内容视为重复",
+                format!("{} 秒", cap_cfg.dedup_window_secs),
+                CaptureSlider::Secs,
+            ),
+        ];
+        for (field, label, desc, val, kind) in items {
+            let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
+            content_y = r.max.y + pal.space_xs * 0.5;
+            if r.max.y < view.min.y || r.min.y > view.max.y {
+                continue;
+            }
+            let ctrl = draw_setting_row(f, r, label, desc);
+            // 左半画当前值、右半画调节按钮。
+            let vw = ctrl.width() * 0.46;
+            let vb = Rect::from_min_max(ctrl.min, pos2(ctrl.min.x + vw, ctrl.max.y));
+            f.ui.painter_at(vb).text(
+                vb.center(),
+                Align2::CENTER_CENTER,
+                val,
+                sized(pal.font_xs, scale),
+                pal.text_dim,
+            );
+            // 「−」「+」两个按钮
+            let bw = (ctrl.height() * 0.9).min(20.0);
+            let plus = Rect::from_center_size(pos2(ctrl.max.x - bw * 0.5, ctrl.center().y), vec2(bw, bw));
+            let minus = Rect::from_center_size(pos2(plus.min.x - bw * 1.1, ctrl.center().y), vec2(bw, bw));
+            let delta = match kind {
+                CaptureSlider::Ms => 50.0,
+                CaptureSlider::Items => 1000.0,
+                CaptureSlider::Secs => 5.0,
+            };
+            for (rr, sign, cur) in [
+                (minus, -1.0f64, cap_cfg.dedup_window_secs as f64),
+                (plus, 1.0f64, cap_cfg.dedup_window_secs as f64),
+            ] {
+                let resp = f.ui.interact(rr, egui::Id::new(("num", field, sign > 0.0)), Sense::click());
+                let p = f.ui.painter_at(rr);
+                if resp.hovered() {
+                    p.rect_filled(rr, pal.radius_sm, pal.row_hover);
+                }
+                p.rect_stroke(rr, pal.radius_sm, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+                p.text(rr.center(), Align2::CENTER_CENTER, if sign > 0.0 { "+" } else { "-" }, sized(pal.font_md, scale), pal.text);
+                if resp.clicked() {
+                    match kind {
+                        CaptureSlider::Ms => {
+                            let v = (cap_cfg.poll_interval_ms as f64 + sign * delta).clamp(50.0, 2000.0);
+                            f.state.push(Op::SetNumber { group: ConfigGroup::Capture, field, value: v });
+                        }
+                        CaptureSlider::Items => {
+                            // 0 = 不限（None）；递增到 0 时变回 Some
+                            let cur = sto_cfg.max_items;
+                            let next = match cur {
+                                None => Some(1000usize),
+                                Some(n) if n as f64 + sign * delta <= 0.0 => None,
+                                Some(n) => Some(((n as f64 + sign * delta).max(100.0)) as usize),
+                            };
+                            f.state.push(Op::SetOptNumber { group: ConfigGroup::Storage, field, value: next.map(|x| x as f64) });
+                        }
+                        CaptureSlider::Secs => {
+                            let v = (cur + sign * delta).max(0.0);
+                            f.state.push(Op::SetNumber { group: ConfigGroup::Capture, field, value: v });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 存储分组开关（单独一个分组标题）------------------------------
+    section!("存储");
+    {
+        let r = Rect::from_min_size(pos2(view.min.x, content_y), vec2(view.width(), row_h));
+        let ctrl = draw_setting_row(f, r, "启动时清理临时文件", "删除上次退出遗留的临时文件");
+        let on = sto_cfg.cleanup_on_start;
+        if draw_switch(f, ctrl, on, "cleanup_on_start") {
+            f.state.push(Op::SetBool { group: ConfigGroup::Storage, field: "cleanup_on_start", value: !on });
+        }
+        content_y = r.max.y;
+    }
+
+    // ---- 滚动 --------------------------------------------------------
+    let content_h = content_y - (view.min.y - f.state.settings_scroll);
+    let max_scroll = (content_h - view.height()).max(0.0);
+    f.state.settings_scroll = f.state.settings_scroll.clamp(0.0, max_scroll);
+    if f.ui.rect_contains_pointer(view) {
+        let d = f.ui.input(|i| i.smooth_scroll_delta.y);
+        if d != 0.0 {
+            f.state.settings_scroll =
+                (f.state.settings_scroll - d * view.height() / 3.0).clamp(0.0, max_scroll);
+            f.ui.ctx().request_repaint();
+        }
+    }
+    // 滚动条
+    if max_scroll > 0.5 {
+        let track_w = 4.0;
+        let track = Rect::from_min_max(
+            pos2(view.max.x + 2.0, view.min.y),
+            pos2(view.max.x + 2.0 + track_w, view.max.y),
+        );
+        let p = f.ui.painter_at(track);
+        p.rect_filled(track, track_w * 0.5, pal.surface_variant);
+        let t = (f.state.settings_scroll / max_scroll).clamp(0.0, 1.0);
+        let h = (track.height() * (view.height() / content_h)).max(24.0).min(track.height());
+        let knob = Rect::from_min_size(
+            pos2(track.min.x, track.min.y + (track.height() - h) * t),
+            vec2(track_w, h),
+        );
+        p.rect_filled(knob, track_w * 0.5, pal.border);
+    }
+
 }
 
 /// 置顶卡片当前是否独立成窗。

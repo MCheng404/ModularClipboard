@@ -749,6 +749,18 @@ impl App {
 
     /// 画一帧业务 UI。
     pub fn draw_frame(&mut self, ui: &mut egui::Ui) {
+        // `MC_SETTINGS=1` 时默认打开设置界面。
+        //
+        // 用途是**截图验证**：设置面板是覆盖层，不点齿轮按钮就拍不到。
+        // 做成环境变量而不是命令行参数，是为了让截图脚本不用改传参逻辑。
+        // `MC_SETTINGS=1` 时默认打开设置界面。
+        //
+        // 用途是**截图验证**：设置面板是覆盖层，不点齿轮按钮就拍不到。
+        // 做成环境变量而不是命令行参数，是为了让截图脚本不用改传参逻辑。
+        if std::env::var_os("MC_SETTINGS").is_some() {
+            self.paint_state.show_settings = true;
+        }
+
         // 消费后台捕获事件；有变化时安排后续重绘。
         if self.svc.pump() {
             self.ctx
@@ -821,6 +833,18 @@ impl App {
                     if let Some(c) = self.ws.get_mut(id) {
                         c.toggle_collapse();
                     }
+                }
+                Op::SetBool { group, field, value } => {
+                    set_bool_field(&mut self.svc.state.config, group, field, value);
+                    self.after_config_change();
+                }
+                Op::SetNumber { group, field, value } => {
+                    set_number_field(&mut self.svc.state.config, group, field, value);
+                    self.after_config_change();
+                }
+                Op::SetOptNumber { group, field, value } => {
+                    set_opt_number_field(&mut self.svc.state.config, group, field, value);
+                    self.after_config_change();
                 }
                 Op::Detach(id) => {
                     self.ws.detach(id);
@@ -959,6 +983,17 @@ impl App {
         self.svc.state.config.ui.window_pos = Some(WindowPos::new(p.x, p.y));
     }
 
+    /// 配置改动后的收尾：立刻落盘。
+    ///
+    /// 设置界面里点一下就写文件——用户不该担心「关掉程序才生效」。
+    /// 写失败只记日志：设置面板不该因为磁盘问题卡住。
+    fn after_config_change(&mut self) {
+        if let Err(e) = self.svc.save_config() {
+            tracing::warn!(%e, "保存配置失败");
+            self.svc.notify(format!("保存设置失败: {e}"));
+        }
+    }
+
     /// 记下置顶窗口位置（供下次启动恢复）。
     pub fn set_pinned_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
         self.svc.state.config.ui.pinned_window_pos = Some(WindowPos::new(p.x, p.y));
@@ -970,6 +1005,66 @@ impl App {
         if let Err(e) = self.svc.save_config() {
             tracing::warn!(%e, "退出时保存配置失败");
         }
+    }
+}
+
+/// 改一个布尔配置字段。
+///
+/// # 为什么用「分组 + 字段名字符串」而不是每项一个 `Op` 变体
+///
+/// 配置项会随版本增删（现在 20+ 项）。若每个都加一个 `Op` 变体，
+/// `apply_ops` 会膨胀成几十个分支，且新增项要改三处。
+/// 字符串字段名把新增成本降到「paint 里多一行 + 这里多一行」。
+///
+/// 代价是**失去编译期检查**——字段名写错会静默无效。
+/// [`tests::unknown_config_field_is_ignored`] 守住「拼错不 panic」。
+fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate::paint::ConfigGroup, field: &str, v: bool) {
+    use crate::paint::ConfigGroup as G;
+    match (g, field) {
+        (G::Capture, "enabled") => cfg.capture.enabled = v,
+        (G::Capture, "track_source_app") => cfg.capture.track_source_app = v,
+        (G::Capture, "skip_password_fields") => cfg.capture.skip_password_fields = v,
+        (G::Capture, "dedup") => cfg.capture.dedup = v,
+        (G::Ui, "always_on_top") => cfg.ui.always_on_top = v,
+        (G::Ui, "hide_on_focus_lost") => cfg.ui.hide_on_focus_lost = v,
+        (G::Ui, "show_tray") => cfg.ui.show_tray = v,
+        (G::Ui, "start_minimized") => cfg.ui.start_minimized = v,
+        (G::Storage, "cleanup_on_start") => cfg.storage.cleanup_on_start = v,
+        _ => tracing::warn!(?g, field, "未知的布尔配置字段，已忽略"),
+    }
+}
+
+/// 改一个数值配置字段。
+fn set_number_field(
+    cfg: &mut modular_clipboard_core::Config,
+    g: crate::paint::ConfigGroup,
+    field: &str,
+    v: f64,
+) {
+    use crate::paint::ConfigGroup as G;
+    match (g, field) {
+        (G::Capture, "poll_interval_ms") => cfg.capture.poll_interval_ms = v.max(50.0) as u64,
+        (G::Capture, "dedup_window_secs") => cfg.capture.dedup_window_secs = v.max(0.0) as i64,
+        (G::Ui, "font_scale") => cfg.ui.font_scale = (v.clamp(0.75, 2.0)) as f32,
+        (G::Storage, "max_bytes") => cfg.storage.max_bytes = v.max(1.0) as u64,
+        (G::Storage, "max_payload_bytes") => cfg.storage.max_payload_bytes = v.max(1.0) as u64,
+        _ => tracing::warn!(?g, field, "未知的数值配置字段，已忽略"),
+    }
+}
+
+/// 改一个可选数值配置字段（`None` = 不限）。
+fn set_opt_number_field(
+    cfg: &mut modular_clipboard_core::Config,
+    g: crate::paint::ConfigGroup,
+    field: &str,
+    v: Option<f64>,
+) {
+    use crate::paint::ConfigGroup as G;
+    match (g, field) {
+        (G::Storage, "max_items") => {
+            cfg.storage.max_items = v.map(|x| x.max(1.0) as usize);
+        }
+        _ => tracing::warn!(?g, field, "未知的可选数值配置字段，已忽略"),
     }
 }
 
@@ -988,6 +1083,56 @@ mod tests {
     /// 驱动在 `cmd_begin_render_pass` 时崩（本项目的历史坑）。
     /// `FrameRenderer::new` 会校验并 bail，但那时窗口已经建好了——
     /// 早失败比晚失败好，所以这里也钉一道。
+    /// 字段名写错时**静默忽略**，不 panic。
+    ///
+    /// 配置项走「分组 + 字段名字符串」而非每项一个 `Op` 变体，
+    /// 代价就是**失去编译期检查**——字段名打错会静默失效。
+    /// 这条测试守住「拼错不炸」，同时提醒维护者：
+    /// 新增配置项时，`paint` 里的字段名与这里的字符串必须一致。
+    #[test]
+    fn unknown_config_field_is_ignored() {
+        let mut cfg = modular_clipboard_core::Config::default();
+        let before = cfg.capture.poll_interval_ms;
+        set_number_field(
+            &mut cfg,
+            crate::paint::ConfigGroup::Capture,
+            "不存在的字段",
+            12345.0,
+        );
+        assert_eq!(
+            cfg.capture.poll_interval_ms, before,
+            "未知字段不应改动任何配置"
+        );
+    }
+
+    /// 数值字段的越界值必须被夹到合法区间。
+    #[test]
+    fn numeric_config_fields_are_clamped() {
+        let mut cfg = modular_clipboard_core::Config::default();
+        // 监听间隔下限 50ms：给 1ms 应被夹到 50。
+        set_number_field(&mut cfg, crate::paint::ConfigGroup::Capture, "poll_interval_ms", 1.0);
+        assert_eq!(cfg.capture.poll_interval_ms, 50);
+        // 字体缩放上限 2.0：给 99 应被夹到 2.0。
+        set_number_field(&mut cfg, crate::paint::ConfigGroup::Ui, "font_scale", 99.0);
+        assert!((cfg.ui.font_scale - 2.0).abs() < 1e-6);
+    }
+
+    /// `max_items = None` 表示「不限」，与 `Some(0)` 不是一回事。
+    #[test]
+    fn opt_number_supports_unlimited() {
+        let mut cfg = modular_clipboard_core::Config::default();
+        set_opt_number_field(
+            &mut cfg,
+            crate::paint::ConfigGroup::Storage,
+            "max_items",
+            None,
+        );
+        assert!(
+            cfg.storage.max_items.is_none(),
+            "None 应表示「不限条数」"
+        );
+    }
+
     #[test]
     fn surface_format_prefers_8bit_bgr_or_rgb() {
         let formats = [
