@@ -1252,6 +1252,24 @@ fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
 // ---------------------------------------------------------------- 内容
 
 fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
+    // 自报列表可视区。
+    //
+    // ⚠️ 这个 key **不是**给绘制用的，是给「热区自报」机制用的：
+    // 测试与自动化脚本从 `UiState::hit` 里读坐标，而不是自己按
+    // `pal` 常量重算一遍公式——重算等于把实现抄进测试，实现改对了
+    // 测试反而挂。
+    //
+    // 两个列表（主栏 / 内嵌置顶区）必须用**不同 key**：`hit` 是
+    // `HashMap<&str, Rect>`，同名会互相覆盖（settings 开关就踩过）。
+    f.state.hit.insert(
+        if only_pinned == Some(true) {
+            "pinned_body"
+        } else {
+            "history_body"
+        },
+        body,
+    );
+
     // 过滤：全部 / 仅置顶。
     let items: Vec<ClipItem> = f
         .svc
@@ -1350,17 +1368,36 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 内容高度决定滚动条比例，必须显式给出，否则 egui 按
             // 「子控件实际占用」算，而虚拟化下只画了可视行 ⇒ 比例失真。
             ui.set_height(content_h);
-            // 虚拟化：定位到第一条可视行，只画到超出可视区为止。
+
+            // ---- 坐标系：**一律用全局坐标** --------------------------------
+            //
+            // ⚠️ egui 的 `Rect` **永远是全局（窗口）坐标**，不存在
+            // 「相对某个 Ui 的本地坐标」。`ScrollArea` 内部虽然把内容
+            // Ui 建成 `content_max_rect = from_min_size(inner_rect.min
+            // - state.offset, …)`，但那只是**可用区域**的偏移，用来让
+            // 常规控件（跟着布局游标走的那些）自动排到滚动后的位置；
+            // 它**不会**给传进来的坐标做任何变换。
+            //
+            // 早前这里写成 `pos2(0.0, offsets[i])`，于是行全部被画到
+            // 窗口左上角（x=0），而列表区域一片空白。这类错误的
+            // 隐蔽之处在于：空列表时根本不执行这段代码。
+            //
+            // 正确做法与改 ScrollArea 之前一致——用绝对坐标：
+            // `body.min.y + offsets[i] - scroll`。ScrollArea 在这套
+            // 手工虚拟化里的作用只剩**裁剪**与**滚动条**。
             let scroll = f.state.scroll_offset;
             let first = offsets.partition_point(|&o| o + ROW_HEIGHT_MIN <= scroll);
             for i in first..items.len() {
-                let y = offsets[i] - scroll;
-                if y > body.height() {
+                let y = body.min.y + offsets[i] - scroll;
+                if y > body.max.y {
                     break; // 已越过可视区底部
                 }
-                let r = Rect::from_min_size(pos2(0.0, y), vec2(body.width(), heights[i]));
-                if r.max.y < 0.0 {
-                    continue;
+                let r = Rect::from_min_size(
+                    pos2(body.min.x, y),
+                    vec2(body.width(), heights[i]),
+                );
+                if r.max.y < body.min.y {
+                    continue; // 整行都在可视区上方
                 }
                 draw_item_row(f, ui, r, &items[i]);
             }
@@ -1528,9 +1565,15 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let scale = f.scale;
     let selected = f.svc.state.selected == Some(item.id);
 
-    let resp = f
-        .ui
-        .interact(r, egui::Id::new(("row", item.id)), Sense::click());
+    // ⚠️ 交互必须挂在**滚动区的内容 `ui`** 上，不能挂根 `f.ui`。
+    //
+    // `f.ui` 是整个主区的 Ui，它的裁剪矩形是**整个窗口**——于是
+    // 被滚出可视区的那半行仍然可点：点在卡片标题、甚至顶栏上，
+    // 都会选中列表里的条目（P0 级：顶栏按钮点不动）。
+    //
+    // `ScrollArea` 的内容 `ui` 裁剪到视口，越界的行自动不可交互，
+    // 与「看得见才点得到」一致。
+    let resp = ui.interact(r, egui::Id::new(("row", item.id)), Sense::click());
     let painter = ui.painter_at(r);
     if selected {
         painter.rect_filled(r, CornerRadius::ZERO, pal.row_selected);
@@ -1837,6 +1880,36 @@ mod tests {
                 area: Rect::from_min_size(pos2(0.0, 0.0), size),
                 _dir: dir,
             }
+        }
+
+        /// 往服务里塞 `n` 条剪贴板记录。
+        ///
+        /// # 为什么必须显式提供
+        ///
+        /// ⚠️ 默认的 `Harness` 是**空列表**，于是 `draw_history_body`
+        /// 每次都走 `draw_empty` 分支直接 return —— **列表行的绘制
+        /// 路径从未被任何测试覆盖过**。
+        ///
+        /// 这正是「列表坐标算错」能一路溜到实机的原因：505 条测试
+        /// 全绿，但没有一条真的画过一行。
+        fn with_items(mut self, n: usize) -> Self {
+            for i in 0..n {
+                let text = format!("第 {i} 条记录，用于测试列表行的坐标与布局");
+                let payload = modular_clipboard_core::CapturedPayload {
+                    kind: modular_clipboard_core::ClipKind::Text,
+                    bytes: text.as_bytes().to_vec(),
+                    html: None,
+                    text: Some(text),
+                    source_app: format!("App{i}"),
+                    files: Vec::new(),
+                };
+                if !self.svc.ingest(payload) {
+                    tracing::warn!(i, "塞入测试记录失败");
+                }
+            }
+            // 写入后必须重灌列表，否则 `state.items` 还是空的。
+            self.svc.reload_list();
+            self
         }
 
         /// 组装这一帧的 [`RawInput`]。
@@ -2204,7 +2277,132 @@ mod tests {
         );
     }
 
-// ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // 列表行：坐标与虚拟化
+    //
+    // ⚠️ 这几条存在的唯一理由：**默认的 Harness 列表是空的**。
+    // `draw_history_body` 一进来就走 `draw_empty` 分支 return，
+    // 于是行的绘制路径从未被覆盖——「列表坐标算错」才能一路溜到
+    // 实机。下面每条都必须用 `with_items(n)`。
+    //
+    // 坐标一律从 `UiState::hit` 里读（`draw_history_body` 自报的
+    // `history_body`），不在测试里按 `pal` 常量重算一遍公式——
+    // 重算等于把实现抄进断言，实现改对了测试反而挂。
+    // ------------------------------------------------------------------
+
+    /// 列表可视区必须被**自报**出来。
+    ///
+    /// 测试与自动化脚本都靠 `hit` 表定位，不自报就只能在测试里
+    /// 重算布局公式——那正是本项目明确要避免的做法。
+    #[test]
+    fn list_body_is_self_reported() {
+        let mut h = Harness::new("list-body", vec2(700.0, 500.0)).with_items(3);
+        h.frame();
+        let body = h
+            .state
+            .hit
+            .get("history_body")
+            .copied()
+            .expect("历史列表应自报 `history_body` 热区");
+        let hist = h
+            .ws
+            .by_kind(CardKind::History)
+            .expect("默认工作区含历史卡片");
+        assert!(
+            hist.rect.contains_rect(body),
+            "列表可视区应完全落在历史卡片内：卡片={:?} 列表={:?}",
+            hist.rect,
+            body
+        );
+        assert!(
+            body.width() > 100.0 && body.height() > 60.0,
+            "列表可视区尺寸应可用，实际={body:?}"
+        );
+    }
+
+    /// 滚到底后，行带必须**正好铺满**列表可视区：贴底、不越上、不越左。
+    ///
+    /// # 守的是什么
+    ///
+    /// 早前把行坐标写成 `pos2(0.0, offsets[i] - scroll)`——少了
+    /// `body.min`，于是所有行整体上移到窗口左上角：列表底部空出
+    /// 一大块，行反而盖住了卡片标题和顶栏。
+    ///
+    /// # 为什么必须**三点**都断言
+    ///
+    /// 「点得到某条记录」是**假守卫**：注入那个 bug 后行仍然是一段
+    /// 连续带，从下往上扫照样命中，测试恒绿（实测过）。真正的差异
+    /// 在**位置**——只断言「底部点得到」也能被平移后的行带蒙混，
+    /// 必须同时要求上沿/左沿**没有**行，整体平移才无处可藏。
+    ///
+    /// # 为什么「上沿没有行」能成立
+    ///
+    /// 虚拟化从「第一条可能露头的行」开始画，那一行通常是**半截**
+    /// 露在视口上方的。交互挂在 `ScrollArea` 的内容 `ui` 上（见
+    /// [`draw_item_row`]），会被裁剪到视口，所以那半截**看得见但
+    /// 点不到**——这既让本条断言成立，也正是「顶栏按钮点不动」
+    /// 那个 P0 的修法。
+    #[test]
+    fn rows_fill_the_list_body_exactly() {
+        let mut h = Harness::new("list-fill", vec2(700.0, 500.0)).with_items(60);
+        // 第一帧：让 solver 求解、布局落位、拿到 body。
+        h.frame();
+        let body = h
+            .state
+            .hit
+            .get("history_body")
+            .copied()
+            .expect("历史列表应自报 `history_body` 热区");
+        assert!(body.height() > 60.0, "历史卡片应有可用高度，实际={body:?}");
+
+        // 滚到最底部（下一帧会被夹到 `max_scroll`）。
+        h.state.scroll_offset = f32::MAX;
+        h.frame();
+        assert!(
+            h.state.scroll_offset > 100.0,
+            "前置条件：应处于已滚动状态（否则测不出差异），实际={}",
+            h.state.scroll_offset
+        );
+
+        let x = body.center().x;
+
+        // (1) 下沿：贴着可视区底部必须有行，且是**最旧**那条。
+        let bottom = h.click_at(pos2(x, body.max.y - 4.0));
+        let hit_bottom = bottom.iter().find_map(|o| match o {
+            Op::Select(id) => Some(*id),
+            _ => None,
+        });
+        let oldest = h.svc.state.items.last().expect("列表非空").id;
+        assert_eq!(
+            hit_bottom,
+            Some(oldest),
+            "滚到底后列表**最底部**应是最旧那条记录。\
+             底部点不到 ⇒ 行带整体上移了（很可能行坐标少了 `body.min`）。\
+             body={body:?} 实际={bottom:?}"
+        );
+
+        // (2) 上沿：可视区**上方**（卡片标题一带）不得有行。
+        let above = h.click_at(pos2(x, body.min.y - 6.0));
+        assert!(
+            !above.iter().any(|o| matches!(o, Op::Select(_))),
+            "列表可视区**上方**不该有行——行溢出了 body，会盖住标题/顶栏。\
+             body={body:?} 实际={above:?}"
+        );
+
+        // (3) 上沿内侧：可视区**顶部**必须有行（不留空白）。
+        //
+        // ⚠️ 这里**不**测左/右边界：egui 的 `interact` 会把命中矩形
+        // 按 `item_spacing` 外扩（实测左边界比 `body.min.x` 还靠左
+        // 4pt），而「行 x 原点写错」只差 8pt —— 点击根本区分不出来，
+        // 硬写一条只会导致假绿。左右由 (1)(2) 的纵向不变量间接覆盖。
+        let top = h.click_at(pos2(x, body.min.y + 4.0));
+        assert!(
+            top.iter().any(|o| matches!(o, Op::Select(_))),
+            "列表可视区**顶部**应有行——顶部留白说明行带整体下移了。\
+             body={body:?} 实际={top:?}"
+        );
+    }
+    // ------------------------------------------------------------------
     // 交互测试：设置面板
     // ------------------------------------------------------------------
 
