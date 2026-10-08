@@ -182,6 +182,9 @@ pub fn draw_child(f: &mut Frame<'_>) {
         return;
     }
     match card.kind {
+        // 置顶卡片作为独立窗口时，只画列表内容（无标题头）——
+        // 窗口标题栏已经说明了它是什么。
+        CardKind::Pinned => draw_history_body(f, body, Some(true)),
         CardKind::Detail => draw_detail_body(f, body),
         CardKind::Rail => draw_rail_body(f, body),
         // 主窗口专属的种类不该出现在子窗口；画空状态而不是崩溃。
@@ -564,11 +567,28 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     }
 }
 
+/// 置顶卡片当前是否独立成窗。
+///
+/// 有独立置顶窗时主窗口**不再显示置顶栏**——置顶内容已经在那个
+/// 窗口里了，再画一份就是重复。
+fn pinned_is_separate(ws: &Workspace) -> bool {
+    ws.cards
+        .iter()
+        .any(|c| c.kind == CardKind::Pinned && c.host == CardHost::Window)
+}
+
 fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
+    // 置顶独立成窗 ⇒ 主窗只画历史栏（不画置顶栏，避免重复内容）。
+    let pinned_separate = pinned_is_separate(f.ws);
+
     // 按 Z 序遍历。这里直接读 `card.rect`——**不做任何二次判断**，
     // 也不重新计算宽度。矩形是solver 算好的，绘制只负责照着画。
     for card in f.ws.cards.iter() {
         if card.host != CardHost::Docked {
+            continue;
+        }
+        // 置顶已独立成窗 ⇒ 主窗口跳过置顶卡片。
+        if pinned_separate && card.kind == CardKind::Pinned {
             continue;
         }
         let r = card.rect;
@@ -584,6 +604,64 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
             draw_expanded_card(f, card, r);
         }
     }
+
+    // 置顶**没有**独立成窗 ⇒ 在历史栏顶部内嵌一个置顶区，
+    // 免得为了一两条置顶再开一个窗口。
+    if !pinned_separate {
+        draw_embedded_pinned(f, _body);
+    }
+}
+
+/// 在历史栏内嵌置顶区（无独立置顶窗时）。
+///
+/// 画在历史栏**上方**，两栏之间用一条细分隔线隔开——
+/// 这不是独立卡片，所以不画自己的边框，避免与历史栏的边框叠成双线。
+fn draw_embedded_pinned(f: &mut Frame<'_>, _body: Rect) {
+    let pal = f.pal;
+    let Some(history) = f.ws.by_kind(CardKind::History) else {
+        return;
+    };
+    let hr = history.rect;
+    if hr.width() <= 0.0 || hr.height() <= 40.0 {
+        return;
+    }
+
+    // 置顶条目为空时不占空间——否则为了 0 条记录占掉一条横幅。
+    let has_pinned = f.svc.state.items.iter().any(|it| it.pinned);
+    if !has_pinned {
+        return;
+    }
+
+    let pad = pal.space_sm;
+    let font: FontId = sized(pal.font_xs, f.scale);
+    let label_h = (pal.font_xs * 1.6).max(14.0);
+    let inner = hr.shrink2(vec2(pad, pad));
+
+    // 标题行「置顶」
+    let label = Rect::from_min_size(inner.min, vec2(inner.width(), label_h));
+    f.ui.painter_at(label).text(
+        label.left_center(),
+        Align2::LEFT_CENTER,
+        "置顶",
+        font,
+        pal.text_dim,
+    );
+
+    // 分隔线 + 列表区
+    let sep_y = label.max.y;
+    let list = Rect::from_min_max(
+        pos2(inner.min.x, sep_y + pal.space_xs),
+        pos2(inner.max.x, inner.max.y),
+    );
+    if list.height() <= 8.0 {
+        return;
+    }
+    // `hline(x范围, y, 描边)`：横线要传 x 的**区间**，不是 y 区间。
+    f.ui
+        .painter_at(hr)
+        .hline(hr.x_range(), sep_y, Stroke::new(1.0, pal.border_subtle));
+
+    draw_history_body(f, list, Some(true));
 }
 
 fn draw_card_frame(f: &mut Frame<'_>, r: Rect) {

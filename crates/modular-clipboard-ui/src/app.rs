@@ -27,6 +27,7 @@
 //!    `view::draw` 按本帧布局算出，顺序反了会用到上一帧的矩形；
 //!    只在启动时设一次则会在窗口 resize / 模块折叠后错位。
 
+use modular_clipboard_core::WindowPos;
 use modular_clipboard_app::Service;
 use modular_clipboard_gfx::frame::{FrameRenderer, PipelineBundle, PresentResult};
 use modular_clipboard_gfx::window::{EventLoop, Window, WindowEvent};
@@ -98,6 +99,17 @@ pub fn run_with_options(
         config.ui.window_width.max(1.0) as u32,
         config.ui.window_height.max(1.0) as u32,
     )?;
+    // 恢复上次退出时的窗口位置。
+    //
+    // ⚠️ 早前位置只存在内存里，每次启动都回屏幕左上角——
+    // 用户拖动的位置在重启后丢失。位置存`UiConfig::window_pos`。
+    //
+    // `Option` 是必要的：`0.0` 是合法坐标（屏幕左上角），
+    // 不能用它当「未设置」的哨兵值。
+    if let Some(p) = config.ui.window_pos {
+        let s = window.scale_factor();
+        window.move_to((p.x * s) as i32, (p.y * s) as i32);
+    }
     // ⚠️ `CreateWindowExW` 创建的窗口**默认不可见**，
     // 必须显式 `ShowWindow` 才会出现在桌面上。
     //
@@ -181,6 +193,13 @@ pub fn run_with_options(
     // ---- egui -----------------------------------------------------------
     let mut app = App::new(config, capture_is_override, data_dir);
     let ctx = app.ctx.clone();
+
+    // 恢复上次退出时的置顶窗口位置。
+    //
+    // ⚠️ 必须在第一次 `sync_with` 之前：那个函数按卡片上的
+    // `window_pos` 建窗，之后再改就只影响下次启动了。
+    let ui_cfg = app.svc.state.config.ui.clone();
+    app.ws.apply_saved_positions(&ui_cfg);
 
     // ---- 托盘常驻--------------------------------------------------------
     //
@@ -327,7 +346,14 @@ pub fn run_with_options(
         //
         // 放在业务 UI **之前**是必须的：本帧的绘制才会把新窗口
         // 的卡片内容算进去。反过来的话新窗口会晚一帧才有内容。
-        children.sync_with(&mut app.ws, &shared, window.scale_factor());
+        // 传主窗口的位置与尺寸：置顶窗口要摆在**主窗口左边**。
+        let main_pos = window.screen_position_points();
+        let (mw, mh) = window.inner_size_points();
+        let main_rect = Some((
+            main_pos,
+            egui::epaint::emath::vec2(mw, mh),
+        ));
+        children.sync_with(&mut app.ws, &shared, window.scale_factor(), main_rect);
 
         // ---- 2. 业务 UI ----
         //
@@ -539,10 +565,29 @@ pub fn run_with_options(
     if let Some(mut r) = resident {
         r.shutdown();
     }
-    app.shutdown();
-    // 子窗口要先关掉：它们也占着 GPU 资源，
-    // 且 `Window::destroy` 必须在 `gpu` 释放前完成。
+    // 先记下主窗口位置，再关子窗口——`close_all` 之后
+    // 读不到任何窗口的位置了。
+    //
+    // ⚠️ 必须在 `shutdown()` 之前取：它会 `save_config()` 把配置落盘，
+    // 顺序反了位置就存不进文件（下次启动又回默认位置）。
+    let main_pos = window.screen_position_points();
+    // 置顶窗口若开着，也记下它的位置。
+    //
+    // 直接遍历子窗口找置顶那张卡——比先从工作区查 Id 再回查子窗口简单，
+    // 也避免「工作区有卡片但子窗口还没建」时的不一致。
+    for child in children.iter() {
+        let is_pinned = app
+            .ws
+            .get(child.card_id)
+            .is_some_and(|c| c.kind == crate::card::CardKind::Pinned);
+        if is_pinned {
+            app.set_pinned_window_pos(child.window.screen_position_points());
+            break;
+        }
+    }
     children.close_all();
+    app.persist_window_pos(main_pos);
+    app.shutdown();
     // `painter` 与 `fr` 借用 `gpu`，必须在 `gpu` 之前 drop。
     drop(painter);
     drop(fr);
@@ -900,6 +945,25 @@ impl App {
     }
 
     /// 退出前保存状态。
+    /// 把主窗口当前位置写回配置。
+    ///
+    /// 由 [`Self::shutdown`] 调用。**不覆盖**用户设置里已有的
+    /// 置顶窗位置——那个由 `childwin` 在关窗时自己写。
+    ///
+    /// 取不到位置时跳过而不是写 `Some(0,0)`：窗口可能因最小化/
+    /// 隐藏而没有有效位置，写进去会让下次启动跑到屏幕左上角。
+    ///
+    /// `App` **不持有窗口**（窗口在 `run()` 的栈上），所以位置由
+    /// 调用方从窗口句柄读出后注入。
+    pub fn persist_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
+        self.svc.state.config.ui.window_pos = Some(WindowPos::new(p.x, p.y));
+    }
+
+    /// 记下置顶窗口位置（供下次启动恢复）。
+    pub fn set_pinned_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
+        self.svc.state.config.ui.pinned_window_pos = Some(WindowPos::new(p.x, p.y));
+    }
+
     pub fn shutdown(&mut self) {
         self.svc.stop_capture();
         self.persist_layout();

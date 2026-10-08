@@ -26,11 +26,44 @@
 
 use modular_clipboard_gfx::window::{Window, WindowEvent};
 
-use crate::card::{CardHost, CardId};
+use crate::card::{Card, CardHost, CardId, CardKind};
 use crate::workspace::Workspace;
 
 /// 一张卡片对应的独立窗口。
 ///
+/// 算出某个卡片首次成窗时的位置（屏幕逻辑点）。
+///
+/// 置顶窗口摆在**主窗口左边**：用户要求两个窗口并排，而不是叠在一起。
+/// 于是位置 = `(main.x - 置顶窗宽 - 8, main.y)`——顶部对齐，
+/// 视觉上像「同一个面板的左右两半」。
+///
+/// 左边界为负（主窗口太靠左）时**夹到 0**：负坐标会被 Win32 当成
+/// 「放到屏幕外」，窗口就找不到了。
+/// 置顶窗口的位置（屏幕逻辑点）。
+///
+/// 优先级：
+/// 1. 卡片自己记录的位置（上次关窗时写回）⇒ 用户拖过，尊重它；
+/// 2. 否则摆在**主窗口左边**并顶部对齐 —— 两个窗口并排而非叠放。
+///
+/// 左边界为负（主窗口太靠左）时**夹到 0**：负坐标会被 Win32 当成
+/// 「放到屏幕外」，窗口就找不到了。
+fn pinned_window_pos(
+    card: &Card,
+    main_rect: Option<(egui::epaint::emath::Vec2, egui::epaint::emath::Vec2)>,
+) -> egui::epaint::emath::Vec2 {
+    let saved = card.window_pos;
+    let Some((main_pos, _)) = main_rect else {
+        return saved;
+    };
+    // 位置等于兜底值 (120,120) ⇒ 用户没拖过，走并排定位。
+    let is_default = (saved.x - 120.0).abs() < 1.0 && (saved.y - 120.0).abs() < 1.0;
+    if !is_default {
+        return saved;
+    }
+    let x = main_pos.x - card.window_size.x - 8.0;
+    egui::epaint::emath::vec2(x.max(0.0), main_pos.y)
+}
+
 /// 渲染资源（`FrameRenderer` + `Painter`）挂在窗口自己身上而不是
 /// 放在 `ChildWindows` 的并行数组里：这样增删窗口时资源必然
 /// 跟着走，不会出现「窗口删了但资源还在」或两者错位。
@@ -116,6 +149,7 @@ impl<'a> ChildWindows<'a> {
         ws: &mut Workspace,
         shared: &crate::multiwindow::SharedGfx<'a>,
         scale_factor: f32,
+        main_rect: Option<(egui::epaint::emath::Vec2, egui::epaint::emath::Vec2)>,
     ) {
         // ---- 1. 该销毁的 ----
         //
@@ -142,22 +176,22 @@ impl<'a> ChildWindows<'a> {
             })
             .map(|c| {
                 // ⚠️ `window_size` 是**逻辑点**，`Window::new` 要的是
-                //**物理像素**。早前这里乘 100 当 DPI 系数，得到
+                // **物理像素**。早前这里乘 100 当 DPI 系数，得到
                 // 36000x48000 的窗口，Vulkan 表面如实报告这个尺寸，
                 // 于是交换链按 36000x48000 分配显存 → `OUT_OF_DEVICE_MEMORY`
                 // →「device memory allocation has failed」。
-                //
-                // 正确做法：用主窗口的 `scale_factor`换算。
-                // 拿不到时退回 1.0（宁可不缩放，也不要放大 100 倍）。
-                // 拿不到主窗口 DPI 时退回 1.0：宁可不缩放，
-                // 也不要放大 100 倍（那会让交换链分配爆显存）。
                 let ppp = if scale_factor > 0.01 { scale_factor } else { 1.0 };
                 (
                     c.id,
                     c.kind.title().to_string(),
                     (c.window_size.x * ppp).round().max(160.0) as u32,
                     (c.window_size.y * ppp).round().max(120.0) as u32,
-                    c.window_pos,
+                    // 置顶窗要摆到主窗左边；其它卡片用自己记录的位置。
+                    if c.kind == CardKind::Pinned {
+                        pinned_window_pos(c, main_rect)
+                    } else {
+                        c.window_pos
+                    },
                 )
             })
             .collect();

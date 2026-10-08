@@ -186,6 +186,37 @@ pub struct UiConfig {
     /// 用户的窗口尺寸、主题、屏蔽名单**全部被抹掉**，且没有任何提示。
     #[serde(default)]
     pub layout: Option<LayoutConfig>,
+    /// 主窗口位置（屏幕逻辑点，`None` = 用默认）。
+    ///
+    /// # 为什么必须持久化
+    ///
+    /// 早前窗口位置只存在内存里，每次启动都回到默认位置——
+    /// 用户拖动窗口后的位置在重启后丢失。
+    ///
+    /// 用 `Option` 而非 `f32`：`0.0` 是**合法坐标**（屏幕左上角），
+    /// 不能用它当「未设置」的哨兵值。
+    #[serde(default)]
+    pub window_pos: Option<WindowPos>,
+    /// 置顶窗口位置（屏幕逻辑点）。语义同 [`UiConfig::window_pos`]。
+    #[serde(default)]
+    pub pinned_window_pos: Option<WindowPos>,
+}
+
+/// 一个窗口的位置（屏幕逻辑点，左上角为原点）。
+///
+/// 独立成结构体而不是两个 `f32`，是为了让 `serde` 的
+/// `#[serde(default)]` 在字段缺失时能正确填 `None`。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WindowPos {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl WindowPos {
+    /// 新建。
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
 }
 
 impl Default for UiConfig {
@@ -201,6 +232,8 @@ impl Default for UiConfig {
             font_path: None,
             font_scale: 1.0,
             layout: None,
+            window_pos: None,
+            pinned_window_pos: None,
         }
     }
 }

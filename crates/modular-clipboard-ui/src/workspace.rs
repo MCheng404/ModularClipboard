@@ -62,9 +62,28 @@ impl Default for Workspace {
         }
         ws
     }
+
 }
 
 impl Workspace {
+    /// 把配置里持久化的窗口位置写回卡片。
+    ///
+    /// 必须在每次启动时调一次：置顶窗口独立成窗时靠它回到上次位置，
+    /// 否则每次启动都回兜底值（主窗口左侧），用户拖过的地方丢失。
+    ///
+    /// 只写位置，**不写** `host` —— 是否独立成窗是运行期的用户选择，
+    /// 不该跨重启恢复（否则用户关掉置顶窗，下次启动它又自己冒出来）。
+    pub fn apply_saved_positions(&mut self, ui: &modular_clipboard_core::UiConfig) {
+        if let Some(p) = ui.pinned_window_pos {
+            if let Some(c) = self
+                .cards
+                .iter_mut()
+                .find(|c| c.kind == CardKind::Pinned)
+            {
+                c.window_pos = egui::epaint::emath::vec2(p.x, p.y);
+            }
+        }
+    }
     /// 新建空工作区。
     pub fn empty() -> Self {
         Self {
@@ -94,8 +113,18 @@ impl Workspace {
         // 于是画面里全是被遮挡的主窗口，看起来像「界面坏了」。
         //
         // 620 已越过主窗口右缘（420），80 让第一个子窗口露出上边。
+        //置顶窗口默认摆在主窗口**左边**：主窗口约 420 物理像素宽，
+        //置顶窗约 300宽，两者并排比上下堆叠更好读。
+        //
+        // ⚠️ 主窗口位置**不是常量**（用户可以拖到屏幕任何地方），
+        // 所以真正的定位在 `childwin::ChildWindows::sync_with`里做——
+        // 它拿得到主窗口句柄与真实矩形。这里只给一个兜底值，
+        // 避免 `None` 时落在 (0,0)（屏幕左上角，与主窗重叠）。
+        //
+        // 兜底值取主窗口的常见位置（居中偏左），不追求精确——
+        // 首帧之后会被真实位置覆盖。
         let n = self.cards.len() as f32;
-        card.window_pos = egui::epaint::emath::vec2(620.0 + n * 40.0, 80.0 + n * 40.0);
+        card.window_pos = egui::epaint::emath::vec2(120.0 + n * 40.0, 120.0);
         self.cards.push(card);
         id
     }
@@ -243,6 +272,55 @@ impl Workspace {
 mod tests {
     use super::*;
     use egui::{pos2, vec2};
+
+    #[test]
+    fn saved_pinned_position_is_restored_on_startup() {
+        // 用户拖动置顶窗口后，重启必须回到同一位置。
+        //
+        // 早前位置只存在内存里，重启就丢——用户每次都要重新摆。
+        let mut ws = Workspace::default();
+        let mut ui = modular_clipboard_core::UiConfig::default();
+        ui.pinned_window_pos = Some(modular_clipboard_core::WindowPos::new(333.0, 222.0));
+
+        ws.apply_saved_positions(&ui);
+
+        let pinned = ws.by_kind(CardKind::Pinned).expect("置顶卡片");
+        assert_eq!(
+            pinned.window_pos,
+            vec2(333.0, 222.0),
+            "配置里的置顶窗口位置应被写回卡片"
+        );
+    }
+
+    #[test]
+    fn missing_saved_position_keeps_default() {
+        // 没有保存过位置时**不能**动卡片——否则会把兜底值
+        // （主窗左侧的计算依据）改掉。
+        let mut ws = Workspace::default();
+        let before = ws.by_kind(CardKind::Pinned).expect("置顶卡片").window_pos;
+        ws.apply_saved_positions(&modular_clipboard_core::UiConfig::default());
+        let after = ws.by_kind(CardKind::Pinned).expect("置顶卡片").window_pos;
+        assert_eq!(before, after, "无保存位置时不应改动");
+    }
+
+    #[test]
+    fn saved_position_does_not_force_window_host() {
+        // ⚠️ 位置持久化与「是否独立成窗」是**两件事**。
+        //
+        // 用户关掉置顶窗口就是不想看到它；下次启动若因为恢复了
+        // 位置就把它重新拉起来，等于用户的关闭操作被无视了。
+        let mut ws = Workspace::default();
+        let mut ui = modular_clipboard_core::UiConfig::default();
+        ui.pinned_window_pos = Some(modular_clipboard_core::WindowPos::new(50.0, 60.0));
+        ws.apply_saved_positions(&ui);
+        assert!(
+            ws.by_kind(CardKind::Pinned)
+                .expect("置顶卡片")
+                .host
+                == CardHost::Docked,
+            "恢复位置不应把停靠卡片变成独立窗口"
+        );
+    }
 
     #[test]
     fn default_workspace_has_pinned_and_history_only() {
