@@ -879,8 +879,6 @@ dependencies = [
  "modular-clipboard-gfx",
  "modular-clipboard-platform",
  "modular-clipboard-store",
- "serde",
- "serde_json",
  "tracing",
  "windows",
 ]
