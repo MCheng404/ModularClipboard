@@ -40,18 +40,30 @@
 //! resize 同理：边缘返回 `HTLEFT`/`HTTOPLEFT` 等，`DefWindowProcW`
 //! 自动进入系统原生缩放循环。
 //!
-//! # 状态为什么是全局的
+//! # 状态是 **per-HWND** 的
 //!
 //! 命中测试在窗口过程里执行，而窗口过程是 `extern "system" fn`，
-//! **拿不到 `Window` 实例**。本项目不做子类化（见 `window.rs` 模块文档的
-//! 架构决策），所以没有 `SetWindowLongPtrW` 写的用户数据可用。
+//! **拿不到 `Window` 实例**；本项目也不做子类化（见 `window.rs` 的
+//! 架构决策），没有 `SetWindowLongPtrW` 写的用户数据可用。
 //!
-//! 拖动区与边框宽度因此放在进程级全局里。这在本项目成立：
-//! **一个进程只有一个主窗口**。若将来要支持多窗口，必须改成子类化——
-//! 那时这些全局量要变成 per-HWND 存储。
+//! 所以退而求其次：用一张**按 HWND 索引**的静态表（`CHROME`）。
+//! 窗口过程拿得到 `hwnd`，足以把状态区分开。
+//!
+//! ⚠️ **曾经是进程级全局，这是错的**。那时本项目只有一个主窗口，
+//! 后来加了卡片子窗口与设置窗口，于是：
+//!
+//! - 新窗口**继承**主窗口的拖动区 ⇒ 设置窗口左上角一整块被判成
+//!   `HTCAPTION`，点击变成拖动，控件点不动；
+//! - `Window::new` 会调 `set_resize_border(默认)` ⇒ **新建一个窗口
+//!   会把主窗口的边框设置也改掉**。
+//!
+//! 症状是「两个窗口互相串味」，而且只在多窗口时出现——单窗口时
+//! 完全测不出来。改成 per-HWND 后这类问题从根上消失。
+//!
+//! 表项在 `Window::drop` 里由 [`forget`] 清理：HWND 会被系统复用，
+//! 不清理的话新窗口可能捡到旧窗口的拖动区。
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use egui::emath::{Pos2, Rect, Vec2};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -213,20 +225,67 @@ pub fn hit_test(pos: Pos2, size: Vec2, border: f32, drag: &[Rect]) -> HitZone {
 /// 症状是「设置打不开、搜索框点不动」，而 paint 层测试全绿。
 const MAX_DRAG_SEGS: usize = 4;
 
-/// 拖动区段，单位**逻辑点**，以 i32×4 的位模式存（原子量里没有 f32）。
+/// 一个窗口的边框与拖动区。
 ///
-/// `DRAG_COUNT` 为 0 表示禁用。
-static DRAG_SEGS: [AtomicI32; MAX_DRAG_SEGS * 4] = [
-    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
-    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
-    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
-    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
-];
-/// 当前有效段数（0..=MAX_DRAG_SEGS）。
-static DRAG_COUNT: AtomicU32 = AtomicU32::new(0);
+/// 见模块文档「状态为什么曾经是全局的」——现在按 HWND 存。
+#[derive(Clone, Default)]
+struct WindowChrome {
+    /// 拖动区段（逻辑点）。空 = 无拖动区。
+    drag: Vec<Rect>,
+    /// resize 边缘宽度（逻辑点）。0 = 不能 resize。
+    border: f32,
+}
 
-/// 边缘宽度，以 `f32` 的**位模式**存（原子量里没有 f32）。
-static RESIZE_BORDER_BITS: AtomicU32 = AtomicU32::new(0);
+/// 按 HWND 索引的窗口外壳状态。
+///
+/// **单线程**访问：`wnd_proc` 与 `set_*` 都在创建窗口的那个线程上跑，
+/// 消息泵不会并发进入。用 `Mutex` 只是为了拿到内部可变性。
+static CHROME: std::sync::OnceLock<std::sync::Mutex<Vec<(isize, WindowChrome)>>> =
+    std::sync::OnceLock::new();
+
+/// 取某窗口的外壳状态（没有就用默认值）。
+///
+/// ⚠️ 窗口在 `WM_NCHITTEST` 时**可能还没登记**（创建早期）。此时返回
+/// 默认（无拖动区、无边框）——比沿用别人的设置安全得多：最坏只是
+/// 那一瞬间不能拖动/缩放。
+fn chrome_of(hwnd: HWND) -> WindowChrome {
+    let key = hwnd.0 as isize;
+    let lock = CHROME.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let Ok(g) = lock.lock() else {
+        return WindowChrome::default();
+    };
+    g.iter()
+        .find(|(h, _)| *h == key)
+        .map(|(_, c)| c.clone())
+        .unwrap_or_default()
+}
+
+/// 写入某窗口的外壳状态。
+fn set_chrome_of(hwnd: HWND, update: impl FnOnce(&mut WindowChrome)) {
+    let key = hwnd.0 as isize;
+    let lock = CHROME.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let Ok(mut g) = lock.lock() else {
+        return;
+    };
+    match g.iter_mut().find(|(h, _)| *h == key) {
+        Some((_, c)) => update(c),
+        None => {
+            let mut c = WindowChrome::default();
+            update(&mut c);
+            g.push((key, c));
+        }
+    }
+}
+
+/// 窗口销毁时清掉它的条目，否则表会随窗口创建销毁无限增长。
+pub fn forget(hwnd: HWND) {
+    let key = hwnd.0 as isize;
+    if let Some(lock) = CHROME.get() {
+        if let Ok(mut g) = lock.lock() {
+            g.retain(|(h, _)| *h != key);
+        }
+    }
+}
 
 /// 设置自绘标题栏（拖动区）的位置，单位逻辑点、客户区坐标系。
 ///
@@ -238,16 +297,28 @@ static RESIZE_BORDER_BITS: AtomicU32 = AtomicU32::new(0);
 /// 因此关闭 / 最小化 / 设置这类按钮必须**画在拖动区之外**，
 /// 或者每帧把拖动区设成「标题栏减去按钮」的矩形。
 ///
-/// 每帧调一次即可：内部只写 4 个原子量，没有系统调用。
-pub fn set_drag_regions(rects: &[Rect]) {
-    let n = rects.len().min(MAX_DRAG_SEGS);
-    for (i, r) in rects.iter().take(n).enumerate() {
-        DRAG_SEGS[i * 4].store(r.min.x.round() as i32, Ordering::Relaxed);
-        DRAG_SEGS[i * 4 + 1].store(r.min.y.round() as i32, Ordering::Relaxed);
-        DRAG_SEGS[i * 4 + 2].store(r.max.x.round() as i32, Ordering::Relaxed);
-        DRAG_SEGS[i * 4 + 3].store(r.max.y.round() as i32, Ordering::Relaxed);
-    }
-    DRAG_COUNT.store(n as u32, Ordering::Relaxed);
+/// ⚠️ **必须传 `hwnd`**：拖动区是**每窗口**的。
+///
+/// 早前这里不收 `hwnd`（状态在进程级全局里），于是设置窗口会继承
+/// 主窗口的拖动区——主窗口顶栏那几段空白的坐标落到设置窗口上，
+/// 那里的点击被判成 `HTCAPTION`，系统发 `WM_NCLBUTTONDOWN` 而非
+/// `WM_LBUTTONDOWN`，egui 收不到：**设置窗口左上角一整块点不动**。
+///
+/// 每帧调一次即可：只改内存里的一个小 Vec，没有系统调用。
+pub fn set_drag_regions(hwnd: HWND, rects: &[Rect]) {
+    let segs: Vec<Rect> = rects
+        .iter()
+        .take(MAX_DRAG_SEGS)
+        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+        // 取整：Win32 命中判定按整数像素，亚像素矩形会漏边。
+        .map(|r| {
+            Rect::from_min_max(
+                Pos2::new(r.min.x.round(), r.min.y.round()),
+                Pos2::new(r.max.x.round(), r.max.y.round()),
+            )
+        })
+        .collect();
+    set_chrome_of(hwnd, |c| c.drag = segs);
 }
 
 /// 设置自绘标题栏（拖动区）的位置，单位逻辑点、客户区坐标系。
@@ -266,48 +337,35 @@ pub fn set_drag_regions(rects: &[Rect]) {
 /// 点齿轮毫无反应（被系统判成 `HTCAPTION`）。而 paint 层交互测试
 /// 全部通过 —— 那条路径要经`WM_NCHITTEST`，测试环境根本不执行。
 /// 所以「测试全绿但实机不可点」在这里是**真实发生过**的。
-///
-/// 每帧调一次即可：内部只写几个原子量，没有系统调用。
-pub fn set_drag_region(rect: Option<Rect>) {
+pub fn set_drag_region(hwnd: HWND, rect: Option<Rect>) {
     match rect {
-        Some(r) => set_drag_regions(std::slice::from_ref(&r)),
-        None => set_drag_regions(&[]),
+        Some(r) => set_drag_regions(hwnd, std::slice::from_ref(&r)),
+        None => set_drag_regions(hwnd, &[]),
     }
 }
 
 /// 一次性设置多段拖动区（推荐）。
-pub fn set_drag_region_multi(rects: &[Rect]) {
-    set_drag_regions(rects);
+pub fn set_drag_region_multi(hwnd: HWND, rects: &[Rect]) {
+    set_drag_regions(hwnd, rects);
 }
 
-/// 当前拖动区的所有段。
-fn drag_regions() -> Vec<Rect> {
-    let n = DRAG_COUNT.load(Ordering::Relaxed) as usize;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n.min(MAX_DRAG_SEGS) {
-        let x0 = DRAG_SEGS[i * 4].load(Ordering::Relaxed);
-        let y0 = DRAG_SEGS[i * 4 + 1].load(Ordering::Relaxed);
-        let x1 = DRAG_SEGS[i * 4 + 2].load(Ordering::Relaxed);
-        let y1 = DRAG_SEGS[i * 4 + 3].load(Ordering::Relaxed);
-        if x1 > x0 && y1 > y0 {
-            out.push(Rect::from_min_max(
-                Pos2::new(x0 as f32, y0 as f32),
-                Pos2::new(x1 as f32, y1 as f32),
-            ));
-        }
-    }
-    out
+/// 当前拖动区的所有段（**指定窗口**）。
+fn drag_regions(hwnd: HWND) -> Vec<Rect> {
+    chrome_of(hwnd).drag
 }
 
-fn resize_border() -> f32 {
-    f32::from_bits(RESIZE_BORDER_BITS.load(Ordering::Relaxed))
+fn resize_border(hwnd: HWND) -> f32 {
+    chrome_of(hwnd).border
 }
 
 /// 设置边缘 resize 的宽度（逻辑点）。
 ///
 /// 每帧可调（跟随边框宽度设置）。
-pub fn set_resize_border(points: f32) {
-    RESIZE_BORDER_BITS.store(points.to_bits(), Ordering::Relaxed);
+///
+/// ⚠️ 同样按 `hwnd` 隔离：`Window::new` 会在建窗时调它，早前因为
+/// 是全局量，**新建一个窗口会把主窗口的边框设置一起改掉**。
+pub fn set_resize_border(hwnd: HWND, points: f32) {
+    set_chrome_of(hwnd, |c| c.border = points.max(0.0));
 }
 
 
@@ -371,7 +429,7 @@ pub(crate) unsafe fn handle_non_client(
     let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
     let pos = Pos2::new(pt.x as f32 / scale, pt.y as f32 / scale);
 
-    let zone = hit_test(pos, size, resize_border(), &drag_regions());
+    let zone = hit_test(pos, size, resize_border(hwnd), &drag_regions(hwnd));
     Some(LRESULT(zone.hit_code() as isize))
 }
 
@@ -596,15 +654,59 @@ mod tests {
         assert_eq!(y_lparam(lp), -32768);
     }
 
-    // ---- 全局状态往返 ----
+    // ---- per-HWND 状态 ----
+
+    /// 测试用的假句柄。
+    ///
+    /// `hit_test` 不碰 Win32，只需要一个能区分身份的值。用明显不像
+    /// 真句柄的数（0xA 起），即便哪天误传给 Win32 也容易看出来。
+    const TEST_HWND_A: HWND = HWND(0xA11 as *mut std::ffi::c_void);
+    const TEST_HWND_B: HWND = HWND(0xB22 as *mut std::ffi::c_void);
+    const TEST_HWND_C: HWND = HWND(0xC33 as *mut std::ffi::c_void);
 
     #[test]
     fn drag_region_round_trips() {
         let r = Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0));
-        set_drag_region(Some(r));
-        assert_eq!(drag_regions(), vec![r]);
-        set_drag_region(None);
-        assert!(drag_regions().is_empty(), "None 必须真的禁用拖动区");
+        set_drag_region(TEST_HWND_A, Some(r));
+        assert_eq!(drag_regions(TEST_HWND_A), vec![r]);
+        set_drag_region(TEST_HWND_A, None);
+        assert!(drag_regions(TEST_HWND_A).is_empty(), "None 必须真的禁用拖动区");
+    }
+
+    /// **窗口之间不得串味**——这是改成 per-HWND 要解决的那个 bug。
+    ///
+    /// 早前拖动区是进程级全局：设置窗口会继承主窗口的拖动区，
+    /// 于是它左上角一整块被判成 `HTCAPTION`，点击变成拖窗、
+    /// 控件点不动。这条守住「A 窗的设置不影响 B 窗」。
+    #[test]
+    fn drag_regions_are_isolated_per_window() {
+        let r = Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0));
+        set_drag_regions(TEST_HWND_A, &[r]);
+        assert_eq!(drag_regions(TEST_HWND_A).len(), 1, "A 窗应有 1 段");
+        assert!(
+            drag_regions(TEST_HWND_B).is_empty(),
+            "B 窗绝不能继承 A 窗的拖动区——那会让 B 的控件点不动"
+        );
+
+        // 边框同理：改 A 不能动 B。
+        set_resize_border(TEST_HWND_A, 6.0);
+        set_resize_border(TEST_HWND_B, 2.0);
+        assert_eq!(resize_border(TEST_HWND_A), 6.0, "A 的边框不应被 B 改掉");
+        assert_eq!(resize_border(TEST_HWND_B), 2.0, "B 的边框不应被 A 改掉");
+
+        // 未登记过的窗口必须拿到**默认值**，而不是别人的设置。
+        assert!(
+            drag_regions(TEST_HWND_C).is_empty(),
+            "未登记窗口必须无拖动区（安全默认）"
+        );
+        assert_eq!(resize_border(TEST_HWND_C), 0.0, "未登记窗口默认无边框");
+
+        // forget 之后彻底清掉。
+        forget(TEST_HWND_A);
+        assert!(
+            drag_regions(TEST_HWND_A).is_empty(),
+            "forget 之后必须彻底清掉，否则 HWND 复用时新窗会捡到旧设置"
+        );
     }
 
     /// **多段**拖动区要能原样往返。
@@ -618,13 +720,13 @@ mod tests {
             Rect::from_min_max(p(80.0, 0.0), p(110.0, 32.0)),
             Rect::from_min_max(p(160.0, 0.0), p(200.0, 32.0)),
         ];
-        set_drag_regions(&segs);
-        assert_eq!(drag_regions().len(), 3, "三段都应保留");
+        set_drag_regions(TEST_HWND_A, &segs);
+        assert_eq!(drag_regions(TEST_HWND_A).len(), 3, "三段都应保留");
         for (i, s) in segs.iter().enumerate() {
-            assert_eq!(drag_regions()[i], *s, "第 {i} 段应原样往返");
+            assert_eq!(drag_regions(TEST_HWND_A)[i], *s, "第 {i} 段应原样往返");
         }
-        set_drag_regions(&[]);
-        assert!(drag_regions().is_empty());
+        set_drag_regions(TEST_HWND_A, &[]);
+        assert!(drag_regions(TEST_HWND_A).is_empty());
     }
 
     /// 拖动区里的点判`Caption`，区外的点判 `Client`。
@@ -650,9 +752,12 @@ mod tests {
 
     #[test]
     fn resize_border_round_trips() {
-        set_resize_border(9.5);
-        assert_eq!(resize_border(), 9.5);
-        set_resize_border(DEFAULT_RESIZE_BORDER);
-        assert_eq!(resize_border(), DEFAULT_RESIZE_BORDER);
+        set_resize_border(TEST_HWND_A, 9.5);
+        assert_eq!(resize_border(TEST_HWND_A), 9.5);
+        set_resize_border(TEST_HWND_A, DEFAULT_RESIZE_BORDER);
+        assert_eq!(resize_border(TEST_HWND_A), DEFAULT_RESIZE_BORDER);
+        // 负值禁用（钳到 0），不该出现负边框。
+        set_resize_border(TEST_HWND_A, -3.0);
+        assert_eq!(resize_border(TEST_HWND_A), 0.0, "负边框应钳到 0");
     }
 }

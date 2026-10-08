@@ -329,7 +329,7 @@ impl Window {
         // 圆角 + 去系统描边。Win10 上失败只记debug，不影响启动。
         chrome::apply_rounded_corners(hwnd);
         // 给一个默认的 resize 边缘；上层可用`set_resize_border` 覆盖。
-        chrome::set_resize_border(chrome::DEFAULT_RESIZE_BORDER);
+        chrome::set_resize_border(hwnd, chrome::DEFAULT_RESIZE_BORDER);
 
         Ok(Self { hwnd, hinstance })
     }
@@ -429,19 +429,19 @@ impl Window {
     ///
     /// 见 [`chrome::set_drag_regions`]。
     pub fn set_drag_region_multi(&self, rects: &[Rect]) {
-        chrome::set_drag_regions(rects);
+        chrome::set_drag_regions(self.hwnd(), rects);
     }
 
     /// 见 [`chrome::set_drag_region`]。
     pub fn set_drag_region(&self, rect: Option<Rect>) {
-        chrome::set_drag_region(rect);
+        chrome::set_drag_region(self.hwnd(), rect);
     }
 
     /// 设置边缘 resize 区宽度，单位**逻辑点**。`<= 0` 禁用 resize。
     ///
     /// 见 [`chrome::set_resize_border`]。
     pub fn set_resize_border(&self, points: f32) {
-        chrome::set_resize_border(points);
+        chrome::set_resize_border(self.hwnd(), points);
     }
 
     /// 主动销毁窗口。
@@ -460,6 +460,13 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
+        // 清掉本窗口的外壳状态（拖动区/边框）。
+        //
+        // ⚠️ 必须显式 forget：那张表按 HWND 索引，窗口反复创建销毁时
+        // 不清理会**无限增长**（每建一个窗口留一条）。HWND 值会被系统
+        // 复用，残留的旧条目还可能让新窗口继承到错误的拖动区——
+        // 正是这次改成 per-HWND 要解决的那类问题。
+        chrome::forget(self.hwnd());
         self.destroy();
     }
 }
