@@ -129,7 +129,20 @@ impl HitZone {
 /// - `border <= 0` ⇒ 只有 `Client` 与 `Caption`（无 resize）。
 /// - 窗口比 `2 * border` 还小（角与角重叠）⇒ `border` 被钳到
 ///   `size / 2`，保证四角判定不会互相吞掉，且中心区始终存在。
-pub fn hit_test(pos: Pos2, size: Vec2, border: f32, drag: Option<Rect>) -> HitZone {
+/// 命中测试。`drag` 是自绘标题栏拖动区（逻辑点、客户区坐标系）。
+///
+/// # ⚠️ 调用方**必须**把交互控件从 `drag` 里排除
+///
+/// 返回 `HitZone::Caption` 会让系统把下一次按下转成
+/// `WM_NCLBUTTONDOWN`（非客户区消息），**根本不会产生
+/// `WM_LBUTTONDOWN`** —— 于是 egui 收不到点击。
+///
+/// 早前 UI 层把**整个顶栏**报成拖动区：
+/// `f.state.drag_region = Some(bar);`，而 `bar` 里含齿轮、垃圾桶、
+/// 搜索框。结果点这些控件毫无反应（表现是「设置打不开」），
+/// 但 paint 层的交互测试**全部通过** —— 测试环境没有
+/// `WM_NCHITTEST`，这条路径在测试里根本不执行。
+pub fn hit_test(pos: Pos2, size: Vec2, border: f32, drag: &[Rect]) -> HitZone {
     let inside = pos.x >= 0.0 && pos.y >= 0.0 && pos.x < size.x && pos.y < size.y;
 
     if !inside {
@@ -173,12 +186,15 @@ pub fn hit_test(pos: Pos2, size: Vec2, border: f32, drag: Option<Rect>) -> HitZo
         }
     }
 
-    if let Some(r) = drag
-        && r.width() > 0.0
-        && r.height() > 0.0
-        && r.contains(pos)
-    {
-        return HitZone::Caption;
+    // 拖动区是**多段**的：控件从中挖空，点任意一段才算标题栏。
+    //
+    // ⚠️ 这里必须逐段判`contains`。早前只有一段（整个顶栏），
+    // 于是齿轮、垃圾桶、搜索框全被算成 `Caption`，
+    // 系统不产生 `WM_LBUTTONDOWN`，egui 收不到点击。
+    for r in drag {
+        if r.width() > 0.0 && r.height() > 0.0 && r.contains(pos) {
+            return HitZone::Caption;
+        }
     }
 
     HitZone::Client
@@ -188,11 +204,26 @@ pub fn hit_test(pos: Pos2, size: Vec2, border: f32, drag: Option<Rect>) -> HitZo
 // 全局外壳状态（窗口过程拿不到实例，见模块文档）
 // ---------------------------------------------------------------------------
 
-/// 拖动区，单位**逻辑点**。`DRAG_X1 <= DRAG_X0` 表示禁用。
-static DRAG_X0: AtomicI32 = AtomicI32::new(0);
-static DRAG_Y0: AtomicI32 = AtomicI32::new(0);
-static DRAG_X1: AtomicI32 = AtomicI32::new(0);
-static DRAG_Y1: AtomicI32 = AtomicI32::new(0);
+/// 拖动区的最大段数。
+///
+/// 为什么需要「多段」：拖动区中间要**挖空**掉交互控件。
+/// 早前只支持单一矩形，于是 UI 层只能把整个顶栏报上来 ——
+/// 而顶栏里有齿轮、垃圾桶、搜索框，点它们会被系统判成标题栏
+/// （`HTCAPTION`）→ 不产生 `WM_LBUTTONDOWN` → egui 收不到点击。
+/// 症状是「设置打不开、搜索框点不动」，而 paint 层测试全绿。
+const MAX_DRAG_SEGS: usize = 4;
+
+/// 拖动区段，单位**逻辑点**，以 i32×4 的位模式存（原子量里没有 f32）。
+///
+/// `DRAG_COUNT` 为 0 表示禁用。
+static DRAG_SEGS: [AtomicI32; MAX_DRAG_SEGS * 4] = [
+    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
+    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
+    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
+    AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0),
+];
+/// 当前有效段数（0..=MAX_DRAG_SEGS）。
+static DRAG_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// 边缘宽度，以 `f32` 的**位模式**存（原子量里没有 f32）。
 static RESIZE_BORDER_BITS: AtomicU32 = AtomicU32::new(0);
@@ -208,48 +239,77 @@ static RESIZE_BORDER_BITS: AtomicU32 = AtomicU32::new(0);
 /// 或者每帧把拖动区设成「标题栏减去按钮」的矩形。
 ///
 /// 每帧调一次即可：内部只写 4 个原子量，没有系统调用。
+pub fn set_drag_regions(rects: &[Rect]) {
+    let n = rects.len().min(MAX_DRAG_SEGS);
+    for (i, r) in rects.iter().take(n).enumerate() {
+        DRAG_SEGS[i * 4].store(r.min.x.round() as i32, Ordering::Relaxed);
+        DRAG_SEGS[i * 4 + 1].store(r.min.y.round() as i32, Ordering::Relaxed);
+        DRAG_SEGS[i * 4 + 2].store(r.max.x.round() as i32, Ordering::Relaxed);
+        DRAG_SEGS[i * 4 + 3].store(r.max.y.round() as i32, Ordering::Relaxed);
+    }
+    DRAG_COUNT.store(n as u32, Ordering::Relaxed);
+}
+
+/// 设置自绘标题栏（拖动区）的位置，单位逻辑点、客户区坐标系。
+///
+/// 传空切片关闭拖动区（此时只有边缘能 resize，标题栏区域归 egui）。
+///
+/// # 上层**必须**把自己的控件排除在拖动区外
+///
+/// 落在矩形**内**的按下会被系统拿走变成拖动，egui 收不到。
+/// 因此关闭 / 最小化 / 设置 / 搜索框这类控件必须**挖空**：
+/// 传「标题栏减去控件」的**多段**矩形。
+///
+/// # 只有单段接口的老坑
+///
+/// 本函数早期只接受 `Option<Rect>`，于是 UI 层把**整个顶栏**报上来，
+/// 点齿轮毫无反应（被系统判成 `HTCAPTION`）。而 paint 层交互测试
+/// 全部通过 —— 那条路径要经`WM_NCHITTEST`，测试环境根本不执行。
+/// 所以「测试全绿但实机不可点」在这里是**真实发生过**的。
+///
+/// 每帧调一次即可：内部只写几个原子量，没有系统调用。
 pub fn set_drag_region(rect: Option<Rect>) {
     match rect {
-        Some(r) => {
-            DRAG_X0.store(r.min.x.round() as i32, Ordering::Relaxed);
-            DRAG_Y0.store(r.min.y.round() as i32, Ordering::Relaxed);
-            DRAG_X1.store(r.max.x.round() as i32, Ordering::Relaxed);
-            DRAG_Y1.store(r.max.y.round() as i32, Ordering::Relaxed);
-        }
-        None => {
-            // 用 x1 <= x0 表示禁用，避免额外一个「是否有效」标志位。
-            DRAG_X1.store(0, Ordering::Relaxed);
-            DRAG_X0.store(0, Ordering::Relaxed);
-            DRAG_Y0.store(0, Ordering::Relaxed);
-            DRAG_Y1.store(0, Ordering::Relaxed);
-        }
+        Some(r) => set_drag_regions(std::slice::from_ref(&r)),
+        None => set_drag_regions(&[]),
     }
 }
 
-/// 当前拖动区。
-fn drag_region() -> Option<Rect> {
-    let x0 = DRAG_X0.load(Ordering::Relaxed);
-    let y0 = DRAG_Y0.load(Ordering::Relaxed);
-    let x1 = DRAG_X1.load(Ordering::Relaxed);
-    let y1 = DRAG_Y1.load(Ordering::Relaxed);
-    if x1 <= x0 || y1 <= y0 {
-        return None;
-    }
-    Some(Rect::from_min_max(
-        Pos2::new(x0 as f32, y0 as f32),
-        Pos2::new(x1 as f32, y1 as f32),
-    ))
+/// 一次性设置多段拖动区（推荐）。
+pub fn set_drag_region_multi(rects: &[Rect]) {
+    set_drag_regions(rects);
 }
 
-/// 设置边缘 resize 区宽度，单位**逻辑点**。`<= 0` 表示禁用 resize。
+/// 当前拖动区的所有段。
+fn drag_regions() -> Vec<Rect> {
+    let n = DRAG_COUNT.load(Ordering::Relaxed) as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n.min(MAX_DRAG_SEGS) {
+        let x0 = DRAG_SEGS[i * 4].load(Ordering::Relaxed);
+        let y0 = DRAG_SEGS[i * 4 + 1].load(Ordering::Relaxed);
+        let x1 = DRAG_SEGS[i * 4 + 2].load(Ordering::Relaxed);
+        let y1 = DRAG_SEGS[i * 4 + 3].load(Ordering::Relaxed);
+        if x1 > x0 && y1 > y0 {
+            out.push(Rect::from_min_max(
+                Pos2::new(x0 as f32, y0 as f32),
+                Pos2::new(x1 as f32, y1 as f32),
+            ));
+        }
+    }
+    out
+}
+
+fn resize_border() -> f32 {
+    f32::from_bits(RESIZE_BORDER_BITS.load(Ordering::Relaxed))
+}
+
+/// 设置边缘 resize 的宽度（逻辑点）。
+///
+/// 每帧可调（跟随边框宽度设置）。
 pub fn set_resize_border(points: f32) {
     RESIZE_BORDER_BITS.store(points.to_bits(), Ordering::Relaxed);
 }
 
-/// 当前边缘宽度，逻辑点。
-fn resize_border() -> f32 {
-    f32::from_bits(RESIZE_BORDER_BITS.load(Ordering::Relaxed))
-}
 
 // ---------------------------------------------------------------------------
 // Win32 层
@@ -311,7 +371,7 @@ pub(crate) unsafe fn handle_non_client(
     let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
     let pos = Pos2::new(pt.x as f32 / scale, pt.y as f32 / scale);
 
-    let zone = hit_test(pos, size, resize_border(), drag_region());
+    let zone = hit_test(pos, size, resize_border(), &drag_regions());
     Some(LRESULT(zone.hit_code() as isize))
 }
 
@@ -364,28 +424,28 @@ mod tests {
     /// 中心永远应该是客户区。
     #[test]
     fn center_is_client() {
-        assert_eq!(hit_test(p(200.0, 300.0), SIZE, B, None), HitZone::Client);
+        assert_eq!(hit_test(p(200.0, 300.0), SIZE, B, &[]), HitZone::Client);
     }
 
     #[test]
     fn no_drag_region_means_only_edges_are_special() {
         let drag = Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0));
         // 拖动区被忽略（传 None）
-        assert_eq!(hit_test(p(200.0, 10.0), SIZE, B, None), HitZone::Client);
+        assert_eq!(hit_test(p(200.0, 10.0), SIZE, B, &[]), HitZone::Client);
         // 传了才生效
         assert_eq!(
-            hit_test(p(200.0, 10.0), SIZE, B, Some(drag)),
+            hit_test(p(200.0, 10.0), SIZE, B, &[drag]),
             HitZone::Caption
         );
     }
 
     #[test]
     fn four_corners_map_to_four_zones() {
-        assert_eq!(hit_test(p(0.0, 0.0), SIZE, B, None), HitZone::TopLeft);
-        assert_eq!(hit_test(p(399.9, 0.0), SIZE, B, None), HitZone::TopRight);
-        assert_eq!(hit_test(p(0.0, 599.9), SIZE, B, None), HitZone::BottomLeft);
+        assert_eq!(hit_test(p(0.0, 0.0), SIZE, B, &[]), HitZone::TopLeft);
+        assert_eq!(hit_test(p(399.9, 0.0), SIZE, B, &[]), HitZone::TopRight);
+        assert_eq!(hit_test(p(0.0, 599.9), SIZE, B, &[]), HitZone::BottomLeft);
         assert_eq!(
-            hit_test(p(399.9, 599.9), SIZE, B, None),
+            hit_test(p(399.9, 599.9), SIZE, B, &[]),
             HitZone::BottomRight
         );
     }
@@ -393,20 +453,20 @@ mod tests {
     #[test]
     fn four_edges_map_to_four_zones() {
         // 取每条边的中点，避开角
-        assert_eq!(hit_test(p(200.0, 1.0), SIZE, B, None), HitZone::Top);
-        assert_eq!(hit_test(p(200.0, 598.0), SIZE, B, None), HitZone::Bottom);
-        assert_eq!(hit_test(p(1.0, 300.0), SIZE, B, None), HitZone::Left);
-        assert_eq!(hit_test(p(398.0, 300.0), SIZE, B, None), HitZone::Right);
+        assert_eq!(hit_test(p(200.0, 1.0), SIZE, B, &[]), HitZone::Top);
+        assert_eq!(hit_test(p(200.0, 598.0), SIZE, B, &[]), HitZone::Bottom);
+        assert_eq!(hit_test(p(1.0, 300.0), SIZE, B, &[]), HitZone::Left);
+        assert_eq!(hit_test(p(398.0, 300.0), SIZE, B, &[]), HitZone::Right);
     }
 
     /// 边缘优先于标题栏——否则顶部边缘永远拉不动。
     #[test]
     fn edges_take_priority_over_drag_region() {
         let drag = Rect::from_min_max(p(0.0, 0.0), p(400.0, 40.0));
-        assert_eq!(hit_test(p(200.0, 2.0), SIZE, B, Some(drag)), HitZone::Top);
+        assert_eq!(hit_test(p(200.0, 2.0), SIZE, B, &[drag]), HitZone::Top);
         // 离开边缘后才落到标题栏
         assert_eq!(
-            hit_test(p(200.0, 20.0), SIZE, B, Some(drag)),
+            hit_test(p(200.0, 20.0), SIZE, B, &[drag]),
             HitZone::Caption
         );
     }
@@ -414,16 +474,16 @@ mod tests {
     #[test]
     fn drag_region_excludes_everything_outside() {
         let drag = Rect::from_min_max(p(10.0, 4.0), p(390.0, 30.0));
-        assert_eq!(hit_test(p(9.0, 10.0), SIZE, B, Some(drag)), HitZone::Client);
-        assert_eq!(hit_test(p(200.0, 31.0), SIZE, B, Some(drag)), HitZone::Client);
-        assert_eq!(hit_test(p(200.0, 10.0), SIZE, B, Some(drag)), HitZone::Caption);
+        assert_eq!(hit_test(p(9.0, 10.0), SIZE, B, &[drag]), HitZone::Client);
+        assert_eq!(hit_test(p(200.0, 31.0), SIZE, B, &[drag]), HitZone::Client);
+        assert_eq!(hit_test(p(200.0, 10.0), SIZE, B, &[drag]), HitZone::Caption);
     }
 
     #[test]
     fn zero_border_disables_resize() {
         for (x, y) in [(0.0, 0.0), (1.0, 1.0), (399.0, 599.0)] {
             assert_eq!(
-                hit_test(p(x, y), SIZE, 0.0, None),
+                hit_test(p(x, y), SIZE, 0.0, &[]),
                 HitZone::Client,
                 "border=0 时 ({x},{y}) 不该是边缘"
             );
@@ -432,7 +492,7 @@ mod tests {
 
     #[test]
     fn negative_border_is_treated_as_disabled() {
-        assert_eq!(hit_test(p(0.0, 0.0), SIZE, -5.0, None), HitZone::Client);
+        assert_eq!(hit_test(p(0.0, 0.0), SIZE, -5.0, &[]), HitZone::Client);
     }
 
     /// 小窗口：角会重叠，必须钳制而不是让某个分支永远不成立。
@@ -440,22 +500,22 @@ mod tests {
     fn tiny_window_still_has_all_four_corners() {
         let size = Vec2::new(8.0, 8.0);
         let b = 6.0; // 大于 size/2
-        assert_eq!(hit_test(p(0.0, 0.0), size, b, None), HitZone::TopLeft);
-        assert_eq!(hit_test(p(7.9, 0.0), size, b, None), HitZone::TopRight);
-        assert_eq!(hit_test(p(0.0, 7.9), size, b, None), HitZone::BottomLeft);
-        assert_eq!(hit_test(p(7.9, 7.9), size, b, None), HitZone::BottomRight);
+        assert_eq!(hit_test(p(0.0, 0.0), size, b, &[]), HitZone::TopLeft);
+        assert_eq!(hit_test(p(7.9, 0.0), size, b, &[]), HitZone::TopRight);
+        assert_eq!(hit_test(p(0.0, 7.9), size, b, &[]), HitZone::BottomLeft);
+        assert_eq!(hit_test(p(7.9, 7.9), size, b, &[]), HitZone::BottomRight);
     }
 
     #[test]
     fn degenerate_size_does_not_panic() {
         for size in [Vec2::ZERO, Vec2::new(f32::NAN, 10.0), Vec2::new(-5.0, -5.0)] {
-            let _ = hit_test(p(0.0, 0.0), size, B, None);
+            let _ = hit_test(p(0.0, 0.0), size, B, &[]);
         }
     }
 
     #[test]
     fn nan_border_does_not_panic() {
-        let _ = hit_test(p(1.0, 1.0), SIZE, f32::NAN, None);
+        let _ = hit_test(p(1.0, 1.0), SIZE, f32::NAN, &[]);
     }
 
     /// 指针在窗口外一律 Client：否则鼠标移出去时窗口仍被"抓住"。
@@ -464,7 +524,7 @@ mod tests {
         let drag = Rect::from_min_max(p(-100.0, -100.0), p(900.0, 900.0));
         for pos in [p(-1.0, 10.0), p(10.0, -1.0), p(401.0, 10.0), p(10.0, 601.0)] {
             assert_eq!(
-                hit_test(pos, SIZE, B, Some(drag)),
+                hit_test(pos, SIZE, B, &[drag]),
                 HitZone::Client,
                 "{pos:?} 在窗口外却不是 Client"
             );
@@ -474,7 +534,7 @@ mod tests {
     #[test]
     fn zero_area_drag_region_is_ignored() {
         let empty = Rect::from_min_max(p(10.0, 10.0), p(10.0, 10.0));
-        assert_eq!(hit_test(p(10.0, 10.0), SIZE, B, Some(empty)), HitZone::Client);
+        assert_eq!(hit_test(p(10.0, 10.0), SIZE, B, &[empty]), HitZone::Client);
     }
 
     #[test]
@@ -540,13 +600,52 @@ mod tests {
 
     #[test]
     fn drag_region_round_trips() {
-        set_drag_region(Some(Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0))));
-        assert_eq!(
-            drag_region(),
-            Some(Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0)))
-        );
+        let r = Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0));
+        set_drag_region(Some(r));
+        assert_eq!(drag_regions(), vec![r]);
         set_drag_region(None);
-        assert_eq!(drag_region(), None, "None 必须真的禁用拖动区");
+        assert!(drag_regions().is_empty(), "None 必须真的禁用拖动区");
+    }
+
+    /// **多段**拖动区要能原样往返。
+    ///
+    /// 单一矩形的接口撑不住「控件从中挖空」的需求 ——
+    /// 顶栏里的齿轮/垃圾桶/搜索框必须排除在外，否则实机点不动。
+    #[test]
+    fn multi_drag_regions_round_trip() {
+        let segs = [
+            Rect::from_min_max(p(0.0, 0.0), p(30.0, 32.0)),
+            Rect::from_min_max(p(80.0, 0.0), p(110.0, 32.0)),
+            Rect::from_min_max(p(160.0, 0.0), p(200.0, 32.0)),
+        ];
+        set_drag_regions(&segs);
+        assert_eq!(drag_regions().len(), 3, "三段都应保留");
+        for (i, s) in segs.iter().enumerate() {
+            assert_eq!(drag_regions()[i], *s, "第 {i} 段应原样往返");
+        }
+        set_drag_regions(&[]);
+        assert!(drag_regions().is_empty());
+    }
+
+    /// 拖动区里的点判`Caption`，区外的点判 `Client`。
+    ///
+    /// 这是「控件能否被点到」的**真正判据**：`Caption` 会让系统
+    /// 发 `WM_NCLBUTTONDOWN` 而不产生 `WM_LBUTTONDOWN`，egui 收不到点击。
+    #[test]
+    fn hit_zone_differs_inside_and_outside_drag() {
+        let segs = [
+            Rect::from_min_max(p(0.0, 0.0), p(30.0, 32.0)),
+            Rect::from_min_max(p(160.0, 0.0), p(200.0, 32.0)),
+        ];
+        // 段内 → Caption（可拖）
+        assert_eq!(hit_test(p(15.0, 16.0), SIZE, 0.0, &segs), HitZone::Caption);
+        assert_eq!(hit_test(p(180.0, 16.0), SIZE, 0.0, &segs), HitZone::Caption);
+        // 段间（模拟齿轮/垃圾桶所在处）→ Client（可点）
+        assert_eq!(
+            hit_test(p(100.0, 16.0), SIZE, 0.0, &segs),
+            HitZone::Client,
+            "两段之间的控件区必须判 Client，否则实机点不动"
+        );
     }
 
     #[test]

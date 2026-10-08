@@ -417,6 +417,21 @@ impl Window {
     /// 每帧调一次即可（内部只写 4 个原子量，无系统调用）。
     /// 传 `None` 关闭拖动区。
     ///
+    /// 设置自绘标题栏拖动区（**多段**，推荐）。
+    ///
+    /// ⚠️ 交互控件**必须**从拖动区里挖空：落在拖动区内的按下会被
+    /// 系统转成 `WM_NCLBUTTONDOWN`（`HTCAPTION`），**不产生
+    /// `WM_LBUTTONDOWN`** —— egui 于是收不到点击。
+    ///
+    /// 症状（真实发生过）：整个顶栏报成一段拖动区，于是齿轮、垃圾桶、
+    /// 搜索框全都点不动，而 paint 层 12 条交互测试**全绿**——
+    /// 那条路径要经 `WM_NCHITTEST`，测试环境根本不执行。
+    ///
+    /// 见 [`chrome::set_drag_regions`]。
+    pub fn set_drag_region_multi(&self, rects: &[Rect]) {
+        chrome::set_drag_regions(rects);
+    }
+
     /// 见 [`chrome::set_drag_region`]。
     pub fn set_drag_region(&self, rect: Option<Rect>) {
         chrome::set_drag_region(rect);

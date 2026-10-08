@@ -238,7 +238,8 @@ pub fn run_with_options(
     let mut minimized = false;
     // 上一帧记进日志的拖动区。只在**变化时**打日志——每帧都打会把
     // debug 日志刷成流水账，而拖动区平时是稳定的。
-    let mut last_drag_logged: Option<egui::Rect> = None;
+    // 拖动区段数（仅用于日志去重）。
+    let mut last_drag_count = usize::MAX;
 
     while !quit {
         // ---- 1. 事件 ----
@@ -387,17 +388,11 @@ pub fn run_with_options(
         // 调用，代价可忽略）：只在启动时设一次的话，窗口 resize 或
         // 模块折叠/浮动之后矩形就对不上了，表现为「刚启动能拖，
         // 拖一会儿就拖不动了」。
-        let drag = app.drag_region();
-        window.set_drag_region(drag);
-        if drag != last_drag_logged {
-            match drag {
-                Some(r) => tracing::debug!(
-                    x = r.min.x, y = r.min.y, w = r.width(), h = r.height(),
-                    "拖动区已更新"
-                ),
-                None => tracing::debug!("拖动区为空（标题栏被压没或窗口过窄）"),
-            }
-            last_drag_logged = drag;
+        let drag = app.drag_regions();
+        window.set_drag_region_multi(drag);
+        if drag.len() != last_drag_count {
+            tracing::debug!(段数 = drag.len(), "拖动区已更新");
+            last_drag_count = drag.len();
         }
 
         // ---- 2.3 标题栏窗口按钮 ----
@@ -927,11 +922,15 @@ impl App {
     }
 
     /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。
-    pub fn drag_region(&self) -> Option<egui::Rect> {
+    pub fn drag_regions(&self) -> &[egui::Rect] {
         // 新架构的拖动区由 `paint::draw_topbar` 每帧写入。
         // 旧的 `local.drag_region` 已不再更新——保留读旧字段会拿到
-        // 永远为None 的值，表现为「窗口拖不动」。
-        self.paint_state.drag_region
+        // 永远为 None 的值，表现为「窗口拖不动」。
+        //
+        // ⚠️ 是**多段**：顶栏里的齿轮、垃圾桶、搜索框必须从拖动区里
+        // 挖空，否则它们会被系统判成标题栏（`HTCAPTION`）→
+        // 不产生 `WM_LBUTTONDOWN` → egui 收不到点击。
+        &self.paint_state.drag_regions
     }
 
     /// 取出并清掉「标题栏关闭按钮」请求。

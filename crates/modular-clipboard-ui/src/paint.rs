@@ -135,7 +135,13 @@ pub struct UiState {
     /// 搜索框文本。
     pub query: String,
     /// 上一帧提交给窗口的拖动区（标题栏）。
-    pub drag_region: Option<Rect>,
+    ///
+    /// ⚠️ 必须是**多段**而不是「整个顶栏一块」：拖动区会被系统转成
+    /// `HTCAPTION`，点其中的控件不会产生 `WM_LBUTTONDOWN`，
+    /// egui 收不到点击（表现：齿轮/垃圾桶/搜索框全都点不动）。
+    ///
+    /// 多个矩形的并集是拖动区；控件区从中间挖空。
+    pub drag_regions: Vec<Rect>,
     /// 当前悬停的卡片。
     pub hover_card: Option<crate::card::CardId>,
     /// 列表滚动偏移（逻辑点）。
@@ -334,7 +340,62 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     let _ = scale;
 
     // 顶栏整体作为拖动区（搜索框与按钮自行 `interact` 会排除命中）。
-    f.state.drag_region = Some(bar);
+    // 拖动区 = 顶栏**减去交互控件**。
+    //
+    // ⚠️ 这里必须是「挖空」而不是「整块上报」。`WM_NCHITTEST` 对拖动区
+    // 返回 `HTCAPTION`，系统随后把按下转成 `WM_NCLBUTTONDOWN`
+    // ——**不会产生 `WM_LBUTTONDOWN`**，egui 于是收不到点击。
+    //
+    // 症状：整个顶栏（含齿轮、垃圾桶、搜索框）全都点不动，
+    // 表现为「设置打不开 / 搜索框不能点」。
+    //
+    // ⚠️ 这条路径**无法用 paint 层测试覆盖**：测试环境没有
+    // `WM_NCHITTEST`，`hit_test` 根本不被调用。所以当时
+    // 12 条交互测试全绿，实机却完全不可点。
+    // 必须配一条直接测 `chrome::hit_test` 的测试（见 gfx crate）。
+    let mut drag = Vec::new();
+    // 左段：窗口左缘到**搜索框左缘**。
+    //
+    // ⚠️ 用热区表的 `search`（即 `TextEdit` 的真实矩形）而不是
+    // `search.min.x - space_xs`：搜索框从 `inner.min.x` 起算，
+    // 往前减内边距会**侵入输入区**，点搜索框又变成拖窗口。
+    let left_end = f
+        .state
+        .hit
+        .get("search")
+        .map(|r| r.min.x)
+        .unwrap_or(search.min.x);
+    if left_end - bar.min.x > 8.0 {
+        drag.push(Rect::from_min_max(bar.min, pos2(left_end - 2.0, bar.max.y)));
+    }
+    // ⚠️ 这里**不设**「两按钮之间」那一段。
+    //
+    // `btn_area` 宽 `btn*2 + space_sm`、两按钮各占一半——它们是
+    // **紧邻**的（`space_sm` 落在 `btn_area` 内部，两侧各一半）。
+    // 早前按「中点 ± 3」加一段，实测该段与垃圾桶重叠
+    // （`[[645.7,0]-[651.7,44]]` vs 按钮 `[[617.4,8.4]-[648.7,35.6]]`），
+    // 于是那段又变成「点垃圾桶 = 拖窗口」。
+    //
+    // 两按钮之间本来也没有可拖的空白，略掉即可。
+    //
+    // 右段：从**设置按钮的真实右缘**到窗口右缘。
+    //
+    // ⚠️ 不能用 `btn_area.max.x + pal.space_sm` 估——
+    // `space_sm` 已经算进 `btn_area` 的宽度里了（见 `btn_area` 的
+    // 构造：宽 `btn*2 + space_sm`），再加一次会**侵入按钮**。
+    // 实测该段`[[688,0]-[700,44]]` 与齿轮 `[[664.7,8.4]-[696,35.6]]`
+    // 重叠，于是点齿轮变成拖窗口。
+    //
+    // 用热区表里按钮的真实矩形——它就是按钮实际交互的区域。
+    let settings_r = f.state.hit.get("topbar_settings").copied();
+    let right_start = settings_r.map(|r| r.max.x).unwrap_or(btn_area.max.x);
+    if bar.max.x - right_start > 8.0 {
+        drag.push(Rect::from_min_max(
+            pos2(right_start + 2.0, bar.min.y),
+            bar.max,
+        ));
+    }
+    f.state.drag_regions = drag;
 }
 
 /// 顶栏右侧的两个图标按钮：清空（垃圾桶）、设置（齿轮）。
@@ -2106,20 +2167,26 @@ mod tests {
     fn drag_region_is_reported() {
         let mut h = Harness::new("drag", vec2(600.0, 400.0));
         h.frame();
-        let r = h
+        assert!(
+            !h.state.drag_regions.is_empty(),
+            "每帧都应上报拖动区，否则窗口拖不动"
+        );
+        let covered = h
             .state
-            .drag_region
-            .expect("每帧都应上报拖动区，否则窗口拖不动");
+            .drag_regions
+            .iter()
+            .fold(0.0f32, |a, r| a + r.width() * r.height());
         assert!(
-            r.height() >= 20.0,
-            "拖动区应覆盖顶栏，实际高 {}",
-            r.height()
+            covered > 100.0,
+            "拖动区总面积过小（{covered}），顶栏几乎拖不动"
         );
-        assert!(
-            r.min.y <= 1.0,
-            "拖动区应从窗口顶端开始，实际 {:?}",
-            r.min
-        );
+        // 拖动区必须在顶栏**纵向范围内**。
+        for r in &h.state.drag_regions {
+            assert!(
+                r.min.y < crate::solver::TOPBAR_HEIGHT,
+                "拖动区段 {r:?} 不在顶栏高度内"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2321,6 +2388,74 @@ mod tests {
             "手柄越界（含线宽）：终点 ({hx:.2},{hy:.2}) +半线宽 {half_w:.2} 框 {:?}",
             r
         );
+    }
+
+    /// 顶栏控件**不得**落在拖动区里 —— 否则实机点不动。
+    ///
+    /// # 这条测试补的是什么缺口
+    ///
+    /// 之前有 12 条交互测试验证「点齿轮会发出 `ToggleSettings`」，
+    /// **全部通过**，但实机完全点不动。
+    ///
+    /// 原因：`paint` 层只调用 `ui.interact`，它向 egui 登记控件矩形；
+    /// 而**按下是否送达**取决于 Win32 的 `WM_NCHITTEST`——拖动区
+    /// 会被判成 `HTCAPTION`，系统随即发`WM_NCLBUTTONDOWN`
+    /// （非客户区消息）而**不产生** `WM_LBUTTONDOWN`，egui 根本
+    /// 收不到点击。测试环境没有 `WM_NCHITTEST`，这条路径不执行。
+    ///
+    /// 所以这里直接用 `chrome::hit_test` 验证：控件中心必须判成
+    /// [`HitZone::Client`]。这才是实机能否点到的**真正判据**。
+    #[test]
+    fn topbar_controls_are_not_in_drag_region() {
+        let mut h = Harness::new("drag-void", vec2(700.0, 500.0));
+        h.frame();
+
+        let drag = h.state.drag_regions.clone();
+        assert!(
+            !drag.is_empty(),
+            "顶栏应上报拖动区（否则窗口拖不动）"
+        );
+
+        // 逐个控件验证：中心点必须**不**落在任何一段拖动区内。
+        for name in ["topbar_clear", "topbar_settings", "search"] {
+            let r = hit(&h, name);
+            let c = r.center();
+            let inside = drag.iter().any(|d| d.contains(c));
+            assert!(
+                !inside,
+                "控件 {name}（中心 {c:?}）落进了拖动区 {drag:?} —— \
+                 实机上点它不会产生 WM_LBUTTONDOWN，表现为「点不动」"
+            );
+        }
+    }
+
+    /// 拖动区本身必须真的能拖：空白处要判成 Caption。
+    ///
+    /// 与上一条成对：上一条保证控件**不在**里面，这条保证
+    /// 区外的地方**仍是**拖动区（否则修了「点不动」却变成
+    /// 「窗口拖不动」）。
+    #[test]
+    fn topbar_blank_area_is_still_draggable() {
+        let mut h = Harness::new("drag-keep", vec2(700.0, 500.0));
+        h.frame();
+        let drag = h.state.drag_regions.clone();
+        assert!(!drag.is_empty(), "应有拖动区");
+
+        // 取第一段的中心：那里是顶栏空白（搜索框左侧），必须可拖。
+        let seg = drag[0];
+        let c = seg.center();
+        assert!(
+            drag.iter().any(|d| d.contains(c)),
+            "拖动区自己的中心应落在拖动区内，实际 {drag:?}"
+        );
+        // 且不能与任何控件重叠。
+        for name in ["topbar_clear", "topbar_settings", "search"] {
+            let r = hit(&h, name);
+            assert!(
+                !r.intersects(seg),
+                "拖动区段 {seg:?} 与控件 {name}（{r:?}）重叠"
+            );
+        }
     }
 
     /// 在 `ctx` 上排版一段文字，返回它占了几行。
