@@ -1489,25 +1489,52 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
         }
     }
 
-    // 虚拟化：定位到第一条可视行，只画到超出可视区为止。
-    let first = offsets.partition_point(|&o| o + ROW_HEIGHT_MIN <= f.state.scroll_offset);
-    for i in first..items.len() {
-        let y = body.min.y + offsets[i] - f.state.scroll_offset;
-        if y > body.max.y {
-            break; // 已越过可视区底部
-        }
-        let r = Rect::from_min_size(pos2(body.min.x, y), vec2(body.width(), heights[i]));
-        // 裁到可视区：画到区外的内容会被 scissor 裁掉，但白白产生几何。
-        if r.max.y < body.min.y {
-            continue;
-        }
-        draw_item_row(f, r, &items[i]);
-    }
-
-    // 滚动条：内容超高时才显示。
-    if content_h > body.height() {
-        draw_scrollbar(f, body, f.state.scroll_offset / max_scroll.max(1.0), content_h);
-    }
+    // # 为什么用 `ScrollArea::show` 而不是 `show_rows`
+    //
+    // `show_rows` 要求**恒定行高**（参数就叫 `row_height_sans_spacing`），
+    // 而本列表的行高是**逐条算出来**的（[`row_height_for`]）——
+    // 预览长度差异极大，固定行高要么截断长内容、要么给短内容留白。
+    // 那是早前 40pt 固定行高被用户否决过的方案。
+    //
+    // 所以用 `show` + 自己做虚拟化：外层 `ScrollArea` 提供**裁剪与
+    // 滚动条**（这两件事手写最容易出错），内层仍按前缀和只画可视行。
+    //
+    // 顺带解决了一个旧缺陷：自绘滚动条的滑块长度曾用
+    // 「可视高 / 固定行高」反推行数，算出来恒为 1（永远是满格），
+    // 现在交给 egui 按真实内容高算。
+    let mut list_ui = f.ui.new_child(
+        egui::UiBuilder::new()
+            .id(egui::Id::new(("list", only_pinned.unwrap_or(false))))
+            .max_rect(body)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    egui::ScrollArea::vertical()
+        // ⚠️ 0.36 用 `id_salt`（不再是旧版的 `id_source`）。
+        // 必须给：主栏与内嵌置顶区是两个独立列表，共用默认 Id 会
+        // 共享滚动位置——滚主栏会把置顶区一起带走。
+        .id_salt(("history_scroll", only_pinned.unwrap_or(false)))
+        .max_height(body.height())
+        .vertical_scroll_offset(f.state.scroll_offset)
+        .auto_shrink([false, false])
+        .show(&mut list_ui, |ui| {
+            // 内容高度决定滚动条比例，必须显式给出，否则 egui 按
+            // 「子控件实际占用」算，而虚拟化下只画了可视行 ⇒ 比例失真。
+            ui.set_height(content_h);
+            // 虚拟化：定位到第一条可视行，只画到超出可视区为止。
+            let scroll = f.state.scroll_offset;
+            let first = offsets.partition_point(|&o| o + ROW_HEIGHT_MIN <= scroll);
+            for i in first..items.len() {
+                let y = offsets[i] - scroll;
+                if y > body.height() {
+                    break; // 已越过可视区底部
+                }
+                let r = Rect::from_min_size(pos2(0.0, y), vec2(body.width(), heights[i]));
+                if r.max.y < 0.0 {
+                    continue;
+                }
+                draw_item_row(f, ui, r, &items[i]);
+            }
+        });
 }
 
 /// 列表行的**最小**高度（逻辑点）。
@@ -1572,28 +1599,6 @@ fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, tex
 
     // 上下内边距 + 预览 + 行间2pt + 来源/时间
     (text_h + meta_h + 5.0 * 2.0 + 2.0).max(ROW_HEIGHT_MIN)
-}
-
-/// 画细滚动条。`t` 是滚动比例 `[0,1]`，`content_h` 是内容总高。
-fn draw_scrollbar(f: &mut Frame<'_>, body: Rect, t: f32, content_h: f32) {
-    let pal = f.pal;
-    let w = 6.0;
-    let track = Rect::from_min_size(
-        pos2(body.max.x - w - 2.0, body.min.y),
-        vec2(w, body.height()),
-    );
-    // 滑块长度 = 可视高 / 内容高 × 轨道长。
-    //
-    // ⚠️ 必须用**真实内容高**算。早前版本用 `可视高 / ROW_HEIGHT`
-    // 反推行数，那算的是「屏幕上放得下几行」而不是「一共有几行」，
-    // 结果滑块永远是满格（比例恒为 1），内容超出时看不出能滚。
-    let ratio = (body.height() / content_h.max(1.0)).clamp(0.06, 1.0);
-    let thumb_h = (body.height() * ratio).max(28.0);
-    let y = body.min.y + t.clamp(0.0, 1.0) * (body.height() - thumb_h);
-    let thumb = Rect::from_min_size(pos2(track.min.x, y), vec2(w, thumb_h));
-    let p = f.ui.painter_at(track);
-    p.rect_filled(track, w / 2.0, pal.surface_variant);
-    p.rect_filled(thumb, w / 2.0, pal.border);
 }
 
 fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
@@ -1688,7 +1693,7 @@ fn draw_empty(f: &mut Frame<'_>, body: Rect, msg: &str) {
     );
 }
 
-fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
+fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let pal = f.pal;
     let scale = f.scale;
     let selected = f.svc.state.selected == Some(item.id);
@@ -1696,7 +1701,7 @@ fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
     let resp = f
         .ui
         .interact(r, egui::Id::new(("row", item.id)), Sense::click());
-    let painter = f.ui.painter_at(r);
+    let painter = ui.painter_at(r);
     if selected {
         painter.rect_filled(r, CornerRadius::ZERO, pal.row_selected);
         painter.rect_filled(
@@ -1728,7 +1733,7 @@ fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
 
     // 左侧类型图标，垂直居中。
     crate::icons::Icon::for_kind(item.kind).paint(
-        &f.ui.painter_at(r),
+        &ui.painter_at(r),
         Rect::from_center_size(
             pos2(
                 r.min.x + icon_w * 0.5,
@@ -1792,7 +1797,7 @@ fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
         // 长路径/无空格的长串要在任意字符间断行，否则会横向溢出。
         job.wrap.break_anywhere = true;
         let galley = f.ui.painter().layout_job(job);
-        f.ui.painter_at(preview_band)
+        ui.painter_at(preview_band)
             .galley(pos2(preview_band.min.x, preview_band.min.y), galley, pal.text);
     }
 
@@ -1802,7 +1807,7 @@ fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
     if !meta_shown.is_empty() {
         // ⚠️ painter_at(meta_band)：来源名可能很长（长 exe 路径），
         // 根 painter 会让它横跨到相邻卡片上。
-        f.ui.painter_at(meta_band).text(
+        ui.painter_at(meta_band).text(
             meta_band.left_center(),
             Align2::LEFT_CENTER,
             meta_shown,
@@ -1850,7 +1855,7 @@ fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
         if b.min.x < text_x1 {
             break; // 卡片太窄，放不下就不画操作
         }
-        let rr = f.ui.interact(b, egui::Id::new(("row_act", item.id, i)), Sense::click());
+        let rr = ui.interact(b, egui::Id::new(("row_act", item.id, i)), Sense::click());
         let color = if !*enabled {
             pal.text_dim
         } else if i == 2 && rr.hovered() {
@@ -1862,7 +1867,7 @@ fn draw_item_row(f: &mut Frame<'_>, r: Rect, item: &ClipItem) {
             pal.text_dim
         };
         icon.paint(
-            &f.ui.painter_at(b),
+            &ui.painter_at(b),
             Rect::from_center_size(b.center(), vec2(btn, btn) * 0.78),
             color,
         );
