@@ -8,7 +8,7 @@
 //! ```text
 //! Win32 消息 ──▶ EventLoop::egui_input ──▶ egui::Context::run_ui
 //!                                                     │
-//!                                            view::draw（业务 UI）
+//!                                            paint::draw（业务 UI）
 //!                                                     │
 //!                                            Context::tessellate
 //!                                                     │
@@ -17,31 +17,36 @@
 //!                                            FrameRenderer（交换链/提交/呈现）
 //! ```
 //!
-//! 渲染后端是 ash 直驱的原生 Vulkan，**不经过 eframe / wgpu**。
+//! 渲染后端是ash 直驱的原生 Vulkan，**不经过 eframe / wgpu**。
+//!
+//! # 已删除的旧模块
+//!
+//! `layout` / `view` / `panels` / `titlebar`（合计约 6679 行）曾是一套
+//! 「按宽度选档位 + 手工布局 + 逐面板绘制」的实现。它与当前架构并存期间，
+//! 同一件事被算两遍（布局侧 `Tier::visibility` 与绘制侧 `is_veiled`
+//! 各自判一次），改一处忘另一处就会「单测全绿、实机错乱」。
+//!
+//! 现在实况路径只有 `paint::draw`（它遍历 `workspace` 的卡片、
+//! 读 `solver` 求好的 `card.rect`，不做二次判断），旧四模块已成孤岛，
+//! 整体删除。`text` 是从 `titlebar` 拆出的文本度量/截断，因为卡片绘制
+//! 同样需要它，不该反向依赖标题栏模块。
 
 pub mod app;
-// 新卡片架构（逐步替换 layout/panels/view/titlebar）。
-// 旧的四个模块仍在用，待 paint.rs 全面接管绘制后删除。
 pub mod card;
 pub mod childwin;
 pub mod multiwindow;
 pub mod paint;
 pub mod solver;
+pub mod text;
 pub mod workspace;
 pub mod icons;
-pub mod layout;
-pub mod panels;
 pub mod presence;
 pub mod renderer;
 pub mod theme;
 pub mod thumbnail;
-pub mod titlebar;
-pub mod view;
 
 pub use app::{run, run_with_capture_override, run_with_options, App};
-pub use layout::{LayoutState, Panel};
 pub use presence::Resident;
-pub use view::UiLocal;
 
 /// 默认数据目录的展示字符串。
 ///

@@ -35,7 +35,6 @@ use modular_clipboard_gfx::Gpu;
 
 use crate::presence::{self, CloseDecision, Resident};
 use crate::renderer::{Painter, WINDOW_TITLE};
-use crate::view::UiLocal;
 use crate::theme;
 
 /// 离开作用域时自动清空 [`egui::TexturesDelta`]。
@@ -660,12 +659,11 @@ pub struct App {
     /// egui 上下文。内部是 `Arc`，克隆代价极低。
     pub ctx: egui::Context,
     svc: Service,
-    local: UiLocal,
     /// 已解析生效的调色板。
     ///
     /// 由 [`theme::set_theme`] 在构造时产出：它同时把令牌灌进 egui
     /// `Visuals` 并返回自绘要用的那一份，因此「控件观感」与「自绘图形」
-    /// 必然同源。`draw_frame` 每帧把它交给 `view::draw`。
+    /// 必然同源。每帧把它交给 [`crate::paint::draw`]。
     pal: theme::Palette,
     /// 新卡片架构的工作区（卡片的唯一权威来源）。
     ///
@@ -734,22 +732,22 @@ impl App {
             "主题已解析"
         );
 
-        // 恢复上次的布局。`None` 表示用布局默认值，不做任何事——
-        // `UiLocal::default()` 里的 `LayoutState::default()` 已经是它。
-        let mut local = UiLocal::default();
-        if let Some(lc) = svc.state.config.ui.layout.as_ref() {
-            local.layout = lc.into();
-            tracing::debug!("已从配置恢复布局");
-        }
+        let mut ws = crate::workspace::Workspace::default();
+        // 恢复上次保存的卡片窗口位置。
+        //
+        // ⚠️ 这里**不恢复** `config.ui.layout`（旧 `LayoutState` 布局）：
+        // 那套四面板停靠/浮动体系连同 `layout.rs` 已随`view.rs` 一并删除，
+        // 新架构的几何由 `solver` 每帧求解、由 `card.window_pos` 持久化。
+        // 继续做那个往返只会把一份没人读的配置原样写回去。
+        ws.apply_saved_positions(&svc.state.config.ui);
 
         svc.start_capture();
 
         Self {
             ctx,
             svc,
-            local,
             pal,
-            ws: crate::workspace::Workspace::default(),
+            ws,
             paint_state: crate::paint::UiState::default(),
             diag_frames: 0,
             should_quit: false,
@@ -890,6 +888,18 @@ impl App {
                         self.svc.notify(format!("清空失败: {e}"));
                     }
                 }
+                // 窗口级按钮只**置标志**，由帧循环消费。
+                //
+                // ⚠️ 不能在这里直接关窗口：`apply_ops`  borrows `self`，
+                // 而关窗口要动 `gfx::Window`（在 `run()` 的栈上，不在 self
+                // 里），且此刻帧循环还持有窗口。置标志、把动作留给
+                // 帧循环，是唯一不违反借用规则的顺序。
+                Op::CloseWindow => {
+                    self.paint_state.close_requested = true;
+                }
+                Op::MinimizeWindow => {
+                    self.paint_state.minimize_requested = true;
+                }
             }
         }
 
@@ -948,13 +958,17 @@ impl App {
     }
 
     /// 取出并清掉「标题栏关闭按钮」请求。
+    ///
+    /// 读的是 [`crate::paint::UiState`] 上的标志，由 `Op::CloseWindow`
+    /// 写入。**不是**旧的 `local`——那个字段只由已删除的 `view::draw`
+    /// 写入，永远是false，于是标题栏关闭按钮点了没反应。
     pub fn take_close_requested(&mut self) -> bool {
-        std::mem::take(&mut self.local.close_requested)
+        std::mem::take(&mut self.paint_state.close_requested)
     }
 
-    /// 取出并清掉「标题栏最小化按钮」请求。
+    /// 取出并清掉「标题栏最小化按钮」请求。语义同 [`Self::take_close_requested`]。
     pub fn take_minimize_requested(&mut self) -> bool {
-        std::mem::take(&mut self.local.minimize_requested)
+        std::mem::take(&mut self.paint_state.minimize_requested)
     }
 
     /// 是否收到退出请求。
@@ -968,17 +982,6 @@ impl App {
     /// 保证两条入口的行为完全一致——包括失败时的提示方式。
     pub fn clear_history(&mut self) -> anyhow::Result<()> {
         self.svc.clear_all()
-    }
-
-    /// 把当前布局写回内存里的配置（尚未落盘）。
-    ///
-    /// 落盘由 [`Service::save_config`] 统一做——它内部有「读回磁盘真实值
-    /// 防临时覆盖落盘」的逻辑，绕开它单独写文件会把 `--no-capture`
-    /// 之类的临时值一起写进去。
-    fn persist_layout(&mut self) {
-        self.svc.state.config.ui.layout = Some(modular_clipboard_core::LayoutConfig::from(
-            &self.local.layout,
-        ));
     }
 
     /// 退出前保存状态。
@@ -1014,7 +1017,9 @@ impl App {
 
     pub fn shutdown(&mut self) {
         self.svc.stop_capture();
-        self.persist_layout();
+        // 旧版这里还调`persist_layout()` 把 `LayoutState` 写回
+        // `config.ui.layout`。那套布局连同 `layout.rs` 已删除，
+        // 保留只会把一份没人读的旧格式配置原样写回磁盘。
         if let Err(e) = self.svc.save_config() {
             tracing::warn!(%e, "退出时保存配置失败");
         }
