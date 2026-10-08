@@ -191,7 +191,12 @@ pub fn run_with_options(
     //
     // 子窗口与主窗口**共用同一个 `Gpu`**（Vulkan 设备创建代价高，
     // 且多设备会多占显存），但各自持有一条交换链。
-    let shared = crate::multiwindow::SharedGfx::create(&gpu)?;
+    //
+    // ⚠️ 必须在 `App::new(config, …)` **之前**取字体路径：那之后
+    // `config` 就被移动进 `App` 了。
+    let font_path = config.ui.font_path.clone();
+    let shared =
+        crate::multiwindow::SharedGfx::create(&gpu)?.with_font_path(font_path.as_deref());
 
     // ---- egui -----------------------------------------------------------
     let mut app = App::new(config, capture_is_override, data_dir);

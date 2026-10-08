@@ -74,6 +74,15 @@ pub struct SharedGfx<'a> {
     /// 不一致直接 `bail`（而不是让驱动在 `cmd_begin_render_pass`
     /// 时才崩，那种失败难查得多）。
     pub pipeline: PipelineBundle,
+    /// 用户配置的自定义字体路径（`config.ui.font_path`）。
+    ///
+    /// 放在这里是为了让**每个**窗口装字体时都能取到它。
+    ///
+    /// ⚠️ 早前各窗口各自调 `install_cjk_font(&ctx, None)`，只有主窗口
+    /// 传了真实的 `font_path` —— 于是同一个界面里，主窗口用用户指定
+    /// 的字体、子窗口和设置窗口用回退字体。用户配了字体却「一半生效」，
+    /// 排查时会以为是字体没加载成功。
+    pub font_path: Option<String>,
 }
 
 impl<'a> SharedGfx<'a> {
@@ -104,7 +113,38 @@ impl<'a> SharedGfx<'a> {
                 pipeline.handle,
                 desc_layout.handle,
             ),
+            font_path: None,
         })
+    }
+
+    /// 记下用户的字体路径，供后续所有窗口使用。
+    pub fn with_font_path(mut self, path: Option<&str>) -> Self {
+        self.font_path = path.map(|s| s.to_string());
+        self
+    }
+
+    /// 建一个**新窗口**的 `egui::Context`，字体与主窗口保持一致。
+    ///
+    /// # 为什么必须走这个函数
+    ///
+    /// 每个窗口必须有自己的 `egui::Context`（共用会让鼠标位置互相
+    /// 覆盖、焦点错乱），但**装字体的步骤必须完全一致**——否则同一
+    /// 个界面里不同窗口用不同字体。
+    ///
+    /// ⚠️ 顺序也有讲究：图标字体必须排在 CJK 之后。`install_cjk_font`
+    /// 内部用 `set_fonts` 整体替换，先装图标会被冲掉（文档里写明）。
+    ///
+    /// 早前这段逻辑被复制了三份（`childwin.rs` / `settingswin.rs` /
+    /// 测试夹具），其中两份传 `None` 而不是真实配置——典型的复制粘贴
+    /// 漂移。收敛成一个函数，新增窗口不可能再漏。
+    pub fn new_context(&self) -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::theme::install_cjk_font(&ctx, self.font_path.as_deref());
+        // 图标字体必须排在 CJK 之后；失败不致命（图标会缺，但界面可用）。
+        if !crate::theme::install_icon_font(&ctx) {
+            tracing::warn!("图标字体加载失败，界面图标可能显示为空");
+        }
+        ctx
     }
 }
 

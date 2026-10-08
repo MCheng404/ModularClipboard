@@ -275,9 +275,9 @@ impl<'a> ChildWindow<'a> {
         // `window_pos` 是逻辑点，`move_to` 要物理像素。
         let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
         window.move_to((pos.x * s) as i32, (pos.y * s) as i32);
-        let ctx = egui::Context::default();
-        crate::theme::install_cjk_font(&ctx, None);
-        crate::theme::install_icon_font(&ctx);
+        // ⚠️ 必须走 `SharedGfx::new_context`：它带的字体配置与主窗口
+        // 一致（此前这里传 `None`，用户配的字体在子窗口里不生效）。
+        let ctx = shared.new_context();
         // 必须给子窗口**自己的**表面：用主窗口那个会报
         // VK_ERROR_NATIVE_WINDOW_IN_USE_KHR。
         let surface = shared

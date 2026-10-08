@@ -70,9 +70,8 @@ impl<'a> SettingsWindow<'a> {
             (anchor.y * s) as i32,
         );
 
-        let ctx = egui::Context::default();
-        crate::theme::install_cjk_font(&ctx, None);
-        crate::theme::install_icon_font(&ctx);
+        // ⚠️ 同上：走 `new_context`，字体配置与主窗口一致。
+        let ctx = shared.new_context();
 
         // 必须用本窗口自己的表面：用主窗口那个会报
         // `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`。

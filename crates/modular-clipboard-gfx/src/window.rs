@@ -649,6 +649,8 @@ impl EventLoop {
         self.focused = unsafe { GetForegroundWindow() } == self.hwnd;
 
         let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // 单独用于探测 `WM_QUIT`（它不属于任何窗口，按 hwnd 过滤收不到）。
+        let mut quit_msg: MSG = unsafe { std::mem::zeroed() };
         let mut events: Vec<WindowEvent> = Vec::new();
 
         // ---- 尺寸主动同步（不能只依赖 WM_SIZE）--------------------------
@@ -689,12 +691,25 @@ impl EventLoop {
             });
         }
 
-        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            // WM_QUIT 没有窗口过程，直接置退出标志。
-            if msg.message == WM_QUIT {
+        // ⚠️ **必须按 `hwnd` 过滤**。
+            //
+            // 早前传 `None`（不过滤），于是这个循环会抽干**整个线程**
+            // 消息队列——包括属于其它窗口的消息。
+            //
+            // 单窗口时看不出问题；一旦有第二个窗口（卡片子窗口、
+            // 设置窗口），**谁先 poll 谁就抢走全部消息**，其余窗口
+            // 永远收不到输入。表现为：设置窗口画出来了但完全不响应
+            // 鼠标/键盘，连 resize 都不知道（于是 `screen_rect` 停在
+            // 初始值，界面尺寸不对）。
+            //
+            // `EventLoop` 持有自己的 `hwnd`（构造时传入），用它过滤
+            // 即可。
+            while unsafe { PeekMessageW(&mut msg, Some(self.hwnd), 0, 0, PM_REMOVE) }.as_bool() {
+            // WM_QUIT 不属于任何窗口，按 hwnd 过滤**收不到它**。
+            // 单独用不过滤的 peek 检查一次。
+            if unsafe { PeekMessageW(&mut quit_msg, None, WM_QUIT, WM_QUIT, PM_REMOVE) }.as_bool() {
                 self.quit = true;
                 events.push(WindowEvent::CloseRequested);
-                continue;
             }
 
             // `WM_SYSCOMMAND` + `SC_CLOSE` 是**标题栏 X 按钮**的第一手消息。

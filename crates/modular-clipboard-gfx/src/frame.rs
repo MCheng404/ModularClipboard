@@ -1438,10 +1438,21 @@ impl<'a> FrameRenderer<'a> {
         // 必须先等 GPU 空闲：旧交换链的 framebuffer 还在被在飞命令引用。
         self.gpu.wait_idle();
 
+        // ⚠️ 必须查**本窗口自己的**表面。
+        //
+        // 早前这里写 `self.gpu.surface()`——那是**主窗口**的表面。
+        // 于是子窗口/设置窗口 resize 时，用的是主窗口的
+        // `current_extent`/`min/max` 去建**自己**的交换链：
+        // 尺寸被钳到主窗口的范围，表现为「设置窗口渲染尺寸跟着
+        // 主窗口走、内容被裁或拉变形」。
+        //
+        // 下面真正 `create_swapchain` 用的是 `self.surface`（对），
+        // 唯独查能力这一步错了，最难查——因为大部分情况下两个
+        // 表面的 caps 恰好相近，只有尺寸差异明显时才暴露。
         let caps = unsafe {
             self.surface_loader.get_physical_device_surface_capabilities(
                 self.gpu.physical_device,
-                self.gpu.surface(),
+                self.surface,
             )?
         };
         let desired = if desired_extent.width == 0 || desired_extent.height == 0 {
