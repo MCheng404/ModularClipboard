@@ -30,6 +30,7 @@ public static class Cap {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern bool GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
@@ -59,6 +60,43 @@ $p.Refresh()
 $main = [IntPtr]::Zero
 foreach ($h in [Cap]::TopLevel([uint32]$p.Id)) { if ([Cap]::Cls($h) -eq 'ModularClipboardWindow') { $main = $h; break } }
 if ($main -eq [IntPtr]::Zero) { Write-Host "找不到主窗口"; Stop-Process -Id $p.Id -Force; exit 1 }
+
+# ⚠️ 必须先把窗口移到**屏幕空白区**再截图。
+# 窗口默认创建在 (120,120)，那里往往被用户的浏览器/终端/编辑器盖住——
+# 截出来的是别的程序，客户区截图完全无效（曾据此误判过渲染 bug）。
+# 这里移到屏幕最左侧（0,0），那里通常只有桌面或侧边栏。
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class Move {
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hgt, bool repaint);
+}
+'@
+# ⚠️ MoveWindow 的宽高**不能传 0**——那会把窗口缩成 0×0
+# （客户区真的变成 0 0，Bitmap 构造直接抛 "Parameter is not valid"）。
+# 先读当前窗口尺寸再原样传回，只改位置。
+$wr = New-Object Cap+RECT
+[void][Cap]::GetWindowRect($main, [ref]$wr)
+$ww = $wr.R - $wr.L; $wh = $wr.B - $wr.T
+# 移到屏幕**右下角**：实测(0,0) 与 (120,120) 都被浏览器/终端占据，
+# 只有右下角是空的任务栏上方的空白区。
+$screenW = 2560; $screenH = 1600
+$mX = $screenW - $ww - 40
+$mY = $screenH - $wh - 120
+[void][Move]::MoveWindow($main, $mX, $mY, $ww, $wh, $true)
+Start-Sleep -Milliseconds 700
+# 置前，避免被别的窗口压住
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class Fg {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+}
+'@
+[void][Fg]::BringWindowToTop($main)
+[void][Fg]::SetForegroundWindow($main)
+Start-Sleep -Milliseconds 500
 
 $rc = New-Object Cap+RECT
 [void][Cap]::GetClientRect($main, [ref]$rc)

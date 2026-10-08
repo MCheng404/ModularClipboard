@@ -481,7 +481,17 @@ pub fn run_with_options(
 
         // ---- 5. 节流 ----
         // 无事件时不要空转烧 CPU。egui 请求了延时重绘就按它等待。
-        events.poll_for(delay);
+        //
+        // ⚠️ `Some(ZERO)` 是「立即重绘」，直接传给 `poll_for` 会走
+        // 纯自旋分支（`Some(d) if !d.is_zero()` 不成立），CPU 占用 100%。
+        // 但也不能当成「无限等待」——那样聚焦的输入框光标不会闪、
+        // 刚输入的字符不会立刻上屏。这里给 1ms 下限：
+        // 既避免忙等，又保证输入延迟感知不到。
+        let wait = match delay {
+            Some(d) if d.is_zero() => Some(std::time::Duration::from_millis(1)),
+            other => other,
+        };
+        events.poll_for(wait);
     }
 
     // ---- 清理 ------------------------------------------------------------
@@ -742,7 +752,29 @@ impl App {
                 Op::SetPinnedMode(mode) => {
                     self.ws.set_pinned_mode(mode);
                 }
+                Op::ToggleSettings => {
+                    self.paint_state.show_settings = !self.paint_state.show_settings;
+                }
+                Op::ClearAll => {
+                    if let Err(e) = self.svc.clear_all() {
+                        self.svc.notify(format!("清空失败: {e}"));
+                    }
+                }
             }
+        }
+
+        // 搜索文本同步到服务层。
+        //
+        // ⚠️ 必须比较**内容**而不是「非空」：早前版本写成
+        // `if !q.is_empty() || !svc.state.query.is_empty()`，
+        // 结果用户删掉全部文本（query 变空）时条件不成立，
+        // 过滤永远解不掉——列表卡在「无结果」状态。
+        //
+        // 只在内容真的变化时调 `search()`：它内部会 `reload_list()`
+        // 重新查库，每帧调一次是无谓的 IO。
+        if self.paint_state.query != self.svc.state.query {
+            let q = self.paint_state.query.clone();
+            self.svc.search(q);
         }
     }
 

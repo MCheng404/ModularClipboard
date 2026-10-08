@@ -101,7 +101,19 @@ foreach ($h in [V]::TopLevel([uint32]$p.Id)) {
   if ([V]::Cls($h) -eq 'ModularClipboardWindow' -and [V]::IsWindowVisible($h)) { $main = $h; break }
 }
 if ($main -eq [IntPtr]::Zero) {
-  Write-Host "找不到主窗口句柄（进程 id=$($p.Id)）" -ForegroundColor Red
+  # ⚠️ 必须把实际枚举到的窗口全打出来。
+  #
+  # 症状：改动后脚本报「找不到主窗口句柄」，但程序日志显示
+  # 「窗口已创建」且手动运行完全正常——说明问题在**查找方式**，
+  # 不在程序。此时只报一句「找不到」等于把线索全丢了，
+  # 下一步只能靠猜。
+  Write-Host "找不到主窗口句柄（进程 id=$($p.Id)）。实际枚举到的顶层窗口：" -ForegroundColor Red
+  foreach ($h in [V]::TopLevel([uint32]$p.Id)) {
+    $cls = [V]::Cls($h)
+    $vis = [V]::IsWindowVisible($h)
+    Write-Host ("  hwnd=0x{0:X}  class='{1}'  visible={2}" -f [int64]$h, $cls, $vis)
+  }
+  Write-Host "（若列表为空说明进程已退出；若都在但 visible=False 说明窗口被隐藏）"
   Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
   exit 1
 }

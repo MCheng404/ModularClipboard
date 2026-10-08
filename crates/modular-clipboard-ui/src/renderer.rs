@@ -323,10 +323,31 @@ pub fn next_capacity(needed: usize) -> usize {
 }
 
 /// egui 请求的下一帧延迟。`None` 表示「有事件时立即处理，不要 sleep」。
+/// 本帧之后还需等多久再重绘（`None` = 立即重绘）。
+///
+/// # egui 的 `repaint_delay` 语义（很容易搞反）
+///
+/// | 值 | 含义 |
+/// |---|---|
+/// | `Duration::MAX` | **不重绘**——初始值，等事件驱动 |
+/// | `Duration::ZERO` | **立即重绘** |
+/// | `Duration::from_millis(n)` | n 毫秒后重绘 |
+///
+/// 出处：`egui::Context` 的 `ViewportRepaintInfo::default()` 把
+/// `repaint_delay` 设为 `Duration::MAX`（注释写着 "We haven't
+/// scheduled a repaint yet."），而 `request_repaint()` 才置 ZERO。
+///
+/// ⚠️ 早前一版把 `ZERO` 映射成 `None` 并注释说
+///「ZERO 表示立即重绘，应转成 None 让调用方走有事件才处理」——
+/// **语义反了**：调用方拿到 None 就不会再触发这一帧重绘，
+/// 于是「有事件才处理」的路径永远等不到这次立即重绘，
+/// 表现为控件状态该变却没变（聚焦高亮、光标闪烁都靠它驱动）。
 pub fn repaint_delay(output: &egui::FullOutput) -> Option<std::time::Duration> {
     let v = output.viewport_output.get(&egui::ViewportId::ROOT)?;
     match v.repaint_delay {
-        d if d.is_zero() => None,
+        // Duration::MAX = egui 明确表示「这一帧不需要重绘」。
+        d if d == std::time::Duration::MAX => None,
+        // ZERO = 立即重绘，调用方应尽快跑下一帧。
         d => Some(d),
     }
 }
@@ -1771,25 +1792,46 @@ mod tests {
     }
 
     #[test]
-    fn repaint_delay_maps_zero_to_immediate() {
-        // repaint_delay 为 0 表示「立即重绘」，应转成 None 让调用方走
-        // 「有事件才处理」而不是 sleep(0) 空转。
+    fn repaint_delay_maps_egui_duration_to_idle() {
+        // 语义基准来自 `egui::Context`：`ViewportRepaintInfo::default()`
+        // 把 `repaint_delay` 设为 `Duration::MAX`，注释是
+        // "We haven't scheduled a repaint yet."；
+        // `request_repaint()` 把它置为 `Duration::ZERO`。
+        //
+        // 因此：**MAX = 不重绘（该睡）**，**ZERO = 立即重绘（不该睡）**。
         let mut out = egui::FullOutput::default();
+        let vp = || egui::ViewportId::ROOT;
         out.viewport_output.insert(
-            egui::ViewportId::ROOT,
+            vp(),
             egui::ViewportOutput {
-                parent: egui::ViewportId::ROOT,
+                parent: vp(),
                 class: egui::ViewportClass::Root,
                 builder: egui::ViewportBuilder::default(),
                 viewport_ui_cb: None,
                 commands: Vec::new(),
-                repaint_delay: std::time::Duration::ZERO,
+                repaint_delay: std::time::Duration::MAX,
             },
         );
-        assert_eq!(repaint_delay(&out), None);
+        assert_eq!(
+            repaint_delay(&out),
+            None,
+            "Duration::MAX 表示 egui 不需要重绘 ⇒ 该交给事件驱动（None）"
+        );
+
+        // ZERO 必须是 Some(ZERO)：它表示「立刻再跑一帧」。
+        // 早前一版把它映射成 None，会让这次立即重绘请求丢失。
+        out.viewport_output
+            .get_mut(&vp())
+            .expect("刚插入")
+            .repaint_delay = std::time::Duration::ZERO;
+        assert_eq!(
+            repaint_delay(&out),
+            Some(std::time::Duration::ZERO),
+            "Duration::ZERO 是「立即重绘」，必须原样传出而不是当成 None"
+        );
 
         out.viewport_output
-            .get_mut(&egui::ViewportId::ROOT)
+            .get_mut(&vp())
             .expect("刚插入")
             .repaint_delay = std::time::Duration::from_millis(250);
         assert_eq!(

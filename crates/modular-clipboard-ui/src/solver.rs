@@ -27,10 +27,19 @@ use egui::{Rect, pos2, vec2};
 use crate::workspace::Workspace;
 
 /// 顶部标题栏高度（逻辑点）。卡片区从它下方开始。
-pub const TOPBAR_HEIGHT: f32 = 40.0;
+///
+/// 顶栏现在**只承载搜索框**（产品标题已移除），所以它不再是
+/// 「标题 + 小控件」而是「一个主要输入区」——40pt 扣掉上下各
+/// `space_sm` 后搜索框只剩 28pt，视觉上偏扁。抬到 44pt 让搜索框
+/// 有 32pt 的净高，接近标准输入框的舒适区间。
+pub const TOPBAR_HEIGHT: f32 = 44.0;
 
 /// 底部状态栏高度（逻辑点）。
-pub const STATUSBAR_HEIGHT: f32 = 28.0;
+///
+/// ⚠️ **已归零**：底部状态栏被移除（「清空 / 设置」上移到顶栏右侧，
+/// 与搜索框并列）。保留常量是为了让 `card_area` 的算法结构不变——
+/// 将来若要恢复底部栏，只需改这一个数字。
+pub const STATUSBAR_HEIGHT: f32 = 0.0;
 
 /// 求解结果：与 [`Workspace::cards`] **同序**的矩形列表。
 ///
@@ -269,10 +278,23 @@ mod tests {
             for b in (a + 1)..docked.len() {
                 let (ia, ra) = docked[a];
                 let (ib, rb) = docked[b];
-                if ra.intersects(rb) {
-                    let ov = (ra.max.x.min(rb.max.x) - ra.min.x.max(rb.min.x)).max(0.0);
+                // ⚠️ 判据是「重叠量 > 0」，**不是** `Rect::intersects`。
+                //
+                // `gap = 0` 时相邻卡片**边界恰好相接**（A 的右边 == B 的左边）。
+                // `Rect::intersects` 对这种「边贴边」返回 **true**，
+                // 于是测试在每一档宽度都报相交，而实际画面完全正常——
+                // 假失败会让人去改本来正确的求解器。
+                //
+                // 浮点上更要留一点余量：分配里有乘除，`7.8` 这类值
+                // 相接时可能有 1e-6 级误差。取 0.01pt 阈值。
+                let ov_x =
+                    (ra.max.x.min(rb.max.x) - ra.min.x.max(rb.min.x)).max(0.0);
+                let ov_y =
+                    (ra.max.y.min(rb.max.y) - ra.min.y.max(rb.min.y)).max(0.0);
+                let overlap = ov_x.min(ov_y);
+                if overlap > 0.01 {
                     bad.push(format!(
-                        "卡片 {ia} {ra:?} 与 {ib} {rb:?} 相交（重叠 {ov:.2}pt）"
+                        "卡片 {ia} {ra:?} 与 {ib} {rb:?} 真正重叠 {overlap:.3}pt"
                     ));
                 }
             }

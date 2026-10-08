@@ -35,17 +35,26 @@ impl Default for Workspace {
         let mut ws = Self {
             cards: Vec::new(),
             next_id: 0,
-            gap: 6.0,
+            // ⚠️ 卡片之间**不留间隙**：卡片本身有 1px 描边 + 圆角，
+            // 再留 6pt 空隙会让相邻卡片之间露出一条明显的缝，
+            // 看起来像「窗口之间有间隙」（用户反馈过这个现象）。
+            // 设 0 让卡片边缘贴合，视觉上是一个连续的面板。
+            gap: 0.0,
         };
-        // 默认卡片集：置顶与历史常驻，详情与侧栏按需。
-        // 顺序 = Z 序，置顶在最下层，详情在最上层。
-        for kind in [
-            CardKind::Pinned,
-            CardKind::History,
-            CardKind::Rail,
-            CardKind::Detail,
+        // 默认卡片集。
+        //
+        // ⚠️ `Detail` / `Rail` **默认就分离为独立子窗口**
+        // （`CardHost::Window`）——主窗口只留「置顶 + 历史」两栏。
+        // 它们仍留在 `cards` 里，只是 `host` 为 Window，
+        // 于是 solver 不给它们分配宽度、主窗口也不绘制。
+        for (kind, host) in [
+            (CardKind::Pinned, CardHost::Docked),
+            (CardKind::History, CardHost::Docked),
+            (CardKind::Rail, CardHost::Window),
+            (CardKind::Detail, CardHost::Window),
         ] {
-            ws.add(kind);
+            let id = ws.add(kind);
+            ws.get_mut(id).expect("刚加入的卡片").host = host;
         }
         ws
     }

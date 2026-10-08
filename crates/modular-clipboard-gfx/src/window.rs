@@ -93,8 +93,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_POPUP, WS_SYSMENU,
+    // IME 会话：搜索框要能输入中文，候选窗依赖这三个消息。
+    //
+    // ⚠️ 名字是 `*_COMPOSITION` 而不是直觉上的 `WM_IME_START`/`WM_IME_END`
+    // ——后者在 windows crate 里叫 `ImmNotifyIME` 之类，完全不在这。
+    // 值分别为 0x10B(267) / 0x86(134) / 0x10F(271)。
+    WM_IME_STARTCOMPOSITION, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
 };
 use windows::core::{HSTRING, PCWSTR};
+// ⚠️ IME API 在 `Win32::UI::Input::Ime`，**不在** `Globalization`
+// （后者只有 `ImmGetCompositionString` 这类旧版ANSI 版）。
+use windows::Win32::UI::Input::Ime::{
+    GCS_COMPSTR, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+};
 
 use crate::chrome;
 
@@ -211,6 +222,32 @@ pub enum WindowEvent {
     /// 控制字符（`\r` `\t` `\x08` `\x1b`）已被过滤——它们由
     /// [`WindowEvent::Key`] 表达，双份会让文本框出现重复字符。
     TextInput(String),
+
+    /// 输入法（IME）会话状态变化。
+    ///
+    /// # 为什么必须转发
+    ///
+    /// 顶栏搜索框是主输入区，中文用户要在那里搜「粘贴板」这类词。
+    /// 只处理 `WM_IME_CHAR`（已提交的字符）**不足以显示候选窗**：
+    /// IME 还要知道「会话开始了」「当前预编辑串是什么」以及
+    /// 「候选窗该画在哪」。缺了这些，用户按下拼音后看不到候选列表，
+    /// 表现为「中文打不出来」。
+    ///
+    /// egui 侧对应 `Event::Ime(egui::IME)`，本枚举是它的窗口层来源。
+    Ime(WindowIme),
+}
+
+/// IME 会话状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowIme {
+    /// `WM_IME_START`：会话开始。
+    Start,
+    /// `WM_IME_COMPOSITION`：预编辑串更新。
+    ///
+    /// `text` 是当前预编辑内容（含拼音与已转换部分）。
+    Composition(String),
+    /// `WM_IME_END`：会话结束，`text` 是最终提交结果（可能为空）。
+    End(String),
 }
 
 /// Win32 窗口。
@@ -808,7 +845,75 @@ impl EventLoop {
                 }
             }
 
+            // ---- IME 会话 ------------------------------------------------
+            //
+            // 只转发会话状态，不改文本：`WM_IME_CHAR` 已经把最终提交的
+            // 字符送进 `TextInput`，这里再送一遍会出现重复字符。
+            WM_IME_STARTCOMPOSITION => out.push(WindowEvent::Ime(WindowIme::Start)),
+
+            WM_IME_COMPOSITION => {
+                // 预编辑串不在 wParam 里，要用 ImmGetCompositionString 读。
+                // GCS_COMPSTR 是「当前预编辑串」，GCS_COMPREADSTR 是选中的
+                // 子串；这里只取前者，候选高亮由 IME 自己负责画。
+                out.push(WindowEvent::Ime(WindowIme::Composition(
+                    self.ime_composition_string(),
+                )));
+            }
+
+            WM_IME_ENDCOMPOSITION => {
+                // 结束时的提交结果同样走ImmGetCompositionString；
+                // 拿不到就交空串，让上层按「会话结束」收尾。
+                out.push(WindowEvent::Ime(WindowIme::End(
+                    self.ime_composition_string(),
+                )));
+            }
+
             _ => {}
+        }
+    }
+
+    /// 读当前 IME 预编辑串（`GCS_COMPSTR`）。
+    ///
+    /// 拿不到时返回空串而不是报错：IME 会话可能已结束、焦点在别处，
+    /// 或 HIMC 为空——这些都属于正常情况，调用方按空串处理即可。
+    fn ime_composition_string(&self) -> String {
+        // SAFETY：`hwnd` 由本结构持有且窗口未销毁；
+        // `ImmGetContext` 失败时 `himc` 为空，直接返回。
+        // `ImmGetCompositionStringW` 的长度查询与读取是两次调用，
+        // 期间缓冲由本函数独占，不会被别的线程改写。
+        unsafe {
+            // ⚠️ `HIMC` 是 newtype 包装的 `isize`，**没有** `is_null()`。
+            // 用 `Default::default()`（即空句柄）判断，等价于 Win32 的 NULL。
+            let himc = ImmGetContext(self.hwnd);
+            if himc == Default::default() {
+                return String::new();
+            }
+            let len = ImmGetCompositionStringW(himc, GCS_COMPSTR, None, 0);
+            let out = if len > 0 {
+                let mut buf = vec![0u16; len as usize];
+                let got = ImmGetCompositionStringW(
+                    himc,
+                    GCS_COMPSTR,
+                    Some(buf.as_mut_ptr() as *mut _),
+                    // 返回值与缓冲区长度都是 `i32`/`u32`——Win32 的
+                    // `DWORD` 在 windows crate 里映射成 u32，
+                    // 直接传 `len`(i32) 会类型不匹配。
+                    len as u32,
+                );
+                if got > 0 {
+                    buf.truncate(got as usize);
+                    String::from_utf16_lossy(&buf)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            // `ImmReleaseContext` 返回 BOOL 且标了 `must_use`。
+            // 释放失败（IME 已被系统回收）无害，但不能留未使用的返回值
+            // 触发警告——这里显式丢弃。
+            let _ = ImmReleaseContext(self.hwnd, himc);
+            out
         }
     }
 
@@ -961,6 +1066,42 @@ impl EventLoop {
                 }
                 WindowEvent::TextInput(s) => {
                     out.push(EguiEvent::Text(s.clone()));
+                }
+                // IME → egui 的 IME 事件。
+                //
+                // ⚠️ 必须用 `commit_string`：这里传的是**预编辑串**，
+                // egui 拿到后会用它画下划线候选与预编辑文本。
+                // 若改传 `preedit` 之外的模式，候选窗能弹但看不到拼音。
+                //
+                // 位置用光标的客户区坐标：egui 据此把系统候选窗
+                // 摆到光标下方，位置错了会出现在屏幕角落。
+                WindowEvent::Ime(ime) => {
+                    // 候选窗要摆在光标下方，所以必须带上光标位置。
+                    // 拿不到就用客户区左上角退化——位置不理想，
+                    // 但不会出现「候选窗在屏幕外、用户够不着」。
+                    let caret = self
+                        .pointer_in_points(self.scale_factor)
+                        .unwrap_or(Pos2::ZERO);
+                    // egui 0.36 的类型名是 `ImeEvent`（不是 `IME`），
+                    // 且没有 `Start` 变体——会话开始不通知，
+                    // 只用 `Preedit{ text: "" }` 表示「IME 已收起」。
+                    out.push(EguiEvent::Ime(match ime {
+                        WindowIme::Start => egui::ImeEvent::Preedit {
+                            text: String::new(),
+                            active_range_chars: None,
+                        },
+                        // 这里必须用 `Preedit`：预编辑串要显示下划线，
+                        // 拼音/候选高亮全靠它。误用 `Commit` 会让用户
+                        // 每敲一个字母就直接上屏，无法反悔。
+                        WindowIme::Composition(s) => egui::ImeEvent::Preedit {
+                            text: s.clone(),
+                            active_range_chars: None,
+                        },
+                        // 提交结果：为空表示会话结束且未提交任何内容。
+                        WindowIme::End(s) => egui::ImeEvent::Commit(s.clone()),
+                    }));
+                    // egui 0.36 里是 `PointerMoved`（`CursorMoved` 已改名）。
+                    out.push(EguiEvent::PointerMoved(caret));
                 }
                 WindowEvent::Focused(b) => {
                     out.push(EguiEvent::WindowFocused(*b));
