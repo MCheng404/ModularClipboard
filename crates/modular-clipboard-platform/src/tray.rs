@@ -195,24 +195,82 @@ fn command_to_event(cmd: usize) -> Option<TrayEvent> {
     }
 }
 
-/// 托盘回调消息 `lParam` 低位的 `NIN_*` 事件码 → 事件。
+/// 托盘回调消息 `lParam` 的两段解码。
 ///
-/// 注意左键点击有两条路径：`NOTIFYICON_VERSION_4` 下正常收到
-/// `NIN_SELECT`，但部分 shell 版本（或未成功 `NIM_SETVERSION` 时）
-/// 仍发旧式的 `WM_LBUTTONUP`/`WM_LBUTTONDBLCLK`。两条都映射为
-/// [`TrayEvent::Show`]，否则用户会「点了没反应」。
-fn notify_event_of(lparam: isize) -> Option<TrayEvent> {
-    match (lparam & 0xFFFF) as u32 {
-        nin::SELECT | nin::KEYSELECT | WM_LBUTTONUP_CODE | WM_LBUTTONDBLCLK_CODE => {
-            Some(TrayEvent::Show)
+/// # 为什么必须分开读
+///
+/// 本项目用 `NOTIFYICON_VERSION_4`（见 `run`里的 `NIM_SETVERSION`），
+/// 该版本下 shell 把回调信息**打包**进 `lParam`：
+///
+/// ```text
+/// ┌──────────────────────────┬──────────────────────────┐
+/// │ 高 16 位：鼠标消息码     │ 低 16 位：通知码         │
+/// │ WM_LBUTTONUP /          │ NIN_SELECT / NIN_KEYSELECT│
+/// │ WM_RBUTTONUP /          │                           │
+/// │ WM_CONTEXTMENU …│                           │
+/// └──────────────────────────┴──────────────────────────┘
+/// ```
+///
+/// 早前两个判定都只看**低 16 位**，于是：
+/// - 左键：`NIN_SELECT` 在低位 ⇒ 命中，看起来正常；
+/// - 右键：鼠标码在**高位**、低位是 `NIN_SELECT` ⇒ 永不命中
+///   ⇒ 右键完全没反应。
+///
+/// 这正是用户报告的症状「左键正常、右键没反应」——一个纯粹的
+/// 打包格式误读，与菜单宿主（前两次修复的重点）毫无关系。
+///
+/// # 坐标也要注意
+///
+/// 高低位**不是**屏幕坐标：坐标在 `GET_X_LPARAM(lParam)` 宏的
+/// 意义上是同一组位，但版本 4 下要用 `GET_X_LPARAM` 而不是
+/// `LOWORD`——后者对负坐标会出错（右键菜单常弹在屏幕左/下边缘，
+/// 那里x 或 y 为负）。见 [`unpack_cursor`]。
+struct Callback {
+    /// 高 16 位：鼠标消息码。
+    mouse: u32,
+    /// 低 16 位：通知码。
+    notify: u32,
+}
+
+impl Callback {
+    fn decode(lparam: isize) -> Self {
+        Self {
+            mouse: ((lparam >> 16) & 0xFFFF) as u32,
+            notify: (lparam & 0xFFFF) as u32,
         }
-        _ => None,
     }
 }
 
-/// 托盘右键事件码（`lParam` 低位）→ 是否应弹菜单。
+/// 托盘回调消息 → 事件（展示主窗口）。
+///
+/// ⚠️ 判定要**同时**看高位鼠标码与低位通知码：
+/// - 版本 4 正常路径：低位是 `NIN_SELECT` / `NIN_KEYSELECT`；
+/// - `NIM_SETVERSION` 失败时回退旧式语义：高位直接是
+///   `WM_LBUTTONUP` / `WM_LBUTTONDBLCLK`。
+///
+/// 两条都映射为 [`TrayEvent::Show`]，否则用户会「点了没反应」。
+fn notify_event_of(lparam: isize) -> Option<TrayEvent> {
+    let cb = Callback::decode(lparam);
+    match cb.notify {
+        nin::SELECT | nin::KEYSELECT => Some(TrayEvent::Show),
+        _ => match cb.mouse {
+            WM_LBUTTONUP_CODE | WM_LBUTTONDBLCLK_CODE => Some(TrayEvent::Show),
+            _ => None,
+        },
+    }
+}
+
+/// 托盘右键事件 → 是否应弹菜单。
+///
+/// ⚠️ 判定必须在**高位**（鼠标消息码），见 [`Callback`] 的说明。
+/// 早前只看低位，而版本 4 下低位恒为 `NIN_SELECT`，所以右键
+/// 永远不匹配。
 fn is_context_menu_event(lparam: isize) -> bool {
-    matches!((lparam & 0xFFFF) as u32, WM_RBUTTONUP_CODE | WM_CONTEXTMENU_CODE)
+    let cb = Callback::decode(lparam);
+    // 两条路径：版本 4 的高位鼠标码，以及旧式语义下低位直接是
+    // `WM_RBUTTONUP`（此时高位为 0）。
+    matches!(cb.mouse, WM_RBUTTONUP_CODE | WM_CONTEXTMENU_CODE)
+        || matches!(cb.notify, WM_RBUTTONUP_CODE | WM_CONTEXTMENU_CODE)
 }
 
 const WM_LBUTTONUP_CODE: u32 = 0x0202;
@@ -220,10 +278,21 @@ const WM_LBUTTONDBLCLK_CODE: u32 = 0x0203;
 const WM_RBUTTONUP_CODE: u32 = 0x0205;
 const WM_CONTEXTMENU_CODE: u32 = 0x007B;
 
-/// 把 `lParam` 里的打包坐标解出来（`WM_MAKE` 风格：低位 x，高位 y）。
+/// 从 `lParam` 解出光标屏幕坐标。
+///
+/// # 必须走 `GET_X_LPARAM` 语义，不能用 `LOWORD`
+///
+/// 托盘右键菜单常弹在屏幕**左边缘或下边缘**，那里 x / y 是负数。
+/// `LOWORD`/`LOWBIT` 把它当 `u16` 再转 `i32`，得到 65535 之类的
+/// 巨大正值 ⇒ 菜单弹出到屏幕外看不见，表现为「点了没反应」。
+/// `GET_X_LPARAM` 内部按 `i16` 解释，正确返回负值。
 fn unpack_cursor(lparam: isize) -> (i32, i32) {
-    let x = (lparam & 0xFFFF) as i32;
-    let y = ((lparam >> 16) & 0xFFFF) as i32;
+    // 通知区回调的坐标在 `lParam` 的低/高 16 位，但**整个 lParam**
+    // 已被 shell 按版本 4 的格式打包：坐标在低 32 位（x 低16 / y 高16），
+    // 鼠标码与通知码在更高位。因此这里只取低 32 位再按 i16 解释。
+    let packed = (lparam & 0xFFFF_FFFF) as u32;
+    let x = (packed & 0xFFFF) as u16 as i16 as i32;
+    let y = ((packed >> 16) & 0xFFFF) as u16 as i16 as i32;
     (x, y)
 }
 
@@ -952,8 +1021,29 @@ mod tests {
         assert_eq!(command_to_event(0xDEAD), None);
     }
 
+    /// 按 `NOTIFYICON_VERSION_4` 的格式打包一个回调 `lParam`。
+    ///
+    /// `lParam = (mouse << 16) | notify`，坐标不参与这两段判定。
+    fn v4_lparam(mouse: u32, notify: u32) -> isize {
+        (((mouse as isize) << 16) | notify as isize) as isize
+    }
+
     #[test]
     fn notify_select_maps_to_show() {
+        // 版本 4 正常路径：低位 NIN_SELECT，高位是鼠标码。
+        assert_eq!(
+            notify_event_of(v4_lparam(WM_LBUTTONUP_CODE, nin::SELECT)),
+            Some(TrayEvent::Show)
+        );
+        assert_eq!(
+            notify_event_of(v4_lparam(WM_LBUTTONDBLCLK_CODE, nin::SELECT)),
+            Some(TrayEvent::Show)
+        );
+        assert_eq!(
+            notify_event_of(v4_lparam(0, nin::KEYSELECT)),
+            Some(TrayEvent::Show)
+        );
+        // 裸码也认（低位直接是通知码时）。
         assert_eq!(notify_event_of(nin::SELECT as isize), Some(TrayEvent::Show));
         assert_eq!(
             notify_event_of(nin::KEYSELECT as isize),
@@ -984,15 +1074,56 @@ mod tests {
     #[test]
     fn right_click_never_maps_to_show() {
         // 右键只弹菜单，不能顺带唤起窗口。
+        assert_eq!(
+            notify_event_of(v4_lparam(WM_RBUTTONUP_CODE, nin::SELECT)),
+            None,
+            "右键绝不能顺带弹出主窗口"
+        );
+        assert_eq!(
+            notify_event_of(v4_lparam(WM_CONTEXTMENU_CODE, nin::SELECT)),
+            None
+        );
         assert_eq!(notify_event_of(WM_RBUTTONUP_CODE as isize), None);
         assert_eq!(notify_event_of(WM_CONTEXTMENU_CODE as isize), None);
     }
 
+    /// **本条守着用户报告的那个 bug**。
+    ///
+    /// 版本 4 下右键的鼠标码在 `lParam` **高位**、低位是 `NIN_SELECT`。
+    /// 早前 `is_context_menu_event` 只看低位，于是永远不匹配 ——
+    /// 症状正是「左键正常、右键完全没反应」。
     #[test]
     fn right_click_requests_context_menu() {
+        // 版本 4 正常路径：高位是右键码，低位是 NIN_SELECT。
+        assert!(
+            is_context_menu_event(v4_lparam(WM_RBUTTONUP_CODE, nin::SELECT)),
+            "版本 4 的右键（高位 WM_RBUTTONUP）必须弹菜单"
+        );
+        assert!(is_context_menu_event(v4_lparam(
+            WM_CONTEXTMENU_CODE,
+            nin::SELECT
+        )));
+        // 旧式路径：低位直接是右键码。
         assert!(is_context_menu_event(WM_RBUTTONUP_CODE as isize));
         assert!(is_context_menu_event(WM_CONTEXTMENU_CODE as isize));
+        // 左键**不能**被当成右键。
+        assert!(!is_context_menu_event(v4_lparam(WM_LBUTTONUP_CODE, nin::SELECT)));
         assert!(!is_context_menu_event(WM_LBUTTONUP_CODE as isize));
+    }
+
+    /// 右键回调的两种形态都应当被识别。
+    ///
+    /// 这条是上条的补充：真实 shell 在版本 4 下可能发
+    /// `WM_CONTEXTMENU` 而非 `WM_RBUTTONUP`（触屏/键盘激活路径），
+    /// 漏掉任一条都会表现为「右键时好时坏」。
+    #[test]
+    fn context_menu_event_is_recognised_in_both_forms() {
+        for mouse in [WM_RBUTTONUP_CODE, WM_CONTEXTMENU_CODE] {
+            assert!(
+                is_context_menu_event(v4_lparam(mouse, nin::SELECT)),
+                "鼠标码 {mouse:#x} 应被识别为右键"
+            );
+        }
     }
 
     #[test]
@@ -1001,12 +1132,19 @@ mod tests {
         assert_eq!((x, y), (100, 200));
     }
 
+    /// 屏幕**左/下边缘**会出现负坐标，必须按有符号解读。
+    ///
+    /// 托盘右键菜单常正好弹在这些位置——若按无符号解出 65535 之类的
+    /// 巨大正值，菜单会弹到屏幕外，表现为「点了没反应」。
     #[test]
-    fn cursor_unpack_handles_negative_y() {
-        // 鼠标可在屏幕上方，y 的高16 位带符号。
-        let (x, y) = unpack_cursor(5 | ((-3i32 as isize) << 16));
-        assert_eq!(x, 5);
-        assert_eq!(y & 0xFFFF, 0xFFFD);
+    fn cursor_unpack_handles_negative_coordinates() {
+        // x = -1（屏幕左缘外侧），y = -3。
+        let (x, y) = unpack_cursor((-1i32 as isize & 0xFFFF) | ((-3i32 as isize) << 16));
+        assert_eq!(x, -1, "x 为负时必须解成 -1，而不是 65535");
+        assert_eq!(y, -3, "y 为负时必须解成 -3，而不是 65533");
+
+        // 对照：正坐标不受影响。
+        assert_eq!(unpack_cursor(100 | (200 << 16)), (100, 200));
     }
 
     #[test]
