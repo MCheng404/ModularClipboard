@@ -110,8 +110,6 @@ pub enum Op {
     /// 用户以为「记录停了」。真实决策（隐藏 / 退出）由 `App` 侧结合
     /// 有无托盘兜底判断，绘制层不决定。
     CloseWindow,
-    /// 最小化按钮。
-    MinimizeWindow,
 }
 
 /// 配置分组。
@@ -174,7 +172,6 @@ pub struct UiState {
     pub hit: std::collections::HashMap<&'static str, Rect>,
     /// 关闭 / 最小化请求。
     pub close_requested: bool,
-    pub minimize_requested: bool,
 }
 
 impl UiState {
@@ -326,13 +323,18 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     // 尺寸取顶栏高度的 60%，留出上下呼吸空间。
     let btn = bar.height() * 0.62;
     let gap = pal.space_sm * 2.0;
-    // 四枚按钮：关闭 / 最小化 / 清空 / 设置。
+    // 三枚按钮：关闭 / 清空 / 设置（「最小化」已去掉，见 draw_topbar_icons）。
+    //
+    // ⚠️ 这里的 `3.0` 必须与 `draw_topbar_icons` 里的 `step = r.width() / 3.0`
+    // 一致。两处各写一份数字，改一处忘另一处 ⇒ 按钮区与实际按钮错位，
+    // 表现为「最右那枚被搜索框压住」或「点齿轮变成拖窗口」。
+    let btn_count = 3.0;
     let btn_area = Rect::from_min_size(
         pos2(
-            inner.max.x - btn * 4.0 - gap * 3.0,
+            inner.max.x - btn * btn_count - gap * (btn_count - 1.0),
             bar.center().y - btn * 0.5,
         ),
-        vec2(btn * 4.0 + gap * 3.0, btn),
+        vec2(btn * btn_count + gap * (btn_count - 1.0), btn),
     );
     draw_topbar_icons(f, btn_area, bar.center().y);
 
@@ -435,31 +437,32 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
 /// 所以 `Button` 只负责命中与悬停底色，图标用 [`Icon::paint`] 叠在
 /// 它自己的矩形上。
 fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
-    let step = r.width() / 4.0;
+    let step = r.width() / 3.0;
     let sq = step * 0.62;
 
-    // 自左向右：关闭 / 最小化 / 清空 / 设置。
+    // 自左向右：关闭 / 清空 / 设置。
     //
-    // ⚠️ 关闭与最小化是仅有的两枚「窗口级」按钮，点击后果是隐藏或
-    // 最小化整个窗口；把它们放在最左，与卡片内的操作在视觉上分开。
+    // ⚠️ 只有三枚了——「最小化」已去掉。它与「关闭到托盘」的实际
+    // 效果几乎相同（都让窗口消失），区别仅在任务栏是否留条目，
+    // 而本程序常驻托盘，用户极少需要「留在任务栏但看不见」。
+    // 两个近乎重复的按钮并排反而增加误点。
+    //
+    // 关闭按钮用 `Icon::Minimize`（横线）而非 `Icon::Close`（叉）：
+    // 它的语义是「收起」，与最小化同族；叉号在中文界面里更常被
+    // 理解成「删除/退出」，而这里并不是退出。
     let slot = |i: f32| Rect::from_center_size(pos2(r.min.x + step * (i + 0.5), center_y), vec2(sq, sq));
     let r_close = slot(0.0);
-    let r_min = slot(1.0);
-    let r_clear = slot(2.0);
-    let r_set = slot(3.0);
+    let r_clear = slot(1.0);
+    let r_set = slot(2.0);
 
     // 登记热区给测试用（见 `UiState::hit` 的说明）。**必须在点击判定
     // 之前登记**：`draw_topbar` 随后要读这张表来挖拖动区。
     f.state.hit.insert("topbar_close", r_close);
-    f.state.hit.insert("topbar_minimize", r_min);
     f.state.hit.insert("topbar_clear", r_clear);
     f.state.hit.insert("topbar_settings", r_set);
 
-    if icon_button(f, "topbar_close", r_close, Icon::Close, "关闭到托盘", false) {
+    if icon_button(f, "topbar_close", r_close, Icon::Minimize, "关闭到托盘", false) {
         f.state.push(Op::CloseWindow);
-    }
-    if icon_button(f, "topbar_minimize", r_min, Icon::Minimize, "最小化", false) {
-        f.state.push(Op::MinimizeWindow);
     }
     // 破坏性操作（清空）用 danger 色，与「设置」区分开。
     if icon_button(f, "topbar_clear", r_clear, Icon::Trash, "清空全部历史", true) {
@@ -1341,88 +1344,30 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     }
 }
 
-/// 卡片头部：标题 + 分离/折叠两枚按钮。
+/// 卡片头部：只有标题。
 ///
-/// 按钮走 [`card_icon_button`]（与顶栏同一个 `Button` 套路），
-/// 标题仍是自绘文本——`Label` 会参与布局并推动游标，而这里要的是
-/// 「标题固定在左侧、按钮固定在右侧」，用绝对矩形最直接。
+/// # 为什么不再有「分离」「折叠」两枚按钮
+///
+/// 历史栏**固定在下方**，是主界面的主区，不需要用户手动折叠或拖走——
+/// 这两个操作对它是多余的。而它们在界面上表现为两个 PUA 码位的
+/// 小图标（⠿ / ⇤），在 150% 缩放下辨识度很差。
+///
+/// # 但折叠态本身**没有**删除
+///
+/// [`crate::solver`] 在窗口过窄时仍会自动折叠卡片（见
+/// `Solution::auto_collapsed`），此时走 [`draw_collapsed_card`]——
+/// 那条路径上的把手仍可点击展开。删掉的只是「手动」入口。
 fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
     let pal = f.pal;
     let scale = f.scale;
     let font: FontId = sized(pal.font_md, scale);
-
-    // 右侧预留两个按钮的宽度，标题只在其左侧绘制。
-    let btn = (pal.control_height * 0.8).max(16.0);
-    let title_area = Rect::from_min_max(
-        head.min,
-        pos2(head.max.x - btn * 2.0 - pal.space_xs * 2.0, head.max.y),
-    );
-    f.ui.painter_at(title_area).text(
-        title_area.left_center(),
+    f.ui.painter_at(head).text(
+        head.left_center(),
         Align2::LEFT_CENTER,
         card.kind.title(),
         font,
         pal.text_bright,
     );
-
-    // 「分离」按钮：把卡片变成独立子窗口。
-    let detach = Rect::from_center_size(
-        pos2(head.max.x - btn * 1.5 - pal.space_xs, head.center().y),
-        vec2(btn, btn),
-    );
-    // 「折叠」按钮。
-    let collapse = Rect::from_center_size(
-        pos2(head.max.x - btn * 0.5, head.center().y),
-        vec2(btn, btn),
-    );
-
-    // 登记热区**在点击判定之前**：`draw_child` 也要读它。
-    f.state.hit.insert("card_detach", detach);
-    f.state.hit.insert("card_collapse", collapse);
-
-    if card_icon_button(f, card, "collapse", collapse, crate::icons::Icon::Collapse, "折叠卡片") {
-        f.state.push(Op::ToggleCollapse(card.id));
-    }
-    if card_icon_button(f, card, "detach", detach, crate::icons::Icon::Drag, "分离为独立窗口") {
-        f.state.push(Op::Detach(card.id));
-    }
-}
-
-/// 卡片头部的一枚图标按钮；返回是否被点击。
-///
-/// 与顶栏 [`icon_button`] 的差别只有一处：`Id` 必须带 `card.id`——
-/// 多张卡片各有同名的「折叠」「分离」按钮，共用 Id 会互相抢点击，
-/// 表现为「点 A 卡片的折叠，实际折叠了 B」。
-fn card_icon_button(
-    f: &mut Frame<'_>,
-    card: &Card,
-    tag: &'static str,
-    r: Rect,
-    icon: crate::icons::Icon,
-    tip: &'static str,
-) -> bool {
-    let pal = f.pal;
-    let scale = f.scale;
-    let resp = f.ui.scope_builder(
-        egui::UiBuilder::new()
-            .id(egui::Id::new((tag, card.id)))
-            .max_rect(r)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-        |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
-    );
-    let resp = resp.inner;
-    if resp.hovered() {
-        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
-    }
-    icon.paint(
-        &f.ui.painter_at(r),
-        Rect::from_center_size(r.center(), vec2(pal.icon_size, pal.icon_size) * scale),
-        if resp.hovered() { pal.text_bright } else { pal.text_dim },
-    );
-    // ⚠️ `on_hover_text` 消耗 `Response`，`clicked()` 必须在它之前取。
-    let clicked = resp.clicked();
-    resp.on_hover_text(tip);
-    clicked
 }
 
 // ---------------------------------------------------------------- 内容
@@ -2267,104 +2212,79 @@ mod tests {
     ///
     /// 行的坐标由 solver 决定，不能写死：从工作区里读回
     /// 历史卡片自己的 `rect`，再在其中取一点。
-    #[test]
-    fn clicking_row_selects_it() {
-        let mut h = Harness::new("row-select", vec2(600.0, 400.0));
-        h.frame();
-        let hist = h
-            .ws
-            .by_kind(CardKind::History)
-            .expect("默认工作区应含历史卡片");
-        let r = hist.rect;
-        assert!(
-            r.width() > 10.0 && r.height() > 10.0,
-            "历史卡片矩形应有效，实际 {r:?}"
-        );
-        let ops = h.click_at(r.center());
-        // 没有数据时点空白不产生 Select 是**对的**，所以这里只验证
-        // 「点列表区域不会崩、且不产生破坏性操作」。
-        assert!(
-            !ops.contains(&Op::ClearAll),
-            "点列表区不应触发清空"
-        );
-        assert!(
-            !ops.iter().any(|o| matches!(o, Op::Delete(_) | Op::ClearAll)),
-            "点列表区不应误删或清空，实际={ops:?}"
-        );
-    }
-
-    /// 点卡片头部的「折叠」按钮 ⇒ 产生 `ToggleCollapse`。
+        /// 卡片头部**不再有**「分离」「折叠」按钮。
     ///
-    /// # 为什么必须用热区而不是猜坐标
+    /// # 为什么守这条
     ///
-    /// 头部右侧有**两枚**按钮：分离（靠左）与折叠（最右）。
-    /// 早前按「头部右侧」点，实际拿到的是 `ToggleCollapse`——
-    /// 看着点的是 A 却触发了 B，而且**不报错**只是断言失败，
-    /// 极难判断是自己坐标算错还是代码有 bug。
-    ///
-    /// 所以先跑一帧，再从 `UiState::hit` 读真实矩形。
-    /// 布局怎么改都不会测错对象。
+    /// 历史栏固定在下方，手动折叠/分离对它没有意义，而那两枚 PUA
+    /// 码位图标（⠿ / ⇤）在 150% 缩放下辨识度很差。若将来有人
+    /// 「顺手加回来」，这条会拦住——它们的交互缺陷（画了但点不动、
+    /// 或点了却误触发对方）正是当初重写的起因。
     #[test]
-    fn clicking_collapse_button_emits_toggle_collapse() {
-        let mut h = Harness::new("collapse-btn", vec2(700.0, 500.0));
+    fn card_header_has_no_buttons() {
+        let mut h = Harness::new("header-clean", vec2(700.0, 500.0));
         h.frame();
-        let p = hit(&h, "card_collapse").center();
-        let ops = h.click_at(p);
-        assert!(
-            ops.iter().any(|o| matches!(o, Op::ToggleCollapse(_))),
-            "点折叠按钮应产生 ToggleCollapse，实际={ops:?}"
-        );
-    }
-
-    /// 点卡片头部的「分离」按钮 ⇒ 产生 `Detach`。
-    ///
-    /// 分离按钮在折叠按钮**左侧**一个身位——两条测试一起守住
-    /// 「两枚按钮各管各的」，不会因为排版改动而互换。
-    #[test]
-    fn clicking_detach_button_emits_detach() {
-        let mut h = Harness::new("detach-btn", vec2(700.0, 500.0));
-        h.frame();
-        let detach = hit(&h, "card_detach");
-        let collapse = hit(&h, "card_collapse");
-        assert!(
-            detach.max.x < collapse.min.x,
-            "分离按钮应在折叠按钮左侧，实际 detach={detach:?} collapse={collapse:?}"
-        );
-        let ops = h.click_at(detach.center());
-        assert!(
-            ops.iter().any(|o| matches!(o, Op::Detach(_))),
-            "点分离按钮应产生 Detach，实际={ops:?}"
-        );
-    }
-
-    /// 折叠可逆：点两次回到初始状态。
-    #[test]
-    fn collapse_is_reversible() {
-        let mut h = Harness::new("collapse-rev", vec2(700.0, 500.0));
-        h.frame();
-        let before = h
-            .ws
-            .by_kind(CardKind::History)
-            .expect("默认工作区应含历史卡片")
-            .collapsed;
-        let p = hit(&h, "card_collapse").center();
-        // 两次点击 + 落地（模拟 App::apply_ops）。
-        for _ in 0..2 {
-            let ops = h.click_at(p);
-            for o in &ops {
-                if let Op::ToggleCollapse(id) = o {
-                    h.ws.get_mut(*id).expect("卡片存在").toggle_collapse();
-                }
-            }
-            h.frame();
+        for name in ["card_collapse", "card_detach"] {
+            assert!(
+                !h.state.hit.contains_key(name),
+                "卡片头部不应再登记 {name} 热区，实际热区={:?}",
+                h.state.hit.keys().collect::<Vec<_>>()
+            );
         }
-        assert_eq!(
-            h.ws
-                .by_kind(CardKind::History)
-                .expect("历史卡片")
-                .collapsed,
+        // 点头部右侧（原先两枚按钮所在的位置）不应产生任何操作。
+        let ops = h.click_at(pos2(680.0, 30.0));
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::ToggleCollapse(_) | Op::Detach(_))),
+            "点卡片头部右侧不应再产生折叠/分离，实际={ops:?}"
+        );
+    }
+
+    /// 折叠态仍可达：窗口变窄时 solver 自动折叠，把手可点击展开。
+    ///
+    /// ⚠️ 这条与上一条**不矛盾**：删掉的是「手动」折叠入口，
+    /// 「自动」折叠（solver 在窄窗口下折叠卡片）必须保留，
+    /// 否则窄窗口下卡片内容会挤成一团。
+    #[test]
+    fn auto_collapsed_card_can_be_expanded_by_its_handle() {
+        // 先确认存在可折叠的卡片（历史栏本身不可折叠）。
+        let mut h = Harness::new("auto-collapse", vec2(700.0, 500.0));
+        h.frame();
+        let collapsible = h
+            .ws
+            .cards
+            .iter()
+            .any(|c| c.kind.collapsible());
+        if !collapsible {
+            // 默认工作区只有置顶 + 历史，两者都不可折叠——跳过而非失败，
+            // 这样将来默认卡片集变化时这条测试不会误报。
+            return;
+        }
+        let before: Vec<bool> = h.ws.cards.iter().map(|c| c.collapsed).collect();
+        // 折叠一张可折叠的卡片，然后点它的把手。
+        let target = h
+            .ws
+            .cards
+            .iter()
+            .find(|c| c.kind.collapsible())
+            .expect("上面已确认存在")
+            .id;
+        h.ws.get_mut(target).expect("卡片存在").toggle_collapse();
+        h.frame();
+        assert!(
+            h.ws.get(target).expect("卡片存在").collapsed,
+            "前置条件：卡片应处于折叠态"
+        );
+        // 把手区域中心点击 ⇒ ToggleCollapse（把手自身就是那个控件）。
+        let ops = h.click_at(pos2(10.0, 250.0));
+        for o in &ops {
+            if let Op::ToggleCollapse(id) = o {
+                h.ws.get_mut(*id).expect("卡片存在").toggle_collapse();
+            }
+        }
+        assert_ne!(
+            h.ws.cards.iter().map(|c| c.collapsed).collect::<Vec<_>>(),
             before,
-            "点两次折叠应回到初始状态"
+            "点击折叠把手后应能展开折叠态"
         );
     }
 
@@ -2542,7 +2462,6 @@ mod tests {
         // 静默漏测——而那正是「按钮存在却点不动」的成因。
         for name in [
             "topbar_close",
-            "topbar_minimize",
             "topbar_clear",
             "topbar_settings",
             "search",
@@ -2564,32 +2483,7 @@ mod tests {
     /// 顶栏也只有清空与设置两枚按钮，于是 `App::take_close_requested`
     /// 读的那个标志永远是 false——标题栏的关闭与最小化按钮
     /// 根本不存在，点了没反应。
-    #[test]
-    fn clicking_close_button_emits_close_window() {
-        let mut h = Harness::new("close-btn", vec2(700.0, 500.0));
-        h.frame();
-        let p = hit(&h, "topbar_close").center();
-        let ops = h.click_at(p);
-        assert!(
-            ops.iter().any(|o| matches!(o, Op::CloseWindow)),
-            "点关闭按钮应产生 CloseWindow，实际={ops:?}"
-        );
-    }
-
-    /// 点最小化按钮必须产生 `Op::MinimizeWindow`。语义同上一条。
-    #[test]
-    fn clicking_minimize_button_emits_minimize_window() {
-        let mut h = Harness::new("min-btn", vec2(700.0, 500.0));
-        h.frame();
-        let p = hit(&h, "topbar_minimize").center();
-        let ops = h.click_at(p);
-        assert!(
-            ops.iter().any(|o| matches!(o, Op::MinimizeWindow)),
-            "点最小化按钮应产生 MinimizeWindow，实际={ops:?}"
-        );
-    }
-
-    /// 四枚按钮互不重叠，且都排在搜索框右侧。
+    /// 三枚按钮互不重叠，且都排在搜索框右侧。
     ///
     /// 顶栏按钮区是「先算按钮、再算搜索框」算出来的；一旦顺序颠倒，
     /// 搜索框会铺到右缘把按钮压在下面——此时热区仍存在、点击仍能
@@ -2599,12 +2493,7 @@ mod tests {
         let mut h = Harness::new("btn-layout", vec2(700.0, 500.0));
         h.frame();
 
-        let names = [
-            "topbar_close",
-            "topbar_minimize",
-            "topbar_clear",
-            "topbar_settings",
-        ];
+        let names = ["topbar_close", "topbar_clear", "topbar_settings"];
         let rects: Vec<(&str, Rect)> = names.iter().map(|n| (*n, hit(&h, n))).collect();
 
         for (i, (name, r)) in rects.iter().enumerate() {

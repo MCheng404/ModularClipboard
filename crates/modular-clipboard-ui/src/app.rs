@@ -428,10 +428,9 @@ pub fn run_with_options(
                 }
             }
         }
-        if app.take_minimize_requested() {
-            // 最小化**不是**隐藏：窗口仍在任务栏，托盘唤起仍能恢复。
-            presence::minimize_window(window.hwnd());
-        }
+        // 注：原先这里还有「最小化」按钮的处理。它已从顶栏去掉——
+        // 与「关闭到托盘」的实际效果几乎相同（都让窗口消失），
+        // 区别仅在任务栏是否留条目，而本程序常驻托盘，用户极少需要。
         if quit {
             break;
         }
@@ -897,9 +896,6 @@ impl App {
                 Op::CloseWindow => {
                     self.paint_state.close_requested = true;
                 }
-                Op::MinimizeWindow => {
-                    self.paint_state.minimize_requested = true;
-                }
             }
         }
 
@@ -964,11 +960,6 @@ impl App {
     /// 写入，永远是false，于是标题栏关闭按钮点了没反应。
     pub fn take_close_requested(&mut self) -> bool {
         std::mem::take(&mut self.paint_state.close_requested)
-    }
-
-    /// 取出并清掉「标题栏最小化按钮」请求。语义同 [`Self::take_close_requested`]。
-    pub fn take_minimize_requested(&mut self) -> bool {
-        std::mem::take(&mut self.paint_state.minimize_requested)
     }
 
     /// 是否收到退出请求。
