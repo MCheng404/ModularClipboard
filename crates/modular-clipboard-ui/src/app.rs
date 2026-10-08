@@ -239,6 +239,14 @@ pub fn run_with_options(
     let mut quit = false;
     // 卡片子窗口集合（详情/视图等被拖出主窗的卡片）。
     let mut children = crate::childwin::ChildWindows::new();
+    // 设置窗口（懒创建）。
+    //
+    // ⚠️ **懒创建**而不是建时就创建：设置窗口只在用户点齿轮时才需要，
+    // 每个窗口都有独立的交换链 + 字体图集（显存开销实测量级不小）。
+    // 程序启动就建一个永不显示的窗口是纯浪费。
+    //
+    // 失败也不致命——设置打不开不该让主程序起不来（降级为无设置）。
+    let mut settings_win: Option<crate::settingswin::SettingsWindow<'_>> = None;
     // 窗口隐藏到托盘后仍在跑帧循环（要继续接收托盘事件），
     // 但不再渲染。`GetClientRect` 对隐藏窗口仍返回原尺寸，
     // 靠尺寸判断不出隐藏态，必须显式记这个标志。
@@ -525,6 +533,52 @@ pub fn run_with_options(
         for child in children.iter_mut() {
             if let Err(e) = child.render(&mut app) {
                 tracing::warn!(card = ?child.card_id, %e, "子窗口渲染失败，跳过本帧");
+            }
+        }
+
+        // ---- 4.6 设置窗口 ------------------------------------------------
+        //
+        // 懒创建：第一次需要时才建窗口（每次都建会泄漏交换链）。
+        //
+        // ⚠️ 生命周期由 `paint_state.show_settings` 决定，而它可能被
+        // 三处改：齿轮点击（`Op::ToggleSettings`）、设置面板里的关闭
+        // 按钮、以及用户点标题栏 ✕。前两处在绘制里改，第三处由
+        // `sync_and_render` 的返回值告知——**必须**在此把它同步回
+        // `false`，否则窗口藏了而状态说「开着」，再点齿轮就没反应。
+        if settings_win.is_none() && app.paint_state.show_settings {
+            match crate::settingswin::SettingsWindow::create(
+                window.screen_position_points(),
+                window.scale_factor(),
+                &shared,
+            ) {
+                Ok(w) => {
+                    tracing::info!("设置窗口已创建");
+                    settings_win = Some(w);
+                }
+                Err(e) => {
+                    // 每帧都会走到这里，必须降频，否则日志刷屏。
+                    if frame_no % 60 == 0 {
+                        tracing::warn!(%e, "创建设置窗口失败，本帧不再重试");
+                    }
+                    app.paint_state.show_settings = false;
+                }
+            }
+        }
+
+        if let Some(w) = settings_win.as_mut() {
+            // ⚠️ 先取 `want_open` 再进函数：`sync_and_render(&mut app, …)`
+            // 会可变借用 `app`，而在参数里读 `app.paint_state` 会二次借用。
+            let want_open = app.paint_state.show_settings;
+            match w.sync_and_render(&mut app, want_open) {
+                Ok(true) => {
+                    // 用户关了设置窗口 ⇒ 状态同步回false。
+                    app.paint_state.show_settings = false;
+                    tracing::info!("设置窗口已被用户关闭");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(%e, "设置窗口渲染失败，跳过本帧");
+                }
             }
         }
 
@@ -928,6 +982,42 @@ impl App {
         crate::paint::draw_child(&mut frame);
         // 子窗口里的操作（点叉收回、点拖动条收回）也要落地。
         self.apply_ops();
+    }
+
+    /// 画设置窗口的一帧（由 [`crate::settingswin`] 调用）。
+    ///
+    /// 与 [`Self::draw_child_frame`] 同一套路：把 `paint::Frame` 的
+    /// 字段组装收敛在这里，`settingswin` 不需要知道 `App` 的内部结构。
+    ///
+    /// ⚠️ 设置窗口里的 `apply_ops` 必须在**之后**跑：改配置要先落盘
+    /// （`after_config_change`），而落盘时机取决于绘制是否已完成。
+    pub fn draw_settings_window(&mut self, ui: &mut egui::Ui) {
+        let area = ui.max_rect();
+        let ppp = ui.ctx().pixels_per_point();
+        let mut frame = crate::paint::Frame {
+            ui,
+            state: &mut self.paint_state,
+            svc: &mut self.svc,
+            ws: &self.ws,
+            pal: &self.pal,
+            scale: ppp,
+            area,
+            card_id: None,
+        };
+        crate::paint::draw_settings(&mut frame);
+        // 设置项的改动要立刻落盘——用户在设置窗口里点了开关就
+        // 关掉窗口，不该丢。
+        self.apply_ops();
+    }
+
+    /// 设置窗口打开时把滚动位置归零。
+    ///
+    /// 由设置窗口在「刚打开」那一帧调用。不做的话，上次停在半截的
+    /// 设置项会出现在新一帧的顶部，用户以为漏看了上面的项。
+    pub fn reset_settings_scroll(&mut self) {
+        // `ScrollArea` 管的滚动位置存在 egui 的内存里，清掉它即可。
+        self.ctx
+            .memory_mut(|m| m.data.remove::<egui::Id>(egui::Id::new("settings_scroll")));
     }
 
     /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。

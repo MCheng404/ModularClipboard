@@ -41,6 +41,7 @@ pub mod text;
 pub mod workspace;
 pub mod icons;
 pub mod presence;
+pub mod settingswin;
 pub mod renderer;
 pub mod theme;
 pub mod thumbnail;

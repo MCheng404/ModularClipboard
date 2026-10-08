@@ -286,11 +286,12 @@ pub fn draw(f: &mut Frame<'_>) {
     draw_topbar(f, top);
     draw_cards(f, body);
 
-    // 设置界面作为**覆盖层**画在最后：它要盖住卡片，
-    // 所以顺序上必须在卡片之后。
-    if f.state.show_settings {
-        draw_settings(f, area);
-    }
+    // ⚠️ 设置界面**不在这里画**——它已移到独立窗口
+    // （见 `crate::settingswin`）。主窗口只负责响应齿轮点击，
+    // 把 `show_settings` 置 true，由设置窗口的绘制入口接管。
+    //
+    // 若在这里再画一次，用户会看到「主窗口里浮着一块面板」，
+    // 而真正的设置窗口在旁边——同一份内容画两遍。
 }
 
 // ---------------------------------------------------------------- 顶栏
@@ -688,89 +689,49 @@ fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
     painter.line_segment([start, end], Stroke::new(stroke_w, color));
 }
 
-/// 设置界面（覆盖层）。
+/// 设置界面的整帧内容（画在**独立窗口**里）。
 ///
-/// # 重写要点
+/// # 与旧「覆盖层」版的差别
 ///
-/// 旧实现把每一行都算成绝对矩形：手写遮罩、手绘开关、���写滚动条、
-/// 宏驱动的分组标题。约 300 行里大部分是「算矩形 + 画」，
-/// 而交互全靠 `ui.interact` 自己维护。
+/// 旧版是在主窗口上盖一块居中面板 + 一层遮罩。这里改成独立窗口后：
 ///
-/// 现在整段跑在 egui 的布局系统里：
-/// - `ui.horizontal` 负责「标签在左、控件在右」，不再手算 `ctrl_w`；
-/// - `Checkbox` / `DragValue` / `selectable_label` 是真控件，
-///   自带命中、焦点、键盘调整；
-/// - `ScrollArea` 负责滚动与裁剪，`settings_scroll` 这个手写偏移量
-///   随之删除。
+/// - **没有遮罩**——独立窗口天然就是模态的，不需要额外拦点击；
+/// - **不居中**——窗口本身就是面板，按客户区铺满即可；
+/// - **没有外框**——它已经是独立窗口，再画一层卡片框会显得
+///   「窗口里还有一块面板」。
 ///
-/// # 为什么开关仍是自绘
-///
-/// 项目视觉语言是「纯平毛玻璃」，明令禁止拟物装饰。`Checkbox`
-/// 自带的勾选框带立体感，与整体观感不符，所以保留 [`draw_switch`]
-/// 的自绘外观——但它现在只管**画**，命中交给 egui 的 `interact`
-/// （由 `add` 系列控件提供），不再自己算热区。
-///
-/// 「置顶模式」的切换入口在这里，不在顶栏——顶栏只保留搜索与图标
-/// 按钮，视觉噪声更低。
-fn draw_settings(f: &mut Frame<'_>, area: Rect) {
+/// `area` 是**本窗口自己的客户区**，与主窗口无关。
+pub fn draw_settings(f: &mut Frame<'_>) {
     let pal = f.pal;
-    // `scale` 不再需要：面板尺寸改由 `area`（逻辑点）直接算，
-    // 而内容区的字号交给 egui 的 `RichText::size` 走样式系统。
-    let _ = f.scale;
+    // 客户区由 `Frame` 带入——设置窗口有自己的客户区，
+    // 不该再让调用方传一个进来（那两个值必须一致，传错就是 bug）。
+    let area = f.area;
 
     // ⚠️ **首帧的 `area` 可能荒谬**（实测 6666x6666）。
     //
     // `ui.max_rect()` 取的是子 `Ui` 的可用矩形，而首帧 `screen_rect`
     // 尚未由 `egui_input` 正确设置（`RawInput.screen_rect` 是默认值）。
-    // 此时按 `area` 居中的面板会被算到屏幕外，**看起来像设置界面没打开**。
+    // 此时按 `area` 排布的面板会被算到屏幕外，**看起来像设置界面没打开**。
     //
-    // 这里显式拒绝明显不合理的尺寸：不画任何东西，等下一帧。
-    // 判断用「超过客户区常见上限」而非绝对值——不同 DPI 下差异很大。
+    // 显式拒绝明显不合理的尺寸：不画任何东西，等下一帧。
+    // 判断用「超过常见上限」而非绝对值——不同 DPI 下差异很大。
     let reasonable = area.width() <= 4000.0 && area.height() <= 4000.0;
     if !reasonable {
         tracing::debug!(area = ?area, "客户区尺寸异常，本帧跳过设置界面");
         return;
     }
 
-    // 遮罩：盖住下面的卡片，点击遮罩关闭。
-    //
-    // ⚠️ 遮罩必须**先**画再开面板子 Ui：它要盖住卡片，而面板画在
-    // 遮罩之上。顺序反了面板会被遮罩盖住。
-    let resp = f
-        .ui
-        .interact(area, egui::Id::new("settings_scrim"), Sense::click());
-    f.ui
-        .painter()
-        .rect_filled(area, 0.0, pal.overlay_scrim);
-    if resp.clicked() {
-        f.state.show_settings = false;
-        return;
-    }
-
-    // 面板：居中，宽度按逻辑点定，不随窗口无限拉伸。
-    //
-    // ⚠️ 两处 `max(...)` 是为了在**极小窗口**下不出现负宽度：
-    // 客户区可能只有 60pt（窗口被拉到极窄），`area.width() - 40` 会为负。
-    // ⚠️ 这里**不能乘 `scale`**。
-    //
-    // `area` 来自 `ui.max_rect()`，是**逻辑点**（DPI 无关）：
-    // 实测 1.5x 屏上客户区 420x560 物理像素，`area` 报 280x373。
-    //
-    // 早前写 `420.0 * scale` 得到 630「逻辑点」——比整个客户区还宽，
-    // 虽然被 `.min(area.width()-40)` 兜住不至于溢出，但那只是恰好被夹住，
-    // 语义是错的：一旦窗口够宽，面板就会宽到不合理。
-    let w = 420.0_f32.min(area.width() - 40.0).max(120.0);
-    let h = (area.height() * 0.85).min(560.0).max(120.0);
-    let panel = Rect::from_center_size(area.center(), vec2(w, h));
-    draw_card_frame(f, panel);
+    // 铺满客户区：外框 + 背景。独立窗口不再画卡片框，
+    // 但要有底色，否则透明区域会透出桌面。
+    f.ui.painter_at(area).rect_filled(area, 0.0, pal.bg);
 
     let pad = pal.space_md;
-    let view = panel.shrink2(vec2(pad, pad));
+    let view = area.shrink2(vec2(pad, pad));
     if view.width() <= 8.0 || view.height() <= 8.0 {
         return;
     }
 
-    // 在面板矩形里开子 Ui：下面所有控件都跑在 egui 的布局里，
+    // 在窗口矩形里开子 Ui：下面所有控件都跑在 egui 的布局里，
     // 由它负责换行、间距、滚动裁剪。
     let mut ui = f.ui.new_child(
         egui::UiBuilder::new()
@@ -783,14 +744,11 @@ fn draw_settings(f: &mut Frame<'_>, area: Rect) {
     settings_header(f, &mut ui);
     ui.separator();
 
-    // 设置项会随版本增加，面板高度固定 ⇒ 必须能滚。
-    // `ScrollArea` 取代原先手写的 `settings_scroll` + 虚拟化 +
-    // 自绘滚动条（约 30 行）。
+    // 设置项会随版本增加，窗口高度固定 ⇒ 必须能滚。
     //
-    // ⚠️ 高度必须用「**剩余可用高度**」而不是估算常量。
-    // 早前写死 `view.height() - 28.0 * scale`，而标题行实际高度随
-    // 字号缩放变化，两者对不上：窗口越矮，误差越大，实测在 600x400
-    // 下开关被排到 y=444（**已在客户区之外**），设置项点不到。
+    // ⚠️ 高度必须用「**剩余可用高度**」而不是估算常量：标题行实际
+    // 高度随字号缩放变化，写死一个系数会在窗口越矮时误差越大
+    // （此前实测 600x400 下开关被排到客户区之外，点不到）。
     // `ScrollArea` 会**扩展**到内容高度，所以这里必须显式封顶。
     let head_h = ui.min_rect().height();
     let body_max = (view.height() - head_h - ui.spacing().item_spacing.y).max(0.0);
@@ -1931,24 +1889,72 @@ mod tests {
             self.frame_with(Vec::new())
         }
 
-        /// 在给定**逻辑点**坐标处点一下，跑一帧。
-        fn click_at(&mut self, p: egui::Pos2) -> Vec<Op> {
-            self.frame_with(vec![
-                egui::Event::PointerMoved(p),
-                egui::Event::PointerButton {
-                    pos: p,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: Default::default(),
-                },
-                egui::Event::PointerButton {
-                    pos: p,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: Default::default(),
-                },
-            ])
+        /// 只跑**设置窗口**的一帧（不跑主界面的 `draw`）。
+        ///
+        /// 设置界面已移到独立窗口（见 `crate::settingswin`），
+        /// 主界面的 `draw` 不再画它——所以要用这条专用入口来测。
+        ///
+        /// ⚠️ 不跑 solver：设置面板不读 `card.rect`，只需要
+        /// `svc`/`state`/`pal` 与客户区。
+        fn settings_frame(&mut self) -> Vec<Op> {
+            self.settings_frame_with(Vec::new())
         }
+
+        /// 带输入事件的设置帧。
+        fn settings_frame_with(&mut self, events: Vec<egui::Event>) -> Vec<Op> {
+            let input = self.input(events);
+            let (svc, ws, state, pal, area) =
+                (&mut self.svc, &self.ws, &mut self.state, &self.pal, self.area);
+            let ws = &*ws;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                let ppp = ui.ctx().pixels_per_point();
+                let mut f = Frame {
+                    ui,
+                    state,
+                    svc,
+                    ws,
+                    pal,
+                    scale: ppp,
+                    area,
+                    card_id: None,
+                };
+                draw_settings(&mut f);
+            });
+            out.textures_delta.clear();
+            std::mem::take(&mut self.state.ops)
+        }
+
+        /// 在给定**逻辑点**坐标处点一下，跑一帧（主界面）。
+        fn click_at(&mut self, p: egui::Pos2) -> Vec<Op> {
+            self.frame_with(click_events(p))
+        }
+
+        /// 在设置**窗口**里的坐标处点一下，跑一帧。
+        ///
+        /// 与 [`Self::click_at`] 的区别只在跑哪一帧：设置界面不在
+        /// 主界面的 `draw` 里画，用 `click_at` 点它永远打不中。
+        fn settings_click_at(&mut self, p: egui::Pos2) -> Vec<Op> {
+            self.settings_frame_with(click_events(p))
+        }
+    }
+
+    /// 一次完整点击（移动 → 按下 → 抬起）的事件序列。
+    fn click_events(p: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
     }
 
 
@@ -1999,32 +2005,37 @@ mod tests {
         );
     }
 
-    /// 点遮罩 ⇒ 关闭设置面板。
+    /// 设置面板里的关闭按钮 ⇒ 关闭设置。
     ///
-    /// 这条守的是「能关掉」：面板打开后，退出入口只有面板上的
-    /// 关闭按钮与这个遮罩。
+    /// # 这条替代了原来的 `clicking_scrim_closes_settings`
     ///
-    /// ⚠️ 直接把 `show_settings` 置 true 而不点齿轮：齿轮点击的效果
-    /// （`Op::ToggleSettings`）由 `App::apply_ops` 落地，paint 层
-    /// 测试里点它不会改状态——那是正确的分层，要测关闭路径就
-    /// 直接进入「已打开」态。
+    /// 旧版设置是主窗口上的**覆盖层**，退出入口有「关闭按钮」与
+    /// 「点遮罩」两个。现在移到独立窗口，没有遮罩了——点遮罩不可能
+    /// 触发任何事。
+    ///
+    /// 新的退出入口只有标题栏 ✕（由 `settingswin` 处理）与这个
+    /// 面板内关闭按钮。
     #[test]
-    fn clicking_scrim_closes_settings() {
-        let mut h = Harness::new("settings-scrim", vec2(600.0, 400.0));
+    fn clicking_close_button_in_settings_closes_it() {
+        let mut h = Harness::new("settings-close", vec2(600.0, 400.0));
         h.state.show_settings = true;
-        h.frame();
-        assert!(h.state.show_settings, "前置状态：面板应处于打开态");
-
-        // 点面板**外面**（客户区左下角，遮罩区域）。
-        h.click_at(pos2(4.0, h.area.max.y - 4.0));
-        h.frame();
+        h.settings_frame();
+        assert!(
+            h.state.hit.contains_key("settings_close"),
+            "前置条件：面板应登记关闭按钮热区，实际={:?}",
+            h.state.hit.keys().collect::<Vec<_>>()
+        );
+        let p = hit(&h, "settings_close").center();
+        h.settings_click_at(p);
+        // 关闭按钮把 `show_settings` 置回 false（不走 Op——
+        // 它改的是本窗口的可见性，不是工作区状态）。
         assert!(
             !h.state.show_settings,
-            "点遮罩应关闭设置面板"
+            "点关闭按钮应关闭设置面板"
         );
     }
 
-    /// 点垃圾桶 ⇒ 产生清空操作。
+/// 点垃圾桶 ⇒ 产生清空操作。
     ///
     /// ⚠️ 清空是**破坏性**操作，所以必须真的能点出来——否则用户
     /// 想清空历史时只能去改配置文件。
@@ -2228,9 +2239,9 @@ mod tests {
     fn settings_panel_renders_within_bounds() {
         let mut h = Harness::new("settings-render", vec2(600.0, 400.0));
         h.state.show_settings = true;
-        h.frame();
-
-        // 至少要有一枚开关登记热区——那是开关真的被画出来的证据。
+        // 设置已移到独立窗口，主界面的 `draw` 不再画它——
+        // 必须走 `settings_frame`，否则热区表是空的。
+        h.settings_frame();
         //
         // ⚠️ 早前所有开关共用一个键（`"settings_switch"`），`hit` 是
         // `HashMap` 会互相覆盖，map 里只剩最后一个，于是这条断言
