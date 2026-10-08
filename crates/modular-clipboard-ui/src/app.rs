@@ -835,11 +835,6 @@ impl App {
         use crate::paint::Op;
         for op in self.paint_state.take_ops() {
             match op {
-                Op::ToggleCollapse(id) => {
-                    if let Some(c) = self.ws.get_mut(id) {
-                        c.toggle_collapse();
-                    }
-                }
                 Op::SetBool { group, field, value } => {
                     set_bool_field(&mut self.svc.state.config, group, field, value);
                     self.after_config_change();
@@ -851,12 +846,6 @@ impl App {
                 Op::SetOptNumber { group, field, value } => {
                     set_opt_number_field(&mut self.svc.state.config, group, field, value);
                     self.after_config_change();
-                }
-                Op::Detach(id) => {
-                    self.ws.detach(id);
-                }
-                Op::Dock(id) => {
-                    self.ws.dock(id);
                 }
                 Op::Select(id) => {
                     self.svc.state.selected = Some(id);

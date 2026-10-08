@@ -53,15 +53,9 @@ const CARD_RADIUS: f32 = 0.0;
 /// 一帧内要执行的操作。
 ///
 /// 绘制层**只识别操作、不改布局**：`Workspace` 的改动由上层在
-/// `apply_ops` 里做。这样「点了折叠按钮」这件事不会分散在绘制代码里。
+/// `apply_ops` 里做。这样「点某个按钮」这件事不会分散在绘制代码里。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
-    /// 切换某张卡片的折叠态。
-    ToggleCollapse(crate::card::CardId),
-    /// 把卡片分离成子窗口。
-    Detach(crate::card::CardId),
-    /// 把卡片收回工作区。
-    Dock(crate::card::CardId),
     /// 选中某个条目。
     Select(modular_clipboard_core::EntryId),
     /// 切换条目置顶。
@@ -1164,11 +1158,9 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
             // 画零尺寸卡会产出退化矩形，某些路径下会算出非法 scissor。
             continue;
         }
-        if card.collapsed {
-            draw_collapsed_card(f, card, r);
-        } else {
-            draw_expanded_card(f, card, r);
-        }
+        // 卡片不再有折叠态——原先这里按 `card.collapsed` 二选一
+        // （折叠画把手 / 展开画内容），折叠功能移除后只剩一条路径。
+        draw_expanded_card(f, card, r);
     }
 
     // 置顶**没有**独立成窗 ⇒ 在历史栏顶部内嵌一个置顶区，
@@ -1246,75 +1238,6 @@ fn draw_card_frame(f: &mut Frame<'_>, r: Rect) {
     );
 }
 
-/// 折叠态：只画一条把手，可点回展开。
-fn draw_collapsed_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
-    let pal = f.pal;
-    let scale = f.scale;
-    // 把手实际只占 handle_width，其余是背景——与 solver 的分配一致。
-    let handle = Rect::from_min_size(
-        r.min,
-        vec2(r.width().min(card.kind.handle_width()), r.height()),
-    );
-    if handle.width() <= 0.0 {
-        return;
-    }
-    // 把手做成 egui `Button`：命中与悬停由 egui 负责。
-    //
-    // ⚠️ 必须开子 `Ui` 绝对定位（理由同顶栏 `icon_button`）：
-    // `add_sized` 会让控件跟着布局游标走，与我们算好的把手矩形错位。
-    let resp = f.ui.scope_builder(
-        egui::UiBuilder::new()
-            .id(egui::Id::new(("card_handle", card.id)))
-            .max_rect(handle)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-        |ui| ui.add_sized(handle.size(), egui::Button::new("").frame(false)),
-    );
-    let resp = resp.inner;
-
-    let painter = f.ui.painter_at(handle);
-    if resp.hovered() {
-        painter.rect_filled(handle, CARD_RADIUS, pal.row_hover);
-    } else {
-        painter.rect_filled(handle, CARD_RADIUS, pal.surface_variant);
-    }
-    // ⚠️ 必须描边：相邻两张折叠把手底色接近，不描边会糊成一片。
-    // 这条曾导致「详情把手与视图把手看不出边界」。
-    painter.rect_stroke(
-        handle,
-        CARD_RADIUS,
-        Stroke::new(CARD_STROKE * scale, pal.border_subtle),
-        egui::StrokeKind::Inside,
-    );
-
-    // 标题竖排在把手中央。
-    //
-    // ⚠️ 这里**必须逐字自绘**，不能用 egui 的竖排控件：egui 0.36
-    // 没有竖排文本（`TextFormat` 无竖排选项），而窄把手（宽度只有一个
-    // 图标宽）放不下横排标题。
-    let font = sized(pal.font_xs, scale);
-    let label = card.kind.title();
-    let y0 = handle.center().y - (label.chars().count() as f32) * font.size * 0.6;
-    for (i, ch) in label.chars().enumerate() {
-        let y = y0 + i as f32 * font.size * 1.15;
-        if y > handle.max.y - font.size * 0.5 {
-            break;
-        }
-        f.ui.painter_at(handle).text(
-            pos2(handle.center().x, y),
-            Align2::CENTER_CENTER,
-            ch.to_string(),
-            font.clone(),
-            pal.text_dim,
-        );
-    }
-    // ⚠️ `on_hover_text` 消耗 `Response`，`clicked()` 必须在它之前取。
-    let clicked = resp.clicked();
-    if clicked {
-        f.state.push(Op::ToggleCollapse(card.id));
-    }
-    resp.on_hover_text(format!("展开{}", card.kind.title()));
-}
-
 /// 展开态：卡片外框 + 头部 + 内容。
 fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     draw_card_frame(f, r);
@@ -1352,11 +1275,9 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
 /// 这两个操作对它是多余的。而它们在界面上表现为两个 PUA 码位的
 /// 小图标（⠿ / ⇤），在 150% 缩放下辨识度很差。
 ///
-/// # 但折叠态本身**没有**删除
-///
-/// [`crate::solver`] 在窗口过窄时仍会自动折叠卡片（见
-/// `Solution::auto_collapsed`），此时走 [`draw_collapsed_card`]——
-/// 那条路径上的把手仍可点击展开。删掉的只是「手动」入口。
+/// 折叠与分离的**完整逻辑**（`Card::collapsed`、`handle_width`、
+/// `collapse_priority`、`Solution::auto_collapsed`、`draw_collapsed_card`、
+/// `Op::ToggleCollapse` / `Detach` / `Dock`）都已移除——不是只删按钮。
 fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
     let pal = f.pal;
     let scale = f.scale;
@@ -2208,22 +2129,18 @@ mod tests {
     // 交互测试：列表行
     // ------------------------------------------------------------------
 
-    /// 点某一行 ⇒ 产生 `Select` 操作。
-    ///
-    /// 行的坐标由 solver 决定，不能写死：从工作区里读回
-    /// 历史卡片自己的 `rect`，再在其中取一点。
-        /// 卡片头部**不再有**「分离」「折叠」按钮。
+    /// 卡片头部**不再有**「分离」「折叠」按钮，且折叠逻辑整体不存在。
     ///
     /// # 为什么守这条
     ///
     /// 历史栏固定在下方，手动折叠/分离对它没有意义，而那两枚 PUA
     /// 码位图标（⠿ / ⇤）在 150% 缩放下辨识度很差。若将来有人
-    /// 「顺手加回来」，这条会拦住——它们的交互缺陷（画了但点不动、
-    /// 或点了却误触发对方）正是当初重写的起因。
+    /// 「顺手加回来」，这条会拦住。
     #[test]
-    fn card_header_has_no_buttons() {
+    fn card_header_has_no_buttons_and_no_fold_logic() {
         let mut h = Harness::new("header-clean", vec2(700.0, 500.0));
         h.frame();
+        // 头部不再登记任何按钮热区。
         for name in ["card_collapse", "card_detach"] {
             assert!(
                 !h.state.hit.contains_key(name),
@@ -2231,64 +2148,52 @@ mod tests {
                 h.state.hit.keys().collect::<Vec<_>>()
             );
         }
-        // 点头部右侧（原先两枚按钮所在的位置）不应产生任何操作。
+        // 点头部右侧（原先两枚按钮所在的位置）不产生任何**卡片结构**操作。
+        //
+        // ⚠️ 不能写成「不产生任何 Op」——那个位置仍可能命中顶栏的
+        // 设置齿轮（`ToggleSettings`），那是合法的。真正要守的是
+        // 「折叠/分离已不存在」，即没有 `Op` 变体与之对应。
         let ops = h.click_at(pos2(680.0, 30.0));
         assert!(
-            !ops.iter().any(|o| matches!(o, Op::ToggleCollapse(_) | Op::Detach(_))),
-            "点卡片头部右侧不应再产生折叠/分离，实际={ops:?}"
+            !ops.iter().any(|o| format!("{o:?}").contains("Collapse")
+                || format!("{o:?}").contains("Detach")
+                || format!("{o:?}").contains("Dock")),
+            "点卡片头部右侧不应产生折叠/分离/收回，实际={ops:?}"
         );
-    }
-
-    /// 折叠态仍可达：窗口变窄时 solver 自动折叠，把手可点击展开。
-    ///
-    /// ⚠️ 这条与上一条**不矛盾**：删掉的是「手动」折叠入口，
-    /// 「自动」折叠（solver 在窄窗口下折叠卡片）必须保留，
-    /// 否则窄窗口下卡片内容会挤成一团。
-    #[test]
-    fn auto_collapsed_card_can_be_expanded_by_its_handle() {
-        // 先确认存在可折叠的卡片（历史栏本身不可折叠）。
-        let mut h = Harness::new("auto-collapse", vec2(700.0, 500.0));
-        h.frame();
-        let collapsible = h
-            .ws
-            .cards
-            .iter()
-            .any(|c| c.kind.collapsible());
-        if !collapsible {
-            // 默认工作区只有置顶 + 历史，两者都不可折叠——跳过而非失败，
-            // 这样将来默认卡片集变化时这条测试不会误报。
-            return;
-        }
-        let before: Vec<bool> = h.ws.cards.iter().map(|c| c.collapsed).collect();
-        // 折叠一张可折叠的卡片，然后点它的把手。
-        let target = h
-            .ws
-            .cards
-            .iter()
-            .find(|c| c.kind.collapsible())
-            .expect("上面已确认存在")
-            .id;
-        h.ws.get_mut(target).expect("卡片存在").toggle_collapse();
-        h.frame();
+        // 更强的一条：`Op` 里根本没有这三个变体。
+        // 编译期能保证的已由「`Op` 枚举无这些变体」保证，
+        // 这里跑一帧确认界面确实画出来了（否则上面的断言是空跑）。
         assert!(
-            h.ws.get(target).expect("卡片存在").collapsed,
-            "前置条件：卡片应处于折叠态"
-        );
-        // 把手区域中心点击 ⇒ ToggleCollapse（把手自身就是那个控件）。
-        let ops = h.click_at(pos2(10.0, 250.0));
-        for o in &ops {
-            if let Op::ToggleCollapse(id) = o {
-                h.ws.get_mut(*id).expect("卡片存在").toggle_collapse();
-            }
-        }
-        assert_ne!(
-            h.ws.cards.iter().map(|c| c.collapsed).collect::<Vec<_>>(),
-            before,
-            "点击折叠把手后应能展开折叠态"
+            !h.state.hit.is_empty(),
+            "应至少登记一处热区，否则上面的点击断言没有意义"
         );
     }
 
-    // ------------------------------------------------------------------
+    /// 窄窗口下卡片**平分宽度**，不再折叠成把手。
+    ///
+    /// 取代原来的 `auto_collapsed_card_can_be_expanded_by_its_handle`
+    /// ——那条守的是「自动折叠后可展开」，而折叠功能已整体移除。
+    /// 现在守的是新契约：窗口再窄，卡片也要有非零宽度（用户仍
+    /// 能看到并滚動列表内容），而不是退化成一条看不出是什么的细条。
+    #[test]
+    fn narrow_window_keeps_cards_visible() {
+        let mut h = Harness::new("narrow", vec2(240.0, 400.0));
+        // 跑几帧让 solver 求解。
+        for _ in 0..3 {
+            h.frame();
+        }
+        let hist = h
+            .ws
+            .by_kind(CardKind::History)
+            .expect("默认工作区应含历史卡片");
+        assert!(
+            hist.rect.width() > 40.0,
+            "窄窗口下历史栏宽度应仍可用（不折叠成把手），实际={:?}",
+            hist.rect
+        );
+    }
+
+// ------------------------------------------------------------------
     // 交互测试：设置面板
     // ------------------------------------------------------------------
 

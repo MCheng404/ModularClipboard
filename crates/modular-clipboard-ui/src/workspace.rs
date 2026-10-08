@@ -266,9 +266,6 @@ impl Workspace {
         match self.get_mut(id) {
             Some(c) if c.host == CardHost::Window => {
                 c.host = CardHost::Docked;
-                // 收回时若处于折叠态会只剩一条把手，用户会觉得「卡片不见了」，
-                // 所以自动展开——分离前的折叠状态没有保留需求。
-                c.collapsed = false;
                 true
             }
             _ => false,
@@ -426,9 +423,7 @@ mod tests {
     fn required_width_includes_gaps_but_not_trailing_one() {
         let mut ws = Workspace::empty();
         for k in CardKind::ALL {
-            let id = ws.add(k);
-            let c = ws.get_mut(id).expect("刚加的卡片");
-            c.collapsed = false;
+            ws.add(k);
         }
         let n = ws.docked().count() as f32;
         // ⚠️ `sum` 必须与 `n` **取自同一来源**：都用 `docked()`。
@@ -464,18 +459,17 @@ mod tests {
         );
     }
 
+    /// 收回工作区是幂等的。
+    ///
+    /// 原先这条守的是「收回时自动展开折叠卡片」——折叠已移除，
+    /// 现在只守 `detach` / `dock` 往返本身。
     #[test]
-    fn docking_back_expands_the_card() {
-        // 收回时若保持折叠，用户会觉得卡片消失了。
+    fn detach_and_dock_roundtrip_is_idempotent() {
         let mut ws = Workspace::empty();
         let id = ws.add(CardKind::Detail);
-        ws.get_mut(id).expect("刚加").collapsed = true;
-        assert!(ws.detach(id));
-        assert!(ws.dock(id));
-        assert!(
-            !ws.get(id).expect("仍在").collapsed,
-            "收回工作区时必须自动展开"
-        );
+        assert!(ws.detach(id), "首次分离应返回 true");
+        assert!(!ws.detach(id), "重复分离应返回 false（幂等）");
+        assert!(ws.dock(id), "首次收回应返回 true");
         assert!(!ws.dock(id), "重复收回应返回 false（幂等）");
     }
 

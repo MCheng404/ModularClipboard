@@ -251,8 +251,22 @@ impl Callback {
 /// 两条都映射为 [`TrayEvent::Show`]，否则用户会「点了没反应」。
 fn notify_event_of(lparam: isize) -> Option<TrayEvent> {
     let cb = Callback::decode(lparam);
+
+    // ⚠️ 顺序要紧：**先排除右键**，再处理左键。
+    //
+    // 版本 4 下右键回调的 `lParam` 里，通知码同样是 `NIN_SELECT`
+    // （shell 对所有鼠标事件都发 `NIN_SELECT`），只有高位的鼠标码
+    // 区分左右键。若先匹配 `NIN_SELECT => Show`，右键会同时
+    // 「弹菜单」并「弹出主窗口」——用户看到的是菜单闪一下、
+    // 窗口却莫名其妙跑出来。
+    if is_context_menu_event(lparam) {
+        return None;
+    }
     match cb.notify {
         nin::SELECT | nin::KEYSELECT => Some(TrayEvent::Show),
+        // 旧式语义（`NIM_SETVERSION` 失败时）：`lParam` 低位直接是
+        // 鼠标消息码，此时 `cb.mouse == 0`，所以低位也要认。
+        m if m == WM_LBUTTONUP_CODE || m == WM_LBUTTONDBLCLK_CODE => Some(TrayEvent::Show),
         _ => match cb.mouse {
             WM_LBUTTONUP_CODE | WM_LBUTTONDBLCLK_CODE => Some(TrayEvent::Show),
             _ => None,

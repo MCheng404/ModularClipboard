@@ -49,8 +49,6 @@ pub const STATUSBAR_HEIGHT: f32 = 0.0;
 pub struct Solution {
     /// 每张卡片的矩形，索引与 `Workspace::cards` 对齐。
     pub rects: Vec<Rect>,
-    /// 本次求解把哪些卡片折叠了（索引）。
-    pub auto_collapsed: Vec<usize>,
 }
 
 impl Solution {
@@ -64,52 +62,23 @@ impl Solution {
 ///
 /// `area` 是**整个窗口客户区**（含标题栏与状态栏）；本函数自己
 /// 扣掉它们，返回的是卡片可用区。
+///
+/// # 宽度不够时**不再**折叠
+///
+/// 早前这里有个「依次折叠」的降级循环（按 `collapse_priority` 把
+/// 次要卡片折成把手）。已随折叠功能整体移除：主界面固定为
+/// 置顶 + 历史两栏，窄窗口下平分宽度即可，折叠只会让用户
+/// 「找不到历史在哪」。
 pub fn solve(ws: &Workspace, area: Rect) -> Solution {
     let body = card_area(area);
     if body.width() <= 0.0 || body.height() <= 0.0 {
         return Solution {
             rects: vec![Rect::ZERO; ws.cards.len()],
-            auto_collapsed: Vec::new(),
         };
     }
 
-    // ---- 步骤 1：确定参与分配的卡片与初始折叠集 ----------------------
+    // ---- 分配宽度 --------------------------------------------------
     //
-    // 起点是「用户当前折叠状态」，但**不写回** `ws`：solver 是纯函数，
-    // 自动折叠的结果只在本帧生效。用户的折叠意图在 `ws` 里保持不变。
-    let mut collapsed: Vec<bool> = ws.cards.iter().map(|c| c.collapsed).collect();
-
-    // 只有停靠且可折叠的卡片才可能被自动折叠。
-    let collapsible: Vec<usize> = ws
-        .cards
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.host == crate::card::CardHost::Docked && c.kind.collapsible())
-        .map(|(i, _)| i)
-        .collect();
-
-    // ---- 步骤 2：不够就依次折叠 ----------------------------------------
-    let mut auto_collapsed: Vec<usize> = Vec::new();
-    // 按优先级从「先折叠」排到「后折叠」（数字大 = 先折叠）。
-    let mut order = collapsible;
-    order.sort_by_key(|&i| {
-        std::cmp::Reverse(ws.cards[i].kind.collapse_priority())
-    });
-
-    let mut i = 0;
-    while demand_of(ws, &collapsed) > body.width() && i < order.len() {
-        let idx = order[i];
-        i += 1;
-        if collapsed[idx] {
-            continue; // 已经折叠，跳过
-        }
-        collapsed[idx] = true;
-        auto_collapsed.push(idx);
-    }
-
-    // ---- 步骤 3：分配宽度 ----------------------------------------------
-    // 注意：即便历史卡片也放不下（窗口极窄），也不再继续折叠——
-    // 它不可折叠。此时所有卡片会平分可用宽度，各自尽可能窄。
     // ⚠️ 判据必须与 [`crate::workspace::Workspace::docked`] 一致：
     // **内嵌的置顶卡片宽度必须是 0**。
     //
@@ -123,14 +92,11 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
     let layout: Vec<f32> = ws
         .cards
         .iter()
-        .enumerate()
-        .map(|(idx, c)| {
+        .map(|c| {
             if c.host != crate::card::CardHost::Docked
                 || (pinned_embedded && c.kind == crate::card::CardKind::Pinned)
             {
                 0.0
-            } else if collapsed[idx] {
-                c.kind.handle_width()
             } else {
                 c.target_width
             }
@@ -141,7 +107,6 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
     if n == 0 {
         return Solution {
             rects: vec![Rect::ZERO; ws.cards.len()],
-            auto_collapsed,
         };
     }
     let gaps = ws.gap * (n as f32 - 1.0);
@@ -191,10 +156,7 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
         }
     }
 
-    Solution {
-        rects,
-        auto_collapsed,
-    }
+    Solution { rects }
 }
 
 /// 卡片可用区：扣掉顶部标题栏与底部状态栏。
@@ -203,35 +165,6 @@ pub fn card_area(area: Rect) -> Rect {
         pos2(area.min.x, area.min.y + TOPBAR_HEIGHT),
         pos2(area.max.x, area.max.y - STATUSBAR_HEIGHT),
     )
-}
-
-/// 当前折叠状态下的总需求宽度（含间隔）。
-fn demand_of(ws: &Workspace, collapsed: &[bool]) -> f32 {
-    let ws_gap = ws.gap;
-    let ws_cards = &ws.cards;
-    let n = ws_cards
-        .iter()
-        .enumerate()
-        .filter(|(i, c)| {
-            c.host == crate::card::CardHost::Docked && !(collapsed[*i] && c.kind.collapsible())
-        })
-        .count();
-    if n == 0 {
-        return 0.0;
-    }
-    let sum: f32 = ws_cards
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.host == crate::card::CardHost::Docked)
-        .map(|(i, c)| {
-            if collapsed[i] && c.kind.collapsible() {
-                c.kind.handle_width()
-            } else {
-                c.target_width
-            }
-        })
-        .sum();
-    sum + ws_gap * (n as f32 - 1.0)
 }
 
 /// 把解应用到工作区（写回每张卡片的 `rect`）。
@@ -369,61 +302,51 @@ mod tests {
         assert!(fails.is_empty(), "以下宽度违反不变式：\n{}", fails.join("\n"));
     }
 
+    /// 窄窗口下**不再折叠**，而是平分宽度。
+    ///
+    /// 取代原先三条测试（`wide_window_keeps_all_cards_expanded` /
+    /// `narrow_window_auto_collapses_until_it_fits` /
+    /// `history_is_never_auto_collapsed`）——它们守的折叠降级功能
+    /// 已整体移除。
+    ///
+    /// 现在守的是「窄窗口不折叠」这条新契约：折叠已删除，
+    /// 剩下的卡片平分宽度即可。
     #[test]
-    fn wide_window_keeps_all_cards_expanded() {
-        // I4：宽度足够时不折叠任何可折叠卡片。
-        // 1200 逻辑宽（= 1800 物理）远大于总需求。
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 533.33));
-        let ws = Workspace::default();
-        let sol = solve(&ws, area);
-        assert!(
-            sol.auto_collapsed.is_empty(),
-            "宽窗口不应自动折叠，却折叠了 {:?}",
-            sol.auto_collapsed
-                .iter()
-                .map(|&i| ws.cards[i].kind)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn narrow_window_auto_collapses_until_it_fits() {
-        // I3：不够就折叠到够用。
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 533.33));
-        let ws = Workspace::default();
-        let sol = solve(&ws, area);
-        assert!(
-            !sol.auto_collapsed.is_empty(),
-            "200pt 宽放不下四张卡片，必须自动折叠"
-        );
-        // 折叠顺序：置顶先于侧栏，侧栏先于详情。
-        let kinds: Vec<CardKind> = sol
-            .auto_collapsed
-            .iter()
-            .map(|&i| ws.cards[i].kind)
-            .collect();
-        let pos_of = |k: CardKind| kinds.iter().position(|&x| x == k);
-        if let (Some(p), Some(d)) = (pos_of(CardKind::Pinned), pos_of(CardKind::Detail)) {
-            assert!(p < d, "置顶应比详情先折叠，实际顺序 {kinds:?}");
-        }
-    }
-
-    #[test]
-    fn history_is_never_auto_collapsed() {
-        // I3：历史卡片永不折叠。
-        for &w in SCAN_W {
+    fn narrow_window_splits_width_instead_of_collapsing() {
+        for w in [140.0f32, 200.0, 320.0] {
             let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, 533.33));
             let ws = Workspace::default();
             let sol = solve(&ws, area);
-            let hist_idx = ws
-                .cards
-                .iter()
-                .position(|c| c.kind == CardKind::History)
-                .expect("默认工作区含历史卡片");
-            assert!(
-                !sol.auto_collapsed.contains(&hist_idx),
-                "宽 {w}: 历史卡片被自动折叠了"
-            );
+
+            // ⚠️ 跳过判据必须与 `solve` 内部**完全一致**：内嵌的置顶卡片
+            // 布局宽度就是 0（它画在历史栏顶部内部，不占一栏）。
+            //
+            // 早前这里用 `c.layout_width() <= 0.0` 判断，而那个方法只看
+            // `host` 不看内嵌—— 于是断言对内嵌置顶误报「宽为 0」。
+            let pinned_embedded = ws.pinned_is_embedded();
+            for (i, c) in ws.cards.iter().enumerate() {
+                if c.host != crate::card::CardHost::Docked
+                    || (pinned_embedded && c.kind == crate::card::CardKind::Pinned)
+                {
+                    continue;
+                }
+                let r = sol.rects[i];
+                assert!(
+                    r.width() > 0.0,
+                    "宽 {w}: {:?} 的矩形宽为 0，应平分而非折叠",
+                    c.kind
+                );
+            }
+            // 所有矩形都必须落在客户区内，且不重叠。
+            let body = card_area(area);
+            for (i, r) in sol.rects.iter().enumerate() {
+                assert!(
+                    r.width() <= 0.0 || r.intersects(body),
+                    "宽 {w}: {:?} 的矩形 {:?} 超出可用区 {body:?}",
+                    ws.cards[i].kind,
+                    r
+                );
+            }
         }
     }
 
@@ -461,16 +384,23 @@ mod tests {
         assert_eq!(sol.rects[idx], Rect::ZERO, "分离卡片应得零矩形");
     }
 
+    /// solver 是纯函数：不得改写工作区。
+    ///
+    /// 原先这条守的是「自动折叠只在本帧生效、不改用户的折叠意图」，
+    /// 而折叠已移除。改为守「不改写 `rect`」——那才是 solver 与
+    /// 应用两段式的关键：求解只算，`apply` 才写。
     #[test]
     fn solve_is_pure_and_does_not_mutate_workspace() {
-        // 自动折叠只是本帧的显示决策，不能改掉用户的折叠意图。
-        // 否则窗口拉宽后卡片不会自动恢复——这正是旧布局的痛点之一。
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 533.33));
-        let ws = Workspace::default();
-        let before: Vec<bool> = ws.cards.iter().map(|c| c.collapsed).collect();
+        let mut ws = Workspace::default();
+        // 先写一批可辨认的 rect。
+        for (i, c) in ws.cards.iter_mut().enumerate() {
+            c.rect = Rect::from_min_size(pos2(i as f32 * 7.0, 3.0), vec2(11.0, 13.0));
+        }
+        let before: Vec<Rect> = ws.cards.iter().map(|c| c.rect).collect();
         let _ = solve(&ws, area);
-        let after: Vec<bool> = ws.cards.iter().map(|c| c.collapsed).collect();
-        assert_eq!(before, after, "solver 不得修改工作区的折叠状态");
+        let after: Vec<Rect> = ws.cards.iter().map(|c| c.rect).collect();
+        assert_eq!(before, after, "solver 不得改写卡片的 rect");
     }
 
     #[test]
