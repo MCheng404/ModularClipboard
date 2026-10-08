@@ -91,6 +91,10 @@ pub fn run_with_options(
     capture_is_override: bool,
     data_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    // ⚠️ 先取 `show_tray` 快照：`config` 后面会被移动进 `App::new`，
+    // 到那时就访问不到了。
+    let want_tray = config.ui.show_tray;
+
     // `Window::new` 的宽高是**物理像素**，而配置里存的是逻辑点。
     // DPI 缩放在窗口创建后才可查，因此先按 1.0 换算——创建后第一帧的
     // `Resized` 事件（或帧循环里的尺寸兜底检查）会把交换链纠正到真实尺寸。
@@ -213,12 +217,22 @@ pub fn run_with_options(
     // 菜单闪一下就消失。
     modular_clipboard_platform::tray::set_main_hwnd(window.hwnd().0 as isize);
 
-    let resident = match Resident::start(TRAY_TOOLTIP) {
-        Ok(r) => Some(r),
-        Err(e) => {
-            tracing::error!(%e, "托盘启动失败，关闭按钮将直接退出程序");
-            None
+    // ⚠️ 必须尊重 `ui.show_tray` —— 设置界面里那个开关。
+    //
+    // 早前这里无条件 `Resident::start`，于是 `show_tray` 只被**写入**、
+    // 从不被读取：用户在设置里关掉「显示托盘图标」，托盘照样在；
+    // 开着也无所谓。配置项形同虚设。
+    let resident = if want_tray {
+        match Resident::start(TRAY_TOOLTIP) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::error!(%e, "托盘启动失败，关闭按钮将直接退出程序");
+                None
+            }
         }
+    } else {
+        tracing::info!("配置已关闭托盘图标，不启动托盘");
+        None
     };
 
     // ---- 帧循环 --------------------------------------------------------

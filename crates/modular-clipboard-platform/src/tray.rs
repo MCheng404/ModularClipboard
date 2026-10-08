@@ -146,6 +146,12 @@ pub const WM_TRAY_CALLBACK: u32 = 0x8000 + 2;
 const WM_TRAY_MENU: u32 = 0x8000 + 3;
 
 /// 菜单命令 ID。取`0x1001` 起，避开 `HMENU` 自身的保留区。
+/// 菜单宿主窗口句柄（托盘线程创建，窗口过程取用）。
+///
+/// 见 [`MENU_HOST_CLASS`]：托盘窗口是 `HWND_MESSAGE`，永远不可见、
+/// 不能置前台，而 `TrackPopupMenu` 要求所属窗口已是前台。
+static MENU_HOST: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
 /// 主窗口句柄（由 UI 层在窗口创建后写入）。
 ///
 /// # 为什么需要它
@@ -318,14 +324,31 @@ mod imp {
         AppendMenuW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
         DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, ICONINFO,
         IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
-        PostMessageW, RegisterClassExW, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        PostMessageW, RegisterClassExW, SetForegroundWindow, ShowWindow, SW_HIDE,
+        SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
         TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_HOTKEY,
-        WM_NULL, WM_QUIT, WNDCLASSEXW, HWND_MESSAGE,
+        WM_NULL, WM_QUIT, WNDCLASSEXW, HWND_MESSAGE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
     use windows::core::{HSTRING, PCWSTR};
 
     /// 窗口类名。多实例共存时靠`RegisterClassExW` 的幂等语义区分。
     const CLASS_NAME: &str = "ModularClipboardTrayWindow";
+
+    /// 菜单宿主窗口的类名。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 托盘窗口是 `HWND_MESSAGE`（message-only）——**永远不可见**，
+    /// 且 Windows **禁止**对这类窗口调`SetForegroundWindow`。
+    /// 而 `TrackPopupMenu` 要求所属窗口已是前台，否则菜单弹出即消失。
+    ///
+    /// 于是菜单需要一个**真正的顶层窗口**当宿主：
+    /// 弹出前 `ShowWindow(SW_SHOWNOACTIVATE)` + `SetForegroundWindow`，
+    /// 菜单关掉后 `ShowWindow(SW_HIDE)` 收回。
+    ///
+    /// 尺寸取 1x1、样式含 `WS_EX_TOOLWINDOW`（不进任务栏/Alt+Tab），
+    /// 弹出期间在屏幕上几乎看不见。
+    const MENU_HOST_CLASS: &str = "ModularClipboardTrayMenuHost";
 
     /// 全局热键 id。任意非零值即可，只要在本进程内唯一。
     const HOTKEY_ID: i32 = 0x0BEE;
@@ -448,34 +471,44 @@ mod imp {
             }
 
             let (x, y) = unpack_cursor(lparam);
-            // 菜单弹出前必须把**主窗口**置前台，否则菜单立刻消失。
+            // 菜单弹出前把宿主置前台，否则菜单立刻消失。
             //
-            // ⚠️ 置前台的对象必须是**可见**窗口。托盘自己的 `hwnd`
-            // 是隐藏的消息窗口（只用于收 WM_TRAY_MENU / 托盘回调），
-            // 对它调 SetForegroundWindow 无效——菜单会闪一下就没。
-            // 这正是「托盘右键菜单消失」的根因。
+            // ⚠️ 宿主必须是**可见的顶层窗口**，这是本次修复的核心。
             //
-            // 取不到主窗口句柄时退回托盘窗口：托盘图标点击本身
-            // 已经给了该进程前台权限，这种情况下的行为与旧版一致。
-            let main = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-            let fg = if main != 0 {
-                HWND(main as *mut std::ffi::c_void)
+            // 踩过的两个坑：
+            // 1. 早前用托盘窗口自己当宿主——它是 `HWND_MESSAGE`
+            //    （message-only），**永远不可见**且 Windows **禁止**
+            //    对它 `SetForegroundWindow`。菜单闪一下就没。
+            // 2. 改用主窗口后仍不行——托盘常驻时主窗口处于
+            //    「隐藏到托盘」状态（`ShowWindow(SW_HIDE)`），
+            //    对隐藏窗口置前台同样无效。于是「窗口能拖、
+            //    按钮点不动」之外的又一例「改了等于没改」。
+            //
+            // 现在用专门的 1x1 `WS_EX_TOOLWINDOW` 宿主：
+            // 弹出期间 `SW_SHOWNOACTIVATE` 显示（不抢焦点），
+            // 菜单关掉后立刻隐藏。
+            let host_raw = MENU_HOST.load(std::sync::atomic::Ordering::Relaxed);
+            let host = if host_raw != 0 {
+                HWND(host_raw as *mut std::ffi::c_void)
             } else {
                 hwnd
             };
-            let _ = SetForegroundWindow(fg);
+            let _ = ShowWindow(host, SW_SHOWNOACTIVATE);
+            let _ = SetForegroundWindow(host);
 
-            // 菜单的消息循环挂在**所属窗口**上；用主窗口才能保证
-            // 键盘/鼠标消息回到有焦点的那一个。
             let cmd = TrackPopupMenu(
                 menu,
                 TPM_RIGHTBUTTON | TPM_RETURNCMD,
                 x,
                 y,
                 None,
-                fg,
+                host,
                 None,
             );
+            // 收回宿主：菜单关掉后它必须隐藏，否则桌面上留一个
+            // 1x1 的窗口（虽然看不见，但会在 Alt+Tab / 任务栏管理里
+            // 留下痕迹）。
+            let _ = ShowWindow(host, SW_HIDE);
             let _ = DestroyMenu(menu);
             // 标准做法：菜单关闭后发 WM_NULL，否则窗口停在「非激活」态。
             let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
@@ -555,6 +588,60 @@ mod imp {
     }
 
     /// 注册窗口类并创建 message-only 窗口。
+    /// 创建菜单宿主窗口（1x1、工具窗口样式、默认隐藏）。
+    ///
+    /// 见 [`MENU_HOST_CLASS`] 的说明：这个窗口存在的唯一目的是给
+    /// `TrackPopupMenu` 当一个**可以置前台**的所属窗口。
+    ///
+    /// 失败不致命 —— 返回 `None`，`show_context_menu` 会退回旧路径。
+    unsafe fn create_menu_host() -> Option<HWND> {
+        unsafe {
+            let hinstance = GetModuleHandleW(None).ok()?;
+            let class_name = HSTRING::from(MENU_HOST_CLASS);
+            let class_p = PCWSTR(class_name.as_ptr());
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW,
+                lpfnWndProc: Some(tray_wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinstance.into(),
+                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+                hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut()),
+                lpszMenuName: PCWSTR::null(),
+                lpszClassName: class_p,
+                hIconSm: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            };
+            let atom = RegisterClassExW(&wc);
+            if atom == 0 {
+                tracing::debug!("菜单宿主类注册返回 0，按已存在处理");
+            }
+            // 1x1 像素 + WS_EX_TOOLWINDOW：不进任务栏、不进 Alt+Tab。
+            // `CreateWindowExW` 返回 `Result`，不是裸 `HWND`。
+            match CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                class_p,
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            ) {
+                Ok(hwnd) => Some(hwnd),
+                Err(e) => {
+                    tracing::debug!("菜单宿主窗口创建失败（{e}），将退回旧路径");
+                    None
+                }
+            }
+        }
+    }
+
     fn create_tray_window() -> Result<(HWND, HSTRING)> {
         unsafe {
             let hinstance = GetModuleHandleW(None).context("GetModuleHandleW 失败")?;
@@ -664,6 +751,16 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
     fn setup(tip: &[u16]) -> Result<Ctx> {
         unsafe {
             let (hwnd, class_name) = create_tray_window()?;
+
+            // 菜单宿主：托盘窗口是 `HWND_MESSAGE`，不能置前台，
+            // 而 `TrackPopupMenu` 要求所属窗口已是前台 —— 没有它
+            // 右键菜单会闪一下就消失。见 [`MENU_HOST_CLASS`]。
+            //
+            // 创建失败不致命：菜单退回托盘窗口（旧的失败行为）。
+            if let Some(host) = create_menu_host() {
+                MENU_HOST.store(host.0 as isize, std::sync::atomic::Ordering::Relaxed);
+            }
+
             let hicon = match make_hicon() {
                 Ok(h) => h,
                 Err(e) => {
