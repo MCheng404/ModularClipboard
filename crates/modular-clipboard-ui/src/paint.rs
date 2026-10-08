@@ -124,6 +124,69 @@ pub struct Frame<'a> {
     pub scale: f32,
     /// 整个客户区。
     pub area: Rect,
+    /// 本帧要绘制的卡片（子窗口用）。
+    ///
+    /// `None` 表示画主窗口（顶栏 + 全部停靠卡片）。
+    ///
+    /// ⚠️ 不能在 `draw_child` 里"找第一张 host==Window 的卡片"：
+    /// 详情与视图都是 Window 型，两个子窗口会各自找到同一张卡片。
+    pub card_id: Option<crate::card::CardId>,
+}
+
+/// 画一个**独立子窗口**的整帧内容。
+///
+/// 与 [`draw`] 的区别：那函数画「主窗口的顶栏 + 卡片区」，
+/// 这函数画「一张卡片铺满整个窗口」。
+///
+/// # 为什么子窗口不画顶栏
+///
+/// 子窗口是纯内容视图，没有「搜索/设置」这类全局控件——
+/// 那些只在主窗口有一份。子窗口只承载一张卡片的内容区。
+pub fn draw_child(f: &mut Frame<'_>) {
+    let area = f.area;
+    f.ui.painter().rect_filled(area, 0.0, f.pal.bg);
+
+    // 找到本窗口对应的那张卡片。
+    //
+    // ⚠️ 不 `expect`：`draw_child` 是生产路径，而「窗口存在但卡片
+    // 不在列表里」是**可能发生**的短暂不一致（卡片刚被删、窗口
+    // 还没销毁）。这里降级为空画而不是 panic——一个附属面板
+    // 的状态问题不该让整个程序崩掉。
+    let Some(id) = f.card_id else {
+        draw_empty(f, area, "未指定卡片");
+        return;
+    };
+    let Some(card) = f.ws.get(id) else {
+        draw_empty(f, area, "窗口与卡片状态不同步");
+        return;
+    };
+
+    // 卡片铺满整个客户区，四周留一点内边角。
+    let r = area.shrink2(vec2(f.pal.space_sm, f.pal.space_sm));
+    if r.width() <= 0.0 || r.height() <= 0.0 {
+        return;
+    }
+    draw_card_frame(f, r);
+
+    let pad = f.pal.space_sm;
+    let inner = r.shrink2(vec2(pad, pad));
+    let head_h = (f.pal.font_md * 1.8).max(20.0);
+    let head = Rect::from_min_size(inner.min, vec2(inner.width(), head_h));
+    draw_card_header(f, card, head);
+
+    let body = Rect::from_min_max(
+        pos2(inner.min.x, head.max.y + f.pal.space_xs),
+        inner.max,
+    );
+    if body.width() <= 0.0 || body.height() <= 0.0 {
+        return;
+    }
+    match card.kind {
+        CardKind::Detail => draw_detail_body(f, body),
+        CardKind::Rail => draw_rail_body(f, body),
+        // 主窗口专属的种类不该出现在子窗口；画空状态而不是崩溃。
+        _ => draw_empty(f, body, "该卡片不支持独立窗口"),
+    }
 }
 
 /// 画一帧。

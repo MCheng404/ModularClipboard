@@ -310,6 +310,61 @@ impl Gpu {
         self.surface
     }
 
+    /// 为**另一个窗口**创建 Vulkan 表面。
+    ///
+    /// # 为什么需要这个方法
+    ///
+    /// [`Gpu`] 在 [`Self::new`] 里为传入的 `hwnd` 建了一个表面，
+    /// 而 [`crate::frame::Swapchain`] 建交换链时固定用
+    /// [`Self::surface`]。于是「新窗口复用这个 `Gpu`」会撞上
+    /// `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`——同一个 `hwnd` 只能
+    /// 绑定一个表面。
+    ///
+    /// 多窗口（卡片拖出成独立子窗口）必须**一个窗口一个表面**，
+    /// 但设备、队列、管线仍然共享。
+    ///
+    /// 返回的表面由调用方负责在不再使用前 `destroy`。
+    pub fn create_surface_for(
+        &self,
+        hinstance: windows::Win32::Foundation::HINSTANCE,
+        hwnd: windows::Win32::Foundation::HWND,
+    ) -> anyhow::Result<vk::SurfaceKHR> {
+        let create_info = vk::Win32SurfaceCreateInfoKHR {
+            // ash 0.38 起各扩展 loader 独立持有函数指针，
+            // 与 `Gpu::new` 里建主窗口表面时同一套写法。
+            hinstance: hinstance.0 as _,
+            hwnd: hwnd.0 as _,
+            ..Default::default()
+        };
+        let entry = unsafe { Entry::load()? };
+        let win32_loader = khr::win32_surface::Instance::new(&entry, &self.instance);
+        // SAFETY：`create_info` 的两个句柄在调用期间有效；
+        // `self.instance` 由本结构持有且未销毁。
+        let surface = unsafe { win32_loader.create_win32_surface(&create_info, None)? };
+        tracing::debug!(?hwnd, ?surface, "为新窗口创建 Vulkan 表面");
+        Ok(surface)
+    }
+
+    /// 查询某个表面支持的交换链格式与能力。
+    ///
+    /// 与 [`Self::new`] 里对主窗口表面做的是同一套查询，
+    /// 抽出来供子窗口复用——**必须复用**，否则两处各查一次，
+    /// 挑出的格式可能不一致，而不一致会在 `FrameRenderer::new`
+    /// 的校验里报错。
+    pub fn query_surface_formats(
+        &self,
+        surface: vk::SurfaceKHR,
+    ) -> anyhow::Result<Vec<vk::SurfaceFormatKHR>> {
+        // SAFETY：`surface` 必须是本实例创建且尚未销毁的表面。
+        // 调用方负责保证这一点（本方法只读，不延长生命周期）。
+        unsafe {
+            self.surface_loader
+                .get_physical_device_surface_formats(self.physical_device, surface)
+                .map(|f| f.into_iter().collect())
+                .map_err(|e| anyhow::anyhow!("查询表面格式失败: {e}"))
+        }
+    }
+
     /// 本机所有可用的 Vulkan 设备，供设置页展示。
     pub fn enumerate_devices(
         _entry: &Entry,
@@ -448,6 +503,42 @@ impl Swapchain {
         render_pass: vk::RenderPass,
         caps: &vk::SurfaceCapabilitiesKHR,
     ) -> anyhow::Result<Self> {
+        // 主窗口：表面与格式都用 `Gpu` 里已查好的。
+        Self::new_for_surface(
+            gpu,
+            gpu.surface(),
+            &gpu.surface_formats,
+            &gpu.present_modes,
+            width,
+            height,
+            render_pass,
+            caps,
+        )
+    }
+
+    /// 为**指定表面**创建交换链（多窗口用）。
+    ///
+    /// # 为什么必须有这个变体
+    ///
+    /// [`Self::new`] 固定用 `gpu.surface()`——那是 `Gpu::new` 时为主窗口
+    /// 建的表面。而 [`vk::SurfaceKHR`] 与 `hwnd` 一一对应，
+    /// **同一个 hwnd 只能绑一个表面**：拿主窗口的表面去给子窗口建交换链，
+    /// `vkCreateSwapchainKHR` 会报 `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`
+    /// （实测子窗口创建时必现）。
+    ///
+    /// 所以每个窗口都要：用自己的 hwnd 建表面 → 查它的格式与呈现模式 →
+    /// 调本方法。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_surface(
+        gpu: &Gpu,
+        surface: vk::SurfaceKHR,
+        formats: &[vk::SurfaceFormatKHR],
+        present_modes: &[vk::PresentModeKHR],
+        width: u32,
+        height: u32,
+        render_pass: vk::RenderPass,
+        caps: &vk::SurfaceCapabilitiesKHR,
+    ) -> anyhow::Result<Self> {
         // 调用方（`resolve_extent`）已按 caps clamp 过，
         // 这里再clamp 一次作为纵深防御——
         // 用**传入的** caps，不是快照。
@@ -456,8 +547,8 @@ impl Swapchain {
             height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         };
 
-        let (format, color_space) = pick_format(&gpu.surface_formats)?;
-        let present_mode = pick_present_mode(&gpu.present_modes);
+        let (format, color_space) = pick_format(formats)?;
+        let present_mode = pick_present_mode(present_modes);
 
         // 图像数量：min+1 可避免驱动等待，但不能超过上限
         let mut image_count = caps.min_image_count + 1;
@@ -466,7 +557,7 @@ impl Swapchain {
         }
 
         let create_info = vk::SwapchainCreateInfoKHR::default()
-            .surface(gpu.surface())
+            .surface(surface)
             .min_image_count(image_count)
             .image_format(format)
             .image_color_space(color_space)

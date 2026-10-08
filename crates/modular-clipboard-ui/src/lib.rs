@@ -23,6 +23,8 @@ pub mod app;
 // 新卡片架构（逐步替换 layout/panels/view/titlebar）。
 // 旧的四个模块仍在用，待 paint.rs 全面接管绘制后删除。
 pub mod card;
+pub mod childwin;
+pub mod multiwindow;
 pub mod paint;
 pub mod solver;
 pub mod workspace;

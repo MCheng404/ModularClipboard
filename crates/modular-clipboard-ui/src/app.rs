@@ -172,6 +172,12 @@ pub fn run_with_options(
     let mut painter = Painter::new(&gpu, fr.slot_count())?;
     tracing::info!(extent = ?fr.extent(), slots = fr.slot_count(), "渲染器就绪");
 
+    // ---- 共享渲染资源（供卡片子窗口复用）------------------------------
+    //
+    // 子窗口与主窗口**共用同一个 `Gpu`**（Vulkan 设备创建代价高，
+    // 且多设备会多占显存），但各自持有一条交换链。
+    let shared = crate::multiwindow::SharedGfx::create(&gpu)?;
+
     // ---- egui -----------------------------------------------------------
     let mut app = App::new(config, capture_is_override, data_dir);
     let ctx = app.ctx.clone();
@@ -192,6 +198,8 @@ pub fn run_with_options(
     // ---- 帧循环 --------------------------------------------------------
     let mut frame_no: u64 = 0;
     let mut quit = false;
+    // 卡片子窗口集合（详情/视图等被拖出主窗的卡片）。
+    let mut children = crate::childwin::ChildWindows::new();
     // 窗口隐藏到托盘后仍在跑帧循环（要继续接收托盘事件），
     // 但不再渲染。`GetClientRect` 对隐藏窗口仍返回原尺寸，
     // 靠尺寸判断不出隐藏态，必须显式记这个标志。
@@ -304,6 +312,15 @@ pub fn run_with_options(
         if quit {
             break;
         }
+
+        // ---- 1.8 卡片子窗口 ----
+        //
+        // 让子窗口集合与工作区的 `CardHost` 保持一致：
+        // 标了 `Window` 但还没建窗的卡片 → 建；被收回的 → 销毁。
+        //
+        // 放在业务 UI **之前**是必须的：本帧的绘制才会把新窗口
+        // 的卡片内容算进去。反过来的话新窗口会晚一帧才有内容。
+        children.sync_with(&mut app.ws, &shared, window.scale_factor());
 
         // ---- 2. 业务 UI ----
         //
@@ -457,6 +474,20 @@ pub fn run_with_options(
             quit = true;
         }
 
+        // ---- 4.5 卡片子窗口渲染 ----
+        //
+        // 每个子窗口有**独立的 `egui::Context`、独立的交换链**，
+        // 所以要各自走一遍「事件 → run_ui → tessellate → 绘制」。
+        //
+        // ⚠️ 渲染失败**不中断主循环**：一个附属窗口出问题
+        // （客户区变 0、交换链过期、驱动抽风）不该让主窗黑屏。
+        // 这里记警告后继续，下一帧重试。
+        for child in children.iter_mut() {
+            if let Err(e) = child.render(&mut app) {
+                tracing::warn!(card = ?child.card_id, %e, "子窗口渲染失败，跳过本帧");
+            }
+        }
+
         frame_no += 1;
         if frame_no % 300 == 0 {
             tracing::debug!(
@@ -502,6 +533,9 @@ pub fn run_with_options(
         r.shutdown();
     }
     app.shutdown();
+    // 子窗口要先关掉：它们也占着 GPU 资源，
+    // 且 `Window::destroy` 必须在 `gpu` 释放前完成。
+    children.close_all();
     // `painter` 与 `fr` 借用 `gpu`，必须在 `gpu` 之前 drop。
     drop(painter);
     drop(fr);
@@ -518,7 +552,12 @@ pub fn run_with_options(
 ///
 /// 必须与 `modular_clipboard_gfx::pick_format` 选到同一个：8bit BGR/RGB 优先，
 /// 单格式时按规范原样采用。真实的一致性由 `FrameRenderer::new` 校验。
-fn pick_surface_format(gpu: &Gpu) -> anyhow::Result<ash::vk::Format> {
+/// 挑一个表面可用格式。
+///
+/// 提到 `pub(crate)` 是因为 [`crate::multiwindow::SharedGfx::create`]
+/// 也要用同一份逻辑——主窗口与子窗口若各选一次，格式可能不一致，
+/// 而不一致会在 `FrameRenderer::new` 的校验里报错。
+pub(crate) fn pick_surface_format(gpu: &Gpu) -> anyhow::Result<ash::vk::Format> {
     let formats = &gpu.surface_formats;
     anyhow::ensure!(!formats.is_empty(), "表面未报告任何可用格式");
     if formats.len() == 1 {
@@ -568,7 +607,11 @@ pub struct App {
     /// 必然同源。`draw_frame` 每帧把它交给 `view::draw`。
     pal: theme::Palette,
     /// 新卡片架构的工作区（卡片的唯一权威来源）。
-    ws: crate::workspace::Workspace,
+    ///
+    /// `pub` 是因为帧循环要用它同步子窗口：
+    /// [`crate::childwin::ChildWindows::sync_with`] 要读每张卡片的
+    /// [`crate::card::CardHost`] 并写回窗口位置。
+    pub ws: crate::workspace::Workspace,
     /// 新卡片架构的界面状态。
     paint_state: crate::paint::UiState,
     /// 诊断用帧计数（仅 `MC_DIAG` 打开时用）。
@@ -699,6 +742,8 @@ impl App {
                 pal: &self.pal,
                 scale: ppp,
                 area,
+                // `None` = 画主窗口（顶栏 + 全部停靠卡片）。
+                card_id: None,
             };
             crate::paint::draw(&mut frame);
         }
@@ -776,6 +821,33 @@ impl App {
             let q = self.paint_state.query.clone();
             self.svc.search(q);
         }
+    }
+
+    /// 画一个卡片子窗口的内容。
+    ///
+    /// 与 [`Self::draw_frame`] 分开而不是加参数：`draw_frame` 还要跑
+    /// 主窗口专属的逻辑（`svc.pump()`、拖动区上报、操作落地），
+    /// 那些对子窗口没有意义——子窗口只是一张卡片的容器。
+    pub fn draw_child_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        card_id: crate::card::CardId,
+    ) {
+        let area = ui.max_rect();
+        let ppp = ui.ctx().pixels_per_point();
+        let mut frame = crate::paint::Frame {
+            ui,
+            state: &mut self.paint_state,
+            svc: &mut self.svc,
+            ws: &self.ws,
+            pal: &self.pal,
+            scale: ppp,
+            area,
+            card_id: Some(card_id),
+        };
+        crate::paint::draw_child(&mut frame);
+        // 子窗口里的操作（点叉收回、点拖动条收回）也要落地。
+        self.apply_ops();
     }
 
     /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。

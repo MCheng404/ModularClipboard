@@ -594,6 +594,13 @@ struct FrameSlot {
 pub struct FrameRenderer<'a> {
     gpu: &'a Gpu,
     bundle: PipelineBundle,
+    /// 本渲染器绑定的表面。
+    ///
+    /// ⚠️ 多窗口必须每个窗口一个表面（`vk::SurfaceKHR` 与 `hwnd`
+    /// 一一对应，不可复用）。`rebuild_swapchain` 要用它重建交换链，
+    /// 早前它硬编码 `gpu.surface()`（主窗口的），子窗口 resize 后
+    /// 会把交换链建到错的窗口上。
+    surface: vk::SurfaceKHR,
     /// 自行创建的表面 loader，用于**重建时重新查询**能力。
     ///
     /// `Gpu` 里的 loader 是私有字段，且其 `surface_caps` 是初始化时的快照——
@@ -669,15 +676,63 @@ impl<'a> FrameRenderer<'a> {
     /// `pipeline_bundle` 的渲染通道格式必须与表面选中的格式一致，
     /// 否则 [`Swapchain::new`] 建出的 framebuffer 与渲染通道不兼容。
     pub fn new(gpu: &'a Gpu, pipeline_bundle: PipelineBundle) -> anyhow::Result<Self> {
+        // 主窗口：沿用 Gpu 里已查好的表面能力。
+        Self::new_for_surface(gpu, pipeline_bundle, gpu.surface())
+    }
+
+    /// 为**指定表面**建渲染器（多窗口用）。
+    ///
+    /// # 为什么必须有这个变体
+    ///
+    /// [`Self::new`] 用的是 `gpu.surface()`——`Gpu::new` 时为主窗口建的
+    /// 表面。`vk::SurfaceKHR` 与 `hwnd` 一一对应、**不可复用**，
+    /// 子窗口必须有自己的表面（见 [`Swapchain::new_for_surface`]）。
+    ///
+    /// 表面能力（caps / 格式 / 呈现模式）在这里**重新查询**：
+    /// `Gpu` 里存的是主窗口表面的快照，子窗口的尺寸、DPI、
+    /// 显示器都可能不同，用快照会拿到过期的 min/max extent。
+    pub fn new_for_surface(
+        gpu: &'a Gpu,
+        pipeline_bundle: PipelineBundle,
+        surface: vk::SurfaceKHR,
+    ) -> anyhow::Result<Self> {
         // 自行建一套 Entry/SurfaceLoader：Gpu 的 surface_caps 是启动时快照，
         // 重建交换链必须重新查询。
         let entry = unsafe { ash::Entry::load()? };
         let surface_loader = khr::surface::Instance::new(&entry, &gpu.instance);
         let swapchain_loader = khr::swapchain::Device::new(&gpu.instance, &gpu.device);
 
-        let caps = gpu.surface_caps;
+        // SAFETY：`surface` 由调用方保证是本实例创建且未销毁的表面。
+        let caps = unsafe {
+            surface_loader
+                .get_physical_device_surface_capabilities(gpu.physical_device, surface)?
+        };
+        let formats = gpu.query_surface_formats(surface)?;
+        let present_modes = unsafe {
+            surface_loader.get_physical_device_surface_present_modes(gpu.physical_device, surface)?
+        };
         let extent = resolve_extent(&caps, FALLBACK_EXTENT);
-        let swapchain = Swapchain::new(gpu, extent.width, extent.height, pipeline_bundle.render_pass, &caps)?;
+        tracing::debug!(
+            ?surface,
+            n_formats = formats.len(),
+            n_present = present_modes.len(),
+            min_img = caps.min_image_count,
+            max_img = caps.max_image_count,
+            cur_extent = ?caps.current_extent,
+            min_extent = ?caps.min_image_extent,
+            max_extent = ?caps.max_image_extent,
+            "建交换链前的表面能力"
+        );
+        let swapchain = Swapchain::new_for_surface(
+            gpu,
+            surface,
+            &formats,
+            &present_modes,
+            extent.width,
+            extent.height,
+            pipeline_bundle.render_pass,
+            &caps,
+        )?;
 
         // 渲染通道是按某个格式建的。若交换链最终选中的格式不同，
         // framebuffer 与渲染通道不兼容——直接失败，别让驱动在运行时炸。
@@ -694,6 +749,7 @@ impl<'a> FrameRenderer<'a> {
         let mut this = Self {
             gpu,
             bundle: pipeline_bundle,
+            surface,
             surface_loader,
             swapchain_loader,
             swapchain,
@@ -1400,7 +1456,7 @@ impl<'a> FrameRenderer<'a> {
             unsafe {
                 self.surface_loader.get_physical_device_surface_formats(
                     self.gpu.physical_device,
-                    self.gpu.surface(),
+                    self.surface,
                 )?
             }
             .as_slice(),
@@ -1415,8 +1471,26 @@ impl<'a> FrameRenderer<'a> {
         // 销毁顺序由 Swapchain::destroy 保证：framebuffer → image_view → swapchain。
         // 反序会留下悬空引用。
         self.swapchain.destroy(&self.gpu.device);
-        self.swapchain =
-            Swapchain::new(self.gpu, extent.width, extent.height, self.bundle.render_pass, &caps)?;
+        // 重建时**重新查询**本窗口表面的格式与呈现模式：
+        // 子窗口可能被移到另一块显示器，格式/呈现模式会变。
+        let formats = self.gpu.query_surface_formats(self.surface)?;
+        let present_modes = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_present_modes(
+                    self.gpu.physical_device,
+                    self.surface,
+                )?
+        };
+        self.swapchain = Swapchain::new_for_surface(
+            self.gpu,
+            self.surface,
+            &formats,
+            &present_modes,
+            extent.width,
+            extent.height,
+            self.bundle.render_pass,
+            &caps,
+        )?;
         if self.swapchain.format != self.pipeline_format {
             anyhow::bail!("重建后交换链格式与渲染通道不一致");
         }
