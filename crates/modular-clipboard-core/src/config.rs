@@ -3,7 +3,12 @@
 use serde::{Deserialize, Serialize};
 
 /// 单个快捷键绑定。
+///
+/// ⚠️ 容器级 `#[serde(default)]`：字段缺失时用 `Hotkey::default()` 补齐。
+/// 缺了它，任何新增字段都会让旧config.json 解析失败，
+/// 而 [`Config::load`] 会静默回退默认值——用户的快捷键**直接消失**。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Hotkey {
     pub key: String,
     pub ctrl: bool,
@@ -46,7 +51,11 @@ impl Default for Hotkey {
 }
 
 /// 存储与保留策略。
+///
+/// ⚠️ 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。没有它，
+/// 新增一个容量字段就会让旧配置整体失效，用户的保留策略被默认值覆盖。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StorageConfig {
     /// 历史条目总数上限。`None` 表示仅按容量淘汰。
     pub max_items: Option<usize>,
@@ -70,7 +79,13 @@ impl Default for StorageConfig {
 }
 
 /// 捕获行为。
+///
+/// ⚠️ 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。这一条尤其关键——
+/// `blocked_apps` 是用户的**安全边界**（密码管理器名单）。缺了它，
+/// 一次无关的格式调整就会让名单退回代码默认值，
+/// 用户的自定义屏蔽项被静默丢弃，且用户以为自己仍有屏蔽保护。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CaptureConfig {
     pub enabled: bool,
     /// 监听间隔（毫秒）。Windows 下为序列号轮询周期，非阻塞。
@@ -160,7 +175,12 @@ impl LayoutConfig {
 }
 
 /// UI 偏好。
+///
+/// ⚠️ 容器级 `#[serde(default)]`：语义同 [`Config`]。下面若干字段另有
+/// 字段级标注（历史原因），容器级这条保证**将来新增**的字段也不会
+/// 再触发整体回退——字段级标注管不到新字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     /// 跟随系统（None）/强制深色（Some(true)）/强制浅色（Some(false)）。
     pub dark_mode: Option<bool>,
@@ -247,18 +267,31 @@ pub struct ActionRule {
     pub id: i64,
     pub name: String,
     /// 触发关键词，`None` 表示匹配所有条目。
+    #[serde(default)]
     pub keyword: Option<String>,
     /// 匹配到的条目类型，`None` 表示不限。
+    #[serde(default)]
     pub kind: Option<crate::item::ClipKind>,
     /// 动作标识，交由 [`ActionRegistry`] 解析为具体实现。
     pub action: String,
     /// 动作参数，例如命令行模板 `{selection}`。
+    #[serde(default)]
     pub arg: Option<String>,
+    #[serde(default)]
     pub sort_order: i64,
 }
 
 /// 全量配置。
+///
+/// ⚠️ 容器级 `#[serde(default)]`：**这是整个配置文件的最后一道防线**。
+///
+/// 没有它，任意一个子结构新增字段 → serde 报 "missing field" →
+/// [`Config::load`] 静默回退 `Config::default()` → 用户的窗口尺寸、
+/// 主题、快捷键、屏蔽名单**一次性全部归零**，且界面上没有任何提示
+/// （只有一行 `tracing::warn`）。有了它，缺失字段由各自结构的
+/// `Default` 补齐，其余字段**原样保留**。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub storage: StorageConfig,
     pub capture: CaptureConfig,
@@ -289,6 +322,13 @@ impl Default for Config {
 
 impl Config {
     /// 载入配置；文件不存在或损坏时回退到默认值而非报错退出。
+    ///
+    /// # 损坏文件不会被丢弃
+    ///
+    /// 解析失败时把原文**另存为 `.corrupt`**再回退默认值。
+    /// 早前这里只`warn!` 然后丢掉全部内容：用户会遇到「配置被重置」
+    /// 却既不知道丢了什么、也找不回原文，而里面可能有花时间调好的
+    /// 屏蔽名单与快捷键。留一份原文，成本是一次文件复制。
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -298,16 +338,55 @@ impl Config {
             Ok(cfg) => Ok(cfg),
             Err(err) => {
                 tracing::warn!(%err, "配置解析失败，回退默认值: {}", path.display());
+                Self::backup_corrupt(path, &raw);
                 Ok(Self::default())
             }
         }
     }
 
+    /// 把无法解析的配置原文另存一份，避免用户的设置被静默销毁。
+    ///
+    /// 失败只记日志：这是「尽力而为」的抢救，不能反过来让启动失败。
+    fn backup_corrupt(path: &std::path::Path, raw: &str) {
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".corrupt");
+        match std::fs::write(&backup, raw) {
+            Ok(()) => tracing::warn!(
+                "配置原文已另存为 {}，可手动检查后恢复",
+                std::path::Path::new(&backup).display()
+            ),
+            Err(e) => tracing::warn!(%e, "配置损坏且备份失败，原文已丢失"),
+        }
+    }
+
+    /// 原子落盘：先写临时文件，再替换目标。
+    ///
+    /// # 为什么不能直接 `fs::write`
+    ///
+    /// `fs::write` 等价于「截断 → 写入」。若在两步之间进程崩溃或断电，
+    /// 留下的是一个**被截断的** config.json。下次启动解析失败 →
+    /// 回退默认值（见 [`Config::load`]）→ 用户配置全丢，且因为文件
+    /// 已被截断，**连原文都找不回来**。
+    ///
+    /// 先写 `<目标>.tmp` 再 `fs::rename`：Windows 的 `MoveFileEx`
+    /// 在同卷内是原子的，读者要么看到完整旧文件、要么看到完整新文件，
+    /// 不存在「半个文件」的中间态。
     pub fn save(&self, path: &std::path::Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let json = serde_json::to_string_pretty(self)?;
+
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+
+        std::fs::write(&tmp, json)?;
+        // rename 失败时不能留下 .tmp 干扰下次启动的读取。
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -395,6 +474,141 @@ mod tests {
         assert_eq!(cfg.capture.poll_interval_ms, 500);
         assert_eq!(cfg.capture.blocked_apps, vec!["钉钉".to_string()]);
         assert_eq!(cfg.ui.font_scale, 1.5);
+    }
+
+    /// 上游实测的真Bug：任何字段缺 `default` 都会让整个配置归零。
+    ///
+    /// 这条比上面的 `legacy_config_without_layout_field` 更狠：它模拟
+    /// 「**新增**字段」这一真实场景——旧config.json 里当然不会有
+    /// 新字段。没有容器级 `#[serde(default)]` 时，`Config::load` 解析失败
+    /// → 回退 `Config::default()` → 用户的窗口尺寸、屏蔽名单、快捷键
+    /// **全部被抹掉**，且界面上零提示。
+    ///
+    /// 断言逐个字段核对「用户数据仍在」，而不只是「能解析」。
+    #[test]
+    fn unknown_or_missing_fields_never_reset_existing_values() {
+        // 模拟未来版本新增 `capture.pause_on_fullscreen` 后的旧配置文件：
+        // 字段缺失，但用户此前的每一项设置都必须活着。
+        let legacy = r#"{
+          "storage": {"max_items": 500, "max_bytes": 1024, "max_payload_bytes": 2048,
+                      "cleanup_on_start": true},
+          "capture": {"enabled": false, "poll_interval_ms": 500, "track_source_app": false,
+                      "blocked_apps": ["钉钉"], "skip_password_fields": false,
+                      "dedup": false, "dedup_window_secs": 9},
+          "ui": {"dark_mode": false, "always_on_top": false, "hide_on_focus_lost": true,
+                 "window_width": 777.0, "window_height": 888.0, "show_tray": false,
+                 "start_minimized": true, "font_path": null, "font_scale": 1.5},
+          "hotkey_toggle": {"key": "V", "ctrl": true, "shift": true, "alt": false, "win": false},
+          "hotkey_paste_previous": {"key": "V", "ctrl": true, "shift": false, "alt": false, "win": true},
+          "rules": []
+        }"#;
+        let cfg: Config = serde_json::from_str(legacy).expect("缺字段不该导致整体解析失败");
+
+        // 缺失字段用各自Default 补齐…
+        assert_eq!(cfg.ui.layout, None);
+        assert_eq!(cfg.ui.window_pos, None);
+        assert_eq!(cfg.ui.pinned_window_pos, None);
+        // …但**已有**的设置一个都不能被默认值覆盖。
+        assert_eq!(cfg.ui.window_width, 777.0, "窗口尺寸被重置了");
+        assert_eq!(cfg.capture.blocked_apps, vec!["钉钉".to_string()], "屏蔽名单被重置了");
+        assert_eq!(cfg.hotkey_toggle.display(), "Ctrl+Shift+V");
+        // `display()` 的顺序固定为 Ctrl→Shift→Alt→Win→key，
+        // 所以这组绑定渲染成 "Ctrl+Win+V" 而非 "Win+Ctrl+V"。
+        assert_eq!(cfg.hotkey_paste_previous.display(), "Ctrl+Win+V");
+        assert!(!cfg.capture.enabled);
+    }
+
+    /// `hotkey_toggle` 这类「整段缺失」也要能被补齐。
+    ///
+    /// 与上一条互补：那条测「段内缺字段」，这条测「整段不存在」。
+    #[test]
+    fn wholly_missing_sections_fall_back_per_section() {
+        let partial = r#"{ "capture": { "blocked_apps": ["keepass"] } }"#;
+        let cfg: Config = serde_json::from_str(partial).expect("整段缺失不该导致解析失败");
+
+        //缺失段用Default…
+        assert_eq!(cfg.hotkey_toggle, Hotkey::default());
+        assert_eq!(cfg.ui, UiConfig::default());
+        // …保留段里已存在的值逐个读回。
+        assert_eq!(cfg.capture.blocked_apps, vec!["keepass".to_string()]);
+        assert!(cfg.capture.enabled, "未写的 capture 字段应取默认 true");
+    }
+
+    /// 规则里可选字段缺失时按`None` 处理，必填字段仍需存在。
+    ///
+    /// `ActionRule` 用**字段级**而非容器级 default：一条规则缺 `action`
+    /// 就没有可执行语义，不该被默认值造出一条假规则；缺 `keyword` 则
+    /// 明确表示「匹配所有条目」，是合法含义。
+    #[test]
+    fn action_rule_tolerates_missing_optional_fields() {
+        let rule: ActionRule =
+            serde_json::from_str(r#"{"id": 7, "name": "打开", "action": "open_path"}"#)
+                .expect("规则缺可选字段不该失败");
+        assert_eq!(rule.id, 7);
+        assert_eq!(rule.name, "打开");
+        assert_eq!(rule.action, "open_path");
+        assert_eq!(rule.keyword, None);
+        assert_eq!(rule.kind, None);
+        assert_eq!(rule.arg, None);
+        assert_eq!(rule.sort_order, 0, "缺省应落0 而不是解析失败");
+    }
+
+    /// 损坏的配置必须留一份原文，用户才有找回设置的可能。
+    ///
+    /// 早前`load` 只 warn 然后丢弃——用户看到配置被重置，却既不知道
+    /// 丢了什么，也找不回原文，而里面可能有调了很久的屏蔽名单。
+    #[test]
+    fn corrupt_config_leaves_original_for_recovery() {
+        let dir = std::env::temp_dir().join("tiez-cfg-corrupt-backup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let original = "{ \"ui\": { \"window_width\": 777.0 }, ";
+        std::fs::write(&path, original).unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg, Config::default(), "损坏时仍应回退默认值，不崩溃");
+
+        let mut backup = path.as_os_str().to_os_string();
+        backup.push(".corrupt");
+        let backup = std::path::PathBuf::from(backup);
+        assert!(backup.is_file(), "损坏原文应另存为 {}", backup.display());
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "备份内容必须与原文逐字节一致"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 落盘后不留临时文件，且再次读取得到同一份配置。
+    ///
+    /// `save` 改成「写 .tmp 再 rename」后，若 rename 失败会把 `.tmp`
+    /// 留下来。这条守住「正常路径不产生残留」。
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join("tiez-cfg-atomic-save");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        let mut cfg = Config::default();
+        cfg.ui.window_width = 777.0;
+        cfg.capture.blocked_apps = vec!["钉钉".into()];
+        cfg.save(&path).unwrap();
+
+        assert!(path.is_file(), "目标文件应存在");
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        assert!(
+            !std::path::PathBuf::from(tmp).exists(),
+            "rename 成功后不应残留 .tmp"
+        );
+
+        let back = Config::load(&path).unwrap();
+        assert_eq!(back.ui.window_width, 777.0);
+        assert_eq!(back.capture.blocked_apps, vec!["钉钉".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 布局字段存→取必须逐字段不变。

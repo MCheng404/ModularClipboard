@@ -220,8 +220,19 @@ impl Service {
                 while r.load(Ordering::Relaxed) {
                     // 自写回抑制：应用刚把历史条目放回剪贴板时，
                     // 那次变化不是用户的复制行为，必须忽略。
-                    let since_self_write = now_ms() as u64 - last_self_write.load(Ordering::Relaxed);
-                    if since_self_write < SELF_WRITE_GUARD_MS as u64 {
+                    //
+                    // ⚠️ 必须用饱和减法，不能写 `now - last`：
+                    // `now_ms()` 取的是**墙钟**，NTP 校时或用户手动改时间
+                    // 会让它瞬间小于 `last_self_write`。无符号减法在此
+                    // 下溢成一个接近 2^64 的巨值，于是 `since < 900`
+                    // 恒为 false——抑制**永久失效**，此后每次把历史写回
+                    // 剪贴板都会被当成用户的复制重新记一条。
+                    // 饱和减法在时钟回拨时得 0（仍在抑制窗口内），
+                    // 时钟前移得最大值（窗口已过），两种方向都安全。
+                    let now = now_ms() as i64;
+                    let last = last_self_write.load(Ordering::Relaxed) as i64;
+                    let since_self_write = now.saturating_sub(last);
+                    if since_self_write < SELF_WRITE_GUARD_MS {
                         std::thread::sleep(Duration::from_millis(interval));
                         continue;
                     }
