@@ -338,7 +338,6 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     );
 
     // 放大镜图标坐在左内边距里，与文字左边界对齐。
-    let font = sized(pal.font_md, scale);
     let pad = pal.space_sm;
     let icon_w = pal.icon_size + pad;
     crate::icons::Icon::Search.paint(

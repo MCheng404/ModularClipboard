@@ -41,17 +41,21 @@ impl Default for Workspace {
             // 设 0 让卡片边缘贴合，视觉上是一个连续的面板。
             gap: 0.0,
         };
-        // 默认卡片集。
+        // 默认卡片集：只有「置顶 + 历史」两栏，都停靠在主窗口。
         //
-        // ⚠️ `Detail` / `Rail` **默认就分离为独立子窗口**
-        // （`CardHost::Window`）——主窗口只留「置顶 + 历史」两栏。
-        // 它们仍留在 `cards` 里，只是 `host` 为 Window，
-        // 于是 solver 不给它们分配宽度、主窗口也不绘制。
+        // ⚠️ 「视图」（`Rail`）与「详情」（`Detail`）**暂时移除**。
+        //
+        // 它们作为独立子窗口存在过，但实测问题较多：
+        //   - 子窗口默认位置与主窗口重叠，遮挡主界面；
+        //   - 关闭子窗口后卡片状态与窗口状态容易不同步；
+        //   - 每窗口一套 `FrameRenderer` + `Painter`（含独立字体图集）
+        //     的显存开销在这个体量下并不划算。
+        //
+        // **枚举、绘制代码、solver 分支全部保留**，只是不再实例化——
+        // 将来要恢复，改回这里加两行即可，不必重写。
         for (kind, host) in [
             (CardKind::Pinned, CardHost::Docked),
             (CardKind::History, CardHost::Docked),
-            (CardKind::Rail, CardHost::Window),
-            (CardKind::Detail, CardHost::Window),
         ] {
             let id = ws.add(kind);
             ws.get_mut(id).expect("刚加入的卡片").host = host;
@@ -83,8 +87,15 @@ impl Workspace {
         // 像素采样证实每个窗口**自身**渲染是完整的（背景占比 86%）。
         //
         // 按已有卡片数递增偏移：够错开，又不至于散得太开。
+        //
+        // ⚠️ 偏移基准改成 **(620, 80)** 而不是 (120,120)：
+        // 主窗口默认 420x560、位于屏幕左上，子窗口若也从 (120,120)
+        // 附近起就会**盖在主窗口上**——截图脚本只截主窗口矩形，
+        // 于是画面里全是被遮挡的主窗口，看起来像「界面坏了」。
+        //
+        // 620 已越过主窗口右缘（420），80 让第一个子窗口露出上边。
         let n = self.cards.len() as f32;
-        card.window_pos = egui::epaint::emath::vec2(120.0 + n * 48.0, 120.0 + n * 36.0);
+        card.window_pos = egui::epaint::emath::vec2(620.0 + n * 40.0, 80.0 + n * 40.0);
         self.cards.push(card);
         id
     }
@@ -234,11 +245,26 @@ mod tests {
     use egui::{pos2, vec2};
 
     #[test]
-    fn default_workspace_has_the_four_core_cards() {
+    fn default_workspace_has_pinned_and_history_only() {
+        // ⚠️ 「视图」（Rail）与「详情」（Detail）**暂时不在默认集里**
+        // ——作为独立子窗口的收益不抵它的遮挡与状态同步成本。
+        // 枚举与代码都保留，将来恢复时改 `Workspace::default()` 即可，
+        // 这个断言也要跟着改回来。
         let ws = Workspace::default();
-        for k in CardKind::ALL {
+        for k in [CardKind::Pinned, CardKind::History] {
             assert!(ws.by_kind(k).is_some(), "默认工作区应含{k:?}卡片");
         }
+        for k in [CardKind::Rail, CardKind::Detail] {
+            assert!(
+                ws.by_kind(k).is_none(),
+                "{k:?} 已暂时移除，不应出现在默认工作区"
+            );
+        }
+        // 默认卡片全部停靠在主窗口，不该有分离出去的。
+        assert!(
+            ws.cards.iter().all(|c| c.host == CardHost::Docked),
+            "默认工作区不应含分离卡片"
+        );
     }
 
     #[test]

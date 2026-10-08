@@ -398,11 +398,12 @@ mod tests {
     #[test]
     fn detached_cards_get_zero_rects() {
         // 分离出去的卡片由子窗口自己管矩形，主窗口必须给它零。
+        //
+        // ⚠️ 必须**自己 add** 一张 Detail：`Workspace::default()`
+        // 只含「置顶 + 历史」两栏（视图/详情暂时不默认创建），
+        // 从 default 里找Detail 会得到 None。
         let mut ws = Workspace::default();
-        let id = ws
-            .by_kind(CardKind::Detail)
-            .map(|c| c.id)
-            .expect("详情卡片");
+        let id = ws.add(CardKind::Detail);
         ws.detach(id);
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 533.33));
         let sol = solve(&ws, area);
