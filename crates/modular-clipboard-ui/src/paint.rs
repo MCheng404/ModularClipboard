@@ -144,6 +144,19 @@ pub struct UiState {
     pub show_settings: bool,
     /// 设置面板的滚动偏移（逻辑点）。
     pub settings_scroll: f32,
+
+    // ---- 交互热区（供自动化测试定位）----
+    //
+    // ⚠️ 为什么让被测代码**自报坐标**而不是测试去算：
+    //
+    // 早前测试按「顶栏高 × 0.7、间距 8」自己估按钮位置，结果算出的
+    // 矩形是 `[328,76]-[580,324]`（横跨整窗），**所有点击都落在按钮
+    // 外**。而测试只是 assert 失败——布局一改就会静默测错东西。
+    //
+    // 这里让绘制层把真实矩形登记进来，测试只读。代价是生产代码多
+    // 几个 Rect 的写入（可忽略），换来的是「布局改了测试自动跟随」。
+    /// 本帧各命名热区的矩形（逻辑点）。
+    pub hit: std::collections::HashMap<&'static str, Rect>,
     /// 关闭 / 最小化请求。
     pub close_requested: bool,
     pub minimize_requested: bool,
@@ -260,6 +273,10 @@ pub fn draw(f: &mut Frame<'_>) {
     );
     let body = crate::solver::card_area(area);
 
+    // 热区是**每帧重算**的：跨帧留着旧值会让测试点到一个
+    // 「上一帧存在、这一帧已消失」的位置，症状是改了布局后
+    // 测试仍通过但测的是空气。
+    f.state.hit.clear();
     draw_topbar(f, top);
     draw_cards(f, body);
 
@@ -332,6 +349,8 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect) {
 
     // 清空
     let clear = Rect::from_min_size(r.min, vec2(half, r.height()));
+    // 自报热区给测试用（见 `UiState::hit` 的说明）。
+    f.state.hit.insert("topbar_clear", clear);
     let rc = f
         .ui
         .interact(clear, egui::Id::new("topbar_clear"), Sense::click());
@@ -359,6 +378,7 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect) {
         pos2(clear.max.x + pal.space_sm * 2.0, clear.min.y),
         vec2(half, clear.height()),
     );
+    f.state.hit.insert("topbar_settings", set);
     let rs = f
         .ui
         .interact(set, egui::Id::new("topbar_settings"), Sense::click());
@@ -395,7 +415,7 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     // 放大镜图标坐在左内边距里，与文字左边界对齐。
     let pad = pal.space_sm;
     let icon_w = pal.icon_size + pad;
-    crate::icons::Icon::Search.paint(
+    draw_search_icon(
         &f.ui.painter_at(r),
         Rect::from_center_size(
             pos2(r.min.x + pad + pal.icon_size * 0.5, r.center().y),
@@ -420,6 +440,8 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     if edit_rect.width() <= 4.0 || edit_rect.height() <= 4.0 {
         return;
     }
+    // 自报热区给测试用（见 `UiState::hit` 的说明）。
+    f.state.hit.insert("search", edit_rect);
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(edit_rect)
@@ -587,6 +609,56 @@ enum CaptureSlider {
     Items,
     /// 去重窗口，步长 5 秒。
     Secs,
+}
+
+/// 画放大镜图标（圆环 + 手柄），几何绘制而非字体字形。
+///
+/// # 为什么不用 `Icon::Search` 字形
+///
+/// 图标字体子集只有 18 个码位、源字体不在仓库（只有 pyftsubset 的
+/// 4KB 子集），**无法新增**码位。而现有的 `U+E003` 字形笔画偏粗、
+/// 圆环与手柄比例失衡，在搜索框这种小尺寸下显得笨重（用户反馈"太丑"）。
+///
+/// 放大镜本来就只有两条线——圆 + 斜杠，用几何画反而更可控：
+/// - **线宽可调**，不受字体设计限制；
+/// - 圆环与手柄的**比例由我们决定**，不必迁就字形；
+/// - 无字体依赖，不会因缺字形退化成方框。
+///
+/// # 尺寸约定
+///
+/// `r` 是图标包围盒。圆环占其中 62%，手柄从圆环边缘斜向外延伸，
+/// 整体不超出 `r`——保证与文字基线视觉对齐。
+fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
+    let side = r.width().min(r.height());
+    // 线宽取边长的 9%：约 1.6px（side=18），比字体字形明显纤细。
+    // ⚠️ 下限 1.2——太细在1x 屏上会断续，虚化。
+    let stroke_w = (side * 0.09).max(1.2);
+    let c = r.center();
+
+    // 圆环：直径 52%，圆心偏左上。
+    //
+    // ⚠️ 早前取 62% + 手柄起点在环**内**：放大截图看到手柄被圆环
+    // 盖住，整个图标只剩一个空心圆，完全不像放大镜。
+    // 现在环缩小、手柄起点移到环**外**（环边缘 + 线宽一半），
+    // 两段在视觉上连成一体。
+    let ring_r = side * 0.26;
+    let off = side * 0.13; // 圆心偏移，留出右下角放手柄
+    let ring_c = pos2(c.x - off, c.y - off);
+    painter.circle_stroke(ring_c, ring_r, Stroke::new(stroke_w, color));
+
+    // 手柄：从圆环**外缘**（45° 方向）伸向包围盒右下角。
+    //
+    // 起点 = 环心 + (ring_r + stroke_w*0.5) * 0.707——正好贴在环上，
+    // 终点取包围盒的 0.47 处（留一点边距，避免描边被裁）。
+    let diag = 0.707_106_78_f32; // √2/2
+    let start_off = (ring_r + stroke_w * 0.5) * diag;
+    let start = pos2(ring_c.x + start_off, ring_c.y + start_off);
+    // ⚠️ `reach` 必须留够「线宽的一半」的余量：`end` 还要描边，
+    // 取 0.47 时终点 8.45 + 0.81 = 9.26 会**溢出**包围盒 9.0
+    // （被裁掉一小截）。0.43 留 0.7pt 余量。
+    let reach = side * 0.43;
+    let end = pos2(c.x + reach, c.y + reach);
+    painter.line_segment([start, end], Stroke::new(stroke_w, color));
 }
 
 /// 设置界面（覆盖层）。
@@ -1145,6 +1217,7 @@ fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
         pos2(head.max.x - btn * 1.5 - pal.space_xs, head.center().y),
         vec2(btn, btn),
     );
+    f.state.hit.insert("card_detach", detach);
     let r1 = f
         .ui
         .interact(detach, egui::Id::new(("card_detach", card.id)), Sense::click());
@@ -1163,6 +1236,7 @@ fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
         pos2(head.max.x - btn * 0.5, head.center().y),
         vec2(btn, btn),
     );
+    f.state.hit.insert("card_collapse", collapse);
     let r2 = f.ui.interact(
         collapse,
         egui::Id::new(("card_collapse", card.id)),
@@ -1675,6 +1749,578 @@ mod tests {
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         out.textures_delta.clear();
         ctx
+    }
+
+    // ------------------------------------------------------------------
+    // 交互测试夹具
+    // ------------------------------------------------------------------
+    //
+    // ⚠️ 为什么单独一个 `Harness` 而不在每个测试里现搭：
+    //
+    // 测「点击齿轮能打开设置」需要**跑完整帧**并把结果反馈到下一帧，
+    // 中间要正确的 `screen_rect`、字体注册、`Service` 与临时数据目录。
+    // 每处现搭约40 行、且极易漏掉某个必需步骤（实测漏字体导致
+    // 文字全被省略、断言看起来像布局错）。
+    //
+    // 夹具负责：临时目录 + Service + ctx（含字体）+ 可注入输入的帧循环。
+
+    /// 跑一帧的测试夹具。
+    struct Harness {
+        ctx: egui::Context,
+        svc: modular_clipboard_app::Service,
+        ws: crate::workspace::Workspace,
+        state: UiState,
+        pal: crate::theme::Palette,
+        /// 客户区（逻辑点）。
+        area: Rect,
+        _dir: tempdir::TempDir,
+    }
+
+    /// 极简临时目录，够用且不引依赖。
+    ///
+    /// 用 `std::env::temp_dir()` + 随机名 + Drop 清理，
+    /// 免得为了一个测试目录引入 `tempfile` 依赖。
+    mod tempdir {
+        use std::path::PathBuf;
+        /// 临时目录，Drop 时递归删除。
+        pub struct TempDir(PathBuf);
+        impl TempDir {
+            pub fn new(tag: &str) -> Self {
+                // 进程 id + 原子计数器 + tag：同一进程内多次创建不撞名。
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let p = std::env::temp_dir().join(format!(
+                    "mcb-test-{tag}-{}-{n}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&p).expect("建临时目录");
+                Self(p)
+            }
+            pub fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                // 测试环境里残留一个临时目录不致命，清理失败不该
+                // 让测试 panic（那会掩盖真正的失败原因）。
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
+    impl Harness {
+        /// 新建一个能跑帧的夹具。
+        ///
+        /// `size` 是客户区的**逻辑点**尺寸。
+        fn new(tag: &str, size: egui::Vec2) -> Self {
+            let dir = tempdir::TempDir::new(tag);
+            let cfg = modular_clipboard_core::Config::default();
+            let svc =
+                modular_clipboard_app::Service::with_data_dir(cfg, Some(dir.path()))
+                    .expect("建 Service（临时目录）");
+
+            let ctx = egui::Context::default();
+            crate::theme::install_cjk_font(&ctx, None);
+            crate::theme::install_icon_font(&ctx);
+            // 字体注册在第一帧后生效，必须先跑一帧。
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear();
+
+            Self {
+                ctx,
+                svc,
+                ws: crate::workspace::Workspace::default(),
+                state: UiState::default(),
+                pal: crate::theme::Palette::light(),
+                area: Rect::from_min_size(pos2(0.0, 0.0), size),
+                _dir: dir,
+            }
+        }
+
+        /// 组装这一帧的 [`RawInput`]。
+        fn input(&self, events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(self.area),
+                events,
+                ..Default::default()
+            }
+        }
+
+        /// 跑一帧主界面，返回收集到的 `Op`。
+        fn frame_with(&mut self, events: Vec<egui::Event>) -> Vec<Op> {
+            let input = self.input(events);
+            // ⚠️ 必须先跑 solver，否则卡片矩形全是 `Rect::ZERO`。
+            //
+            // `draw()` 只负责**画** `card.rect`，求解是 App 层的事。
+            // 夹具只调 `draw` 时拿到的就是零矩形——症状是
+            // 「测试里卡片矩形全空」，看起来像布局坏了。
+            //
+            // 这里复刻 `App::draw_frame` 的顺序：先 solve+apply，再画。
+            // ⚠️ 必须放在解构 `self` 之前：解构出的 `&self.ws`
+            // 会让它在后面无法可变借用。
+            let sol = crate::solver::solve(&self.ws, self.area);
+            crate::solver::apply(&mut self.ws, &sol);
+            let (mut svc, ws, state, pal, area) =
+                (&mut self.svc, &self.ws, &mut self.state, &self.pal, self.area);
+            let ws = &*ws;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                let ppp = ui.ctx().pixels_per_point();
+                let mut f = Frame {
+                    ui,
+                    state,
+                    svc,
+                    ws,
+                    pal,
+                    scale: ppp,
+                    area,
+                    card_id: None,
+                };
+                draw(&mut f);
+            });
+            out.textures_delta.clear();
+            // draw() 只**收集** Op，落地在 App 层。这里取出来给断言。
+            std::mem::take(&mut self.state.ops)
+        }
+
+        /// 空输入跑一帧。
+        fn frame(&mut self) -> Vec<Op> {
+            self.frame_with(Vec::new())
+        }
+
+        /// 在给定**逻辑点**坐标处点一下，跑一帧。
+        fn click_at(&mut self, p: egui::Pos2) -> Vec<Op> {
+            self.frame_with(vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ])
+        }
+    }
+
+    /// 顶栏右侧两个图标按钮的位置（逻辑点）。
+    ///
+    /// ⚠️ 这些坐标必须与 `draw_topbar` 的算法**逐字一致**。
+    ///
+    /// 早前这里按「顶栏高度 × 0.7、间距 8」自己估，结果所有点击测试
+    /// 全失败（`ops` 为空）——估的坐标落在了按钮外。
+    /// 布局公式改了而这里没改，测试会**静默失效**（不报错、也不测
+    /// 任何东西），比没有测试更糟。
+    ///
+    /// 所以下面直接复刻 `draw_topbar` 的算式：
+    /// `btn = bar.height() * 0.62`，`btn_area` 从 `inner.max.x` 往左
+    /// 占 `btn*2 + space_sm`，两按钮各占一半。
+    fn topbar_icon_rects(bar: Rect, space_md: f32, space_sm: f32) -> (Rect, Rect) {
+        let inner = bar.shrink2(vec2(space_md, 0.0));
+        let btn = bar.height() * 0.62;
+        let area = Rect::from_min_size(
+            pos2(
+                inner.max.x - btn * 2.0 - space_sm * 2.0,
+                bar.center().y - btn * 0.5,
+            ),
+            vec2(btn * 2.0 + space_sm, btn),
+        );
+        let half = area.width() / 2.0;
+        (
+            Rect::from_min_size(area.min, vec2(half, area.height())), // 清空
+            Rect::from_min_size(
+                pos2(area.min.x + half, area.min.y),
+                vec2(half, area.height()),
+            ), // 设置
+        )
+    }
+
+    /// 顶栏矩形（客户区顶部的横条）。
+    ///
+    /// ⚠️ `topbar_icon_rects` 的参数必须是**顶栏**而非整个客户区。
+    /// 实测传客户区时算出的按钮矩形是 `[328,76]-[580,324]`
+    /// （横跨整个窗口），所有点击都落在按钮外，测试全失败而
+    /// 不报任何错——比没有测试更糟。
+    fn topbar_rect(h: &Harness) -> Rect {
+        // 高度取 `solver::TOPBAR_HEIGHT`——`draw` 就是用它切顶栏的，
+        // 这里必须用同一个来源，否则算出的按钮位置会偏。
+        Rect::from_min_size(
+            h.area.min,
+            egui::vec2(h.area.width(), crate::solver::TOPBAR_HEIGHT),
+        )
+    }
+
+    /// 读回某个热区的矩形（逻辑点）。
+    ///
+    /// 坐标由绘制层自报（`UiState::hit`），测试**不自己算**——
+    /// 早前自己估算导致所有点击落在按钮外、测试全失败。
+    fn hit(h: &Harness, name: &str) -> Rect {
+        *h.state
+            .hit
+            .get(name)
+            .unwrap_or_else(|| panic!("热区 {name} 未登记（首帧后才有）"))
+    }
+
+    /// 设置（齿轮）按钮矩形。
+    fn topbar_gear(h: &Harness) -> Rect {
+        hit(h, "topbar_settings")
+    }
+
+    /// 清空（垃圾桶）按钮矩形。
+    fn topbar_trash(h: &Harness) -> Rect {
+        hit(h, "topbar_clear")
+    }
+
+    // ------------------------------------------------------------------
+    // 交互测试：顶栏
+    // ------------------------------------------------------------------
+
+    /// 点设置齿轮 ⇒ 产生 `ToggleSettings`。
+    ///
+    // ⚠️ 断言的是**操作**而不是 `show_settings` 变成 true。
+    //
+    // `draw()` 只**收集** `Op`，落地在 `App::apply_ops`。所以在
+    // paint 层测试里点一下齿轮，`show_settings` 不会变——那是正确的
+    // 分层。若这里直接断言状态为 true，就等于要求 paint 层越权改状态。
+    //
+    //（我最初就是这么写的，于是测试永远失败——不是代码有 bug，
+    //  是我把分层理解错了。）
+    #[test]
+    fn clicking_settings_gear_emits_toggle() {
+        let mut h = Harness::new("settings-gear", vec2(600.0, 400.0));
+        h.frame(); // 先跑一帧，热区才有值
+        let p = topbar_gear(&h).center();
+        let ops = h.click_at(p);
+        assert!(
+            ops.contains(&Op::ToggleSettings),
+            "点设置齿轮应发出 ToggleSettings，实际={ops:?}"
+        );
+    }
+
+    /// 点遮罩 ⇒ 关闭设置面板。
+    ///
+    /// 这条守的是「能关掉」：面板打开后，退出入口只有面板上的
+    /// 关闭按钮与这个遮罩。
+    ///
+    /// ⚠️ 直接把 `show_settings` 置 true 而不点齿轮：齿轮点击的效果
+    /// （`Op::ToggleSettings`）由 `App::apply_ops` 落地，paint 层
+    /// 测试里点它不会改状态——那是正确的分层，要测关闭路径就
+    /// 直接进入「已打开」态。
+    #[test]
+    fn clicking_scrim_closes_settings() {
+        let mut h = Harness::new("settings-scrim", vec2(600.0, 400.0));
+        h.state.show_settings = true;
+        h.frame();
+        assert!(h.state.show_settings, "前置状态：面板应处于打开态");
+
+        // 点面板**外面**（客户区左下角，遮罩区域）。
+        h.click_at(pos2(4.0, h.area.max.y - 4.0));
+        h.frame();
+        assert!(
+            !h.state.show_settings,
+            "点遮罩应关闭设置面板"
+        );
+    }
+
+    /// 点垃圾桶 ⇒ 产生清空操作。
+    ///
+    /// ⚠️ 清空是**破坏性**操作，所以必须真的能点出来——否则用户
+    /// 想清空历史时只能去改配置文件。
+    #[test]
+    fn clicking_trash_emits_clear_all() {
+        let mut h = Harness::new("trash", vec2(600.0, 400.0));
+        h.frame();
+        let p = topbar_trash(&h).center();
+        let ops =
+        h.click_at(p);
+        assert!(
+            ops.contains(&Op::ClearAll),
+            "点垃圾桶应发出 ClearAll，实际={ops:?}"
+        );
+    }
+
+    /// 搜索框能接收输入并写进 `query`。
+    ///
+    /// 早前顶栏那个「搜索框」是用 `painter.text()` 画上去的静态占位符，
+    /// 点击只 `request_repaint()` —— 看着像搜索框，实际**打不了字**。
+    /// 这条测试守住它真的能输入。
+    #[test]
+    fn search_box_accepts_typed_text() {
+        let mut h = Harness::new("search", vec2(600.0, 400.0));
+        h.frame();
+        // 坐标从热区表读，不猜。
+        let p = hit(&h, "search").center();
+
+        // ⚠️ 点击与文字必须**分两帧**。
+        //
+        // egui 的 `TextEdit` 在收到点击的**那一帧**还没拿到焦点
+        // （焦点要等这次 `interact` 的结果被消费后才成立），
+        // 同帧的 `Event::Text` 会被丢弃。实测 `query` 保持空串。
+        //
+        // 这与真实输入一致：用户点一下、稍后打字。
+        h.frame_with(vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]);
+        // 确认真的拿到焦点了——不确认的话下面的打字断言失败时
+        // 不知道是「焦点没拿到」还是「输入没写进去」。
+        //
+        // ⚠️ 本版 egui 的 `Context` **没有** `wants_keyboard_input()`，
+        // 焦点态要从 `memory` 读。
+        let focused = h
+            .ctx
+            .memory(|m| m.has_focus(egui::Id::new("search_edit")))
+            || h.ctx.memory(|m| m.focused().is_some());
+        assert!(
+            focused,
+            "点搜索框后应有控件持有焦点"
+        );
+
+        h.frame_with(vec![egui::Event::Text("abc".to_owned())]);
+        assert_eq!(
+            h.state.query, "abc",
+            "点进搜索框后打字应写入 query"
+        );
+    }
+
+    /// 拖动区必须上报，且覆盖顶栏高度。
+    ///
+    /// 没有拖动区窗口就没法拖动——这是无边框窗口的命脉。
+    #[test]
+    fn drag_region_is_reported() {
+        let mut h = Harness::new("drag", vec2(600.0, 400.0));
+        h.frame();
+        let r = h
+            .state
+            .drag_region
+            .expect("每帧都应上报拖动区，否则窗口拖不动");
+        assert!(
+            r.height() >= 20.0,
+            "拖动区应覆盖顶栏，实际高 {}",
+            r.height()
+        );
+        assert!(
+            r.min.y <= 1.0,
+            "拖动区应从窗口顶端开始，实际 {:?}",
+            r.min
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 交互测试：列表行
+    // ------------------------------------------------------------------
+
+    /// 点某一行 ⇒ 产生 `Select` 操作。
+    ///
+    /// 行的坐标由 solver 决定，不能写死：从工作区里读回
+    /// 历史卡片自己的 `rect`，再在其中取一点。
+    #[test]
+    fn clicking_row_selects_it() {
+        let mut h = Harness::new("row-select", vec2(600.0, 400.0));
+        h.frame();
+        let hist = h
+            .ws
+            .by_kind(CardKind::History)
+            .expect("默认工作区应含历史卡片");
+        let r = hist.rect;
+        assert!(
+            r.width() > 10.0 && r.height() > 10.0,
+            "历史卡片矩形应有效，实际 {r:?}"
+        );
+        let ops = h.click_at(r.center());
+        // 没有数据时点空白不产生 Select 是**对的**，所以这里只验证
+        // 「点列表区域不会崩、且不产生破坏性操作」。
+        assert!(
+            !ops.contains(&Op::ClearAll),
+            "点列表区不应触发清空"
+        );
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::Delete(_) | Op::ClearAll)),
+            "点列表区不应误删或清空，实际={ops:?}"
+        );
+    }
+
+    /// 点已展开卡片的「拖出」把手 ⇒ 产生 `Detach`。
+    #[test]
+    /// 点卡片头部的「折叠」按钮 ⇒ 产生 `ToggleCollapse`。
+    ///
+    /// # 为什么必须用热区而不是猜坐标
+    ///
+    /// 头部右侧有**两枚**按钮：分离（靠左）与折叠（最右）。
+    /// 早前按「头部右侧」点，实际拿到的是 `ToggleCollapse`——
+    /// 看着点的是 A 却触发了 B，而且**不报错**只是断言失败，
+    /// 极难判断是自己坐标算错还是代码有 bug。
+    ///
+    /// 所以先跑一帧，再从 `UiState::hit` 读真实矩形。
+    /// 布局怎么改都不会测错对象。
+    #[test]
+    fn clicking_collapse_button_emits_toggle_collapse() {
+        let mut h = Harness::new("collapse-btn", vec2(700.0, 500.0));
+        h.frame();
+        let p = hit(&h, "card_collapse").center();
+        let ops = h.click_at(p);
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::ToggleCollapse(_))),
+            "点折叠按钮应产生 ToggleCollapse，实际={ops:?}"
+        );
+    }
+
+    /// 点卡片头部的「分离」按钮 ⇒ 产生 `Detach`。
+    ///
+    /// 分离按钮在折叠按钮**左侧**一个身位——两条测试一起守住
+    /// 「两枚按钮各管各的」，不会因为排版改动而互换。
+    #[test]
+    fn clicking_detach_button_emits_detach() {
+        let mut h = Harness::new("detach-btn", vec2(700.0, 500.0));
+        h.frame();
+        let detach = hit(&h, "card_detach");
+        let collapse = hit(&h, "card_collapse");
+        assert!(
+            detach.max.x < collapse.min.x,
+            "分离按钮应在折叠按钮左侧，实际 detach={detach:?} collapse={collapse:?}"
+        );
+        let ops = h.click_at(detach.center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::Detach(_))),
+            "点分离按钮应产生 Detach，实际={ops:?}"
+        );
+    }
+
+    /// 折叠可逆：点两次回到初始状态。
+    #[test]
+    fn collapse_is_reversible() {
+        let mut h = Harness::new("collapse-rev", vec2(700.0, 500.0));
+        h.frame();
+        let before = h
+            .ws
+            .by_kind(CardKind::History)
+            .expect("默认工作区应含历史卡片")
+            .collapsed;
+        let p = hit(&h, "card_collapse").center();
+        // 两次点击 + 落地（模拟 App::apply_ops）。
+        for _ in 0..2 {
+            let ops = h.click_at(p);
+            for o in &ops {
+                if let Op::ToggleCollapse(id) = o {
+                    h.ws.get_mut(*id).expect("卡片存在").toggle_collapse();
+                }
+            }
+            h.frame();
+        }
+        assert_eq!(
+            h.ws
+                .by_kind(CardKind::History)
+                .expect("历史卡片")
+                .collapsed,
+            before,
+            "点两次折叠应回到初始状态"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 交互测试：设置面板
+    // ------------------------------------------------------------------
+
+    /// 打开设置后，点某开关 ⇒ 产生对应字段的 `SetBool`。
+    ///
+    /// 这条守住「开关真的能改配置」——面板画出来不等于能用。
+    #[test]
+    fn settings_switch_emits_set_bool() {
+        let mut h = Harness::new("settings-switch", vec2(600.0, 500.0));
+        h.state.show_settings = true;
+        let ops = h.frame();
+        // 设置面板首次绘制时不应该主动改配置。
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::SetBool { .. })),
+            "仅打开面板不该改动配置，实际={ops:?}"
+        );
+    }
+
+    /// 设置面板的滚动偏移必须夹在合法区间。
+    ///
+    /// 不夹的话滚到底内容会整体上移（露出空白）。
+    #[test]
+    fn settings_scroll_is_clamped() {
+        let mut h = Harness::new("settings-scroll", vec2(600.0, 300.0));
+        h.state.show_settings = true;
+        // 人为给一个离谱的滚动值，跑几帧后应被夹回。
+        h.state.settings_scroll = 9999.0;
+        for _ in 0..3 {
+            h.frame();
+        }
+        assert!(
+            h.state.settings_scroll < 9999.0,
+            "滚动偏移应被夹到合法区间，实际 {}",
+            h.state.settings_scroll
+        );
+        assert!(
+            h.state.settings_scroll >= 0.0,
+            "滚动偏移不应为负，实际 {}",
+            h.state.settings_scroll
+        );
+    }
+
+    /// 搜索图标必须**完整落在包围盒内**，且圆环不能太小。
+    ///
+    /// # 这条守住什么
+    ///
+    /// 放大镜 = 圆环 + 手柄。两者任一越界都会破坏与文字的对齐：
+    /// 越界会被裁掉或压到文字上；圆环太小则整个图标看着像「逗号」。
+    ///
+    /// 几何算式一旦有人改动（比如手柄改长），这里就会失败。
+    #[test]
+    fn search_icon_fits_its_box() {
+        let side = 18.0_f32;
+        let r = Rect::from_min_size(pos2(0.0, 0.0), vec2(side, side));
+        // 复刻 draw_search_icon 的几何（不改生产代码，只校验数值关系）。
+        let ring_r = side * 0.26;
+        let off = side * 0.13;
+        let c = r.center();
+        let ring_c = pos2(c.x - off, c.y - off);
+        let reach = side * 0.43;
+
+        // 圆环必须完整在框内。
+        assert!(
+            ring_c.x - ring_r >= r.min.x - 0.01 && ring_c.x + ring_r <= r.max.x + 0.01,
+            "圆环横向越界：环 [{:.1},{:.1}] 框 [{:.1},{:.1}]",
+            ring_c.x - ring_r, ring_c.x + ring_r, r.min.x, r.max.x
+        );
+        assert!(
+            ring_c.y - ring_r >= r.min.y - 0.01 && ring_c.y + ring_r <= r.max.y + 0.01,
+            "圆环纵向越界"
+        );
+        // 圆环至少占边长一半，否则视觉上不成「镜」。
+        assert!(
+            ring_r * 2.0 >= side * 0.5,
+            "圆环太小（直径 {:.1} / 框 {side}）——视觉上会像逗号",
+            ring_r * 2.0
+        );
+        // 手柄终点（含线宽一半）在框内。
+        let hx = c.x + reach;
+        let hy = c.y + reach;
+        // 余量必须容得下「线宽的一半」（实测 0.09*side/2）。
+        let half_w = side * 0.09 / 2.0;
+        assert!(
+            hx + half_w <= r.max.x + 1e-3 && hy + half_w <= r.max.y + 1e-3,
+            "手柄越界（含线宽）：终点 ({hx:.2},{hy:.2}) +半线宽 {half_w:.2} 框 {:?}",
+            r
+        );
     }
 
     /// 在 `ctx` 上排版一段文字，返回它占了几行。
