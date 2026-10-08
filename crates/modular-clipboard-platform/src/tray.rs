@@ -146,6 +146,24 @@ pub const WM_TRAY_CALLBACK: u32 = 0x8000 + 2;
 const WM_TRAY_MENU: u32 = 0x8000 + 3;
 
 /// 菜单命令 ID。取`0x1001` 起，避开 `HMENU` 自身的保留区。
+/// 主窗口句柄（由 UI 层在窗口创建后写入）。
+///
+/// # 为什么需要它
+///
+/// 托盘的右键菜单必须**依附一个可见的前台窗口**，否则弹出后立刻
+/// 失去激活、随即消失。托盘自己那个窗口是**隐藏的辅助窗口**
+/// （只收消息、不显示），`SetForegroundWindow` 对它无效。
+///
+/// 早期实现直接对托盘窗口调 `SetForegroundWindow`，症状就是
+/// 「托盘右键菜单点出来就没了」。
+static MAIN_HWND: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+
+/// 登记主窗口句柄，供托盘菜单置前台用。
+pub fn set_main_hwnd(hwnd: isize) {
+    MAIN_HWND.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+}
+
 const CMD_SHOW: usize = 0x1001;
 const CMD_CLEAR: usize = 0x1002;
 const CMD_QUIT: usize = 0x1003;
@@ -430,15 +448,32 @@ mod imp {
             }
 
             let (x, y) = unpack_cursor(lparam);
-            // 菜单弹出前必须把窗口置前台，否则菜单立刻消失。
-            let _ = SetForegroundWindow(hwnd);
+            // 菜单弹出前必须把**主窗口**置前台，否则菜单立刻消失。
+            //
+            // ⚠️ 置前台的对象必须是**可见**窗口。托盘自己的 `hwnd`
+            // 是隐藏的消息窗口（只用于收 WM_TRAY_MENU / 托盘回调），
+            // 对它调 SetForegroundWindow 无效——菜单会闪一下就没。
+            // 这正是「托盘右键菜单消失」的根因。
+            //
+            // 取不到主窗口句柄时退回托盘窗口：托盘图标点击本身
+            // 已经给了该进程前台权限，这种情况下的行为与旧版一致。
+            let main = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+            let fg = if main != 0 {
+                HWND(main as *mut std::ffi::c_void)
+            } else {
+                hwnd
+            };
+            let _ = SetForegroundWindow(fg);
+
+            // 菜单的消息循环挂在**所属窗口**上；用主窗口才能保证
+            // 键盘/鼠标消息回到有焦点的那一个。
             let cmd = TrackPopupMenu(
                 menu,
                 TPM_RIGHTBUTTON | TPM_RETURNCMD,
                 x,
                 y,
                 None,
-                hwnd,
+                fg,
                 None,
             );
             let _ = DestroyMenu(menu);

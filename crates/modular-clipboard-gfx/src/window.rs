@@ -86,7 +86,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetWindowRect,
+    SetWindowPos, GetWindowRect,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE,
     GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW,
     SIZE_MINIMIZED, SIZE_RESTORED, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
     WM_SYSCOMMAND,
@@ -383,6 +384,28 @@ impl Window {
         }
         let s = self.scale_factor();
         egui::epaint::emath::vec2(r.left as f32 / s, r.top as f32 / s)
+    }
+
+    /// 把窗口移到屏幕坐标（**物理像素**，左上角）。
+    ///
+    /// 用途：卡片拖出成子窗口时按 `card.window_pos` 定位。
+    ///
+    /// 失败（窗口已销毁、坐标越界）时静默忽略：定位失败不该让
+    /// 「创建子窗口」整体失败，窗口默认出现在屏幕原点也能用。
+    pub fn move_to(&self, x_px: i32, y_px: i32) {
+        // `SetWindowPos` 被标记为必须处理返回值（`SetLastError` 语义），
+        // 但移动失败通常只意味着窗口已销毁 —— 没有可恢复的动作。
+        let _ = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                x_px,
+                y_px,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
     }
 
     /// 设置自绘标题栏（窗口拖动区）的位置，单位**逻辑点**、客户区坐标系。

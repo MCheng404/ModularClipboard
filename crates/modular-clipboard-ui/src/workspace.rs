@@ -74,7 +74,18 @@ impl Workspace {
     pub fn add(&mut self, kind: CardKind) -> CardId {
         let id = CardId(self.next_id);
         self.next_id += 1;
-        self.cards.push(Card::new(id, kind));
+        let mut card = Card::new(id, kind);
+        // ⚠️ 每个窗口型卡片的默认位置必须**互相错开**。
+        //
+        // 早前所有卡片的 `window_pos` 都是 (120,120)，于是视图与详情
+        // 两个子窗口完全重叠、后创建的压在前者上面。用户看到的
+        // 「界面有黑区、一半内容不见了」其实只是窗口叠在一起——
+        // 像素采样证实每个窗口**自身**渲染是完整的（背景占比 86%）。
+        //
+        // 按已有卡片数递增偏移：够错开，又不至于散得太开。
+        let n = self.cards.len() as f32;
+        card.window_pos = egui::epaint::emath::vec2(120.0 + n * 48.0, 120.0 + n * 36.0);
+        self.cards.push(card);
         id
     }
 

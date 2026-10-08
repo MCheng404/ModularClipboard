@@ -200,6 +200,9 @@ impl Card {
             // 且避免首帧就铺开四栏。
             collapsed: kind != CardKind::History && kind != CardKind::Pinned,
             pinned_mode: PinnedMode::default(),
+            // 窗口位置/尺寸的**最终值**由 `Workspace::add` 按已有卡片数
+            // 错开设置——所有卡片都用同一个默认值会让多个子窗口重叠
+            // （后创建的压在前者上面，看起来像「界面缺了一块」）。
             window_pos: vec2(120.0, 120.0),
             window_size: vec2(360.0, 480.0),
         }

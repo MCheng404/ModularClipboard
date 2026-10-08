@@ -375,7 +375,19 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
                 egui::TextEdit::singleline(&mut f.state.query)
                     .hint_text("搜索历史…")
                     .desired_width(f32::INFINITY)
-                    .font(font)
+                    // ⚠️ 字号必须给**不带scale 的逻辑字号**。
+                    //
+                    // 早前传的是 `sized(pal.font_md, scale)`——它已经把
+                    // DPI 系数乘进去了，而 egui 在计算可用高度时会
+                    // **再乘一次** `pixels_per_point`。结果是行高被放大到
+                    // 远超框高，文字被裁掉上半/下半截，表现为
+                    //「能输入但看不见、字很小」。
+                    //
+                    // 正确做法：`FontId` 用逻辑字号，由 egui 负责缩放。
+                    .font(egui::FontId::proportional(pal.font_md))
+                    // 内边距收窄：顶栏只有 44pt，egui 默认的
+                    // `symmetric(4,2)` 在此会让单行控件偏高而裁切。
+                    .margin(egui::Margin::symmetric(2, 0))
                     .text_color(pal.text)
                     // 去掉 TextEdit 自带的外框：外框已由上面的
                     // `rect_stroke` 画好，两层框叠在一起会显得脏。

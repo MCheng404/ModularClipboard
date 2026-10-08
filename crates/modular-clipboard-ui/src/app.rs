@@ -187,6 +187,13 @@ pub fn run_with_options(
     // 托盘自带独立线程与消息循环（见 `presence` 模块文档），
     // 这里只是每帧收一次事件。启动失败**不阻断应用**：
     // 托盘只是入口方式，没有它界面照样能用，只是关掉就没了。
+    // 登记主窗口句柄：托盘右键菜单需要把它置前台才能显示。
+    //
+    // ⚠️ 必须在托盘启动**之前**登记——否则用户在这段时间内右键
+    // 托盘图标，`TrackPopupMenu` 会挂在隐藏的托盘辅助窗口上，
+    // 菜单闪一下就消失。
+    modular_clipboard_platform::tray::set_main_hwnd(window.hwnd().0 as isize);
+
     let resident = match Resident::start(TRAY_TOOLTIP) {
         Ok(r) => Some(r),
         Err(e) => {

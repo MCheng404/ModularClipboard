@@ -132,7 +132,7 @@ impl<'a> ChildWindows<'a> {
         }
 
         // ---- 2. 该创建的 ----
-        let wanted: Vec<(CardId, String, u32, u32)> = ws
+        let wanted: Vec<(CardId, String, u32, u32, egui::epaint::emath::Vec2)> = ws
             .cards
             .iter()
             .filter(|c| {
@@ -141,7 +141,7 @@ impl<'a> ChildWindows<'a> {
                     && !self.windows.iter().any(|w| w.card_id == c.id)
             })
             .map(|c| {
-                //⚠️ `window_size` 是**逻辑点**，`Window::new` 要的是
+                // ⚠️ `window_size` 是**逻辑点**，`Window::new` 要的是
                 //**物理像素**。早前这里乘 100 当 DPI 系数，得到
                 // 36000x48000 的窗口，Vulkan 表面如实报告这个尺寸，
                 // 于是交换链按 36000x48000 分配显存 → `OUT_OF_DEVICE_MEMORY`
@@ -157,12 +157,13 @@ impl<'a> ChildWindows<'a> {
                     c.kind.title().to_string(),
                     (c.window_size.x * ppp).round().max(160.0) as u32,
                     (c.window_size.y * ppp).round().max(120.0) as u32,
+                    c.window_pos,
                 )
             })
             .collect();
 
-        for (id, title, w, h) in wanted {
-            match ChildWindow::create(id, &title, w.max(160), h.max(120), shared) {
+        for (id, title, w, h, pos) in wanted {
+            match ChildWindow::create(id, &title, w.max(160), h.max(120), pos, scale_factor, shared) {
                 Ok(win) => {
                     tracing::info!(card = ?id, title = %title, w, h, "卡片子窗口已创建");
                     self.windows.push(win);
@@ -226,9 +227,20 @@ impl<'a> ChildWindow<'a> {
         title: &str,
         width: u32,
         height: u32,
+        pos: egui::epaint::emath::Vec2,
+        scale_factor: f32,
         shared: &crate::multiwindow::SharedGfx<'a>,
     ) -> anyhow::Result<Self> {
         let window = Window::new(title, width, height)?;
+        // 立刻定位到卡片记录的位置。
+        //
+        // ⚠️ 早前 `window_pos` 只在「收回时写入」、**从不读取**，
+        // 于是所有子窗口都停在Win32 默认位置（层叠在一起），
+        // 表现为「多个窗口重叠、界面像缺了一块」。
+        //
+        // `window_pos` 是逻辑点，`move_to` 要物理像素。
+        let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
+        window.move_to((pos.x * s) as i32, (pos.y * s) as i32);
         let ctx = egui::Context::default();
         crate::theme::install_cjk_font(&ctx, None);
         crate::theme::install_icon_font(&ctx);
