@@ -184,11 +184,19 @@ impl<'a> ChildWindows<'a> {
             return;
         };
         let win = self.windows.remove(pos);
-        // 卡片还在工作区里（只是被收回）→ 恢复它的窗口位置，
-        // 这样再拖出去时不会跳到默认位置。
+        // 卡片还在工作区里（只是被收回）⇒ 把窗口位置存回卡片。
+        //
+        // 不存的话，用户把卡片拖出去→ 收回 → 再拖出去，窗口每次都
+        // 跳回默认位置。位置属于卡片的**持久状态**，不是窗口的临时状态。
         if let Some(card) = ws.get_mut(id) {
-            let p = win.window.hwnd();
-            tracing::debug!(card = ?id, hwnd = ?p, "卡片子窗口已关闭");
+            let (w, h) = win.window.inner_size_points();
+            card.window_size = egui::epaint::emath::vec2(w, h);
+            card.window_pos = win.window.screen_position_points();
+            tracing::debug!(
+                card = ?id,
+                pos = ?card.window_pos,
+                "卡片子窗口已关闭，位置已存回卡片"
+            );
         }
     }
 

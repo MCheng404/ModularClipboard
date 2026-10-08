@@ -86,6 +86,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetWindowRect,
     GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW,
     SIZE_MINIMIZED, SIZE_RESTORED, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
     WM_SYSCOMMAND,
@@ -364,6 +365,24 @@ impl Window {
     /// 缩放比例，`dpi / 96`。`1.0` 为 100%。
     pub fn scale_factor(&self) -> f32 {
         dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) })
+    }
+
+    /// 窗口左上角的**屏幕坐标**，逻辑点。
+    ///
+    /// 无边框窗口的窗口区 == 客户区，所以这里直接用窗口矩形即可。
+    ///
+    /// 用途：卡片被收回时把位置存回卡片，下次拖出能回到原处。
+    pub fn screen_position_points(&self) -> egui::epaint::emath::Vec2 {
+        let mut r = RECT::default();
+        // SAFETY：`self.hwnd` 由本结构持有且窗口未销毁；
+        // `r` 是栈上有效的可写内存。
+        // windows 0.62 里返回 `Result`，不是 BOOL。
+        let ok = unsafe { GetWindowRect(self.hwnd, &mut r) }.is_ok();
+        if !ok {
+            return egui::epaint::emath::Vec2::ZERO;
+        }
+        let s = self.scale_factor();
+        egui::epaint::emath::vec2(r.left as f32 / s, r.top as f32 / s)
     }
 
     /// 设置自绘标题栏（窗口拖动区）的位置，单位**逻辑点**、客户区坐标系。
