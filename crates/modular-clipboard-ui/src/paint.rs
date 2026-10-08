@@ -1249,11 +1249,19 @@ fn draw_collapsed_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     if handle.width() <= 0.0 {
         return;
     }
-    let resp = f.ui.interact(
-        handle,
-        egui::Id::new(("card_handle", card.id)),
-        Sense::click(),
+    // 把手做成 egui `Button`：命中与悬停由 egui 负责。
+    //
+    // ⚠️ 必须开子 `Ui` 绝对定位（理由同顶栏 `icon_button`）：
+    // `add_sized` 会让控件跟着布局游标走，与我们算好的把手矩形错位。
+    let resp = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new(("card_handle", card.id)))
+            .max_rect(handle)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| ui.add_sized(handle.size(), egui::Button::new("").frame(false)),
     );
+    let resp = resp.inner;
+
     let painter = f.ui.painter_at(handle);
     if resp.hovered() {
         painter.rect_filled(handle, CARD_RADIUS, pal.row_hover);
@@ -1270,6 +1278,10 @@ fn draw_collapsed_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     );
 
     // 标题竖排在把手中央。
+    //
+    // ⚠️ 这里**必须逐字自绘**，不能用 egui 的竖排控件：egui 0.36
+    // 没有竖排文本（`TextFormat` 无竖排选项），而窄把手（宽度只有一个
+    // 图标宽）放不下横排标题。
     let font = sized(pal.font_xs, scale);
     let label = card.kind.title();
     let y0 = handle.center().y - (label.chars().count() as f32) * font.size * 0.6;
@@ -1286,7 +1298,9 @@ fn draw_collapsed_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
             pal.text_dim,
         );
     }
-    if resp.clicked() {
+    // ⚠️ `on_hover_text` 消耗 `Response`，`clicked()` 必须在它之前取。
+    let clicked = resp.clicked();
+    if clicked {
         f.state.push(Op::ToggleCollapse(card.id));
     }
     resp.on_hover_text(format!("展开{}", card.kind.title()));
@@ -1321,6 +1335,11 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     }
 }
 
+/// 卡片头部：标题 + 分离/折叠两枚按钮。
+///
+/// 按钮走 [`card_icon_button`]（与顶栏同一个 `Button` 套路），
+/// 标题仍是自绘文本——`Label` 会参与布局并推动游标，而这里要的是
+/// 「标题固定在左侧、按钮固定在右侧」，用绝对矩形最直接。
 fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
     let pal = f.pal;
     let scale = f.scale;
@@ -1345,40 +1364,59 @@ fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
         pos2(head.max.x - btn * 1.5 - pal.space_xs, head.center().y),
         vec2(btn, btn),
     );
-    f.state.hit.insert("card_detach", detach);
-    let r1 = f
-        .ui
-        .interact(detach, egui::Id::new(("card_detach", card.id)), Sense::click());
-    crate::icons::Icon::Drag.paint(
-        &f.ui.painter_at(detach),
-        Rect::from_center_size(detach.center(), vec2(pal.icon_size, pal.icon_size) * scale),
-        if r1.hovered() { pal.text_bright } else { pal.text_dim },
-    );
-    if r1.clicked() {
-        f.state.push(Op::Detach(card.id));
-    }
-    r1.on_hover_text("分离为独立窗口");
-
     // 「折叠」按钮。
     let collapse = Rect::from_center_size(
         pos2(head.max.x - btn * 0.5, head.center().y),
         vec2(btn, btn),
     );
+
+    // 登记热区**在点击判定之前**：`draw_child` 也要读它。
+    f.state.hit.insert("card_detach", detach);
     f.state.hit.insert("card_collapse", collapse);
-    let r2 = f.ui.interact(
-        collapse,
-        egui::Id::new(("card_collapse", card.id)),
-        Sense::click(),
-    );
-    crate::icons::Icon::Collapse.paint(
-        &f.ui.painter_at(collapse),
-        Rect::from_center_size(collapse.center(), vec2(pal.icon_size, pal.icon_size) * scale),
-        if r2.hovered() { pal.text_bright } else { pal.text_dim },
-    );
-    if r2.clicked() {
+
+    if card_icon_button(f, card, "collapse", collapse, crate::icons::Icon::Collapse, "折叠卡片") {
         f.state.push(Op::ToggleCollapse(card.id));
     }
-    r2.on_hover_text("折叠卡片");
+    if card_icon_button(f, card, "detach", detach, crate::icons::Icon::Drag, "分离为独立窗口") {
+        f.state.push(Op::Detach(card.id));
+    }
+}
+
+/// 卡片头部的一枚图标按钮；返回是否被点击。
+///
+/// 与顶栏 [`icon_button`] 的差别只有一处：`Id` 必须带 `card.id`——
+/// 多张卡片各有同名的「折叠」「分离」按钮，共用 Id 会互相抢点击，
+/// 表现为「点 A 卡片的折叠，实际折叠了 B」。
+fn card_icon_button(
+    f: &mut Frame<'_>,
+    card: &Card,
+    tag: &'static str,
+    r: Rect,
+    icon: crate::icons::Icon,
+    tip: &'static str,
+) -> bool {
+    let pal = f.pal;
+    let scale = f.scale;
+    let resp = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new((tag, card.id)))
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
+    );
+    let resp = resp.inner;
+    if resp.hovered() {
+        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
+    }
+    icon.paint(
+        &f.ui.painter_at(r),
+        Rect::from_center_size(r.center(), vec2(pal.icon_size, pal.icon_size) * scale),
+        if resp.hovered() { pal.text_bright } else { pal.text_dim },
+    );
+    // ⚠️ `on_hover_text` 消耗 `Response`，`clicked()` 必须在它之前取。
+    let clicked = resp.clicked();
+    resp.on_hover_text(tip);
+    clicked
 }
 
 // ---------------------------------------------------------------- 内容
