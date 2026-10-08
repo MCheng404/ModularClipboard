@@ -305,7 +305,16 @@ impl<'a> ChildWindow<'a> {
         // 客户区 0×0（最小化）时不能 acquire：交换链拿不到可呈现图像。
         let (cw, ch) = self.window.inner_size_physical();
         if cw == 0 || ch == 0 {
-            self.events.poll_for(Some(crate::multiwindow::CHILD_POLL_INTERVAL));
+            // ⚠️ 必须**非阻塞**（`None`）且排空积压。
+            //
+            // 早前这里用 `poll_for(Some(CHILD_POLL_INTERVAL))`：
+            // `poll_for` 带超时会真的睡等（`MsgWaitForMultipleObjects`），
+            // 于是**每个**最小化/0×0 的附属窗都会把主循环卡住 16ms——
+            // 窗口越多越卡，而且这段时间主窗口完全不响应。
+            //
+            // 主循环有自己的节奏控制，附属窗不该再睡一次。
+            self.events.poll_for(None);
+            self.events.take_pending();
             return Ok(());
         }
 

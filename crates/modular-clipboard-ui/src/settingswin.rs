@@ -43,8 +43,6 @@ pub struct SettingsWindow<'a> {
     was_open: bool,
     /// 收到关窗请求（标题栏 ✕）。
     close_requested: bool,
-    /// 客户区为 0（最小化）时跳过渲染，避免无意义地 acquire。
-    skip_frames: u32,
 }
 
 impl<'a> SettingsWindow<'a> {
@@ -90,7 +88,6 @@ impl<'a> SettingsWindow<'a> {
             ctx,
             was_open: false,
             close_requested: false,
-            skip_frames: 0,
         })
     }
 
@@ -108,12 +105,20 @@ impl<'a> SettingsWindow<'a> {
         let just_closed = self.was_open && !want_open;
         self.was_open = want_open;
 
-        // 隐藏态：只poll 消息、隐藏窗口，不渲染。
+        // 隐藏态：poll 消息、**排空**事件，不渲染。
         //
-        // ⚠️ 隐藏时**仍要 poll**：否则消息队列积压，下次打开会有一堆
-        // 过期的鼠标事件集中到达（表现为「一打开就误点」）。
+        // ⚠️ 两件事都要做，缺一不可：
+        //
+        // 1. `poll_for` —— 驱动窗口过程，让系统把窗口画出来/响应 resize；
+        // 2. `take_pending` —— **排空**积压的事件。
+        //
+        // 只做 1 不做 2（早前的写法）会让事件在 `EventLoop::pending`
+        // 里无限累积：窗口关闭期间的所有鼠标/键盘都堆着，下次刚打开
+        // 就一次性回放 ⇒ 界面「一闪就没」或「点齿轮没反应」。
+        // 这是最容易被误判成「窗口创建失败」的一类 bug。
         if !want_open {
-            self.events.poll_for(Some(crate::multiwindow::CHILD_POLL_INTERVAL));
+            self.events.poll_for(None);
+            self.events.take_pending();
             // `just_closed` 这一帧要把待处理的关窗请求清掉：它是
             // 「关闭瞬间」才收到的，若不清，下一次打开会立刻被判关闭。
             if just_closed {
@@ -126,19 +131,20 @@ impl<'a> SettingsWindow<'a> {
         if just_opened {
             crate::presence::focus_window(self.window.hwnd());
             // 新开时滚动归零：上次停在半截的设置项不该出现在顶部。
-            app.reset_settings_scroll();
+            //
+            // ⚠️ 必须用**本窗口的** `self.ctx`，不能用 `app.ctx`。
+            // `ScrollArea` 的滚动位置存在它所属 `Context` 的内存里，
+            // 清主窗口的 Context 对设置窗口毫无作用——早前就是这么
+            // 写的，等于没写。
+            self.ctx
+                .memory_mut(|m| m.data.remove::<egui::Id>(egui::Id::new("settings_scroll")));
         }
 
         // 客户区 0×0（最小化）时不能 acquire：交换链拿不到可呈现图像。
         let (cw, ch) = self.window.inner_size_physical();
         if cw == 0 || ch == 0 {
-            self.events.poll_for(Some(crate::multiwindow::CHILD_POLL_INTERVAL));
-            return Ok(false);
-        }
-        // 窗口刚创建时交换链可能还没跟上尺寸，给几帧恢复时间。
-        if self.skip_frames > 0 {
-            self.skip_frames -= 1;
-            self.events.poll_for(Some(crate::multiwindow::CHILD_POLL_INTERVAL));
+            self.events.poll_for(None);
+            self.events.take_pending();
             return Ok(false);
         }
 

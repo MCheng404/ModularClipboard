@@ -1015,16 +1015,6 @@ impl App {
         self.apply_ops();
     }
 
-    /// 设置窗口打开时把滚动位置归零。
-    ///
-    /// 由设置窗口在「刚打开」那一帧调用。不做的话，上次停在半截的
-    /// 设置项会出现在新一帧的顶部，用户以为漏看了上面的项。
-    pub fn reset_settings_scroll(&mut self) {
-        // `ScrollArea` 管的滚动位置存在 egui 的内存里，清掉它即可。
-        self.ctx
-            .memory_mut(|m| m.data.remove::<egui::Id>(egui::Id::new("settings_scroll")));
-    }
-
     /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。
     pub fn drag_regions(&self) -> &[egui::Rect] {
         // 新架构的拖动区由 `paint::draw_topbar` 每帧写入。
