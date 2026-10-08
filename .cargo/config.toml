@@ -7,6 +7,18 @@ target = "x86_64-pc-windows-msvc"
 [target.x86_64-pc-windows-msvc]
 # rusqlite bundled 会编译 sqlite3.c，交由 cc-rs 用 cl.exe 处理。
 # 链接器由 rustc 自带的 lld-link / link 处理，无需额外指定。
+#
+# ⚠️ `+crt-static`：把 MSVC C 运行时**静态**链进去。
+#
+# 默认是动态链接，于是产物依赖 `VCRUNTIME140.dll`——它只随
+# VS 运行时安装包分发。别人的机器上（尤其是没装开发环境的）
+# 双击 exe 会报「找不到 VCRUNTIME140.dll」。
+#
+# 静态链接后是**真正的单文件**：只需复制 exe 本身。
+# 实测导入表里其余 20 个 DLL（kernel32/user32/gdi32/shell32/
+# advapi32/oleaut32/imm32/dwmapi/ntdll/combase…）全是系统组件，
+# Windows 10+ 自带，无需附带。
+rustflags = ["-C", "target-feature=+crt-static"]
 
 [env]
 CC = { value = "cl.exe", force = false }

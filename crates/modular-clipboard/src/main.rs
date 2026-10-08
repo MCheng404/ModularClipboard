@@ -6,6 +6,16 @@
 //! 3. 初始化日志；
 //! 4. 启动界面与后台捕获。
 
+// GUI 子系统：不弹控制台窗口。
+//
+// ⚠️ 不加这一行，程序是 **console** 子系统 —— 从资源管理器双击
+// 也会附带一个黑底白字的 cmd 窗口，常驻程序一直挂着它非常突兀。
+//
+// 代价：没有 stdout/stderr 可写。所以日志必须落**文件**
+// （见 [`init_tracing`]），`--version` 之类要输出到控制台的路径
+// 得改走文件或MessageBox。
+#![windows_subsystem = "windows"]
+
 use std::path::{Path, PathBuf};
 
 use modular_clipboard_core::Config;
@@ -36,7 +46,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-capture" => args.no_capture = true,
             "-V" | "--version" => args.version = true,
             "-h" | "--help" => {
-                print_help();
+                show_message_box("模块化剪贴板 - 帮助", HELP_TEXT);
                 std::process::exit(0);
             }
             other => return Err(format!("未知参数: {other}")),
@@ -45,26 +55,57 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-fn print_help() {
-    println!(
-        "ModularClipboard 剪贴板管理器 {version}
+/// 帮助文本（同时用于弹窗内容）。
+///
+/// ⚠️ GUI 子系统没有 stdout，`println!` 什么都不会显示——
+/// 所以 `-h` 走 [`show_message_box`]。
+const HELP_TEXT: &str = "ModularClipboard 剪贴板管理器
 
 用法:
   modular-clipboard [选项]
 
 选项:
-      --data-dir <路径>   指定数据目录（默认 {data_dir}）
+      --data-dir <路径>   指定数据目录
       --no-capture         启动时不监听剪贴板（调试用）
   -V, --version           显示版本
-  -h, --help              显示帮助
-",
-        version = env!("CARGO_PKG_VERSION"),
-        // 从真实的目录常量派生，而不是硬编码字符串。
-        // 之前这里写的是「%APPDATA%/tiez」，而实现用的是
-        // 「modular-clipboard」——帮助文本与实际行为不符，
-        // 用户照着它找数据目录会找不到。
-        data_dir = modular_clipboard_ui::default_data_dir_display()
-    );
+  -h, --help              显示帮助";
+
+/// 弹一个消息框。
+///
+/// # 为什么需要它
+///
+/// 本程序是 [`windows_subsystem = "windows"]`]（GUI 子系统），
+/// **没有 stdout/stderr**。原先 `println!` / `eprintln!` 的所有
+/// 输出都会静默消失——用户双击程序看到「什么都没发生」，
+/// 连 `--version` 都看不到任何东西。
+///
+/// 用 `MessageBoxW` 是Win32 里最省事的做法：不需要额外依赖，
+/// 也能把错误真正送到用户眼前。
+fn show_message_box(title: &str, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MB_ICONERROR, MB_OK, MessageBoxW,
+    };
+    use windows::core::PCWSTR;
+
+    let t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let c: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(c.as_ptr()),
+            PCWSTR(t.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// 默认数据目录（未指定 `--data-dir` 时）。
+///
+/// 从 UI 层的展示字符串派生，保证与「帮助里写的路径」同源——
+/// 之前硬编码过 `%APPDATA%/tiez` 而实现用 `modular-clipboard`，
+/// 用户照着提示找目录会找不到。
+fn default_data_dir() -> PathBuf {
+    PathBuf::from(modular_clipboard_ui::default_data_dir_display())
 }
 
 fn config_path(data_dir: Option<&Path>) -> PathBuf {
@@ -108,14 +149,16 @@ fn main() {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("参数错误: {e}");
-            print_help();
+            show_message_box("参数错误", &format!("{e}\n\n{}", HELP_TEXT));
             std::process::exit(2);
         }
     };
 
     if args.version {
-        println!("modular-clipboard {}", env!("CARGO_PKG_VERSION"));
+        // ⚠️ GUI 子系统没有 stdout，`println!` 什么都不会显示。
+        // 所以版本信息弹窗——这是唯一能让用户看到它的途径。
+        // （从控制台启动调试时也弹窗，可接受。）
+        show_message_box("模块化剪贴板", &format!("版本 {}", env!("CARGO_PKG_VERSION")));
         return;
     }
 
@@ -149,12 +192,16 @@ fn main() {
         Ok(guard) => {
             // 保持 guard 存活到main 返回
             let _guard = guard;
-            init_tracing();
+            // 日志落在数据目录里（GUI 程序无 stderr可用）。
+            let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+            init_tracing(&log_dir.join("app.log"));
             run_app(args, data_dir);
             return;
         }
         Err(e) => {
-            eprintln!("已有实例在运行（{e}），本次启动退出");
+            // GUI 程序没有 stderr，且这属于**用户可见**的失败
+            // （双击图标却什么都没发生），必须弹窗告知。
+            show_message_box("模块化剪贴板", &format!("已有实例在运行，本次启动退出。\n\n{e}"));
             std::process::exit(3);
         }
     }
@@ -191,17 +238,45 @@ fn run_app(args: Args, data_dir: Option<PathBuf>) {
 
 /// 初始化日志。默认只输出警告级别，避免常驻程序刷屏；
 /// 可用 `RUST_LOG=debug` 环境变量覆盖。
-fn init_tracing() {
+///
+/// # 为什么写文件而不是 stderr
+///
+/// 本程序是 [`windows_subsystem = "windows"]`]（GUI 子系统），
+/// **没有可用的 stderr**——写过去要么失败要么丢弃。
+/// 而常驻程序恰恰最需要日志：用户报「托盘没了」时唯一能查的就是它。
+///
+/// 落盘位置：`{数据目录}/app.log`。启动时截断（每次启动一个新文件，
+/// 免得无限增长）；打开失败则退回 stderr（控制台调试时仍可用）。
+fn init_tracing(log_path: &Path) {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_env("RUST_LOG")
         .unwrap_or_else(|_| EnvFilter::new("warn,modular_clipboard=info"));
 
-    let init = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path);
 
-    // 无控制台（如 GUI 程序从资源管理器启动）时忽略错误即可。
+    let init = match file {
+        Ok(f) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            // GUI 程序里 ANSI 转义序列是乱码，必须关掉。
+            .with_writer(f),
+        Err(e) => {
+            // 文件打不开（比如目录不存在）时退回 stderr：
+            // 从控制台启动调试时仍能看到日志。
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .try_init();
+            eprintln!("[警告] 无法打开日志文件 {}：{e}", log_path.display());
+            return;
+        }
+    };
     let _ = init.try_init();
 }
 

@@ -34,7 +34,9 @@ UI 渲染端到端验证：在多个窗口宽度下截图，并用**像素判据
 param(
   [int[]]$Widths = @(420, 560, 720, 900),
   [int]$Height = 800,
-  [string]$OutDir = 'D:\WorkBuddy\Tiez'
+  [string]$OutDir = 'D:\WorkBuddy\Tiez',
+  # 打开设置面板再截图。它平时是覆盖层，不点齿轮按钮拍不到。
+  [switch]$Settings
 )
 
 $ErrorActionPreference = 'Continue'
@@ -59,6 +61,7 @@ public static class V {
   [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int ht, bool repaint);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
@@ -91,6 +94,8 @@ $err = "$OutDir\verify-render.err"
 Remove-Item $err -ErrorAction SilentlyContinue
 $env:RUST_LOG = 'info,modular_clipboard=debug'
 $env:MC_DIAG = '1'
+# `-Settings` 开关：把设置面板打开后截图（它平时是覆盖层，拍不到）。
+if ($Settings) { $env:MC_SETTINGS = '1' } else { Remove-Item Env:\MC_SETTINGS -ErrorAction SilentlyContinue }
 $p = Start-Process -FilePath $exe -ArgumentList '--no-capture' -PassThru `
   -RedirectStandardOutput "$OutDir\verify-render.log" -RedirectStandardError $err
 Start-Sleep -Seconds 4
@@ -119,18 +124,33 @@ if ($main -eq [IntPtr]::Zero) {
 }
 
 # 屏幕右下角实测是唯一稳定的空白区（(0,0) 与 (120,120) 常被浏览器/终端占据）。
-$screenW = 2560; $screenH = 1600
-$mX = $screenW - 900 - 60
-$mY = $screenH - $Height - 160
+# ⚠️ 屏幕尺寸必须**动态查询**，不能写死。
+#
+# 原先硬编码 2560x1600，换台显示器（或改缩放）就会把窗口放到
+# 屏幕外，`CopyFromScreen` 抓到的就是别的窗口 —— 表现为
+# 「截图内容与程序无关」且极难排查。
+Add-Type -AssemblyName System.Windows.Forms
+$screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+$screenW = $screen.Width; $screenH = $screen.Height
+
+# 设置面板要能看到全部分组项，窗口得够高。
+$shotH = if ($Settings) { [Math]::Min(1000, $screenH - 200) } else { $Height }
+$mX = [Math]::Max(0, $screenW - 900 - 60)
+$mY = [Math]::Max(0, $screenH - $shotH - 120)
 
 $fail = 0
 $skip = 0
 foreach ($w in $Widths) {
-  [void][V]::MoveWindow($main, $mX, $mY, $w, $Height, $true)
-  Start-Sleep -Milliseconds 500
+  [void][V]::MoveWindow($main, $mX, $mY, $w, $shotH, $true)
   [void][V]::BringWindowToTop($main)
   [void][V]::SetForegroundWindow($main)
-  Start-Sleep -Milliseconds 600
+  # ⚠️ 移动/改尺寸后必须给程序**充分时间**处理完，否则拍到旧布局。
+  #
+  # 程序侧要连走几步：收 WM_SIZE → 重建 Vulkan 交换链 →
+  # 下一帧 egui 才拿到新的 `screen_rect` → 按新尺寸重算布局。
+  # 500~600ms 在本机够用，但窗口很大时重建更慢——统一给 1.2s。
+  # 症状对照：拍到「面板偏在一侧、内容按旧客户区居中」。
+  Start-Sleep -Milliseconds 1200
 
   $rc = New-Object V+RECT
   [void][V]::GetClientRect($main, [ref]$rc)
@@ -143,7 +163,18 @@ foreach ($w in $Widths) {
 
   $bmp = New-Object System.Drawing.Bitmap $cw, $ch
   $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-  $gfx.CopyFromScreen($pt.X, $pt.Y, 0, 0, (New-Object System.Drawing.Size($cw, $ch)))
+  # ⚠️ 用 `PrintWindow` 而不是 `CopyFromScreen`。
+  #
+  # `CopyFromScreen` 抓的是**屏幕像素**，所以结果取决于「那一刻谁的
+  # 像素在这个矩形里」。程序开了 `always_on_top` 时，它压过任何窗口；
+  # 若脚本先把别的窗口放到前面，抓到的就是那个窗口——
+  # 表现为「截图内容与程序完全无关」，且极易误判成程序没渲染。
+  #
+  # `PrintWindow` 直接让窗口**自己绘制到 DC**，与遮挡、置顶、
+  # 前台焦点全都无关。Vulkan 直写的窗口需要 `PW_RENDERFULLCONTENT`
+  // （flag = 2）才能抓到内容，否则得到全黑。
+  [void][V]::PrintWindow($main, $gfx.GetHdc(), 2)
+  $gfx.ReleaseHdc()
   $png = "$OutDir\shot-w$w.png"
   $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
   $gfx.Dispose(); $bmp.Dispose()
@@ -218,7 +249,7 @@ foreach ($w in $Widths) {
   $coverY = if ($ch -gt 0) { $boxH / $ch } else { 0 }
 
   Write-Host "=========================================================="
-  Write-Host ("窗口 {0}x{1}  客户区(物理) {2}x{3}  DPI={4} scale={5}" -f $w, $Height, $cw, $ch, $dpi, $scale)
+  Write-Host ("窗口 {0}x{1}  客户区(物理) {2}x{3}  DPI={4} scale={5}" -f $w, $shotH, $cw, $ch, $dpi, $scale)
   Write-Host ("暗像素占比 {0:P2}（判「是否被遮挡」）" -f $darkRatio)
   Write-Host ("内容包围盒: x {0}..{1}  y {2}..{3}  ({4}x{5})" -f $minX, $maxX, $minY, $maxY, $boxW, $boxH)
   Write-Host ("横向覆盖 {0:P1}  纵向覆盖 {1:P1}  墨迹像素比 {2:P1}" -f $coverX, $coverY, $ratio)

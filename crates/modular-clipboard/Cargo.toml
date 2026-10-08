@@ -23,4 +23,7 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    # `MessageBoxW`：GUI 子系统没有 stdout/stderr，
+    # `--version` / `--help` / 启动失败只能靠它告知用户。
+    "Win32_UI_WindowsAndMessaging",
 ] }
