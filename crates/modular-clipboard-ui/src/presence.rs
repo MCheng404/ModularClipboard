@@ -23,8 +23,10 @@ use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowPos,
     ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SW_HIDE, SW_MINIMIZE,
-    SW_RESTORE,
+    SW_RESTORE, IDC_ARROW, IDC_IBEAM, IDC_HAND,
 };
+use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor};
 
 /// 窗口隐藏时的轮询间隔。
 ///
@@ -265,6 +267,57 @@ pub fn hide_window(hwnd: HWND) {
 ///
 /// 无边框窗口（`WS_POPUP`）同样可以最小化：最小化是窗口管理器提供
 /// 的行为，与有没有系统标题栏无关。
+/// 按 egui 给出的光标形状设置鼠标指针。
+///
+/// egui 的 `PlatformOutput::cursor_icon` 早前被整个丢弃
+/// （`run_ui` 的返回值只取了 `shapes` / `textures_delta` / `ppp`），
+/// 于是**光标永远是默认箭头**——在搜索框上、在可点条目上、在文本上
+/// 全都一模一样，「这里能点」没有任何视觉提示。
+///
+/// 只在**形状变化时**才调 `SetCursor`：它是 Win32 全局状态，
+/// 每帧设一次既无必要也会和别的窗口抢光标。
+pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // 上一次设置的光标。0 = 从未设过。
+    static LAST: AtomicU32 = AtomicU32::new(0);
+
+    // egui 0.36 的变体名与旧版不同：手型是 `PointingHand`（不是 `Pointer`），
+    // 且**没有** `Resize*` 系列 —— 缩放光标由 `WM_NCHITTEST` + 系统
+    // 默认处理，不走这里。
+    let code: u16 = match icon {
+        // IDC_* 在 windows crate 里是 PCWSTR 常量，这里要裸的u16 资源 ID。
+        egui::CursorIcon::Default => IDC_ARROW.0 as u16,
+        egui::CursorIcon::Text | egui::CursorIcon::VerticalText => IDC_IBEAM.0 as u16,
+        egui::CursorIcon::PointingHand => IDC_HAND.0 as u16,
+        egui::CursorIcon::Help
+        | egui::CursorIcon::ContextMenu
+        | egui::CursorIcon::Alias
+        | egui::CursorIcon::Copy
+        | egui::CursorIcon::Move
+        | egui::CursorIcon::Cell
+        | egui::CursorIcon::Crosshair
+        | egui::CursorIcon::Grab
+        | egui::CursorIcon::Grabbing => IDC_ARROW.0 as u16,
+        // 其余（None / Progress / Wait / NoDrop / NotAllowed）本项目
+        // 不会产生，一律退回默认箭头。
+        _ => IDC_ARROW.0 as u16,
+    };
+    let key = code as u32;
+    if LAST.swap(key, Ordering::Relaxed) == key {
+        return;
+    }
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return;
+    }
+    // SAFETY: IDC_* 是系统预定义的光标资源 ID，`LoadCursorW` 返回的
+    // 句柄由系统持有、不需要销毁。
+    unsafe {
+        if let Ok(h) = LoadCursorW(None, PCWSTR(code as *const u16)) {
+            let _ = SetCursor(Some(h));
+        }
+    }
+}
+
 /// 设置/取消窗口置顶。
 ///
 /// 用 `SetWindowPos` 改扩展样式里的 `WS_EX_TOPMOST`。**不能**用

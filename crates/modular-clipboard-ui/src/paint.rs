@@ -98,6 +98,13 @@ pub enum Op {
     ToggleSettings,
     /// 清空全部历史。
     ClearAll,
+    /// 退出程序。
+    ///
+    /// ⚠️ 早前 UI 层**没有任何退出入口**：`App::should_quit` 这个字段
+    /// 存在、有初始化、有消费点、有 getter，但**全仓没有任何地方把它
+    /// 置成 true**。于是设置窗口里没有「退出程序」按钮，而标题栏 ✕
+    /// 在有托盘时只隐藏到托盘 —— 用户从界面里根本无法退出程序。
+    Quit,
     /// 关闭按钮 ⇒ 隐藏到托盘。
     ///
     /// ⚠️ 语义是「隐藏」不是「退出」：剪贴板类工具直接退出会让
@@ -936,6 +943,28 @@ fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
             field: "cleanup_on_start",
             value: cleanup,
         });
+    }
+
+    // ---- 危险操作 -------------------------------------------------------
+    //
+    // 放在最后并与配置项明显区分：这是**唯一**能从界面退出程序的地方
+    // （标题栏 ✕ 在有托盘时只隐藏到托盘）。
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(4.0);
+    let quit_resp = ui.add_sized(
+        [ui.available_width(), 30.0],
+        egui::Button::new(
+            egui::RichText::new("退出程序")
+                .color(pal.danger)
+                .strong()
+                .size(pal.font_md),
+        ),
+    );
+    // 自报热区供测试定位（见 `UiState::hit` 的说明）。
+    f.state.hit.insert("settings_quit", quit_resp.rect);
+    if quit_resp.clicked() {
+        f.state.push(Op::Quit);
     }
 
     let _ = pal;
@@ -2405,6 +2434,40 @@ fn with_pinned(mut self, n: usize) -> Self {
             hist.rect.width() > 40.0,
             "窄窗口下历史栏宽度应仍可用（不折叠成把手），实际={:?}",
             hist.rect
+        );
+    }
+
+    /// 设置面板里的「退出程序」按钮 ⇒ 产生 `Op::Quit`。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// `App::should_quit` 这个字段存在、有初始化、有消费点、有 getter，
+    /// 但**全仓没有任何地方把它置成 true** —— 于是设置窗口里没有任何
+    /// 退出入口，而标题栏 ✕ 在有托盘时只隐藏到托盘。用户从界面里
+    /// 根本无法退出程序，只能去托盘菜单。
+    ///
+    /// 死字段的特征：每个单点都「看得出是实现了」，合起来却没人用。
+    #[test]
+    fn settings_has_a_quit_button_that_emits_quit_op() {
+        let mut h = Harness::new("settings-quit", vec2(600.0, 900.0));
+        h.state.show_settings = true;
+        h.settings_frame();
+
+        let rect = h
+            .state
+            .hit
+            .get("settings_quit")
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "设置面板应登记「退出程序」按钮热区，实际热区={:?}",
+                    h.state.hit.keys().collect::<Vec<_>>()
+                )
+            });
+        let ops = h.settings_click_at(rect.center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::Quit)),
+            "点「退出程序」应产生 Op::Quit，实际={ops:?}"
         );
     }
 

@@ -442,6 +442,32 @@ pub fn run_with_options(
             app.draw_frame(ui);
         });
         let ppp = output.pixels_per_point;
+
+        // ---- 2.1 消费 PlatformOutput ----------------------------------
+        //
+        // ⚠️ 早前 `run_ui` 的返回值只取了 `shapes` / `textures_delta` /
+        // `ppp`，`platform_output` 整个被丢弃 —— 于是**光标永远是默认
+        // 箭头**，在搜索框上、在可点条目上毫无区别，「这里能点」没有
+        // 任何视觉提示。
+        presence::set_cursor_icon(window.hwnd(), output.platform_output.cursor_icon);
+
+        // ⚠️ `OutputCommand::CopyText`（egui 里 Ctrl+C 复制选中文本）
+        // **故意不接**，说明如下。
+        //
+        // 接线本身很简单（`ClipboardReader::write_text` 已在
+        // `Service::copy_item` 里用着），但**本程序会自己监听剪贴板**：
+        // 写进去的内容会触发自己的捕获钩子，于是「在搜索框里选中几个字
+        // 按 Ctrl+C」会**多出一条历史记录**。
+        //
+        // capture 层目前**没有自写防护**——既没有「忽略自己刚写的内容」
+        // 的时间窗，也没有内容比对。要接就必须先补那层防护，否则回环。
+        //
+        // 宁可功能缺失，也不要让用户每按一次 Ctrl+C 就多一条垃圾记录。
+        for cmd in &output.platform_output.commands {
+            if let egui::OutputCommand::CopyText(t) = cmd {
+                tracing::debug!(len = t.len(), "收到 CopyText，未接线：需先给 capture 层加自写防护");
+            }
+        }
         // 在移动 output.shapes 之前先把重绘延时取出来。
         let delay = crate::renderer::repaint_delay(&output);
 
@@ -1000,10 +1026,14 @@ impl App {
         // 绘制层只识别操作、不改布局：统一在这里落到工作区与服务上。
         self.apply_ops();
 
-        if self.should_quit {
-            self.svc.stop_capture();
-            let _ = self.svc.save_config();
-        }
+        // ⚠️ 这里**不要**写「`should_quit` 时停捕获并存配置」——
+        // 那属于退出流程，而 `shutdown()` 已经做了同样的两件事。
+        // 放在绘制函数里意味着只要标志为真就**每帧重复**
+        // `save_config()`（一次全量 JSON 序列化写盘）。
+        //
+        // 早前这段因为 `should_quit` 从没被置真而从不执行，
+        // 所以看不出来；接上退出按钮后它就成了真实的性能问题。
+        // 退出收尾统一由帧循环退出后的 `App::shutdown()` 负责。
     }
 
     /// 把绘制层收集到的操作落到工作区与服务上。
@@ -1054,6 +1084,15 @@ impl App {
                     if let Err(e) = self.svc.clear_all() {
                         self.svc.notify(format!("清空失败: {e}"));
                     }
+                }
+                Op::Quit => {
+                    // 只**置标志**，真正退出由帧循环消费。
+                    //
+                    // ⚠️ 不能在这里直接 `std::process::exit`：那会跳过
+                    // 收尾（停捕获、`save_config`、销毁 Vulkan 设备、
+                    // 托盘 `shutdown`），配置里的改动会丢。
+                    tracing::info!("设置界面请求退出程序");
+                    self.should_quit = true;
                 }
                 // 窗口级按钮只**置标志**，由帧循环消费。
                 //
