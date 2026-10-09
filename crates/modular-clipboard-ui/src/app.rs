@@ -195,6 +195,9 @@ pub fn run_with_options(
     // ⚠️ 必须在 `App::new(config, …)` **之前**取字体路径：那之后
     // `config` 就被移动进 `App` 了。
     let font_path = config.ui.font_path.clone();
+    // ⚠️ 启动期要用的配置必须在这里取：`config` 下一行就被移动进 `App`。
+    let start_minimized = config.ui.start_minimized;
+    let always_on_top = config.ui.always_on_top;
     let shared =
         crate::multiwindow::SharedGfx::create(&gpu)?.with_font_path(font_path.as_deref());
 
@@ -239,9 +242,36 @@ pub fn run_with_options(
         None
     };
 
+    // ---- 启动期窗口开关 ------------------------------------------------
+    //
+    // 这两个配置项早前只被**写入**、从不被读取：用户在设置里改了、
+    // 也落盘了，重启后毫无效果。
+    //
+    // ⚠️ 必须放在托盘创建**之后**：`start_minimized` 的语义是
+    // 「启动后隐藏到托盘」，而若托盘没起来还把窗口藏掉，程序就成了
+    // 「没有窗口、没有托盘」的僵尸——用户只看到进程在，却什么都
+    // 点不到。宁可退回「正常显示」。
+    if always_on_top {
+        presence::set_topmost(window.hwnd(), true);
+    }
+    if start_minimized {
+        if resident.is_some() {
+            // 不是 `SW_MINIMIZE`：那只是「最小化」，窗口仍在任务栏留
+            // 条目、也能被 Alt+Tab 切回，与「隐藏到托盘」不符。
+            // 直接 `SW_HIDE`，托盘是唯一入口。
+            presence::hide_window(window.hwnd());
+            tracing::info!("配置 start_minimized：启动后隐藏到托盘");
+        } else {
+            tracing::warn!("配置要求启动时隐藏，但托盘不可用——改为正常显示，否则程序无法唤回");
+        }
+    }
+
     // ---- 帧循环 --------------------------------------------------------
     let mut frame_no: u64 = 0;
     let mut quit = false;
+    // 已应用到 Win32 的置顶状态。用来每帧比对配置，避免重复调
+    // `SetWindowPos`（那会触发一次窗口样式变更）。
+    let mut applied_topmost = always_on_top;
     // 卡片子窗口集合（详情/视图等被拖出主窗的卡片）。
     let mut children = crate::childwin::ChildWindows::new();
     // 设置窗口（懒创建）。
@@ -565,6 +595,18 @@ pub fn run_with_options(
 
         if app.should_quit {
             quit = true;
+        }
+
+        // ---- 4.4 窗口置顶状态同步 ----
+        //
+        // `always_on_top` 能在设置里随时改，而 Win32 的置顶是**窗口属性**，
+        // 不会因为配置变了自己变。每帧比对一次，改了就调 `SetWindowPos`。
+        //
+        // 用 `applied_topmost` 记住已应用的值，避免每帧都调
+        // `SetWindowPos`（那会触发一次窗口样式变更）。
+        if app.svc.state.config.ui.always_on_top != applied_topmost {
+            applied_topmost = app.svc.state.config.ui.always_on_top;
+            presence::set_topmost(window.hwnd(), applied_topmost);
         }
 
         // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口）----

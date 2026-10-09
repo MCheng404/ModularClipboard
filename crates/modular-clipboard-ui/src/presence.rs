@@ -21,8 +21,9 @@ use modular_clipboard_platform::tray::{self, TrayEvent};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, ShowWindow,
-    SW_HIDE, SW_MINIMIZE, SW_RESTORE,
+    GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowPos,
+    ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SW_HIDE, SW_MINIMIZE,
+    SW_RESTORE,
 };
 
 /// 窗口隐藏时的轮询间隔。
@@ -264,6 +265,37 @@ pub fn hide_window(hwnd: HWND) {
 ///
 /// 无边框窗口（`WS_POPUP`）同样可以最小化：最小化是窗口管理器提供
 /// 的行为，与有没有系统标题栏无关。
+/// 设置/取消窗口置顶。
+///
+/// 用 `SetWindowPos` 改扩展样式里的 `WS_EX_TOPMOST`。**不能**用
+/// `HWND_TOPMOST` 常量直接替换 `hwnd` 参数——那会同时改 Z 序，
+/// 在无边框窗口上会让 resize 行为出现异常。
+pub fn set_topmost(hwnd: HWND, on: bool) {
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        tracing::warn!("设置置顶失败：主窗口句柄已失效");
+        return;
+    }
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED;
+    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    // SAFETY: hwnd 已由上面的 IsWindow 校验；flags 只改 Z 序不改位置尺寸。
+    let ok = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(after),
+            0,
+            0,
+            0,
+            0,
+            flags,
+        )
+    };
+    if ok.is_ok() {
+        tracing::info!(置顶 = on, "窗口置顶状态已更新");
+    } else {
+        tracing::warn!(置顶 = on, "SetWindowPos 失败");
+    }
+}
+
 pub fn minimize_window(hwnd: HWND) {
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         tracing::warn!("最小化失败：主窗口句柄已失效");

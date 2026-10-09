@@ -86,7 +86,17 @@ impl Workspace {
         self.cards
             .iter()
             .find(|c| c.kind == CardKind::Pinned)
-            .is_some_and(|c| c.host == CardHost::Docked)
+            .is_some_and(|c| {
+                // ⚠️ 必须同时看 `pinned_mode`。
+                //
+                // 早前这里只判 `host == Docked`，于是用户在设置里选
+                // 「独立分栏」（`OwnCard`）→ `set_pinned_mode` 写入成功、
+                // 按钮选中态也变了 → 但下一帧 solver 仍把置顶算成 0 宽、
+                // paint 仍走内嵌分支 ⇒ **这个开关完全无效**。
+                //
+                // 两个条件都满足才算内嵌：停靠着 **且** 选了共用单栏。
+                c.host == CardHost::Docked && c.pinned_mode == PinnedMode::SharedColumn
+            })
     }
 
     /// 把配置里持久化的窗口位置写回卡片。
@@ -548,5 +558,57 @@ mod tests {
         assert_eq!(ws.pinned_mode(), PinnedMode::SharedColumn, "默认共用单栏");
         assert!(ws.set_pinned_mode(PinnedMode::OwnCard));
         assert_eq!(ws.pinned_mode(), PinnedMode::OwnCard);
+    }
+
+    /// 「独立分栏」必须**真的改变布局**。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// 原先 `pinned_mode_round_trips` 只验证「写进去能读回来」，
+    /// 于是「这个开关有没有人读」完全没被测到—— 而
+    /// `pinned_is_embedded()` 恰恰**从不读 `pinned_mode`**，
+    /// 只判 `host == Docked`。结果是设置里选「独立分栏」、
+    /// 按钮选中态也变了、配置也落盘了，但布局一帧都不动。
+    ///
+    /// 这类「存了但没人用」的字段最容易蒙混过关：写和读都对，
+    /// 只是中间没人用。
+    #[test]
+    fn own_card_mode_actually_changes_the_layout() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 533.33));
+
+        // 默认（共用单栏）：置顶内嵌 ⇒ 布局宽度 0。
+        let mut ws = Workspace::default();
+        assert!(
+            ws.pinned_is_embedded(),
+            "默认应为内嵌（置顶画在历史栏顶部）"
+        );
+        let sol = crate::solver::solve(&ws, area);
+        let pinned_idx = ws
+            .cards
+            .iter()
+            .position(|c| c.kind == CardKind::Pinned)
+            .expect("默认工作区含置顶卡片");
+        assert_eq!(
+            sol.rects[pinned_idx].width(),
+            0.0,
+            "内嵌时置顶不应占独立列"
+        );
+
+        // 切到「独立分栏」：必须拿到自己的列。
+        assert!(ws.set_pinned_mode(PinnedMode::OwnCard));
+        assert!(
+            !ws.pinned_is_embedded(),
+            "选了独立分栏后就不该再判定为内嵌"
+        );
+        let sol = crate::solver::solve(&ws, area);
+        assert!(
+            sol.rects[pinned_idx].width() > 0.0,
+            "选了独立分栏后置顶必须占独立列（实际宽度 {}）——              这说明 `pinned_is_embedded()` 又没读 `pinned_mode`",
+            sol.rects[pinned_idx].width()
+        );
+
+        // 切回来必须复原，避免留下不可逆的状态。
+        assert!(ws.set_pinned_mode(PinnedMode::SharedColumn));
+        assert!(ws.pinned_is_embedded(), "切回共用单栏应恢复内嵌");
     }
 }
