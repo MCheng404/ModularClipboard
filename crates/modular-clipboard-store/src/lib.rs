@@ -232,15 +232,18 @@ impl Store {
 
     // ---------- 条目写入 ----------
 
-    /// 查找指定指纹在时间窗口内的未置顶条目。
-    pub fn find_recent_by_hash(&self, hash: &str, window_secs: i64) -> Result<Option<EntryId>> {
-        let cutoff = now_ms() - window_secs * 1000;
+    /// 查找指定指纹对应的**未置顶**条目（按时间倒序取最新一条）。
+    ///
+    /// 全局查找、不设时间窗口：无论隔了多久再次复制相同内容，
+    /// 都视为重复（不新增、只置顶更新时间）。窗口语义已被全局去重
+    /// 取代——剪贴板管理器对「复制同一段内容」的期望就是只留一条。
+    pub fn find_by_hash(&self, hash: &str) -> Result<Option<EntryId>> {
         let id = self
             .conn
             .query_row(
-                "SELECT id FROM items WHERE hash = ?1 AND pinned = 0 AND created_at >= ?2
+                "SELECT id FROM items WHERE hash = ?1 AND pinned = 0
                  ORDER BY created_at DESC LIMIT 1",
-                params![hash, cutoff],
+                params![hash],
                 |r| r.get::<_, EntryId>(0),
             )
             .optional()?;
@@ -942,6 +945,42 @@ mod tests {
         assert_eq!(loaded.preview, "hello world");
         assert_eq!(loaded.kind, ClipKind::Text);
         assert_eq!(store.load_payload(&loaded).unwrap(), b"hello world");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 全局去重：同一哈希无论隔了多久再次出现都命中（取最新未置顶条目）。
+    ///
+    /// 早期实现带 3 秒窗口（`dedup_window_secs`），隔几秒的重复复制
+    /// 仍会新增一条；全局查找后相同内容永远只保留一条记录。
+    #[test]
+    fn find_by_hash_finds_latest_unpinned() {
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1024 * 1024);
+
+        // 同一哈希插入两条（时间不同）→ 全局查找命中最新一条。
+        let a = ClipItem::new(ClipKind::Text, "same-hash".into(), "first".into(), "app".into());
+        store.insert(a, b"first".to_vec()).unwrap();
+        let b = ClipItem::new(ClipKind::Text, "same-hash".into(), "second".into(), "app".into());
+        let saved_b = store.insert(b, b"second".to_vec()).unwrap();
+        assert_eq!(
+            store.find_by_hash("same-hash").unwrap(),
+            Some(saved_b.id),
+            "重复复制应命中最新那条，而不是 None（窗口外也生效）"
+        );
+
+        // 置顶条目不参与去重：用户手动置顶的旧内容不能被吞掉。
+        let mut c = ClipItem::new(ClipKind::Text, "same-hash".into(), "pinned".into(), "app".into());
+        c.pinned = true;
+        let saved_c = store.insert(c, b"pinned".to_vec()).unwrap();
+        assert_ne!(
+            store.find_by_hash("same-hash").unwrap(),
+            Some(saved_c.id),
+            "置顶条目不应被去重逻辑命中"
+        );
+
+        // 不存在的哈希返回 None。
+        assert_eq!(store.find_by_hash("nope").unwrap(), None);
 
         let _ = std::fs::remove_dir_all(base);
     }

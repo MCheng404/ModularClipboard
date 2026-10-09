@@ -45,6 +45,8 @@ pub struct SettingsWindow<'a> {
     was_open: bool,
     /// 收到关窗请求（标题栏 ✕）。
     close_requested: bool,
+    /// 已应用到 Win32 的置顶状态（幂等去重，见 [`Self::apply_topmost`]）。
+    topmost: bool,
 }
 
 impl<'a> SettingsWindow<'a> {
@@ -91,7 +93,19 @@ impl<'a> SettingsWindow<'a> {
             ctx,
             was_open: false,
             close_requested: false,
+            topmost: false,
         })
+    }
+
+    /// 应用置顶状态。幂等：状态没变就不调 `SetWindowPos`。
+    ///
+    /// 主窗口开着「总是置顶」时设置窗口必须跟着置顶，否则切走焦点后
+    /// 设置窗口会被置顶的主窗口或其它置顶窗口压到下面。
+    pub fn apply_topmost(&mut self, on: bool) {
+        if self.topmost != on {
+            self.topmost = on;
+            crate::presence::set_topmost(self.window.hwnd(), on);
+        }
     }
 
     /// 按 `want_open` 显示/隐藏，并在需要时绘制一帧。
@@ -132,6 +146,9 @@ impl<'a> SettingsWindow<'a> {
         }
 
         if just_opened {
+            // 先确保 Z 序在置顶组最上（即使抢焦点失败也不被主窗口遮），
+            // 再尝试把前台焦点给设置窗口。
+            crate::presence::raise_to_top(self.window.hwnd());
             crate::presence::focus_window(self.window.hwnd());
             // 新开时滚动归零：上次停在半截的设置项不该出现在顶部。
             //
@@ -143,6 +160,27 @@ impl<'a> SettingsWindow<'a> {
                 .memory_mut(|m| m.data.remove::<egui::Id>(egui::Id::new("settings_scroll")));
         }
 
+        // 设置窗口的拖动区：客户区顶部标题行（逻辑点、客户区坐标系）。
+        //
+        // 无边框窗口没有系统标题栏，**不设拖动区就无法拖动窗口**；
+        // 主窗口的拖动区由 `app.drag_regions()` 每帧上报，设置窗口
+        // 没有等价入口，必须在这里自己设。挖空右上角一块给关闭按钮，
+        // 否则它会被系统判成 `HTCAPTION`，点击变拖动、按钮点不动。
+        //
+        // 每帧调用：`set_drag_regions` 只改内存里的小 Vec，无系统调用；
+        // 只在创建时设一次的话，窗口 resize 后矩形就对不上了。
+        let (cw, ch) = self.window.inner_size_points();
+        let title_h = 44.0f32;
+        let close_zone_w = 40.0f32;
+        if cw > close_zone_w && ch > 0.0 {
+            self.window.set_drag_region(Some(egui::Rect::from_min_max(
+                egui::pos2(0.0, 0.0),
+                egui::pos2(cw - close_zone_w, title_h.min(ch)),
+            )));
+        } else {
+            self.window.set_drag_region(None);
+        }
+
         // 客户区 0×0（最小化）时不能 acquire：交换链拿不到可呈现图像。
         let (cw, ch) = self.window.inner_size_physical();
         if cw == 0 || ch == 0 {
@@ -151,7 +189,17 @@ impl<'a> SettingsWindow<'a> {
             return Ok(false);
         }
 
-        let frame_events = self.events.take_pending();
+        let frame_events = {
+            // ⚠️ 显示态也必须先 `poll_for` 再 `take_pending`。
+            //
+            // `poll_for`（含 `poll`）是**唯一**把消息从系统队列泵进
+            // `EventLoop::pending` 的入口；只调 `take_pending()` 会拿到
+            // 恒空的缓冲——本窗口的鼠标/键盘消息一直堆在系统队列里，
+            // 拖动、滚动、点击全部无效（9ddba86 只修了隐藏态与 0×0 态，
+            // 显示态从创建起就缺这一步，设置窗口「画出来了但点不动」）。
+            self.events.poll_for(None);
+            self.events.take_pending()
+        };
         if frame_events.iter().any(|e| matches!(e, WindowEvent::CloseRequested)) {
             self.close_requested = true;
         }
@@ -190,6 +238,15 @@ impl<'a> SettingsWindow<'a> {
         // 「未应用的 delta 必须先clear」，否则 panic 且报错与真实
         // 原因毫无关系。
         textures_delta.clear();
+
+        // ⚠️ 这里**不能**做任何周期性的 `SetWindowPos(HWND_TOPMOST)`
+        // 提升：置顶窗口之间按激活顺序排 Z 序，用户点击主窗口后主
+        // 窗口在上是 Windows 标准行为（用户主动切走）；每 1 秒把本
+        // 窗口强提回顶会**持续抢焦点**——主窗口操作（搜索、列表）
+        // 被反复打断，任务栏/输入法跟随抖动。
+        //
+        // 打开瞬间的 `raise_to_top`（just_opened 分支）已保证不被遮；
+        // 之后用户想回设置窗口，点击它可见部分即可（激活自动到顶）。
 
         let requested = self.close_requested;
         self.close_requested = false;

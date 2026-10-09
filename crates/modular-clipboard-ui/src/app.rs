@@ -531,6 +531,7 @@ pub fn run_with_options(
             events.poll_for(Some(presence::HIDDEN_POLL_INTERVAL));
             // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
             // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
+            let topmost = app.svc.state.config.ui.always_on_top;
             drive_attach_windows(
                 &mut app,
                 &mut children,
@@ -538,6 +539,7 @@ pub fn run_with_options(
                 &shared,
                 &window,
                 frame_no,
+                topmost,
             );
             continue;
         }
@@ -571,6 +573,7 @@ pub fn run_with_options(
             events.poll_for(Some(std::time::Duration::from_millis(50)));
             // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
             // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
+            let topmost = app.svc.state.config.ui.always_on_top;
             drive_attach_windows(
                 &mut app,
                 &mut children,
@@ -578,6 +581,7 @@ pub fn run_with_options(
                 &shared,
                 &window,
                 frame_no,
+                topmost,
             );
             continue;
         }
@@ -600,6 +604,7 @@ pub fn run_with_options(
             tracing::debug!("acquire 返回过期，已重建交换链");
             // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
             // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
+            let topmost = app.svc.state.config.ui.always_on_top;
             drive_attach_windows(
                 &mut app,
                 &mut children,
@@ -607,6 +612,7 @@ pub fn run_with_options(
                 &shared,
                 &window,
                 frame_no,
+                topmost,
             );
             continue;
         };
@@ -636,6 +642,7 @@ pub fn run_with_options(
         }
 
         // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口）----
+        let topmost = app.svc.state.config.ui.always_on_top;
         drive_attach_windows(
             &mut app,
             &mut children,
@@ -643,6 +650,7 @@ pub fn run_with_options(
             &shared,
             &window,
             frame_no,
+            topmost,
         );
 
         frame_no += 1;
@@ -752,8 +760,9 @@ fn drive_attach_windows<'a>(
     shared: &crate::multiwindow::SharedGfx<'a>,
     window: &Window,
     frame_no: u64,
+    topmost: bool,
 ) {
-// 卡片子窗口
+    // 卡片子窗口
     //
     // 每个子窗口有**独立的 `egui::Context`、独立的交换链**，
     // 所以要各自走一遍「事件 → run_ui → tessellate → 绘制」。
@@ -762,6 +771,9 @@ fn drive_attach_windows<'a>(
     // （客户区变 0、交换链过期、驱动抽风）不该让主窗黑屏。
     // 这里记警告后继续，下一帧重试。
     for child in children.iter_mut() {
+        // 置顶同步：主窗口置顶时附属窗口必须跟随，否则被压住。
+        // `apply_topmost` 幂等，仅状态变化时调 `SetWindowPos`。
+        child.apply_topmost(topmost);
         if let Err(e) = child.render(&mut *app) {
             tracing::warn!(card = ?child.card_id, %e, "子窗口渲染失败，跳过本帧");
         }
@@ -797,6 +809,8 @@ Ok(w) => {
     }
 
     if let Some(w) = settings_win.as_mut() {
+        // 置顶同步：设置窗口跟随主窗口置顶状态（幂等）。
+        w.apply_topmost(topmost);
         // ⚠️ 先取 `want_open` 再进函数：`sync_and_render(&mut app, …)`
         // 会可变借用 `app`，而在参数里读 `app.paint_state` 会二次借用。
         let want_open = app.paint_state.show_settings;
@@ -1047,7 +1061,19 @@ impl App {
         for op in self.paint_state.take_ops() {
             match op {
                 Op::SetBool { group, field, value } => {
+                    let is_capture_enabled =
+                        matches!(group, crate::paint::ConfigGroup::Capture) && field == "enabled";
                     set_bool_field(&mut self.svc.state.config, group, field, value);
+                    // 「记录剪贴板」开关必须在运行时立即生效，不能等重启：
+                    // 否则用户开/关开关后，捕获线程维持旧状态（开着时新复制
+                    // 全部丢弃、关了时线程继续空转），复制监听表现为「改了无效」。
+                    if is_capture_enabled {
+                        if value {
+                            self.svc.start_capture();
+                        } else {
+                            self.svc.stop_capture();
+                        }
+                    }
                     self.after_config_change();
                 }
                 Op::SetNumber { group, field, value } => {
@@ -1394,6 +1420,53 @@ mod tests {
             cfg.storage.max_items.is_none(),
             "None 应表示「不限条数」"
         );
+    }
+
+    /// 设置窗口的「记录剪贴板」开关必须**运行时**启停捕获线程。
+    ///
+    /// 早期实现只改 `cfg.capture.enabled` 并落盘，从不调
+    /// `start_capture`/`stop_capture`——于是运行中打开开关后
+    /// 捕获线程仍然不存在，用户复制什么都记录不到（重启才生效），
+    /// 表现为「复制监听获取不到、开关改了没反应」。
+    #[test]
+    fn capture_enabled_switch_restarts_thread_at_runtime() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-capture-switch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        assert!(
+            !app.svc.is_capturing(),
+            "capture.enabled=false 启动时不应有捕获线程"
+        );
+
+        // 打开「记录剪贴板」→ 线程应立即启动，无需重启。
+        app.paint_state.ops.push(crate::paint::Op::SetBool {
+            group: crate::paint::ConfigGroup::Capture,
+            field: "enabled",
+            value: true,
+        });
+        app.apply_ops();
+        assert!(
+            app.svc.is_capturing(),
+            "打开「记录剪贴板」后应立即启动捕获线程"
+        );
+
+        // 关闭 → 线程应立即停止，不再空转。
+        app.paint_state.ops.push(crate::paint::Op::SetBool {
+            group: crate::paint::ConfigGroup::Capture,
+            field: "enabled",
+            value: false,
+        });
+        app.apply_ops();
+        assert!(
+            !app.svc.is_capturing(),
+            "关闭「记录剪贴板」后应立即停止捕获线程"
+        );
+
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

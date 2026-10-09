@@ -98,7 +98,11 @@ pub struct CaptureConfig {
     pub skip_password_fields: bool,
     /// 连续相同内容不重复入库。
     pub dedup: bool,
-    /// 自动去重窗口：多少秒内的相同哈希视为重复。
+    /// 去重窗口（秒）。
+    ///
+    /// ⚠️ 已由全局去重取代：`ingest` 现在按哈希查**全部历史**，
+    /// 任何时间点的相同内容都不再新增。此字段保留仅为兼容
+    /// 已落盘的旧配置文件，不再参与去重逻辑。
     pub dedup_window_secs: i64,
 }
 

@@ -223,7 +223,11 @@ pub fn hit_test(pos: Pos2, size: Vec2, border: f32, drag: &[Rect]) -> HitZone {
 /// 而顶栏里有齿轮、垃圾桶、搜索框，点它们会被系统判成标题栏
 /// （`HTCAPTION`）→ 不产生 `WM_LBUTTONDOWN` → egui 收不到点击。
 /// 症状是「设置打不开、搜索框点不动」，而 paint 层测试全绿。
-const MAX_DRAG_SEGS: usize = 4;
+///
+/// 段数预算：顶栏左/右 2 段 + 共用单栏时内嵌置顶区左/右 2 段 +
+/// 历史主栏左/右 2 段 = 6 段。当初只按顶栏估了 4，共用单栏下
+/// 列表边距段被截断，表现为「列表左右留白拖不动窗口」。
+const MAX_DRAG_SEGS: usize = 8;
 
 /// 一个窗口的边框与拖动区。
 ///

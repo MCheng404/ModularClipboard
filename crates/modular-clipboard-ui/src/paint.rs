@@ -918,7 +918,7 @@ fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
         (ConfigGroup::Ui, "start_minimized", "启动时最小化", "启动后隐藏到托盘", ui_cfg.start_minimized),
         (ConfigGroup::Capture, "enabled", "记录剪贴板", "关闭后不再新增历史", cap_cfg.enabled),
         (ConfigGroup::Capture, "skip_password_fields", "跳过密码字段", "疑似输入密码时不记录", cap_cfg.skip_password_fields),
-        (ConfigGroup::Capture, "dedup", "自动去重", "短时间内相同内容只留一条", cap_cfg.dedup),
+        (ConfigGroup::Capture, "dedup", "复制去重", "复制相同内容不再新增记录，自动置顶更新", cap_cfg.dedup),
     ];
 
     let mut last_group: Option<ConfigGroup> = None;
@@ -1301,12 +1301,35 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
                 let pinned_area =
                     Rect::from_min_max(body.min, pos2(body.max.x, split_y));
                 draw_embedded_pinned(f, pinned_area);
-                let rest = Rect::from_min_max(pos2(body.min.x, split_y), body.max);
-                // 分隔线画在两段之间。
-                f.ui.painter_at(rest).hline(
-                    rest.x_range(),
-                    rest.min.y,
+                // 分隔线画在置顶区与历史区之间。
+                f.ui.painter_at(body).hline(
+                    body.x_range(),
+                    split_y,
                     Stroke::new(1.0, f.pal.border_subtle),
+                );
+                // 共用单栏时历史区顶部补一个「历史」标签（与「置顶」
+                // 标签同款）：置顶区有自己的标题，历史区却从列表直接
+                // 开始，用户分不清下面这堆内容属于谁。
+                //
+                // 标签占据列表顶部一行（label_h），历史列表从它之下
+                // 开始——「历史」两字因此可见、且为列表让出位置。
+                let pal = f.pal;
+                let font: FontId = sized(pal.font_xs, f.scale);
+                let label_h = (pal.font_xs * 1.6).max(14.0);
+                let label = Rect::from_min_size(
+                    pos2(body.min.x, split_y + pal.space_xs * 0.5),
+                    vec2(body.width(), label_h),
+                );
+                f.ui.painter_at(label).text(
+                    label.left_center(),
+                    Align2::LEFT_CENTER,
+                    "历史",
+                    font,
+                    pal.text_dim,
+                );
+                let rest = Rect::from_min_max(
+                    pos2(body.min.x, label.max.y + pal.space_xs),
+                    body.max,
                 );
                 if rest.height() > 8.0 {
                     draw_history_body(f, rest, None);
@@ -1413,13 +1436,46 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 于是滚主栏会把内嵌置顶区一起带走（反之亦然）。
     let pinned_slot = only_pinned == Some(true);
 
+    // ---- 列表边距 ------------------------------------------------------
+    //
+    // 内容区左右各缩进一条竖边距（`LIST_PAD_X`），历史条目像卡片一样
+    // 悬浮在留白中；左右留白竖条同时上报为**拖动区**（WM_NCHITTEST
+    // 返回 HTCAPTION），用户按住列表两侧的空白即可拖动窗口。
+    //
+    // ⚠️ 滚动条放在内容区右缘（`ScrollArea` 的 `max_rect` 用
+    // `content`），因此滚动条不会压进右留白拖动区——若滚动条贴着
+    // `body.max.x` 画，右拖动区就正好压在滚动条上，拖滚动条会变成
+    // 拖窗口。
+    let content = Rect::from_min_max(
+        pos2(body.min.x + LIST_PAD_X, body.min.y),
+        pos2(body.max.x - LIST_PAD_X, body.max.y),
+    );
+    if content.width() <= 8.0 || content.height() <= 8.0 {
+        return;
+    }
+    f.state.drag_regions.push(Rect::from_min_max(
+        pos2(body.min.x, body.min.y),
+        pos2(body.min.x + LIST_PAD_X, body.max.y),
+    ));
+    f.state.drag_regions.push(Rect::from_min_max(
+        pos2(body.max.x - LIST_PAD_X, body.min.y),
+        pos2(body.max.x, body.max.y),
+    ));
+
     // 过滤：全部 / 仅置顶。
     let items: Vec<ClipItem> = f
         .svc
         .state
         .items
         .iter()
-        .filter(|it| only_pinned.map_or(true, |p| it.pinned == p))
+        // ⚠️ 主栏（`None`）**排除置顶条目**：置顶内容由置顶区（共用单栏）
+        // 或置顶卡（独立分栏）单独负责，主栏再画一份会产生两处同名
+        // 行 Id（`("row", item.id)`）→ egui 的 ID 冲突检查在界面上
+        // 画出「First use of widget ID … / Second use of …」警告。
+        .filter(|it| match only_pinned {
+            Some(p) => it.pinned == p,
+            None => !it.pinned,
+        })
         .cloned()
         .collect();
 
@@ -1449,16 +1505,22 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     let pal = f.pal;
     let scale = f.scale;
     // ⚠️ 必须用 `preview_width`——与 `draw_item_row` 共用同一个算式。
-    let text_w = preview_width(body.width(), pal);
+    // 宽度取内容区（左右已扣边距），保证测量与渲染一致。
+    let text_w = preview_width(content.width(), pal);
     let heights: Vec<f32> = items
         .iter()
         .map(|it| row_height_for(f.ui, it, pal, scale, text_w))
         .collect();
     // 前缀和：用来 O(log n) 由滚动偏移定位到行。
+    //
+    // 卡片样式需要行间留缝（`ROW_GAP`）：首项顶部留半条，每项之后
+    // 再留整条。**最后一项之后不留**——否则滚到底时最后一行会悬在
+    // 列表底部之上一条缝（gap），贴底点击/视觉都对不上。
     let mut offsets: Vec<f32> = Vec::with_capacity(heights.len() + 1);
-    offsets.push(0.0);
-    for h in &heights {
-        offsets.push(offsets.last().copied().unwrap_or(0.0) + h);
+    offsets.push(ROW_GAP * 0.5);
+    for (i, h) in heights.iter().enumerate() {
+        let inc = if i + 1 == heights.len() { *h } else { h + ROW_GAP };
+        offsets.push(offsets.last().copied().unwrap_or(0.0) + inc);
     }
     let content_h = offsets.last().copied().unwrap_or(0.0);
 
@@ -1485,7 +1547,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     let mut list_ui = f.ui.new_child(
         egui::UiBuilder::new()
             .id(egui::Id::new(("list", only_pinned.unwrap_or(false))))
-            .max_rect(body)
+            .max_rect(content)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     let out = egui::ScrollArea::vertical()
@@ -1531,18 +1593,45 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 手工虚拟化里的作用只剩**裁剪**与**滚动条**。
             let first = offsets.partition_point(|&o| o + ROW_HEIGHT_MIN <= scroll);
             for i in first..items.len() {
-                let y = body.min.y + offsets[i] - scroll;
-                if y > body.max.y {
+                let y = content.min.y + offsets[i] - scroll;
+                if y > content.max.y {
                     break; // 已越过可视区底部
                 }
                 let r = Rect::from_min_size(
-                    pos2(body.min.x, y),
-                    vec2(body.width(), heights[i]),
+                    pos2(content.min.x, y),
+                    vec2(content.width(), heights[i]),
                 );
-                if r.max.y < body.min.y {
+                if r.max.y < content.min.y {
                     continue; // 整行都在可视区上方
                 }
+                // ---- 卡片缝隙 = 拖动区 ------------------------------------
+                // 卡片与卡片之间的空白横带（含首行顶部的半条缝）同样上报
+                // 为拖动区：WM_NCHITTEST 返回 HTCAPTION，用户按住行间
+                // 缝隙即可拖动窗口，不必精确瞄准左右留白。
+                //
+                // ⚠️ 右缘让出垂直滚动条占位（`content.max.x - RESERVE`），
+                // 否则「拖滚动条」会被系统判成 HTCAPTION 变成拖窗口——
+                // 与左右留白拖动区避开滚动条是同一个原因。
+                let gap_top = if i == 0 { content.min.y } else { r.min.y - ROW_GAP };
+                let gap_bottom = r.min.y.min(content.max.y);
+                if gap_bottom > gap_top {
+                    f.state.drag_regions.push(Rect::from_min_max(
+                        pos2(content.min.x, gap_top.max(content.min.y)),
+                        pos2(content.max.x - SCROLLBAR_RESERVE, gap_bottom),
+                    ));
+                }
                 draw_item_row(f, ui, r, &items[i]);
+            }
+            // 最后可视行之后的空白（内容不满一屏时的列表底部）也作为拖动
+            // 区——它不覆盖任何卡片，按住中部空白即可拖动窗口。
+            //
+            // ⚠️ 只在**内容不满一屏**（无滚动条）时补这条：滚动状态下底部
+            // 会被下一行占据，误报会把下一行的可点击区域吃成 HTCAPTION。
+            if content_h < content.height() {
+                f.state.drag_regions.push(Rect::from_min_max(
+                    pos2(content.min.x, content.min.y + content_h),
+                    pos2(content.max.x, content.max.y),
+                ));
             }
         });
 
@@ -1582,6 +1671,26 @@ fn preview_width(body_w: f32, pal: &Palette) -> f32 {
 /// 长内容被省略号截断（用户反馈「需要完整显示内容」）。
 /// 实际行高由 [`row_height_for`] 按每条内容的折行数动态算出。
 const ROW_HEIGHT_MIN: f32 = 52.0;
+
+/// 列表内容区左右留白（逻辑点）。
+///
+/// 这条竖边距既是「卡片与窗口边缘之间的呼吸感」，也是**拖动区**：
+/// 用户按住留白拖动即可移动窗口（见 `draw_history_body` 上报的
+/// `drag_regions`）。
+const LIST_PAD_X: f32 = 8.0;
+
+/// 列表卡片之间的垂直间隙（逻辑点）。
+///
+/// 卡片样式 = 每条历史是一张圆角小卡，卡与卡之间留这条缝；
+/// 首项顶部再留半条，让整体上下边缘也有留白。
+const ROW_GAP: f32 = 6.0;
+
+/// 垂直滚动条占位（逻辑点），缝隙拖动区右缘必须让出这一段。
+///
+/// `ScrollArea` 的滚动条画在内容区右缘内侧；若缝隙横条直抵
+/// `content.max.x`，按住滚动条会被系统判成 HTCAPTION 变成拖窗口
+/// （与左右留白拖动区避开滚动条是同一个原因）。
+const SCROLLBAR_RESERVE: f32 = 8.0;
 
 /// 每行文字的高度倍率。
 const LINE_H: f32 = 1.35;
@@ -1752,15 +1861,34 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 与「看得见才点得到」一致。
     let resp = ui.interact(r, egui::Id::new(("row", item.id)), Sense::click());
     let painter = ui.painter_at(r);
+
+    // 卡片样式：每条历史是一张圆角小卡。
+    //
+    // 常态 = `surface_variant` 底 + 1px 描边（与窗口底 / 历史卡片外框
+    // 区分开）；悬停在半透明提亮上叠一层；选中换主题高亮 + 左侧强调条。
+    // ⚠️ 圆角用 `pal.radius_sm` 而不是 `CornerRadius::ZERO`——后者是
+    // 早前「通栏行」的直角样式，与卡片语义不符。
+    //
+    // ⚠️ 描边在所有状态都画：悬停/选中若只换底色，边框会「消失一瞬」
+    // （从有到无再到有），视觉上跳变。
+    let radius = pal.radius_sm;
+    let stroke = Stroke::new(CARD_STROKE * scale, pal.border_subtle);
     if selected {
-        painter.rect_filled(r, CornerRadius::ZERO, pal.row_selected);
+        painter.rect_filled(r, radius, pal.surface_variant);
+        painter.rect_filled(r, radius, pal.row_selected);
         painter.rect_filled(
             Rect::from_min_size(r.min, vec2(2.0 * scale, r.height())),
             CornerRadius::ZERO,
             pal.accent,
         );
+        painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     } else if resp.hovered() {
-        painter.rect_filled(r, CornerRadius::ZERO, pal.row_hover);
+        painter.rect_filled(r, radius, pal.surface_variant);
+        painter.rect_filled(r, radius, pal.row_hover);
+        painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
+    } else {
+        painter.rect_filled(r, radius, pal.surface_variant);
+        painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     }
 
     // ---- 两行布局 ----------------------------------------------------
@@ -1905,7 +2033,11 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
                 crate::icons::Icon::Unpinned
             },
             Op::TogglePin(item.id),
-            !item.pinned,
+            // ⚠️ 必须始终可点：置顶条目正是靠这个按钮取消置顶。
+            // 早前写成 `!item.pinned` —— 条目置顶后按钮变灰、点击不触发，
+            // 于是「置顶后无法取消置顶」。图标已区分 Pinned/Unpinned 状态，
+            // 语义就是置顶 ↔ 取消置顶的开关，任何状态下都可点。
+            true,
         ),
         (crate::icons::Icon::File, Op::Copy(item.id), true),
         (crate::icons::Icon::Close, Op::Delete(item.id), true),
@@ -2436,13 +2568,71 @@ fn with_pinned(mut self, n: usize) -> Self {
             covered > 100.0,
             "拖动区总面积过小（{covered}），顶栏几乎拖不动"
         );
-        // 拖动区必须在顶栏**纵向范围内**。
+        // 拖动区覆盖顶栏纵向范围（顶栏段），并允许顶栏以下的
+        // 「列表边距」竖条（列表左右留白，按住可拖动窗口）。
         for r in &h.state.drag_regions {
+            if r.min.y < crate::solver::TOPBAR_HEIGHT {
+                continue; // 顶栏段：面积由上面的断言兜底
+            }
             assert!(
-                r.min.y < crate::solver::TOPBAR_HEIGHT,
-                "拖动区段 {r:?} 不在顶栏高度内"
+                (r.width() - LIST_PAD_X).abs() < 0.5,
+                "顶栏以下出现非边距拖动区段 {r:?}"
             );
         }
+    }
+
+    /// 卡片行间缝隙（`ROW_GAP` 横带）与首行顶部半条缝必须是拖动区：
+    /// 按住行间空白即可拖动窗口，不必精确瞄准左右留白。
+    ///
+    /// ⚠️ 缝隙横条右缘让出滚动条占位（`SCROLLBAR_RESERVE`），否则
+    /// 拖滚动条会被系统判成 HTCAPTION 变成拖窗口。
+    #[test]
+    fn row_gap_is_drag_region() {
+        let mut h = Harness::new("row-gap-drag", vec2(700.0, 600.0)).with_items(3);
+        h.frame();
+        let body = hit(&h, "history_body");
+        let content = Rect::from_min_max(
+            pos2(body.min.x + LIST_PAD_X, body.min.y),
+            pos2(body.max.x - LIST_PAD_X, body.max.y),
+        );
+        let near = |a: f32, b: f32| (a - b).abs() < 0.6;
+        // ① 首行顶部的半条缝：从列表顶到第一行顶，右缘让出滚动条位。
+        let top_gap = Rect::from_min_max(
+            content.min,
+            pos2(
+                content.max.x - SCROLLBAR_RESERVE,
+                content.min.y + ROW_GAP * 0.5,
+            ),
+        );
+        assert!(
+            h.state.drag_regions.iter().any(|r| {
+                near(r.min.x, top_gap.min.x)
+                    && near(r.max.x, top_gap.max.x)
+                    && near(r.min.y, top_gap.min.y)
+                    && near(r.max.y, top_gap.max.y)
+            }),
+            "首行顶部半条缝应是拖动区；drag_regions={:?}",
+            h.state.drag_regions
+        );
+        // ② 行间整条缝：3 条记录之间至少一条 `ROW_GAP` 高的横条。
+        assert!(
+            h.state.drag_regions.iter().any(|r| {
+                r.height() >= ROW_GAP - 0.5
+                    && r.height() <= ROW_GAP + 0.5
+                    && r.width() > 200.0
+            }),
+            "行间缝隙（{ROW_GAP}pt 横条）应是拖动区"
+        );
+        // ③ 内容不满一屏 → 列表底部空白也应是拖动区，横向延伸到最右缘。
+        assert!(
+            h.state.drag_regions.iter().any(|r| {
+                near(r.min.x, content.min.x)
+                    && near(r.max.x, content.max.x)
+                    && near(r.max.y, content.max.y)
+            }),
+            "列表底部空白（内容不满一屏）应是拖动区；drag_regions={:?}",
+            h.state.drag_regions
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2673,6 +2863,45 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             history.min.y - card.min.y < 60.0,
             "无置顶条目时历史列表应从卡片顶部附近开始，实际 history={history:?} card={card:?}"
+        );
+    }
+
+    /// 置顶条目的置顶按钮**必须可点**（否则无法取消置顶）。
+    ///
+    /// 早前 `acts[0].enabled = !item.pinned`：条目置顶后按钮变灰、
+    /// 点击不产生 `Op::TogglePin` —— 用户看到的正是「置顶后无法
+    /// 取消置顶」。置顶 ↔ 取消置顶是同一个开关，任何状态下都应可点。
+    ///
+    /// 行高随预览折行数变化，测试不重算 `row_height_for` 的公式，
+    /// 而是沿置顶区首行范围扫几个 y；`enabled=false` 的旧实现无论
+    /// 点哪个 y 都不会产生 `TogglePin`，所以任一命中即可区分。
+    #[test]
+    fn pinned_row_button_can_unpin() {
+        let mut h = Harness::new("unpin-btn", vec2(700.0, 600.0))
+            .with_items(3)
+            .with_pinned(1);
+        h.frame();
+
+        let body = hit(&h, "pinned_body");
+        let btn = h.pal.control_height * 0.7;
+        let acts_w = 3.0 * (btn + h.pal.space_xs);
+        // 按钮从行右缘向左排，i=0（置顶/取消置顶）是最右一个。
+        let x = body.max.x - LIST_PAD_X - acts_w + 0.5 * (btn + h.pal.space_xs);
+        let mut hit_any = false;
+        for y in [
+            body.min.y + 12.0,
+            body.min.y + 24.0,
+            body.min.y + 36.0,
+        ] {
+            let ops = h.click_at(pos2(x, y));
+            if ops.iter().any(|o| matches!(o, Op::TogglePin(_))) {
+                hit_any = true;
+                break;
+            }
+        }
+        assert!(
+            hit_any,
+            "置顶条目的置顶按钮必须可点并产生 TogglePin（取消置顶入口）"
         );
     }
 

@@ -152,3 +152,57 @@ fn hidden_branch_continues_instead_of_breaking() {
         "隐藏态分支里不能有 `break`：那会让程序隐藏后直接退出循环，         事件随之丢失。实际代码行：{code:?}"
     );
 }
+
+/// 守卫：附属窗口（卡片子窗口 / 设置窗口）的每个 `take_pending()` 之前
+/// 必须紧跟 `poll_for`。
+///
+/// `EventLoop::poll_for`（含 `poll`）是**唯一**把消息从系统队列泵进
+/// `EventLoop::pending` 的入口。只调 `take_pending()` 会拿到恒空的缓冲：
+/// 窗口的鼠标/键盘消息一直堆在系统队列里，拖动、滚动、点击全部无效。
+///
+/// 真实缺陷形态：`settingswin` / `childwin` 的显示态从创建起就只有
+/// `take_pending()`（隐藏态与 0×0 态反而有 poll），于是设置窗口
+/// 「画出来了但点不动」——而全工作区测试无一失败（同 `&[]` 那次回归
+/// 一样，属于「接线是否正确」的问题，只能靠源码断言守住）。
+fn assert_attach_window_pumps_before_take_pending(path: &Path, label: &str) {
+    let src = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("读不到 {label}（{}）: {e}", path.display()));
+
+    // 过滤注释与空行：注释里提到 `take_pending()` 也会被误匹配。
+    // 真实调用必然含 `events.take_pending()` 或 `self.events.take_pending()`。
+    let code: String = src
+        .lines()
+        .filter(|l| !l.trim().starts_with("//") && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut search_from = 0usize;
+    let mut found = 0usize;
+    while let Some(rel) = code[search_from..].find("take_pending()") {
+        let idx = search_from + rel;
+        // 取该调用之前最近 120 字符：`poll_for` 应紧邻它（同一分支）。
+        let window = &code[idx.saturating_sub(120)..idx];
+        assert!(
+            window.contains("poll_for"),
+            "{label}: 每个 `take_pending()` 之前必须有 `poll_for`，否则该窗口\n\
+             收不到任何鼠标/键盘输入（拖动/滚动/点击全部无效）。\n\
+             上下文：…{}",
+            &code[idx.saturating_sub(220)..idx]
+        );
+        found += 1;
+        search_from = idx + "take_pending()".len();
+    }
+    assert!(found > 0, "{label}: 找不到任何 `take_pending()` 调用");
+}
+
+#[test]
+fn settings_window_pumps_before_take_pending() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/settingswin.rs");
+    assert_attach_window_pumps_before_take_pending(&path, "settingswin.rs");
+}
+
+#[test]
+fn child_window_pumps_before_take_pending() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/childwin.rs");
+    assert_attach_window_pumps_before_take_pending(&path, "childwin.rs");
+}

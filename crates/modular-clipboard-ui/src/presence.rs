@@ -22,7 +22,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowPos,
-    ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SW_HIDE, SW_MINIMIZE,
+    ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SW_HIDE, SW_MINIMIZE,
     SW_RESTORE, IDC_ARROW, IDC_IBEAM, IDC_HAND,
 };
 use windows::core::PCWSTR;
@@ -318,6 +318,23 @@ pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
     }
 }
 
+/// 把窗口提升到置顶组最上层（不激活、不移动、不缩放）。
+///
+/// 置顶窗口之间按**激活顺序**排 Z 序：设置窗口打开时在顶，但用户
+/// 点击主窗口后主窗口激活、被提到置顶组顶部，会把设置窗口压到下面
+/// ——「设置窗口被主窗口遮住」。本函数用 `SetWindowPos(HWND_TOPMOST,
+/// SWP_NOACTIVATE)` 把目标窗口重新提回最上，**不抢焦点**（键盘/鼠标
+/// 焦点仍归当前操作窗口），只保证目标窗口不被其它置顶窗口遮住。
+pub fn raise_to_top(hwnd: HWND) {
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return;
+    }
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    // SAFETY: hwnd 已由上面的 IsWindow 校验；HWND_TOPMOST 只调整
+    // Z 序与置顶标志，flags 不移动、不缩放、不激活。
+    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags) };
+}
+
 /// 设置/取消窗口置顶。
 ///
 /// 用 `SetWindowPos` 改扩展样式里的 `WS_EX_TOPMOST`。**不能**用
@@ -343,7 +360,8 @@ pub fn set_topmost(hwnd: HWND, on: bool) {
         )
     };
     if ok.is_ok() {
-        tracing::info!(置顶 = on, "窗口置顶状态已更新");
+        // 置顶成功不打日志：该函数会被频繁调用（启动、配置切换、各窗口
+        // 同步），每次切换都记一条 info 只会刷屏。失败保留 warn 即可。
     } else {
         tracing::warn!(置顶 = on, "SetWindowPos 失败");
     }

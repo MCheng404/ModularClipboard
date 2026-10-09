@@ -91,6 +91,9 @@ pub struct ChildWindow<'a> {
     pub ctx: egui::Context,
     /// 窗口标题（显示在任务栏/Alt+Tab）。
     title: String,
+    /// 已应用到 Win32 的置顶状态。置顶只在主窗口置顶开关变化或本窗口
+    /// 新建时需要调整，用该字段避免每帧重复 `SetWindowPos`。
+    topmost: bool,
 }
 
 impl<'a> ChildWindow<'a> {
@@ -99,6 +102,17 @@ impl<'a> ChildWindow<'a> {
         // `EventLoop` 没有直接的可见性查询，但客户区为 0 通常意味着
         // 最小化。渲染主循环会用这个判断跳过渲染。
         self.window.inner_size_physical().0 > 0
+    }
+
+    /// 应用置顶状态。幂等：状态没变就不调 `SetWindowPos`。
+    ///
+    /// 主窗口的 `always_on_top` 变化或本窗口新建时都走这里——
+    /// 子窗口不置顶的话，会被置顶的主窗口或其它置顶窗口压住。
+    pub fn apply_topmost(&mut self, on: bool) {
+        if self.topmost != on {
+            self.topmost = on;
+            crate::presence::set_topmost(self.window.hwnd(), on);
+        }
     }
 }
 
@@ -318,6 +332,7 @@ impl<'a> ChildWindow<'a> {
             events,
             ctx,
             title: title.to_string(),
+            topmost: false,
         })
     }
 
@@ -342,7 +357,17 @@ impl<'a> ChildWindow<'a> {
             return Ok(());
         }
 
-        let frame_events = self.events.take_pending();
+        let frame_events = {
+            // ⚠️ 显示态也必须先 `poll_for` 再 `take_pending`。
+            //
+            // `poll_for`（含 `poll`）是**唯一**把消息从系统队列泵进
+            // `EventLoop::pending` 的入口；只调 `take_pending()` 会拿到
+            // 恒空的缓冲——本窗口的鼠标/键盘消息一直堆在系统队列里，
+            // 拖动、滚动、点击全部无效（与 settingswin 同一处缺陷：
+            // 9ddba86 只修了隐藏态与 0×0 态，显示态从创建起就缺这一步）。
+            self.events.poll_for(None);
+            self.events.take_pending()
+        };
         for ev in &frame_events {
             if matches!(ev, WindowEvent::CloseRequested) {
                 // 用户关了子窗口 ⇒ 把卡片收回工作区。

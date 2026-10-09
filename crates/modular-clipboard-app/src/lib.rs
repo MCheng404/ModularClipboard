@@ -231,18 +231,24 @@ impl Service {
                     // 时钟前移得最大值（窗口已过），两种方向都安全。
                     let now = now_ms() as i64;
                     let last = last_self_write.load(Ordering::Relaxed) as i64;
-                    let since_self_write = now.saturating_sub(last);
-                    if since_self_write < SELF_WRITE_GUARD_MS {
-                        std::thread::sleep(Duration::from_millis(interval));
-                        continue;
-                    }
 
-                    if reader.changed()
+                    // ⚠️ 抑制期内**也要**推进序列号基线（`capture_should_read`
+                    // 无条件调用 `changed()`）。
+                    //
+                    // 自写回（`copy_item`）会改变剪贴板序列号；若抑制期内跳过
+                    // `changed()`，基线停留在自写前的值，抑制期结束后的第一轮
+                    // 就会把「自写导致的变化」当成用户的新复制重新捕获——每次
+                    // 把历史条目放回剪贴板都会**多记一条重复记录**。
+                    // 抑制期内的用户复制（900ms 窗口内，概率极低）会被吸收进
+                    // 基线，这正是抑制语义的本意：抑制期内的一切变化都视为
+                    // 自写引起。
+                    if capture_should_read(&mut reader, now, last)
                         && let Some(payload) = reader.read()
                     {
                         c.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(kind = ?payload.kind, len = payload.bytes.len(), "捕获线程读取到内容");
                         if tx.push(Signal::Captured(payload)).is_err() {
-                            // 队列满：丢���这次事件，不能阻塞剪贴板读取。
+                            // 队列满：丢弃这次事件，不能阻塞剪贴板读取。
                             tracing::debug!("事件队列已满，丢弃一条捕获");
                         }
                     }
@@ -318,30 +324,32 @@ impl Service {
         // 空白内容直接忽略：用户按了 Ctrl+C 但没选中任何东西。
         if payload.bytes.iter().all(|b| b.is_ascii_whitespace()) {
             self.state.stats.empty += 1;
+            tracing::debug!("捕获被过滤：空白内容");
             return false;
         }
 
         // 来源程序屏蔽。
         if !payload.source_app.is_empty() && cfg.is_app_blocked(&payload.source_app) {
             self.state.stats.app_blocked += 1;
+            tracing::debug!(app = %payload.source_app, "捕获被过滤：来源程序被屏蔽");
             return false;
         }
 
         // 密码框启发式：仅在敏感窗口为前台时跳过。
         if cfg.capture.skip_password_fields && modular_clipboard_platform::is_password_field() {
             self.state.stats.secret_field += 1;
+            tracing::debug!(class = %modular_clipboard_capture::foreground_class_name(), "捕获被过滤：疑似密码框");
             return false;
         }
 
         let hash = fingerprint(&payload.bytes);
         let preview = build_preview(&payload);
 
-        // 去重：窗口内的相同内容仅刷新时间，不新增条目。
+        // 去重：历史中已有相同内容（无论何时复制的）就不再新增，
+        // 只把原条目刷新时间、顶到列表顶部——「复制相同内容」不应
+        // 产生一条又一条的重复记录。
         if cfg.capture.dedup {
-            match self
-                .store
-                .find_recent_by_hash(&hash, cfg.capture.dedup_window_secs)
-            {
+            match self.store.find_by_hash(&hash) {
                 Ok(Some(existing)) => {
                     if self.store.bump_to_top(existing).is_ok() {
                         self.reload_list();
@@ -550,6 +558,23 @@ impl Service {
     }
 }
 
+/// 捕获循环的单步决策：这一轮是否应该读取剪贴板内容。
+///
+/// 返回 `true` 当且仅当：序列号有新变化，且当前不在自写回抑制窗口内。
+///
+/// ⚠️ 无论结果如何，都会推进序列号基线（`ClipboardReader::changed` 的
+/// 副作用）。这是刻意为之：自写回（`copy_item`）同样会改变剪贴板序列号，
+/// 若抑制期内跳过基线推进，自写导致的变化会在抑制期结束后被当成用户的
+/// 新复制重新捕获——每次把历史条目放回剪贴板都多记一条重复记录。
+///
+/// `now` 为当前墙钟（Unix 毫秒），`last_self_write` 为上次自写回时刻。
+/// 减法必须用 `saturating_sub`：墙钟可能被 NTP 校时或手动改时间回拨，
+/// 无符号减法会下溢成巨值，让抑制永久失效（见捕获线程的注释）。
+fn capture_should_read(reader: &mut ClipboardReader, now: i64, last_self_write: i64) -> bool {
+    let since = now.saturating_sub(last_self_write);
+    reader.changed() && since >= SELF_WRITE_GUARD_MS
+}
+
 /// 单页最多加载的条目数。
 const PAGE_LIMIT: usize = 2000;
 
@@ -755,6 +780,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 「复制去重」开启时：重复复制相同内容不新增条目，
+    /// 只把原记录顶到列表顶部（列表条目数不变）。
+    #[test]
+    fn dedup_collapses_repeated_copies() {
+        let dir = unique_dir("dedup-on");
+        let mut svc = Service::with_data_dir(Config::default(), Some(&dir)).unwrap();
+        assert!(svc.state.config.capture.dedup, "默认应开启复制去重");
+
+        let first = payload(ClipKind::Text, "同一段文字 12345");
+        assert!(svc.ingest(first), "首次复制应入库");
+        assert_eq!(svc.state.items.len(), 1, "首次复制后列表应有 1 条");
+
+        let again = payload(ClipKind::Text, "同一段文字 12345");
+        assert!(svc.ingest(again), "去重命中时也应返回成功（列表已更新）");
+        assert_eq!(
+            svc.state.items.len(),
+            1,
+            "开启去重时重复复制不应新增条目"
+        );
+        assert_eq!(svc.state.stats.duplicate, 1, "应计入 duplicate 统计");
+
+        svc.stop_capture();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「复制去重」关闭时：每次复制都新增一条记录。
+    #[test]
+    fn dedup_disabled_keeps_each_copy() {
+        let dir = unique_dir("dedup-off");
+        let mut svc = Service::with_data_dir(Config::default(), Some(&dir)).unwrap();
+        svc.state.config.capture.dedup = false;
+
+        assert!(svc.ingest(payload(ClipKind::Text, "重复内容 abc")));
+        assert!(svc.ingest(payload(ClipKind::Text, "重复内容 abc")));
+        assert_eq!(
+            svc.state.items.len(),
+            2,
+            "关闭去重时重复复制应各记一条"
+        );
+        assert_eq!(svc.state.stats.duplicate, 0, "关闭去重不应计入 duplicate");
+
+        svc.stop_capture();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `--no-capture` 的临时覆盖不能落进 `--data-dir` 指定的配置。
     ///
     /// 两条保护同时生效：目录跟着参数走，且覆盖值不持久化。
@@ -790,5 +860,56 @@ mod tests {
             Service::with_data_dir(Config::default(), Some(std::path::Path::new("  "))).is_err(),
             "空白数据目录必须报错"
         );
+    }
+
+    /// 自写回的内容在抑制期结束后**不得**被当成新复制重新捕获。
+    ///
+    /// 回归场景：用户点击历史条目（`copy_item` 写回剪贴板）后，
+    /// 捕获线程必须忽略这次变化。旧实现的捕获循环在抑制期内跳过
+    /// `changed()`，序列号基线停留在自写前的值，抑制期结束后的第一轮
+    /// 就会把「自写导致的变化」判为新变化——每次写回历史都多记一条
+    /// 重复记录。
+    ///
+    /// 判据落在真实行为上（用真实剪贴板 + 捕获循环的单步决策函数），
+    /// 且分三步验证：抑制期内不读、抑制期后不读、用户新复制必读。
+    #[test]
+    fn self_write_is_not_recaptured_after_suppression() {
+        // 模拟捕获线程的 reader：基线停在写回之前。
+        let mut reader = ClipboardReader::new().unwrap();
+
+        // 模拟一次 copy_item 的自写回（写剪贴板 ⇒ 序列号 +1）。
+        let marker = format!("tiez-self-write-{}", std::process::id());
+        {
+            let mut writer = ClipboardReader::new().unwrap();
+            writer.write_text(&marker).unwrap();
+        }
+        let last_self_write = now_ms() as i64;
+
+        // 1. 抑制期内（since = 0 < 900）：不读取；
+        //    但基线必须已推进——自写导致的变化被吸收。
+        assert!(
+            !capture_should_read(&mut reader, last_self_write, last_self_write),
+            "抑制期内不应读取剪贴板"
+        );
+
+        // 2. 抑制期结束后（since = 900）：序列号无新变化 ⇒ 仍不读取。
+        //    旧实现在这里返回 true——把自写回当成用户新复制（bug）。
+        assert!(
+            !capture_should_read(&mut reader, last_self_write + SELF_WRITE_GUARD_MS, last_self_write),
+            "自写回的内容在抑制期结束后被重新捕获——每次写回历史都多记一条重复记录"
+        );
+
+        // 3. 用户真的复制了新内容：序列号变化 ⇒ 必须读取。
+        {
+            let mut writer = ClipboardReader::new().unwrap();
+            writer.write_text("tiez-new-user-copy").ok();
+        }
+        assert!(
+            capture_should_read(&mut reader, last_self_write + SELF_WRITE_GUARD_MS + 1, last_self_write),
+            "用户的新复制必须能被捕获线程读到"
+        );
+
+        // 清理：写空剪贴板，避免污染其它依赖真实剪贴板的测试。
+        ClipboardReader::new().unwrap().write_text("").ok();
     }
 }

@@ -26,3 +26,7 @@ target-*/
 
 # 临时提交信息文件（用 git commit -F 绕过 shell 拦截时产生）
 .git-commit-msg.txt
+
+# 本地快捷方式（指向 deps 构建产物，环境相关，不入库）
+modular_clipboard.lnk
+
