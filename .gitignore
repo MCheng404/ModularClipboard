@@ -29,4 +29,7 @@ target-*/
 
 # 本地快捷方式（指向 deps 构建产物，环境相关，不入库）
 modular_clipboard.lnk
-
+shot-*.png
+*.log
+*.err
+# 验证脚本的临时产物（截图、stdout/stderr 重定向）
