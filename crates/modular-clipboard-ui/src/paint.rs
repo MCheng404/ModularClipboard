@@ -1305,7 +1305,14 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     let inner = r.shrink2(vec2(pad, pad));
 
     // 头部：标题 + 折叠/分离按钮。
-    let head_h = (pal.font_md * 1.8).max(20.0);
+    //
+    // ⚠️ 历史栏的标题「历史」已按用户要求去掉——头部高度压为 0，
+    // 列表从卡片顶部直接开始（不占位置）。其它卡片保留头部标题。
+    let head_h = if card.kind == CardKind::History {
+        0.0
+    } else {
+        (pal.font_md * 1.8).max(20.0)
+    };
     let head = Rect::from_min_size(inner.min, vec2(inner.width(), head_h));
     draw_card_header(f, card, head);
 
@@ -1343,28 +1350,11 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
                     split_y,
                     Stroke::new(1.0, f.pal.border_subtle),
                 );
-                // 共用单栏时历史区顶部补一个「历史」标签（与「置顶」
-                // 标签同款）：置顶区有自己的标题，历史区却从列表直接
-                // 开始，用户分不清下面这堆内容属于谁。
-                //
-                // 标签占据列表顶部一行（label_h），历史列表从它之下
-                // 开始——「历史」两字因此可见、且为列表让出位置。
-                let pal = f.pal;
-                let font: FontId = sized(pal.font_xs, f.scale);
-                let label_h = (pal.font_xs * 1.6).max(14.0);
-                let label = Rect::from_min_size(
-                    pos2(body.min.x, split_y + pal.space_xs * 0.5),
-                    vec2(body.width(), label_h),
-                );
-                f.ui.painter_at(label).text(
-                    label.left_center(),
-                    Align2::LEFT_CENTER,
-                    "历史",
-                    font,
-                    pal.text_dim,
-                );
+                // 历史区直接从分隔线下方开始。早前这里画了一个
+                // 「历史」标签并让出 label_h 一行；按用户要求去掉
+                // 标签后，历史列表向上多占一行（不占列表位置）。
                 let rest = Rect::from_min_max(
-                    pos2(body.min.x, label.max.y + pal.space_xs),
+                    pos2(body.min.x, split_y + pal.space_xs),
                     body.max,
                 );
                 if rest.height() > 8.0 {
@@ -1432,6 +1422,12 @@ fn embedded_pinned_height(f: &mut Frame<'_>, avail_w: f32, avail_h: f32) -> f32 
 /// `collapse_priority`、`Solution::auto_collapsed`、`draw_collapsed_card`、
 /// `Op::ToggleCollapse` / `Detach` / `Dock`）都已移除——不是只删按钮。
 fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
+    // 历史栏标题按用户要求去掉：主窗口历史卡片不再显示「历史」两字，
+    // 其头部高度也在 `draw_expanded_card` 压为 0，列表从卡片顶部直接
+    // 开始（不占位置）。其它卡片（详情等）保留自己的标题。
+    if card.kind == CardKind::History {
+        return;
+    }
     let pal = f.pal;
     let scale = f.scale;
     let font: FontId = sized(pal.font_md, scale);
