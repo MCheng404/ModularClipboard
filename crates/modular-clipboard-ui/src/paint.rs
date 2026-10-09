@@ -1695,18 +1695,20 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 /// 而且偏差随窗口宽度变化、不同机器表现不同，极难定位。
 fn preview_width(body_w: f32, pal: &Palette) -> f32 {
     let icon_w = pal.icon_size + pal.space_sm;
-    let acts_w = 3.0 * (pal.control_height * 0.7 + pal.space_xs);
+    let acts_w = 3.0 * (pal.control_height * 0.55 + pal.space_xs);
     (body_w - icon_w - acts_w).max(20.0)
 }
 
 /// 列表行的**最小**高度（逻辑点）。
 ///
-/// 两行布局：预览（14pt，可折行）+ 来源/时间（11pt）+ 上下内边距。
+/// 三段布局：左上来源行 + 预览（14pt，可折行）+ 右下类型/大小行。
+/// 预览一行 ≈ 19pt、上下两行 meta 各 ≈ 11pt、内边距 2×5 + 行间 4，
+/// 合计 ≈ 55pt，取下限 58 兜底按钮区域。
 ///
 /// ⚠️ 这是**下限**不是固定值：早前用固定 40pt 时预览只够放一行半，
 /// 长内容被省略号截断（用户反馈「需要完整显示内容」）。
 /// 实际行高由 [`row_height_for`] 按每条内容的折行数动态算出。
-const ROW_HEIGHT_MIN: f32 = 52.0;
+const ROW_HEIGHT_MIN: f32 = 58.0;
 
 /// 列表内容区左右留白（逻辑点）。
 ///
@@ -1754,11 +1756,11 @@ const LINE_H: f32 = 1.35;
 /// 这里只取「实际用了几行」——比按字符数估算准得多，
 /// 中英文混排、全角半角混排都能正确处理。
 fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, text_w: f32) -> f32 {
-    let preview_font = sized(pal.font_sm, scale);
+    let preview_font = sized(pal.font_md, scale);
     let meta_font = sized(pal.font_xs, scale);
     // ⚠️ 行高也必须用**逻辑点**、不乘 ppp：字号已经改成逻辑点，
     // 这里再乘一次会让行高与实际字形高度对不上（留白/裁剪都错）。
-    let line_h = pal.font_sm * LINE_H;
+    let line_h = pal.font_md * LINE_H;
     let meta_h = meta_font.size.max(10.0);
 
     // 折行一次，拿到实际行数。
@@ -1791,8 +1793,9 @@ fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, tex
     let n_lines = galley.rows.len().max(1);
     let text_h = n_lines as f32 * line_h;
 
-    // 上下内边距 + 预览 + 行间2pt + 来源/时间
-    (text_h + meta_h + 5.0 * 2.0 + 2.0).max(ROW_HEIGHT_MIN)
+    // 三段布局：上 meta（来源）5 + 11 + 预览 + 2 + 下 meta（类型/大小）
+    // 11 + 5。预览带高度与 `draw_item_row` 的 `preview_band` 严格对应。
+    (text_h + meta_h * 2.0 + 5.0 * 2.0 + 4.0).max(ROW_HEIGHT_MIN)
 }
 
 fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
@@ -1937,10 +1940,12 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     }
 
-    // ---- 两行布局 ----------------------------------------------------
+    // ---- 三段布局 ----------------------------------------------------
     //
-    // 上行：预览（可换行，最多占 2 行）+ 左侧类型图标
-    // 下行：来源程序 · 时间（小字弱化）
+    // 左上：来源程序 · 时间（小字弱化）
+    // 中间：预览（主字号，可折行）
+    // 右下：类型标签 · 大小（小字弱化，右对齐，大小自适应单位）
+    // 右上：置顶 / 复制 / 删除 三个小图标按钮
     //
     // ⚠️ 目标是「**完整显示内容**」：预览**不再截断**，而是按宽度
     // 折行。折行数由 `wrap` 直接给出，不用手工估算——
@@ -1948,7 +1953,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // char、英文一个词算一个 char，两者的实际显示宽度差了好几倍，
     // 于是「看起来还有空间」但已经被砍掉了。
     let icon_w = pal.icon_size + pal.space_sm;
-    let acts_w = 3.0 * (pal.control_height * 0.7 + pal.space_xs);
+    let acts_w = 3.0 * (pal.control_height * 0.55 + pal.space_xs);
     let text_x0 = r.min.x + icon_w;
     // 宽度同样取自 `preview_width`（减去已扣掉的 icon 区），保证
     // 「量出来的行高」与「画出来的宽度」严格一致。
@@ -1988,15 +1993,23 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let pad_v = 5.0;
     let meta_font = sized(pal.font_xs, scale);
     let meta_h = meta_font.size.max(10.0);
-    // 下行固定给来源/时间一行。
-    let meta_band = Rect::from_min_max(
+    // 左上角：来源 · 时间（小字，左对齐）。
+    let top_band = Rect::from_min_max(
+        pos2(text_x0, r.min.y + pad_v),
+        pos2(text_x1, r.min.y + pad_v + meta_h),
+    );
+    // 右下角：类型 · 大小（小字，右对齐）。
+    let bot_band = Rect::from_min_max(
         pos2(text_x0, r.max.y - pad_v - meta_h),
         pos2(text_x1, r.max.y - pad_v),
     );
-    // 上行占剩下的全部高度。
+    // 中间：预览占上下两行之间的全部高度。
+    //
+    // 高度与 `row_height_for` 严格对应：行高 = top + 预览 + bot，
+    // 这里同样扣掉上下 meta 与 2pt 行间，保证两次排版结果一致。
     let preview_band = Rect::from_min_max(
-        pos2(text_x0, r.min.y + pad_v),
-        pos2(text_x1, meta_band.min.y - 2.0),
+        pos2(text_x0, top_band.max.y + 2.0),
+        pos2(text_x1, bot_band.min.y - 2.0),
     );
 
     if preview_band.height() > 4.0 {
@@ -2011,7 +2024,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
             &item.preview,
             0.0,
             egui::TextFormat {
-                font_id: sized(pal.font_sm, scale),
+                font_id: sized(pal.font_md, scale),
                 color: if selected {
                     pal.text_bright
                 } else {
@@ -2032,7 +2045,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         //
         // ⚠️ **不能设 0**：egui 文档写明「If set to 0, no text will be
         // outputted」——0 表示一行都不输出。默认值 `usize::MAX` 才是「不限」。
-        job.wrap.max_rows = ((preview_band.height() / (pal.font_sm * LINE_H))
+        job.wrap.max_rows = ((preview_band.height() / (pal.font_md * LINE_H))
             .floor()
             .max(1.0)) as usize;
         // 长路径/无空格的长串要在任意字符间断行，否则会横向溢出。
@@ -2042,17 +2055,37 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
             .galley(pos2(preview_band.min.x, preview_band.min.y), galley, pal.text);
     }
 
-    // 来源 · 时间
+    // 左上：来源 · 时间（小字）。
     let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
-    let meta_shown = crate::text::elide_text(f.ui, &meta, &meta_font, meta_band.width());
+    let meta_shown = crate::text::elide_text(f.ui, &meta, &meta_font, top_band.width());
     if !meta_shown.is_empty() {
-        // ⚠️ painter_at(meta_band)：来源名可能很长（长 exe 路径），
+        // ⚠️ painter_at(top_band)：来源名可能很长（长 exe 路径），
         // 根 painter 会让它横跨到相邻卡片上。
-        ui.painter_at(meta_band).text(
-            meta_band.left_center(),
+        ui.painter_at(top_band).text(
+            top_band.left_center(),
             Align2::LEFT_CENTER,
             meta_shown,
-            meta_font,
+            meta_font.clone(),
+            pal.text_dim,
+        );
+    }
+
+    // 右下：类型标签 · 大小（小字，右对齐）。
+    //
+    // 大小来自 `PayloadRef::len`（字节数），`format_size` 自适应
+    // B/KB/MB/GB；载荷被淘汰（`payload = None`）时只显示类型。
+    let size_str = item.payload.as_ref().map(|p| format_size(p.len));
+    let bot_meta = match size_str {
+        Some(s) => format!("{} · {}", kind_label(item.kind), s),
+        None => kind_label(item.kind).to_string(),
+    };
+    let bot_shown = crate::text::elide_text(f.ui, &bot_meta, &meta_font, bot_band.width());
+    if !bot_shown.is_empty() {
+        ui.painter_at(bot_band).text(
+            bot_band.right_center(),
+            Align2::RIGHT_CENTER,
+            bot_shown,
+            meta_font.clone(),
             pal.text_dim,
         );
     }
@@ -2070,7 +2103,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     //
     // 代价：图标字体只有 18 个码位，「复制」没有现成图标，
     // 只能用 `File`（文档）近似表达「复制到剪贴板」。
-    let btn = pal.control_height * 0.7;
+    let btn = pal.control_height * 0.55;
     let acts: [(crate::icons::Icon, Op, bool); 3] = [
         (
             if item.pinned {
@@ -2090,10 +2123,12 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     ];
 
     for (i, (icon, op, enabled)) in acts.iter().enumerate() {
+        // 三个操作按钮排**卡片右上角**（小图标）：从右缘向左排，
+        // 垂直对齐顶部来源行（中心 y = pad_v + btn/2）。
         let b = Rect::from_center_size(
             pos2(
                 r.max.x - acts_w + (i as f32 + 0.5) * (btn + pal.space_xs),
-                r.center().y,
+                r.min.y + pad_v + btn * 0.5,
             ),
             vec2(btn, btn),
         );
@@ -2147,6 +2182,44 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 
 fn format_meta(ts_ms: i64) -> String {
     modular_clipboard_app::format_time(ts_ms, modular_clipboard_core::now_ms())
+}
+
+/// 内容类型的展示名（右下角标签）。
+fn kind_label(kind: modular_clipboard_core::ClipKind) -> &'static str {
+    match kind {
+        modular_clipboard_core::ClipKind::Text => "文本",
+        modular_clipboard_core::ClipKind::Html => "HTML",
+        modular_clipboard_core::ClipKind::Image => "图片",
+        modular_clipboard_core::ClipKind::Files => "文件",
+    }
+}
+
+/// 字节数 → 自适应单位（B / KB / MB / GB）。
+///
+/// 直接显示原始字节数既占位又难读：`1234567 字节` 一眼看不出量级。
+/// 这里按 1024 进位取一档，整数部分 <10 时保留一位小数（`1.5 KB`），
+/// 否则整数显示（`12 KB`），避免「12.3 KB」这类不必要的小数噪音。
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    let one = |v: f64, unit: &str| {
+        if v >= 10.0 {
+            format!("{v:.0} {unit}")
+        } else {
+            format!("{v:.1} {unit}")
+        }
+    };
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < MB {
+        one(b / KB, "KB")
+    } else if b < GB {
+        one(b / MB, "MB")
+    } else {
+        one(b / GB, "GB")
+    }
 }
 
 #[cfg(test)]
@@ -2932,15 +3005,17 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.frame();
 
         let body = hit(&h, "pinned_body");
-        let btn = h.pal.control_height * 0.7;
+        let btn = h.pal.control_height * 0.55;
         let acts_w = 3.0 * (btn + h.pal.space_xs);
         // 按钮从行右缘向左排，i=0（置顶/取消置顶）是最右一个。
         let x = body.max.x - LIST_PAD_X - acts_w + 0.5 * (btn + h.pal.space_xs);
         let mut hit_any = false;
+        // 按钮现在贴在卡片**右上角**（中心 y ≈ pad_v + btn/2 ≈ 卡片顶
+        // 向下 ~12pt），只扫顶部几条 y 即可。
         for y in [
+            body.min.y + 8.0,
             body.min.y + 12.0,
-            body.min.y + 24.0,
-            body.min.y + 36.0,
+            body.min.y + 20.0,
         ] {
             let ops = h.click_at(pos2(x, y));
             if ops.iter().any(|o| matches!(o, Op::TogglePin(_))) {
@@ -3607,5 +3682,32 @@ fn with_pinned(mut self, n: usize) -> Self {
             ROW_HEIGHT_MIN >= 40.0,
             "两行布局至少需要 40pt：预览 ~19 + 来源 ~13 + 内边距 ~12"
         );
+    }
+
+    /// 大小自适应性：B / KB / MB / GB 进位与小数位取舍。
+    #[test]
+    fn format_size_adapts_units() {
+        assert_eq!(format_size(0), "0 B");
+        assert_eq!(format_size(512), "512 B");
+        assert_eq!(format_size(1023), "1023 B");
+        assert_eq!(format_size(1024), "1.0 KB");
+        assert_eq!(format_size(1536), "1.5 KB");
+        // ≥10 的档位不显示小数：12.06 KB → 12 KB。
+        assert_eq!(format_size(12345), "12 KB");
+        // 临界进位：5 MB → 5120 KB，仍按 KB 显示（未过 MB 档）。
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+        // 跨档：1025 MB → 1.0 GB。
+        assert_eq!(format_size(1025 * 1024 * 1024), "1.0 GB");
+    }
+
+    /// 类型标签中文名与枚举一一对应。
+    #[test]
+    fn kind_label_covers_all_kinds() {
+        use modular_clipboard_core::ClipKind::*;
+        assert_eq!(kind_label(Text), "文本");
+        assert_eq!(kind_label(Html), "HTML");
+        assert_eq!(kind_label(Image), "图片");
+        assert_eq!(kind_label(Files), "文件");
     }
 }
