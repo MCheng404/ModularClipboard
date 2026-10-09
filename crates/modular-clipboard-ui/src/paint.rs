@@ -1735,6 +1735,33 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // `offsets[i] + heights[i]` 随 i 单调递增（offsets 递增、
             // heights 非负），满足 `partition_point` 的分段前提。
             let first = first_visible_row(&offsets, &heights, scroll);
+
+            // ⚠️ 行矩形本身必须避开垂直滚动条（仅**可滚动**时）。
+            //
+            // egui 0.36 默认 `ScrollStyle` 是 **floating**：滚动条
+            // **不占布局宽度**，而是浮在 `content` 右缘覆盖
+            // `[content.max.x - 10, content.max.x]`（宽度见
+            // `ScrollStyle::floating().bar_width = 10.0`）。
+            //
+            // 而滚动条在内容闭包**之后**才注册交互（`scroll_area.rs`
+            // 用 `Sense::CLICK | Sense::DRAG` 注册 `max_bar_rect`），
+            // egui 的 hit-test 规则是「并列取最后注册 = 最上层」
+            // ⇒ **滚动条压过行内所有控件**。
+            //
+            // 早前行矩形用 `content.width()`，最右侧的删除按钮中心
+            // 恰好落进滚动条 ⇒ 列表一多就**点不动**，而条目少（无滚动条）
+            // 时一切正常 —— 「条目少就好、条目多就坏」是这条 bug 的指纹。
+            //
+            // 让行矩形右缘内缩，按钮/文字都以 `r.max.x` 为基准，于是
+            // 自动全部避开，不必逐个改。
+            //
+            // 仅在 `content_h > 视口高`（有滚动条）时让出：否则白白
+            // 损失 10pt 可用宽度。
+            let row_w = if content_h > content.height() {
+                content.width() - SCROLLBAR_RESERVE
+            } else {
+                content.width()
+            };
             for i in first..items.len() {
                 let y = content.min.y + offsets[i] - scroll;
                 if y > content.max.y {
@@ -1742,7 +1769,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 }
                 let r = Rect::from_min_size(
                     pos2(content.min.x, y),
-                    vec2(content.width(), heights[i]),
+                    vec2(row_w, heights[i]),
                 );
                 if r.max.y < content.min.y {
                     continue; // 整行都在可视区上方
@@ -1845,7 +1872,14 @@ const SEARCH_EXPAND_W: f32 = 140.0;
 /// `ScrollArea` 的滚动条画在内容区右缘内侧；若缝隙横条直抵
 /// `content.max.x`，按住滚动条会被系统判成 HTCAPTION 变成拖窗口
 /// （与左右留白拖动区避开滚动条是同一个原因）。
-const SCROLLBAR_RESERVE: f32 = 8.0;
+/// 垂直滚动条占用的宽度。
+///
+/// ⚠️ 必须对齐 egui 的 `ScrollStyle::floating().bar_width`（**10.0**，
+/// 见 egui 0.36.2 `style.rs:646`）。
+///
+/// 早前这里是 8.0，比滚动条实际宽度**小 2pt** —— 于是按它算出的
+/// 「已避开滚动条」的位置，仍然有 2pt 落在滚动条下面。
+const SCROLLBAR_RESERVE: f32 = 10.0;
 
 /// 每行文字的高度倍率。
 const LINE_H: f32 = 1.35;
@@ -2233,6 +2267,23 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     for (i, (icon, op, enabled)) in acts.iter().enumerate() {
         // 三个操作按钮排**卡片右上角**（小图标）：从右缘向左排，
         // 垂直对齐顶部来源行（中心 y = pad_v + btn/2）。
+        //
+        // ⚠️ 基准右缘必须让出 `SCROLLBAR_RESERVE`。
+        //
+        // egui 0.36 默认 `ScrollStyle` 是 **floating** —— 滚动条
+        // **不占布局宽度**，而是浮在 `content` 右缘覆盖
+        // `[content.max.x - 10, content.max.x]`。而 `r.max.x` 恰好等于
+        // `content.max.x`，所以按 `r.max.x` 排的最后一个按钮（删除）
+        // 中心会落在滚动条里。
+        //
+        // 滚动条在内容闭包**之后**才注册交互（`scroll_area.rs` 里用
+        // `Sense::CLICK | Sense::DRAG` 注册 `max_bar_rect`），而 egui 的
+        // hit-test 规则是「并列时取最后注册的 = 最上层」⇒ **滚动条压过
+        // 行内所有控件**。
+        //
+        // 现象（极难自查）：条目少、列表不满一屏时**没有滚动条**，一切
+        // 正常；条目一多（有滚动条）删除按钮就点不动——而这是常态。
+        // 「条目少就好、条目多就坏」是这条 bug 的指纹。
         let b = Rect::from_center_size(
             pos2(
                 r.max.x - acts_w + (i as f32 + 0.5) * (btn + pal.space_xs),
@@ -3115,7 +3166,10 @@ fn with_pinned(mut self, n: usize) -> Self {
         let body = hit(&h, "pinned_body");
         let btn = h.pal.control_height * 0.55;
         let acts_w = 3.0 * (btn + h.pal.space_xs);
-        // 按钮从行右缘向左排，i=0（置顶/取消置顶）是最右一个。
+        // 按钮从「行右缘让出滚动条」处向左排，i=0（置顶/取消置顶）是最右一个。
+        //
+        // 注：置顶区只有 1 条、**没有滚动条**，所以这里不减
+        // `SCROLLBAR_RESERVE`——行矩形只在可滚动时才让出滚动条宽度。
         let x = body.max.x - LIST_PAD_X - acts_w + 0.5 * (btn + h.pal.space_xs);
         let mut hit_any = false;
         // 按钮现在贴在卡片**右上角**（中心 y ≈ pad_v + btn/2 ≈ 卡片顶
@@ -3202,24 +3256,6 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// [`draw_item_row`]），会被裁剪到视口，所以那半截**看得见但
     /// 点不到**——这既让本条断言成立，也正是「顶栏按钮点不动」
     /// 那个 P0 的修法。
-    #[test]
-    /// 混有**超长条目**时，滚到中段仍必须有行被画出来。
-    ///
-    /// # 为什么这条重要
-    ///
-    /// 虚拟化起始行早前用 `offsets[i] + ROW_HEIGHT_MIN <= scroll` 判定
-    /// 「该行已滚过」—— 而 `ROW_HEIGHT_MIN` 是**单行**高度。预览超过
-    /// 1 行的条目，其真实高度远大于它，于是会被误判为「已滚过」而跳过。
-    ///
-    /// 实测推演（heights = [58, 3816, 58]，视口 500，scroll = 200）：
-    /// 第 1 行明明铺满整个视口，却被跳过；第 2 行的 y 又超出视口底
-    /// ⇒ `break` ⇒ **一行都没画，列表整块空白**。
-    ///
-    /// # 为什么现有测试没抓到
-    ///
-    /// `Harness::with_items` 造的文本只有一行（`"第 {i} 条记录…"`），
-    /// 于是所有 `heights[i]` 都等于 `ROW_HEIGHT_MIN`，该 bug 恒不触发。
-    /// 这条用**超长文本**构造，才能真正覆盖到它。
     /// 首行下标必须按**每行实际高度**算，不能用单行高度常量。
     ///
     /// # 为什么这条重要
@@ -3283,6 +3319,72 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
+    /// 列表**可滚动**时，最右侧的「删除」按钮仍必须可点。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// egui 0.36 默认 `ScrollStyle` 是 **floating**：滚动条不占布局宽度，
+    /// 而是浮在 `content` 右缘覆盖 `[content.max.x - 10, content.max.x]`。
+    /// 它又在内容闭包**之后**注册交互，而 egui hit-test 取「最后注册 =
+    /// 最上层」⇒ **滚动条压过行内所有控件**。
+    ///
+    /// 早前行矩形用 `content.width()`，删除按钮（最右一个）中心恰好落进
+    /// 滚动条 ⇒ 条目一多就点不动；条目少（无滚动条）时一切正常。
+    /// 「条目少就好、条目多就坏」是这条 bug 的指纹。
+    ///
+    /// # 为什么现有测试没抓到
+    ///
+    /// `pinned_row_button_can_unpin` 只放 3 条记录、窗口 600pt 高
+    /// ⇒ `content_h` 远小于视口 ⇒ **根本没有滚动条**。
+    ///
+    /// 修法是让**行矩形**在可滚动时右缘内缩 `SCROLLBAR_RESERVE`，
+    /// 按钮与文字都以 `r.max.x` 为基准，于是自动全部避开。
+    #[test]
+    fn delete_button_is_clickable_when_list_is_scrollable() {
+        // 条目足够多，确保撑出滚动条（这是本测试成立的前提）。
+        let mut h = Harness::new("scrollable-delete", vec2(700.0, 400.0)).with_items(40);
+        h.frame();
+
+        let body = hit(&h, "history_body");
+
+        // 前置条件：列表必须真的可滚动，否则测不出差异。
+        // （可滚动 ⟺ 行矩形已内缩 SCROLLBAR_RESERVE）
+        assert!(
+            body.height() < 40.0 * 58.0,
+            "前置条件：40 条应超出 {}pt 的视口，否则没有滚动条",
+            body.height()
+        );
+
+        let btn = h.pal.control_height * 0.55;
+        let acts_w = 3.0 * (btn + h.pal.space_xs);
+        // 行矩形已内缩，按钮基准就是 content.max.x - SCROLLBAR_RESERVE。
+        let right = body.max.x - LIST_PAD_X - SCROLLBAR_RESERVE;
+        // i=2 是删除（最右一个），中心偏左 acts_w - 2.5*(btn+space_xs)。
+        let x = right - acts_w + 2.5 * (btn + h.pal.space_xs);
+
+        let mut hit_any = false;
+        for y in [
+            body.min.y + 8.0,
+            body.min.y + 12.0,
+            body.min.y + 20.0,
+            body.min.y + 28.0,
+        ] {
+            let ops = h.click_at(pos2(x, y));
+            if ops.iter().any(|o| matches!(o, Op::Delete(_))) {
+                hit_any = true;
+                break;
+            }
+        }
+        assert!(
+            hit_any,
+            "可滚动列表的删除按钮必须可点并产生 Delete。\\
+             若失败，多半是行矩形没有让出滚动条宽度 —— \\
+             「条目多就点不动删除」正是这条要守的回归。\\
+             探测点 x={x}（右缘 {right}），body={body:?}"
+        );
+    }
+
+    #[test]
     fn rows_fill_the_list_body_exactly() {
         let mut h = Harness::new("list-fill", vec2(700.0, 500.0)).with_items(60);
         // 第一帧：让 solver 求解、布局落位、拿到 body。
