@@ -6,21 +6,29 @@
 //! 再让每个面板查`Tier::visibility()` 决定自己显示什么。档位与面板的
 //! 交叉组合有 4×5=20 种，每种都要在布局侧与绘制侧各写对一次。
 //!
-//! 本模块没有档位。算法只有三步：
+//! 本模块没有档位。算法只有两步：
 //!
-//! 1. 收集可见卡片的宽度需求；
-//! 2. 够用 → 按`target_width` 比例分配剩余空间；
-//! 3. 不够 → 按 [`CardKind::collapse_priority`] 依次折叠，每折叠一张
-//!    就重新检查，够用即停。
+//! 1. 收集停靠卡片的宽度需求（`target_width`，钳到 ≥1pt）；
+//! 2. 够用 → 按比例分配剩余空间；不够 → **等比缩小**到恰好铺满。
 //!
 //! 输出是「每张卡片的矩形」，绘制层直接读，**不做二次判断**。
+//!
+//! # 为什么没有「折叠降级」
+//!
+//! 早前这里有第三步：宽度不够时按 [`CardKind::collapse_priority`]
+//! 依次把次要卡片**折成把手**（24pt 宽）。该功能已整体移除——
+//! 折叠后卡片只剩一条看不出是什么的细条，用户既不知道那是什么，
+//! 也不知道点哪能展开。窄窗口下卡片变窄虽然拥挤，但列表仍可读、
+//! 可滚动。
+//!
+//! ⚠️ 下一个人若照着本文档改动，请不要把折叠加回来。
 //!
 //! # 不变式（测试逐条守住）
 //!
 //! - `I1` 所有分配到的矩形都在 `area` 内；
 //! - `I2` 任意两张停靠卡片的矩形不相交；
-//! - `I3` 宽度不够时折叠到够用为止，历史卡片永不折叠；
-//! - `I4` 宽度足够时**不折叠任何可折叠卡片**（不无谓降级）。
+//! - `I3` 宽度不够时**等比缩小**到恰好铺满，**绝不折叠**；
+//! - `I4` 参与分配的卡片**宽度恒 > 0**（即使窗口极窄）。
 
 use egui::{Rect, pos2, vec2};
 
@@ -98,7 +106,15 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
             {
                 0.0
             } else {
-                c.target_width
+                // ⚠️ 必须钳到**正数**。`target_width` 是 pub 字段，
+                // 拖分隔条或持久化脏值都可能让它变成 0 甚至负数。
+                //
+                // 后果不只是「这张卡变窄」：`n` 是靠「宽度 > 0」推断
+                // 参与分配的，一旦某张卡宽度为 0，`n` 就少算一个 ⇒
+                // `gaps` 也少算一份 ⇒ **avail 反而变大**，剩下的卡
+                // 突然变宽 —— 布局对窗口宽度变得**非单调**，缩到某点
+                // 时画面会「跳」一下。
+                c.target_width.max(1.0)
             }
         })
         .collect();
@@ -109,8 +125,13 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
             rects: vec![Rect::ZERO; ws.cards.len()],
         };
     }
-    let gaps = ws.gap * (n as f32 - 1.0);
-    let avail = (body.width() - gaps).max(0.0);
+    // ⚠️ `gap` 必须钳到非负：负 gap 会让 `gaps < 0` ⇒ `avail` 大于
+    // `body.width()` ⇒ 卡片总跨度**超出客户区**，画到窗口外。
+    // 无边框窗口外面就是桌面，用户会直接看见。
+    let gaps = ws.gap.max(0.0) * (n as f32 - 1.0);
+    // 每张卡至少 1pt，否则 gap 大时会算出 0 宽卡片（绘制层直接跳过，
+    // 表现为「整窗空白」）。
+    let avail = (body.width() - gaps).max(n as f32);
     let total: f32 = layout.iter().sum();
 
     // 需求 <= 可用：按 target_width 比例分剩余空间（让卡片保持用户设定的比例）。
@@ -168,10 +189,33 @@ pub fn card_area(area: Rect) -> Rect {
 }
 
 /// 把解应用到工作区（写回每张卡片的 `rect`）。
-pub fn apply(ws: &mut Workspace, sol: &Solution) {
+/// 把解写回工作区。
+///
+/// # 为什么长度不等要**拒绝**而不是 `zip` 静默截断
+///
+/// `zip` 在长度不等时静默取短的一边：多出来的卡片**保留上一帧的
+/// `rect`**，绘制层照画 —— 画面错乱却不 panic、不 warn、不 assert。
+/// 调用方在 `solve` 与 `apply` 之间增删卡片、或跨帧复用 `Solution`
+/// 时就会这样。
+///
+/// 退化策略：清空全部矩形（下一帧画不出东西，但**不会画错东西**）
+/// 并返回 `false` 让上层记一笔。
+pub fn apply(ws: &mut Workspace, sol: &Solution) -> bool {
+    if ws.cards.len() != sol.rects.len() {
+        tracing::warn!(
+            cards = ws.cards.len(),
+            rects = sol.rects.len(),
+            "Solution 与 cards 不同序，已丢弃本帧解（否则会画出上一帧的过期矩形）"
+        );
+        for c in ws.cards.iter_mut() {
+            c.rect = Rect::ZERO;
+        }
+        return false;
+    }
     for (c, r) in ws.cards.iter_mut().zip(sol.rects.iter()) {
         c.rect = *r;
     }
+    true
 }
 
 #[cfg(test)]
