@@ -161,6 +161,18 @@ pub struct UiState {
     /// 约定：`[0]` = 历史列表，`[1]` = 置顶列表。经
     /// [`Self::list_scroll`] / [`Self::set_list_scroll`] 访问。
     list_scroll: [f32; 2],
+
+    /// 搜索框 `TextEdit` 的 egui `Id`（本帧绘制时写入）。
+    ///
+    /// # 为什么需要
+    ///
+    /// egui 0.36 的 `Id` 是**哈希值**，`format!("{id:?}")` 只得到
+    /// `Id::new(3070286450358649230)` 这样的数字，没法按名字匹配。
+    /// 于是「点搜索框后焦点是否落在搜索框上」只能退化成「有没有任何
+    /// 控件获得焦点」——那是**恒真**的，点别处也一样通过。
+    ///
+    /// 绘制层把自己用的 id 记下来，测试才能**精确比对**。
+    pub search_edit_id: Option<egui::Id>,
     /// 设置界面是否打开。
     pub show_settings: bool,
     // 注：原先这里有 `settings_scroll`（手写滚动偏移）。设置面板
@@ -606,6 +618,14 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     f.state.hit.insert("search", edit_rect);
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
+            // ⚠️ **必须给显式 id**。不给的话 egui 按调用位置自动生成，
+            // 于是：焦点断言没法稳定地指向它（只能退化成
+            // 「有没有任何控件获得焦点」这种恒真判断），且任何调整
+            // 布局的改动都可能悄悄换掉 id。
+            //
+            // 上面 `icon_button` 同样用 `scope_builder`，它就给了
+            // `.id(Id::new(id))` —— 两处写法必须一致。
+            .id(egui::Id::new("search_edit"))
             .max_rect(edit_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
         |ui| {
@@ -640,6 +660,9 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     // 自己的响应，外层是这次作用域分配整体的响应。
     // 焦点与 id 都要用**内层**的——外层 id 属于作用域，不是输入框。
     let edit_resp = resp.inner;
+
+    // 自报真实 Id，供测试精确判断焦点落在哪个控件上（见字段说明）。
+    f.state.search_edit_id = Some(edit_resp.id);
 
     if edit_resp.has_focus() {
         // 聚焦时描边加强，给出明确的视觉反馈。
@@ -2324,13 +2347,29 @@ fn with_pinned(mut self, n: usize) -> Self {
         //
         // ⚠️ 本版 egui 的 `Context` **没有** `wants_keyboard_input()`，
         // 焦点态要从 `memory` 读。
-        let focused = h
-            .ctx
-            .memory(|m| m.has_focus(egui::Id::new("search_edit")))
-            || h.ctx.memory(|m| m.focused().is_some());
-        assert!(
-            focused,
-            "点搜索框后应有控件持有焦点"
+        //
+        // ⚠️ 判据必须指出**是哪个控件**拿到了焦点。
+        //
+        // 原先是 `has_focus(Id::new("search_edit")) || focused().is_some()`
+        // —— 后半句只要「有任何控件获得焦点」就成立，于是这条断言
+        // 在「点空了别处」的情况下**照样通过**，等于没有断言。
+        // 修掉它之后这条测试立刻变红，正好证明了它此前是恒真的。
+        //
+        //
+        // ⚠️ 也不能按 id 的 debug 串匹配：egui 0.36 的 `Id` 是**哈希值**，
+        // `format!("{id:?}")` 只得到 `Id::new(3070286450358649230)`。
+        //
+        // 所以绘制层把**自己用的那个 id** 记进 `UiState::search_edit_id`，
+        // 测试与它精确比对。
+        let edit_id = h
+            .state
+            .search_edit_id
+            .expect("绘制层应自报搜索框的 egui Id");
+        let focused_id = h.ctx.memory(|m| m.focused());
+        assert_eq!(
+            focused_id,
+            Some(edit_id),
+            "点搜索框后焦点应**精确落在搜索框**上（不是「有控件获得焦点」就算）"
         );
 
         h.frame_with(vec![egui::Event::Text("abc".to_owned())]);
