@@ -703,9 +703,39 @@ fn log_font_loaded(ctx: &egui::Context, defs: &mut FontDefinitions, path: &str) 
     tracing::info!(path, "中文字体已加载");
 }
 
-/// 按缩放比例返回字号。
-pub fn sized(size: f32, scale: f32) -> FontId {
-    FontId::proportional(size * scale.clamp(0.8, 2.0))
+/// 返回指定**逻辑字号**的 [`FontId`]。
+///
+/// # ⚠️ 这里**不能**乘 `pixels_per_point`
+///
+/// egui 的 `FontId::size` 与 `RichText::size(..)` 单位都是**逻辑点**，
+/// 排版时 egui 自己会再乘一次 `pixels_per_point`（见 `epaint` 的
+/// `layout()`：字形位置算在物理像素上，取尺寸时
+/// `cursor_x_px / pixels_per_point`）。
+///
+/// 早前这里写成 `size * scale`，于是**自绘文字被缩放了两次**：
+/// 150% 屏上 `font_md = 14` 最终渲染成 `14 × 1.5 × 1.5 = 31.5` 物理
+/// 像素（视觉放大 2.25 倍）。
+///
+/// # 症状
+///
+/// 与 egui 原生控件（`Button` / `TextEdit` / `DragValue`）字号**不同源**
+/// ——后者直接给逻辑点，所以只有自绘的那部分大。
+///
+/// # 为什么测试测不出来
+///
+/// `Harness` 用的 `egui::Context::default()` 的
+/// `pixels_per_point` 是 **1.0**，此时 `size * 1.0 == size`，
+/// 两种写法结果完全相同。**必须显式用 ppp>1 的夹具才测得出来。**
+///
+/// `scale` 参数保留是为了不改动全部调用点，但**已不再参与计算**——
+/// 留着一个「传了但没用」的参数本身就是误导，故改名为 `_scale`。
+pub fn sized(size: f32, _scale: f32) -> FontId {
+    FontId::proportional(size)
+}
+
+/// [`sized`] 的逻辑字号版本（不需要传 `scale`）。
+pub fn sized_pt(size: f32) -> FontId {
+    FontId::proportional(size)
 }
 
 #[cfg(test)]
@@ -1414,8 +1444,14 @@ mod tests {
 
     #[test]
     fn size_scale_is_clamped() {
-        assert_eq!(sized(12.0, 0.1).size, 9.6);
-        assert_eq!(sized(12.0, 5.0).size, 24.0);
+        // ⚠️ 这条测试原先断言的是**错误行为**：`sized(12.0, 5.0).size == 24.0`
+        // （12 × 2.0钳制）。那正是「字号被 ppp 乘两次」的根源——
+        // egui 排版时自己会再乘一次 `pixels_per_point`。
+        //
+        // 现在 `sized` 恒返回逻辑字号，与 `scale` 无关。
+        assert_eq!(sized(12.0, 0.1).size, 12.0, "极端 scale 不得改变字号");
+        assert_eq!(sized(12.0, 5.0).size, 12.0, "极端 scale 不得改变字号");
+        assert_eq!(sized(12.0, 1.5).size, 12.0, "字号与 ppp 无关");
     }
 
     // ------------------------------------------------------------------

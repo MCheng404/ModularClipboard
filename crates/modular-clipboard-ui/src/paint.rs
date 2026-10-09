@@ -797,7 +797,7 @@ fn settings_header(f: &mut Frame<'_>, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("设置")
-                .size(pal.font_md * scale)
+                .size(pal.font_md)
                 .color(pal.text_bright),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -843,7 +843,7 @@ fn settings_header(f: &mut Frame<'_>, ui: &mut Ui) {
 /// 而 `Op` 侧用「分组 + 字段名字符串」把新增成本降到两行。
 fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
     let pal = f.pal;
-    let scale = f.scale;
+    let _ = f.scale;
     let cur = f.ws.pinned_mode();
 
     // ⚠️ 必须把配置值**逐个拷出来**，不能 `let cfg = &f.svc.state.config`
@@ -867,7 +867,7 @@ fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
             // `selectable_label` 自带选中态与键盘响应，替代原先
             // 手绘的圆点 + 描边矩形。
             if ui
-                .selectable_label(cur == mode, egui::RichText::new(label).size(pal.font_sm * scale))
+                .selectable_label(cur == mode, egui::RichText::new(label).size(pal.font_sm))
                 .on_hover_text(desc)
                 .clicked()
                 && cur != mode
@@ -1532,7 +1532,9 @@ const LINE_H: f32 = 1.35;
 fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, text_w: f32) -> f32 {
     let preview_font = sized(pal.font_sm, scale);
     let meta_font = sized(pal.font_xs, scale);
-    let line_h = pal.font_sm * scale * LINE_H;
+    // ⚠️ 行高也必须用**逻辑点**、不乘 ppp：字号已经改成逻辑点，
+    // 这里再乘一次会让行高与实际字形高度对不上（留白/裁剪都错）。
+    let line_h = pal.font_sm * LINE_H;
     let meta_h = meta_font.size.max(10.0);
 
     // 折行一次，拿到实际行数。
@@ -1770,7 +1772,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         //
         // ⚠️ **不能设 0**：egui 文档写明「If set to 0, no text will be
         // outputted」——0 表示一行都不输出。默认值 `usize::MAX` 才是「不限」。
-        job.wrap.max_rows = ((preview_band.height() / (pal.font_sm * scale * LINE_H))
+        job.wrap.max_rows = ((preview_band.height() / (pal.font_sm * LINE_H))
             .floor()
             .max(1.0)) as usize;
         // 长路径/无空格的长串要在任意字符间断行，否则会横向溢出。
@@ -2403,6 +2405,60 @@ fn with_pinned(mut self, n: usize) -> Self {
             hist.rect.width() > 40.0,
             "窄窗口下历史栏宽度应仍可用（不折叠成把手），实际={:?}",
             hist.rect
+        );
+    }
+
+    /// 字号必须是**逻辑点**，不能被 DPI 乘两次（P2-8）。
+    ///
+    /// # 为什么这条能抓到
+    ///
+    /// `Harness` 默认 `pixels_per_point == 1.0`，此时
+    /// `size * scale == size`，两种写法结果**完全相同**——
+    /// 这正是这个 bug 能长期存活的原因。
+    ///
+    /// 所以这里直接断言函数契约，不依赖夹具的 ppp：
+    /// `sized(14, 1.5)` 必须等于 `FontId::proportional(14)`。
+    /// 若有人改回乘 ppp，这条立刻红。
+    #[test]
+    fn font_size_is_in_logical_points_not_pixels() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            assert_eq!(
+                crate::theme::sized(14.0, scale),
+                egui::FontId::proportional(14.0),
+                "字号不能随 pixels_per_point 变化（scale={scale}）——                  egui 排版时自己会乘一次 ppp，这里再乘就是缩放两次"
+            );
+        }
+    }
+
+    /// 150% 缩放下，自绘文字的行高必须仍与 egui 原生控件同源。
+    ///
+    /// 守的是「自绘与原生控件字号一致」这个契约：两边都给逻辑点，
+    /// 渲染出的物理大小才相同。早前只有 `TextEdit` 遵守（它直接用
+    /// 逻辑字号），其余 `painter_at().text()` 全部乘了 ppp，
+    /// 于是卡片标题、条目预览比旁边的按钮大 1.5 倍。
+    #[test]
+    fn self_drawn_text_matches_native_widget_size() {
+        let pal = crate::theme::Palette::light();
+        // 自绘路径
+        let drawn = crate::theme::sized(pal.font_md, 1.5);
+        // 原生控件路径：egui 的 `RichText::size` 收**逻辑点**。
+        // 不用 `into_font_id()`（egui 0.36 没有这个方法），改为断言
+        // 两条路径产出同一个 `FontId`——这正是「同源」的可测形式。
+        let native_job = {
+            let mut job = egui::text::LayoutJob::default();
+            job.append(
+                "x",
+                0.0,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(pal.font_md),
+                    ..Default::default()
+                },
+            );
+            job
+        };
+        assert_eq!(
+            drawn.size, native_job.sections[0].format.font_id.size,
+            "自绘文字与 egui 原生控件的字号必须一致（都用逻辑点），             否则高 DPI 下自绘那部分会大一倍"
         );
     }
 
