@@ -61,8 +61,9 @@ enum Signal {
 }
 
 /// 应用服务。
-/// 自写抑制窗口：写回剪贴板后这段时间内忽略捕获。
-const SELF_WRITE_GUARD_MS: i64 = 900;
+/// 自写抑制窗口的**下限**（毫秒）。实际窗口按轮询间隔动态计算，
+/// 见 [`self_write_guard_ms`]。
+const SELF_WRITE_GUARD_MS_FLOOR: i64 = 900;
 
 pub struct Service {
     pub store: Store,
@@ -212,6 +213,8 @@ impl Service {
         let running = Arc::new(AtomicBool::new(true));
         let counted = Arc::new(AtomicU64::new(0));
         let interval = self.state.config.capture.poll_interval_ms.max(50);
+        // 捕获线程要用它算抑制窗口（见 `self_write_guard_ms`）。
+        let interval_ms = interval as i64;
         let last_self_write = self.last_self_write.clone();
 
         // rtrb 的 Producer 不可克隆，因此在启动捕获时新建队列，
@@ -259,7 +262,7 @@ impl Service {
                     // 抑制期内的用户复制（900ms 窗口内，概率极低）会被吸收进
                     // 基线，这正是抑制语义的本意：抑制期内的一切变化都视为
                     // 自写引起。
-                    if capture_should_read(&mut reader, now, last)
+                    if capture_should_read(&mut reader, now, last, interval_ms)
                         && let Some(payload) = reader.read()
                     {
                         c.fetch_add(1, Ordering::Relaxed);
@@ -445,6 +448,21 @@ impl Service {
         let bytes = self.store.load_payload(&item)?;
         let mut reader = ClipboardReader::new()?;
 
+        // ⚠️ 抑制必须在**写之前**武装，不能等写完再标。
+        //
+        // 早前 `suppress_self_capture()` 在 `match item.kind` **之后**，
+        // 于是从「剪贴板已被改写（序列号 +1）」到「抑制生效」之间存在
+        // 一段窗口（Win32 调用 + 一次 `store.touch` 的 SQLite 写）。
+        // 捕获线程若在这段里醒来，看到的 `last_self_write` 仍是旧值
+        // ⇒ 判定为「用户的新复制」⇒ **把自己刚写回的内容又记一条**。
+        //
+        // 默认 `poll_interval_ms = 300`，该窗口通常 1~5ms，单次命中率
+        // 约 0.3%~1.7% —— 一天点几十次历史条目就会稳定复现。
+        //
+        // 现象：从历史里点一条复制出去，列表顶部立刻多出一条内容
+        // 相同的记录。
+        self.suppress_self_capture();
+
         match item.kind {
             ClipKind::Text | ClipKind::Html => {
                 reader.write_text(&String::from_utf8_lossy(&bytes))?;
@@ -465,8 +483,6 @@ impl Service {
         }
 
         self.store.touch(id).ok();
-        // 标记抑制，避免刚写入的内容被当成新捕获。
-        self.suppress_self_capture();
         Ok(())
     }
 
@@ -586,10 +602,42 @@ impl Service {
 ///
 /// `now` 为当前墙钟（Unix 毫秒），`last_self_write` 为上次自写回时刻。
 /// 减法必须用 `saturating_sub`：墙钟可能被 NTP 校时或手动改时间回拨，
+/// 自写抑制窗口，按**轮询间隔**动态计算。
+///
+/// # 为什么不能是常量
+///
+/// 设自写发生在 T，捕获线程上一轮在 `t0 ∈ (T-I, T]` 唤醒（I = 轮询间隔），
+/// 下一轮在 `t0+I`，此时 `since = t0 + I - T`。最坏情形 `t0 → T`，
+/// `since → I`。
+///
+/// 因此抑制窗口必须 **> I** 才能保证「自写后的第一轮一定落在窗口内」。
+/// 早前 `SELF_WRITE_GUARD_MS` 是常量 900，而 `poll_interval_ms` 只夹
+/// 下限（50）、**无上限**——用户在设置面板把间隔调到 1000ms（省电是很
+/// 自然的动机）就会让 `since ≥ 900` 成立 ⇒ **抑制彻底失效**，此后每次
+/// 从历史写回都多记一条。
+///
+/// 取 `2*I + 200`：覆盖「上一轮刚好在写之前唤醒」的最坏情形，并留余量。
+///
+/// # 已知取舍
+///
+/// 窗口越大，自写之后**用户真实的复制**被一并吞掉的概率越高（它们会被
+/// `changed()` 吸收进基线后丢弃）。这是时间窗方案的固有代价。更彻底的
+/// 解法是**计数式抑制**（写前 `fetch_add(1)`，捕获线程消费一次），
+/// 与轮询间隔、墙钟回拨、NTP 校时全部解耦 —— 但那需要跨线程共享计数器，
+/// 改动面大，留待后续。
+fn self_write_guard_ms(poll_interval_ms: i64) -> i64 {
+    (2 * poll_interval_ms + 200).max(SELF_WRITE_GUARD_MS_FLOOR)
+}
+
 /// 无符号减法会下溢成巨值，让抑制永久失效（见捕获线程的注释）。
-fn capture_should_read(reader: &mut ClipboardReader, now: i64, last_self_write: i64) -> bool {
+fn capture_should_read(
+    reader: &mut ClipboardReader,
+    now: i64,
+    last_self_write: i64,
+    poll_interval_ms: i64,
+) -> bool {
     let since = now.saturating_sub(last_self_write);
-    reader.changed() && since >= SELF_WRITE_GUARD_MS
+    reader.changed() && since >= self_write_guard_ms(poll_interval_ms)
 }
 
 /// 单页最多加载的条目数。
@@ -689,6 +737,41 @@ pub fn format_time(ts_ms: i64, now_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// 抑制窗口必须**始终大于**轮询间隔，否则间隔调大时抑制失效。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// 设自写发生在 T，捕获线程上一轮在 `t0 ∈ (T-I, T]` 唤醒，下一轮
+    /// 在 `t0+I`，`since = t0 + I - T`；最坏情形 `t0 → T` 时
+    /// `since → I`。所以窗口必须 **> I** 才能保证自写后的第一轮落在
+    /// 窗口内。
+    ///
+    /// 早前用常量 900，而 `poll_interval_ms` 无上限 —— 用户把间隔调到
+    /// 1000ms 就让 `since ≥ 900` 成立 ⇒ 抑制彻底失效 ⇒ 每次从历史写回
+    /// 都多记一条重复记录。
+    #[test]
+    fn self_write_guard_exceeds_poll_interval() {
+        // 只夹下限（50）之后的所有合法间隔值。
+        for interval in [50i64, 100, 300, 500, 900, 1000, 2000, 5000] {
+            let guard = self_write_guard_ms(interval);
+            assert!(
+                guard > interval,
+                "间隔 {interval}ms 时抑制窗口 {guard}ms 必须 > 间隔，                 否则「自写后的第一轮」会落在窗口外 ⇒ 抑制失效"
+            );
+        }
+    }
+
+    /// 间隔小于默认下限时，窗口退回下限（不必无限增大）。
+    #[test]
+    fn self_write_guard_floors_at_minimum() {
+        assert_eq!(
+            self_write_guard_ms(50),
+            SELF_WRITE_GUARD_MS_FLOOR,
+            "小间隔时窗口应取下限，避免过度吞掉用户的真实复制"
+        );
+    }
+
     use super::*;
 
     fn payload(kind: ClipKind, text: &str) -> CapturedPayload {
@@ -932,14 +1015,19 @@ mod tests {
         // 1. 抑制期内（since = 0 < 900）：不读取；
         //    但基线必须已推进——自写导致的变化被吸收。
         assert!(
-            !capture_should_read(&mut reader, last_self_write, last_self_write),
+            !capture_should_read(&mut reader, last_self_write, last_self_write, 300),
             "抑制期内不应读取剪贴板"
         );
 
         // 2. 抑制期结束后（since = 900）：序列号无新变化 ⇒ 仍不读取。
         //    旧实现在这里返回 true——把自写回当成用户新复制（bug）。
         assert!(
-            !capture_should_read(&mut reader, last_self_write + SELF_WRITE_GUARD_MS, last_self_write),
+            !capture_should_read(
+                &mut reader,
+                last_self_write + self_write_guard_ms(300),
+                last_self_write,
+                300,
+            ),
             "自写回的内容在抑制期结束后被重新捕获——每次写回历史都多记一条重复记录"
         );
 
@@ -949,7 +1037,12 @@ mod tests {
             writer.write_text("tiez-new-user-copy").ok();
         }
         assert!(
-            capture_should_read(&mut reader, last_self_write + SELF_WRITE_GUARD_MS + 1, last_self_write),
+            capture_should_read(
+                &mut reader,
+                last_self_write + self_write_guard_ms(300) + 1,
+                last_self_write,
+                300,
+            ),
             "用户的新复制必须能被捕获线程读到"
         );
 
