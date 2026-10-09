@@ -145,8 +145,15 @@ pub struct UiState {
     pub drag_regions: Vec<Rect>,
     /// 当前悬停的卡片。
     pub hover_card: Option<crate::card::CardId>,
-    /// 列表滚动偏移（逻辑点）。
-    pub scroll_offset: f32,
+    /// 列表滚动偏移（逻辑点），**按列表分开存**。
+    ///
+    /// ⚠️ 主栏历史列表与内嵌置顶区是两个独立列表。早前共用一个
+    /// `f32`，而绘制每帧都会把它灌进 `ScrollArea`，于是滚其中一个
+    /// 会把另一个一起带走。
+    ///
+    /// 约定：`[0]` = 历史列表，`[1]` = 置顶列表。经
+    /// [`Self::list_scroll`] / [`Self::set_list_scroll`] 访问。
+    list_scroll: [f32; 2],
     /// 设置界面是否打开。
     pub show_settings: bool,
     // 注：原先这里有 `settings_scroll`（手写滚动偏移）。设置面板
@@ -176,6 +183,18 @@ impl UiState {
 
     fn push(&mut self, op: Op) {
         self.ops.push(op);
+    }
+
+    /// 取某个列表的滚动偏移。
+    ///
+    /// `pinned = true` 取内嵌置顶区，`false` 取主栏历史列表。
+    pub fn list_scroll(&self, pinned: bool) -> f32 {
+        self.list_scroll[usize::from(pinned)]
+    }
+
+    /// 写某个列表的滚动偏移（见 [`Self::list_scroll`]）。
+    pub fn set_list_scroll(&mut self, pinned: bool, v: f32) {
+        self.list_scroll[usize::from(pinned)] = v;
     }
 }
 
@@ -1270,6 +1289,13 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
         body,
     );
 
+    // 本列表用哪个滚动槽位。
+    //
+    // ⚠️ 两个列表的滚动位置必须**分开存**。早前共用一个
+    // `f32`，而 `vertical_scroll_offset` 每帧都会把它写进 egui ——
+    // 于是滚主栏会把内嵌置顶区一起带走（反之亦然）。
+    let pinned_slot = only_pinned == Some(true);
+
     // 过滤：全部 / 仅置顶。
     let items: Vec<ClipItem> = f
         .svc
@@ -1324,18 +1350,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 滚动偏移夹在 `[0, content_h - 可视高]`：不夹的话快速滚到底后
     // 列表会整体上移、最后几项「跳」出可视区。
     let max_scroll = (content_h - body.height()).max(0.0);
-    f.state.scroll_offset = f.state.scroll_offset.clamp(0.0, max_scroll);
-
-    // 滚轮：只有在指针悬停于本列表时才消费，否则会抢走整个窗口的滚动。
-    // 步长取可视高的 1/3，与原生滚动条的手感一致。
-    if f.ui.rect_contains_pointer(body) {
-        let delta = f.ui.input(|i| i.smooth_scroll_delta.y);
-        if delta != 0.0 {
-            f.state.scroll_offset =
-                (f.state.scroll_offset - delta * body.height() / 3.0).clamp(0.0, max_scroll);
-            f.ui.ctx().request_repaint();
-        }
-    }
+    let scroll = f.state.list_scroll(pinned_slot).clamp(0.0, max_scroll);
 
     // # 为什么用 `ScrollArea::show` 而不是 `show_rows`
     //
@@ -1356,13 +1371,25 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             .max_rect(body)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
-    egui::ScrollArea::vertical()
+    let out = egui::ScrollArea::vertical()
         // ⚠️ 0.36 用 `id_salt`（不再是旧版的 `id_source`）。
         // 必须给：主栏与内嵌置顶区是两个独立列表，共用默认 Id 会
         // 共享滚动位置——滚主栏会把置顶区一起带走。
-        .id_salt(("history_scroll", only_pinned.unwrap_or(false)))
+        .id_salt(("history_scroll", pinned_slot))
         .max_height(body.height())
-        .vertical_scroll_offset(f.state.scroll_offset)
+        // 每帧把我们存的偏移灌进去：虚拟化要在 `show` **之前**知道
+        // 滚到哪了，而 `ScrollArea` 自己的状态只在结束后才拿得到。
+        .vertical_scroll_offset(scroll)
+        // 滚轮交给 egui 处理，步长用 multiplier 调。
+        //
+        // ⚠️ 这里**不能**再自己读 `smooth_scroll_delta` 手动加一次：
+        // `ScrollArea` 内部已经消费了同一个事件（它同样只在指针悬停
+        // 于本区域时生效），两边叠加会以两倍速度滚。早前就是双份的。
+        //
+        // 平台层一个刻度 = 1.0 行（见 `wheel_lines`），egui 默认
+        // `line_scroll_speed = 40`，即 40pt/刻度 ≈ 1 行，太慢；
+        // ×3 对齐 Windows 的「一个刻度滚 3 行」惯例。
+        .wheel_scroll_multiplier(egui::vec2(1.0, 3.0))
         .auto_shrink([false, false])
         .show(&mut list_ui, |ui| {
             // 内容高度决定滚动条比例，必须显式给出，否则 egui 按
@@ -1385,7 +1412,6 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 正确做法与改 ScrollArea 之前一致——用绝对坐标：
             // `body.min.y + offsets[i] - scroll`。ScrollArea 在这套
             // 手工虚拟化里的作用只剩**裁剪**与**滚动条**。
-            let scroll = f.state.scroll_offset;
             let first = offsets.partition_point(|&o| o + ROW_HEIGHT_MIN <= scroll);
             for i in first..items.len() {
                 let y = body.min.y + offsets[i] - scroll;
@@ -1402,6 +1428,16 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 draw_item_row(f, ui, r, &items[i]);
             }
         });
+
+    // ---- 回读 egui 的真实滚动位置 --------------------------------
+    //
+    // ⚠️ 必须回读，否则**拖动滚动条无效**：拖动改变的是 `ScrollArea`
+    // 自己的状态，而我们每帧开头又用旧值把它覆盖回去了。
+    //
+    // 回读后两者就一致了：滚轮、拖条、触屏都由 egui 处理，我们只
+    // 是把结果镜像一份，供**下一帧**的虚拟化使用。
+    let reported = out.state.offset.y;
+    f.state.set_list_scroll(pinned_slot, reported.clamp(0.0, max_scroll));
 }
 
 /// 列表行的**最小**高度（逻辑点）。
@@ -2356,12 +2392,12 @@ mod tests {
         assert!(body.height() > 60.0, "历史卡片应有可用高度，实际={body:?}");
 
         // 滚到最底部（下一帧会被夹到 `max_scroll`）。
-        h.state.scroll_offset = f32::MAX;
+        h.state.set_list_scroll(false, f32::MAX);
         h.frame();
         assert!(
-            h.state.scroll_offset > 100.0,
+            h.state.list_scroll(false) > 100.0,
             "前置条件：应处于已滚动状态（否则测不出差异），实际={}",
-            h.state.scroll_offset
+            h.state.list_scroll(false)
         );
 
         let x = body.center().x;
