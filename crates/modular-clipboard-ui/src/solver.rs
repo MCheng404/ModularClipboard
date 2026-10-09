@@ -77,7 +77,15 @@ impl Solution {
 /// 次要卡片折成把手）。已随折叠功能整体移除：主界面固定为
 /// 置顶 + 历史两栏，窄窗口下平分宽度即可，折叠只会让用户
 /// 「找不到历史在哪」。
-pub fn solve(ws: &Workspace, area: Rect) -> Solution {
+/// 按 `scale`（`pixels_per_point`）求解，落位对齐设备像素栅格。
+///
+/// # 为什么要scale
+///
+/// 落位若直接用浮点累加，ppp=1.5（本项目默认场景）时卡片边界落在
+/// 非整数设备像素上 ⇒ 1px 描边发虚、相邻卡的描边叠成 2px、末张卡
+/// 右缘可能超出 `body.max.x` 约 1e-5pt 或留一条亚像素缝。
+/// 详见落位循环处的说明。
+pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
     let body = card_area(area);
     if body.width() <= 0.0 || body.height() <= 0.0 {
         return Solution {
@@ -169,15 +177,48 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
 
     // ---- 步骤 4：落位 --------------------------------------------------
     let mut rects = vec![Rect::ZERO; ws.cards.len()];
-    let mut x = body.min.x;
+    // ---- 落位：对齐像素栅格 + 末张吃掉余数 --------------------------
+    //
+    // ⚠️ 不能直接用浮点 `x`/`w` 累加：
+    //
+    // 1. ppp=1.5（本项目默认场景）时，卡片边界落在非整数设备像素上
+    //    ⇒ 1px 描边发虚、相邻卡的描边叠成 2px、末张卡右缘可能超出
+    //    `body.max.x` 约 1e-5pt 或留一条亚像素缝；
+    // 2. 逐项 `extra * (w / total_f)` 累加的误差会漂移，总和不等于
+    //    `avail`。
+    //
+    // 做法：宽度先按**设备像素**取整，最后一张直接取
+    // `body.max.x - x` 吃掉全部余数 —— 这样右边界必然精确对齐。
+    let ppp = scale.max(0.01);
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let gap_s = snap(ws.gap.max(0.0));
+    let right = body.max.x;
+
+    let mut x = snap(body.min.x);
+    let last_idx = widths.iter().rposition(|&w| w > 0.0);
     for (idx, &w) in widths.iter().enumerate() {
-        if w > 0.0 {
-            rects[idx] = Rect::from_min_size(pos2(x, body.min.y), vec2(w, body.height()));
-            x += w + ws.gap;
+        if w <= 0.0 {
+            continue;
         }
+        let w = if Some(idx) == last_idx {
+            // 末张：右缘精确贴到 body.max.x
+            (right - x).max(1.0 / ppp)
+        } else {
+            snap(w).max(1.0 / ppp)
+        };
+        rects[idx] = Rect::from_min_size(pos2(x, body.min.y), vec2(w, body.height()));
+        x += w + gap_s;
     }
 
     Solution { rects }
+}
+
+/// 按 `scale = 1.0` 求解（不额外对齐栅格）。
+///
+/// 供测试与「不需要像素对齐」的调用方使用。生产路径请用
+/// [`solve_scaled`]，传入真实的 `pixels_per_point`。
+pub fn solve(ws: &Workspace, area: Rect) -> Solution {
+    solve_scaled(ws, area, 1.0)
 }
 
 /// 卡片可用区：扣掉顶部标题栏与底部状态栏。
@@ -188,7 +229,6 @@ pub fn card_area(area: Rect) -> Rect {
     )
 }
 
-/// 把解应用到工作区（写回每张卡片的 `rect`）。
 /// 把解写回工作区。
 ///
 /// # 为什么长度不等要**拒绝**而不是 `zip` 静默截断
@@ -217,6 +257,72 @@ pub fn apply(ws: &mut Workspace, sol: &Solution) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+    /// 落位必须对齐**设备像素**栅格（S7）。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// 早前落位是浮点累加（`x += w + gap`），不做任何对齐。ppp=1.5
+    /// 时卡片边界落在非整数设备像素上，表现为 1px 描边发虚、相邻卡的
+    /// 描边叠成 2px、末张卡右缘超出或留亚像素缝。
+    ///
+    /// 测试夹具的 ppp 是 1.0，所以这条**必须显式传 1.5** 才测得出来。
+    #[test]
+    fn placement_snaps_to_device_pixels_at_high_dpi() {
+        let ppp = 1.5f32;
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 533.33));
+        let mut ws = Workspace::default();
+        // 多加几张卡，确保宽度不被整除。
+        for k in [
+            crate::card::CardKind::Detail,
+            crate::card::CardKind::Rail,
+            crate::card::CardKind::Pinned,
+        ] {
+            let _ = ws.add(k);
+        }
+        let sol = solve_scaled(&ws, area, ppp);
+
+        for (i, r) in sol.rects.iter().enumerate() {
+            if r.width() <= 0.0 {
+                continue;
+            }
+            for (which, v) in [("min.x", r.min.x), ("min.y", r.min.y), ("max.x", r.max.x)] {
+                let dev = v * ppp;
+                assert!(
+                    (dev - dev.round()).abs() < 1e-3,
+                    "卡片 {i} 的 {which}={v} 落在非整数设备像素 {dev} ——                      描边会发虚（ppp={ppp}）"
+                );
+            }
+        }
+    }
+
+    /// 最后一张卡的右缘必须**精确**贴到可用区右缘。
+    ///
+    /// 浮点累加会漂移：逐项加起来的和不一定恰好等于 `avail`，
+    /// 差值约 1e-5pt——肉眼看是亚像素缝，实机上就是一条细线。
+    #[test]
+    fn last_card_right_edge_exactly_meets_body() {
+        let ppp = 1.5f32;
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(701.0, 533.0)); // 故意用非整除宽度
+        let mut ws = Workspace::default();
+        for k in [
+            crate::card::CardKind::Detail,
+            crate::card::CardKind::Rail,
+            crate::card::CardKind::Pinned,
+        ] {
+            let _ = ws.add(k);
+        }
+        let sol = solve_scaled(&ws, area, ppp);
+        let body = card_area(area);
+        let last = sol.rects.iter().rev().find(|r| r.width() > 0.0).expect("至少一张卡");
+        assert!(
+            (last.max.x - body.max.x).abs() < 1e-3,
+            "末张卡右缘应精确贴到可用区右缘，差={}（body={body:?} last={last:?}）",
+            last.max.x - body.max.x
+        );
+    }
+
 
 #[cfg(test)]
 mod tests {
@@ -297,12 +403,16 @@ mod tests {
         600.0, 700.0, 800.0, 900.0, 1000.0, 1200.0,
     ];
 
-    /// 内嵌置顶时，历史栏必须**铺满整个可用宽度**。
+    /// 扫一遍各种窗口宽度，每档都校验三条不变式（S10）。
     ///
-    /// # 这条守住什么
+    /// # 为什么必须有这条
     ///
-    /// 内嵌的置顶卡片宽度必须是 0，历史栏才能吃掉全部剩余宽度。
-    /// 早前 `solve` 只看 `c.host == Docked`，给置顶也分了一栏——
+    /// `check()` 与 `SCAN_W` 早前就存在，但**没有任何测试调用它们**
+    /// （编译器报dead code）—— 于是不变式检查器形同虚设。
+    ///
+    /// 覆盖组合也要比原来宽：原来只扫 `Workspace::default()`
+    /// （gap=0、只有历史一张参与分配），任何宽度下都拿满可用宽度，
+    /// 触发不到「0 宽」「gap 吃光 avail」这些风险区间。
     /// 实测界面左边空出约 1/3、历史栏只占右边 2/3。
     #[test]
     fn embedded_pinned_leaves_history_full_width() {
@@ -337,10 +447,30 @@ mod tests {
         let mut fails = Vec::new();
         for &w in SCAN_W {
             let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(w, 533.33));
+
             let ws = Workspace::default();
-            let sol = solve(&ws, area);
-            for msg in check(&ws, &sol, area) {
-                fails.push(format!("宽 {w}: {msg}"));
+            for msg in check(&ws, &solve_scaled(&ws, area, 1.5), area) {
+                fails.push(format!("默认布局 宽 {w}: {msg}"));
+            }
+
+            // ⚠️ 覆盖组合必须够宽（S10）。
+            //
+            // 原来只扫 `Workspace::default()`：gap=0、只有历史一张参与
+            // 分配，任何宽度下都**拿满**可用宽度——于是永远触发不到
+            // 「0 宽」「gap 吃光 avail」这些风险区间。
+            // 这里额外扫「三张卡 + gap=6」：窗口很窄时 `gaps` 会吃掉
+            // 大部分 `avail`，那才是真正会出事的地方。
+            let mut ws2 = Workspace::empty();
+            for k in [
+                crate::card::CardKind::History,
+                crate::card::CardKind::Detail,
+                crate::card::CardKind::Rail,
+            ] {
+                let _ = ws2.add(k);
+            }
+            ws2.gap = 6.0;
+            for msg in check(&ws2, &solve_scaled(&ws2, area, 1.5), area) {
+                fails.push(format!("三卡+gap6 宽 {w}: {msg}"));
             }
         }
         assert!(fails.is_empty(), "以下宽度违反不变式：\n{}", fails.join("\n"));

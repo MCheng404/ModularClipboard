@@ -986,7 +986,9 @@ impl App {
         // 消除「布局算一遍、绘制再判一遍」的关键。
         let area = ui.max_rect();
         let ppp = ui.ctx().pixels_per_point();
-        let sol = crate::solver::solve(&self.ws, area);
+        // ⚠️ 必须传真实的 `ppp`：落位要对齐**设备**像素栅格，
+        // 否则高DPI 下卡片边界落在半像素上，描边发虚。
+        let sol = crate::solver::solve_scaled(&self.ws, area, ppp);
         crate::solver::apply(&mut self.ws, &sol);
 
         if std::env::var_os("MC_DIAG").is_some() {

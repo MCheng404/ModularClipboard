@@ -2116,7 +2116,10 @@ fn with_pinned(mut self, n: usize) -> Self {
             // 这里复刻 `App::draw_frame` 的顺序：先 solve+apply，再画。
             // ⚠️ 必须放在解构 `self` 之前：解构出的 `&self.ws`
             // 会让它在后面无法可变借用。
-            let sol = crate::solver::solve(&self.ws, self.area);
+            // 与 `App::draw_frame` 用同一个 scale（生产路径传真实 ppp；
+            // 测试夹具的 ppp 恰好是 1.0，`solve` 与 `solve_scaled` 等价）。
+            let ppp = self.ctx.pixels_per_point();
+            let sol = crate::solver::solve_scaled(&self.ws, self.area, ppp);
             crate::solver::apply(&mut self.ws, &sol);
             let (svc, ws, state, pal, area) =
                 (&mut self.svc, &self.ws, &mut self.state, &self.pal, self.area);
