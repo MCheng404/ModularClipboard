@@ -296,6 +296,12 @@ pub fn run_with_options(
     // debug 日志刷成流水账，而拖动区平时是稳定的。
     // 拖动区段数（仅用于日志去重）。
     let mut last_drag_count = usize::MAX;
+    // 上次把主窗口位置落盘的时刻（实时记忆用防抖）。
+    //
+    // 位置只在退出时保存的话，强杀/崩溃（任务管理器、断电）会丢掉
+    // 用户最后的拖动结果。这里每帧比对，变化超过阈值后防抖落盘——
+    // 拖动停止后最多 500ms 内写入，崩溃最多丢最后一次拖动。
+    let mut last_pos_save: Option<std::time::Instant> = None;
 
     while !quit {
         // ---- 1. 事件 ----
@@ -675,6 +681,36 @@ pub fn run_with_options(
             );
         }
 
+        // ---- 4.6 窗口位置实时记忆（防抖落盘）----
+        //
+        // 只靠退出路径保存的话，强杀/崩溃（任务管理器、断电、蓝屏）
+        // 会丢掉用户最后的拖动结果。这里每帧比对一次主窗口位置：
+        // 与上次记录相差超过 1 逻辑点、且距上次落盘 ≥500ms 才写盘。
+        //
+        // ⚠️ 不落盘时**不更新** `last_pos_save`：否则最小化返回的
+        // `(-32000,-32000)` 触发一次「无效坐标」后，防抖计时被清掉，
+        // 接下来 500ms 内恢复窗口到合法位置也写不进去。
+        //
+        // 写入的是逻辑点（`screen_position_points` 已除 scale），
+        // 与启动恢复路径（`move_to(p.x * s)`）同单位，无需额外换算。
+        let pos = window.screen_position_points();
+        let moved = match app.svc.state.config.ui.window_pos {
+            Some(p) => (p.x - pos.x).abs() > 1.0 || (p.y - pos.y).abs() > 1.0,
+            None => true,
+        };
+        if moved {
+            let now = std::time::Instant::now();
+            let due = last_pos_save
+                .map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_millis(500));
+            if due && app.persist_window_pos(pos) {
+                if let Err(e) = app.svc.save_config() {
+                    tracing::warn!(%e, "实时保存窗口位置失败");
+                } else {
+                    last_pos_save = Some(now);
+                }
+            }
+        }
+
         // ---- 5. 节流 ----
         // 无事件时不要空转烧 CPU。egui 请求了延时重绘就按它等待。
         //
@@ -718,7 +754,10 @@ pub fn run_with_options(
         }
     }
     children.close_all();
-    app.persist_window_pos(main_pos);
+    // 退出路径也存一次（兜底：窗口全程没移动过、实时记忆没触发时，
+    // 这里确保位置仍落盘）。返回值 `false` 说明窗口处于最小化等
+    // 无效状态，跳过即可。
+    let _ = app.persist_window_pos(main_pos);
     app.shutdown();
     // `painter` 与 `fr` 借用 `gpu`，必须在 `gpu` 之前 drop。
     drop(painter);
@@ -1247,7 +1286,10 @@ impl App {
     ///
     /// `App` **不持有窗口**（窗口在 `run()` 的栈上），所以位置由
     /// 调用方从窗口句柄读出后注入。
-    pub fn persist_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
+    ///
+    /// 返回 `true` 表示已写入配置；坐标无效（最小化 `-32000`、非有限值）
+    /// 时返回 `false` 且不写入——调用方据此决定是否推进防抖计时。
+    pub fn persist_window_pos(&mut self, p: egui::epaint::emath::Vec2) -> bool {
         // ⚠️ 必须拒绝**无效坐标**，否则下次启动窗口跑到屏幕外。
         //
         // `screen_position_points()` 走 `GetWindowRect`，而它对
@@ -1257,11 +1299,16 @@ impl App {
         // 窗口在屏幕外，用户只看到托盘图标，主界面「不见了」。
         //
         // 负坐标在任何多显示器布局下都几乎不可能是真实位置。
-        if p.x < -32000.0 || p.y < -32000.0 || !p.is_finite() {
+        //
+        // ⚠️ 必须用 `<=` 而不是 `<`：`GetWindowRect` 对最小化窗口
+        // 返回的正是 `(-32000, -32000)`（**等于**哨兵值），严格小于
+        // 会让它漏过去、把最小化位置写进配置，下次启动窗口跑屏幕外。
+        if p.x <= -32000.0 || p.y <= -32000.0 || !p.is_finite() {
             tracing::debug!(?p, "窗口坐标无效（很可能处于最小化），不写回配置");
-            return;
+            return false;
         }
         self.svc.state.config.ui.window_pos = Some(WindowPos::new(p.x, p.y));
+        true
     }
 
     /// 配置改动后的收尾：立刻落盘。
@@ -1279,7 +1326,8 @@ impl App {
     pub fn set_pinned_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
         // 同 [`Self::persist_window_pos`]：最小化时 `GetWindowRect` 返回
         // `(-32000, -32000)`，写回去下次启动子窗口就跑到屏幕外。
-        if p.x < -32000.0 || p.y < -32000.0 || !p.is_finite() {
+        // ⚠️ `<=`：最小化返回值恰好等于 -32000，`<` 会漏掉它。
+        if p.x <= -32000.0 || p.y <= -32000.0 || !p.is_finite() {
             tracing::debug!(?p, "置顶窗口坐标无效（很可能处于最小化），不写回配置");
             return;
         }
@@ -1420,6 +1468,44 @@ mod tests {
             cfg.storage.max_items.is_none(),
             "None 应表示「不限条数」"
         );
+    }
+
+    /// 窗口位置记忆：合法坐标写入并返回 `true`，无效坐标（最小化 /
+    /// 非有限值）拒绝并返回 `false`。
+    ///
+    /// 守着实机缺陷：最小化时 `GetWindowRect` 返回 `(-32000,-32000)`，
+    /// 若把它写进配置，下次启动窗口跑到屏幕外。返回 `false` 的语义
+    /// 让调用方（主循环实时记忆）**不推进防抖计时**——否则无效坐标
+    /// 触发一次写入尝试后，接下来半秒内窗口恢复到合法位置也写不进去。
+    #[test]
+    fn persist_window_pos_writes_valid_and_rejects_invalid() {
+        let dir = std::env::temp_dir().join(format!("mcb-pos-test-{}", std::process::id()));
+        let mut app = App::new(modular_clipboard_core::Config::default(), false, Some(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 合法坐标 → 写入 + true。
+        assert!(app.persist_window_pos(egui::vec2(320.0, 180.0)));
+        let saved = app
+            .svc
+            .state
+            .config
+            .ui
+            .window_pos
+            .expect("合法坐标应写入 window_pos");
+        assert!(
+            (saved.x - 320.0).abs() < 1e-6 && (saved.y - 180.0).abs() < 1e-6,
+            "写入的坐标应与入参一致，实际 {saved:?}"
+        );
+
+        // 最小化坐标 → 拒绝 + false + 配置不变。
+        let before = app.svc.state.config.ui.window_pos;
+        assert!(!app.persist_window_pos(egui::vec2(-32000.0, -32000.0)));
+        assert_eq!(app.svc.state.config.ui.window_pos, before);
+
+        // 非有限值 → 同样拒绝。
+        assert!(!app.persist_window_pos(egui::vec2(f32::NAN, 5.0)));
+        assert_eq!(app.svc.state.config.ui.window_pos, before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 设置窗口的「记录剪贴板」开关必须**运行时**启停捕获线程。
