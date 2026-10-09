@@ -18,3 +18,8 @@ target-*/
 .vuidfix/
 .perimage/
 .verify-logs/
+
+# 构建产物（8MB 可执行文件）。
+# 不入库：二进制每次构建都是新 blob，历史会持续膨胀，且无法合并。
+# 需要给用户分发时走 GitHub Release，而不是仓库。
+/dist/
