@@ -311,6 +311,27 @@ pub fn run_with_options(
     let mut last_pos_save: Option<std::time::Instant> = None;
 
     while !quit {
+        // ---- 0. 退出标志（必须在**所有** continue 之前）----------
+        //
+        // ⚠️ 早前这个判断在循环末尾（第 4 步之后），而本循环有三条
+        // `continue`（隐藏态 / 客户区 0×0 / `acquire` 过期）会绕开它。
+        //
+        // `Op::Quit` 由**设置窗口**产生（「退出程序」按钮）。设置窗口是
+        // 独立顶层窗口，主窗口隐藏后它仍在 `drive_attach_windows` 里被
+        // 继续驱动、仍可点。于是完整故障链是：
+        //
+        //   打开设置 → 主窗口点 ✕ 隐藏到托盘 → 设置窗口仍开着
+        //   → 点「退出程序」→ `should_quit = true`
+        //   → 主循环永远在 `hidden` 分支 continue
+        //   → **程序退不掉**，只能任务管理器强杀。
+        //
+        // 这也正是「藏起来唤不回来」家族里最实的一条。
+        //
+        // 放在循环开头后，最迟下一帧就会生效（延迟一帧无感）。
+        if app.should_quit {
+            break;
+        }
+
         // ---- 1. 事件 ----
         //
         // `saw_close` 与 `wm_quit` 必须分开记：`gfx::window` 把
@@ -638,10 +659,6 @@ pub fn run_with_options(
             tracing::debug!("present 报告过期，下一轮重建");
         }
 
-        if app.should_quit {
-            quit = true;
-        }
-
         // ---- 4.4 窗口置顶状态同步 ----
         //
         // `always_on_top` 能在设置里随时改，而 Win32 的置顶是**窗口属性**，
@@ -740,6 +757,26 @@ pub fn run_with_options(
         // 既避免忙等，又保证输入延迟感知不到。
         let wait = match delay {
             Some(d) if d.is_zero() => Some(std::time::Duration::from_millis(1)),
+            // ⚠️ **`None` 必须给一个下限，不能原样传下去。**
+            //
+            // `None` 是 egui **空闲时**的常态：`Context::run` 在没有
+            // outstanding 重绘请求时会把 `repaint_delay` 置为
+            // `Duration::MAX`，`repaint_delay()` 于是返回 `None`
+            // （见 `egui-0.36.2/src/context.rs`）。
+            //
+            // 而 `poll_for(None)` 走 `_ => events` 分支——`PeekMessageW`
+            // 之后**立即返回**，从不调用 `MsgWaitForMultipleObjects`。
+            // 早前这里把 `None` 原样传下去，于是：
+            //
+            //   鼠标不动、无动画时，主循环以 CPU 极限速度反复执行
+            //   run_ui + tessellate + acquire/paint/present。
+            //
+            // 现象：主窗口可见且空闲时单核 100%、风扇转、笔记本掉电。
+            // 上面「不要空转烧 CPU」的注释只在 `Some(ZERO)` 那支成立，
+            // `None` 这条更常见的路径完全没堵住。
+            //
+            // 8ms ≈ 120Hz，既不会让输入有可感延迟，也不会忙等。
+            None => Some(std::time::Duration::from_millis(8)),
             other => other,
         };
         events.poll_for(wait);
