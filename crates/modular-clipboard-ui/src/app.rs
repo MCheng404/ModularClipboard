@@ -964,6 +964,33 @@ fn rebuild<'a>(
 // App
 // ---------------------------------------------------------------------------
 
+/// 窗口坐标是否**可安全写入配置**。
+///
+/// # 为什么阈值不是 `-32000`
+///
+/// `GetWindowRect` 对**最小化**的窗口返回任务栏图标矩形，典型值
+/// `(-32000, -32000)` —— 但那是**物理像素**。而
+/// `Window::screen_position_points()` 返回的是**逻辑点**
+/// （`r.left as f32 / scale_factor`，见 `gfx/src/window.rs`）。
+///
+/// 于是 150% 缩放下传入的是 `-32000 / 1.5 = -21333.3`，而判据若写
+/// `p.x <= -32000.0` 就**漏过** ⇒ 把最小化坐标写进配置 ⇒ 下次启动
+/// `move_to(p.x * scale)` 把它还原成物理 `-32000` ⇒ **窗口跑到屏幕外**，
+/// 用户只看到托盘图标，主界面「不见了」。
+///
+/// 用 `-8000` 这个阈值则在任何常见缩放（1.0 ~ 4.0）下都能拦住，
+/// 同时不会误伤真实的多显示器布局（副屏在主屏左侧时，坐标最小也就
+/// 约 -4000，4K 屏也不过 -3840）。
+///
+/// # 为什么不用 `IsIconic`
+///
+/// 那更准确，但本函数只拿到坐标、拿不到 `HWND`。把判据收在一处，
+/// 是为了让三个写入点（主窗口 / 置顶窗口 / 卡片子窗口）口径一致。
+pub(crate) fn is_sane_window_pos(p: egui::epaint::emath::Vec2) -> bool {
+    p.is_finite() && p.x > -8000.0 && p.y > -8000.0
+}
+
+
 /// 应用状态。
 ///
 /// 只持有业务状态与 [`egui::Context`]；渲染资源在 [`run`] 的栈上。
@@ -1367,6 +1394,7 @@ impl App {
     /// 由 [`Self::shutdown`] 调用。**不覆盖**用户设置里已有的
     /// 置顶窗位置——那个由 `childwin` 在关窗时自己写。
     ///
+
     /// 取不到位置时跳过而不是写 `Some(0,0)`：窗口可能因最小化/
     /// 隐藏而没有有效位置，写进去会让下次启动跑到屏幕左上角。
     ///
@@ -1384,12 +1412,7 @@ impl App {
         // 这个值就被写进配置，下次启动 `move_to(-32000, …)` ⇒
         // 窗口在屏幕外，用户只看到托盘图标，主界面「不见了」。
         //
-        // 负坐标在任何多显示器布局下都几乎不可能是真实位置。
-        //
-        // ⚠️ 必须用 `<=` 而不是 `<`：`GetWindowRect` 对最小化窗口
-        // 返回的正是 `(-32000, -32000)`（**等于**哨兵值），严格小于
-        // 会让它漏过去、把最小化位置写进配置，下次启动窗口跑屏幕外。
-        if p.x <= -32000.0 || p.y <= -32000.0 || !p.is_finite() {
+        if !is_sane_window_pos(p) {
             tracing::debug!(?p, "窗口坐标无效（很可能处于最小化），不写回配置");
             return false;
         }
@@ -1410,10 +1433,7 @@ impl App {
 
     /// 记下置顶窗口位置（供下次启动恢复）。
     pub fn set_pinned_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
-        // 同 [`Self::persist_window_pos`]：最小化时 `GetWindowRect` 返回
-        // `(-32000, -32000)`，写回去下次启动子窗口就跑到屏幕外。
-        // ⚠️ `<=`：最小化返回值恰好等于 -32000，`<` 会漏掉它。
-        if p.x <= -32000.0 || p.y <= -32000.0 || !p.is_finite() {
+        if !is_sane_window_pos(p) {
             tracing::debug!(?p, "置顶窗口坐标无效（很可能处于最小化），不写回配置");
             return;
         }
@@ -1497,6 +1517,58 @@ fn set_opt_number_field(
 
 #[cfg(test)]
 mod tests {
+
+    /// 最小化窗口的坐标必须在**任何常见缩放**下都被拒绝。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// `GetWindowRect` 对最小化窗口返回 `(-32000, -32000)` **物理像素**，
+    /// 而 `screen_position_points()` 返回的是**逻辑点**（除以 scale）。
+    /// 于是 150% 缩放下传入 `-21333.3`。
+    ///
+    /// 早前判据写 `p.x <= -32000.0` ⇒ **漏过** ⇒ 把屏幕外坐标写进配置
+    /// ⇒ 下次启动 `move_to(p.x * scale)` 还原成物理 `-32000`
+    /// ⇒ 窗口跑到屏幕外，用户只看到托盘图标。
+    #[test]
+    fn minimized_window_pos_is_rejected_at_every_scale() {
+        // 常见 DPI 缩放：100% / 125% / 150% / 175% / 200%
+        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let logical = -32000.0f32 / scale;
+            let p = egui::epaint::emath::vec2(logical, logical);
+            assert!(
+                !is_sane_window_pos(p),
+                "scale={scale} 时最小化坐标 {logical} 必须被拒绝                  （判据不能只在 scale==1.0 才生效）"
+            );
+        }
+    }
+
+    /// 真实的多显示器布局（副屏在主屏左侧）不能被误判为无效。
+    #[test]
+    fn real_negative_positions_are_accepted() {
+        // 4K 副屏放在主屏左侧：x 最小约 -3840。
+        for p in [
+            egui::epaint::emath::vec2(-3840.0, 100.0),
+            egui::epaint::emath::vec2(-1920.0, -100.0),
+            egui::epaint::emath::vec2(0.0, 0.0),
+            egui::epaint::emath::vec2(2560.0, 1440.0),
+        ] {
+            assert!(is_sane_window_pos(p), "真实坐标不应被拒绝：{p:?}");
+        }
+    }
+
+    /// 非有限值（NaN / Infinity）必须被拒绝。
+    #[test]
+    fn non_finite_positions_are_rejected() {
+        for p in [
+            egui::epaint::emath::vec2(f32::NAN, 0.0),
+            egui::epaint::emath::vec2(0.0, f32::NAN),
+            egui::epaint::emath::vec2(f32::INFINITY, 0.0),
+            egui::epaint::emath::vec2(0.0, f32::NEG_INFINITY),
+        ] {
+            assert!(!is_sane_window_pos(p), "非有限坐标必须拒绝：{p:?}");
+        }
+    }
+
     use super::*;
     use ash::vk;
 

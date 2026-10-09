@@ -247,12 +247,31 @@ impl<'a> ChildWindows<'a> {
         if let Some(card) = ws.get_mut(id) {
             let (w, h) = win.window.inner_size_points();
             card.window_size = egui::epaint::emath::vec2(w, h);
-            card.window_pos = win.window.screen_position_points();
-            tracing::debug!(
-                card = ?id,
-                pos = ?card.window_pos,
-                "卡片子窗口已关闭，位置已存回卡片"
-            );
+            // ⚠️ 必须校验：子窗口（`WS_POPUP | WS_SYSMENU`）用户可以从
+            // 任务栏点一下就最小化，此时 `screen_position_points()` 会
+            // 返回本缩放下的 -32000 逻辑坐标。
+            //
+            // 早前这里**一行校验都没有** —— 同族的 `persist_window_pos`
+            // 与 `set_pinned_window_pos` 都做了，唯独漏了这里。于是
+            // 「收回一张最小化的卡片」会把屏幕外坐标写进
+            // `card.window_pos`，下次再把这张卡拖出成窗就跑到屏幕外。
+            //
+            // 这是本组里**最容易被触发**的一条：子窗口最小化比主窗口
+            // 常见得多。
+            let pos = win.window.screen_position_points();
+            if crate::app::is_sane_window_pos(pos) {
+                card.window_pos = pos;
+                tracing::debug!(
+                    card = ?id,
+                    pos = ?card.window_pos,
+                    "卡片子窗口已关闭，位置已存回卡片"
+                );
+            } else {
+                tracing::debug!(
+                    card = ?id, pos = ?pos,
+                    "卡片子窗口坐标无效（很可能处于最小化），保留上次有效位置"
+                );
+            }
         }
     }
 
