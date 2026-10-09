@@ -1461,6 +1461,13 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
         body,
     );
 
+    // ---- 列表显示区域背景 ----
+    //
+    // 整块可视区铺 `list_bg`（比窗口底 `bg` 暗一档）：历史条目以
+    // `surface_raised`（亮）浮在暗容器上，形成「亮卡片、暗列表」的
+    // 层次。空态提示文字也画在这层之上。
+    f.ui.painter_at(body).rect_filled(body, CornerRadius::ZERO, f.pal.list_bg);
+
     // 本列表用哪个滚动槽位。
     //
     // ⚠️ 两个列表的滚动位置必须**分开存**。早前共用一个
@@ -1909,8 +1916,9 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 
     // 卡片样式：每条历史是一张圆角小卡。
     //
-    // 常态 = `surface_variant` 底 + 1px 描边（与窗口底 / 历史卡片外框
-    // 区分开）；悬停在半透明提亮上叠一层；选中换主题高亮 + 左侧强调条。
+    // 常态 = `surface_raised`（提亮后的卡片）底 + 1px 描边，浮在暗色
+    // 列表区（`list_bg`）之上；悬停在半透明提亮上叠一层；选中换主题
+    // 高亮 + 左侧强调条。
     // ⚠️ 圆角用 `pal.radius_sm` 而不是 `CornerRadius::ZERO`——后者是
     // 早前「通栏行」的直角样式，与卡片语义不符。
     //
@@ -1919,7 +1927,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let radius = pal.radius_sm;
     let stroke = Stroke::new(CARD_STROKE * scale, pal.border_subtle);
     if selected {
-        painter.rect_filled(r, radius, pal.surface_variant);
+        painter.rect_filled(r, radius, pal.surface_raised);
         painter.rect_filled(r, radius, pal.row_selected);
         painter.rect_filled(
             Rect::from_min_size(r.min, vec2(2.0 * scale, r.height())),
@@ -1928,11 +1936,11 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         );
         painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     } else if resp.hovered() {
-        painter.rect_filled(r, radius, pal.surface_variant);
+        painter.rect_filled(r, radius, pal.surface_raised);
         painter.rect_filled(r, radius, pal.row_hover);
         painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     } else {
-        painter.rect_filled(r, radius, pal.surface_variant);
+        painter.rect_filled(r, radius, pal.surface_raised);
         painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     }
 

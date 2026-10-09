@@ -138,6 +138,12 @@ palette! {
     /// 次级面板（嵌套容器）。
     surface_variant: color = egui::Color32::from_rgb(0x26, 0x2A, 0x31)
                        => egui::Color32::from_rgb(0xEC, 0xEF, 0xF3),
+    /// 列表显示区域背景。比窗口底 `bg` **更暗一档**，把亮卡片衬托出来。
+    ///
+    /// 历史列表的整块可视区铺这一层（`draw_history_body` 开头），
+    /// 卡片用 `surface_raised` 浮在它之上——「亮卡片、暗容器」。
+    list_bg: color = egui::Color32::from_rgb(0x10, 0x12, 0x15)
+              => egui::Color32::from_rgb(0xE8, 0xEB, 0xF0),
     /// 浮层：菜单、气泡、可拖拽模块。
     surface_raised: color = egui::Color32::from_rgb(0x2E, 0x33, 0x3B)
                     => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
@@ -795,6 +801,7 @@ mod tests {
             "surface" => base,
             "surface_variant" => composite(p.surface_variant, base),
             "surface_raised" => composite(p.surface_raised, base),
+            "list_bg" => composite(p.list_bg, base),
             "row_alt" => composite(p.row_alt, composite(p.surface, base)),
             "row_hover" => composite(p.row_hover, composite(p.surface, base)),
             "row_selected" => composite(p.row_selected, composite(p.surface, base)),
@@ -812,6 +819,7 @@ mod tests {
         "surface",
         "surface_variant",
         "surface_raised",
+        "list_bg",
         "row_alt",
         "row_hover",
         "row_selected",
@@ -921,7 +929,7 @@ mod tests {
     /// 完整性测试会比对它，漏登记即失败。
     const EXPECTED_COLOR_TOKENS: &[&str] = &[
         // 背景层
-        "bg", "surface", "surface_variant", "surface_raised", "overlay_scrim",
+        "bg", "surface", "surface_variant", "surface_raised", "list_bg", "overlay_scrim",
         // 描边层
         "border", "border_strong", "border_subtle",
         // 文本层
