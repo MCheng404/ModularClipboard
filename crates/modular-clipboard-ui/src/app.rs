@@ -463,6 +463,16 @@ pub fn run_with_options(
             // 睡固定间隔而非用 egui 的 delay：隐藏时没有下一次绘制，
             // egui 也不会请求重绘，用它的 delay 会退化成 0 延时忙等。
             events.poll_for(Some(presence::HIDDEN_POLL_INTERVAL));
+            // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
+            // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
+            drive_attach_windows(
+                &mut app,
+                &mut children,
+                &mut settings_win,
+                &shared,
+                &window,
+                frame_no,
+            );
             continue;
         }
 
@@ -493,6 +503,16 @@ pub fn run_with_options(
             let _guard = DeltaGuard(std::mem::take(&mut output.textures_delta));
             drop(output);
             events.poll_for(Some(std::time::Duration::from_millis(50)));
+            // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
+            // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
+            drive_attach_windows(
+                &mut app,
+                &mut children,
+                &mut settings_win,
+                &shared,
+                &window,
+                frame_no,
+            );
             continue;
         }
         if (cw, ch) != (fr.extent().width, fr.extent().height) {
@@ -512,6 +532,16 @@ pub fn run_with_options(
         let Some(acquired) = fr.acquire()? else {
             rebuild(&mut fr, &mut painter)?;
             tracing::debug!("acquire 返回过期，已重建交换链");
+            // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
+            // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
+            drive_attach_windows(
+                &mut app,
+                &mut children,
+                &mut settings_win,
+                &shared,
+                &window,
+                frame_no,
+            );
             continue;
         };
 
@@ -527,65 +557,15 @@ pub fn run_with_options(
             quit = true;
         }
 
-        // ---- 4.5 卡片子窗口渲染 ----
-        //
-        // 每个子窗口有**独立的 `egui::Context`、独立的交换链**，
-        // 所以要各自走一遍「事件 → run_ui → tessellate → 绘制」。
-        //
-        // ⚠️ 渲染失败**不中断主循环**：一个附属窗口出问题
-        // （客户区变 0、交换链过期、驱动抽风）不该让主窗黑屏。
-        // 这里记警告后继续，下一帧重试。
-        for child in children.iter_mut() {
-            if let Err(e) = child.render(&mut app) {
-                tracing::warn!(card = ?child.card_id, %e, "子窗口渲染失败，跳过本帧");
-            }
-        }
-
-        // ---- 4.6 设置窗口 ------------------------------------------------
-        //
-        // 懒创建：第一次需要时才建窗口（每次都建会泄漏交换链）。
-        //
-        // ⚠️ 生命周期由 `paint_state.show_settings` 决定，而它可能被
-        // 三处改：齿轮点击（`Op::ToggleSettings`）、设置面板里的关闭
-        // 按钮、以及用户点标题栏 ✕。前两处在绘制里改，第三处由
-        // `sync_and_render` 的返回值告知——**必须**在此把它同步回
-        // `false`，否则窗口藏了而状态说「开着」，再点齿轮就没反应。
-        if settings_win.is_none() && app.paint_state.show_settings {
-            match crate::settingswin::SettingsWindow::create(
-                window.screen_position_points(),
-                window.scale_factor(),
-                &shared,
-            ) {
-                Ok(w) => {
-                    tracing::info!("设置窗口已创建");
-                    settings_win = Some(w);
-                }
-                Err(e) => {
-                    // 每帧都会走到这里，必须降频，否则日志刷屏。
-                    if frame_no % 60 == 0 {
-                        tracing::warn!(%e, "创建设置窗口失败，本帧不再重试");
-                    }
-                    app.paint_state.show_settings = false;
-                }
-            }
-        }
-
-        if let Some(w) = settings_win.as_mut() {
-            // ⚠️ 先取 `want_open` 再进函数：`sync_and_render(&mut app, …)`
-            // 会可变借用 `app`，而在参数里读 `app.paint_state` 会二次借用。
-            let want_open = app.paint_state.show_settings;
-            match w.sync_and_render(&mut app, want_open) {
-                Ok(true) => {
-                    // 用户关了设置窗口 ⇒ 状态同步回false。
-                    app.paint_state.show_settings = false;
-                    tracing::info!("设置窗口已被用户关闭");
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(%e, "设置窗口渲染失败，跳过本帧");
-                }
-            }
-        }
+        // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口）----
+        drive_attach_windows(
+            &mut app,
+            &mut children,
+            &mut settings_win,
+            &shared,
+            &window,
+            frame_no,
+        );
 
         frame_no += 1;
         if frame_no % 300 == 0 {
@@ -669,6 +649,94 @@ pub fn run_with_options(
 /// 按 `modular_clipboard_gfx` 的偏好规则预选表面格式。
 ///
 /// 必须与 `modular_clipboard_gfx::pick_format` 选到同一个：8bit BGR/RGB 优先，
+/// 驱动附属窗口：卡片子窗口 + 设置窗口。
+///
+/// # 为什么必须抽成函数、在**所有**跳过路径上调用
+///
+/// 主循环有三条 `continue` 路径会跳过第 4.5/4.6 步：
+/// 隐藏态、客户区 0×0（最小化）、`acquire` 返回过期。
+///
+/// 早前附属窗口只在那条「正常路径」上被驱动，于是：
+///
+/// - 主窗口「隐藏到托盘」后，之前拖出的卡片窗口 / 设置窗口**仍留在
+///   屏幕上**，但既不渲染也不泵消息 —— 画面冻结、点不动，Win32 约
+///   5 秒后把它们标成「无响应」，用户看到的是一堆僵住的窗口；
+/// - 主窗口 resize 期间（`acquire` 频繁返回 None）子窗口跟着卡帧；
+/// - 隐藏期间若齿轮被点（`show_settings = true`），因为走不到这一步，
+///   设置窗口永远创建不出来，要等主窗恢复才突然弹出。
+///
+/// 抽成函数是为了让「该驱动附属窗口」这件事只有一个入口，漏不掉。
+#[allow(clippy::too_many_arguments)]
+fn drive_attach_windows<'a>(
+    app: &mut App,
+    children: &mut crate::childwin::ChildWindows<'a>,
+    settings_win: &mut Option<crate::settingswin::SettingsWindow<'a>>,
+    shared: &crate::multiwindow::SharedGfx<'a>,
+    window: &Window,
+    frame_no: u64,
+) {
+// 卡片子窗口
+    //
+    // 每个子窗口有**独立的 `egui::Context`、独立的交换链**，
+    // 所以要各自走一遍「事件 → run_ui → tessellate → 绘制」。
+    //
+    // ⚠️ 渲染失败**不中断主循环**：一个附属窗口出问题
+    // （客户区变 0、交换链过期、驱动抽风）不该让主窗黑屏。
+    // 这里记警告后继续，下一帧重试。
+    for child in children.iter_mut() {
+        if let Err(e) = child.render(&mut *app) {
+            tracing::warn!(card = ?child.card_id, %e, "子窗口渲染失败，跳过本帧");
+        }
+    }
+
+// 设置窗口---------------------------------------------
+    //
+    // 懒创建：第一次需要时才建窗口（每次都建会泄漏交换链）。
+    //
+    // ⚠️ 生命周期由 `paint_state.show_settings` 决定，而它可能被
+    // 三处改：齿轮点击（`Op::ToggleSettings`）、设置面板里的关闭
+    // 按钮、以及用户点标题栏 ✕。前两处在绘制里改，第三处由
+    // `sync_and_render` 的返回值告知——**必须**在此把它同步回
+    // `false`，否则窗口藏了而状态说「开着」，再点齿轮就没反应。
+    if settings_win.is_none() && app.paint_state.show_settings {
+        match crate::settingswin::SettingsWindow::create(
+            window.screen_position_points(),
+            window.scale_factor(),
+            &shared,
+        ) {
+Ok(w) => {
+                    tracing::info!("设置窗口已创建");
+                    *settings_win = Some(w);
+                }
+            Err(e) => {
+                // 每帧都会走到这里，必须降频，否则日志刷屏。
+                if frame_no % 60 == 0 {
+                    tracing::warn!(%e, "创建设置窗口失败，本帧不再重试");
+                }
+                app.paint_state.show_settings = false;
+            }
+        }
+    }
+
+    if let Some(w) = settings_win.as_mut() {
+        // ⚠️ 先取 `want_open` 再进函数：`sync_and_render(&mut app, …)`
+        // 会可变借用 `app`，而在参数里读 `app.paint_state` 会二次借用。
+        let want_open = app.paint_state.show_settings;
+        match w.sync_and_render(&mut *app, want_open) {
+            Ok(true) => {
+                // 用户关了设置窗口 ⇒ 状态同步回false。
+                app.paint_state.show_settings = false;
+                tracing::info!("设置窗口已被用户关闭");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(%e, "设置窗口渲染失败，跳过本帧");
+            }
+        }
+    }
+
+}
+
 /// 单格式时按规范原样采用。真实的一致性由 `FrameRenderer::new` 校验。
 /// 挑一个表面可用格式。
 ///
@@ -1061,6 +1129,19 @@ impl App {
     /// `App` **不持有窗口**（窗口在 `run()` 的栈上），所以位置由
     /// 调用方从窗口句柄读出后注入。
     pub fn persist_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
+        // ⚠️ 必须拒绝**无效坐标**，否则下次启动窗口跑到屏幕外。
+        //
+        // `screen_position_points()` 走 `GetWindowRect`，而它对
+        // **最小化**的窗口返回的是任务栏图标的矩形 —— 典型值
+        // `(-32000, -32000)`。托盘「退出」时若窗口正处于最小化，
+        // 这个值就被写进配置，下次启动 `move_to(-32000, …)` ⇒
+        // 窗口在屏幕外，用户只看到托盘图标，主界面「不见了」。
+        //
+        // 负坐标在任何多显示器布局下都几乎不可能是真实位置。
+        if p.x < -32000.0 || p.y < -32000.0 || !p.is_finite() {
+            tracing::debug!(?p, "窗口坐标无效（很可能处于最小化），不写回配置");
+            return;
+        }
         self.svc.state.config.ui.window_pos = Some(WindowPos::new(p.x, p.y));
     }
 
@@ -1077,6 +1158,12 @@ impl App {
 
     /// 记下置顶窗口位置（供下次启动恢复）。
     pub fn set_pinned_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
+        // 同 [`Self::persist_window_pos`]：最小化时 `GetWindowRect` 返回
+        // `(-32000, -32000)`，写回去下次启动子窗口就跑到屏幕外。
+        if p.x < -32000.0 || p.y < -32000.0 || !p.is_finite() {
+            tracing::debug!(?p, "置顶窗口坐标无效（很可能处于最小化），不写回配置");
+            return;
+        }
         self.svc.state.config.ui.pinned_window_pos = Some(WindowPos::new(p.x, p.y));
     }
 
