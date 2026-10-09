@@ -35,6 +35,8 @@ const DEFAULT_SIZE: (f32, f32) = (460.0, 560.0);
 /// `egui::Context`**。共用一个 `Context` 会导致两个窗口的鼠标位置
 /// 互相覆盖（都以为自己拿到焦点），键盘输入也会错投。
 pub struct SettingsWindow<'a> {
+    /// 本窗口的 Vulkan 表面句柄（须自己留一份，理由见 `ChildWindow`）。
+    surface: ash::vk::SurfaceKHR,
     window: Window,
     gfx: crate::multiwindow::WindowGfx<'a>,
     events: EventLoop,
@@ -82,6 +84,7 @@ impl<'a> SettingsWindow<'a> {
         let events = EventLoop::new(&window);
 
         Ok(Self {
+            surface,
             window,
             gfx,
             events,
@@ -196,5 +199,17 @@ impl<'a> SettingsWindow<'a> {
     /// 退出前隐藏窗口。
     pub fn close(&mut self) {
         crate::presence::hide_window(self.window.hwnd());
+    }
+}
+
+impl<'a> Drop for SettingsWindow<'a> {
+    fn drop(&mut self) {
+        // ⚠️ 必须销毁表面：设置窗口是「每次开关都新建」，不销毁就是
+        // 每开关一次泄漏一个 `vk::SurfaceKHR`。
+        //
+        // 先销毁表面再让字段 drop —— `gfx`（含交换链）还引用着它。
+        unsafe {
+            self.gfx.gpu.destroy_surface(self.surface);
+        }
     }
 }

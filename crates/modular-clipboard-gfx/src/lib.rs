@@ -392,6 +392,34 @@ impl Gpu {
             tracing::warn!(?e, "等待设备空闲失败");
         }
     }
+    /// 销毁由 [`Self::create_surface_for`] 创建的表面。
+    ///
+    /// # 为什么必须有这个入口
+    ///
+    /// `create_surface_for` 的文档写着「返回的表面由调用方负责在不再
+    /// 使用前 destroy」，但 `Gpu` 早前**没有**提供销毁方法，
+    /// `FrameRenderer::drop` 也只销毁交换链/池/命令池、不动 surface。
+    /// 于是 UI 侧 `ChildWindow` / `SettingsWindow` 建出来的
+    /// `vk::SurfaceKHR` 句柄创建后即丢失，**每次创建一个窗口泄漏一个**
+    /// （含 DWM 侧的呈现资源）。
+    ///
+    /// 设置窗口是「每次开关都新建」（关掉时 `settings_win = None`），
+    /// 所以反复开关设置会持续泄漏。
+    ///
+    /// ⚠️ 调用前必须 `device_wait_idle()`：交换链可能还在引用该表面。
+    ///
+    /// # 安全
+    ///
+    /// `surface` 必须是本 `Gpu` 创建的、且尚未销毁的句柄。
+    pub unsafe fn destroy_surface(&self, surface: vk::SurfaceKHR) {
+        if surface == vk::SurfaceKHR::null() {
+            return;
+        }
+        // 复用已有的等待助手（它自己处理了错误日志）。
+        self.wait_idle();
+        // SAFETY: 调用方保证 surface 来自本 Gpu 且未销毁；本函数是 unsafe。
+        unsafe { self.surface_loader.destroy_surface(surface, None) };
+    }
 }
 
 impl Drop for Gpu {
@@ -402,9 +430,9 @@ impl Drop for Gpu {
             self.instance.destroy_instance(None);
         }
     }
-}
 
-/// 按偏好选择物理设备与队列族。
+}
+    /// 按偏好选择物理设备与队列族。
 ///
 /// 队列族必须同时支持 `GRAPHICS` 与 `PRESENT`，否则无法把画面显示到窗口。
 fn select_device(

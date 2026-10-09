@@ -153,6 +153,13 @@ impl<'a> SharedGfx<'a> {
 /// drop 顺序：字段按声明顺序 drop，`painter` 先于 `fr`——正确，
 /// 因为 `Painter` 借用 `Gpu`，而 `fr` 也借用 `Gpu`，两者互不依赖。
 pub struct WindowGfx<'a> {
+    /// 共享设备（借用 `SharedGfx` 的那一个）。
+    ///
+    /// 存在的唯一理由：`ChildWindow` / `SettingsWindow` 要在 `Drop`
+    /// 里销毁自己的 `vk::SurfaceKHR`，而表面是由 `Gpu` 创建、
+    /// 也必须由 `Gpu` 销毁的。`FrameRenderer` 内部的 `surface`
+    /// 字段是私有的，且它的 `drop` 不销毁表面。
+    pub gpu: &'a Gpu,
     /// 该窗口的交换链与帧缓冲。
     pub fr: FrameRenderer<'a>,
     /// 该窗口的画笔（顶点/纹理/描述符）。
@@ -183,7 +190,11 @@ impl<'a> WindowGfx<'a> {
             slots = fr.slot_count(),
             "窗口渲染器就绪"
         );
-        Ok(Self { fr, painter })
+        Ok(Self {
+            gpu: shared.gpu,
+            fr,
+            painter,
+        })
     }
 
     /// 客户区尺寸为 0（最小化 / 被 resize 到 0）时返回 true。

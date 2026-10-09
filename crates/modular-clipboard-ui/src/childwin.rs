@@ -70,6 +70,13 @@ fn pinned_window_pos(
 pub struct ChildWindow<'a> {
     /// 关联的卡片。
     pub card_id: CardId,
+    /// 本窗口的 Vulkan 表面句柄。
+    ///
+    /// ⚠️ 必须自己留一份：`WindowGfx`/`FrameRenderer` 内部也持有它，
+    /// 但那个字段是私有的、且 `FrameRenderer::drop` **不销毁表面**。
+    /// 不留副本的话 `Drop` 里无从销毁 ⇒ 每建一个子窗口泄漏一个
+    /// `vk::SurfaceKHR`（含 DWM 侧的呈现资源）。
+    surface: ash::vk::SurfaceKHR,
     /// Win32 窗口。
     pub window: Window,
     /// 该窗口的交换链。
@@ -245,8 +252,24 @@ impl<'a> ChildWindows<'a> {
 
 impl<'a> Drop for ChildWindows<'a> {
     fn drop(&mut self) {
-        // `Window` 的 `Drop` 也会销毁窗口，但显式调一次让意图清晰，
-        // 且能保证在 `Drop` 里不依赖字段顺序。
+        // 元素是 `ChildWindow`，它自己的 `Drop` 会销毁表面；
+        // `Window` 的 `Drop` 也会销毁窗口。不需要在这里再做任何事——
+        // 早前这里有个空实现 + 一段「显式调一次让意图清晰」的注释，
+        // 但代码里其实什么都没做，注释是假的。
+        self.windows.clear();
+    }
+}
+
+impl<'a> Drop for ChildWindow<'a> {
+    fn drop(&mut self) {
+        // 顺序很重要：**先销毁表面**（它属于 `Gpu`），再让字段各自 drop。
+        // Rust 的字段 drop 顺序是声明顺序，`surface` 声明在 `gfx` 之前，
+        // 所以这里必须显式做——否则 `gfx`（含交换链）先销毁时
+        // 交换链还引用着这个表面。
+        unsafe {
+            // `gfx.gpu` 是 `&Gpu`，表面由它创建、由它销毁。
+            self.gfx.gpu.destroy_surface(self.surface);
+        }
     }
 }
 
@@ -289,6 +312,7 @@ impl<'a> ChildWindow<'a> {
         let events = modular_clipboard_gfx::window::EventLoop::new(&window);
         Ok(Self {
             card_id,
+            surface,
             window,
             gfx,
             events,
