@@ -1149,41 +1149,31 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
         // （折叠画把手 / 展开画内容），折叠功能移除后只剩一条路径。
         draw_expanded_card(f, card, r);
     }
-
-    // 置顶**没有**独立成窗 ⇒ 在历史栏顶部内嵌一个置顶区，
-    // 免得为了一两条置顶再开一个窗口。
-    if !pinned_is_separate(f.ws) {
-        draw_embedded_pinned(f, _body);
-    }
+    // 置顶内嵌的绘制**不在这里**——它在
+    // `draw_expanded_card` 里随历史卡片一起处理：那里会先把历史
+    // 卡片的 body 切成两段（置顶在上、历史在下），两段各画各的。
+    //
+    // ⚠️ 早前是「画完历史再往上叠一层」，于是标题叠字 + 列表重叠。
+    // 而且这里也拿不到「置顶该占多高」——那是切分时才确定的量。
 }
 
-/// 在历史栏内嵌置顶区（无独立置顶窗时）。
+/// 在**给定的**矩形里画内嵌置顶区。
 ///
-/// 画在历史栏**上方**，两栏之间用一条细分隔线隔开——
-/// 这不是独立卡片，所以不画自己的边框，避免与历史栏的边框叠成双线。
-fn draw_embedded_pinned(f: &mut Frame<'_>, _body: Rect) {
+/// # `area` 是谁给的
+///
+/// 由 [`draw_expanded_card`] 提前算好并从历史卡片的 body 顶部切出来。
+/// 早前这个函数自己去读 `history.rect` 并从 `inner.min` 铺到
+/// `inner.max.y` —— 那等于无视历史列表已经占了整块 body，必然重叠。
+///
+/// 不画自己的边框：它不是独立卡片，画了会与历史卡片边框叠成双线。
+fn draw_embedded_pinned(f: &mut Frame<'_>, area: Rect) {
     let pal = f.pal;
-    let Some(history) = f.ws.by_kind(CardKind::History) else {
-        return;
-    };
-    let hr = history.rect;
-    if hr.width() <= 0.0 || hr.height() <= 40.0 {
-        return;
-    }
-
-    // 置顶条目为空时不占空间——否则为了 0 条记录占掉一条横幅。
-    let has_pinned = f.svc.state.items.iter().any(|it| it.pinned);
-    if !has_pinned {
-        return;
-    }
-
-    let pad = pal.space_sm;
     let font: FontId = sized(pal.font_xs, f.scale);
     let label_h = (pal.font_xs * 1.6).max(14.0);
-    let inner = hr.shrink2(vec2(pad, pad));
 
-    // 标题行「置顶」
-    let label = Rect::from_min_size(inner.min, vec2(inner.width(), label_h));
+    // 标题行「置顶」。画在 `area` 顶部 —— 即历史卡片**头部之下**，
+    // 与标题「历史」不再同一个 y。
+    let label = Rect::from_min_size(area.min, vec2(area.width(), label_h));
     f.ui.painter_at(label).text(
         label.left_center(),
         Align2::LEFT_CENTER,
@@ -1192,20 +1182,13 @@ fn draw_embedded_pinned(f: &mut Frame<'_>, _body: Rect) {
         pal.text_dim,
     );
 
-    // 分隔线 + 列表区
-    let sep_y = label.max.y;
     let list = Rect::from_min_max(
-        pos2(inner.min.x, sep_y + pal.space_xs),
-        pos2(inner.max.x, inner.max.y),
+        pos2(area.min.x, label.max.y + pal.space_xs),
+        area.max,
     );
-    if list.height() <= 8.0 {
+    if list.height() <= 8.0 || list.width() <= 8.0 {
         return;
     }
-    // `hline(x范围, y, 描边)`：横线要传 x 的**区间**，不是 y 区间。
-    f.ui
-        .painter_at(hr)
-        .hline(hr.x_range(), sep_y, Stroke::new(1.0, pal.border_subtle));
-
     draw_history_body(f, list, Some(true));
 }
 
@@ -1247,11 +1230,83 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
         return;
     }
     match card.kind {
-        CardKind::History => draw_history_body(f, body, None),
+        CardKind::History => {
+            // 置顶内嵌在历史卡片**顶部** ⇒ 先把 body 切成两段，
+            // 历史列表用下面那段。
+            //
+            // ⚠️ 早前是「先画完整历史列表，再事后往上叠一层置顶」——
+            // 于是「置顶」标签与卡片标题「历史」画在**同一个 y**
+            // （都是 `inner.min`），而置顶列表一直铺到卡片底部，
+            // 盖住历史的前 N 行。用户看到的是两层内容叠在一起的乱字，
+            // 且被盖住的历史行仍然可点（命中矩形还在）。
+            let pinned_h = if f.ws.pinned_is_embedded() {
+                embedded_pinned_height(f, body.width(), body.height())
+            } else {
+                0.0
+            };
+            if pinned_h > 0.0 {
+                let split_y = body.min.y + pinned_h;
+                let pinned_area =
+                    Rect::from_min_max(body.min, pos2(body.max.x, split_y));
+                draw_embedded_pinned(f, pinned_area);
+                let rest = Rect::from_min_max(pos2(body.min.x, split_y), body.max);
+                // 分隔线画在两段之间。
+                f.ui.painter_at(rest).hline(
+                    rest.x_range(),
+                    rest.min.y,
+                    Stroke::new(1.0, f.pal.border_subtle),
+                );
+                if rest.height() > 8.0 {
+                    draw_history_body(f, rest, None);
+                }
+            } else {
+                draw_history_body(f, body, None);
+            }
+        }
         CardKind::Pinned => draw_history_body(f, body, Some(true)),
         CardKind::Detail => draw_detail_body(f, body),
         CardKind::Rail => draw_rail_body(f, body),
     }
+}
+
+/// 内嵌置顶区应当占用的**高度**；没有置顶条目时返回 0。
+///
+/// # 为什么必须提前算
+///
+/// 历史列表的矩形要让出这一段。事后叠画（早前的做法）必然重叠——
+/// 历史列表不知道自己头顶被占了一块，照样从 `body.min` 开始铺。
+///
+/// # 封顶 1/3
+///
+/// 置顶条目可能很多（用户能钉几十条）。全给会让历史列表被挤没，
+/// 而历史才是主区。所以封顶 1/3，剩下的靠 `ScrollArea` 自己滚。
+fn embedded_pinned_height(f: &mut Frame<'_>, avail_w: f32, avail_h: f32) -> f32 {
+    let pal = f.pal;
+    if !f.svc.state.items.iter().any(|it| it.pinned) {
+        return 0.0;
+    }
+    if avail_w <= 8.0 || avail_h <= 32.0 {
+        return 0.0;
+    }
+    // 标题行 + 上下留白 + 一条分隔线。
+    let chrome = (pal.font_xs * 1.6).max(14.0) + pal.space_xs * 2.0 + pal.space_sm;
+
+    // 行高必须用与 `draw_history_body` **同一个** `row_height_for`，
+    // 否则预留高度与实际内容对不上（多留浪费空间，少留又盖住）。
+    let icon_w = pal.icon_size + pal.space_sm;
+    let text_w = (avail_w - icon_w - pal.space_sm).max(20.0);
+    let rows: f32 = f
+        .svc
+        .state
+        .items
+        .iter()
+        .filter(|it| it.pinned)
+        .map(|it| row_height_for(f.ui, it, pal, f.scale, text_w))
+        .sum();
+
+    (chrome + rows)
+        .min(avail_h * 0.34)
+        .max(chrome.min(avail_h))
 }
 
 /// 卡片头部：只有标题。
@@ -1963,6 +2018,29 @@ mod tests {
             self
         }
 
+        /// 把前 `n` 条记录置顶。
+///
+/// 内嵌置顶区只在**有置顶条目**时才占空间，所以针对它的测试必须
+/// 先造置顶条目——否则 `embedded_pinned_height` 直接返回 0，
+/// 测的还是「没有置顶区」那条路径。
+fn with_pinned(mut self, n: usize) -> Self {
+    let ids: Vec<_> = self
+        .svc
+        .state
+        .items
+        .iter()
+        .take(n)
+        .map(|it| it.id)
+        .collect();
+    for id in ids {
+        if let Err(e) = self.svc.toggle_pin(id) {
+            tracing::warn!("置顶测试记录失败: {e}");
+        }
+    }
+    self.svc.reload_list();
+    self
+}
+
         /// 组装这一帧的 [`RawInput`]。
         fn input(&self, events: Vec<egui::Event>) -> egui::RawInput {
             egui::RawInput {
@@ -2325,6 +2403,81 @@ mod tests {
             hist.rect.width() > 40.0,
             "窄窗口下历史栏宽度应仍可用（不折叠成把手），实际={:?}",
             hist.rect
+        );
+    }
+
+    /// 内嵌置顶区与历史列表**必须**各占一段、互不重叠。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// 早前是「先画完整历史列表，再事后往上叠一层置顶」：
+    ///
+    /// - 「置顶」标签画在 `inner.min`，而卡片标题「历史」也在 `inner.min`
+    ///   —— 两者**同一个 y**，字叠字；
+    /// - 置顶列表从标签下一路铺到卡片底部 `inner.max.y` —— 盖住历史
+    ///   的前 N 行，且被盖住的行**仍然可点**（命中矩形还在）。
+    ///
+    /// 现在 `draw_expanded_card` 先把 body 切成两段：置顶在上、历史在下。
+    ///
+    /// 判据取两个自报热区（`pinned_body` / `history_body`）的**几何关系**，
+    /// 而不是像素颜色——后者在无 GPU 的测试环境里拿不到。
+    #[test]
+    fn embedded_pinned_does_not_overlap_history() {
+        let mut h = Harness::new("pin-overlap", vec2(700.0, 600.0))
+            .with_items(8)
+            .with_pinned(2);
+        h.frame();
+
+        let pinned = hit(&h, "pinned_body");
+        let history = hit(&h, "history_body");
+
+        // 前置条件：确实画出了两个独立列表。
+        assert!(
+            pinned.height() > 0.0,
+            "有置顶条目时应画出置顶列表，实际={pinned:?}"
+        );
+        assert!(
+            history.height() > 0.0,
+            "历史列表必须仍然有可用高度（不能被置顶区挤没），实际={history:?}"
+        );
+
+        // 核心断言：两段**不重叠**，且置顶段在历史段**上方**。
+        assert!(
+            pinned.max.y <= history.min.y + 0.5,
+            "内嵌置顶区与历史列表重叠了：pinned={pinned:?} history={history:?} ——              会出现「置顶」标签压在标题「历史」上、且置顶行盖住历史行"
+        );
+
+        // 置顶段必须在卡片头部**之下**（否则标签会与标题同高）。
+        let card = h
+            .ws
+            .by_kind(CardKind::History)
+            .expect("默认工作区含历史卡片")
+            .rect;
+        assert!(
+            pinned.min.y > card.min.y,
+            "置顶区应从卡片头部**下方**开始，而不是压在标题上：pinned={pinned:?} card={card:?}"
+        );
+    }
+
+    /// 没有置顶条目时，历史列表必须占满整个 body（不留下空白带）。
+    #[test]
+    fn no_pinned_items_means_no_reserved_band() {
+        let mut h = Harness::new("pin-empty", vec2(700.0, 600.0)).with_items(5);
+        h.frame();
+        assert!(
+            !h.state.hit.contains_key("pinned_body"),
+            "没有置顶条目时不应绘制置顶区（否则白占一条横幅）"
+        );
+        let history = hit(&h, "history_body");
+        let card = h
+            .ws
+            .by_kind(CardKind::History)
+            .expect("默认工作区含历史卡片")
+            .rect;
+        // 历史列表的顶端应紧贴头部（只差正常的内容起始边距）。
+        assert!(
+            history.min.y - card.min.y < 60.0,
+            "无置顶条目时历史列表应从卡片顶部附近开始，实际 history={history:?} card={card:?}"
         );
     }
 
