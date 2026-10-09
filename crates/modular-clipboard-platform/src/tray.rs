@@ -219,12 +219,11 @@ fn command_to_event(cmd: usize) -> Option<TrayEvent> {
 /// 这正是用户报告的症状「左键正常、右键没反应」——一个纯粹的
 /// 打包格式误读，与菜单宿主（前两次修复的重点）毫无关系。
 ///
-/// # 坐标也要注意
+/// # 坐标怎么取
 ///
-/// 高低位**不是**屏幕坐标：坐标在 `GET_X_LPARAM(lParam)` 宏的
-/// 意义上是同一组位，但版本 4 下要用 `GET_X_LPARAM` 而不是
-/// `LOWORD`——后者对负坐标会出错（右键菜单常弹在屏幕左/下边缘，
-/// 那里x 或 y 为负）。见 [`unpack_cursor`]。
+/// 回调 `lParam` 里**不携带**屏幕坐标（它是消息码的打包体），
+/// 菜单弹出位置改用 `GetCursorPos` 直接取当前光标（见
+/// `show_context_menu`），不再从这里解坐标。
 struct Callback {
     /// 高 16 位：鼠标消息码。
     mouse: u32,
@@ -291,24 +290,6 @@ const WM_LBUTTONUP_CODE: u32 = 0x0202;
 const WM_LBUTTONDBLCLK_CODE: u32 = 0x0203;
 const WM_RBUTTONUP_CODE: u32 = 0x0205;
 const WM_CONTEXTMENU_CODE: u32 = 0x007B;
-
-/// 从 `lParam` 解出光标屏幕坐标。
-///
-/// # 必须走 `GET_X_LPARAM` 语义，不能用 `LOWORD`
-///
-/// 托盘右键菜单常弹在屏幕**左边缘或下边缘**，那里 x / y 是负数。
-/// `LOWORD`/`LOWBIT` 把它当 `u16` 再转 `i32`，得到 65535 之类的
-/// 巨大正值 ⇒ 菜单弹出到屏幕外看不见，表现为「点了没反应」。
-/// `GET_X_LPARAM` 内部按 `i16` 解释，正确返回负值。
-fn unpack_cursor(lparam: isize) -> (i32, i32) {
-    // 通知区回调的坐标在 `lParam` 的低/高 16 位，但**整个 lParam**
-    // 已被 shell 按版本 4 的格式打包：坐标在低 32 位（x 低16 / y 高16），
-    // 鼠标码与通知码在更高位。因此这里只取低 32 位再按 i16 解释。
-    let packed = (lparam & 0xFFFF_FFFF) as u32;
-    let x = (packed & 0xFFFF) as u16 as i16 as i32;
-    let y = ((packed >> 16) & 0xFFFF) as u16 as i16 as i32;
-    (x, y)
-}
 
 // ---------------------------------------------------------------------------
 // 主线程侧句柄
@@ -389,7 +370,7 @@ pub fn start(_tooltip: &str) -> Result<Tray> {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
         DeleteObject,
@@ -405,8 +386,8 @@ mod imp {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetMessageW, ICONINFO,
-        IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
+        DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+        ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
         PostMessageW, RegisterClassExW, SetForegroundWindow, ShowWindow, SW_HIDE,
         SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
         TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_HOTKEY,
@@ -510,7 +491,7 @@ mod imp {
                 LRESULT(0)
             }
             WM_TRAY_MENU => {
-                unsafe { show_context_menu(hwnd, lparam.0) };
+                unsafe { show_context_menu(hwnd) };
                 LRESULT(0)
             }
             WM_HOTKEY => {
@@ -530,7 +511,7 @@ mod imp {
     }
 
     /// 弹出右键菜单并派发用户选择。
-    unsafe fn show_context_menu(hwnd: HWND, lparam: isize) {
+    unsafe fn show_context_menu(hwnd: HWND) {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else {
                 tracing::warn!("CreatePopupMenu 失败，跳过托盘菜单");
@@ -553,7 +534,20 @@ mod imp {
                 }
             }
 
-            let (x, y) = unpack_cursor(lparam);
+            // 菜单弹出位置 = **当前光标屏幕坐标**。
+            //
+            // ⚠️ 不能用 `unpack_cursor(lparam)` 从回调参数里解坐标：
+            // shell 对通知区回调的 `lParam` 传的是**消息码**（如
+            // `WM_RBUTTONUP = 0x205`），并不携带坐标。早前按
+            // 「坐标在低 32 位」解包，解出的是消息码本身 ——
+            // x ≈ 0x205 / 0x7B、y = 0，菜单因此弹到**屏幕左上角**
+            // （用户实机反馈的症状）。
+            //
+            // 标准做法是 `GetCursorPos`：右键点击的瞬间光标正停在
+            // 托盘图标上，取到的就是图标所在屏幕位置。
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let (x, y) = (pt.x, pt.y);
             // 菜单弹出前把宿主置前台，否则菜单立刻消失。
             //
             // ⚠️ 宿主必须是**可见的顶层窗口**，这是本次修复的核心。
@@ -1138,27 +1132,6 @@ mod tests {
                 "鼠标码 {mouse:#x} 应被识别为右键"
             );
         }
-    }
-
-    #[test]
-    fn cursor_unpacking_roundtrips() {
-        let (x, y) = unpack_cursor(100 | (200 << 16));
-        assert_eq!((x, y), (100, 200));
-    }
-
-    /// 屏幕**左/下边缘**会出现负坐标，必须按有符号解读。
-    ///
-    /// 托盘右键菜单常正好弹在这些位置——若按无符号解出 65535 之类的
-    /// 巨大正值，菜单会弹到屏幕外，表现为「点了没反应」。
-    #[test]
-    fn cursor_unpack_handles_negative_coordinates() {
-        // x = -1（屏幕左缘外侧），y = -3。
-        let (x, y) = unpack_cursor((-1i32 as isize & 0xFFFF) | ((-3i32 as isize) << 16));
-        assert_eq!(x, -1, "x 为负时必须解成 -1，而不是 65535");
-        assert_eq!(y, -3, "y 为负时必须解成 -3，而不是 65533");
-
-        // 对照：正坐标不受影响。
-        assert_eq!(unpack_cursor(100 | (200 << 16)), (100, 200));
     }
 
     #[test]

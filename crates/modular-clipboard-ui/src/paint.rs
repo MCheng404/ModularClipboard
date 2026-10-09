@@ -1326,6 +1326,12 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     }
     match card.kind {
         CardKind::History => {
+            // ⚠️ 历史栏整卡是「暗容器」：frame 底色也用 `list_bg`，
+            // 否则列表四周（frame 与 body 之间的边距）仍露出 frame
+            // 的 `surface` 底色——浅色主题下就是一圈白色（用户反馈
+            // 「列表边上还是白色」）。描边由 `draw_card_frame` 已画，
+            // 这里只盖底色，不动描边。
+            f.ui.painter_at(r).rect_filled(r, CARD_RADIUS, pal.list_bg);
             // 置顶内嵌在历史卡片**顶部** ⇒ 先把 body 切成两段，
             // 历史列表用下面那段。
             //
