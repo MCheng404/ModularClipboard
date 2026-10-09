@@ -23,3 +23,6 @@ target-*/
 # 不入库：二进制每次构建都是新 blob，历史会持续膨胀，且无法合并。
 # 需要给用户分发时走 GitHub Release，而不是仓库。
 /dist/
+
+# 临时提交信息文件（用 git commit -F 绕过 shell 拦截时产生）
+.git-commit-msg.txt
