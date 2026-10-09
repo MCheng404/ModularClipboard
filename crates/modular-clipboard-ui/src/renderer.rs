@@ -753,6 +753,21 @@ impl Drop for Painter<'_> {
         if let Some(mut f) = self.font.take() {
             f.destroy(&self.gpu.device);
         }
+        // ⚠️ 早前**漏了** `user_tex` 与 `placeholder`。
+        //
+        // 两者都是 `Option<DeviceImage>`，各持有 image + image view +
+        // DeviceMemory 三样 Vulkan 对象。`placeholder` 在第一次需要纹理
+        // 时就会创建，之后**每个窗口都会有一份**（每个窗口一个 `Painter`），
+        // 而设置窗口是「每次开关都新建」⇒ 反复开关设置会持续泄漏。
+        //
+        // 退出时验证层还会因此报 `VUID-vkDestroyDevice-device-05137`
+        // （销毁 device 时仍有活对象）。
+        if let Some(mut t) = self.user_tex.take() {
+            t.destroy(&self.gpu.device);
+        }
+        if let Some(mut t) = self.placeholder.take() {
+            t.destroy(&self.gpu.device);
+        }
         self.sampler.destroy(&self.gpu.device);
         self.slots.destroy(&self.gpu.device);
         self.uniform.destroy(&self.gpu.device);

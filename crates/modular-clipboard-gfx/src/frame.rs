@@ -1167,6 +1167,7 @@ impl<'a> FrameRenderer<'a> {
     /// 绑定后交给 GPU 会解引用垃圾值（UB → 丢设备）。
     /// 本方法不代为校验这一点——它无法知道资源层是否已写入。
     ///
+
     /// `batches` 为空时只清屏、不绑定任何描述符集，因此是安全的。
     pub fn record(&mut self, input: &DrawInput<'_>) -> anyhow::Result<()> {
         let Some(pending) = self.pending.as_ref() else {
@@ -1262,6 +1263,24 @@ impl<'a> FrameRenderer<'a> {
             // 每个批次开始前必须按自己的 clip 重设，否则所有
             // `ui.painter_at(rect)` 的裁剪都会被全屏范围覆盖掉。
             let rect = batch.clip.unwrap_or(scissor);
+
+            // ---- 纵深防御：与 framebuffer 求交并钳到合法范围 ----------
+            //
+            // `DrawBatch.clip` 是 **pub**字段，注释只写「已是物理像素」，
+            // 本模块不做任何越界/零面积检查。当前唯一生产调用方
+            // （`ui/src/renderer.rs` 的 `to_draw`）确实做了
+            // 「负坐标钳0 + 与视口求交 + 零面积跳过」，所以现在没出问题。
+            //
+            // 但 gfx 的 `examples/` 与任何**新**调用方都能构造出负 offset
+            // 或超出 framebuffer 的rect。Vulkan 对越界 scissor 是
+            // **未定义行为**（`VUID-vkCmdSetScissor-...`），而这类错误
+            // **不报 GPU 错误**，只是「裁剪失效 / 画面错」，极难定位。
+            let rect = sanitize_scissor(rect, self.swapchain.extent);
+            if rect.extent.width == 0 || rect.extent.height == 0 {
+                // 完全被裁掉 ⇒ 无需绘制。
+                continue;
+            }
+
             unsafe {
                 device.cmd_set_scissor(cmd, 0, std::slice::from_ref(&rect));
                 device.cmd_draw_indexed(cmd, batch.index_count, 1, batch.index_offset, 0, 0);
@@ -1846,8 +1865,106 @@ fn swapchain_format_of(gpu: &Gpu) -> anyhow::Result<vk::Format> {
 // 单测
 // ---------------------------------------------------------------------------
 
+/// 把 scissor 矩形与 framebuffer 求交，并钳成 Vulkan 合法值。
+///
+/// 返回宽或高为 0 的矩形表示「完全被裁掉」，调用方应跳过该批次。
+///
+/// # 为什么需要
+///
+/// `VUID-vkCmdSetScissor-02070` 要求 `offset + extent` 不超出
+/// attachment，且 `extent` 非 0。越界是**未定义行为**且**不报错**——
+/// 表现只是画面错位或裁剪失效，排查成本极高。这里做纵深防御。
+fn sanitize_scissor(mut r: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
+    let (w, h) = (i64::from(extent.width), i64::from(extent.height));
+    let mut x0 = i64::from(r.offset.x);
+    let mut y0 = i64::from(r.offset.y);
+    let mut x1 = x0 + i64::from(r.extent.width);
+    let mut y1 = y0 + i64::from(r.extent.height);
+
+    // 「整体在左/上之外」要能被正确判定为**全裁掉**，所以先与 0 求交，
+    // 再各自clamp 进 [0, extent]。顺序反了会把负坐标当成合法值。
+    x1 = x1.max(0);
+    y1 = y1.max(0);
+    x0 = x0.clamp(0, w);
+    y0 = y0.clamp(0, h);
+    x1 = x1.clamp(0, w);
+    y1 = y1.clamp(0, h);
+
+    r.offset.x = x0 as i32;
+    r.offset.y = y0 as i32;
+    r.extent.width = (x1 - x0).max(0) as u32;
+    r.extent.height = (y1 - y0).max(0) as u32;
+    r
+}
+
 #[cfg(test)]
 mod tests {
+
+    // ---- scissor 纵深防御 ----
+
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> vk::Rect2D {
+        vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D { width: w, height: h },
+        }
+    }
+
+    #[test]
+    fn sanitize_scissor_keeps_valid_rect_unchanged() {
+        let e = vk::Extent2D { width: 800, height: 600 };
+        assert_eq!(sanitize_scissor(rect(10, 20, 100, 50), e), rect(10, 20, 100, 50));
+    }
+
+    #[test]
+    fn sanitize_scissor_clips_to_framebuffer() {
+        let e = vk::Extent2D { width: 800, height: 600 };
+        assert_eq!(sanitize_scissor(rect(700, 10, 300, 50), e), rect(700, 10, 100, 50));
+        assert_eq!(sanitize_scissor(rect(900, 10, 50, 50), e), rect(800, 10, 0, 50));
+        assert_eq!(sanitize_scissor(rect(-20, -10, 100, 50), e), rect(0, 0, 80, 40));
+        assert_eq!(sanitize_scissor(rect(-200, -200, 50, 50), e), rect(0, 0, 0, 0));
+    }
+
+    /// Vulkan 要求 offset + extent 不越界。这条遍历一批病态输入逐个断言。
+    #[test]
+    fn sanitize_scissor_never_produces_illegal_scissor() {
+        let e = vk::Extent2D { width: 800, height: 600 };
+        let cases = [
+            rect(0, 0, 0, 0),
+            rect(-1, -1, 1, 1),
+            rect(799, 599, 100, 100),
+            rect(i32::MAX, i32::MAX, u32::MAX, u32::MAX),
+            rect(-1, 599, 2, 2),
+            rect(400, 300, u32::MAX, u32::MAX),
+        ];
+        for c in cases {
+            let r = sanitize_scissor(c, e);
+            assert!(r.offset.x >= 0 && r.offset.y >= 0, "offset 为负：{r:?}");
+            assert!(
+                r.offset.x as u64 + r.extent.width as u64 <= e.width as u64,
+                "右侧越界：{r:?}"
+            );
+            assert!(
+                r.offset.y as u64 + r.extent.height as u64 <= e.height as u64,
+                "下侧越界：{r:?}"
+            );
+        }
+    }
+
+    /// 本文件的 `clamp_axis(caps, want)` 在**上下限反了**时也不能 panic。
+    ///
+    /// 驱动报告 `min_image_extent > max_image_extent` 是可能的
+    /// （能力查询出错、或某些虚拟化驱动）。
+    #[test]
+    fn local_clamp_axis_tolerates_inverted_bounds() {
+        let caps = vk::SurfaceCapabilitiesKHR {
+            min_image_extent: vk::Extent2D { width: 10, height: 10 },
+            max_image_extent: vk::Extent2D { width: 5, height: 5 }, // 反了
+            ..Default::default()
+        };
+        let r = clamp_axis(&caps, vk::Extent2D { width: 800, height: 600 });
+        assert!(r.width > 0 && r.height > 0, "不得产出 0 尺寸：{r:?}");
+    }
+
     use super::*;
 
     fn caps(

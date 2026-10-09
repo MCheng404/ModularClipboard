@@ -686,9 +686,18 @@ pub fn staging_size(format: vk::Format, width: u32, height: u32) -> vk::DeviceSi
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_UNORM
         | vk::Format::B8G8R8A8_SRGB => 4,
-        other => panic!(
-            "staging_size 不支持压缩或未知格式 {other:?}：             请改用按 block 大小计算的路径"
-        ),
+        // ⚠️ **不能 panic**。这是库里被外部调用的函数，panic 会把整个
+        // 程序带走，而这里的条件只是「遇到了没支持的格式」——用返回值
+        // 表达更合适。
+        //
+        // 早前这里 panic，于是任何走 BC 压缩或未列入的格式都会让程序崩，
+        // 而不是「这一路径不支持」。
+        other => {
+            tracing::warn!(
+                "staging_size 遇到未支持格式 {other:?}，按 0 字节处理（该格式需按 block 大小另算）"
+            );
+            return 0;
+        }
     };
     bpp * width as vk::DeviceSize * height as vk::DeviceSize
 }
@@ -1130,11 +1139,26 @@ mod tests {    /// 按格式算 staging 字节数——R8 与 RGBA 必须不同�
         assert_eq!(staging_size_r8(w, h), staging_size(vk::Format::R8_UNORM, w, h));
     }
 
-    /// 非压缩格式不能panic——未知格式必须显式失败。
+    /// 未支持格式**不得 panic**，也不得算出错误的字节数。
+    ///
+    /// # 这条测试原先断言的是相反的行为
+    ///
+    /// 早前它是 `#[should_panic(expected = "不支持压缩或未知格式")]` ——
+    /// 把「库里遇到未支持格式就把整个程序带走」当成了正确行为。
+    ///
+    /// `staging_size` 是被外部调用的库函数：panic 会杀掉整个程序，
+    /// 而条件只是「这个格式要走另一条按 block 算的路径」。用返回值
+    /// 表达才合适——调用方看到 0 就知道这条路径不支持。
     #[test]
-    #[should_panic(expected = "不支持压缩或未知格式")]
-    fn staging_size_rejects_unknown_format() {
-        staging_size(vk::Format::BC7_UNORM_BLOCK, 4, 4);
+    fn staging_size_returns_zero_for_unsupported_format() {
+        assert_eq!(
+            staging_size(vk::Format::BC7_UNORM_BLOCK, 4, 4),
+            0,
+            "未支持格式应返回 0，绝不能 panic"
+        );
+        // 已支持的格式仍要算对，别被这条改动带偏。
+        assert_eq!(staging_size(vk::Format::R8_UNORM, 10, 10), 100);
+        assert_eq!(staging_size(vk::Format::R8G8B8A8_UNORM, 10, 10), 400);
     }
 
 

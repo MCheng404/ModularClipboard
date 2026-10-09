@@ -432,7 +432,19 @@ impl Drop for Gpu {
     }
 
 }
-    /// 按偏好选择物理设备与队列族。
+    /// 把 `v`夹进 `[lo, hi]`；`lo > hi`（驱动报告异常）时退回 `lo`。
+///
+/// 与 `frame.rs::clamp_axis` 同义。`f32::clamp` 在 `lo > hi` 时会 panic，
+/// 而「驱动报告的上下限反了」不该让程序崩——最坏结果只是那一次
+/// 建出的交换链尺寸不理想。
+fn clamp_axis(v: u32, lo: u32, hi: u32) -> u32 {
+    if lo > hi {
+        return lo;
+    }
+    v.clamp(lo, hi)
+}
+
+/// 按偏好选择物理设备与队列族。
 ///
 /// 队列族必须同时支持 `GRAPHICS` 与 `PRESENT`，否则无法把画面显示到窗口。
 fn select_device(
@@ -571,8 +583,14 @@ impl Swapchain {
         // 这里再clamp 一次作为纵深防御——
         // 用**传入的** caps，不是快照。
         let extent = vk::Extent2D {
-            width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
-            height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+            // ⚠️ 不用 `clamp`：它在 `min > max` 时会 panic。
+            //
+            // 驱动报告 `min_image_extent > max_image_extent` 是**可能发生**
+            // 的异常（能力查询出错、或某些虚拟化驱动）。`frame.rs` 的
+            // `clamp_axis` 早就专门处理过这种情况（退化为取下限），
+            // 这里却漏了——同一个文件里的同类逻辑必须一致。
+            width: clamp_axis(width, caps.min_image_extent.width, caps.max_image_extent.width),
+            height: clamp_axis(height, caps.min_image_extent.height, caps.max_image_extent.height),
         };
 
         let (format, color_space) = pick_format(formats)?;
