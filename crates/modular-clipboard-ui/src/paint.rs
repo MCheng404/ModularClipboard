@@ -375,8 +375,14 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     //
     // ⚠️ 顺序硬性：**先算右侧按钮区，再算搜索框**。反过来的话搜索框会
     // 一路铺到顶栏右缘，把图标按钮压在下面（按钮不可点）。
+    //
+    // ⚠️ 左缘必须让出 `DRAG_LEFT` 给顶栏拖动区：搜索框若贴 `inner.min.x`
+    // （= space_md=8pt）画，左段拖动区只有 `left_end - bar.min.x = 8pt`
+    // 且被 `> 8.0` 条件掐掉——顶栏左侧整块变成「可点不可拖」，
+    // 用户按住顶栏空白拖动毫无反应（8e40bad 后的回归）。
+    let search_min_x = inner.min.x + DRAG_LEFT;
     let search = Rect::from_min_max(
-        pos2(inner.min.x, bar.min.y + pal.space_sm),
+        pos2(search_min_x, bar.min.y + pal.space_sm),
         pos2(btn_area.min.x - pal.space_md, bar.max.y - pal.space_sm),
     );
     if search.width() > 40.0 && search.height() > 8.0 {
@@ -412,6 +418,8 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     //
     // 用外框左缘既不侵入输入区，又保住左侧那段可拖。
     let left_end = search.min.x;
+    // 搜索框已让出 `DRAG_LEFT`，左段必然有可拖宽度；阈值保留
+    // 8pt 只是防御极小窗口（搜索框被按钮区挤没时整条顶栏都不可拖）。
     if left_end - bar.min.x > 8.0 {
         drag.push(Rect::from_min_max(bar.min, pos2(left_end - 2.0, bar.max.y)));
     }
@@ -1684,6 +1692,14 @@ const LIST_PAD_X: f32 = 8.0;
 /// 卡片样式 = 每条历史是一张圆角小卡，卡与卡之间留这条缝；
 /// 首项顶部再留半条，让整体上下边缘也有留白。
 const ROW_GAP: f32 = 6.0;
+
+/// 顶栏左侧拖动区宽度（逻辑点）。
+///
+/// 顶栏里搜索框占掉绝大部分宽度，若搜索框贴着 `inner.min.x` 画，
+/// 左侧可拖空白只剩 8pt 且被 `> 8.0` 条件掐掉——顶栏整条
+/// 「可点不可拖」。让搜索框右移 `DRAG_LEFT`，给顶栏左侧留出
+/// 一段真正按得住、拖得动的区域。
+const DRAG_LEFT: f32 = 28.0;
 
 /// 垂直滚动条占位（逻辑点），缝隙拖动区右缘必须让出这一段。
 ///
