@@ -142,6 +142,12 @@ pub struct UiState {
     pub ops: Vec<Op>,
     /// 搜索框文本。
     pub query: String,
+    /// 搜索框是否展开（顶栏右侧图标折叠式搜索）。
+    ///
+    /// 折叠时顶栏只显示一枚放大镜图标（贴近窗口按钮），左侧整片
+    /// 都是拖动区；点击图标展开输入框（向左弹出），此时拖动区
+    /// 收缩到输入框左缘，但仍保留一段可拖宽度。
+    pub search_expanded: bool,
     /// 上一帧提交给窗口的拖动区（标题栏）。
     ///
     /// ⚠️ 必须是**多段**而不是「整个顶栏一块」：拖动区会被系统转成
@@ -371,28 +377,53 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     );
     draw_topbar_icons(f, btn_area, bar.center().y);
 
-    // ---- 搜索框：占满剩余全部空间 --------------------------------------
+    // ---- 搜索：折叠图标 + 点击展开输入框 --------------------------------
     //
-    // ⚠️ 顺序硬性：**先算右侧按钮区，再算搜索框**。反过来的话搜索框会
-    // 一路铺到顶栏右缘，把图标按钮压在下面（按钮不可点）。
+    // 布局（自左向右）：
+    //   [ 大片拖动区 ][ 搜索输入框（仅展开时） ][ 🔍 ][ ✕ ][ 🗑 ][ ⚙ ]
     //
-    // ⚠️ 左缘必须让出 `DRAG_LEFT` 给顶栏拖动区：搜索框若贴 `inner.min.x`
-    // （= space_md=8pt）画，左段拖动区只有 `left_end - bar.min.x = 8pt`
-    // 且被 `> 8.0` 条件掐掉——顶栏左侧整块变成「可点不可拖」，
-    // 用户按住顶栏空白拖动毫无反应（8e40bad 后的回归）。
-    let search_min_x = inner.min.x + DRAG_LEFT;
-    let search = Rect::from_min_max(
-        pos2(search_min_x, bar.min.y + pal.space_sm),
-        pos2(btn_area.min.x - pal.space_md, bar.max.y - pal.space_sm),
+    // 搜索框默认**折叠成一枚放大镜图标**、贴在窗口按钮左侧：顶栏左侧
+    // 整片（除按钮与图标）都是拖动区，用户落手即拖——这是顶栏拖动区
+    // 曾经「只剩 8pt、拖不动」问题的最优解：不是给拖动区留宽，
+    // 而是把占位的搜索框整个压缩到右侧一角。
+    //
+    // 点击图标展开输入框（向左弹出固定宽度），再点一次折叠。
+    // 展开时拖动区收缩到输入框左缘，但 140pt 输入框 + 右端控件之后
+    // 仍剩 ~46pt 可拖，不会退化成「窗口拖不动」。
+    let sq = btn * 0.62;
+    let search_icon_r = Rect::from_center_size(
+        pos2(btn_area.min.x - pal.space_md - sq * 0.5, bar.center().y),
+        vec2(sq, sq),
     );
-    if search.width() > 40.0 && search.height() > 8.0 {
-        draw_search(f, search);
+    f.state.hit.insert("search_icon", search_icon_r);
+    if search_toggle_button(f, search_icon_r) {
+        f.state.search_expanded = !f.state.search_expanded;
+        if f.state.search_expanded {
+            // 展开瞬间把焦点交给输入框：用户点击图标就是冲着搜索去的，
+            // 不该再额外点一下输入框。`TextEdit` 的 id 与
+            // `draw_search` 里一致（`Id::new("search_edit")`）。
+            f.ui
+                .memory_mut(|m| m.request_focus(egui::Id::new("search_edit")));
+        }
+    }
+
+    // 展开时输入框弹出在图标左侧。
+    let mut search_left = search_icon_r.min.x;
+    if f.state.search_expanded {
+        let input_w = SEARCH_EXPAND_W;
+        let input = Rect::from_min_max(
+            pos2(search_icon_r.min.x - pal.space_md - input_w, bar.min.y + pal.space_sm),
+            pos2(search_icon_r.min.x - pal.space_md, bar.max.y - pal.space_sm),
+        );
+        if input.width() > 40.0 && input.height() > 8.0 {
+            draw_search(f, input);
+            search_left = input.min.x;
+        }
     }
 
     let _ = scale;
 
-    // 顶栏整体作为拖动区（搜索框与按钮自行 `interact` 会排除命中）。
-    // 拖动区 = 顶栏**减去交互控件**。
+    // 顶栏拖动区 = 顶栏**减去交互控件**。
     //
     // ⚠️ 这里必须是「挖空」而不是「整块上报」。`WM_NCHITTEST` 对拖动区
     // 返回 `HTCAPTION`，系统随后把按下转成 `WM_NCLBUTTONDOWN`
@@ -400,26 +431,13 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     //
     // 症状：整个顶栏（含齿轮、垃圾桶、搜索框）全都点不动，
     // 表现为「设置打不开 / 搜索框不能点」。
-    //
-    // ⚠️ 这条路径**无法用 paint 层测试覆盖**：测试环境没有
-    // `WM_NCHITTEST`，`hit_test` 根本不被调用。所以当时
-    // 12 条交互测试全绿，实机却完全不可点。
-    // 必须配一条直接测 `chrome::hit_test` 的测试（见 gfx crate）。
     let mut drag = Vec::new();
-    // 左段：窗口左缘到**搜索框左缘**。
+    // 左段：窗口左缘 → 搜索输入框/图标的左缘。
     //
-    // ⚠️ 用热区表的 `search`（即 `TextEdit` 的真实矩形）而不是
-    // ⚠️ 必须用 `search.min.x`（搜索框**外框**左缘），不能用
-    // `hit["search"].min.x` —— 那是 `edit_rect` 的左缘，比外框右移了
-    // 一个图标宽（约 24pt）。于是拖动区一直伸进输入区内部，
-    // 点搜索框左侧（放大镜图标所在处，很自然的落点）被判成
-    // `HTCAPTION` ⇒ 系统发 `WM_NCLBUTTONDOWN` 而非 `WM_LBUTTONDOWN`
-    // ⇒ **搜索框点不动，变成拖窗口**。
-    //
-    // 用外框左缘既不侵入输入区，又保住左侧那段可拖。
-    let left_end = search.min.x;
-    // 搜索框已让出 `DRAG_LEFT`，左段必然有可拖宽度；阈值保留
-    // 8pt 只是防御极小窗口（搜索框被按钮区挤没时整条顶栏都不可拖）。
+    // 折叠时 `search_left` 是图标左缘，顶栏左侧几乎整条都是拖动区；
+    // 展开时收缩到输入框左缘。**必须用左缘 - 2pt 收尾**：多出来的
+    // 2pt 与控件之间留缝，避免亚像素重叠把控件边缘判成 Caption。
+    let left_end = search_left;
     if left_end - bar.min.x > 8.0 {
         drag.push(Rect::from_min_max(bar.min, pos2(left_end - 2.0, bar.max.y)));
     }
@@ -572,10 +590,37 @@ fn icon_button(
     clicked
 }
 
+/// 顶栏搜索图标按钮（折叠式搜索的开关）。
+///
+/// 与 [`icon_button`] 同构：egui `Button` 负责命中与悬停，图标自绘。
+/// 区别是放大镜**不用字体字形**（图标字体子集只有 18 个码位且
+/// `U+E003` 字形偏粗，见 [`draw_search_icon`]），改用几何绘制。
+fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> bool {
+    let pal = f.pal;
+    let resp = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new("search_icon"))
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
+    );
+    let resp = resp.inner;
+    if resp.hovered() {
+        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
+    }
+    draw_search_icon(
+        &f.ui.painter_at(r),
+        Rect::from_center_size(r.center(), vec2(pal.icon_size, pal.icon_size)),
+        if resp.hovered() { pal.text_bright } else { pal.text_dim },
+    );
+    let clicked = resp.clicked();
+    resp.on_hover_text(if f.state.search_expanded { "收起搜索" } else { "搜索" });
+    clicked
+}
+
 
 fn draw_search(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
-    let scale = f.scale;
     let painter = f.ui.painter_at(r);
     painter.rect_filled(r, pal.radius_md, pal.surface);
     painter.rect_stroke(
@@ -585,29 +630,12 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
         egui::StrokeKind::Inside,
     );
 
-    // 放大镜图标坐在左内边距里，与文字左边界对齐。
+    // 放大镜图标由右侧的折叠式搜索图标按钮承担（见 `draw_topbar`），
+    // 输入框内不再重复画 —— 否则框内左侧又冒出一个放大镜，与右侧
+    // 图标成双，视觉重复。文字直接从左边距起排。
     let pad = pal.space_sm;
-    let icon_w = pal.icon_size + pad;
-    draw_search_icon(
-        &f.ui.painter_at(r),
-        Rect::from_center_size(
-            pos2(r.min.x + pad + pal.icon_size * 0.5, r.center().y),
-            vec2(pal.icon_size, pal.icon_size) * scale,
-        ),
-        pal.text_dim,
-    );
-
-    // ⚠️ 这里必须是**真正的输入控件**，不能只画文字。
-    //
-    // 早前版本用 `painter_at().text()` 把占位符「搜索历史…」画上去、
-    // 点击只 `request_repaint()`——看着像搜索框，实际**打不了字**。
-    // 搜索框一旦占据顶栏主位置（原先那里是产品标题），静态假框就等于
-    // 占着最好的位置却不可用，比没有更糟。
-    //
-    // `TextEdit` 必须放在一个**限定矩形**的子 `Ui` 里，否则它会按
-    // egui 默认布局占满整行，把右侧的模式切换按钮挤出顶栏。
     let edit_rect = Rect::from_min_max(
-        pos2(r.min.x + icon_w, r.min.y + 1.0),
+        pos2(r.min.x + pad, r.min.y + 1.0),
         pos2(r.max.x - pad, r.max.y - 1.0),
     );
     if edit_rect.width() <= 4.0 || edit_rect.height() <= 4.0 {
@@ -725,9 +753,9 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
 /// 整体不超出 `r`——保证与文字基线视觉对齐。
 fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
     let side = r.width().min(r.height());
-    // 线宽取边长的 9%：约 1.6px（side=18），比字体字形明显纤细。
-    // ⚠️ 下限 1.2——太细在1x 屏上会断续，虚化。
-    let stroke_w = (side * 0.09).max(1.2);
+    // 线宽取边长的 9%：约 1.6px（side=16），比字体字形明显纤细。
+    // ⚠️ 下限 1.5——太细在1x 屏上会断续，虚化。
+    let stroke_w = (side * 0.09).max(1.5);
     let c = r.center();
 
     // 圆环：直径 52%，圆心偏左上。
@@ -1693,13 +1721,15 @@ const LIST_PAD_X: f32 = 8.0;
 /// 首项顶部再留半条，让整体上下边缘也有留白。
 const ROW_GAP: f32 = 6.0;
 
-/// 顶栏左侧拖动区宽度（逻辑点）。
+/// 顶栏搜索框展开时的宽度（逻辑点）。
 ///
-/// 顶栏里搜索框占掉绝大部分宽度，若搜索框贴着 `inner.min.x` 画，
-/// 左侧可拖空白只剩 8pt 且被 `> 8.0` 条件掐掉——顶栏整条
-/// 「可点不可拖」。让搜索框右移 `DRAG_LEFT`，给顶栏左侧留出
-/// 一段真正按得住、拖得动的区域。
-const DRAG_LEFT: f32 = 28.0;
+/// 搜索框默认折叠成一枚放大镜图标（贴在窗口按钮左侧），顶栏左侧
+/// 整片让给拖动区；点击图标后输入框向左弹出这段宽度。
+///
+/// 取值平衡：太窄（<120）输入体验差；太宽（>180）展开时把拖动区
+/// 挤到 <30pt，用户搜索完要拖窗口又拖不动。140pt ≈ 物理 210px，
+/// 足够输入，且展开后拖动区仍剩约 46pt。
+const SEARCH_EXPAND_W: f32 = 140.0;
 
 /// 垂直滚动条占位（逻辑点），缝隙拖动区右缘必须让出这一段。
 ///
@@ -2502,6 +2532,9 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn search_box_accepts_typed_text() {
         let mut h = Harness::new("search", vec2(600.0, 400.0));
         h.frame();
+        // 搜索框默认折叠成一枚图标：先点顶栏右侧图标展开，输入区才存在。
+        let icon = hit(&h, "search_icon").center();
+        h.click_at(icon);
         // 坐标从热区表读，不猜。
         let p = hit(&h, "search").center();
 
@@ -3222,34 +3255,59 @@ fn with_pinned(mut self, n: usize) -> Self {
         // ⚠️ 必须查**四角**而不只是中心。早前只查中心，漏掉了
         // 「拖动区伸进搜索框左侧约 22pt」这个 bug——中心在框内没问题，
         // 但点左边缘会被系统判成 HTCAPTION，搜索框点不动。
-        for name in [
-            "topbar_close",
-            "topbar_clear",
-            "topbar_settings",
-            "search",
-            // ⚠️ 外框也要查：它左侧的图标带是可点的，而那正是拖动区
-            // 最容易伸手的地方。只查 `search`（输入区）测不到——
-            // 输入区左缘与拖动区终点只差 2pt，恒在区外。
-            "search_box",
-        ] {
-            let r = hit(&h, name);
-            // 四角 + 中心：中心保证「主体可点」，四角保证「边缘也可点」。
-            let probes = [
-                ("左上", r.left_top()),
-                ("右上", r.right_top()),
-                ("左下", r.left_bottom()),
-                ("右下", r.right_bottom()),
-                ("中心", r.center()),
-            ];
-            for (which, c) in probes {
-                let inside = drag.iter().any(|d| d.contains(c));
-                assert!(
-                    !inside,
-                    "控件 {name} 的{which} {c:?} 落进了拖动区 {drag:?} —— \
-                     实机上点它不产生 WM_LBUTTONDOWN，表现为「点不动」/「变成拖窗口」"
-                );
+        //
+        // 搜索框是折叠式的：折叠态只有图标（`search_icon`），展开态
+        // 才登记 `search`/`search_box`。两种状态都要验证——折叠态
+        // 图标不能进拖动区（否则点图标变成拖窗口），展开态输入框
+        // 同样不能。
+        fn assert_outside_drag(drag: &[Rect], h: &Harness, names: &[&str]) {
+            for name in names {
+                let r = hit(h, name);
+                let probes = [
+                    ("左上", r.left_top()),
+                    ("右上", r.right_top()),
+                    ("左下", r.left_bottom()),
+                    ("右下", r.right_bottom()),
+                    ("中心", r.center()),
+                ];
+                for (which, c) in probes {
+                    let inside = drag.iter().any(|d| d.contains(c));
+                    assert!(
+                        !inside,
+                        "控件 {name} 的{which} {c:?} 落进了拖动区 {drag:?} —— \
+                         实机上点它不产生 WM_LBUTTONDOWN，表现为「点不动」/「变成拖窗口」"
+                    );
+                }
             }
         }
+
+        // 折叠态：三按钮 + 搜索图标。
+        assert_outside_drag(
+            &drag,
+            &h,
+            &["topbar_close", "topbar_clear", "topbar_settings", "search_icon"],
+        );
+
+        // 展开态：点击图标展开搜索框，再验证输入区与外框。
+        let icon = hit(&h, "search_icon").center();
+        h.click_at(icon);
+        let drag_expanded = h.state.drag_regions.clone();
+        assert!(
+            h.state.search_expanded,
+            "点搜索图标应展开搜索框"
+        );
+        assert_outside_drag(
+            &drag_expanded,
+            &h,
+            &[
+                "topbar_close",
+                "topbar_clear",
+                "topbar_settings",
+                "search_icon",
+                "search",
+                "search_box",
+            ],
+        );
     }
 
     /// 点关闭按钮必须产生 `Op::CloseWindow`。
@@ -3284,17 +3342,47 @@ fn with_pinned(mut self, n: usize) -> Self {
             }
         }
 
-        let search = hit(&h, "search");
+        // 搜索图标必须在按钮区左侧，且不得与任何按钮重叠。
+        let icon_r = hit(&h, "search_icon");
+        assert!(
+            icon_r.max.x <= rects[0].1.min.x,
+            "搜索图标 {} 越过最左按钮 {}",
+            icon_r.max.x,
+            rects[0].1.min.x
+        );
+        for (name, r) in &rects {
+            assert!(
+                !icon_r.intersects(*r),
+                "搜索图标 {icon_r:?} 与按钮 {name} {r:?} 重叠"
+            );
+        }
+
+        // 展开后：搜索框也必须完全排在按钮（与图标）左侧。
+        let icon_center = icon_r.center();
+        h.click_at(icon_center);
+        let search = hit(&h, "search_box");
         let rightmost = rects
             .iter()
             .map(|(_, r)| r.max.x)
             .fold(f32::MIN, f32::max);
+        assert!(
+            search.max.x <= icon_r.min.x + 0.5,
+            "展开后搜索框右缘 {} 越过搜索图标左缘 {}",
+            search.max.x,
+            icon_r.min.x
+        );
         assert!(
             search.max.x <= rightmost + 0.5,
             "搜索框右缘 {} 越过最右按钮 {}，按钮会被盖住",
             search.max.x,
             rightmost
         );
+        for (name, r) in &rects {
+            assert!(
+                !search.intersects(*r),
+                "展开后搜索框 {search:?} 与按钮 {name} {r:?} 重叠"
+            );
+        }
     }
 
     /// 拖动区本身必须真的能拖：空白处要判成 Caption。
@@ -3309,21 +3397,118 @@ fn with_pinned(mut self, n: usize) -> Self {
         let drag = h.state.drag_regions.clone();
         assert!(!drag.is_empty(), "应有拖动区");
 
-        // 取第一段的中心：那里是顶栏空白（搜索框左侧），必须可拖。
+        // 折叠态：drag[0] 是顶栏左段（窗口左缘 → 搜索图标左缘）。
+        // 搜索框折叠成右侧图标后，顶栏左侧几乎整条都是拖动区——
+        // 这是「顶部拖动区少」问题的最终形态，宽度必须守住。
         let seg = drag[0];
+        assert!(
+            seg.width() >= 100.0,
+            "折叠态顶栏左段拖动区只有 {}pt（应 ≥ 100pt）—— \
+             搜索区又占回顶栏左侧了？drag_regions={drag:?}",
+            seg.width()
+        );
+        // 左段必须真的能拖：中心应落在拖动区内。
         let c = seg.center();
         assert!(
             drag.iter().any(|d| d.contains(c)),
             "拖动区自己的中心应落在拖动区内，实际 {drag:?}"
         );
-        // 且不能与任何控件重叠。
-        for name in ["topbar_clear", "topbar_settings", "search"] {
+        // 且不能与折叠态任何控件重叠（图标 + 三按钮）。
+        for name in ["search_icon", "topbar_clear", "topbar_settings"] {
             let r = hit(&h, name);
             assert!(
                 !r.intersects(seg),
                 "拖动区段 {seg:?} 与控件 {name}（{r:?}）重叠"
             );
         }
+
+        // 展开态：左段收缩到输入框左缘，但仍必须存在且能拖。
+        let icon = hit(&h, "search_icon").center();
+        h.click_at(icon);
+        let drag2 = h.state.drag_regions.clone();
+        let seg2 = drag2[0];
+        assert!(
+            seg2.width() >= 40.0,
+            "展开态顶栏左段拖动区只剩 {}pt（应 ≥ 40pt）—— \
+             搜索框展开时窗口会拖不动；drag_regions={drag2:?}",
+            seg2.width()
+        );
+        let c2 = seg2.center();
+        assert!(
+            drag2.iter().any(|d| d.contains(c2)),
+            "展开态拖动区自己的中心应落在拖动区内，实际 {drag2:?}"
+        );
+        for name in ["search_icon", "topbar_clear", "topbar_settings", "search_box", "search"] {
+            let r = hit(&h, name);
+            assert!(
+                !r.intersects(seg2),
+                "展开态拖动区段 {seg2:?} 与控件 {name}（{r:?}）重叠"
+            );
+        }
+    }
+
+    /// 搜索框折叠式：默认折叠、点图标展开、再点收起，输入框随之消失。
+    #[test]
+    fn search_collapses_and_expands_on_icon_click() {
+        let mut h = Harness::new("search-toggle", vec2(700.0, 500.0));
+        h.frame();
+
+        // 默认折叠：没有输入区热区，只有图标。
+        assert!(!h.state.search_expanded, "搜索框应默认折叠");
+        assert!(
+            h.state.hit.contains_key("search_icon"),
+            "应有搜索图标热区"
+        );
+        assert!(
+            !h.state.hit.contains_key("search_box"),
+            "折叠态不应有输入框外框热区"
+        );
+
+        // 点图标 → 展开：输入区出现。
+        let icon = hit(&h, "search_icon").center();
+        h.click_at(icon);
+        assert!(h.state.search_expanded, "点图标应展开搜索框");
+        assert!(
+            h.state.hit.contains_key("search_box"),
+            "展开后应有输入框外框热区"
+        );
+
+        // 再点图标 → 收起：输入区消失。
+        let icon = hit(&h, "search_icon").center();
+        h.click_at(icon);
+        assert!(!h.state.search_expanded, "再点图标应收起搜索框");
+        assert!(
+            !h.state.hit.contains_key("search_box"),
+            "收起后输入框外框热区应消失"
+        );
+    }
+
+    /// 搜索图标的**绘制矩形**必须完整落在按钮热区内。
+    ///
+    /// 守着实机缺陷：`search_toggle_button` 曾用
+    /// `vec2(pal.icon_size, pal.icon_size) * scale` 算图标包围盒——
+    /// `icon_size=16` × `scale=1.5` = 24 逻辑点，**超过按钮
+    /// `sq = btn*0.62 ≈ 16.9`**。几何放大镜（圆环 + 手柄）占满整个
+    /// 包围盒，`painter_at(r)` 随即按按钮矩形裁剪，圆环被切掉一大块，
+    /// 实机表现「搜索图标渲染不完整」。
+    ///
+    /// 字体图标（×/垃圾桶/齿轮）有内部边距，24 逻辑矩形内字形只占
+    /// ~60%，未被裁到，所以只有搜索图标残缺——正是这条测试守的洞。
+    #[test]
+    fn search_icon_draw_rect_fits_toggle_box() {
+        let mut h = Harness::new("search-icon-fit", vec2(700.0, 500.0));
+        h.frame();
+        let r = hit(&h, "search_icon");
+        // 与生产路径同一算法：绘制矩形 = 中心对齐、边长 icon_size（不乘 scale）。
+        let draw = Rect::from_center_size(
+            r.center(),
+            egui::vec2(h.pal.icon_size, h.pal.icon_size),
+        );
+        assert!(
+            r.contains_rect(draw),
+            "搜索图标绘制矩形 {draw:?} 超出按钮热区 {r:?} —— \
+             painter_at 会按热区裁剪，放大镜被切掉（实机「图标渲染不完整」）"
+        );
     }
 
     /// 在 `ctx` 上排版一段文字，返回它占了几行。
