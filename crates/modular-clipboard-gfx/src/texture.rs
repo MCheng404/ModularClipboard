@@ -26,7 +26,6 @@
 //! 必须由调用方显式 [`FontTexture::destroy`]，且**调用前必须已
 //! `device_wait_idle`**。
 
-use std::collections::HashMap;
 
 use ash::{Device, vk};
 
@@ -915,215 +914,20 @@ impl FontTexture {
     }
 }
 
-/// 按 [`egui::TextureId`] 管理的纹理表。
-///
-/// egui 的 [`egui::TexturesDelta`] 是以 `TextureId` 为键的增量集合：
-/// `Managed(0)` 恒为字体图集，`Managed(n)` 与 `User(n)` 是用户纹理。
-/// 本表负责按 ID 增删改，帧层只需查表拿描述符信息。
-///
-/// 采样器按过滤方式缓存：字体图集用点采样，其余若为线性则共用一个
-/// 线性采样器，避免为每张纹理各建一个。
-pub struct TextureStore {
-    textures: HashMap<egui::TextureId, DeviceImage>,
-    /// 每个纹理配套的采样器句柄。
-    samplers: HashMap<egui::TextureId, vk::Sampler>,
-    owned_samplers: Vec<Sampler>,
-    /// 字体图集（`Managed(0)`）的专用句柄，供着色器绑定。
-    pub font: Option<FontTexture>,
-}
-
-impl TextureStore {
-    pub fn new() -> Self {
-        Self {
-            textures: HashMap::new(),
-            samplers: HashMap::new(),
-            owned_samplers: Vec::new(),
-            font: None,
-        }
-    }
-
-    /// 按 egui 的增量描述更新纹理表。
-    ///
-    /// 步骤：先处理 `set`（新增或覆盖），再处理 `free`（释放）。
-    /// 顺序不能反——同一帧内既设置又释放同一 ID 时，
-    /// egui 期望的是「先设后释放」，这样净效果是该纹理消失。
-    ///
-    /// `arena` 提供所有上传的 staging 空间——**必须**是
-    /// [`crate::frame::StagingArena`]，因为 egui 的一帧可能包含
-    /// 上千次逐字形增量上传，自建 staging 会耗尽显存。
-    pub fn apply(
-        &mut self,
-        gpu: &Gpu,
-        arena: &mut crate::frame::StagingArena<'_>,
-        cmd: vk::CommandBuffer,
-        delta: &egui::TexturesDelta,
-    ) -> anyhow::Result<()> {
-        for (id, deltas) in &delta.set {
-            // 字体图集走专用路径：它有独立的采样器与描述符绑定。
-            if *id == FONT_TEXTURE_ID {
-                self.update_font(gpu, arena, cmd, deltas)?;
-                continue;
-            }
-            for d in deltas {
-                self.update_user(gpu, arena, cmd, *id, d)?;
-            }
-        }
-
-        for id in &delta.free {
-            if *id == FONT_TEXTURE_ID {
-                // 字体图集不会被 egui 释放；真要释放说明调用方逻辑有问题。
-                tracing::warn!("egui 请求释放字体图集，已忽略");
-                continue;
-            }
-            if let Some(mut image) = self.textures.remove(id) {
-                // 释放前必须确保设备不再读取该纹理。
-                gpu.wait_idle();
-                image.destroy(&gpu.device);
-            }
-            self.samplers.remove(id);
-        }
-        Ok(())
-    }
-
-    /// 更新（或新建）一张用户纹理。
-    fn update_user(
-        &mut self,
-        gpu: &Gpu,
-        arena: &mut crate::frame::StagingArena<'_>,
-        cmd: vk::CommandBuffer,
-        id: egui::TextureId,
-        delta: &egui::epaint::ImageDelta,
-    ) -> anyhow::Result<()> {
-        let size = delta.image.size();
-        let (w, h) = (size[0] as u32, size[1] as u32);
-
-        // 尺寸变化意味着整图重建：局部更新无法改变图像尺寸。
-        // egui 约定此时会先发一个整图 delta，因此走新建路径。
-        let stale = self
-            .textures
-            .get(&id)
-            .is_some_and(|img| img.size.width != w || img.size.height != h);
-        if stale {
-            if let Some(mut old) = self.textures.remove(&id) {
-                gpu.wait_idle();
-                old.destroy(&gpu.device);
-            }
-            self.samplers.remove(&id);
-        }
-
-        if !self.textures.contains_key(&id) {
-            let image = DeviceImage::new(
-                gpu,
-                vk::Extent2D { width: w, height: h },
-                FONT_FORMAT,
-                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            )?;
-            self.textures.insert(id, image);
-            let sampler = Sampler::from_egui(&gpu.device, &delta.options)?;
-            self.samplers.insert(id, sampler.handle());
-            self.owned_samplers.push(sampler);
-        }
-
-        // 先取 staging 并写入，再录制命令。顺序不能反：
-        // `get_mut` 借用了 self，而 arena 是独立对象，不冲突。
-        let bytes = DeviceImage::coverage_bytes(&delta.image);
-        let offset = delta.pos.map(|p| (p[0] as u32, p[1] as u32));
-        let staging = arena.allocate(bytes.len() as vk::DeviceSize)?;
-        staging.write(&gpu.device, &bytes)?;
-
-        let image = self.textures.get_mut(&id).expect("上方已确保存在");
-        image.upload(gpu, cmd, staging, &bytes, offset, (w, h))
-    }
-
-    fn update_font(
-        &mut self,
-        gpu: &Gpu,
-        arena: &mut crate::frame::StagingArena<'_>,
-        cmd: vk::CommandBuffer,
-        deltas: &[egui::epaint::ImageDelta],
-    ) -> anyhow::Result<()> {
-        let Some(last) = deltas.last() else {
-            return Ok(());
-        };
-        let size = last.image.size();
-        let (w, h) = (size[0] as u32, size[1] as u32);
-
-        let needs_new = match &self.font {
-            None => true,
-            Some(f) => f.size().width != w || f.size().height != h,
-        };
-        if needs_new {
-            // 图集扩容：销毁旧纹理再建新的。
-            // 旧纹理可能仍被在途命令引用，因此必须先等设备空闲。
-            if let Some(mut old) = self.font.take() {
-                gpu.wait_idle();
-                old.destroy(&gpu.device);
-            }
-            self.font = Some(FontTexture::new(gpu, w, h)?);
-        }
-
-        // 逐个应用增量。整图更新会覆盖此前的局部更新，
-        // 而 egui 保证同一帧内 whole delta 会替换该 ID 的所有历史增量，
-        // 因此按顺序应用即可得到正确结果。
-        for d in deltas {
-            let bytes = DeviceImage::coverage_bytes(&d.image);
-            let staging = arena.allocate(bytes.len() as vk::DeviceSize)?;
-            staging.write(&gpu.device, &bytes)?;
-            let font = self.font.as_mut().expect("上方已确保存在");
-            font.apply_delta(gpu, cmd, staging, d)?;
-        }
-        Ok(())
-    }
-
-    /// 查表取描述符信息。
-    pub fn descriptor_info(&self, id: egui::TextureId) -> Option<vk::DescriptorImageInfo> {
-        let image = self.textures.get(&id)?;
-        let sampler = self.samplers.get(&id).copied()?;
-        Some(image.descriptor_info(sampler))
-    }
-
-    /// 字体图集描述符信息。
-    pub fn font_descriptor_info(&self) -> Option<vk::DescriptorImageInfo> {
-        self.font.as_ref().map(|f| f.descriptor_info())
-    }
-
-    /// 当前托管的纹理数量（不含字体图集）。
-    pub fn len(&self) -> usize {
-        self.textures.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.textures.is_empty()
-    }
-
-    /// 释放所有纹理。
-    ///
-    /// # 前置条件
-    /// 调用方**必须**已经 `device_wait_idle`。
-    pub fn destroy(&mut self, device: &Device) {
-        if let Some(mut font) = self.font.take() {
-            font.destroy(device);
-        }
-        for (_, image) in self.textures.drain() {
-            let mut image = image;
-            image.destroy(device);
-        }
-        self.samplers.clear();
-        for s in &self.owned_samplers {
-            s.destroy(device);
-        }
-        self.owned_samplers.clear();
-    }
-}
-
-impl Default for TextureStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ---------------------------------------------------------------------------
+// 注：`TextureStore` 已删除（2026-09）。
+//
+// 它全仓没有任何调用者（只在自身文件里被引用，且只有自己的测试用它），
+// 却带着一个真陷阱：`update_user` 用 `FONT_FORMAT`（R8）建用户纹理，
+// 于是 RGBA 缩略图会被压成单通道灰度——与 `pipeline.rs` 里「缩略图是
+// RGBA 彩色图」的设计直接矛盾。
+//
+// 留着它 = 留一个「看起来能用、用了就出错」的死代码。删掉比注释更彻底。
+// 生产路径走 `Painter::upload_font_delta` + `DeviceImage::new(…, R8G8B8A8_UNORM)`。
 
 #[cfg(test)]
-mod tests {    /// 按格式算 staging 字节数——R8 与 RGBA 必须不同。
+mod tests {
+    /// 按格式算 staging 字节数——R8 与 RGBA 必须不同。
     ///
     /// 回归测试：`upload` 早前硬编码按 R8 算，
     /// 上传 RGBA 缩略图时校验必然失败（GPU 命令一条都没录制）。
@@ -1382,14 +1186,6 @@ mod tests {    /// 按格式算 staging 字节数——R8 与 RGBA 必须不同�
         );
     }
 
-    #[test]
-    fn store_starts_empty() {
-        let s = TextureStore::new();
-        assert!(s.is_empty());
-        assert_eq!(s.len(), 0);
-        assert!(s.font.is_none());
-        assert!(s.font_descriptor_info().is_none());
-    }
 
     /// staging 容量决策：局部更新也按整图分配。
     ///

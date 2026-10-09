@@ -643,7 +643,20 @@ impl EventLoop {
     /// 累积语义下，`poll_for` 读到的关闭请求会一直留在 `pending` 里，
     /// 直到主循环 `poll()` 把它当本帧事件交给应用层。
     pub fn poll(&mut self) -> Vec<WindowEvent> {
-        self.modifiers = Modifiers::default();
+        // ⚠️ 这里**不再**每轮清零 `self.modifiers`（G9）。
+        //
+        // `pending` 是**跨轮累积**的，而 `poll_for` 一轮里最多调两次
+        // `poll()` 并丢弃返回值。清零会让「上一轮读到的 `Key` 事件」在
+        // 交付时拿到**全false** 的修饰键 —— 混合批次（先 Ctrl+点击、
+        // 后 Ctrl 抬起）里，Key 事件就会带着错误的修饰键。
+        //
+        // 不清零的代价是「所有键都松开后 `self.modifiers` 仍是旧值」，
+        // 但这个字段只作为「本批含 `Key` 事件时的兜底」，而：
+        // 1. 循环内每个 `Key` 事件都会被事件自带的 modifiers 覆盖
+        //    （那是按下瞬间的精确状态，更可靠）；
+        // 2. 不含 `Key` 事件的批次走 `current_modifiers()` 实时查询。
+        //
+        // 所以「保留旧值」严格优于「每轮清零」。
 
         // 焦点可能在两轮之间丢失（Alt+Tab 到别的程序），每轮重查。
         self.focused = unsafe { GetForegroundWindow() } == self.hwnd;

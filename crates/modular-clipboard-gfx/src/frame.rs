@@ -736,7 +736,14 @@ impl<'a> FrameRenderer<'a> {
 
         // 渲染通道是按某个格式建的。若交换链最终选中的格式不同，
         // framebuffer 与渲染通道不兼容——直接失败，别让驱动在运行时炸。
-        let pipeline_format = swapchain_format_of(gpu)?;
+        // ⚠️ 必须用**本窗口**的 formats（上面刚查到的），不能用
+        // `gpu.surface_formats` —— 那是**主窗口**的创建时快照。
+        //
+        // 两者在多数机器上相同，所以平时不发作；但两块显示器色彩能力
+        // 不同、或某表面只报单一格式时，这里会误报「渲染通道格式 X 与
+        // 交换链格式 Y 不一致」而**直接失败**（子窗口开不出来），
+        // 反过来也可能放过真正的不一致。
+        let pipeline_format = crate::pick_format(&formats)?.0;
         if pipeline_format != swapchain.format {
             anyhow::bail!(
                 "渲染通道格式 {pipeline_format:?} 与交换链格式 {:?} 不一致",
@@ -1852,14 +1859,6 @@ fn create_command_pool(device: &Device, queue_family: u32) -> anyhow::Result<vk:
         .map_err(|e| anyhow::anyhow!("创建命令池失败: {e:?}"))
 }
 
-/// 预知交换链将选中的格式。
-///
-/// 复用 `crate::pick_format`——**不另写副本**。渲染通道的附件格式必须与
-/// 交换链完全一致，两份实现一旦分叉就是静默失配，表现为驱动在
-/// `cmd_begin_render_pass` 时崩溃，极难定位。
-fn swapchain_format_of(gpu: &Gpu) -> anyhow::Result<vk::Format> {
-    Ok(crate::pick_format(&gpu.surface_formats)?.0)
-}
 
 // ---------------------------------------------------------------------------
 // 单测

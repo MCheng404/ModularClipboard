@@ -1448,8 +1448,8 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 对剪贴板这类「几十到几百条」的场景可接受。
     let pal = f.pal;
     let scale = f.scale;
-    let acts_w = 3.0 * (pal.control_height * 0.7 + pal.space_xs);
-    let text_w = (body.width() - (pal.icon_size + pal.space_sm) - acts_w - 8.0).max(20.0);
+    // ⚠️ 必须用 `preview_width`——与 `draw_item_row` 共用同一个算式。
+    let text_w = preview_width(body.width(), pal);
     let heights: Vec<f32> = items
         .iter()
         .map(|it| row_height_for(f.ui, it, pal, scale, text_w))
@@ -1555,6 +1555,23 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 是把结果镜像一份，供**下一帧**的虚拟化使用。
     let reported = out.state.offset.y;
     f.state.set_list_scroll(pinned_slot, reported.clamp(0.0, max_scroll));
+}
+
+/// 行内「文字区」的可用宽度。
+///
+/// # 为什么必须是**同一个函数**
+///
+/// 早前测量（`row_height_for`）与渲染（`draw_item_row`）各写一份算式，
+/// 而测量那份额外减了 `8.0`：于是按 `text_w` 量折行数、按宽 8pt 的
+/// `preview_band` 渲染，折行数可能**多算一行** ⇒ 行高凭空高出一整行
+/// （约 16pt），长内容下方留一条空白。
+///
+/// 「动态行高」的价值就在于贴合内容，两处不一致会让它稳定地偏大，
+/// 而且偏差随窗口宽度变化、不同机器表现不同，极难定位。
+fn preview_width(body_w: f32, pal: &Palette) -> f32 {
+    let icon_w = pal.icon_size + pal.space_sm;
+    let acts_w = 3.0 * (pal.control_height * 0.7 + pal.space_xs);
+    (body_w - icon_w - acts_w).max(20.0)
 }
 
 /// 列表行的**最小**高度（逻辑点）。
@@ -1759,9 +1776,26 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let icon_w = pal.icon_size + pal.space_sm;
     let acts_w = 3.0 * (pal.control_height * 0.7 + pal.space_xs);
     let text_x0 = r.min.x + icon_w;
-    let text_x1 = (r.max.x - acts_w).max(text_x0);
+    // 宽度同样取自 `preview_width`（减去已扣掉的 icon 区），保证
+    // 「量出来的行高」与「画出来的宽度」严格一致。
+    let text_x1 = text_x0 + preview_width(r.width(), &pal);
     if text_x1 - text_x0 < 20.0 {
-        return; // 太窄，画不下任何文字
+        // ⚠️ 太窄画不下文字，但**行仍必须可点**。
+        //
+        // 早前这里是裸`return`，直接跳到函数末尾的
+        // `resp.clicked()` / `resp.double_clicked()` 之前——
+        // 而 `resp` 早已通过 `ui.interact(r, …)` 注册好了。于是
+        // 极窄栏时整行**不可点**，却仍然画了 hover 底色与选中条，
+        // 视觉上像是能点，一点没反应。
+        //
+        // 只跳过绘制，不跳过交互。
+        if resp.clicked() {
+            f.state.push(Op::Select(item.id));
+        }
+        if resp.double_clicked() {
+            f.state.push(Op::Copy(item.id));
+        }
+        return;
     }
 
     // 左侧类型图标，垂直居中。
