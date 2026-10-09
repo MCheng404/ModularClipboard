@@ -170,12 +170,18 @@ impl<'a> SettingsWindow<'a> {
             self.gfx.fr.rebuild_swapchain(Default::default())?;
             return Ok(false);
         };
-        self.gfx.painter.paint(
+        if let Err(e) = self.gfx.painter.paint(
             &mut self.gfx.fr,
             &primitives,
             ppp,
             &mut textures_delta,
-        )?;
+        ) {
+            // ⚠️ 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
+            // 每次 `acquire()` 都 bail ⇒ **该窗口永久死掉**（黑屏 +
+            // 报「上一帧尚未 present」，与真实原因毫无关系）。
+            self.gfx.fr.abandon_frame();
+            return Err(e.into());
+        }
         let _ = self.gfx.fr.present(acquired)?;
         // ⚠️ 必须 clear：`TexturesDelta` 的 `Drop` 有debug 断言
         // 「未应用的 delta 必须先clear」，否则 panic 且报错与真实

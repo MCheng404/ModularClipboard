@@ -1434,9 +1434,44 @@ impl<'a> FrameRenderer<'a> {
     /// 重建后视口与剪裁自动跟随新尺寸（它们是动态状态，无需重建管线）。
     /// 若表面格式发生变化则直接失败——此时渲染通道与图形管线都必须重建，
     /// 已超出本模块的职责。
+    /// 放弃当前帧：清掉 `pending`，让下一次 [`Self::acquire`] 能重新开始。
+    ///
+    /// # 什么时候用
+    ///
+    /// 在 `acquire()` 成功之后、`present()` 之前出错时调用。否则
+    /// `pending` 一直是 `Some`，之后每次 `acquire()` 都 bail，
+    /// **该窗口永久死掉**（黑屏 + 报「上一帧尚未 present」，
+    /// 与真实原因毫无关系）。
+    ///
+    /// 典型来源：纹理上传失败、staging arena 耗尽、描述符池耗尽。
+    ///
+    /// 会先等 GPU 空闲，确保在飞命令都已完成——否则清掉 `pending`
+    /// 后重录命令缓冲可能与仍在执行的那一份冲突。
+    pub fn abandon_frame(&mut self) {
+        if self.pending.take().is_none() {
+            return;
+        }
+        tracing::debug!("放弃未present 的帧，恢复 acquire 能力");
+        self.gpu.wait_idle();
+    }
+
     pub fn rebuild_swapchain(&mut self, desired_extent: vk::Extent2D) -> anyhow::Result<()> {
         // 必须先等 GPU 空闲：旧交换链的 framebuffer 还在被在飞命令引用。
         self.gpu.wait_idle();
+
+        // ⚠️ 重建后**必须清掉 `pending`**。
+        //
+        // `pending` 只在 `present()` 里清除。若某一帧在
+        // `acquire()` 成功之后出错（纹理上传失败、staging arena 耗尽…）
+        // 就不会走到 `present`，`pending` 一直是 `Some` ⇒ 之后每一次
+        // `acquire()` 都直接 `bail!("上一帧尚未 present")` ⇒
+        // **该窗口永久黑屏，且没有任何恢复路径**。
+        //
+        // 错误只在首帧出现一次，后续全是这句与真实原因毫无关系的
+        // 报错，排查时极难定位。
+        //
+        // 这里已经 `wait_idle()`，在飞命令全部完成，清 `pending` 是安全的。
+        self.pending = None;
 
         // ⚠️ 必须查**本窗口自己的**表面。
         //

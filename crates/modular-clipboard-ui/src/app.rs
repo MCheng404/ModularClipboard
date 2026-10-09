@@ -330,6 +330,16 @@ pub fn run_with_options(
                 if let Err(e) = app.clear_history() {
                     tracing::warn!(%e, "托盘清空历史失败");
                 }
+                // ⚠️ 必须请求重绘。
+                //
+                // `clear_all` 内部已 `reload_list()`，数据层是新的；
+                // 但窗口可能正处于「空闲」状态（鼠标不动、egui 也没
+                // 别的理由重绘），于是**画面仍显示旧列表**，直到用户
+                // 碰一下鼠标才刷新 —— 表现为「清了但没清」。
+                //
+                // 下一行的 `f.show` 分支本来就有 `request_repaint()`，
+                // 这里补上的是「只清空、不唤起」的那条路径。
+                ctx.request_repaint();
             }
             if f.show {
                 presence::focus_window(window.hwnd());
