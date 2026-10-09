@@ -1,3 +1,8 @@
+
+# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
 $ErrorActionPreference = 'Stop'
 # ⚠️ 必须先让本进程Per-Monitor DPI 感知，否则 GetClientRect 返回的是
 # **DPI 虚拟化后的逻辑坐标**，而 CopyFromScreen 按物理像素抓取。
@@ -45,15 +50,15 @@ public static class Cap {
 }
 '@
 
-$exe = 'D:\WorkBuddy\Tiez\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
+$exe = '$RepoRoot\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
 Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 
 $env:RUST_LOG = 'info,modular_clipboard=debug'
-$err = 'D:\WorkBuddy\Tiez\shot.err'
+$err = '$RepoRoot\shot.err'
 Remove-Item $err -ErrorAction SilentlyContinue
 $p = Start-Process -FilePath $exe -ArgumentList '--no-capture' -PassThru `
-  -RedirectStandardOutput 'D:\WorkBuddy\Tiez\shot.log' -RedirectStandardError $err
+  -RedirectStandardOutput '$RepoRoot\shot.log' -RedirectStandardError $err
 Start-Sleep -Seconds 4
 $p.Refresh()
 
@@ -113,7 +118,7 @@ Add-Type -AssemblyName System.Drawing
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $gfx = [System.Drawing.Graphics]::FromImage($bmp)
 $gfx.CopyFromScreen($pt.X, $pt.Y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
-$png = 'D:\WorkBuddy\Tiez\shot-client.png'
+$png = '$RepoRoot\shot-client.png'
 $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
 $gfx.Dispose(); $bmp.Dispose()
 Write-Host "客户区截图已存: $png"
@@ -127,7 +132,7 @@ $sb = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $fb = New-Object System.Drawing.Bitmap $sb.Width, $sb.Height
 $fg = [System.Drawing.Graphics]::FromImage($fb)
 $fg.CopyFromScreen($sb.Left, $sb.Top, 0, 0, (New-Object System.Drawing.Size($sb.Width, $sb.Height)))
-$fpng = 'D:\WorkBuddy\Tiez\shot-fullscreen.png'
+$fpng = '$RepoRoot\shot-fullscreen.png'
 $fb.Save($fpng, [System.Drawing.Imaging.ImageFormat]::Png)
 $fg.Dispose(); $fb.Dispose()
 Write-Host "全屏截图已存: $fpng ($($sb.Width)x$($sb.Height))"

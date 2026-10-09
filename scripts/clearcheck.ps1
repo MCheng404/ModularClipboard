@@ -1,6 +1,11 @@
 param(
-    [string]$Png = 'D:\WorkBuddy\Tiez\shot-client.png'
+    [string]$Png = '$RepoRoot\shot-client.png'
 )
+
+# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
 
 # 分析客户区截图：统计 clear color 像素占比，判断 UI 是否铺满客户区。
 #

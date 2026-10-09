@@ -1,3 +1,8 @@
+
+# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
 $ErrorActionPreference = 'Stop'
 # 主题接线实机验证。
 #
@@ -11,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 # 用像素采样证明第2 点：抓客户区一块不含文字/按钮的区域，
 # 深色下应是暗色、浅色下应是亮色。
 
-$exe = 'D:\WorkBuddy\Tiez\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
+$exe = '$RepoRoot\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
 $script:pass = 0
 $script:fail = 0
 
@@ -151,7 +156,7 @@ function RunCase($dir, $darkModeJson, $label) {
   return [pscustomobject]@{ label = $label; line = "$themeLine"; luma = $luma }
 }
 
-$base = 'D:\WorkBuddy\Tiez\theme-probe'
+$base = '$RepoRoot\theme-probe'
 if (Test-Path $base) { Remove-Item $base -Recurse -Force }
 
 Write-Host "== 三种 dark_mode 各自跑一次 =="

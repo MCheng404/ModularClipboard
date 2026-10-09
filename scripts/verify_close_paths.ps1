@@ -1,5 +1,10 @@
+
+# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
 $ErrorActionPreference = 'Stop'
-$exe = 'D:\WorkBuddy\Tiez\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
+$exe = '$RepoRoot\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
 
 Add-Type -TypeDefinition @'
 using System;
@@ -33,8 +38,8 @@ $cases = @(
 foreach ($c in $cases) {
   Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue
   Start-Sleep -Milliseconds 500
-  $err = "D:\WorkBuddy\Tiez\sc-$($c.Msg.ToString('x'))-$($c.Wp.ToString('x')).err"
-  $out = "D:\WorkBuddy\Tiez\sc.log"
+  $err = "$RepoRoot\sc-$($c.Msg.ToString('x'))-$($c.Wp.ToString('x')).err"
+  $out = "$RepoRoot\sc.log"
   Remove-Item $err,$out -ErrorAction SilentlyContinue
 
   $env:RUST_LOG = 'info,modular_clipboard=debug'

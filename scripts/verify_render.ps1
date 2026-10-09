@@ -28,16 +28,25 @@ UI 渲染端到端验证：在多个窗口宽度下截图，并用**像素判据
 窗口物理像素高度。
 
 .EXAMPLE
-& 'D:\WorkBuddy\Tiez\scripts\verify_render.ps1'
-& 'D:\WorkBuddy\Tiez\scripts\verify_render.ps1' -Widths 420,560,720,900
+& '$PSScriptRoot\verify_render.ps1'
+& '$PSScriptRoot\verify_render.ps1' -Widths 420,560,720,900
 #>
 param(
   [int[]]$Widths = @(420, 560, 720, 900),
   [int]$Height = 800,
-  [string]$OutDir = 'D:\WorkBuddy\Tiez',
+  [string]$OutDir = '',
   # 打开设置面板再截图。它平时是覆盖层，不点齿轮按钮拍不到。
   [switch]$Settings
 )
+
+# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
+# param 默认值里PowerShell **不做变量插值**（那是字面串），
+# 所以默认值留空，在这里回填。
+if (-not $OutDir) { $OutDir = $RepoRoot }
+
 
 $ErrorActionPreference = 'Continue'
 

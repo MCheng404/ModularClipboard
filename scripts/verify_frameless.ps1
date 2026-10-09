@@ -1,8 +1,13 @@
+
+# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
 $ErrorActionPreference = 'Stop'
 #无边框窗口实机验证。
 #
 # 用法（**必须由用户自己执行**，Agent 不得在用户在场时弹窗）：
-#   powershell -ExecutionPolicy Bypass -File D:\WorkBuddy\Tiez\scripts\verify_frameless.ps1
+#   powershell -ExecutionPolicy Bypass -File $PSScriptRoot\verify_frameless.ps1
 #
 # 验证项：
 #   a) 窗口可见且**客户区**尺寸仍约 420x560（去掉AdjustWindowRectEx 后
@@ -14,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 #
 # c)「系统不再画标题栏」**无法自动验证**，需人眼确认，见脚本末尾提示。
 
-$exe = 'D:\WorkBuddy\Tiez\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
+$exe = '$RepoRoot\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
 $script:pass = 0
 $script:fail = 0
 
@@ -80,8 +85,8 @@ function Say($ok, $label, $detail) {
 Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 
-$err = 'D:\WorkBuddy\Tiez\frameless.err'
-$out = 'D:\WorkBuddy\Tiez\frameless.log'
+$err = '$RepoRoot\frameless.err'
+$out = '$RepoRoot\frameless.log'
 Remove-Item $err, $out -ErrorAction SilentlyContinue
 $env:RUST_LOG = 'info,modular_clipboard=debug'
 
@@ -190,8 +195,8 @@ foreach ($c in $cases) {
   #每条路径都用**全新进程**，避免上一条的状态污染
   Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue
   Start-Sleep -Milliseconds 500
-  $e2 = "D:\WorkBuddy\Tiez\fl-$($c.Msg.ToString('x'))-$($c.Wp.ToString('x')).err"
-  $o2 = "D:\WorkBuddy\Tiez\fl.log"
+  $e2 = "$RepoRoot\fl-$($c.Msg.ToString('x'))-$($c.Wp.ToString('x')).err"
+  $o2 = "$RepoRoot\fl.log"
   Remove-Item $e2, $o2 -ErrorAction SilentlyContinue
   $q = Start-Process -FilePath $exe -ArgumentList '--no-capture' -PassThru `
         -RedirectStandardOutput $o2 -RedirectStandardError $e2
@@ -221,7 +226,7 @@ foreach ($c in $cases) {
 
 # ---------------------------------------------------------------- 汇总
 Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue
-Remove-Item 'D:\WorkBuddy\Tiez\fl-*.err','D:\WorkBuddy\Tiez\fl.log','D:\WorkBuddy\Tiez\frameless.err','D:\WorkBuddy\Tiez\frameless.log' -ErrorAction SilentlyContinue
+Remove-Item '$RepoRoot\fl-*.err','$RepoRoot\fl.log','$RepoRoot\frameless.err','$RepoRoot\frameless.log' -ErrorAction SilentlyContinue
 
 Write-Host "`n================================"
 Write-Host "PASS = $script:pass    FAIL = $script:fail"

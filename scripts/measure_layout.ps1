@@ -19,8 +19,8 @@
 要测的**物理**像素宽度列表。默认覆盖 420/600/900 三个代表值。
 
 .EXAMPLE
-& 'D:\WorkBuddy\Tiez\scripts\measure_layout.ps1'
-& 'D:\WorkBuddy\Tiez\scripts\measure_layout.ps1' -Widths 420,600,900,1200
+& '$PSScriptRoot\measure_layout.ps1'
+& '$PSScriptRoot\measure_layout.ps1' -Widths 420,600,900,1200
 #>
 param(
   [int[]]$Widths = @(420, 600, 900),
@@ -28,6 +28,11 @@ param(
   [int]$Height = 560,
   [switch]$SkipMove
 )
+
+# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
 
 $ErrorActionPreference = 'Continue'
 
@@ -333,7 +338,7 @@ function Get-Layout([double]$bodyW) {
   }
 }
 
-$exe = 'D:\WorkBuddy\Tiez\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
+$exe = '$RepoRoot\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
 if (-not (Test-Path $exe)) {
   Write-Host "找不到 exe：$exe" -ForegroundColor Red
   Write-Host "请先运行 ./scripts/build.sh" -ForegroundColor Red
@@ -343,11 +348,11 @@ if (-not (Test-Path $exe)) {
 Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 500
 
-$err = 'D:\WorkBuddy\Tiez\measure-layout.err'
+$err = '$RepoRoot\measure-layout.err'
 Remove-Item $err -ErrorAction SilentlyContinue
 $env:RUST_LOG = 'warn'
 $p = Start-Process -FilePath $exe -ArgumentList '--no-capture' -PassThru `
-  -RedirectStandardOutput 'D:\WorkBuddy\Tiez\measure-layout.log' -RedirectStandardError $err
+  -RedirectStandardOutput '$RepoRoot\measure-layout.log' -RedirectStandardError $err
 Start-Sleep -Seconds 3
 $p.Refresh()
 
@@ -420,7 +425,7 @@ foreach ($w in $Widths) {
 
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
-Remove-Item $err, 'D:\WorkBuddy\Tiez\measure-layout.log' -ErrorAction SilentlyContinue
+Remove-Item $err, '$RepoRoot\measure-layout.log' -ErrorAction SilentlyContinue
 
 if ($fail -gt 0) {
   Write-Host "结果: $fail 个宽度仍溢出" -ForegroundColor Red
