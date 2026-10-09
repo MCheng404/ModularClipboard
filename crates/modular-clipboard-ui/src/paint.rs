@@ -384,14 +384,15 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     // 左段：窗口左缘到**搜索框左缘**。
     //
     // ⚠️ 用热区表的 `search`（即 `TextEdit` 的真实矩形）而不是
-    // `search.min.x - space_xs`：搜索框从 `inner.min.x` 起算，
-    // 往前减内边距会**侵入输入区**，点搜索框又变成拖窗口。
-    let left_end = f
-        .state
-        .hit
-        .get("search")
-        .map(|r| r.min.x)
-        .unwrap_or(search.min.x);
+    // ⚠️ 必须用 `search.min.x`（搜索框**外框**左缘），不能用
+    // `hit["search"].min.x` —— 那是 `edit_rect` 的左缘，比外框右移了
+    // 一个图标宽（约 24pt）。于是拖动区一直伸进输入区内部，
+    // 点搜索框左侧（放大镜图标所在处，很自然的落点）被判成
+    // `HTCAPTION` ⇒ 系统发 `WM_NCLBUTTONDOWN` 而非 `WM_LBUTTONDOWN`
+    // ⇒ **搜索框点不动，变成拖窗口**。
+    //
+    // 用外框左缘既不侵入输入区，又保住左侧那段可拖。
+    let left_end = search.min.x;
     if left_end - bar.min.x > 8.0 {
         drag.push(Rect::from_min_max(bar.min, pos2(left_end - 2.0, bar.max.y)));
     }
@@ -586,6 +587,15 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
         return;
     }
     // 自报热区给测试用（见 `UiState::hit` 的说明）。
+    //
+    // ⚠️ 登记**两个**：`search_box` 是外框，`search` 是输入区。
+    //
+    // 只登记输入区不够——外框左侧那条约 22pt 宽的图标带**也是可点的**
+    //（点它会聚焦搜索框），而它恰好是最容易被拖动区吃掉的地方。
+    // 没有 `search_box` 这条热区，`topbar_controls_are_not_in_drag_region`
+    // 就探测不到那个 bug：输入区左缘与拖动区终点只差 2pt，四角全落在
+    // 拖动区**之外**，测试照样绿。
+    f.state.hit.insert("search_box", r);
     f.state.hit.insert("search", edit_rect);
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
@@ -1536,9 +1546,14 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     // 来源与时间。
     let meta_y = text_area.min.y + font.size * 2.4;
     if meta_y < text_area.max.y {
+        // ⚠️ `max.y` 只能是 `meta_y + 高`，**不能**再叠加 `text_area.min.y`。
+        // 叠加后高度会变成 `min.y + 高`（几百 pt），而文字画在
+        // `meta_area.left_center()` —— 「来源 · 时间」会跑到卡片中部甚至
+        // 卡片之外；而 `painter_at(meta_area)` 的裁剪就是它自己，
+        // 越界部分不受任何裁剪。
         let meta_area = Rect::from_min_max(
             pos2(text_area.min.x, meta_y),
-            pos2(text_area.max.x, text_area.min.y + meta_y + font.size * 1.2),
+            pos2(text_area.max.x, meta_y + font.size * 1.2),
         );
         let meta_font = sized(pal.font_xs, scale);
         let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
@@ -2605,25 +2620,42 @@ mod tests {
             "顶栏应上报拖动区（否则窗口拖不动）"
         );
 
-        // 逐个控件验证：中心点必须**不**落在任何一段拖动区内。
+        // 逐个控件验证：**整个矩形**（含四角）都不得落在任何一段拖动区内。
         //
         // ⚠️ 名单必须**逐个列出**，不要用「遍历 hit表」的写法：
         // 遍历只能验证「已存在的控件」，新加的按钮若忘了登记热区就会
         // 静默漏测——而那正是「按钮存在却点不动」的成因。
+        //
+        // ⚠️ 必须查**四角**而不只是中心。早前只查中心，漏掉了
+        // 「拖动区伸进搜索框左侧约 22pt」这个 bug——中心在框内没问题，
+        // 但点左边缘会被系统判成 HTCAPTION，搜索框点不动。
         for name in [
             "topbar_close",
             "topbar_clear",
             "topbar_settings",
             "search",
+            // ⚠️ 外框也要查：它左侧的图标带是可点的，而那正是拖动区
+            // 最容易伸手的地方。只查 `search`（输入区）测不到——
+            // 输入区左缘与拖动区终点只差 2pt，恒在区外。
+            "search_box",
         ] {
             let r = hit(&h, name);
-            let c = r.center();
-            let inside = drag.iter().any(|d| d.contains(c));
-            assert!(
-                !inside,
-                "控件 {name}（中心 {c:?}）落进了拖动区 {drag:?} —— \
-                 实机上点它不会产生 WM_LBUTTONDOWN，表现为「点不动」"
-            );
+            // 四角 + 中心：中心保证「主体可点」，四角保证「边缘也可点」。
+            let probes = [
+                ("左上", r.left_top()),
+                ("右上", r.right_top()),
+                ("左下", r.left_bottom()),
+                ("右下", r.right_bottom()),
+                ("中心", r.center()),
+            ];
+            for (which, c) in probes {
+                let inside = drag.iter().any(|d| d.contains(c));
+                assert!(
+                    !inside,
+                    "控件 {name} 的{which} {c:?} 落进了拖动区 {drag:?} —— \
+                     实机上点它不产生 WM_LBUTTONDOWN，表现为「点不动」/「变成拖窗口」"
+                );
+            }
         }
     }
 
