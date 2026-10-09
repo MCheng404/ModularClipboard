@@ -96,9 +96,26 @@ impl Service {
     ///
     /// `data_dir` 为 `None` 时退回 `%APPDATA%/modular-clipboard`。
     pub fn with_data_dir(config: Config, data_dir: Option<&std::path::Path>) -> Result<Self> {
-        // 存储与配置必须落在**同一个**目录，否则会出现
-        // 「库在 D 盘、配置在 C 盘」的半生效状态。
-        let config_path = data_dir.map(|d| d.join(CONFIG_FILE_NAME));
+        // ⚠️ `config_path` **不能**在 `data_dir` 为 `None` 时也是 `None`。
+        //
+        // 早前写 `data_dir.map(|d| d.join(CONFIG_FILE_NAME))`，
+        // 于是默认启动（不带 `--data-dir`，也就是**所有**双击启动的用户）
+        // 的 `config_path == None` ⇒ `save_config()` 直接静默返回 ⇒
+        // **配置永不落盘**：
+        //
+        // - 设置面板里改的每一项（主题、置顶、监听开关、历史上限…）
+        //   重启后全部归零；
+        // - 退出时的窗口位置丢失，每次启动回默认位置；
+        // - 「主窗口位置实时记忆」功能 100% 无效。
+        //
+        // 而 `main.rs::config_path()` **读**的正是
+        // `ProjectDirs::config_dir()` —— 于是变成「读在 A 处、写无处可去」。
+        //
+        // 所以这里必须回退到默认配置文件路径，与读取端对齐。
+        let config_path = match data_dir {
+            Some(dir) => Some(dir.join(CONFIG_FILE_NAME)),
+            None => default_config_path(),
+        };
         let store = match data_dir {
             Some(dir) => Store::open_in(dir)?,
             None => Store::open_default()?,
@@ -778,6 +795,33 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
         assert!(on_disk.capture.enabled);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **默认启动路径也必须能落盘**（不传 `--data-dir`）。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// 早前 `with_data_dir` 把 `config_path` 写成
+    /// `data_dir.map(|d| d.join(CONFIG_FILE_NAME))` —— `None` 时就是
+    /// `None`，`save_config()` 于是静默什么都不做。
+    ///
+    /// 而**所有**双击启动的用户都走 `data_dir = None` 这条路径，
+    /// 于是设置改了重启就没、窗口位置每次回默认。
+    ///
+    /// 现有 `save_config_writes_into_given_data_dir` 只覆盖了
+    /// `Some(dir)` 分支，所以这条 bug 一直没被测到 —— 这是典型的
+    /// 「测试只覆盖 happy path 的那一支」。
+    #[test]
+    fn default_data_dir_still_has_a_config_path() {
+        // 只验证「config_path 有值」，不真的往 %APPDATA% 写文件：
+        // 测试不该污染用户的真实配置。
+        let svc = Service::with_data_dir(Config::default(), None)
+            .expect("默认数据目录应能打开");
+        assert!(
+            svc.config_path.is_some(),
+            "默认启动路径必须有配置写入路径，否则设置永不落盘 \\
+             （历史 bug：所有不带 --data-dir 的用户设置重启即丢）"
+        );
     }
 
     /// 「复制去重」开启时：重复复制相同内容不新增条目，

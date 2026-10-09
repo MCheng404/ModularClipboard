@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use modular_clipboard_platform::hotkey;
 use modular_clipboard_platform::tray::{self, TrayEvent};
+use modular_clipboard_core::config::WindowBackdrop;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -26,7 +27,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_RESTORE, IDC_ARROW, IDC_IBEAM, IDC_HAND,
 };
 use windows::core::PCWSTR;
-use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor};
+use windows::Win32::Foundation::COLORREF;
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowLongPtrW, LoadCursorW, SetCursor, SetLayeredWindowAttributes,
+    SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+};
 
 /// 窗口隐藏时的轮询间隔。
 ///
@@ -365,6 +371,98 @@ pub fn set_topmost(hwnd: HWND, on: bool) {
     } else {
         tracing::warn!(置顶 = on, "SetWindowPos 失败");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 背景效果（磨砂 / 半透明）
+// ---------------------------------------------------------------------------
+
+/// 应用窗口背景效果（磨砂 / 半透明 / 无），幂等可重入。
+///
+/// `opacity` 语义为「背景不透明度」，取值 0.3~1.0：
+///
+/// - [`WindowBackdrop::Acrylic`]：窗口级 alpha 恒 255（磨砂窗口
+///   **不能**是分层窗口——DWM 的 backdrop 在 `WS_EX_LAYERED` 窗口上
+///   不生效），背景透明度由渲染层的 palette 变体控制（见
+///   [`crate::theme::Palette::with_backdrop_alpha`]）；
+/// - [`WindowBackdrop::Translucent`]：`WS_EX_LAYERED` +
+///   `SetLayeredWindowAttributes(LWA_ALPHA, opacity*255)`——整窗按
+///   alpha 淡出，渲染层不必改；
+/// - [`WindowBackdrop::None`]：清掉 DWM backdrop 与分层样式，恢复
+///   纯色不透明背景。
+///
+/// 调用方在帧循环里比对配置后调用（与 [`set_topmost`] 相同的幂等
+/// 模式），失败只记日志——背景效果是锦上添花，不能影响主流程。
+pub fn apply_backdrop(hwnd: HWND, mode: WindowBackdrop, opacity: f32) {
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        tracing::warn!("设置背景效果失败：主窗口句柄已失效");
+        return;
+    }
+    let opacity = opacity.clamp(0.3, 1.0);
+    match mode {
+        WindowBackdrop::Acrylic => {
+            // 磨砂 = DWM 渲染：`DWMWA_SYSTEMBACKDROP_TYPE =
+            // DWMSBT_TRANSIENTWINDOW(2)`（Win11 22H2+ 的 Acrylic）。
+            let _ = unsafe { set_layered(hwnd, false) };
+            let _ = unsafe { set_layered_alpha(hwnd, 255) };
+            if let Err(e) = unsafe { set_dwm_backdrop(hwnd, 2) } {
+                tracing::warn!("设置磨砂背景失败（需 Win11 22H2+ 且 DWM 可用）: {e:?}");
+            }
+        }
+        WindowBackdrop::Translucent => {
+            let _ = unsafe { set_dwm_backdrop(hwnd, 0) };
+            let _ = unsafe { set_layered(hwnd, true) };
+            let _ = unsafe { set_layered_alpha(hwnd, (opacity * 255.0).round() as u8) };
+        }
+        WindowBackdrop::None => {
+            let _ = unsafe { set_dwm_backdrop(hwnd, 0) };
+            let _ = unsafe { set_layered(hwnd, false) };
+            let _ = unsafe { set_layered_alpha(hwnd, 255) };
+        }
+    }
+}
+
+/// 设置/清除 DWM 系统背景（`DWMWA_SYSTEMBACKDROP_TYPE`，0 = 无）。
+///
+/// # SAFETY: `hwnd` 须由调用方先经 `IsWindow` 校验。
+unsafe fn set_dwm_backdrop(hwnd: HWND, mode: i32) -> windows::core::Result<()> {
+    // SAFETY: 调用方已保证 hwnd 是有效窗口。
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &mode as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        )
+    }
+}
+
+/// 设置/清除窗口的 `WS_EX_LAYERED` 扩展样式（幂等）。
+///
+/// # SAFETY: `hwnd` 须由调用方先经 `IsWindow` 校验。
+unsafe fn set_layered(hwnd: HWND, on: bool) -> windows::core::Result<()> {
+    // SAFETY: 调用方已保证 hwnd 是有效窗口。
+    let style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as i64;
+    let has = style & (WS_EX_LAYERED.0 as i64) != 0;
+    if has == on {
+        return Ok(());
+    }
+    let new_style = if on {
+        style | (WS_EX_LAYERED.0 as i64)
+    } else {
+        style & !(WS_EX_LAYERED.0 as i64)
+    };
+    // SAFETY: 同上；只改扩展样式标志位。
+    let _ = unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize) };
+    Ok(())
+}
+
+/// 设置窗口级 alpha（`LWA_ALPHA`，255 = 不透明）。
+///
+/// # SAFETY: `hwnd` 须由调用方先经 `IsWindow` 校验。
+unsafe fn set_layered_alpha(hwnd: HWND, alpha: u8) -> windows::core::Result<()> {
+    // SAFETY: 调用方已保证 hwnd 是有效窗口。
+    unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA) }
 }
 
 pub fn minimize_window(hwnd: HWND) {

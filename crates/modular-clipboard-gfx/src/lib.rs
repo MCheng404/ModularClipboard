@@ -602,6 +602,28 @@ impl Swapchain {
             image_count = image_count.min(caps.max_image_count);
         }
 
+        // 合成 alpha：优先 PRE_MULTIPLIED。
+        //
+        // 磨砂（Acrylic）模式要求 DWM 按**像素 alpha** 合成——背景层
+        // 画半透明时透出 blur。`OPAQUE` 下 DWM 忽略像素 alpha，磨砂
+        // 会被背景完全盖住（用户可见为「磨砂没生效」）。
+        //
+        // 对**不透明**内容（默认绘制、子窗口、设置窗口）PRE_MULTIPLIED
+        // 与 OPAQUE 显示完全一致，因此全局切到 PRE_MULTIPLIED 是安全的；
+        // 若驱动不支持则回退 OPAQUE（透明背景失效但程序不崩）。
+        let composite_alpha =
+            if caps.supported_composite_alpha.contains(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED) {
+                vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+            } else {
+                vk::CompositeAlphaFlagsKHR::OPAQUE
+            };
+        tracing::info!(
+            supported = ?caps.supported_composite_alpha,
+            chosen = ?composite_alpha,
+            format = ?format,
+            "交换链合成 alpha 选择"
+        );
+
         let create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(surface)
             .min_image_count(image_count)
@@ -611,7 +633,7 @@ impl Swapchain {
             .image_array_layers(1)
             // 合成沿用 FIFO 变换，避免对不支持的变换做额外拷贝
             .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .composite_alpha(composite_alpha)
             .present_mode(present_mode)
             .clipped(true)
             .old_swapchain(vk::SwapchainKHR::null())

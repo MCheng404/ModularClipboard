@@ -53,6 +53,23 @@ macro_rules! palette_token {
     (dur, $v:expr) => { TokenValue::Dur($v) };
 }
 
+/// 背景层变体：`color` 类且属于背景层时整体降 alpha，其余原样返回。
+///
+/// 供 [`Palette::with_backdrop_alpha`] 逐字段展开使用。四个背景层名
+/// 是**编译期**常量分支——新增背景 token 必须同步加入这里的名单，
+/// 否则磨砂模式下新背景不透明、遮住 DWM 磨砂。
+macro_rules! backdrop_layer_value {
+    (color, $name:ident, $v:expr, $alpha:expr) => {{
+        if matches!(stringify!($name), "bg" | "surface" | "surface_variant" | "list_bg") {
+            $v.gamma_multiply($alpha as f32 / 255.0)
+        } else {
+            $v
+        }
+    }};
+    (num, $name:ident, $v:expr, $_alpha:expr) => { $v };
+    (dur, $name:ident, $v:expr, $_alpha:expr) => { $v };
+}
+
 /// 定义 [`Palette`] 的字段与两套取值。
 ///
 /// 用宏而不是手写两个 `struct` 字面量，是为了让「深浅两套字段对称」
@@ -120,6 +137,21 @@ macro_rules! palette {
             /// `Palette::from_mode(mode)` 这样更顺。
             pub fn from_mode(mode: crate::theme::ThemeMode) -> Palette {
                 mode.palette()
+            }
+
+            /// 背景透明变体：背景层（`bg` / `surface` / `surface_variant`
+            /// / `list_bg`）整体降 alpha，内容层（文字/卡片/状态色）
+            /// 保持不变。
+            ///
+            /// 磨砂（Acrylic）模式下用：窗口背景画半透明，DWM 的
+            /// 磨砂透过这些区域显示；卡片与文字仍不透明保证可读性。
+            ///
+            /// `alpha` 取值 0-255，255 等于原色（不透明）。
+            pub fn with_backdrop_alpha(&self, alpha: u8) -> Palette {
+                Self {
+                    $( $name: backdrop_layer_value!($kind, $name, self.$name, alpha), )*
+                    is_dark: self.is_dark,
+                }
             }
         }
     };
@@ -884,6 +916,46 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// 磨砂变体：四个背景层降 alpha，内容层（文字/卡片/状态色）不动。
+    ///
+    /// 这是磨砂模式下「DWM 的 blur 能透出」的渲染侧保证——背景层
+    /// 必须真的变透明，而不是只在文档里声明。
+    ///
+    /// ⚠️ 不断言 RGB 不变：`gamma_multiply` 在 gamma 空间同时调整
+    /// RGB 与 alpha（视觉上「同色更淡」），这是 egui 预乘的预期语义。
+    #[test]
+    fn backdrop_alpha_only_touches_backdrop_layers() {
+        for p in [Palette::dark(), Palette::light()] {
+            let glass = p.with_backdrop_alpha(96);
+            for (name, c) in [("bg", p.bg), ("surface", p.surface), ("surface_variant", p.surface_variant), ("list_bg", p.list_bg)] {
+                let g = field_of(&glass, name);
+                assert!(
+                    g.a() < c.a(),
+                    "[{}] {name} 在磨砂变体下应降 alpha（{} -> {}）",
+                    mode_of(&p),
+                    c.a(),
+                    g.a()
+                );
+            }
+            // 内容层不受影响：直接按字段比对。
+            assert_eq!(glass.text, p.text, "text 不应被磨砂变体改变");
+            assert_eq!(glass.surface_raised, p.surface_raised, "卡片底色不应被改变");
+            assert_eq!(glass.accent, p.accent, "状态色不应被改变");
+            assert_eq!(glass.is_dark, p.is_dark, "主题模式不应被改变");
+        }
+    }
+
+    /// 按字段名取色（测试用）。
+    fn field_of(p: &Palette, name: &str) -> egui::Color32 {
+        match name {
+            "bg" => p.bg,
+            "surface" => p.surface,
+            "surface_variant" => p.surface_variant,
+            "list_bg" => p.list_bg,
+            other => panic!("未知字段 {other}"),
         }
     }
 

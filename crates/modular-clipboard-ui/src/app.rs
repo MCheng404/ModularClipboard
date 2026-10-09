@@ -272,6 +272,13 @@ pub fn run_with_options(
     // 已应用到 Win32 的置顶状态。用来每帧比对配置，避免重复调
     // `SetWindowPos`（那会触发一次窗口样式变更）。
     let mut applied_topmost = always_on_top;
+    // 已应用到 Win32 的背景效果（磨砂/半透明 + 透明度）。
+    // 哨兵值 `(None, 1.0)`：首帧必然与配置比对并应用一次
+    // （若配置也是默认值，比对相等、无需调用——默认本来就不透明）。
+    let mut applied_backdrop = (
+        modular_clipboard_core::config::WindowBackdrop::None,
+        1.0,
+    );
     // 卡片子窗口集合（详情/视图等被拖出主窗的卡片）。
     let mut children = crate::childwin::ChildWindows::new();
     // 设置窗口（懒创建）。
@@ -645,6 +652,18 @@ pub fn run_with_options(
         if app.svc.state.config.ui.always_on_top != applied_topmost {
             applied_topmost = app.svc.state.config.ui.always_on_top;
             presence::set_topmost(window.hwnd(), applied_topmost);
+        }
+
+        // ---- 4.4b 背景效果同步（磨砂 / 半透明）----
+        //
+        // 与置顶同一模式：配置变了才调 Win32。`apply_backdrop` 幂等，
+        // 但 `SetLayeredWindowAttributes` 每帧调用没有意义且可能触发
+        // 重绘，所以比对后再调。
+        let backdrop = app.svc.state.config.ui.window_backdrop;
+        let opacity = app.svc.state.config.ui.window_opacity;
+        if (backdrop, opacity) != applied_backdrop {
+            applied_backdrop = (backdrop, opacity);
+            presence::apply_backdrop(window.hwnd(), backdrop, opacity);
         }
 
         // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口）----
@@ -1063,13 +1082,31 @@ impl App {
             }
         }
 
+        // 磨砂（Acrylic）模式：背景层整体降 alpha，DWM 的磨砂透过
+        // 背景显示；内容层（卡片/文字）保持不透明。滑块越大背景越实。
+        // 半透明与无模式用原 palette——整窗 alpha 由平台层处理，
+        // 渲染层不参与。
+        let backdrop = self.svc.state.config.ui.window_backdrop;
+        let opacity = self.svc.state.config.ui.window_opacity;
+        let acrylic_pal;
+        let pal_ref: &theme::Palette =
+            if backdrop == modular_clipboard_core::config::WindowBackdrop::Acrylic {
+            // 0.3~1.0 映射到 0.18~0.60：上限 0.6 保证磨砂**始终可见**
+            // （1.0 也不会把 DWM 的 blur 完全盖死）。
+            let alpha = ((opacity.clamp(0.3, 1.0) * 0.6 * 255.0).round() as u8).max(1);
+            acrylic_pal = self.pal.with_backdrop_alpha(alpha);
+            &acrylic_pal
+        } else {
+            &self.pal
+        };
+
         {
             let mut frame = crate::paint::Frame {
                 ui,
                 state: &mut self.paint_state,
                 svc: &mut self.svc,
                 ws: &self.ws,
-                pal: &self.pal,
+                pal: pal_ref,
                 scale: ppp,
                 area,
                 // `None` = 画主窗口（顶栏 + 全部停靠卡片）。
@@ -1121,6 +1158,18 @@ impl App {
                 }
                 Op::SetOptNumber { group, field, value } => {
                     set_opt_number_field(&mut self.svc.state.config, group, field, value);
+                    self.after_config_change();
+                }
+                Op::SetBackdrop(mode) => {
+                    // ⚠️ 背景效果必须**运行时立即生效**，不能等重启：
+                    // 用户从设置里切换无/磨砂/半透明后马上就能看到。
+                    // 配置只负责记住选择，真正调用 Win32 API 的时机在
+                    // 帧循环的幂等比对（`applied_backdrop`）。
+                    self.svc.state.config.ui.window_backdrop = mode;
+                    self.after_config_change();
+                }
+                Op::SetOpacity(opacity) => {
+                    self.svc.state.config.ui.window_opacity = opacity.clamp(0.3, 1.0);
                     self.after_config_change();
                 }
                 Op::Select(id) => {

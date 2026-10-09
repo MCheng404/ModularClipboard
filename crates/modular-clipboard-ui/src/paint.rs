@@ -27,6 +27,7 @@
 use egui::{Align2, CornerRadius, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use modular_clipboard_app::Service;
 use modular_clipboard_core::ClipItem;
+use modular_clipboard_core::config::WindowBackdrop;
 
 use crate::card::{Card, CardHost, CardKind, PinnedMode};
 use crate::icons::Icon;
@@ -94,6 +95,10 @@ pub enum Op {
         /// `None` 表示「不限」。
         value: Option<f64>,
     },
+    /// 切换窗口背景效果（无 / 磨砂 / 半透明）。
+    SetBackdrop(modular_clipboard_core::config::WindowBackdrop),
+    /// 调背景不透明度（0.3 ~ 1.0）。
+    SetOpacity(f32),
     /// 打开/关闭设置界面。
     ToggleSettings,
     /// 清空全部历史。
@@ -944,6 +949,43 @@ fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
     });
     ui.add_space(4.0);
 
+    // ---- 背景效果 -------------------------------------------------------
+    //
+    // 无 / 磨砂（Win11 原生 Acrylic）/ 半透明（整窗淡出），三选一互斥。
+    // 与置顶模式一样用 `selectable_label` 单选；透明度滑块在下方。
+    section(ui, "背景效果");
+    ui.horizontal(|ui| {
+        for (mode, label, desc) in [
+            (WindowBackdrop::None, "无", "纯色不透明背景"),
+            (WindowBackdrop::Acrylic, "磨砂", "Win11 原生毛玻璃，背景透出模糊"),
+            (WindowBackdrop::Translucent, "半透明", "整窗按透明度淡出"),
+        ] {
+            let selected = ui_cfg.window_backdrop == mode;
+            if ui
+                .selectable_label(selected, egui::RichText::new(label).size(pal.font_sm))
+                .on_hover_text(desc)
+                .clicked()
+                && !selected
+            {
+                f.state.push(Op::SetBackdrop(mode));
+            }
+        }
+    });
+    {
+        // 滑块语义随模式：磨砂 = 背景强度（上限 0.6，磨砂始终可见）；
+        // 半透明 = 整窗淡出程度。无模式下禁用。
+        let mut op = ui_cfg.window_opacity;
+        let enabled = ui_cfg.window_backdrop != WindowBackdrop::None;
+        let changed = setting_row(ui, "背景不透明度", "磨砂=背景强度，半透明=整窗淡出", |ui| {
+            ui.add_enabled(enabled, egui::Slider::new(&mut op, 0.3..=1.0).show_value(true))
+                .changed()
+        });
+        if changed && enabled {
+            f.state.push(Op::SetOpacity(op));
+        }
+    }
+    ui.add_space(4.0);
+
     // ---- 开关组 ---------------------------------------------------------
     //
     // 每项：(分组, 字段, 标签, 说明, 当前值)
@@ -1448,6 +1490,42 @@ fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
 
 // ---------------------------------------------------------------- 内容
 
+/// 首帧该从哪一行开始画（手工虚拟化的起始下标）。
+///
+/// `offsets[i]` 是第 i 行的顶边，`heights[i]` 是它的**实际**高度
+/// （预览折行数不同则高度不同），`scroll` 是滚动偏移。
+///
+/// # 为什么 `ROW_HEIGHT_MIN` 不能用在这里
+///
+/// 「第 i 行已完全滚出可视区上方」的真正条件是
+/// `offsets[i] + heights[i] <= scroll`。用代表**单行**高度的
+/// `ROW_HEIGHT_MIN` 代替，则任何预览超过 1 行的条目都会被提前判定为
+/// 「已滚过」—— 它明明还铺满整个视口，却一行都不画。
+///
+/// 实测推演（heights = [58, 3816, 58]，视口 500，scroll = 200）：
+/// 第 1 行占 67..3883 仍铺满视口，但 `67 + 58 = 125 <= 200` ⇒ 被跳过，
+/// 第 2 行的 y 又超出视口底 ⇒ `break` ⇒ **列表整块空白**。
+///
+/// # 为什么抽成函数
+///
+/// 这段逻辑躲在 `draw_history_body` 里、依赖 `Frame`，而列表行**不登记**
+/// 自报热区 —— 于是从外部**没有任何办法**观测到「行被跳过了」。
+/// 抽成纯函数后判据才能落在真正出错的地方。
+fn first_visible_row(offsets: &[f32], heights: &[f32], scroll: f32) -> usize {
+    debug_assert!(
+        offsets.len() >= heights.len(),
+        "offsets 应比 heights 多一项（末项是总高），实际 {} vs {}",
+        offsets.len(),
+        heights.len()
+    );
+    // `take_while` 在首个不满足处停止，语义与 `partition_point` 相同；
+    // 用它而非 `partition_point` 是因为后者是 slice 方法，而这里要同时
+    // 查两个数组的第 i 项。零分配——这条路径每帧都跑。
+    (0..heights.len())
+        .take_while(|&i| offsets[i] + heights[i] <= scroll)
+        .count()
+}
+
 fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 自报列表可视区。
     //
@@ -1636,7 +1714,27 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 正确做法与改 ScrollArea 之前一致——用绝对坐标：
             // `body.min.y + offsets[i] - scroll`。ScrollArea 在这套
             // 手工虚拟化里的作用只剩**裁剪**与**滚动条**。
-            let first = offsets.partition_point(|&o| o + ROW_HEIGHT_MIN <= scroll);
+            // ⚠️ 判据必须用**每行自己的实际高度**，不能用 `ROW_HEIGHT_MIN`。
+            //
+            // 早前写成 `offsets[i] + ROW_HEIGHT_MIN <= scroll`：
+            // 「第 i 行已经滚过去了」的真正条件是
+            // `offsets[i] + heights[i] <= scroll`，而 `heights[i]` 只在
+            // 预览恰好 1 行时才等于 `ROW_HEIGHT_MIN`。
+            //
+            // 只要某条预览超过 1 行（复制一段代码/长文本，剪贴板工具的
+            // 最常规用法），就存在区间
+            // `scroll ∈ [offsets[i]+58, offsets[i]+heights[i])`
+            // —— 此区间内该行**明明还看得见**却被判定为「已滚过」而跳过。
+            //
+            // 实测推演（heights=[58, 3816, 58]，视口 500，scroll=200）：
+            //   第 1 行占 67..3883，滚到 200 时仍然铺满整个视口；
+            //   但 `67 + 58 = 125 <= 200` ⇒ 被跳过；
+            //   第 2 行的 y = 3689 > 视口底 ⇒ break；
+            //   ⇒ **一行都没画，列表整块空白**。
+            //
+            // `offsets[i] + heights[i]` 随 i 单调递增（offsets 递增、
+            // heights 非负），满足 `partition_point` 的分段前提。
+            let first = first_visible_row(&offsets, &heights, scroll);
             for i in first..items.len() {
                 let y = content.min.y + offsets[i] - scroll;
                 if y > content.max.y {
@@ -3105,6 +3203,86 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 点不到**——这既让本条断言成立，也正是「顶栏按钮点不动」
     /// 那个 P0 的修法。
     #[test]
+    /// 混有**超长条目**时，滚到中段仍必须有行被画出来。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// 虚拟化起始行早前用 `offsets[i] + ROW_HEIGHT_MIN <= scroll` 判定
+    /// 「该行已滚过」—— 而 `ROW_HEIGHT_MIN` 是**单行**高度。预览超过
+    /// 1 行的条目，其真实高度远大于它，于是会被误判为「已滚过」而跳过。
+    ///
+    /// 实测推演（heights = [58, 3816, 58]，视口 500，scroll = 200）：
+    /// 第 1 行明明铺满整个视口，却被跳过；第 2 行的 y 又超出视口底
+    /// ⇒ `break` ⇒ **一行都没画，列表整块空白**。
+    ///
+    /// # 为什么现有测试没抓到
+    ///
+    /// `Harness::with_items` 造的文本只有一行（`"第 {i} 条记录…"`），
+    /// 于是所有 `heights[i]` 都等于 `ROW_HEIGHT_MIN`，该 bug 恒不触发。
+    /// 这条用**超长文本**构造，才能真正覆盖到它。
+    /// 首行下标必须按**每行实际高度**算，不能用单行高度常量。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// 早前写 `offsets[i] + ROW_HEIGHT_MIN <= scroll`。`ROW_HEIGHT_MIN`
+    /// 是**单行**高度，而预览超过 1 行的条目真实高度远大于它 ⇒
+    /// 该行明明还铺满整个视口，却被判定为「已滚过」而跳过。
+    ///
+    /// 实测推演（heights = [58, 3816, 58]，视口 500，scroll = 200）：
+    /// 第 1 行占 67..3883 铺满视口，但 `67 + 58 = 125 <= 200` ⇒ 跳过；
+    /// 第 2 行 y = 3689 超出视口底 ⇒ `break` ⇒ **列表整块空白**。
+    ///
+    /// 触发条件是「复制一段长文本」—— 剪贴板工具的最常规用法。
+    ///
+    /// # 为什么要用纯函数测
+    ///
+    /// 列表行**不登记**自报热区，从 `Harness` 外部无法观测「行被跳过了」。
+    /// 把这段计算抽成 `first_visible_row` 后，判据才落得住。
+    #[test]
+    fn first_visible_row_uses_actual_row_heights() {
+        // 三行：短 / 超长 / 短。offsets 比 heights 多一项（末项是总高）。
+        let heights = [58.0f32, 3816.0, 58.0];
+        let offsets = [3.0f32, 67.0, 3889.0, 3947.0];
+
+        // scroll=0：一行都没滚过去。
+        assert_eq!(first_visible_row(&offsets, &heights, 0.0), 0);
+
+        // scroll=100：第 0 行（3..61）已滚过，第 1 行仍在。
+        assert_eq!(first_visible_row(&offsets, &heights, 100.0), 1);
+
+        // ⚠️ 关键档位：scroll=200。
+        // 第 1 行占 67..3883，铺满整个视口，必须仍是 1。
+        // 用 ROW_HEIGHT_MIN 的旧写法在这里会得到 2（跳过长行）⇒ 空白。
+        assert_eq!(
+            first_visible_row(&offsets, &heights, 200.0),
+            1,
+            "长条目仍占据视口时不能被跳过 —— 用 ROW_HEIGHT_MIN 判定会整块空白"
+        );
+
+        // 全部滚过去：从末尾开始（等价于「没有行要画」）。
+        assert_eq!(first_visible_row(&offsets, &heights, 3947.0), 3);
+    }
+
+    /// 全部是单行时，新写法与旧的 `ROW_HEIGHT_MIN` 等价 —— 这解释了
+    /// 为什么旧 bug 一直没暴露：`Harness::with_items` 造的文本全是单行。
+    #[test]
+    fn first_visible_row_matches_constant_when_all_rows_are_min_height() {
+        let n = 10usize;
+        let heights = vec![ROW_HEIGHT_MIN; n];
+        let offsets: Vec<f32> = (0..=n).map(|i| i as f32 * ROW_HEIGHT_MIN).collect();
+        for scroll in [0.0, 30.0, 58.0, 100.0, 300.0] {
+            let by_const = offsets
+                .iter()
+                .take_while(|&&o| o + ROW_HEIGHT_MIN <= scroll)
+                .count();
+            assert_eq!(
+                first_visible_row(&offsets, &heights, scroll),
+                by_const,
+                "全单行时两种算法应一致（scroll={scroll}）"
+            );
+        }
+    }
+
     fn rows_fill_the_list_body_exactly() {
         let mut h = Harness::new("list-fill", vec2(700.0, 500.0)).with_items(60);
         // 第一帧：让 solver 求解、布局落位、拿到 body。

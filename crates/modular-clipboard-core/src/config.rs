@@ -224,6 +224,41 @@ pub struct UiConfig {
     /// 置顶窗口位置（屏幕逻辑点）。语义同 [`UiConfig::window_pos`]。
     #[serde(default)]
     pub pinned_window_pos: Option<WindowPos>,
+    /// 窗口背景效果（无 / 磨砂 / 半透明）。
+    ///
+    /// `#[serde(default)]` 保证旧版 config.json 缺字段时解析为
+    /// [`WindowBackdrop::None`]，用户既有配置不会被抹掉。
+    #[serde(default)]
+    pub window_backdrop: WindowBackdrop,
+    /// 背景不透明度（0.3 ~ 1.0，1.0 = 最不透明）。
+    ///
+    /// - `Translucent`（整窗半透明）：直接映射为窗口级 alpha；
+    /// - `Acrylic`（磨砂）：映射为渲染层背景 alpha（强度），
+    ///   窗口级 alpha 恒为 255——磨砂由 DWM 渲染，窗口不能分层。
+    #[serde(default = "default_window_opacity")]
+    pub window_opacity: f32,
+}
+
+/// 窗口背景效果。
+///
+/// 三选一，互斥：磨砂靠 DWM 渲染、半透明靠窗口分层，
+/// 两者机制不同不能同时开，因此不是位标志而是单选。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WindowBackdrop {
+    /// 无效果：纯色不透明背景。
+    #[default]
+    None,
+    /// Win11 原生磨砂（Acrylic）：DWM 渲染模糊 + 着色，渲染层
+    /// 背景画半透明让磨砂透出，文字/卡片保持不透明。
+    Acrylic,
+    /// 整体半透明：`SetLayeredWindowAttributes(LWA_ALPHA)`，
+    /// 整窗按透明度淡出，渲染层不必改。
+    Translucent,
+}
+
+/// `window_opacity` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
+fn default_window_opacity() -> f32 {
+    1.0
 }
 
 /// 一个窗口的位置（屏幕逻辑点，左上角为原点）。
@@ -258,6 +293,8 @@ impl Default for UiConfig {
             layout: None,
             window_pos: None,
             pinned_window_pos: None,
+            window_backdrop: WindowBackdrop::None,
+            window_opacity: 1.0,
         }
     }
 }
