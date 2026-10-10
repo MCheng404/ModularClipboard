@@ -1236,8 +1236,19 @@ fn setting_row(ui: &mut Ui, label: &str, desc: &str, control: impl FnOnce(&mut U
 fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut bool) -> bool {
     let pal = f.pal;
     let s = 18.0_f32;
-    // `allocate_exact_size` 返回 `(Rect, Response)` —— 不是单个 Response。
-    let (rect, _alloc) = ui.allocate_exact_size(egui::vec2(s * 1.8, s), Sense::click());
+    // ⚠️ 同一个矩形只准注册**一次**交互。
+    //
+    // 早前这里写的是 `allocate_exact_size(size, Sense::click())`
+    // 紧接着又 `interact(rect, Id::new(("switch", …)), Sense::click())`
+    // ——同一块区域注册了两个不同 Id 的交互区，靠「后注册者优先」
+    // 侥幸正确：一旦有人在中间插一个控件，或者 egui 改了同层交互区
+    // 的优先级规则，点击就会落到那个被忽略的 `_alloc` 上，开关直接
+    // 失灵而且毫无征兆。
+    //
+    // 正确分工：`allocate_exact_size` 只负责**占位**（`Sense::empty()`，
+    // 纯粹向后推游标），点击交互由下面那条显式 `interact` 承担——
+    // 它的 Id 绑定字段名，跨帧稳定。
+    let (rect, _alloc) = ui.allocate_exact_size(egui::vec2(s * 1.8, s), Sense::empty());
     let resp = ui.interact(rect, egui::Id::new(("switch", id_suffix)), Sense::click());
 
     // 开关本体：宽 = 高的 1.8 倍。
@@ -3615,6 +3626,34 @@ fn with_pinned(mut self, n: usize) -> Self {
     // ------------------------------------------------------------------
     // 交互测试：设置面板
     // ------------------------------------------------------------------
+
+    /// 点开关必须**真的翻转**对应字段。
+    ///
+    /// # 为什么之前没有这条
+    ///
+    /// 已有的 `settings_switch_emits_set_bool` 断言的是「只打开面板
+    /// 不该改动配置」——它跑的是**不点击**的路径。于是「开关能画出来
+    /// 但点了没反应」这种故障完全测不到，而这恰恰是 P附2 的表现：
+    /// `draw_switch` 在同一矩形上注册了两个不同 Id 的交互区，靠
+    /// 「后注册者优先」侥幸能用，一旦优先级规则变了就静默失灵。
+    #[test]
+    fn clicking_a_settings_switch_flips_that_field() {
+        let mut h = Harness::new("switch-click", vec2(600.0, 900.0));
+        h.state.show_settings = true;
+        h.settings_frame();
+
+        let field = "cleanup_on_start";
+        let r = settings_hit(&h, field);
+        let ops = h.settings_click_at(r.center());
+        let flipped = ops.iter().any(|o| match o {
+            Op::SetBool { field: f, .. } => *f == field,
+            _ => false,
+        });
+        assert!(
+            flipped,
+            "点「{field}」应产生该字段的 `SetBool`，实际={ops:?}。             若为空 ⇒ 点击没落在这个开关上（很可能又是同矩形重复注册交互）"
+        );
+    }
 
     /// 打开设置后，点某开关 ⇒ 产生对应字段的 `SetBool`。
     ///
