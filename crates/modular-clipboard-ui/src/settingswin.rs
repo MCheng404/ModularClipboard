@@ -27,7 +27,11 @@ use modular_clipboard_gfx::window::{EventLoop, Window, WindowEvent};
 const TITLE: &str = "剪贴板设置";
 
 /// 窗口默认尺寸（逻辑点）。
-const DEFAULT_SIZE: (f32, f32) = (460.0, 560.0);
+///
+/// 定稿布局：左侧导航（搜索框 + 圆角导航块）+ 右侧卡片内容。
+/// 宽度 780 容纳「常规/外观/捕获/存储/快捷键/关于」六分类导航
+/// 与右侧完整卡片；固定大小（无 resize 逻辑）。
+const DEFAULT_SIZE: (f32, f32) = (780.0, 560.0);
 
 /// 设置窗口。
 ///
@@ -52,10 +56,12 @@ pub struct SettingsWindow<'a> {
 impl<'a> SettingsWindow<'a> {
     /// 创建设置窗口。
     ///
-    /// `anchor` 是主窗口左上角的屏幕坐标（逻辑点），设置窗口摆在它
-    /// 右边 —— 紧挨着而不是叠着，用户能同时看到两者。
+    /// `anchor` 是主窗口左上角的屏幕坐标（逻辑点），`main_w` 是主窗口
+    /// 宽度（逻辑点）。设置窗口紧贴**主窗口右缘**摆放（中间留 12pt
+    /// 缝）——主窗口居中时也能两窗并排可见；右侧放不下再回退到左侧。
     pub fn create(
         anchor: egui::epaint::emath::Vec2,
+        main_w: f32,
         scale_factor: f32,
         shared: &crate::multiwindow::SharedGfx<'a>,
     ) -> anyhow::Result<Self> {
@@ -66,11 +72,40 @@ impl<'a> SettingsWindow<'a> {
             (DEFAULT_SIZE.1 * s) as u32,
         )?;
         // `Window::new` 收物理像素，`anchor` 是逻辑点，要乘 `s`。
-        // 中间留 12pt 缝，两窗口贴一起会显得像同一块面板。
-        window.move_to(
-            ((anchor.x + DEFAULT_SIZE.0 + 12.0) * s) as i32,
+        // 设置窗口左缘 = 主窗口右缘 + 12pt 缝：两窗并排紧贴。
+        // 早期实现是 `anchor.x + 780 + 12`（从主窗口左缘算起），
+        // 主窗口居中时右侧放不下、左侧也没空间，设置窗口被钳到
+        // 屏幕右缘——右侧内容贴屏幕边缘，观感上「内容文字位置
+        // 不对」（2026-10-11 用户反馈）。
+        let (mut x, mut y) = (
+            ((anchor.x + main_w + 12.0) * s) as i32,
             (anchor.y * s) as i32,
         );
+        let (cw, ch) = ((DEFAULT_SIZE.0 * s) as i32, (DEFAULT_SIZE.1 * s) as i32);
+        // 右侧放不下时（主窗口被「记住位置」恢复到屏幕右侧），
+        // 改为摆到**主窗口左侧**：两窗并排都可见，不重叠、不贴屏幕
+        // 边缘。左侧也没空间时才退回整体 clamp。
+        let (wl, _wt, wr, _wb) = crate::presence::work_area_of(window.hwnd());
+        let right_x = x + cw;
+        let left_x = ((anchor.x - DEFAULT_SIZE.0 - 12.0) * s) as i32;
+        if right_x > wr && left_x >= wl {
+            x = left_x;
+        }
+        // 兜底：仍超出工作区就钳制到工作区内（含下缘，防任务栏遮挡）。
+        let (x, y) = crate::presence::clamp_to_work_area(window.hwnd(), x, y, cw, ch);
+        tracing::info!(
+            anchor_x = anchor.x,
+            anchor_y = anchor.y,
+            main_w,
+            scale = s,
+            right_x,
+            left_x,
+            work_right = wr,
+            final_x = x,
+            final_y = y,
+            "设置窗口定位"
+        );
+        window.move_to(x, y);
 
         // NOTE: 同上：走 `new_context`，字体配置与主窗口一致。
         let ctx = shared.new_context();
@@ -158,23 +193,40 @@ impl<'a> SettingsWindow<'a> {
             // 写的，等于没写。
             self.ctx
                 .memory_mut(|m| m.data.remove::<egui::Id>(egui::Id::new("settings_scroll")));
+            // 设置界面状态归零：每次打开都从「常规」分类、空搜索、
+            // 非最近修改视图开始。
+            //
+            // 实测（2026-10-11）同一样例 exe 两次启动，首次打开时
+            // 曾出现「外观」分类被选中——来源是打开瞬间被排空的
+            // 积压输入里混入了落在导航项上的点击（窗口刚创建、
+            // 位置/焦点尚未稳定）。这里显式复位三个状态位，配合
+            // 下面「首帧丢弃积压输入」，任何竞态/残留都不可能让
+            // 「刚打开的窗口」跳到别的分类。
+            app.reset_settings_view();
         }
 
         // 设置窗口的拖动区：客户区顶部标题行（逻辑点、客户区坐标系）。
         //
         // 无边框窗口没有系统标题栏，**不设拖动区就无法拖动窗口**；
         // 主窗口的拖动区由 `app.drag_regions()` 每帧上报，设置窗口
-        // 没有等价入口，必须在这里自己设。挖空右上角一块给关闭按钮，
-        // 否则它会被系统判成 `HTCAPTION`，点击变拖动、按钮点不动。
+        // 没有等价入口，必须在这里自己设。
+        //
+        // 新布局下拖动区要**挖掉两处**：
+        // 1. 左侧搜索列（搜索框可点击，不能变成 `HTCAPTION`）；
+        // 2. 右上角关闭按钮（否则点击变拖动、按钮点不动）。
+        // 中间段整条都是拖动区——右侧内容区顶部（卡片标题之上）
+        // 不承载可点控件，拖动窗口时不会被误触发。
         //
         // 每帧调用：`set_drag_regions` 只改内存里的小 Vec，无系统调用；
         // 只在创建时设一次的话，窗口 resize 后矩形就对不上了。
         let (cw, ch) = self.window.inner_size_points();
         let title_h = 44.0f32;
         let close_zone_w = 40.0f32;
-        if cw > close_zone_w && ch > 0.0 {
+        // 左挖到搜索列右缘：与 `paint::draw_settings` 的布局常量一致。
+        let drag_left = crate::paint::SETTINGS_NAV_W + crate::paint::SETTINGS_MARGIN;
+        if cw > drag_left + close_zone_w && ch > 0.0 {
             self.window.set_drag_region(Some(egui::Rect::from_min_max(
-                egui::pos2(0.0, 0.0),
+                egui::pos2(drag_left, 0.0),
                 egui::pos2(cw - close_zone_w, title_h.min(ch)),
             )));
         } else {
@@ -189,14 +241,27 @@ impl<'a> SettingsWindow<'a> {
             return Ok(false);
         }
 
-        let frame_events = {
-            // IMPORTANT: 显示态也必须先 `poll_for` 再 `take_pending`。
+        let frame_events = if just_opened {
+            // 打开**首帧**把积压输入整个丢弃（不传进 egui）。
             //
+            // 实测（2026-10-11）：同一样例 exe 连续两次启动，首次
+            // 打开设置窗口偶发「外观」分类被选中——窗口刚创建、位置
+            // 与焦点尚未稳定时，系统队列里可能混入落在导航项上的
+            // 点击/移动（上一窗口激活、焦点抢夺产生的残留）。若把
+            // 它们回放进首帧，`settings_cat` 会被「幽灵点击」改掉。
+            // 首帧本就没有任何可信的用户输入（用户不可能在窗口
+            // 出现的同一瞬间精确点到导航项），整批丢弃是安全的。
+            //
+            // IMPORTANT: 分支内也必须先 `poll_for` 再 `take_pending`：
             // `poll_for`（含 `poll`）是**唯一**把消息从系统队列泵进
             // `EventLoop::pending` 的入口；只调 `take_pending()` 会拿到
             // 恒空的缓冲——本窗口的鼠标/键盘消息一直堆在系统队列里，
             // 拖动、滚动、点击全部无效（9ddba86 只修了隐藏态与 0×0 态，
             // 显示态从创建起就缺这一步，设置窗口「画出来了但点不动」）。
+            self.events.poll_for(None);
+            let _ = self.events.take_pending();
+            Vec::new()
+        } else {
             self.events.poll_for(None);
             self.events.take_pending()
         };
@@ -205,6 +270,13 @@ impl<'a> SettingsWindow<'a> {
         }
 
         let raw_input = self.events.egui_input(&self.ctx, &frame_events);
+        // 每帧把主窗口的调色板同步到设置窗口自己的 `egui::Context`。
+        //
+        // 设置窗口与主窗口各有一个独立 Context；`App::pal` 只在主题
+        // 被切换（`Op::SetThemeMode`）时更新，灌入的是主窗口的
+        // `Visuals`。这里把同一份调色板 `apply` 到设置窗口，保证
+        // 「外观 → 主题」切换后两个窗口同时变色。
+        crate::theme::apply(&self.ctx, app.palette());
         // 绘制委托给 `App` 的方法：把私有字段访问收敛在 app.rs 内，
         // 本模块不需要知道 `App` 的内部结构。
         let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_settings_window(ui));

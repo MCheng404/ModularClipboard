@@ -914,8 +914,10 @@ fn drive_attach_windows<'a>(
     // `sync_and_render` 的返回值告知——**必须**在此把它同步回
     // `false`，否则窗口藏了而状态说「开着」，再点齿轮就没反应。
     if settings_win.is_none() && app.paint_state.show_settings {
+        let (mw, _mh) = window.inner_size_points();
         match crate::settingswin::SettingsWindow::create(
             window.screen_position_points(),
+            mw,
             window.scale_factor(),
             &shared,
         ) {
@@ -1267,6 +1269,31 @@ impl App {
                     self.svc.state.config.ui.window_opacity = opacity.clamp(0.3, 1.0);
                     self.after_config_change();
                 }
+                Op::SetThemeMode(mode) => {
+                    // 主题必须**运行时立即生效**：记录选择 + 重灌调色板。
+                    //
+                    // CAUTION: 必须同时更新 `App.pal`（自绘层每帧从它取色）
+                    // 与主窗口 `Visuals`（egui 控件层）。`set_theme` 两件事
+                    // 一起做；设置窗口自己的 `Visuals` 由 `settingswin` 每帧
+                    // 从 `App.pal` 同步，这里不用管。
+                    self.svc.state.config.ui.dark_mode = mode.to_dark_mode();
+                    self.pal = crate::theme::set_theme(&self.ctx, mode);
+                    self.after_config_change();
+                }
+                Op::SetHotkey { slot, hotkey } => {
+                    // 写入配置。NOTE: 全局热键的实际注册在托盘线程，
+                    // 当前用硬编码 `DEFAULT_HOTKEY`，配置接入注册是
+                    // 后续任务——这里只保证绑定被记住并落盘。
+                    match slot {
+                        crate::paint::HotkeySlot::Toggle => {
+                            self.svc.state.config.hotkey_toggle = hotkey;
+                        }
+                        crate::paint::HotkeySlot::PastePrevious => {
+                            self.svc.state.config.hotkey_paste_previous = hotkey;
+                        }
+                    }
+                    self.after_config_change();
+                }
                 Op::Select(id) => {
                     self.svc.state.selected = Some(id);
                 }
@@ -1387,6 +1414,17 @@ impl App {
         self.apply_ops();
     }
 
+    /// 设置窗口打开时调用：设置界面状态归零。
+    ///
+    /// 每次打开都从「常规」分类、空搜索、非最近修改视图开始；
+    /// 配合 `settingswin` 首帧丢弃积压输入，杜绝打开瞬间被
+    /// 「幽灵点击」改掉分类的竞态。
+    pub(crate) fn reset_settings_view(&mut self) {
+        self.paint_state.settings_cat = crate::paint::SettingsCat::General;
+        self.paint_state.settings_query.clear();
+        self.paint_state.settings_show_recent = false;
+    }
+
     /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。
     pub fn drag_regions(&self) -> &[egui::Rect] {
         // 新架构的拖动区由 `paint::draw_topbar` 每帧写入。
@@ -1464,9 +1502,16 @@ impl App {
         }
     }
 
+    /// 当前生效调色板。
+    ///
+    /// `settingswin` 每帧用它同步设置窗口自己的 `Visuals`——设置窗口
+    /// 有独立的 `egui::Context`，`set_theme` 只灌主窗口那份。
+    pub(crate) fn palette(&self) -> &theme::Palette {
+        &self.pal
+    }
+
     /// 记下置顶窗口位置（供下次启动恢复）。
-    pub fn set_pinned_window_pos(&mut self, p: egui::epaint::emath::Vec2) {
-        if !is_sane_window_pos(p) {
+    pub fn set_pinned_window_pos(&mut self, p: egui::epaint::emath::Vec2) {        if !is_sane_window_pos(p) {
             tracing::debug!(?p, "置顶窗口坐标无效（很可能处于最小化），不写回配置");
             return;
         }

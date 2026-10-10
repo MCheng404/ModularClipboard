@@ -49,13 +49,22 @@
   --radius-md: 6px;
   --radius-lg: 10px;
 
-  /* ---- 圆角风格（本次提案，Rust 侧对应值待定）----
-     窗口圆角由 DWM 提供（chrome::apply_rounded_corners，Win11 生效），
-     这里用 --win-radius 表达它；--card-radius 是内容层要跟着改的那一个：
-     现在 Rust 里 CARD_RADIUS = 0（直角），这是与窗口圆角最违和的一处。 */
-  --win-radius:  12px;
-  --card-radius: 10px;
-  --row-radius:  6px;
+  /* ---- 圆角风格 ----
+     CAUTION: --win-radius 在原型里可以随便调，但**系统真实值调不了**。
+     DWMWA_WINDOW_CORNER_PREFERENCE 收的是枚举（DWMWCP_ROUND），
+     半径由系统决定（Win11 约 8pt）。想要任意半径只有 SetWindowRgn，
+     代价是像素级裁剪、四角锯齿。
+
+     所以「整体看起来更圆」要靠内容层主导：卡片圆角足够大 + 卡片
+     内缩足够多，让卡片的圆角成为视觉主体，窗口圆角只作外层。 */
+  --win-radius:  16px;   /* 原型示意值；真实约 8pt（系统定） */
+  --card-radius: 12px;   /* Rust: CARD_RADIUS，现为 0 */
+  --row-radius:  12px;   /* Rust: 行卡片现用 pal.radius_sm = 4 */
+  /* 卡片内边距 ≥ 卡片圆角，否则行卡片的方角会从圆角底下露出来。
+     取 13（比 12 大 1）而不是相等：相切时行卡片边缘正好落在圆角
+     切点上，亚像素舍入会让它偶尔露出一点点方角。 */
+  --card-pad:    13px;
+  --cardarea-pad: 8px;
 
   /* ---- 间距 ---- */
   --space-xs: 4px;
@@ -284,7 +293,7 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
    Rust 侧对应改动：card_area() 加内边距。 */
 .cardarea {
   flex: 1 1 auto; min-height: 0; background: var(--bg); display: flex;
-  padding: 0 var(--space-sm) var(--space-sm);
+  padding: 0 var(--cardarea-pad) var(--cardarea-pad);
 }
 .card {
   flex: 1 1 auto; min-width: 0;
@@ -293,12 +302,12 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   border-radius: var(--card-radius);
   display: flex; flex-direction: column;
   /* 圆角后内容必须让开圆角区域，否则行卡片的方角会从圆角底下露出来。
-     内边距 ≥ 圆角半径是硬要求：space_md(12) > radius_lg(10)。 */
-  padding: var(--space-md);
+     内边距 ≥ 圆角半径是硬要求：--card-pad(14) > --card-radius(12)。 */
+  padding: var(--card-pad);
 }
 /* 列表内容整体也要裁进圆角里，否则第一行/最后一行会压到圆角上 */
 .list, .pinned {
-  border-radius: calc(var(--card-radius) - var(--space-md));
+  border-radius: calc(var(--card-radius) - var(--card-pad) + 4px);
 }
 .card-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 
@@ -322,8 +331,46 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   display: flex; flex-direction: column; gap: var(--row-gap);
   scrollbar-width: thin;
 }
-.list::-webkit-scrollbar { width: var(--scrollbar-reserve); }
-.list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
+/* ---- 现代滑动条（overlay · 静止隐形 · 悬停淡入）----
+   这是当下的主流做法（macOS / Win11 / 各家现代 Web 组件库一致）：
+   不用时完全不出现，鼠标进入可滚动区域才淡入。
+
+   布局预留仍是 SCROLLBAR_RESERVE(10)——必须对齐 egui 的
+   ScrollStyle::floating().bar_width，这个值不能改（行内按钮的右基准
+   靠它避让）。视觉宽度用 `border + background-clip` 收窄到 4px：
+   **热区仍是 10，滑块只有 4**，好抓又好看。
+
+   三级反馈：
+     静止     → 完全透明（列表干净）
+     列表悬停 → 细滑块淡入
+     滑块悬停 → 加深 + 加粗到 6px（抓住的反馈）
+*/
+.list::-webkit-scrollbar { width: var(--scrollbar-reserve); background: transparent; }
+.list::-webkit-scrollbar-track { background: transparent; }
+.list::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 999px;
+  border: 3px solid transparent;      /* 10 − 2×3 = 4px 视觉宽度 */
+  background-clip: content-box;
+  transition: background-color .18s ease, border-width .18s ease;
+}
+.list:hover::-webkit-scrollbar-thumb,
+.list.force-scrollbar::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--border) 60%, transparent);
+}
+.list::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+  border-width: 2px;                  /* → 6px */
+}
+/* Firefox：scrollbar-width 只有 auto/thin/none 三档，给不了具体宽度，
+   但 scrollbar-color 支持 transparent，同样能做出「悬停才显形」。 */
+.list {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.list:hover, .list.force-scrollbar {
+  scrollbar-color: color-mix(in srgb, var(--border) 60%, transparent) transparent;
+}
 
 /* ---- 行卡片 ---- */
 .row {
@@ -349,9 +396,15 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 /* 行内操作区：热区 btn = control_height×0.55 = 15.4，字形 btn×0.78 ≈ 12。
    实现里 x = r.max.x − acts_w + (i+0.5)*(btn+space_xs)，i=0 是 pin，
    所以自左向右是 pin → copy → delete，delete 在最右。
-   DOM 按 delete,copy,pin 写，配 row-reverse 得到同样的视觉顺序。 */
+   DOM 按 delete,copy,pin 写，配 row-reverse 得到同样的视觉顺序。
+
+   **位置改动**：原先 `top: 5px` 与左上的「来源 · 时间」同一水平线，
+   两处争那一行的空间，长来源名会把按钮挤掉。改为**垂直居中**
+   （与左侧类型图标对齐）：上下都留出余量，不再和来源行打架，
+   视觉上也更平衡。右侧再留 6px，不贴边。 */
 .row-acts {
-  position: absolute; top: 5px; right: 0;
+  position: absolute; top: 50%; transform: translateY(-50%);
+  right: var(--space-sm);
   display: flex; flex-direction: row-reverse; gap: var(--space-xs);
 }
 .row-act {
@@ -372,8 +425,9 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   margin-left: calc(var(--icon-size) + var(--space-sm));
   /* 右边界 = r.max.x − acts_w —— preview_width() 里已经减掉了操作区宽度：
      (body_w − icon_w − acts_w)，所以文字**不会**排到按钮底下，
-     长来源名是被 elide 截断（省略号），不是被覆盖。 */
-  margin-right: calc(3 * (var(--control-height) * .55 + var(--space-xs)));
+     长来源名是被 elide 截断（省略号），不是被覆盖。
+     按钮现在还额外右移了 space_sm，这里再补上，保持两者不相碰。 */
+  margin-right: calc(3 * (var(--control-height) * .55 + var(--space-xs)) + var(--space-sm));
 }
 .row-meta-top {
   font-size: var(--font-xs); color: var(--text-dim); line-height: 1;
@@ -543,6 +597,7 @@ const state = {
   theme: 'light', view: 'normal', w: 480, h: 533, zoom: 1.5,
   winPinned: false,   // 窗口置顶（新增）
   rounded: true,      // 圆角风格（新增；false = 现在的直角风格，便于对比）
+  forceScroll: false, // 强制显示滚动条 —— headless 截图模拟不了 :hover
 };
 
 function rowHtml(item, i, mode) {
@@ -612,7 +667,7 @@ function render() {
       <div class="card-body">
         ${pinnedBlock}
         ${showPinned ? '<div class="pinned-sep" style="margin:0 var(--space-sm) var(--space-xs)"></div>' : ''}
-        <div class="list">${rows}</div>
+        <div class="list${state.forceScroll ? ' force-scrollbar' : ''}">${rows}</div>
       </div>
     </div></div>`;
   }
@@ -702,6 +757,14 @@ SPEC.tokens = `
 <p>下面的值取自 <code>theme.rs</code> 的 <code>palette!</code> 宏（深色在前）。
 可直接改，改完立即生效——用于验证「换一个值会怎样」。
 NOTE: 这是原型工具，不参与构建；正式取值仍以 <code>theme.rs</code> 为准。</p>
+<p><b>想试两个硬约束的边界：</b></p>
+<ul>
+<li><code>card-pad</code> 调到 <b>小于</b> <code>card-radius</code> ——
+    行卡片的方角会从卡片圆角底下露出来。</li>
+<li><code>cardarea-pad</code> 调到 <b>0</b> —— 卡片圆角与窗口圆角重叠错位，
+    边缘出现两道弧。</li>
+</ul>
+<p>这两个不是可以随便调的：它们决定了圆角能不能成立。</p>
 <div id="tokenGrid"></div>`;
 
 const TOKEN_GROUPS = [
@@ -721,6 +784,13 @@ const TOKEN_GROUPS = [
     ['danger-hover', '#eb8487', '#c11f24'], ['success', '#a0daae', '#307b43'],
     ['warn', '#ebc98e', '#906419'], ['info', '#95cfe4', '#257593']]],
   ['圆角', [['radius-sm', '4px'], ['radius-md', '6px'], ['radius-lg', '10px']]],
+  ['圆角风格（本轮）', [
+    ['win-radius', '16px'],    // 原型示意值；真实约 8pt，系统定
+    ['card-radius', '12px'],
+    ['row-radius', '12px'],
+    ['card-pad', '13px'],
+    ['cardarea-pad', '8px'],
+  ]],
   ['间距', [['space-xs', '4px'], ['space-sm', '8px'], ['space-md', '12px'],
             ['space-lg', '16px'], ['space-xl', '24px']]],
   ['字号（逻辑点）', [['font-xs', '11px'], ['font-sm', '12px'], ['font-md', '14px'],
@@ -878,8 +948,11 @@ document.getElementById('winH').addEventListener('input', e => { state.h = +e.ta
 render();
 
 /* URL hash 支持状态直达，便于批量截图与分享：
-   #dark  #pinned  #search  #empty  #selected  #hover  #narrow
-   例：main-window.html#dark+pinned */
+     列表视图  #normal #hover #selected #search #empty #narrow
+     #embedded  含内嵌置顶区      #wintop  窗口置顶
+     #dark      深色主题          #square  直角对照
+     #scroll    强制显示滚动条（截图模拟不了 :hover，只能这样验）
+   例：main-window.html#dark+wintop+scroll */
 (function applyHash() {
   const h = (location.hash || '').replace('#', '');
   if (!h) return;
@@ -907,6 +980,8 @@ render();
     state.rounded = false;
     document.getElementById('roundChk').checked = false;
   }
+  // headless 截图模拟不了 :hover，用这个把滚动条强行显形以便验证。
+  if (parts.includes('scroll')) state.forceScroll = true;
   syncDesktop();
   render();
   syncRound();

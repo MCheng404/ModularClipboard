@@ -99,6 +99,22 @@ pub enum Op {
     SetBackdrop(modular_clipboard_core::config::WindowBackdrop),
     /// 调背景不透明度（0.3 ~ 1.0）。
     SetOpacity(f32),
+    /// 切换主题（跟随系统 / 深色 / 浅色）。
+    ///
+    /// 由 `App::apply_ops` 落地：更新 `App.pal` 并重灌主窗口 `Visuals`；
+    /// 设置窗口的 `Visuals` 由 `settingswin` 每帧从 `App.pal` 同步。
+    SetThemeMode(crate::theme::ThemeMode),
+    /// 设置全局快捷键绑定（写入配置）。
+    ///
+    /// NOTE: 当前托盘线程注册的是硬编码 `DEFAULT_HOTKEY`，配置里的
+    /// 绑定尚未接入注册——录制与热键重注册是后续任务，这里先让
+    /// 设置界面能展示并保存绑定。
+    SetHotkey {
+        /// 哪个快捷键槽位。
+        slot: HotkeySlot,
+        /// 新绑定。
+        hotkey: modular_clipboard_core::config::Hotkey,
+    },
     /// 打开/关闭设置界面。
     ToggleSettings,
     /// 清空全部历史。
@@ -136,6 +152,125 @@ impl ConfigGroup {
             ConfigGroup::Ui => "界面",
             ConfigGroup::Capture => "捕获",
             ConfigGroup::Storage => "存储",
+        }
+    }
+}
+
+/// 全局快捷键槽位（设置界面「快捷键」卡片）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeySlot {
+    /// 显示 / 隐藏主窗口。
+    Toggle,
+    /// 粘贴上一个条目。
+    PastePrevious,
+}
+
+impl HotkeySlot {
+    /// 槽位对应的配置字段。
+    pub fn field(self) -> &'static str {
+        match self {
+            HotkeySlot::Toggle => "hotkey_toggle",
+            HotkeySlot::PastePrevious => "hotkey_paste_previous",
+        }
+    }
+
+    /// 槽位当前绑定的快捷键。
+    pub fn current(self, cfg: &modular_clipboard_core::config::Config) -> modular_clipboard_core::config::Hotkey {
+        match self {
+            HotkeySlot::Toggle => cfg.hotkey_toggle.clone(),
+            HotkeySlot::PastePrevious => cfg.hotkey_paste_previous.clone(),
+        }
+    }
+
+    /// 槽位默认绑定（与 `Config::default()` 一致）。
+    pub fn default(self) -> modular_clipboard_core::config::Hotkey {
+        match self {
+            HotkeySlot::Toggle => modular_clipboard_core::config::Hotkey::default(),
+            HotkeySlot::PastePrevious => modular_clipboard_core::config::Hotkey {
+                key: "V".into(),
+                ctrl: true,
+                shift: false,
+                alt: false,
+                win: true,
+            },
+        }
+    }
+}
+
+/// 设置界面左侧导航分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SettingsCat {
+    /// 常规：窗口行为。
+    #[default]
+    General,
+    /// 外观：主题 / 背景效果。
+    Appearance,
+    /// 捕获：剪贴板记录行为。
+    Capture,
+    /// 存储：历史容量。
+    Storage,
+    /// 快捷键：全局热键绑定。
+    Shortcuts,
+    /// 关于：版本 / 数据目录 / 退出。
+    About,
+}
+
+impl SettingsCat {
+    /// 全部分类（导航顺序）。
+    pub const ALL: [SettingsCat; 6] = [
+        SettingsCat::General,
+        SettingsCat::Appearance,
+        SettingsCat::Capture,
+        SettingsCat::Storage,
+        SettingsCat::Shortcuts,
+        SettingsCat::About,
+    ];
+
+    /// 导航标题。
+    pub fn title(self) -> &'static str {
+        match self {
+            SettingsCat::General => "常规",
+            SettingsCat::Appearance => "外观",
+            SettingsCat::Capture => "捕获",
+            SettingsCat::Storage => "存储",
+            SettingsCat::Shortcuts => "快捷键",
+            SettingsCat::About => "关于",
+        }
+    }
+
+    /// 导航图标（复用现有字体字形，无新增字形能力）。
+    pub fn icon(self) -> crate::icons::Icon {
+        match self {
+            SettingsCat::General => crate::icons::Icon::Settings,
+            SettingsCat::Appearance => crate::icons::Icon::Image,
+            SettingsCat::Capture => crate::icons::Icon::Text,
+            SettingsCat::Storage => crate::icons::Icon::Table,
+            SettingsCat::Shortcuts => crate::icons::Icon::Pinned,
+            SettingsCat::About => crate::icons::Icon::Code,
+        }
+    }
+
+    /// 导航项热区 key。
+    pub fn hot_key(self) -> &'static str {
+        match self {
+            SettingsCat::General => "settings_cat_general",
+            SettingsCat::Appearance => "settings_cat_appearance",
+            SettingsCat::Capture => "settings_cat_capture",
+            SettingsCat::Storage => "settings_cat_storage",
+            SettingsCat::Shortcuts => "settings_cat_shortcuts",
+            SettingsCat::About => "settings_cat_about",
+        }
+    }
+
+    /// 卡片重置按钮热区 key。
+    pub fn reset_key(self) -> &'static str {
+        match self {
+            SettingsCat::General => "settings_reset_general",
+            SettingsCat::Appearance => "settings_reset_appearance",
+            SettingsCat::Capture => "settings_reset_capture",
+            SettingsCat::Storage => "settings_reset_storage",
+            SettingsCat::Shortcuts => "settings_reset_shortcuts",
+            SettingsCat::About => "settings_reset_about",
         }
     }
 }
@@ -186,6 +321,21 @@ pub struct UiState {
     pub search_edit_id: Option<egui::Id>,
     /// 设置界面是否打开。
     pub show_settings: bool,
+
+    // ---- 设置界面状态（左右导航 + 卡片布局）----
+    /// 当前选中分类（左侧导航）。
+    pub settings_cat: SettingsCat,
+    /// 设置搜索框文本。
+    pub settings_query: String,
+    /// 搜索框「空态聚焦」：显示最近修改的设置项。
+    ///
+    /// 定稿交互：点击搜索框（内容为空）出现最近修改；输入内容后
+    /// 改为显示搜索结果；搜索结果为空时回落到最近修改。
+    pub settings_show_recent: bool,
+    /// 最近修改的设置项（label, 时间戳），按修改时间倒序展示。
+    ///
+    /// 任何设置控件被改动时登记；重置某卡片时清除该卡片所有项。
+    pub settings_recent: Vec<(String, u64)>,
     // 注：原先这里有 `settings_scroll`（手写滚动偏移）。设置面板
     // 改用 `ScrollArea` 后由 egui 自己管理滚动位置，该字段整体删除。
 
@@ -879,9 +1029,9 @@ fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
 
     // 手柄：从圆环**外缘**（45° 方向）伸向包围盒右下角。
     //
-    // 起点 = 环心 + (ring_r + stroke_w*0.5) * 0.707——正好贴在环上，
+    // 起点 = 环心 + (ring_r + stroke_w*0.5) * √2/2——正好贴在环上，
     // 终点取包围盒的 0.47 处（留一点边距，避免描边被裁）。
-    let diag = 0.707_106_78_f32; // √2/2
+    let diag = std::f32::consts::FRAC_1_SQRT_2;
     let start_off = (ring_r + stroke_w * 0.5) * diag;
     let start = pos2(ring_c.x + start_off, ring_c.y + start_off);
     // IMPORTANT: `reach` 必须留够「线宽的一半」的余量：`end` 还要描边，
@@ -904,10 +1054,18 @@ fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
 ///   「窗口里还有一块面板」。
 ///
 /// `area` 是**本窗口自己的客户区**，与主窗口无关。
+/// 设置界面布局常量：左侧导航列宽（逻辑点）。
+///
+/// `settingswin` 的拖动区用这两个值挖掉左列，二者必须保持一致。
+pub const SETTINGS_NAV_W: f32 = 172.0;
+/// 设置界面外缘留白（逻辑点）。
+pub const SETTINGS_MARGIN: f32 = 12.0;
+
+/// 设置界面：左侧搜索框 + 圆角导航块，右侧卡片分组。
+///
+/// `area` 是**本窗口自己的客户区**，与主窗口无关。
 pub fn draw_settings(f: &mut Frame<'_>) {
     let pal = f.pal;
-    // 客户区由 `Frame` 带入——设置窗口有自己的客户区，
-    // 不该再让调用方传一个进来（那两个值必须一致，传错就是 bug）。
     let area = f.area;
 
     // IMPORTANT: 清空必须**早于**下面所有提前 return。
@@ -923,7 +1081,6 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     // 此时按 `area` 排布的面板会被算到屏幕外，**看起来像设置界面没打开**。
     //
     // 显式拒绝明显不合理的尺寸：不画任何东西，等下一帧。
-    // 判断用「超过常见上限」而非绝对值——不同 DPI 下差异很大。
     let reasonable = area.width() <= 4000.0 && area.height() <= 4000.0;
     if !reasonable {
         tracing::debug!(area = ?area, "客户区尺寸异常，本帧跳过设置界面");
@@ -934,257 +1091,914 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     // 但要有底色，否则透明区域会透出桌面。
     f.ui.painter_at(area).rect_filled(area, 0.0, pal.bg);
 
-    let pad = pal.space_md;
-    let view = area.shrink2(vec2(pad, pad));
-    if view.width() <= 8.0 || view.height() <= 8.0 {
+    let m = SETTINGS_MARGIN;
+    let left_w = SETTINGS_NAV_W;
+
+    // ---- 左列：搜索框 + 导航块 ----
+    let left_x0 = area.min.x + m;
+    let left_x1 = left_x0 + left_w;
+    let search_h = 34.0;
+    let search_rect = Rect::from_min_size(pos2(left_x0, area.min.y + m), vec2(left_w, search_h));
+    draw_settings_search(f, search_rect);
+
+    let nav_top = search_rect.max.y + 10.0;
+    let nav_bottom = area.max.y - m;
+    if nav_bottom > nav_top + 8.0 {
+        let nav_rect = Rect::from_min_max(pos2(left_x0, nav_top), pos2(left_x1, nav_bottom));
+        draw_settings_nav(f, nav_rect);
+    }
+
+    // ---- 右列：右上关闭按钮 + 内容 ----
+    let right_x0 = left_x1 + m + 4.0; // 列间留白
+    let right = Rect::from_min_max(
+        pos2(right_x0, area.min.y + m),
+        area.max - vec2(m, m),
+    );
+    if right.width() <= 8.0 || right.height() <= 8.0 {
         return;
     }
 
-    // 在窗口矩形里开子 Ui：下面所有控件都跑在 egui 的布局里，
-    // 由它负责换行、间距、滚动裁剪。
+    // 右上角关闭按钮（独立于内容区，不随滚动）。
+    let close_r = Rect::from_min_size(
+        pos2(right.max.x - 30.0, right.min.y),
+        vec2(30.0, 30.0),
+    );
+    draw_settings_close(f, close_r);
+
+    // 内容区：关闭按钮下方，可滚动。
+    let content = Rect::from_min_max(
+        pos2(right.min.x, close_r.max.y + 6.0),
+        right.max,
+    );
+    if content.height() <= 8.0 {
+        return;
+    }
     let mut ui = f.ui.new_child(
         egui::UiBuilder::new()
             .id(egui::Id::new("settings"))
-            .max_rect(view)
+            .max_rect(content)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
-
-    settings_header(f, &mut ui);
-    ui.separator();
-
-    // 设置项会随版本增加，窗口高度固定 ⇒ 必须能滚。
-    //
-    // IMPORTANT: 高度必须用「**剩余可用高度**」而不是估算常量：标题行实际
-    // 高度随字号缩放变化，写死一个系数会在窗口越矮时误差越大
-    // （此前实测 600x400 下开关被排到客户区之外，点不到）。
-    // `ScrollArea` 会**扩展**到内容高度，所以这里必须显式封顶。
-    let head_h = ui.min_rect().height();
-    let body_max = (view.height() - head_h - ui.spacing().item_spacing.y).max(0.0);
     egui::ScrollArea::vertical()
         .id_salt("settings_scroll")
         .auto_shrink([false, false])
-        .max_height(body_max)
         .show(&mut ui, |ui| {
-            settings_body(f, ui);
+            settings_content(f, ui);
         });
 }
 
-/// 标题行 + 关闭按钮。
-fn settings_header(f: &mut Frame<'_>, ui: &mut Ui) {
+/// 右上角关闭按钮（绝对定位，不随滚动）。
+fn draw_settings_close(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
-    let scale = f.scale;
-    ui.horizontal(|ui| {
+    let btn = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new("settings_close"))
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |u| u.add_sized(r.size(), egui::Button::new("").frame(false)),
+    );
+    let btn = btn.inner;
+    if btn.hovered() {
+        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
+    }
+    crate::icons::Icon::Close.paint(
+        &f.ui.painter_at(r),
+        Rect::from_center_size(r.center(), vec2(14.0, 14.0)),
+        if btn.hovered() { pal.text_bright } else { pal.text_dim },
+    );
+    f.hit_insert("settings_close", r);
+    if btn.clicked() {
+        f.state.show_settings = false;
+    }
+}
+
+/// 左侧搜索框：圆角输入框，右侧放大镜。
+///
+/// 定稿交互：内容为空且聚焦时显示「最近修改」；输入内容后转为
+/// 搜索结果视图；失焦且内容为空时恢复当前分类卡片。
+fn draw_settings_search(f: &mut Frame<'_>, search_rect: Rect) {
+    let pal = f.pal;
+    let mut q = f.state.settings_query.clone();
+    let resp = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new("settings_search"))
+            .max_rect(search_rect),
+        |u| {
+            u.painter().rect_filled(search_rect, pal.radius_md, pal.surface_variant);
+            // 文字输入区（左侧留白，右侧留图标位）。
+            let text_rect = Rect::from_min_max(
+                search_rect.min + vec2(10.0, 0.0),
+                search_rect.max - vec2(30.0, 0.0),
+            );
+            let mut child = u.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(text_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            let r = child.add(
+                egui::TextEdit::singleline(&mut q)
+                    .hint_text("搜索设置")
+                    .frame(egui::Frame::NONE)
+                    .desired_width(text_rect.width()),
+            );
+            // 右侧放大镜。
+            let icon_r = Rect::from_center_size(
+                pos2(search_rect.max.x - 15.0, search_rect.center().y),
+                vec2(16.0, 16.0),
+            );
+            crate::icons::Icon::Search.paint(u.painter(), icon_r, pal.text_dim);
+            r
+        },
+    );
+    let inner = resp.inner;
+    if q != f.state.settings_query {
+        f.state.settings_query = q;
+    }
+    // 空态聚焦 → 最近修改；失焦（空）→ 回分类视图。
+    if f.state.settings_query.is_empty() {
+        f.state.settings_show_recent = inner.has_focus();
+    }
+    f.hit_insert("settings_search", search_rect);
+}
+
+/// 左侧导航块：圆角背景 + 分类按钮（图标 + 标题）。
+///
+/// 导航背景是**一整块圆角矩形**，顶边与搜索框下缘对齐、底边伸到
+/// 窗口下缘留白处——「导航背景覆盖设置与搜索框」的问题由搜索框
+/// 画在导航块**上方**解决。
+fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
+    let pal = f.pal;
+    let painter = f.ui.painter_at(nav_rect);
+    painter.rect_filled(nav_rect, pal.radius_lg, pal.surface);
+
+    let pad = 6.0;
+    let gap = 2.0;
+    let item_h = 40.0;
+    for (i, cat) in SettingsCat::ALL.iter().enumerate() {
+        let y0 = nav_rect.min.y + pad + i as f32 * (item_h + gap);
+        let r = Rect::from_min_max(
+            pos2(nav_rect.min.x + pad, y0),
+            pos2(nav_rect.max.x - pad, y0 + item_h),
+        );
+        let selected = f.state.settings_cat == *cat;
+        let resp = f
+            .ui
+            .interact(r, egui::Id::new(("settings_cat", *cat)), egui::Sense::click());
+        let bg = if selected {
+            pal.row_selected
+        } else if resp.hovered() {
+            pal.row_hover
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        if bg != egui::Color32::TRANSPARENT {
+            painter.rect_filled(r, pal.radius_md, bg);
+        }
+        // 图标（左）+ 标题（右）。
+        let icon_r = Rect::from_center_size(pos2(r.min.x + 17.0, r.center().y), vec2(16.0, 16.0));
+        cat.icon().paint(
+            &painter,
+            icon_r,
+            if selected { pal.accent } else { pal.text_dim },
+        );
+        painter.text(
+            r.center() + vec2(14.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            cat.title(),
+            egui::FontId::proportional(pal.font_sm),
+            if selected { pal.text_bright } else { pal.text_dim },
+        );
+        f.hit_insert(cat.hot_key(), r);
+        if resp.clicked() {
+            f.state.settings_cat = *cat;
+            f.state.settings_query.clear();
+            f.state.settings_show_recent = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 设置卡片描述：每张卡片 = 标题 + 设置项列表。
+//
+// 数据驱动的好处：
+// 1. 「重置按钮」与「搜索」都遍历同一份结构，不会出现
+//    「界面渲染一项、重置漏一项」的分叉；
+// 2. 新增设置项只改这里 + `app.rs` 的字段处理器。
+// ---------------------------------------------------------------------------
+
+/// 数值项规格（含存储值 ↔ 显示值换算，如字节 ↔ MB）。
+struct NumberSpec {
+    min: f64,
+    max: f64,
+    step: f64,
+    unit: &'static str,
+    /// 存储值 → 显示值。
+    display: fn(f64) -> f64,
+    /// 显示值 → 存储值。
+    store: fn(f64) -> f64,
+}
+
+/// 可选数值项规格（`None` = 不限）。
+struct OptNumberSpec {
+    default: f64,
+    step: f64,
+    unit: &'static str,
+}
+
+const fn identity_num(v: f64) -> f64 {
+    v
+}
+const fn bytes_to_mb(v: f64) -> f64 {
+    v / 1048576.0
+}
+const fn mb_to_bytes(v: f64) -> f64 {
+    v * 1048576.0
+}
+
+const NUMBER_FONT_SCALE: NumberSpec = NumberSpec {
+    min: 0.8,
+    max: 1.4,
+    step: 0.05,
+    unit: "×",
+    display: identity_num,
+    store: identity_num,
+};
+const NUMBER_POLL_MS: NumberSpec = NumberSpec {
+    min: 50.0,
+    max: 2000.0,
+    step: 50.0,
+    unit: " ms",
+    display: identity_num,
+    store: identity_num,
+};
+const NUMBER_MAX_PAYLOAD_MB: NumberSpec = NumberSpec {
+    min: 1.0,
+    max: 4096.0,
+    step: 1.0,
+    unit: " MB",
+    display: bytes_to_mb,
+    store: mb_to_bytes,
+};
+const OPTN_MAX_ITEMS: OptNumberSpec = OptNumberSpec {
+    default: 1000.0,
+    step: 100.0,
+    unit: " 条",
+};
+
+/// 设置项类型。
+enum ItemKind {
+    Bool(ConfigGroup, &'static str),
+    Number(ConfigGroup, &'static str, &'static NumberSpec),
+    OptNumber(ConfigGroup, &'static str, &'static OptNumberSpec),
+    /// 置顶模式单选（共用单栏 / 独立分栏）。
+    PinnedMode,
+    /// 主题单选（跟随系统 / 深色 / 浅色）。
+    Theme,
+    /// 背景效果单选（无 / 磨砂 / 半透明）。
+    Backdrop,
+    /// 背景不透明度滑块。
+    Opacity,
+    /// 快捷键绑定（只读展示）。
+    Hotkey(HotkeySlot),
+    /// 只读信息行（关于页）。
+    Info(&'static str),
+    /// 退出程序按钮（关于页）。
+    Quit,
+}
+
+/// 一个设置项。
+struct SettingsItem {
+    label: &'static str,
+    desc: &'static str,
+    kind: ItemKind,
+}
+
+impl SettingsItem {
+    /// 当前值是否偏离默认（决定重置按钮是否出现）。
+    fn is_changed(
+        &self,
+        cfg: &modular_clipboard_core::config::Config,
+        ws: &crate::workspace::Workspace,
+    ) -> bool {
+        let d = modular_clipboard_core::config::Config::default();
+        match &self.kind {
+            ItemKind::Bool(g, f) => get_bool(cfg, *g, f) != get_bool(&d, *g, f),
+            ItemKind::Number(g, f, _) => get_number(cfg, *g, f) != get_number(&d, *g, f),
+            ItemKind::OptNumber(g, f, _) => {
+                get_opt_number(cfg, *g, f) != get_opt_number(&d, *g, f)
+            }
+            ItemKind::PinnedMode => ws.pinned_mode() != PinnedMode::SharedColumn,
+            ItemKind::Theme => cfg.ui.dark_mode.is_some(),
+            ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
+            ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
+            ItemKind::Hotkey(slot) => slot.current(cfg) != slot.default(),
+            ItemKind::Info(_) | ItemKind::Quit => false,
+        }
+    }
+
+    /// 该设置项的重置操作（恢复默认值）。
+    fn reset_op(&self) -> Option<Op> {
+        let d = modular_clipboard_core::config::Config::default();
+        match &self.kind {
+            ItemKind::Bool(g, f) => Some(Op::SetBool {
+                group: *g,
+                field: f,
+                value: get_bool(&d, *g, f),
+            }),
+            ItemKind::Number(g, f, _) => Some(Op::SetNumber {
+                group: *g,
+                field: f,
+                value: get_number(&d, *g, f),
+            }),
+            ItemKind::OptNumber(g, f, _) => Some(Op::SetOptNumber {
+                group: *g,
+                field: f,
+                value: get_opt_number(&d, *g, f),
+            }),
+            ItemKind::PinnedMode => Some(Op::SetPinnedMode(PinnedMode::SharedColumn)),
+            ItemKind::Theme => Some(Op::SetThemeMode(crate::theme::ThemeMode::FollowSystem)),
+            ItemKind::Backdrop => Some(Op::SetBackdrop(WindowBackdrop::None)),
+            ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
+            ItemKind::Hotkey(slot) => Some(Op::SetHotkey {
+                slot: *slot,
+                hotkey: slot.default(),
+            }),
+            ItemKind::Info(_) | ItemKind::Quit => None,
+        }
+    }
+}
+
+/// 一张设置卡片。
+struct SettingsCard {
+    cat: SettingsCat,
+    title: &'static str,
+    items: &'static [SettingsItem],
+}
+
+/// 全部分类卡片（导航顺序与 `SettingsCat::ALL` 一致）。
+static SETTINGS_CARDS: &[SettingsCard] = &[
+    SettingsCard {
+        cat: SettingsCat::General,
+        title: "常规",
+        items: &[
+            SettingsItem {
+                label: "窗口置顶",
+                desc: "始终显示在其它窗口之上",
+                kind: ItemKind::Bool(ConfigGroup::Ui, "always_on_top"),
+            },
+            SettingsItem {
+                label: "失焦时隐藏",
+                desc: "切换到别的程序后隐藏窗口",
+                kind: ItemKind::Bool(ConfigGroup::Ui, "hide_on_focus_lost"),
+            },
+            SettingsItem {
+                label: "显示托盘图标",
+                desc: "后台常驻，保留右键菜单入口",
+                kind: ItemKind::Bool(ConfigGroup::Ui, "show_tray"),
+            },
+            SettingsItem {
+                label: "启动时最小化",
+                desc: "启动后隐藏到托盘",
+                kind: ItemKind::Bool(ConfigGroup::Ui, "start_minimized"),
+            },
+            SettingsItem {
+                label: "置顶模式",
+                desc: "共用单栏与历史同列，独立分栏可拖出",
+                kind: ItemKind::PinnedMode,
+            },
+        ],
+    },
+    SettingsCard {
+        cat: SettingsCat::Appearance,
+        title: "外观",
+        items: &[
+            SettingsItem {
+                label: "主题",
+                desc: "跟随系统 / 深色 / 浅色",
+                kind: ItemKind::Theme,
+            },
+            SettingsItem {
+                label: "字体缩放",
+                desc: "界面文字大小",
+                kind: ItemKind::Number(ConfigGroup::Ui, "font_scale", &NUMBER_FONT_SCALE),
+            },
+            SettingsItem {
+                label: "背景效果",
+                desc: "无 / 磨砂 / 半透明",
+                kind: ItemKind::Backdrop,
+            },
+            SettingsItem {
+                label: "背景不透明度",
+                desc: "磨砂=背景强度，半透明=整窗淡出",
+                kind: ItemKind::Opacity,
+            },
+        ],
+    },
+    SettingsCard {
+        cat: SettingsCat::Capture,
+        title: "捕获",
+        items: &[
+            SettingsItem {
+                label: "记录剪贴板",
+                desc: "关闭后不再新增历史",
+                kind: ItemKind::Bool(ConfigGroup::Capture, "enabled"),
+            },
+            SettingsItem {
+                label: "跳过密码字段",
+                desc: "疑似输入密码时不记录",
+                kind: ItemKind::Bool(ConfigGroup::Capture, "skip_password_fields"),
+            },
+            SettingsItem {
+                label: "复制去重",
+                desc: "相同内容不再新增，自动置顶更新",
+                kind: ItemKind::Bool(ConfigGroup::Capture, "dedup"),
+            },
+            SettingsItem {
+                label: "监听间隔",
+                desc: "越小越灵敏、越耗电",
+                kind: ItemKind::Number(ConfigGroup::Capture, "poll_interval_ms", &NUMBER_POLL_MS),
+            },
+        ],
+    },
+    SettingsCard {
+        cat: SettingsCat::Storage,
+        title: "存储",
+        items: &[
+            SettingsItem {
+                label: "历史条数上限",
+                desc: "留空表示只按容量淘汰",
+                kind: ItemKind::OptNumber(ConfigGroup::Storage, "max_items", &OPTN_MAX_ITEMS),
+            },
+            SettingsItem {
+                label: "单条大小上限",
+                desc: "超出该大小的内容不记录",
+                kind: ItemKind::Number(ConfigGroup::Storage, "max_payload_bytes", &NUMBER_MAX_PAYLOAD_MB),
+            },
+            SettingsItem {
+                label: "启动时清理临时文件",
+                desc: "删除上次退出遗留的临时文件",
+                kind: ItemKind::Bool(ConfigGroup::Storage, "cleanup_on_start"),
+            },
+        ],
+    },
+    SettingsCard {
+        cat: SettingsCat::Shortcuts,
+        title: "快捷键",
+        items: &[
+            SettingsItem {
+                label: "显示/隐藏主窗口",
+                desc: "全局唤起",
+                kind: ItemKind::Hotkey(HotkeySlot::Toggle),
+            },
+            SettingsItem {
+                label: "粘贴上一个条目",
+                desc: "直接粘贴最近复制的条目",
+                kind: ItemKind::Hotkey(HotkeySlot::PastePrevious),
+            },
+        ],
+    },
+    SettingsCard {
+        cat: SettingsCat::About,
+        title: "关于",
+        items: &[
+            SettingsItem {
+                label: "版本",
+                desc: "",
+                kind: ItemKind::Info(concat!("v", env!("CARGO_PKG_VERSION"))),
+            },
+            SettingsItem {
+                label: "数据目录",
+                desc: "",
+                kind: ItemKind::Info("系统应用数据目录（%APPDATA%\\modular-clipboard）"),
+            },
+            SettingsItem {
+                label: "技术栈",
+                desc: "",
+                kind: ItemKind::Info("Rust · egui · Vulkan (Win32)"),
+            },
+            SettingsItem {
+                label: "项目主页",
+                desc: "",
+                kind: ItemKind::Info("待补充 GitHub 地址"),
+            },
+            SettingsItem {
+                label: "作者主页",
+                desc: "",
+                kind: ItemKind::Info("待补充"),
+            },
+            SettingsItem {
+                label: "退出程序",
+                desc: "",
+                kind: ItemKind::Quit,
+            },
+        ],
+    },
+];
+
+/// 读一个布尔配置字段（与 `app.rs::set_bool_field` 的键表对称）。
+fn get_bool(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, field: &str) -> bool {
+    use ConfigGroup as G;
+    match (g, field) {
+        (G::Capture, "enabled") => cfg.capture.enabled,
+        (G::Capture, "skip_password_fields") => cfg.capture.skip_password_fields,
+        (G::Capture, "dedup") => cfg.capture.dedup,
+        (G::Ui, "always_on_top") => cfg.ui.always_on_top,
+        (G::Ui, "hide_on_focus_lost") => cfg.ui.hide_on_focus_lost,
+        (G::Ui, "show_tray") => cfg.ui.show_tray,
+        (G::Ui, "start_minimized") => cfg.ui.start_minimized,
+        (G::Storage, "cleanup_on_start") => cfg.storage.cleanup_on_start,
+        _ => false,
+    }
+}
+
+/// 读一个数值配置字段（存储单位，未换算）。
+fn get_number(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, field: &str) -> f64 {
+    use ConfigGroup as G;
+    match (g, field) {
+        (G::Capture, "poll_interval_ms") => cfg.capture.poll_interval_ms as f64,
+        (G::Ui, "font_scale") => cfg.ui.font_scale as f64,
+        (G::Storage, "max_payload_bytes") => cfg.storage.max_payload_bytes as f64,
+        _ => 0.0,
+    }
+}
+
+/// 读一个可选数值配置字段。
+fn get_opt_number(
+    cfg: &modular_clipboard_core::config::Config,
+    g: ConfigGroup,
+    field: &str,
+) -> Option<f64> {
+    use ConfigGroup as G;
+    match (g, field) {
+        (G::Storage, "max_items") => cfg.storage.max_items.map(|n| n as f64),
+        _ => None,
+    }
+}
+
+/// 设置内容视图分发：搜索非空 → 结果；空态聚焦 → 最近修改；否则当前分类。
+fn settings_content(f: &mut Frame<'_>, ui: &mut Ui) {
+    let q = f.state.settings_query.trim().to_string();
+    if !q.is_empty() {
+        settings_search_results(f, ui, &q);
+    } else if f.state.settings_show_recent {
+        settings_recent_view(f, ui);
+    } else {
+        settings_category_cards(f, ui);
+    }
+}
+
+/// 当前分类的卡片组。
+fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
+    let Some(card) = SETTINGS_CARDS.iter().find(|c| c.cat == f.state.settings_cat) else {
+        return;
+    };
+    settings_card(f, ui, card);
+}
+
+/// 一张卡片：圆角背景 + 标题行（标题 + 条件重置按钮）+ 设置行。
+///
+/// 卡片高度由 `head_h + row_h * 行数` 算出，整块 `allocate` 推进滚动游标。
+fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
+    let pal = f.pal;
+    let w = ui.available_width();
+    let row_h = 44.0;
+    let head_h = 40.0;
+    let pad = 12.0;
+    let h = head_h + row_h * card.items.len() as f32 + pad * 2.0;
+    let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
+    ui.painter_at(r).rect_filled(r, pal.radius_lg, pal.surface);
+
+    let inner_rect = r.shrink2(vec2(pad, pad * 0.5));
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    inner.spacing_mut().item_spacing = vec2(0.0, 2.0);
+
+    // 标题行：左标题，右「重置」（仅当有项偏离默认值时出现）。
+    let changed_any = {
+        let cfg = &f.svc.state.config;
+        card.items.iter().any(|it| it.is_changed(cfg, f.ws))
+    };
+    inner.horizontal(|ui| {
         ui.label(
-            egui::RichText::new("设置")
+            egui::RichText::new(card.title)
+                .strong()
                 .size(pal.font_md)
                 .color(pal.text_bright),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 自报热区供测试定位（见 `UiState::hit` 的说明）。
-            // 固定 16x16 的方形热区：用子 Ui 绝对定位（同顶栏做法），
-            // 不能用 allocate ——它会跟着布局游标走。
-            let r = Rect::from_min_size(
-                egui::pos2(ui.max_rect().max.x - 16.0 * scale, ui.max_rect().min.y),
-                egui::vec2(16.0, 16.0) * scale,
-            );
-            let btn = f.ui.scope_builder(
-                egui::UiBuilder::new()
-                    .id(egui::Id::new("settings_close"))
-                    .max_rect(r)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-                |u| u.add_sized(r.size(), egui::Button::new("").frame(false)),
-            );
-            let btn = btn.inner;
-            if btn.hovered() {
-                ui.painter_at(r).rect_filled(r, f.pal.radius_sm, f.pal.row_hover);
-            }
-            crate::icons::Icon::Close.paint(
-                &ui.painter_at(r),
-                egui::Rect::from_center_size(r.center(), egui::vec2(12.0, 12.0) * scale),
-                if btn.hovered() { f.pal.text_bright } else { f.pal.text_dim },
-            );
-            f.hit_insert("settings_close", r);
-            let clicked = btn.clicked();
-            btn.on_hover_text("关闭设置");
-            if clicked {
-                f.state.show_settings = false;
+            if changed_any {
+                let resp = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new("重置").size(pal.font_sm).color(pal.text_dim),
+                    )
+                    .frame(false),
+                );
+                let rect = resp.rect;
+                let clicked = resp.clicked();
+                resp.on_hover_text("恢复该卡片默认值");
+                f.hit_insert(card.cat.reset_key(), rect);
+                if clicked {
+                    for it in card.items {
+                        if let Some(op) = it.reset_op() {
+                            f.state.push(op);
+                        }
+                    }
+                    // 该卡片全部项从「最近修改」里移除。
+                    f.state
+                        .settings_recent
+                        .retain(|(l, _)| !card.items.iter().any(|it| it.label == *l));
+                }
             }
         });
     });
+
+    // 标题下细分隔线。
+    let line_y = inner_rect.min.y + head_h - 10.0;
+    ui.painter_at(r).hline(
+        r.min.x + pad..=r.max.x - pad,
+        line_y,
+        egui::Stroke::new(1.0, pal.border_subtle),
+    );
+
+    for it in card.items {
+        settings_item_row(f, &mut inner, it);
+    }
 }
 
-/// 设置项正文：置顶模式 + 开关组 + 数值组。
-///
-/// # 为什么逐项列出而不是遍历数据结构
-///
-/// 配置项会随版本增删（现在 20+ 项）。写死在这里换来的是
-/// 「新增一项只需改这一处 + `app.rs` 的字段处理器」，
-/// 而 `Op` 侧用「分组 + 字段名字符串」把新增成本降到两行。
-fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
+/// 一行设置项：按类型分派到开关 / 数值 / 单选 / 只读。
+fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
     let pal = f.pal;
-    let _ = f.scale;
-    let cur = f.ws.pinned_mode();
-
-    // CAUTION: 必须把配置值**逐个拷出来**，不能 `let cfg = &f.svc.state.config`
-    // 然后边遍历边调需要 `&mut Frame` 的函数。
-    //
-    // 那个借用会活到函数结束，于是后面每次 `draw_switch(f, ...)` /
-    // `number_row(f, ...)` 的可变借用都撞上它（E0502）。这类错误在
-    // 「先读配置、后统一处理」的写法里非常常见。
-    let (ui_cfg, cap_cfg, sto_cfg) = {
-        let c = &f.svc.state.config;
-        (c.ui.clone(), c.capture.clone(), c.storage.clone())
-    };
-
-    // ---- 置顶模式 -------------------------------------------------------
-    section(ui, "置顶");
-    ui.horizontal(|ui| {
-        for (mode, label, desc) in [
-            (PinnedMode::SharedColumn, "共用单栏", "与历史列表在同一栏内"),
-            (PinnedMode::OwnCard, "独立分栏", "单独一栏，可拖出成窗口"),
-        ] {
-            // `selectable_label` 自带选中态与键盘响应，替代原先
-            // 手绘的圆点 + 描边矩形。
-            if ui
-                .selectable_label(cur == mode, egui::RichText::new(label).size(pal.font_sm))
-                .on_hover_text(desc)
-                .clicked()
-                && cur != mode
-            {
-                f.state.push(Op::SetPinnedMode(mode));
+    match &it.kind {
+        ItemKind::Bool(g, field) => {
+            let mut v = get_bool(&f.svc.state.config, *g, field);
+            if setting_row(ui, it.label, it.desc, |ui| draw_switch(f, ui, field, &mut v)) {
+                f.state.push(Op::SetBool { group: *g, field, value: v });
+                record_recent(f, it.label);
             }
         }
-    });
-    ui.add_space(4.0);
-
-    // ---- 背景效果 -------------------------------------------------------
-    //
-    // 无 / 磨砂（Win11 原生 Acrylic）/ 半透明（整窗淡出），三选一互斥。
-    // 与置顶模式一样用 `selectable_label` 单选；透明度滑块在下方。
-    section(ui, "背景效果");
-    ui.horizontal(|ui| {
-        for (mode, label, desc) in [
-            (WindowBackdrop::None, "无", "纯色不透明背景"),
-            (WindowBackdrop::Acrylic, "磨砂", "Win11 原生毛玻璃，背景透出模糊"),
-            (WindowBackdrop::Translucent, "半透明", "整窗按透明度淡出"),
-        ] {
-            let selected = ui_cfg.window_backdrop == mode;
-            if ui
-                .selectable_label(selected, egui::RichText::new(label).size(pal.font_sm))
-                .on_hover_text(desc)
-                .clicked()
-                && !selected
-            {
-                f.state.push(Op::SetBackdrop(mode));
-            }
-        }
-    });
-    {
-        // 滑块语义随模式：磨砂 = 背景强度（上限 0.6，磨砂始终可见）；
-        // 半透明 = 整窗淡出程度。无模式下禁用。
-        let mut op = ui_cfg.window_opacity;
-        let enabled = ui_cfg.window_backdrop != WindowBackdrop::None;
-        let changed = setting_row(ui, "背景不透明度", "磨砂=背景强度，半透明=整窗淡出", |ui| {
-            ui.add_enabled(enabled, egui::Slider::new(&mut op, 0.3..=1.0).show_value(true))
+        ItemKind::Number(g, field, spec) => {
+            let cur = (spec.display)(get_number(&f.svc.state.config, *g, field));
+            let mut val = cur;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut val)
+                        .range(spec.min..=spec.max)
+                        .speed(spec.step)
+                        .suffix(spec.unit),
+                )
                 .changed()
-        });
-        if changed && enabled {
-            f.state.push(Op::SetOpacity(op));
+            });
+            if changed {
+                f.state.push(Op::SetNumber {
+                    group: *g,
+                    field,
+                    value: (spec.store)(val),
+                });
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::OptNumber(g, field, spec) => {
+            let cur = get_opt_number(&f.svc.state.config, *g, field);
+            let mut val = cur.unwrap_or(spec.default);
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(
+                    egui::DragValue::new(&mut val)
+                        .range(spec.default..=1_000_000.0)
+                        .speed(spec.step)
+                        .suffix(spec.unit),
+                )
+                .changed()
+            });
+            if changed {
+                let next = if val <= spec.default { None } else { Some(val) };
+                f.state.push(Op::SetOptNumber { group: *g, field, value: next });
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::PinnedMode => {
+            let cur = f.ws.pinned_mode();
+            let mut picked: Option<PinnedMode> = None;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                let mut ch = false;
+                ui.horizontal(|ui| {
+                    for (mode, label) in [
+                        (PinnedMode::SharedColumn, "共用单栏"),
+                        (PinnedMode::OwnCard, "独立分栏"),
+                    ] {
+                        let resp = ui.selectable_label(cur == mode, label);
+                        if resp.clicked() && cur != mode {
+                            picked = Some(mode);
+                            ch = true;
+                        }
+                    }
+                });
+                ch
+            });
+            if changed
+                && let Some(m) = picked
+            {
+                f.state.push(Op::SetPinnedMode(m));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::Theme => {
+            let cur = crate::theme::ThemeMode::from_dark_mode(f.svc.state.config.ui.dark_mode);
+            let mut picked: Option<crate::theme::ThemeMode> = None;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                let mut ch = false;
+                ui.horizontal(|ui| {
+                    for (mode, label) in [
+                        (crate::theme::ThemeMode::FollowSystem, "跟随系统"),
+                        (crate::theme::ThemeMode::Dark, "深色"),
+                        (crate::theme::ThemeMode::Light, "浅色"),
+                    ] {
+                        let resp = ui.selectable_label(cur == mode, label);
+                        if resp.clicked() && cur != mode {
+                            picked = Some(mode);
+                            ch = true;
+                        }
+                    }
+                });
+                ch
+            });
+            if changed
+                && let Some(m) = picked
+            {
+                f.state.push(Op::SetThemeMode(m));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::Backdrop => {
+            let cur = f.svc.state.config.ui.window_backdrop;
+            let mut picked: Option<WindowBackdrop> = None;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                let mut ch = false;
+                ui.horizontal(|ui| {
+                    for (mode, label) in [
+                        (WindowBackdrop::None, "无"),
+                        (WindowBackdrop::Acrylic, "磨砂"),
+                        (WindowBackdrop::Translucent, "半透明"),
+                    ] {
+                        let resp = ui.selectable_label(cur == mode, label);
+                        if resp.clicked() && cur != mode {
+                            picked = Some(mode);
+                            ch = true;
+                        }
+                    }
+                });
+                ch
+            });
+            if changed
+                && let Some(m) = picked
+            {
+                f.state.push(Op::SetBackdrop(m));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::Opacity => {
+            let mut op = f.svc.state.config.ui.window_opacity;
+            let enabled = f.svc.state.config.ui.window_backdrop != WindowBackdrop::None;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add_enabled(
+                    enabled,
+                    egui::Slider::new(&mut op, 0.3..=1.0).show_value(true),
+                )
+                .changed()
+            });
+            if changed && enabled {
+                f.state.push(Op::SetOpacity(op));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::Hotkey(slot) => {
+            // NOTE: 托盘线程当前注册的是硬编码 `DEFAULT_HOTKEY`，配置里的
+            // 绑定尚未接入注册。这里只读展示当前配置值；「录制」与
+            // 热键重注册是后续任务。
+            let cur = slot.current(&f.svc.state.config);
+            setting_row(ui, it.label, it.desc, |ui| {
+                ui.label(
+                    egui::RichText::new(cur.display())
+                        .monospace()
+                        .color(pal.text_dim),
+                );
+                false
+            });
+        }
+        ItemKind::Info(text) => {
+            setting_row(ui, it.label, "", |ui| {
+                ui.label(egui::RichText::new(*text).color(pal.text_dim));
+                false
+            });
+        }
+        ItemKind::Quit => {
+            ui.add_space(8.0);
+            let resp = ui.add_sized(
+                [ui.available_width(), 30.0],
+                egui::Button::new(
+                    egui::RichText::new("退出程序").color(pal.danger).strong(),
+                ),
+            );
+            f.hit_insert("settings_quit", resp.rect);
+            if resp.clicked() {
+                f.state.push(Op::Quit);
+            }
         }
     }
-    ui.add_space(4.0);
+}
 
-    // ---- 开关组 ---------------------------------------------------------
-    //
-    // 每项：(分组, 字段, 标签, 说明, 当前值)
-    let toggles: [(ConfigGroup, &'static str, &str, &str, bool); 7] = [
-        (ConfigGroup::Ui, "always_on_top", "窗口置顶", "始终显示在其它窗口之上", ui_cfg.always_on_top),
-        (ConfigGroup::Ui, "hide_on_focus_lost", "失焦时隐藏", "切换到别的程序后隐藏窗口", ui_cfg.hide_on_focus_lost),
-        (ConfigGroup::Ui, "show_tray", "显示托盘图标", "后台常驻，保留右键菜单入口", ui_cfg.show_tray),
-        (ConfigGroup::Ui, "start_minimized", "启动时最小化", "启动后隐藏到托盘", ui_cfg.start_minimized),
-        (ConfigGroup::Capture, "enabled", "记录剪贴板", "关闭后不再新增历史", cap_cfg.enabled),
-        (ConfigGroup::Capture, "skip_password_fields", "跳过密码字段", "疑似输入密码时不记录", cap_cfg.skip_password_fields),
-        (ConfigGroup::Capture, "dedup", "复制去重", "复制相同内容不再新增记录，自动置顶更新", cap_cfg.dedup),
-    ];
-
-    let mut last_group: Option<ConfigGroup> = None;
-    for (g, field, label, desc, on) in toggles {
-        if last_group != Some(g) {
-            section(ui, g.title());
-            last_group = Some(g);
+/// 搜索非空：跨全部分类过滤，命中项只读展示（点击跳转分类）。
+fn settings_search_results(f: &mut Frame<'_>, ui: &mut Ui, q: &str) {
+    let pal = f.pal;
+    let mut total = 0;
+    for card in SETTINGS_CARDS {
+        let hits: Vec<&SettingsItem> = card
+            .items
+            .iter()
+            .filter(|it| it.label.contains(q) || it.desc.contains(q))
+            .collect();
+        if hits.is_empty() {
+            continue;
         }
-        let mut v = on;
-        if setting_row(ui, label, desc, |ui| draw_switch(f, ui, field, &mut v)) {
-            f.state.push(Op::SetBool { group: g, field, value: v });
+        total += hits.len();
+        section(ui, card.title);
+        for it in hits {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::click());
+            if resp.hovered() {
+                ui.painter_at(rect).rect_filled(rect, pal.radius_md, pal.row_hover);
+            }
+            ui.painter_at(rect).text(
+                rect.min + vec2(8.0, 8.0),
+                egui::Align2::LEFT_TOP,
+                it.label,
+                egui::FontId::proportional(pal.font_sm),
+                pal.text,
+            );
+            ui.painter_at(rect).text(
+                rect.max - vec2(8.0, 8.0),
+                egui::Align2::RIGHT_BOTTOM,
+                card.title,
+                egui::FontId::proportional(pal.font_xs),
+                pal.text_dim,
+            );
+            if resp.clicked() {
+                f.state.settings_cat = card.cat;
+                f.state.settings_query.clear();
+                f.state.settings_show_recent = false;
+            }
         }
     }
-
-    // ---- 数值组 ---------------------------------------------------------
-    section(ui, "监听与存储");
-
-    // 监听间隔（ms）。下限 50：更小的值只会让 CPU 空转，
-    // 而剪贴板序列号不会更新得那么快。
-    number_row(
-        f, ui, "poll_interval_ms", "监听间隔", "越小越灵敏、越耗电",
-        cap_cfg.poll_interval_ms as f64, 50.0, 2000.0, 50.0, " ms",
-        ConfigGroup::Capture,
-    );
-    // 历史条数上限：`None` = 不限，所以默认显示一个代表值并在
-    // 「减到底」时变回 `None`（与旧实现语义一致）。
-    opt_number_row(
-        f, ui, "max_items", "历史条数上限", "留空表示只按容量淘汰",
-        sto_cfg.max_items, 1000.0, 100.0, " 条",
-    );
-    // NOTE: 「去重窗口」控件已**移除**。
-    //
-    // `dedup_window_secs` 的注释已写明「此字段保留仅为兼容已落盘的旧
-    // 配置文件，**不再参与去重逻辑**」—— 去重改成按哈希查**全部历史**，
-    // 任何时间点的相同内容都不再新增。
-    //
-    // 但设置面板仍在渲染这个滑块，且提示文字写的是
-    // 「该时长内的相同内容视为重复」—— 描述的是一个**已经不存在**的
-    // 行为。于是用户把 3 秒拖到 300 秒，什么都没发生；或者以为「设成
-    // 0 秒就能每次都记一条」，结果还是被全局去重挡住。
-    //
-    // 这比单纯的死开关更糟：它**主动误导**。控件移除，字段为兼容保留。
-
-    // ---- 存储分组 -------------------------------------------------------
-    section(ui, "存储");
-    let mut cleanup = sto_cfg.cleanup_on_start;
-    if setting_row(ui, "启动时清理临时文件", "删除上次退出遗留的临时文件", |ui| {
-        draw_switch(f, ui, "cleanup_on_start", &mut cleanup)
-    }) {
-        f.state.push(Op::SetBool {
-            group: ConfigGroup::Storage,
-            field: "cleanup_on_start",
-            value: cleanup,
-        });
+    if total == 0 {
+        settings_recent_view(f, ui);
     }
+}
 
-    // ---- 危险操作 -------------------------------------------------------
-    //
-    // 放在最后并与配置项明显区分：这是**唯一**能从界面退出程序的地方
-    // （标题栏 ✕ 在有托盘时只隐藏到托盘）。
-    ui.add_space(12.0);
-    ui.separator();
-    ui.add_space(4.0);
-    let quit_resp = ui.add_sized(
-        [ui.available_width(), 30.0],
-        egui::Button::new(
-            egui::RichText::new("退出程序")
-                .color(pal.danger)
-                .strong()
-                .size(pal.font_md),
-        ),
-    );
-    // 自报热区供测试定位（见 `UiState::hit` 的说明）。
-    f.hit_insert("settings_quit", quit_resp.rect);
-    if quit_resp.clicked() {
-        f.state.push(Op::Quit);
+/// 最近修改的设置项（倒序，最多 8 条）。
+fn settings_recent_view(f: &mut Frame<'_>, ui: &mut Ui) {
+    let pal = f.pal;
+    if f.state.settings_recent.is_empty() {
+        ui.label(egui::RichText::new("暂无最近修改的设置").color(pal.text_dim));
+        return;
     }
+    section(ui, "最近修改");
+    for (label, _ts) in f.state.settings_recent.iter().rev() {
+        let cat_title = SETTINGS_CARDS
+            .iter()
+            .find(|c| c.items.iter().any(|it| it.label == *label))
+            .map(|c| c.title)
+            .unwrap_or("");
+        let (rect, _resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::hover());
+        ui.painter_at(rect).text(
+            rect.min + vec2(8.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::proportional(pal.font_sm),
+            pal.text,
+        );
+        ui.painter_at(rect).text(
+            rect.max - vec2(8.0, 8.0),
+            egui::Align2::RIGHT_BOTTOM,
+            cat_title,
+            egui::FontId::proportional(pal.font_xs),
+            pal.text_dim,
+        );
+    }
+}
 
-    let _ = pal;
+/// 登记一条最近修改（去重 + 上限 8 条）。
+fn record_recent(f: &mut Frame<'_>, label: &str) {
+    f.state.settings_recent.retain(|(l, _)| l != label);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    f.state.settings_recent.push((label.to_string(), now));
+    if f.state.settings_recent.len() > 8 {
+        f.state.settings_recent.remove(0);
+    }
 }
 
 /// 分组标题。
@@ -1290,79 +2104,6 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // 逐个登记还有一个好处：测试能逐项核对边界，而不是只看最后一个。
     f.hit_insert(id_suffix, rect);
     *v != on
-}
-
-/// 数值项：`DragValue`，改动时发 `Op::SetNumber`。
-#[allow(clippy::too_many_arguments)]
-fn number_row(
-    f: &mut Frame<'_>,
-    ui: &mut Ui,
-    field: &'static str,
-    label: &str,
-    desc: &str,
-    v: f64,
-    min: f64,
-    max: f64,
-    step: f64,
-    unit: &str,
-    group: ConfigGroup,
-) {
-    let mut val = v;
-    let changed = setting_row(ui, label, desc, |ui| {
-        ui.add(
-            egui::DragValue::new(&mut val)
-                .range(min..=max)
-                .speed(step)
-                .suffix(unit),
-        )
-        .changed()
-    });
-    let _ = field;
-    if changed {
-        f.state.push(Op::SetNumber { group, field, value: val });
-    }
-}
-
-/// 可清空的数值项（`None` = 不限）。
-///
-/// `DragValue` 本身表达不了「无限制」，所以映射为：
-/// 显示一个代表值（`min`），减到下界时变回 `None`——与旧实现
-/// 「0 = 不限」的语义一致。
-fn opt_number_row(
-    f: &mut Frame<'_>,
-    ui: &mut Ui,
-    field: &'static str,
-    label: &str,
-    desc: &str,
-    cur: Option<usize>,
-    default: f64,
-    step: f64,
-    unit: &str,
-) {
-    let mut val = cur.map(|n| n as f64).unwrap_or(default);
-    let changed = setting_row(ui, label, desc, |ui| {
-        ui.add(
-            egui::DragValue::new(&mut val)
-                .range(default..=1_000_000.0)
-                .speed(step)
-                .suffix(unit),
-        )
-        .changed()
-    });
-    if !changed {
-        return;
-    }
-    let next = if val <= default {
-        // 减到下界 ⇒ 恢复「不限」。
-        None
-    } else {
-        Some(val)
-    };
-    f.state.push(Op::SetOptNumber {
-        group: ConfigGroup::Storage,
-        field,
-        value: next,
-    });
 }
 
 
@@ -3141,6 +3882,9 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("settings-quit", vec2(600.0, 900.0));
         h.state.show_settings = true;
         h.settings_frame();
+        // 「退出程序」在「关于」卡片里——先切到关于分类再点。
+        let nav = settings_hit(&h, "settings_cat_about").center();
+        h.settings_click_at(nav);
 
         let rect = settings_hit(&h, "settings_quit");
         let ops = h.settings_click_at(rect.center());
@@ -3641,6 +4385,9 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("switch-click", vec2(600.0, 900.0));
         h.state.show_settings = true;
         h.settings_frame();
+        // 「启动时清理临时文件」在「存储」卡片里——先切到存储分类。
+        let nav = settings_hit(&h, "settings_cat_storage").center();
+        h.settings_click_at(nav);
 
         let field = "cleanup_on_start";
         let r = settings_hit(&h, field);

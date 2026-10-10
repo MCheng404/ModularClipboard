@@ -341,6 +341,39 @@ pub fn raise_to_top(hwnd: HWND) {
     let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags) };
 }
 
+/// 查询主显示器**工作区**（不含任务栏，物理像素）。
+///
+/// 用于把窗口钳制在屏幕内：主窗口被「记住位置」恢复到屏幕右侧时，
+/// 锚定其右上角的设置窗口会整体摆到屏幕外——右上角的关闭按钮
+/// 直接点在屏外，表现为「点击关闭没反应」（2026-10-11 实测）。
+pub fn work_area_of(_hwnd: HWND) -> (i32, i32, i32, i32) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut wa = RECT::default();
+    let _ = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut _ as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    (wa.left, wa.top, wa.right, wa.bottom)
+}
+
+/// 把窗口位置钳制到其所在监视器的工作区内。
+///
+/// 返回钳制后的 (x, y)。`w`/`h` 为窗口物理像素尺寸。
+pub fn clamp_to_work_area(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) -> (i32, i32) {
+    let (l, t, r, b) = work_area_of(hwnd);
+    // 窗口比工作区还大时退化为左上角对齐，避免 clamp 区间为空。
+    let (min_x, max_x) = if w >= r - l { (l, l) } else { (l, r - w) };
+    let (min_y, max_y) = if h >= b - t { (t, t) } else { (t, b - h) };
+    (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+}
+
 /// 设置/取消窗口置顶。
 ///
 /// 用 `SetWindowPos` 改扩展样式里的 `WS_EX_TOPMOST`。**不能**用
