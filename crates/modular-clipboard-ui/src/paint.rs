@@ -321,6 +321,12 @@ pub struct UiState {
     pub search_edit_id: Option<egui::Id>,
     /// 设置界面是否打开。
     pub show_settings: bool,
+    /// `MC_SETTINGS` 启动开关是否已消费（一次性）。
+    ///
+    /// `MC_SETTINGS=1` 只在**启动首帧**打开设置界面一次，随后不再
+    /// 强制——早期实现每帧 `show_settings = true`，导致带该环境变量
+    /// 启动时设置窗口**永远关不掉**（点 ✕ / 齿轮都被下一帧改回）。
+    pub settings_startup_opened: bool,
 
     // ---- 设置界面状态（左右导航 + 卡片布局）----
     /// 当前选中分类（左侧导航）。
@@ -1255,7 +1261,12 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         if bg != egui::Color32::TRANSPARENT {
             painter.rect_filled(r, pal.radius_md, bg);
         }
-        // 图标（左）+ 标题（右）。
+        // 图标（左）+ 标题（紧挨图标，不留大空隙）。
+        //
+        // 早期实现文字以 `r.center() + vec2(14, 0)` 左对齐起点——图标
+        // 贴左缘（x≈17）、文字却从导航项中心偏右起，中间空出约 70pt，
+        // 观感「图标和字体离得太远」（2026-10-11 用户反馈）。改为文字
+        // 起点 = 图标右缘 + 8pt，图标与标题紧凑成组。
         let icon_r = Rect::from_center_size(pos2(r.min.x + 17.0, r.center().y), vec2(16.0, 16.0));
         cat.icon().paint(
             &painter,
@@ -1263,7 +1274,7 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
             if selected { pal.accent } else { pal.text_dim },
         );
         painter.text(
-            r.center() + vec2(14.0, 0.0),
+            pos2(icon_r.max.x + 8.0, r.center().y),
             egui::Align2::LEFT_CENTER,
             cat.title(),
             egui::FontId::proportional(pal.font_sm),

@@ -1132,12 +1132,15 @@ impl App {
         //
         // 用途是**截图验证**：设置面板是覆盖层，不点齿轮按钮就拍不到。
         // 做成环境变量而不是命令行参数，是为了让截图脚本不用改传参逻辑。
-        // `MC_SETTINGS=1` 时默认打开设置界面。
         //
-        // 用途是**截图验证**：设置面板是覆盖层，不点齿轮按钮就拍不到。
-        // 做成环境变量而不是命令行参数，是为了让截图脚本不用改传参逻辑。
-        if std::env::var_os("MC_SETTINGS").is_some() {
+        // CAUTION: 必须**只打开一次**。早期实现每帧置 `true`，带该环境
+        // 变量启动的实例里设置窗口永远关不掉——点 ✕ / 齿轮把
+        // `show_settings` 置回 `false`，下一帧这里又改回 `true`，
+        // 用户实测「设置窗口无法关闭，从主窗口点击也无法关闭」
+        // （2026-10-11）。首帧打开一次后置位，之后关闭走正常逻辑。
+        if std::env::var_os("MC_SETTINGS").is_some() && !self.paint_state.settings_startup_opened {
             self.paint_state.show_settings = true;
+            self.paint_state.settings_startup_opened = true;
         }
 
         // 消费后台捕获事件；有变化时安排后续重绘。
