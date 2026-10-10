@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// 单个快捷键绑定。
 ///
-/// ⚠️ 容器级 `#[serde(default)]`：字段缺失时用 `Hotkey::default()` 补齐。
+/// NOTE: 容器级 `#[serde(default)]`：字段缺失时用 `Hotkey::default()` 补齐。
 /// 缺了它，任何新增字段都会让旧config.json 解析失败，
 /// 而 [`Config::load`] 会静默回退默认值——用户的快捷键**直接消失**。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +52,7 @@ impl Default for Hotkey {
 
 /// 存储与保留策略。
 ///
-/// ⚠️ 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。没有它，
+/// NOTE: 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。没有它，
 /// 新增一个容量字段就会让旧配置整体失效，用户的保留策略被默认值覆盖。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,7 +80,7 @@ impl Default for StorageConfig {
 
 /// 捕获行为。
 ///
-/// ⚠️ 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。这一条尤其关键——
+/// IMPORTANT: 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。这一条尤其关键——
 /// `blocked_apps` 是用户的**安全边界**（密码管理器名单）。缺了它，
 /// 一次无关的格式调整就会让名单退回代码默认值，
 /// 用户的自定义屏蔽项被静默丢弃，且用户以为自己仍有屏蔽保护。
@@ -100,7 +100,7 @@ pub struct CaptureConfig {
     pub dedup: bool,
     /// 去重窗口（秒）。
     ///
-    /// ⚠️ 已由全局去重取代：`ingest` 现在按哈希查**全部历史**，
+    /// NOTE: 已由全局去重取代：`ingest` 现在按哈希查**全部历史**，
     /// 任何时间点的相同内容都不再新增。此字段保留仅为兼容
     /// 已落盘的旧配置文件，不再参与去重逻辑。
     pub dedup_window_secs: i64,
@@ -180,7 +180,7 @@ impl LayoutConfig {
 
 /// UI 偏好。
 ///
-/// ⚠️ 容器级 `#[serde(default)]`：语义同 [`Config`]。下面若干字段另有
+/// NOTE: 容器级 `#[serde(default)]`：语义同 [`Config`]。下面若干字段另有
 /// 字段级标注（历史原因），容器级这条保证**将来新增**的字段也不会
 /// 再触发整体回退——字段级标注管不到新字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,7 +204,7 @@ pub struct UiConfig {
     pub font_scale: f32,
     /// 面板布局（停靠 / 折叠 / 浮动位置）。`None` 表示用布局默认值。
     ///
-    /// ⚠️ `#[serde(default)]` 不是可选的：没有它，serde 会要求这个
+    /// NOTE: `#[serde(default)]` 不是可选的：没有它，serde 会要求这个
     /// 字段**必须存在**，于是任何旧版config.json 解析失败，
     /// [`Config::load`] 静默回退到 `Config::default()`——
     /// 用户的窗口尺寸、主题、屏蔽名单**全部被抹掉**，且没有任何提示。
@@ -324,7 +324,7 @@ pub struct ActionRule {
 
 /// 全量配置。
 ///
-/// ⚠️ 容器级 `#[serde(default)]`：**这是整个配置文件的最后一道防线**。
+/// NOTE: 容器级 `#[serde(default)]`：**这是整个配置文件的最后一道防线**。
 ///
 /// 没有它，任意一个子结构新增字段 → serde 报 "missing field" →
 /// [`Config::load`] 静默回退 `Config::default()` → 用户的窗口尺寸、

@@ -893,7 +893,7 @@ struct Batch {
 }
 
 impl Batch {
-    /// ⚠️ 这里必须与生产 `modular_clipboard_ui::renderer::Batch::to_draw`
+    /// IMPORTANT: 这里必须与生产 `modular_clipboard_ui::renderer::Batch::to_draw`
     /// 做**同样的裁剪换算**，否则探针会得出与产品相反的结论。
     ///
     /// 曾因漏掉 `clip` 字段（不裁剪）而让探针"通过"，而实机产品里

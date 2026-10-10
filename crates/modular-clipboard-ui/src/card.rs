@@ -27,7 +27,7 @@
 //!    宽高的 `rect`（由 [`crate::solver`] 保证），**要么**是「内嵌置顶」
 //!    ——它画在历史栏顶部内部，布局宽度**刻意为 0**，不占一栏。
 //!
-//!    ⚠️ 早前这里写的是「`is_visible()` 为真时 `rect` 一定非零宽高」，
+//!    NOTE: 早前这里写的是「`is_visible()` 为真时 `rect` 一定非零宽高」，
 //!    而那条不变式**是假的**：内嵌置顶的 `is_visible()` 为真、但 `rect`
 //!    宽度是 0（solver 的既定设计）。照着它写代码会得到错的判断。
 
@@ -35,7 +35,7 @@ use egui::{Rect, Vec2, vec2};
 
 /// 卡片身份。跨帧稳定，用于 egui 的 widget Id 与状态查找。
 ///
-/// ⚠️ 必须是**稳定标识**，不能用数组下标：卡片顺序会随拖拽变化，
+/// CAUTION: 必须是**稳定标识**，不能用数组下标：卡片顺序会随拖拽变化，
 /// 用下标会让 egui 把 A 卡片的悬停/焦点状态记到 B 卡片头上
 /// （egui 按 Id 存交互状态）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -85,7 +85,7 @@ impl CardKind {
 
     /// 展开态的最小宽度（逻辑点）。
     ///
-    /// ⚠️ 宽度不够时**不再**降级成折叠态——原先的「折叠优先级」
+    /// NOTE: 宽度不够时**不再**降级成折叠态——原先的「折叠优先级」
     /// （`collapse_priority` + `handle_width` + `collapsible` +
     /// `Card::collapsed`）已整体移除。主界面固定为置顶 + 历史两栏，
     /// 窄窗口下由 [`crate::solver`] 缩放而非折叠。

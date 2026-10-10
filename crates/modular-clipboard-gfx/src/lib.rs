@@ -406,7 +406,7 @@ impl Gpu {
     /// 设置窗口是「每次开关都新建」（关掉时 `settings_win = None`），
     /// 所以反复开关设置会持续泄漏。
     ///
-    /// ⚠️ 调用前必须 `device_wait_idle()`：交换链可能还在引用该表面。
+    /// IMPORTANT: 调用前必须 `device_wait_idle()`：交换链可能还在引用该表面。
     ///
     /// # 安全
     ///
@@ -583,7 +583,7 @@ impl Swapchain {
         // 这里再clamp 一次作为纵深防御——
         // 用**传入的** caps，不是快照。
         let extent = vk::Extent2D {
-            // ⚠️ 不用 `clamp`：它在 `min > max` 时会 panic。
+            // CAUTION: 不用 `clamp`：它在 `min > max` 时会 panic。
             //
             // 驱动报告 `min_image_extent > max_image_extent` 是**可能发生**
             // 的异常（能力查询出错、或某些虚拟化驱动）。`frame.rs` 的

@@ -35,7 +35,7 @@ impl Default for Workspace {
         let mut ws = Self {
             cards: Vec::new(),
             next_id: 0,
-            // ⚠️ 卡片之间**不留间隙**：卡片本身有 1px 描边 + 圆角，
+            // NOTE: 卡片之间**不留间隙**：卡片本身有 1px 描边 + 圆角，
             // 再留 6pt 空隙会让相邻卡片之间露出一条明显的缝，
             // 看起来像「窗口之间有间隙」（用户反馈过这个现象）。
             // 设 0 让卡片边缘贴合，视觉上是一个连续的面板。
@@ -43,7 +43,7 @@ impl Default for Workspace {
         };
         // 默认卡片集：只有「置顶 + 历史」两栏，都停靠在主窗口。
         //
-        // ⚠️ 「视图」（`Rail`）与「详情」（`Detail`）**暂时移除**。
+        // NOTE: 「视图」（`Rail`）与「详情」（`Detail`）**暂时移除**。
         //
         // 它们作为独立子窗口存在过，但实测问题较多：
         //   - 子窗口默认位置与主窗口重叠，遮挡主界面；
@@ -87,7 +87,7 @@ impl Workspace {
             .iter()
             .find(|c| c.kind == CardKind::Pinned)
             .is_some_and(|c| {
-                // ⚠️ 必须同时看 `pinned_mode`。
+                // IMPORTANT: 必须同时看 `pinned_mode`。
                 //
                 // 早前这里只判 `host == Docked`，于是用户在设置里选
                 // 「独立分栏」（`OwnCard`）→ `set_pinned_mode` 写入成功、
@@ -122,7 +122,7 @@ impl Workspace {
         Self {
             cards: Vec::new(),
             next_id: 0,
-            // ⚠️ 必须是 **0.0**，与 [`Default`] 一致。
+            // IMPORTANT: 必须是 **0.0**，与 [`Default`] 一致。
             //
             // 早前这里是 `6.0`，而 `Default` 明确写着「卡片之间不留间隙
             // —— 6pt 会让相邻卡片露出一条明显的缝（用户反馈过）」。
@@ -137,7 +137,7 @@ impl Workspace {
         let id = CardId(self.next_id);
         self.next_id += 1;
         let mut card = Card::new(id, kind);
-        // ⚠️ 每个窗口型卡片的默认位置必须**互相错开**。
+        // IMPORTANT: 每个窗口型卡片的默认位置必须**互相错开**。
         //
         // 早前所有卡片的 `window_pos` 都是 (120,120)，于是视图与详情
         // 两个子窗口完全重叠、后创建的压在前者上面。用户看到的
@@ -146,7 +146,7 @@ impl Workspace {
         //
         // 按已有卡片数递增偏移：够错开，又不至于散得太开。
         //
-        // ⚠️ 偏移基准改成 **(620, 80)** 而不是 (120,120)：
+        // NOTE: 偏移基准改成 **(620, 80)** 而不是 (120,120)：
         // 主窗口默认 420x560、位于屏幕左上，子窗口若也从 (120,120)
         // 附近起就会**盖在主窗口上**——截图脚本只截主窗口矩形，
         // 于是画面里全是被遮挡的主窗口，看起来像「界面坏了」。
@@ -155,7 +155,7 @@ impl Workspace {
         //置顶窗口默认摆在主窗口**左边**：主窗口约 420 物理像素宽，
         //置顶窗约 300宽，两者并排比上下堆叠更好读。
         //
-        // ⚠️ 主窗口位置**不是常量**（用户可以拖到屏幕任何地方），
+        // NOTE: 主窗口位置**不是常量**（用户可以拖到屏幕任何地方），
         // 所以真正的定位在 `childwin::ChildWindows::sync_with`里做——
         // 它拿得到主窗口句柄与真实矩形。这里只给一个兜底值，
         // 避免 `None` 时落在 (0,0)（屏幕左上角，与主窗重叠）。
@@ -195,7 +195,7 @@ impl Workspace {
     /// [`DoubleEndedIterator`]，用 `impl Iterator` 会把这个能力抹掉。
     /// 停靠卡片。
     ///
-    /// ⚠️ **不含内嵌的置顶卡片**。
+    /// NOTE: **不含内嵌的置顶卡片**。
     ///
     /// 置顶停靠时不单独占一栏（用户要求「不用分栏」），
     /// 它由 [`Self::pinned_is_embedded`] 单独识别、
@@ -219,7 +219,7 @@ impl Workspace {
 
     /// 停靠卡片的总需求宽度（含间隔）。
     ///
-    /// ⚠️ 必须走 [`crate::solver::layout_demand`] —— 那里是**唯一**的
+    /// IMPORTANT: 必须走 [`crate::solver::layout_demand`] —— 那里是**唯一**的
     /// 宽度口径（见它的文档：早前三套口径各自漂移）。
     ///
     /// 特别地：`n` 由「需求宽度 > 0」推断，和 solver 用的是同一个判据。
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn saved_position_does_not_force_window_host() {
-        // ⚠️ 位置持久化与「是否独立成窗」是**两件事**。
+        // NOTE: 位置持久化与「是否独立成窗」是**两件事**。
         //
         // 用户关掉置顶窗口就是不想看到它；下次启动若因为恢复了
         // 位置就把它重新拉起来，等于用户的关闭操作被无视了。
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn default_workspace_has_pinned_and_history_only() {
-        // ⚠️ 「视图」（Rail）与「详情」（Detail）**暂时不在默认集里**
+        // NOTE: 「视图」（Rail）与「详情」（Detail）**暂时不在默认集里**
         // ——作为独立子窗口的收益不抵它的遮挡与状态同步成本。
         // 枚举与代码都保留，将来恢复时改 `Workspace::default()` 即可，
         // 这个断言也要跟着改回来。
@@ -448,7 +448,7 @@ mod tests {
         for k in CardKind::ALL {
             ws.add(k);
         }
-        // ⚠️ 参与者的判定必须**与 solver 同源**（`layout_demand`）：
+        // IMPORTANT: 参与者的判定必须**与 solver 同源**（`layout_demand`）：
         // 置顶默认内嵌，不占一栏宽度。早前这里按 `docked()` 数人头，
         // 于是 `n` 比 solver 实际分配的多一个，`gaps` 也跟着多一份。
         let demand = crate::solver::layout_demand(&ws);

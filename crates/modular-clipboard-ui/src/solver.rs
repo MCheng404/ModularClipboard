@@ -21,7 +21,7 @@
 //! 也不知道点哪能展开。窄窗口下卡片变窄虽然拥挤，但列表仍可读、
 //! 可滚动。
 //!
-//! ⚠️ 下一个人若照着本文档改动，请不要把折叠加回来。
+//! CAUTION: 下一个人若照着本文档改动，请不要把折叠加回来。
 //!
 //! # 不变式（测试逐条守住）
 //!
@@ -44,7 +44,7 @@ pub const TOPBAR_HEIGHT: f32 = 44.0;
 
 /// 底部状态栏高度（逻辑点）。
 ///
-/// ⚠️ **已归零**：底部状态栏被移除（「清空 / 设置」上移到顶栏右侧，
+/// NOTE: **已归零**：底部状态栏被移除（「清空 / 设置」上移到顶栏右侧，
 /// 与搜索框并列）。保留常量是为了让 `card_area` 的算法结构不变——
 /// 将来若要恢复底部栏，只需改这一个数字。
 pub const STATUSBAR_HEIGHT: f32 = 0.0;
@@ -85,9 +85,9 @@ impl Solution {
 ///
 /// | 来源 | 排除已分离 | 排除内嵌置顶 | 钳到 ≥1pt |
 /// |---|---|---|---|
-/// | `solve` 里的内联 `layout` | ✅ | ✅ | ✅ |
-/// | `Card::layout_width` | ✅ | ❌ | ❌ |
-/// | `Workspace::required_width` | 间接 | ❌ | ❌ |
+/// | `solve` 里的内联 `layout` | DONE: | DONE: | DONE: |
+/// | `Card::layout_width` | DONE: | ERROR: | ERROR: |
+/// | `Workspace::required_width` | 间接 | ERROR: | ERROR: |
 ///
 /// 于是 `required_width()` 会算出一个 `solve` 永远不会兑现的数字：
 /// 置顶内嵌时它把置顶那一栏也算进去，`n` 与 solver 不同，连带
@@ -96,7 +96,7 @@ impl Solution {
 /// 现在 `solve` 与 `Workspace::required_width` 都走这里，口径由
 /// 构造保证一致。
 pub fn layout_demand(ws: &Workspace) -> Vec<f32> {
-    // ⚠️ 判据必须与 paint 一致：**内嵌的置顶卡片宽度必须是 0**。
+    // IMPORTANT: 判据必须与 paint 一致：**内嵌的置顶卡片宽度必须是 0**。
     //
     // 早前这里只看 `c.host == Docked`，于是置顶（停靠态）仍分到一栏
     // 宽度，而 paint 又在历史栏顶部内嵌画了一份—— 实测界面左边
@@ -113,7 +113,7 @@ pub fn layout_demand(ws: &Workspace) -> Vec<f32> {
             {
                 0.0
             } else {
-                // ⚠️ 必须钳到**正数**。`target_width` 是 pub 字段，
+                // IMPORTANT: 必须钳到**正数**。`target_width` 是 pub 字段，
                 // 拖分隔条或持久化脏值都可能让它变成 0 甚至负数。
                 //
                 // 后果不只是「这张卡变窄」：`n` 是靠「宽度 > 0」推断
@@ -152,7 +152,7 @@ pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
             rects: vec![Rect::ZERO; ws.cards.len()],
         };
     }
-    // ⚠️ `gap` 必须钳到非负：负 gap 会让 `gaps < 0` ⇒ `avail` 大于
+    // IMPORTANT: `gap` 必须钳到非负：负 gap 会让 `gaps < 0` ⇒ `avail` 大于
     // `body.width()` ⇒ 卡片总跨度**超出客户区**，画到窗口外。
     // 无边框窗口外面就是桌面，用户会直接看见。
     let gaps = ws.gap.max(0.0) * (n as f32 - 1.0);
@@ -173,7 +173,7 @@ pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
     } else {
         // 需求 > 可用（历史卡片都放不下的极端窄窗）：按需求比例缩到刚好装下。
         //
-        // ⚠️ 不能给每张卡加一个「最小可见宽度」下限：60pt 宽的窗口里
+        // CAUTION: 不能给每张卡加一个「最小可见宽度」下限：60pt 宽的窗口里
         // 4 张卡各8pt 就是 32pt 需求，但gaps 已经是 18pt，
         // 硬下限会让总宽**超出**可用区，卡片被推出客户区右缘。
         // 那种情况下宁可让卡片窄到 1pt，也不能越界——越界会画到
@@ -198,7 +198,7 @@ pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
     let mut rects = vec![Rect::ZERO; ws.cards.len()];
     // ---- 落位：对齐像素栅格 + 末张吃掉余数 --------------------------
     //
-    // ⚠️ 不能直接用浮点 `x`/`w` 累加：
+    // CAUTION: 不能直接用浮点 `x`/`w` 累加：
     //
     // 1. ppp=1.5（本项目默认场景）时，卡片边界落在非整数设备像素上
     //    ⇒ 1px 描边发虚、相邻卡的描边叠成 2px、末张卡右缘可能超出
@@ -392,7 +392,7 @@ mod tests {
             for b in (a + 1)..docked.len() {
                 let (ia, ra) = docked[a];
                 let (ib, rb) = docked[b];
-                // ⚠️ 判据是「重叠量 > 0」，**不是** `Rect::intersects`。
+                // NOTE: 判据是「重叠量 > 0」，**不是** `Rect::intersects`。
                 //
                 // `gap = 0` 时相邻卡片**边界恰好相接**（A 的右边 == B 的左边）。
                 // `Rect::intersects` 对这种「边贴边」返回 **true**，
@@ -513,7 +513,7 @@ mod tests {
                 fails.push(format!("默认布局 宽 {w}: {msg}"));
             }
 
-            // ⚠️ 覆盖组合必须够宽（S10）。
+            // IMPORTANT: 覆盖组合必须够宽（S10）。
             //
             // 原来只扫 `Workspace::default()`：gap=0、只有历史一张参与
             // 分配，任何宽度下都**拿满**可用宽度——于是永远触发不到
@@ -552,7 +552,7 @@ mod tests {
             let ws = Workspace::default();
             let sol = solve(&ws, area);
 
-            // ⚠️ 跳过判据必须与 `solve` 内部**完全一致**：内嵌的置顶卡片
+            // IMPORTANT: 跳过判据必须与 `solve` 内部**完全一致**：内嵌的置顶卡片
             // 布局宽度就是 0（它画在历史栏顶部内部，不占一栏）。
             //
             // 早前这里用 `c.layout_width() <= 0.0` 判断，而那个方法只看
@@ -602,7 +602,7 @@ mod tests {
     fn detached_cards_get_zero_rects() {
         // 分离出去的卡片由子窗口自己管矩形，主窗口必须给它零。
         //
-        // ⚠️ 必须**自己 add** 一张 Detail：`Workspace::default()`
+        // IMPORTANT: 必须**自己 add** 一张 Detail：`Workspace::default()`
         // 只含「置顶 + 历史」两栏（视图/详情暂时不默认创建），
         // 从 default 里找Detail 会得到 None。
         let mut ws = Workspace::default();
@@ -656,7 +656,7 @@ mod tests {
         let ws = Workspace::default();
         let sol = solve(&ws, area);
         //
-        // ⚠️ **内嵌的置顶卡片是刻意的例外**：它不占栏，内容由
+        // NOTE: **内嵌的置顶卡片是刻意的例外**：它不占栏，内容由
         // `draw_embedded_pinned` 画进历史栏顶部，矩形必须是零。
         // 所以这里要排除它，否则会把「按设计为零」当成回归。
         let pinned_embedded = ws.pinned_is_embedded();

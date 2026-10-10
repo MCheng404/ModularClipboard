@@ -90,7 +90,7 @@ pub fn run_with_options(
     capture_is_override: bool,
     data_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    // ⚠️ 先取 `show_tray` 快照：`config` 后面会被移动进 `App::new`，
+    // NOTE: 先取 `show_tray` 快照：`config` 后面会被移动进 `App::new`，
     // 到那时就访问不到了。
     let want_tray = config.ui.show_tray;
 
@@ -104,7 +104,7 @@ pub fn run_with_options(
     )?;
     // 恢复上次退出时的窗口位置。
     //
-    // ⚠️ 早前位置只存在内存里，每次启动都回屏幕左上角——
+    // NOTE: 早前位置只存在内存里，每次启动都回屏幕左上角——
     // 用户拖动的位置在重启后丢失。位置存`UiConfig::window_pos`。
     //
     // `Option` 是必要的：`0.0` 是合法坐标（屏幕左上角），
@@ -113,7 +113,7 @@ pub fn run_with_options(
         let s = window.scale_factor();
         window.move_to((p.x * s) as i32, (p.y * s) as i32);
     }
-    // ⚠️ `CreateWindowExW` 创建的窗口**默认不可见**，
+    // CAUTION: `CreateWindowExW` 创建的窗口**默认不可见**，
     // 必须显式 `ShowWindow` 才会出现在桌面上。
     //
     // 实测踩坑：早前这里从不调用它，窗口**从不显示**——
@@ -192,10 +192,10 @@ pub fn run_with_options(
     // 子窗口与主窗口**共用同一个 `Gpu`**（Vulkan 设备创建代价高，
     // 且多设备会多占显存），但各自持有一条交换链。
     //
-    // ⚠️ 必须在 `App::new(config, …)` **之前**取字体路径：那之后
+    // IMPORTANT: 必须在 `App::new(config, …)` **之前**取字体路径：那之后
     // `config` 就被移动进 `App` 了。
     let font_path = config.ui.font_path.clone();
-    // ⚠️ 启动期要用的配置必须在这里取：`config` 下一行就被移动进 `App`。
+    // IMPORTANT: 启动期要用的配置必须在这里取：`config` 下一行就被移动进 `App`。
     let start_minimized = config.ui.start_minimized;
     let always_on_top = config.ui.always_on_top;
     let shared =
@@ -207,7 +207,7 @@ pub fn run_with_options(
 
     // 恢复上次退出时的置顶窗口位置。
     //
-    // ⚠️ 必须在第一次 `sync_with` 之前：那个函数按卡片上的
+    // IMPORTANT: 必须在第一次 `sync_with` 之前：那个函数按卡片上的
     // `window_pos` 建窗，之后再改就只影响下次启动了。
     let ui_cfg = app.svc.state.config.ui.clone();
     app.ws.apply_saved_positions(&ui_cfg);
@@ -219,12 +219,12 @@ pub fn run_with_options(
     // 托盘只是入口方式，没有它界面照样能用，只是关掉就没了。
     // 登记主窗口句柄：托盘右键菜单需要把它置前台才能显示。
     //
-    // ⚠️ 必须在托盘启动**之前**登记——否则用户在这段时间内右键
+    // CAUTION: 必须在托盘启动**之前**登记——否则用户在这段时间内右键
     // 托盘图标，`TrackPopupMenu` 会挂在隐藏的托盘辅助窗口上，
     // 菜单闪一下就消失。
     modular_clipboard_platform::tray::set_main_hwnd(window.hwnd().0 as isize);
 
-    // ⚠️ 必须尊重 `ui.show_tray` —— 设置界面里那个开关。
+    // IMPORTANT: 必须尊重 `ui.show_tray` —— 设置界面里那个开关。
     //
     // 早前这里无条件 `Resident::start`，于是 `show_tray` 只被**写入**、
     // 从不被读取：用户在设置里关掉「显示托盘图标」，托盘照样在；
@@ -247,7 +247,7 @@ pub fn run_with_options(
     // 这两个配置项早前只被**写入**、从不被读取：用户在设置里改了、
     // 也落盘了，重启后毫无效果。
     //
-    // ⚠️ 必须放在托盘创建**之后**：`start_minimized` 的语义是
+    // IMPORTANT: 必须放在托盘创建**之后**：`start_minimized` 的语义是
     // 「启动后隐藏到托盘」，而若托盘没起来还把窗口藏掉，程序就成了
     // 「没有窗口、没有托盘」的僵尸——用户只看到进程在，却什么都
     // 点不到。宁可退回「正常显示」。
@@ -283,7 +283,7 @@ pub fn run_with_options(
     let mut children = crate::childwin::ChildWindows::new();
     // 设置窗口（懒创建）。
     //
-    // ⚠️ **懒创建**而不是建时就创建：设置窗口只在用户点齿轮时才需要，
+    // NOTE: **懒创建**而不是建时就创建：设置窗口只在用户点齿轮时才需要，
     // 每个窗口都有独立的交换链 + 字体图集（显存开销实测量级不小）。
     // 程序启动就建一个永不显示的窗口是纯浪费。
     //
@@ -292,7 +292,15 @@ pub fn run_with_options(
     // 窗口隐藏到托盘后仍在跑帧循环（要继续接收托盘事件），
     // 但不再渲染。`GetClientRect` 对隐藏窗口仍返回原尺寸，
     // 靠尺寸判断不出隐藏态，必须显式记这个标志。
-    let mut hidden = false;
+    //
+    // ⚠️ 初值必须反映**启动时的真实可见性**。
+    //
+    // 早前这里恒为 `false`，而上面 `start_minimized` 分支已经把窗口
+    // `SW_HIDE` 了 ⇒ 主循环对一个**不可见**的窗口跑完整渲染
+    // （run_ui + tessellate + 一次完整的 acquire/paint/present），
+    // CPU 与 GPU 全部白烧；且 `hidden` 与 Win32 真实可见性长期不一致，
+    // 后续任何依赖它的判断都会错。
+    let mut hidden = start_minimized && resident.is_some();
     // 窗口是否处于最小化。由 `WindowEvent::Minimized` 维护。
     //
     // 最小化时客户区变成 0x0，第3 步的尺寸检查会跳过渲染；但那个检查
@@ -313,7 +321,7 @@ pub fn run_with_options(
     while !quit {
         // ---- 0. 退出标志（必须在**所有** continue 之前）----------
         //
-        // ⚠️ 早前这个判断在循环末尾（第 4 步之后），而本循环有三条
+        // NOTE: 早前这个判断在循环末尾（第 4 步之后），而本循环有三条
         // `continue`（隐藏态 / 客户区 0×0 / `acquire` 过期）会绕开它。
         //
         // `Op::Quit` 由**设置窗口**产生（「退出程序」按钮）。设置窗口是
@@ -361,6 +369,28 @@ pub fn run_with_options(
                     // 内部会 `device_wait_idle` 并重查表面能力。
                     rebuild(&mut fr, &mut painter)?;
                 }
+                WindowEvent::Focused(gained) => {
+                    // ⚠️ 这里**必须接** `hide_on_focus_lost`。
+                    //
+                    // 它是一个「只写不读」的死开关：全仓只有定义、
+                    // 默认值、设置面板渲染、`set_bool_field` 写入四处，
+                    // 帧循环对 `Focused` 事件**没有任何分支** ——
+                    // 用户开关它、落盘了、重启了，什么都不会发生。
+                    //
+                    // ⚠️ 隐藏**必须有托盘兜底**，与 `decide_on_close`
+                    // 的保护一致：没有托盘时隐藏窗口 = 程序彻底消失，
+                    // 用户只能任务管理器强杀。
+                    let gained = *gained;
+                    if !gained
+                        && app.svc.state.config.ui.hide_on_focus_lost
+                        && resident.is_some()
+                        && !hidden
+                    {
+                        presence::hide_window(window.hwnd());
+                        hidden = true;
+                        tracing::info!("失焦且已开启「失焦时隐藏」，已隐藏到托盘");
+                    }
+                }
                 WindowEvent::Minimized(min) => {
                     // `min` 是 `&bool`：事件是以 `&WindowEvent` 形式遍历的。
                     let min = *min;
@@ -394,7 +424,7 @@ pub fn run_with_options(
                 if let Err(e) = app.clear_history() {
                     tracing::warn!(%e, "托盘清空历史失败");
                 }
-                // ⚠️ 必须请求重绘。
+                // IMPORTANT: 必须请求重绘。
                 //
                 // `clear_all` 内部已 `reload_list()`，数据层是新的；
                 // 但窗口可能正处于「空闲」状态（鼠标不动、egui 也没
@@ -479,13 +509,13 @@ pub fn run_with_options(
 
         // ---- 2.1 消费 PlatformOutput ----------------------------------
         //
-        // ⚠️ 早前 `run_ui` 的返回值只取了 `shapes` / `textures_delta` /
+        // NOTE: 早前 `run_ui` 的返回值只取了 `shapes` / `textures_delta` /
         // `ppp`，`platform_output` 整个被丢弃 —— 于是**光标永远是默认
         // 箭头**，在搜索框上、在可点条目上毫无区别，「这里能点」没有
         // 任何视觉提示。
         presence::set_cursor_icon(window.hwnd(), output.platform_output.cursor_icon);
 
-        // ⚠️ `OutputCommand::CopyText`（egui 里 Ctrl+C 复制选中文本）
+        // NOTE: `OutputCommand::CopyText`（egui 里 Ctrl+C 复制选中文本）
         // **故意不接**，说明如下。
         //
         // 接线本身很简单（`ClipboardReader::write_text` 已在
@@ -582,7 +612,7 @@ pub fn run_with_options(
         // 客户区可能被最小化到 0×0，此时交换链拿不到可呈现的图像。
         let (cw, ch) = window.inner_size_physical();
         if cw == 0 || ch == 0 {
-            // ⚠️ 这里必须用 `events.poll_for` 而不是 `thread::sleep`。
+            // IMPORTANT: 这里必须用 `events.poll_for` 而不是 `thread::sleep`。
             //
             // `sleep` 不处理消息，于是**最小化期间队列里的消息全部积压**：
             //   - `WM_SIZE(SIZE_MINIMIZED)` 读不到 → 上层收不到
@@ -723,7 +753,7 @@ pub fn run_with_options(
         // 会丢掉用户最后的拖动结果。这里每帧比对一次主窗口位置：
         // 与上次记录相差超过 1 逻辑点、且距上次落盘 ≥500ms 才写盘。
         //
-        // ⚠️ 不落盘时**不更新** `last_pos_save`：否则最小化返回的
+        // CAUTION: 不落盘时**不更新** `last_pos_save`：否则最小化返回的
         // `(-32000,-32000)` 触发一次「无效坐标」后，防抖计时被清掉，
         // 接下来 500ms 内恢复窗口到合法位置也写不进去。
         //
@@ -750,14 +780,14 @@ pub fn run_with_options(
         // ---- 5. 节流 ----
         // 无事件时不要空转烧 CPU。egui 请求了延时重绘就按它等待。
         //
-        // ⚠️ `Some(ZERO)` 是「立即重绘」，直接传给 `poll_for` 会走
+        // NOTE: `Some(ZERO)` 是「立即重绘」，直接传给 `poll_for` 会走
         // 纯自旋分支（`Some(d) if !d.is_zero()` 不成立），CPU 占用 100%。
         // 但也不能当成「无限等待」——那样聚焦的输入框光标不会闪、
         // 刚输入的字符不会立刻上屏。这里给 1ms 下限：
         // 既避免忙等，又保证输入延迟感知不到。
         let wait = match delay {
             Some(d) if d.is_zero() => Some(std::time::Duration::from_millis(1)),
-            // ⚠️ **`None` 必须给一个下限，不能原样传下去。**
+            // CAUTION: **`None` 必须给一个下限，不能原样传下去。**
             //
             // `None` 是 egui **空闲时**的常态：`Context::run` 在没有
             // outstanding 重绘请求时会把 `repaint_delay` 置为
@@ -792,7 +822,7 @@ pub fn run_with_options(
     // 先记下主窗口位置，再关子窗口——`close_all` 之后
     // 读不到任何窗口的位置了。
     //
-    // ⚠️ 必须在 `shutdown()` 之前取：它会 `save_config()` 把配置落盘，
+    // IMPORTANT: 必须在 `shutdown()` 之前取：它会 `save_config()` 把配置落盘，
     // 顺序反了位置就存不进文件（下次启动又回默认位置）。
     let main_pos = window.screen_position_points();
     // 置顶窗口若开着，也记下它的位置。
@@ -862,7 +892,7 @@ fn drive_attach_windows<'a>(
     // 每个子窗口有**独立的 `egui::Context`、独立的交换链**，
     // 所以要各自走一遍「事件 → run_ui → tessellate → 绘制」。
     //
-    // ⚠️ 渲染失败**不中断主循环**：一个附属窗口出问题
+    // NOTE: 渲染失败**不中断主循环**：一个附属窗口出问题
     // （客户区变 0、交换链过期、驱动抽风）不该让主窗黑屏。
     // 这里记警告后继续，下一帧重试。
     for child in children.iter_mut() {
@@ -878,7 +908,7 @@ fn drive_attach_windows<'a>(
     //
     // 懒创建：第一次需要时才建窗口（每次都建会泄漏交换链）。
     //
-    // ⚠️ 生命周期由 `paint_state.show_settings` 决定，而它可能被
+    // NOTE: 生命周期由 `paint_state.show_settings` 决定，而它可能被
     // 三处改：齿轮点击（`Op::ToggleSettings`）、设置面板里的关闭
     // 按钮、以及用户点标题栏 ✕。前两处在绘制里改，第三处由
     // `sync_and_render` 的返回值告知——**必须**在此把它同步回
@@ -906,7 +936,7 @@ Ok(w) => {
     if let Some(w) = settings_win.as_mut() {
         // 置顶同步：设置窗口跟随主窗口置顶状态（幂等）。
         w.apply_topmost(topmost);
-        // ⚠️ 先取 `want_open` 再进函数：`sync_and_render(&mut app, …)`
+        // NOTE: 先取 `want_open` 再进函数：`sync_and_render(&mut app, …)`
         // 会可变借用 `app`，而在参数里读 `app.paint_state` 会二次借用。
         let want_open = app.paint_state.show_settings;
         match w.sync_and_render(&mut *app, want_open) {
@@ -1075,7 +1105,7 @@ impl App {
         let mut ws = crate::workspace::Workspace::default();
         // 恢复上次保存的卡片窗口位置。
         //
-        // ⚠️ 这里**不恢复** `config.ui.layout`（旧 `LayoutState` 布局）：
+        // NOTE: 这里**不恢复** `config.ui.layout`（旧 `LayoutState` 布局）：
         // 那套四面板停靠/浮动体系连同 `layout.rs` 已随`view.rs` 一并删除，
         // 新架构的几何由 `solver` 每帧求解、由 `card.window_pos` 持久化。
         // 继续做那个往返只会把一份没人读的配置原样写回去。
@@ -1122,7 +1152,7 @@ impl App {
         // 消除「布局算一遍、绘制再判一遍」的关键。
         let area = ui.max_rect();
         let ppp = ui.ctx().pixels_per_point();
-        // ⚠️ 必须传真实的 `ppp`：落位要对齐**设备**像素栅格，
+        // IMPORTANT: 必须传真实的 `ppp`：落位要对齐**设备**像素栅格，
         // 否则高DPI 下卡片边界落在半像素上，描边发虚。
         let sol = crate::solver::solve_scaled(&self.ws, area, ppp);
         crate::solver::apply(&mut self.ws, &sol);
@@ -1183,7 +1213,7 @@ impl App {
         // 绘制层只识别操作、不改布局：统一在这里落到工作区与服务上。
         self.apply_ops();
 
-        // ⚠️ 这里**不要**写「`should_quit` 时停捕获并存配置」——
+        // CAUTION: 这里**不要**写「`should_quit` 时停捕获并存配置」——
         // 那属于退出流程，而 `shutdown()` 已经做了同样的两件事。
         // 放在绘制函数里意味着只要标志为真就**每帧重复**
         // `save_config()`（一次全量 JSON 序列化写盘）。
@@ -1226,7 +1256,7 @@ impl App {
                     self.after_config_change();
                 }
                 Op::SetBackdrop(mode) => {
-                    // ⚠️ 背景效果必须**运行时立即生效**，不能等重启：
+                    // CAUTION: 背景效果必须**运行时立即生效**，不能等重启：
                     // 用户从设置里切换无/磨砂/半透明后马上就能看到。
                     // 配置只负责记住选择，真正调用 Win32 API 的时机在
                     // 帧循环的幂等比对（`applied_backdrop`）。
@@ -1269,7 +1299,7 @@ impl App {
                 Op::Quit => {
                     // 只**置标志**，真正退出由帧循环消费。
                     //
-                    // ⚠️ 不能在这里直接 `std::process::exit`：那会跳过
+                    // CAUTION: 不能在这里直接 `std::process::exit`：那会跳过
                     // 收尾（停捕获、`save_config`、销毁 Vulkan 设备、
                     // 托盘 `shutdown`），配置里的改动会丢。
                     tracing::info!("设置界面请求退出程序");
@@ -1277,7 +1307,7 @@ impl App {
                 }
                 // 窗口级按钮只**置标志**，由帧循环消费。
                 //
-                // ⚠️ 不能在这里直接关窗口：`apply_ops`  borrows `self`，
+                // CAUTION: 不能在这里直接关窗口：`apply_ops`  borrows `self`，
                 // 而关窗口要动 `gfx::Window`（在 `run()` 的栈上，不在 self
                 // 里），且此刻帧循环还持有窗口。置标志、把动作留给
                 // 帧循环，是唯一不违反借用规则的顺序。
@@ -1289,7 +1319,7 @@ impl App {
 
         // 搜索文本同步到服务层。
         //
-        // ⚠️ 必须比较**内容**而不是「非空」：早前版本写成
+        // IMPORTANT: 必须比较**内容**而不是「非空」：早前版本写成
         // `if !q.is_empty() || !svc.state.query.is_empty()`，
         // 结果用户删掉全部文本（query 变空）时条件不成立，
         // 过滤永远解不掉——列表卡在「无结果」状态。
@@ -1335,7 +1365,7 @@ impl App {
     /// 与 [`Self::draw_child_frame`] 同一套路：把 `paint::Frame` 的
     /// 字段组装收敛在这里，`settingswin` 不需要知道 `App` 的内部结构。
     ///
-    /// ⚠️ 设置窗口里的 `apply_ops` 必须在**之后**跑：改配置要先落盘
+    /// IMPORTANT: 设置窗口里的 `apply_ops` 必须在**之后**跑：改配置要先落盘
     /// （`after_config_change`），而落盘时机取决于绘制是否已完成。
     pub fn draw_settings_window(&mut self, ui: &mut egui::Ui) {
         let area = ui.max_rect();
@@ -1363,7 +1393,7 @@ impl App {
         // 旧的 `local.drag_region` 已不再更新——保留读旧字段会拿到
         // 永远为 None 的值，表现为「窗口拖不动」。
         //
-        // ⚠️ 是**多段**：顶栏里的齿轮、垃圾桶、搜索框必须从拖动区里
+        // IMPORTANT: 是**多段**：顶栏里的齿轮、垃圾桶、搜索框必须从拖动区里
         // 挖空，否则它们会被系统判成标题栏（`HTCAPTION`）→
         // 不产生 `WM_LBUTTONDOWN` → egui 收不到点击。
         &self.paint_state.drag_regions
@@ -1407,7 +1437,7 @@ impl App {
     /// 返回 `true` 表示已写入配置；坐标无效（最小化 `-32000`、非有限值）
     /// 时返回 `false` 且不写入——调用方据此决定是否推进防抖计时。
     pub fn persist_window_pos(&mut self, p: egui::epaint::emath::Vec2) -> bool {
-        // ⚠️ 必须拒绝**无效坐标**，否则下次启动窗口跑到屏幕外。
+        // CAUTION: 必须拒绝**无效坐标**，否则下次启动窗口跑到屏幕外。
         //
         // `screen_position_points()` 走 `GetWindowRect`，而它对
         // **最小化**的窗口返回的是任务栏图标的矩形 —— 典型值

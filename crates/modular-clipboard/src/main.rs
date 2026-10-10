@@ -8,7 +8,7 @@
 
 // GUI 子系统：不弹控制台窗口。
 //
-// ⚠️ 不加这一行，程序是 **console** 子系统 —— 从资源管理器双击
+// NOTE: 不加这一行，程序是 **console** 子系统 —— 从资源管理器双击
 // 也会附带一个黑底白字的 cmd 窗口，常驻程序一直挂着它非常突兀。
 //
 // 代价：没有 stdout/stderr 可写。所以日志必须落**文件**
@@ -57,7 +57,7 @@ fn parse_args() -> Result<Args, String> {
 
 /// 帮助文本（同时用于弹窗内容）。
 ///
-/// ⚠️ GUI 子系统没有 stdout，`println!` 什么都不会显示——
+/// NOTE: GUI 子系统没有 stdout，`println!` 什么都不会显示——
 /// 所以 `-h` 走 [`show_message_box`]。
 const HELP_TEXT: &str = "ModularClipboard 剪贴板管理器
 
@@ -155,7 +155,7 @@ fn main() {
     };
 
     if args.version {
-        // ⚠️ GUI 子系统没有 stdout，`println!` 什么都不会显示。
+        // NOTE: GUI 子系统没有 stdout，`println!` 什么都不会显示。
         // 所以版本信息弹窗——这是唯一能让用户看到它的途径。
         // （从控制台启动调试时也弹窗，可接受。）
         show_message_box("模块化剪贴板", &format!("版本 {}", env!("CARGO_PKG_VERSION")));

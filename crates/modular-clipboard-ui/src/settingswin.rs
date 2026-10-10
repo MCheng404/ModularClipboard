@@ -31,7 +31,7 @@ const DEFAULT_SIZE: (f32, f32) = (460.0, 560.0);
 
 /// 设置窗口。
 ///
-/// ⚠️ 与 [`super::childwin::ChildWindow`] 一样：每个窗口带**独立的
+/// NOTE: 与 [`super::childwin::ChildWindow`] 一样：每个窗口带**独立的
 /// `egui::Context`**。共用一个 `Context` 会导致两个窗口的鼠标位置
 /// 互相覆盖（都以为自己拿到焦点），键盘输入也会错投。
 pub struct SettingsWindow<'a> {
@@ -72,7 +72,7 @@ impl<'a> SettingsWindow<'a> {
             (anchor.y * s) as i32,
         );
 
-        // ⚠️ 同上：走 `new_context`，字体配置与主窗口一致。
+        // NOTE: 同上：走 `new_context`，字体配置与主窗口一致。
         let ctx = shared.new_context();
 
         // 必须用本窗口自己的表面：用主窗口那个会报
@@ -124,7 +124,7 @@ impl<'a> SettingsWindow<'a> {
 
         // 隐藏态：poll 消息、**排空**事件，不渲染。
         //
-        // ⚠️ 两件事都要做，缺一不可：
+        // CAUTION: 两件事都要做，缺一不可：
         //
         // 1. `poll_for` —— 驱动窗口过程，让系统把窗口画出来/响应 resize；
         // 2. `take_pending` —— **排空**积压的事件。
@@ -152,7 +152,7 @@ impl<'a> SettingsWindow<'a> {
             crate::presence::focus_window(self.window.hwnd());
             // 新开时滚动归零：上次停在半截的设置项不该出现在顶部。
             //
-            // ⚠️ 必须用**本窗口的** `self.ctx`，不能用 `app.ctx`。
+            // CAUTION: 必须用**本窗口的** `self.ctx`，不能用 `app.ctx`。
             // `ScrollArea` 的滚动位置存在它所属 `Context` 的内存里，
             // 清主窗口的 Context 对设置窗口毫无作用——早前就是这么
             // 写的，等于没写。
@@ -190,7 +190,7 @@ impl<'a> SettingsWindow<'a> {
         }
 
         let frame_events = {
-            // ⚠️ 显示态也必须先 `poll_for` 再 `take_pending`。
+            // IMPORTANT: 显示态也必须先 `poll_for` 再 `take_pending`。
             //
             // `poll_for`（含 `poll`）是**唯一**把消息从系统队列泵进
             // `EventLoop::pending` 的入口；只调 `take_pending()` 会拿到
@@ -227,19 +227,19 @@ impl<'a> SettingsWindow<'a> {
             ppp,
             &mut textures_delta,
         ) {
-            // ⚠️ 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
+            // CAUTION: 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
             // 每次 `acquire()` 都 bail ⇒ **该窗口永久死掉**（黑屏 +
             // 报「上一帧尚未 present」，与真实原因毫无关系）。
             self.gfx.fr.abandon_frame();
             return Err(e.into());
         }
         let _ = self.gfx.fr.present(acquired)?;
-        // ⚠️ 必须 clear：`TexturesDelta` 的 `Drop` 有debug 断言
+        // IMPORTANT: 必须 clear：`TexturesDelta` 的 `Drop` 有debug 断言
         // 「未应用的 delta 必须先clear」，否则 panic 且报错与真实
         // 原因毫无关系。
         textures_delta.clear();
 
-        // ⚠️ 这里**不能**做任何周期性的 `SetWindowPos(HWND_TOPMOST)`
+        // CAUTION: 这里**不能**做任何周期性的 `SetWindowPos(HWND_TOPMOST)`
         // 提升：置顶窗口之间按激活顺序排 Z 序，用户点击主窗口后主
         // 窗口在上是 Windows 标准行为（用户主动切走）；每 1 秒把本
         // 窗口强提回顶会**持续抢焦点**——主窗口操作（搜索、列表）
@@ -261,7 +261,7 @@ impl<'a> SettingsWindow<'a> {
 
 impl<'a> Drop for SettingsWindow<'a> {
     fn drop(&mut self) {
-        // ⚠️ 必须销毁表面：设置窗口是「每次开关都新建」，不销毁就是
+        // IMPORTANT: 必须销毁表面：设置窗口是「每次开关都新建」，不销毁就是
         // 每开关一次泄漏一个 `vk::SurfaceKHR`。
         //
         // 先销毁表面再让字段 drop —— `gfx`（含交换链）还引用着它。

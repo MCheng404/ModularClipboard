@@ -685,7 +685,7 @@ pub fn staging_size(format: vk::Format, width: u32, height: u32) -> vk::DeviceSi
         | vk::Format::R8G8B8A8_SRGB
         | vk::Format::B8G8R8A8_UNORM
         | vk::Format::B8G8R8A8_SRGB => 4,
-        // ⚠️ **不能 panic**。这是库里被外部调用的函数，panic 会把整个
+        // CAUTION: **不能 panic**。这是库里被外部调用的函数，panic 会把整个
         // 程序带走，而这里的条件只是「遇到了没支持的格式」——用返回值
         // 表达更合适。
         //

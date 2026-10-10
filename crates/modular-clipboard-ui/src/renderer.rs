@@ -105,7 +105,7 @@ impl Batch {
     /// `prim.clip_rect` 是**逻辑点**，而 `vk::Rect2D` 要的是物理像素且
     /// 取整。渲染层（`gfx::frame`）不持有 `ppp`，所以换算只能在这里做。
     ///
-    /// #⚠️ 换算里的三个坑
+    /// #NOTE: 换算里的三个坑
     ///
     /// 1. **负坐标必须钳到 0**。`painter_at` 允许传入屏幕外/负值的矩形
     ///    （例如浮层被拖到窗口左侧），`offset` 为负会让 `cmd_set_scissor`
@@ -268,7 +268,7 @@ pub fn unpremultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
 /// `clip_from_uv` 传单位矩阵：着色器内部已把像素坐标换算成 NDC（并做了 y 轴
 /// 翻转），再乘一个矩阵只会引入二次变换。
 ///
-/// # ⚠️ 坐标系不变式（务必与 `EventLoop::egui_input` 成对阅读）
+/// # IMPORTANT: 坐标系不变式（务必与 `EventLoop::egui_input` 成对阅读）
 ///
 /// * `size_in_pixels` = **物理像素**（交换链尺寸），来自 [`Painter::paint`] 的
 ///   `fr.extent()`；
@@ -288,7 +288,7 @@ pub fn unpremultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
 /// `2 * pos / screen_size` 而不乘 dpr。同一件事的两种写法，本项目选
 /// 「物理视口 + 乘 dpr」。
 ///
-/// ⚠️ 只要 `ppp` 被漏设成 1.0（DPI 144 时真实值是 1.5），这条不变式就破了：
+/// NOTE: 只要 `ppp` 被漏设成 1.0（DPI 144 时真实值是 1.5），这条不变式就破了：
 /// 布局按逻辑点算好、换算按物理视口算，于是内容只占视口的 1/1.5，
 /// 右侧与底部各空 1/3，且**不产生任何 GPU 错误**。
 pub fn uniforms_for(extent: vk::Extent2D, pixels_per_point: f32) -> Uniforms {
@@ -311,7 +311,7 @@ pub struct UniformKey {
     pub height: u32,
     /// egui 的逻辑点→物理像素比例。
     ///
-    /// ⚠️ 注意命名不一致：本字段叫 `pixels_per_point`，而它写进去的
+    /// NOTE: 注意命名不一致：本字段叫 `pixels_per_point`，而它写进去的
     /// [`crate::pipeline::Uniforms`] 里对应字段叫 **`dpr`**。
     /// 同一个值两个名字，改动时容易写错。
     pub pixels_per_point: f32,
@@ -337,7 +337,7 @@ pub fn next_capacity(needed: usize) -> usize {
 /// `repaint_delay` 设为 `Duration::MAX`（注释写着 "We haven't
 /// scheduled a repaint yet."），而 `request_repaint()` 才置 ZERO。
 ///
-/// ⚠️ 早前一版把 `ZERO` 映射成 `None` 并注释说
+/// NOTE: 早前一版把 `ZERO` 映射成 `None` 并注释说
 ///「ZERO 表示立即重绘，应转成 None 让调用方走有事件才处理」——
 /// **语义反了**：调用方拿到 None 就不会再触发这一帧重绘，
 /// 于是「有事件才处理」的路径永远等不到这次立即重绘，
@@ -753,7 +753,7 @@ impl Drop for Painter<'_> {
         if let Some(mut f) = self.font.take() {
             f.destroy(&self.gpu.device);
         }
-        // ⚠️ 早前**漏了** `user_tex` 与 `placeholder`。
+        // NOTE: 早前**漏了** `user_tex` 与 `placeholder`。
         //
         // 两者都是 `Option<DeviceImage>`，各持有 image + image view +
         // DeviceMemory 三样 Vulkan 对象。`placeholder` 在第一次需要纹理
@@ -1479,7 +1479,7 @@ mod tests {
         assert_eq!(c.offset.y, 0, "负 y 必须钳到 0");
         // 原矩形 x∈[-50,30]、y∈[-20,40]；钳位后可见部分
         // 是 x∈[0,30]、y∈[0,40] ⇒ 宽 30、高 40。
-        // ⚠️ 期望值是「钳位后的可见区域」，不是原矩形的宽高——
+        // NOTE: 期望值是「钳位后的可见区域」，不是原矩形的宽高——
         //   写成 80/60（原点 + 原宽高）会算出一个延伸到 x=80 的
         //   矩形，把本该被裁掉的部分又画回来。
         assert_eq!(c.extent.width, 30, "宽度应是钳位后与视口相交的部分");
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn clip_fully_outside_viewport_becomes_zero_area_not_fullscreen() {
-        // ⚠️ 这一条是「裁剪失效」与「裁剪生效」的分界：
+        // NOTE: 这一条是「裁剪失效」与「裁剪生效」的分界：
         // 整块被裁掉时若退回 `None`（= 全屏），文字就会重新画到窗口上。
         let b = Batch {
             index_offset: 0,

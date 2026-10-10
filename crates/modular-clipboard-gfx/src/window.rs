@@ -97,13 +97,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_POPUP, WS_SYSMENU,
     // IME 会话：搜索框要能输入中文，候选窗依赖这三个消息。
     //
-    // ⚠️ 名字是 `*_COMPOSITION` 而不是直觉上的 `WM_IME_START`/`WM_IME_END`
+    // NOTE: 名字是 `*_COMPOSITION` 而不是直觉上的 `WM_IME_START`/`WM_IME_END`
     // ——后者在 windows crate 里叫 `ImmNotifyIME` 之类，完全不在这。
     // 值分别为 0x10B(267) / 0x86(134) / 0x10F(271)。
     WM_IME_STARTCOMPOSITION, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
 };
 use windows::core::{HSTRING, PCWSTR};
-// ⚠️ IME API 在 `Win32::UI::Input::Ime`，**不在** `Globalization`
+// NOTE: IME API 在 `Win32::UI::Input::Ime`，**不在** `Globalization`
 // （后者只有 `ImmGetCompositionString` 这类旧版ANSI 版）。
 use windows::Win32::UI::Input::Ime::{
     GCS_COMPSTR, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
@@ -419,7 +419,7 @@ impl Window {
     ///
     /// 设置自绘标题栏拖动区（**多段**，推荐）。
     ///
-    /// ⚠️ 交互控件**必须**从拖动区里挖空：落在拖动区内的按下会被
+    /// IMPORTANT: 交互控件**必须**从拖动区里挖空：落在拖动区内的按下会被
     /// 系统转成 `WM_NCLBUTTONDOWN`（`HTCAPTION`），**不产生
     /// `WM_LBUTTONDOWN`** —— egui 于是收不到点击。
     ///
@@ -462,7 +462,7 @@ impl Drop for Window {
     fn drop(&mut self) {
         // 清掉本窗口的外壳状态（拖动区/边框）。
         //
-        // ⚠️ 必须显式 forget：那张表按 HWND 索引，窗口反复创建销毁时
+        // IMPORTANT: 必须显式 forget：那张表按 HWND 索引，窗口反复创建销毁时
         // 不清理会**无限增长**（每建一个窗口留一条）。HWND 值会被系统
         // 复用，残留的旧条目还可能让新窗口继承到错误的拖动区——
         // 正是这次改成 per-HWND 要解决的那类问题。
@@ -544,7 +544,7 @@ pub struct EventLoop {
     inner_size: Vec2,
     /// 本帧事件缓冲。
     ///
-    /// ⚠️ 刻意**不在** [`Self::poll`] 开头清空，见该方法内的说明。
+    /// NOTE: 刻意**不在** [`Self::poll`] 开头清空，见该方法内的说明。
     pending: Vec<WindowEvent>,
     /// 本帧观察到的修饰键状态，用于发 `ModifiersChanged`。
     modifiers: Modifiers,
@@ -629,7 +629,7 @@ impl EventLoop {
     /// 返回本轮读到的全部事件，同时写入内部缓冲供 [`Self::egui_input`]
     /// 使用。有事件时立即返回——这是高优先级路径。
     ///
-    /// # ⚠️ 事件不丢的保证
+    /// # NOTE: 事件不丢的保证
     ///
     /// `pending` 缓冲区**刻意不在本函数开头清空**，而是累积到被
     /// [`Self::take_pending`] 取走为止。这不是疏忽，而是必需：
@@ -643,7 +643,7 @@ impl EventLoop {
     /// 累积语义下，`poll_for` 读到的关闭请求会一直留在 `pending` 里，
     /// 直到主循环 `poll()` 把它当本帧事件交给应用层。
     pub fn poll(&mut self) -> Vec<WindowEvent> {
-        // ⚠️ 这里**不再**每轮清零 `self.modifiers`（G9）。
+        // NOTE: 这里**不再**每轮清零 `self.modifiers`（G9）。
         //
         // `pending` 是**跨轮累积**的，而 `poll_for` 一轮里最多调两次
         // `poll()` 并丢弃返回值。清零会让「上一轮读到的 `Key` 事件」在
@@ -668,7 +668,7 @@ impl EventLoop {
 
         // ---- 尺寸主动同步（不能只依赖 WM_SIZE）--------------------------
         //
-        // ⚠️ 这是「UI 只画在客户区左上角、不随窗口缩放」的真根因。
+        // NOTE: 这是「UI 只画在客户区左上角、不随窗口缩放」的真根因。
         //
         // `translate` 里的 `WM_SIZE` 分支是对的，但**它经常收不到**：
         // `MoveWindow` / `SetWindowPos` 这类改变窗口尺寸的调用，若来自
@@ -704,7 +704,7 @@ impl EventLoop {
             });
         }
 
-        // ⚠️ **必须按 `hwnd` 过滤**。
+        // IMPORTANT: **必须按 `hwnd` 过滤**。
             //
             // 早前传 `None`（不过滤），于是这个循环会抽干**整个线程**
             // 消息队列——包括属于其它窗口的消息。
@@ -778,7 +778,7 @@ impl EventLoop {
     /// 早先的测试直接调`Vec::extend_from_slice`，把这里的实现改回
     /// 覆盖语义（`self.pending = events`）测试照样通过，属于假守卫。
     fn absorb(&mut self, events: Vec<WindowEvent>) {
-        // ⚠️ 必须**追加**而非覆盖：`poll_for` 也会走到这里，
+        // IMPORTANT: 必须**追加**而非覆盖：`poll_for` 也会走到这里，
         // 覆盖会把上一轮累积的未交付事件抹掉（见 `poll` 的说明）。
         self.pending.extend_from_slice(&events);
     }
@@ -974,7 +974,7 @@ impl EventLoop {
         // `ImmGetCompositionStringW` 的长度查询与读取是两次调用，
         // 期间缓冲由本函数独占，不会被别的线程改写。
         unsafe {
-            // ⚠️ `HIMC` 是 newtype 包装的 `isize`，**没有** `is_null()`。
+            // NOTE: `HIMC` 是 newtype 包装的 `isize`，**没有** `is_null()`。
             // 用 `Default::default()`（即空句柄）判断，等价于 Win32 的 NULL。
             let himc = ImmGetContext(self.hwnd);
             if himc == Default::default() {
@@ -1029,7 +1029,7 @@ impl EventLoop {
     /// `events` 是本帧要翻译的事件，通常来自 [`Self::take_pending`]。
     /// D 组每帧开头调用一次，把结果交给 `egui::Context::run` 即可。
     ///
-    /// # ⚠️ 为什么事件是参数而不是读`self.pending`
+    /// # NOTE: 为什么事件是参数而不是读`self.pending`
     ///
     /// 事件缓冲是**累积**的（见 [`Self::poll`] 的说明）：节流路径
     /// `poll_for` 也会读消息，其返回值被调用方丢弃，事件只能留在
@@ -1046,7 +1046,7 @@ impl EventLoop {
     /// `screen_rect` 用逻辑点，`time` 是自事件循环创建起的秒数，
     /// `predicted_dt` 取 `set_repaint_after` 设的间隔。
     ///
-    /// # ⚠️ 坐标系不变式：`screen_rect * ppp` 必须等于客户区物理像素
+    /// # IMPORTANT: 坐标系不变式：`screen_rect * ppp` 必须等于客户区物理像素
     ///
     /// 本函数喂给 egui 的 `screen_rect` 是**逻辑点**，而渲染侧
     /// [`crate::pipeline::Uniforms`] 的 `size_in_pixels` 是**物理像素**。
@@ -1070,7 +1070,7 @@ impl EventLoop {
     /// 这类缺陷不报任何 GPU 错误，只是「画小了」，因此必须靠上面那条
     /// 不变式当判据，而不是靠肉眼看整体比例。
     pub fn egui_input(&self, ctx: &egui::Context, events: &[WindowEvent]) -> egui::RawInput {
-        // ⚠️ 必须与下面的 `screen_rect` **成对**设置，且用同一个
+        // IMPORTANT: 必须与下面的 `screen_rect` **成对**设置，且用同一个
         // `scale_factor`。少这一句就是「UI 只画左上角 2/3」的根因。
         //
         // egui 的 `ppp` 决定两件事：字体图集的栅格化分辨率，以及
@@ -1161,7 +1161,7 @@ impl EventLoop {
                 }
                 // IME → egui 的 IME 事件。
                 //
-                // ⚠️ 必须用 `commit_string`：这里传的是**预编辑串**，
+                // IMPORTANT: 必须用 `commit_string`：这里传的是**预编辑串**，
                 // egui 拿到后会用它画下划线候选与预编辑文本。
                 // 若改传 `preedit` 之外的模式，候选窗能弹但看不到拼音。
                 //
@@ -1617,7 +1617,7 @@ mod tests {
     /// `pointer_in_points` 把 `GetCursorPos` 的客户区像素坐标除以 `scale`。
     /// 若改成物理坐标，等于在逻辑点画布里塞物理像素位置——
     /// 光标会落在控件的 1.5 倍偏移处（点了A 结果触发 B）。
-    /// ⚠️ 判据不能是「坐标落在画布内」：测试用的 `HWND` 是空指针，
+    /// CAUTION: 判据不能是「坐标落在画布内」：测试用的 `HWND` 是空指针，
     /// `ScreenToClient` 必然失败，于是坐标停留在**屏幕坐标**（可远大于画布），
     /// 那是无头环境的预期降级，与本缺陷无关。
     /// 要锁住的是「**做了除法**」这件事，故直接与 `GetCursorPos` 的
@@ -1627,7 +1627,7 @@ mod tests {
         let scale = 1.5_f32;
         let e = fake_loop_scaled(scale, Vec2::new(280.0, 373.0));
 
-        // ⚠️ 本测试依赖**光标的实时屏幕位置**，因此不能假设
+        // CAUTION: 本测试依赖**光标的实时屏幕位置**，因此不能假设
         // `ScreenToClient` 一定不生效。
         //
         // 早前这里断言 `moved == pt / scale`，前提是「空 HWND 下
@@ -2294,7 +2294,7 @@ mod tests {
     /// 导致从节流路径 `poll_for` 读到的 `CloseRequested`
     /// 在下一帧被静默丢弃，实测表现为**用户点标题栏 X 完全没反应**。
     ///
-    /// ⚠️ 这个测试必须走 `absorb()`——即 `poll()` 真正使用的写路径。
+    /// IMPORTANT: 这个测试必须走 `absorb()`——即 `poll()` 真正使用的写路径。
     /// 用局部 `Vec` 或直接 `extend_from_slice` 都测不到被测代码：
     /// 那样只测了 `Vec::push` 与 `mem::take` 两个标准库行为，把
     /// `absorb` 改回覆盖语义也照样通过（已实测确认，属于假守卫）。

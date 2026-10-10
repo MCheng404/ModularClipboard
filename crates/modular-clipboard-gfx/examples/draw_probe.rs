@@ -163,7 +163,7 @@ fn run() -> anyhow::Result<()> {
     ub.write(&gpu.device, &Uniforms::new(IDENTITY, [w, h], 1.0))?;
     println!("OK 顶点/索引/uniform 数据已上传");
 
-    // ⚠️ 关键顺序（本探针存在过的真实违规）：
+    // IMPORTANT: 关键顺序（本探针存在过的真实违规）：
     //
     // 纹理绑定必须在**第一次纹理上传之后**，且要对**所有**槽位都写。
     //

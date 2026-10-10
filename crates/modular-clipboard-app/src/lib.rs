@@ -97,7 +97,7 @@ impl Service {
     ///
     /// `data_dir` 为 `None` 时退回 `%APPDATA%/modular-clipboard`。
     pub fn with_data_dir(config: Config, data_dir: Option<&std::path::Path>) -> Result<Self> {
-        // ⚠️ `config_path` **不能**在 `data_dir` 为 `None` 时也是 `None`。
+        // CAUTION: `config_path` **不能**在 `data_dir` 为 `None` 时也是 `None`。
         //
         // 早前写 `data_dir.map(|d| d.join(CONFIG_FILE_NAME))`，
         // 于是默认启动（不带 `--data-dir`，也就是**所有**双击启动的用户）
@@ -241,7 +241,7 @@ impl Service {
                     // 自写回抑制：应用刚把历史条目放回剪贴板时，
                     // 那次变化不是用户的复制行为，必须忽略。
                     //
-                    // ⚠️ 必须用饱和减法，不能写 `now - last`：
+                    // CAUTION: 必须用饱和减法，不能写 `now - last`：
                     // `now_ms()` 取的是**墙钟**，NTP 校时或用户手动改时间
                     // 会让它瞬间小于 `last_self_write`。无符号减法在此
                     // 下溢成一个接近 2^64 的巨值，于是 `since < 900`
@@ -252,7 +252,7 @@ impl Service {
                     let now = now_ms() as i64;
                     let last = last_self_write.load(Ordering::Relaxed) as i64;
 
-                    // ⚠️ 抑制期内**也要**推进序列号基线（`capture_should_read`
+                    // NOTE: 抑制期内**也要**推进序列号基线（`capture_should_read`
                     // 无条件调用 `changed()`）。
                     //
                     // 自写回（`copy_item`）会改变剪贴板序列号；若抑制期内跳过
@@ -448,7 +448,7 @@ impl Service {
         let bytes = self.store.load_payload(&item)?;
         let mut reader = ClipboardReader::new()?;
 
-        // ⚠️ 抑制必须在**写之前**武装，不能等写完再标。
+        // CAUTION: 抑制必须在**写之前**武装，不能等写完再标。
         //
         // 早前 `suppress_self_capture()` 在 `match item.kind` **之后**，
         // 于是从「剪贴板已被改写（序列号 +1）」到「抑制生效」之间存在
@@ -595,7 +595,7 @@ impl Service {
 ///
 /// 返回 `true` 当且仅当：序列号有新变化，且当前不在自写回抑制窗口内。
 ///
-/// ⚠️ 无论结果如何，都会推进序列号基线（`ClipboardReader::changed` 的
+/// NOTE: 无论结果如何，都会推进序列号基线（`ClipboardReader::changed` 的
 /// 副作用）。这是刻意为之：自写回（`copy_item`）同样会改变剪贴板序列号，
 /// 若抑制期内跳过基线推进，自写导致的变化会在抑制期结束后被当成用户的
 /// 新复制重新捕获——每次把历史条目放回剪贴板都多记一条重复记录。

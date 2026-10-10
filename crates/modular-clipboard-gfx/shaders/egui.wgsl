@@ -64,7 +64,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // ⚠️ 必须用 `textureSampleLevel`（显式 LOD 0）而**不是** `textureSample`。
+    // IMPORTANT: 必须用 `textureSampleLevel`（显式 LOD 0）而**不是** `textureSample`。
     //
     // `textureSample` 内部用隐式 LOD，需要计算屏幕空间导数；
     // WGSL 与 Vulkan 都要求它处于 **uniform control flow** 中。

@@ -200,7 +200,7 @@ pub fn decode(bytes: &[u8], max_edge: u32) -> Result<Thumbnail, ThumbError> {
     // 原图已小于上限时 `resize_exact` 会做一次无意义的重采样，
     // 直接用原解码结果即可（省掉一次全图拷贝与滤波）。
     //
-    // ⚠️ 输出尺寸必须取**缩放后**的 `nw/nh`。曾误用 `src_w/src_h`
+    // IMPORTANT: 输出尺寸必须取**缩放后**的 `nw/nh`。曾误用 `src_w/src_h`
     // 填进 `Thumbnail`，于是 1920×1080 的图被标成 1920×1080
     // 却只带 256×144 的像素——`to_color_image` 按 width 切分时会
     // 直接越界 panic。

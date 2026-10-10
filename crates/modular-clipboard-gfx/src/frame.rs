@@ -187,7 +187,7 @@ pub enum AcquireOutcome {
 
 /// 绘制批次：索引缓冲上的一段连续区间，对应一次 `draw_indexed`。
 ///
-/// # ⚠️ 裁剪必须由 GPU scissor 逐批次设置
+/// # IMPORTANT: 裁剪必须由 GPU scissor 逐批次设置
 ///
 /// 早前的假设是「egui 的裁剪矩形在 CPU 侧 tessellation 时就已反映为
 /// 被裁掉的顶点不进入网格」。**这个假设是错的**，代价是整个 UI 的裁剪
@@ -596,7 +596,7 @@ pub struct FrameRenderer<'a> {
     bundle: PipelineBundle,
     /// 本渲染器绑定的表面。
     ///
-    /// ⚠️ 多窗口必须每个窗口一个表面（`vk::SurfaceKHR` 与 `hwnd`
+    /// IMPORTANT: 多窗口必须每个窗口一个表面（`vk::SurfaceKHR` 与 `hwnd`
     /// 一一对应，不可复用）。`rebuild_swapchain` 要用它重建交换链，
     /// 早前它硬编码 `gpu.surface()`（主窗口的），子窗口 resize 后
     /// 会把交换链建到错的窗口上。
@@ -736,7 +736,7 @@ impl<'a> FrameRenderer<'a> {
 
         // 渲染通道是按某个格式建的。若交换链最终选中的格式不同，
         // framebuffer 与渲染通道不兼容——直接失败，别让驱动在运行时炸。
-        // ⚠️ 必须用**本窗口**的 formats（上面刚查到的），不能用
+        // CAUTION: 必须用**本窗口**的 formats（上面刚查到的），不能用
         // `gpu.surface_formats` —— 那是**主窗口**的创建时快照。
         //
         // 两者在多数机器上相同，所以平时不发作；但两块显示器色彩能力
@@ -1208,10 +1208,10 @@ impl<'a> FrameRenderer<'a> {
 
         // 没有批次就只清屏。
         //
-        // ⚠️ 渲染通道**此刻才开启**（而非在 acquire 时）：纹理上传必须录在
+        // IMPORTANT: 渲染通道**此刻才开启**（而非在 acquire 时）：纹理上传必须录在
         // 渲染通道作用域**之外**，Vulkan 不允许在通道内录传输命令。
         //
-        // ⚠️ 描述符集绑定必须放在 `drawable.is_empty()` 判断**之后**。
+        // IMPORTANT: 描述符集绑定必须放在 `drawable.is_empty()` 判断**之后**。
         // `allocate_descriptor_sets` 分配出的集合内容是**未初始化**的，
         // 着色器又声明了 binding 0/1/2，绑上去GPU 就会解引用垃圾值
         // （UB → 丢设备）。「不绑定」严格优于「绑定一个假的」。
@@ -1264,7 +1264,7 @@ impl<'a> FrameRenderer<'a> {
             device.cmd_bind_index_buffer(cmd, index_buffer, index_offset, index_type);
         }
         for batch in drawable {
-            // ⚠️ 逐批次 scissor：这是 UI 裁剪**唯一**生效的地方。
+            // NOTE: 逐批次 scissor：这是 UI 裁剪**唯一**生效的地方。
             //
             // 上面那次全屏 scissor 只是给「清屏后第一批」一个合理初值；
             // 每个批次开始前必须按自己的 clip 重设，否则所有
@@ -1350,7 +1350,7 @@ impl<'a> FrameRenderer<'a> {
         // 1 为长度才不出错——先设 stage mask，再设 semaphores 最保险。
         let wait_stage = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let acquire_sem = self.slots[slot].acquire_semaphore;
-        // ⚠️ 呈现信号量必须按 **image_index** 取，不是按 slot。
+        // IMPORTANT: 呈现信号量必须按 **image_index** 取，不是按 slot。
         //
         // image_index 由驱动挑选，与 `cursor % slot_count` 无对应关系。
         // 按槽位取会让「本槽位上一次present」尚未完成时就用同一个信号量
@@ -1485,7 +1485,7 @@ impl<'a> FrameRenderer<'a> {
         // 必须先等 GPU 空闲：旧交换链的 framebuffer 还在被在飞命令引用。
         self.gpu.wait_idle();
 
-        // ⚠️ 重建后**必须清掉 `pending`**。
+        // IMPORTANT: 重建后**必须清掉 `pending`**。
         //
         // `pending` 只在 `present()` 里清除。若某一帧在
         // `acquire()` 成功之后出错（纹理上传失败、staging arena 耗尽…）
@@ -1499,7 +1499,7 @@ impl<'a> FrameRenderer<'a> {
         // 这里已经 `wait_idle()`，在飞命令全部完成，清 `pending` 是安全的。
         self.pending = None;
 
-        // ⚠️ 必须查**本窗口自己的**表面。
+        // IMPORTANT: 必须查**本窗口自己的**表面。
         //
         // 早前这里写 `self.gpu.surface()`——那是**主窗口**的表面。
         // 于是子窗口/设置窗口 resize 时，用的是主窗口的
@@ -1756,7 +1756,7 @@ impl<'a> FrameRenderer<'a> {
 
         let mut slots = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
-            // ⚠️ fence 必须以 **UNSIGNALED** 创建
+            // IMPORTANT: fence 必须以 **UNSIGNALED** 创建
             // （`FenceCreateInfo::default()` 即无 flags）。
             //
             // 曾建成SIGNALED，理由是「让首次复用槽位时 wait 立刻通过」。

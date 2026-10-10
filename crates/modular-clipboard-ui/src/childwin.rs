@@ -72,7 +72,7 @@ pub struct ChildWindow<'a> {
     pub card_id: CardId,
     /// 本窗口的 Vulkan 表面句柄。
     ///
-    /// ⚠️ 必须自己留一份：`WindowGfx`/`FrameRenderer` 内部也持有它，
+    /// IMPORTANT: 必须自己留一份：`WindowGfx`/`FrameRenderer` 内部也持有它，
     /// 但那个字段是私有的、且 `FrameRenderer::drop` **不销毁表面**。
     /// 不留副本的话 `Drop` 里无从销毁 ⇒ 每建一个子窗口泄漏一个
     /// `vk::SurfaceKHR`（含 DWM 侧的呈现资源）。
@@ -196,7 +196,7 @@ impl<'a> ChildWindows<'a> {
                     && !self.windows.iter().any(|w| w.card_id == c.id)
             })
             .map(|c| {
-                // ⚠️ `window_size` 是**逻辑点**，`Window::new` 要的是
+                // NOTE: `window_size` 是**逻辑点**，`Window::new` 要的是
                 // **物理像素**。早前这里乘 100 当 DPI 系数，得到
                 // 36000x48000 的窗口，Vulkan 表面如实报告这个尺寸，
                 // 于是交换链按 36000x48000 分配显存 → `OUT_OF_DEVICE_MEMORY`
@@ -224,7 +224,7 @@ impl<'a> ChildWindows<'a> {
                     self.windows.push(win);
                 }
                 Err(e) => {
-                    // ⚠️ 失败后记进 `failed`，**不**每帧重试：
+                    // NOTE: 失败后记进 `failed`，**不**每帧重试：
                     // 建窗失败的常见原因是系统资源不足或窗口数超限，
                     // 每帧重试会刷爆日志且永远成功不了。
                     tracing::error!(card = ?id, %e, "卡片子窗口创建失败，本会话不再重试");
@@ -247,7 +247,7 @@ impl<'a> ChildWindows<'a> {
         if let Some(card) = ws.get_mut(id) {
             let (w, h) = win.window.inner_size_points();
             card.window_size = egui::epaint::emath::vec2(w, h);
-            // ⚠️ 必须校验：子窗口（`WS_POPUP | WS_SYSMENU`）用户可以从
+            // IMPORTANT: 必须校验：子窗口（`WS_POPUP | WS_SYSMENU`）用户可以从
             // 任务栏点一下就最小化，此时 `screen_position_points()` 会
             // 返回本缩放下的 -32000 逻辑坐标。
             //
@@ -324,14 +324,14 @@ impl<'a> ChildWindow<'a> {
         let window = Window::new(title, width, height)?;
         // 立刻定位到卡片记录的位置。
         //
-        // ⚠️ 早前 `window_pos` 只在「收回时写入」、**从不读取**，
+        // NOTE: 早前 `window_pos` 只在「收回时写入」、**从不读取**，
         // 于是所有子窗口都停在Win32 默认位置（层叠在一起），
         // 表现为「多个窗口重叠、界面像缺了一块」。
         //
         // `window_pos` 是逻辑点，`move_to` 要物理像素。
         let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
         window.move_to((pos.x * s) as i32, (pos.y * s) as i32);
-        // ⚠️ 必须走 `SharedGfx::new_context`：它带的字体配置与主窗口
+        // IMPORTANT: 必须走 `SharedGfx::new_context`：它带的字体配置与主窗口
         // 一致（此前这里传 `None`，用户配的字体在子窗口里不生效）。
         let ctx = shared.new_context();
         // 必须给子窗口**自己的**表面：用主窗口那个会报
@@ -363,7 +363,7 @@ impl<'a> ChildWindow<'a> {
         // 客户区 0×0（最小化）时不能 acquire：交换链拿不到可呈现图像。
         let (cw, ch) = self.window.inner_size_physical();
         if cw == 0 || ch == 0 {
-            // ⚠️ 必须**非阻塞**（`None`）且排空积压。
+            // IMPORTANT: 必须**非阻塞**（`None`）且排空积压。
             //
             // 早前这里用 `poll_for(Some(CHILD_POLL_INTERVAL))`：
             // `poll_for` 带超时会真的睡等（`MsgWaitForMultipleObjects`），
@@ -377,7 +377,7 @@ impl<'a> ChildWindow<'a> {
         }
 
         let frame_events = {
-            // ⚠️ 显示态也必须先 `poll_for` 再 `take_pending`。
+            // IMPORTANT: 显示态也必须先 `poll_for` 再 `take_pending`。
             //
             // `poll_for`（含 `poll`）是**唯一**把消息从系统队列泵进
             // `EventLoop::pending` 的入口；只调 `take_pending()` 会拿到
@@ -421,7 +421,7 @@ impl<'a> ChildWindow<'a> {
             .painter
             .paint(&mut self.gfx.fr, &primitives, ppp, &mut textures_delta)
         {
-            // ⚠️ 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
+            // CAUTION: 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
             // 每次 `acquire()` 都 bail ⇒ **该窗口永久死掉**（黑屏 +
             // 报「上一帧尚未 present」，与真实原因毫无关系）。
             self.gfx.fr.abandon_frame();

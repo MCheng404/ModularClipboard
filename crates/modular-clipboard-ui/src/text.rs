@@ -77,7 +77,7 @@ mod tests {
     /// 在里面调用捕获来的 `FnOnce` 会 E0507。
     fn with_ui(mut f: impl FnMut(&egui::Ui)) {
         let ctx = egui::Context::default();
-        // ⚠️ 必须装字体，否则 `layout_no_wrap` 找不到任何字形而 panic。
+        // CAUTION: 必须装字体，否则 `layout_no_wrap` 找不到任何字形而 panic。
         crate::theme::install_cjk_font(&ctx, None);
         let mut out = ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -85,7 +85,7 @@ mod tests {
                 f(ui);
             });
         });
-        // ⚠️ 必须 clear：`TexturesDelta` 的 `Drop` 在 debug 断言下要求
+        // IMPORTANT: 必须 clear：`TexturesDelta` 的 `Drop` 在 debug 断言下要求
         // 「没有被应用的 delta 必须先 clear」，否则整条测试 panic 在
         // epaint 内部，报错信息与真实原因毫无关系。
         out.textures_delta.clear();

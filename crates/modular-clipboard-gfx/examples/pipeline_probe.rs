@@ -255,7 +255,7 @@ fn main() {
 
     // 实际录制并提交一帧
     //
-    // ⚠️ 必须先 `acquire_next_image` —— 规范要求：
+    // IMPORTANT: 必须先 `acquire_next_image` —— 规范要求：
     // 「对 presentable 图像的使用（含布局转换与渲染命令）
     // 只能发生在 `vkAcquireNextImageKHR` 返回它之后、
     // `vkQueuePresentKHR` 释放它之前」。
@@ -384,7 +384,7 @@ fn main() {
     pipe_layout.destroy(&gpu.device);
     layout.destroy(&gpu.device);
 
-    // ⚠️ 交换链必须在 `rp.destroy()` **之前**销毁。
+    // IMPORTANT: 交换链必须在 `rp.destroy()` **之前**销毁。
     //
     // `Swapchain::destroy` 内部按 framebuffer → image_view → swapchain
     // 的顺序销毁（framebuffer 引用了图像视图，反序会留悬空引用）。

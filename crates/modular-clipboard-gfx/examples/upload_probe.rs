@@ -146,7 +146,7 @@ fn run() -> anyhow::Result<()> {
 
     // 跑消息循环让窗口完成显示。
     //
-    // ⚠️ `ShowWindow` 不能省。窗口在不可见状态时，Win32 的表面
+    // CAUTION: `ShowWindow` 不能省。窗口在不可见状态时，Win32 的表面
     // 无法呈现，`acquire_next_image` 会让驱动进入不可恢复的状态——
     // 实测症状是**首次 acquire 就报「逻辑设备已丢失」**，而不是任何
     // 指向「窗口没显示」的错误信息。`pipeline_probe` 早就有这一行，
@@ -347,7 +347,7 @@ fn run() -> anyhow::Result<()> {
         done += 1;
         // 逐帧确认设备存活。
         //
-        // ⚠️ 这里的 `device_wait_idle` **每帧强制同步**，会掩盖
+        // NOTE: 这里的 `device_wait_idle` **每帧强制同步**，会掩盖
         // 「多帧在途」路径上的bug——MEMORY.md 坑 28 明确说过
         // 不要靠每帧 wait idle 绕过 staging 问题。因此默认**关闭**，
         // 需要时用 `UPLOAD_PROBE_WAIT_EACH_FRAME=1` 打开。

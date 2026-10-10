@@ -78,7 +78,7 @@ pub struct SharedGfx<'a> {
     ///
     /// 放在这里是为了让**每个**窗口装字体时都能取到它。
     ///
-    /// ⚠️ 早前各窗口各自调 `install_cjk_font(&ctx, None)`，只有主窗口
+    /// NOTE: 早前各窗口各自调 `install_cjk_font(&ctx, None)`，只有主窗口
     /// 传了真实的 `font_path` —— 于是同一个界面里，主窗口用用户指定
     /// 的字体、子窗口和设置窗口用回退字体。用户配了字体却「一半生效」，
     /// 排查时会以为是字体没加载成功。
@@ -131,7 +131,7 @@ impl<'a> SharedGfx<'a> {
     /// 覆盖、焦点错乱），但**装字体的步骤必须完全一致**——否则同一
     /// 个界面里不同窗口用不同字体。
     ///
-    /// ⚠️ 顺序也有讲究：图标字体必须排在 CJK 之后。`install_cjk_font`
+    /// IMPORTANT: 顺序也有讲究：图标字体必须排在 CJK 之后。`install_cjk_font`
     /// 内部用 `set_fonts` 整体替换，先装图标会被冲掉（文档里写明）。
     ///
     /// 早前这段逻辑被复制了三份（`childwin.rs` / `settingswin.rs` /
@@ -178,7 +178,7 @@ impl<'a> WindowGfx<'a> {
 
     /// 为**指定表面**建窗口渲染器（子窗口用）。
     ///
-    /// ⚠️ 不能对子窗口调 [`Self::new`]：它用 `gpu.surface()`，
+    /// CAUTION: 不能对子窗口调 [`Self::new`]：它用 `gpu.surface()`，
     /// 那是主窗口的表面。`vk::SurfaceKHR` 与 `hwnd` 一一对应，
     /// 复用会撞上 `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`（实测必现）。
     pub fn new_for(shared: &SharedGfx<'a>, surface: ash::vk::SurfaceKHR) -> anyhow::Result<Self> {

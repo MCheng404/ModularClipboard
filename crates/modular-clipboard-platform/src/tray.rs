@@ -242,7 +242,7 @@ impl Callback {
 
 /// 托盘回调消息 → 事件（展示主窗口）。
 ///
-/// ⚠️ 判定要**同时**看高位鼠标码与低位通知码：
+/// NOTE: 判定要**同时**看高位鼠标码与低位通知码：
 /// - 版本 4 正常路径：低位是 `NIN_SELECT` / `NIN_KEYSELECT`；
 /// - `NIM_SETVERSION` 失败时回退旧式语义：高位直接是
 ///   `WM_LBUTTONUP` / `WM_LBUTTONDBLCLK`。
@@ -251,7 +251,7 @@ impl Callback {
 fn notify_event_of(lparam: isize) -> Option<TrayEvent> {
     let cb = Callback::decode(lparam);
 
-    // ⚠️ 顺序要紧：**先排除右键**，再处理左键。
+    // NOTE: 顺序要紧：**先排除右键**，再处理左键。
     //
     // 版本 4 下右键回调的 `lParam` 里，通知码同样是 `NIN_SELECT`
     // （shell 对所有鼠标事件都发 `NIN_SELECT`），只有高位的鼠标码
@@ -275,7 +275,7 @@ fn notify_event_of(lparam: isize) -> Option<TrayEvent> {
 
 /// 托盘右键事件 → 是否应弹菜单。
 ///
-/// ⚠️ 判定必须在**高位**（鼠标消息码），见 [`Callback`] 的说明。
+/// IMPORTANT: 判定必须在**高位**（鼠标消息码），见 [`Callback`] 的说明。
 /// 早前只看低位，而版本 4 下低位恒为 `NIN_SELECT`，所以右键
 /// 永远不匹配。
 fn is_context_menu_event(lparam: isize) -> bool {
@@ -536,7 +536,7 @@ mod imp {
 
             // 菜单弹出位置 = **当前光标屏幕坐标**。
             //
-            // ⚠️ 不能用 `unpack_cursor(lparam)` 从回调参数里解坐标：
+            // CAUTION: 不能用 `unpack_cursor(lparam)` 从回调参数里解坐标：
             // shell 对通知区回调的 `lParam` 传的是**消息码**（如
             // `WM_RBUTTONUP = 0x205`），并不携带坐标。早前按
             // 「坐标在低 32 位」解包，解出的是消息码本身 ——
@@ -550,7 +550,7 @@ mod imp {
             let (x, y) = (pt.x, pt.y);
             // 菜单弹出前把宿主置前台，否则菜单立刻消失。
             //
-            // ⚠️ 宿主必须是**可见的顶层窗口**，这是本次修复的核心。
+            // IMPORTANT: 宿主必须是**可见的顶层窗口**，这是本次修复的核心。
             //
             // 踩过的两个坑：
             // 1. 早前用托盘窗口自己当宿主——它是 `HWND_MESSAGE`

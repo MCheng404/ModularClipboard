@@ -743,7 +743,7 @@ fn log_font_loaded(ctx: &egui::Context, defs: &mut FontDefinitions, path: &str) 
 
 /// 返回指定**逻辑字号**的 [`FontId`]。
 ///
-/// # ⚠️ 这里**不能**乘 `pixels_per_point`
+/// # CAUTION: 这里**不能**乘 `pixels_per_point`
 ///
 /// egui 的 `FontId::size` 与 `RichText::size(..)` 单位都是**逻辑点**，
 /// 排版时 egui 自己会再乘一次 `pixels_per_point`（见 `epaint` 的
@@ -924,7 +924,7 @@ mod tests {
     /// 这是磨砂模式下「DWM 的 blur 能透出」的渲染侧保证——背景层
     /// 必须真的变透明，而不是只在文档里声明。
     ///
-    /// ⚠️ 不断言 RGB 不变：`gamma_multiply` 在 gamma 空间同时调整
+    /// NOTE: 不断言 RGB 不变：`gamma_multiply` 在 gamma 空间同时调整
     /// RGB 与 alpha（视觉上「同色更淡」），这是 egui 预乘的预期语义。
     #[test]
     fn backdrop_alpha_only_touches_backdrop_layers() {
@@ -1524,7 +1524,7 @@ mod tests {
 
     #[test]
     fn size_scale_is_clamped() {
-        // ⚠️ 这条测试原先断言的是**错误行为**：`sized(12.0, 5.0).size == 24.0`
+        // NOTE: 这条测试原先断言的是**错误行为**：`sized(12.0, 5.0).size == 24.0`
         // （12 × 2.0钳制）。那正是「字号被 ppp 乘两次」的根源——
         // egui 排版时自己会再乘一次 `pixels_per_point`。
         //

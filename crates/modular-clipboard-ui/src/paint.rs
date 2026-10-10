@@ -40,7 +40,7 @@ const CARD_STROKE: f32 = 1.0;
 /// 卡片圆角（逻辑点）。
 /// 卡片圆角（逻辑点）。
 ///
-/// ⚠️ **取 0（直角）**，不是原先的 8。
+/// NOTE: **取 0（直角）**，不是原先的 8。
 ///
 /// 圆角会在相邻卡片之间与窗口边缘留下 4 个「缺口」：卡片明明
 /// 紧贴（实测底部间隙 0px），但视觉上像有一条缝——用户报的
@@ -70,7 +70,7 @@ pub enum Op {
 
     // ---- 设置界面 ----
     //
-    // ⚠️ 配置项**不能**在 paint 里直接改：`Frame` 借的是 `&UiConfig`，
+    // CAUTION: 配置项**不能**在 paint 里直接改：`Frame` 借的是 `&UiConfig`，
     // 且改完还要落盘（`svc.save_config()`）。统一走 Op 由 `App` 落地。
 
     /// 改一个布尔配置项。
@@ -105,14 +105,14 @@ pub enum Op {
     ClearAll,
     /// 退出程序。
     ///
-    /// ⚠️ 早前 UI 层**没有任何退出入口**：`App::should_quit` 这个字段
+    /// NOTE: 早前 UI 层**没有任何退出入口**：`App::should_quit` 这个字段
     /// 存在、有初始化、有消费点、有 getter，但**全仓没有任何地方把它
     /// 置成 true**。于是设置窗口里没有「退出程序」按钮，而标题栏 ✕
     /// 在有托盘时只隐藏到托盘 —— 用户从界面里根本无法退出程序。
     Quit,
     /// 关闭按钮 ⇒ 隐藏到托盘。
     ///
-    /// ⚠️ 语义是「隐藏」不是「退出」：剪贴板类工具直接退出会让
+    /// NOTE: 语义是「隐藏」不是「退出」：剪贴板类工具直接退出会让
     /// 用户以为「记录停了」。真实决策（隐藏 / 退出）由 `App` 侧结合
     /// 有无托盘兜底判断，绘制层不决定。
     CloseWindow,
@@ -155,7 +155,7 @@ pub struct UiState {
     pub search_expanded: bool,
     /// 上一帧提交给窗口的拖动区（标题栏）。
     ///
-    /// ⚠️ 必须是**多段**而不是「整个顶栏一块」：拖动区会被系统转成
+    /// IMPORTANT: 必须是**多段**而不是「整个顶栏一块」：拖动区会被系统转成
     /// `HTCAPTION`，点其中的控件不会产生 `WM_LBUTTONDOWN`，
     /// egui 收不到点击（表现：齿轮/垃圾桶/搜索框全都点不动）。
     ///
@@ -165,7 +165,7 @@ pub struct UiState {
     pub hover_card: Option<crate::card::CardId>,
     /// 列表滚动偏移（逻辑点），**按列表分开存**。
     ///
-    /// ⚠️ 主栏历史列表与内嵌置顶区是两个独立列表。早前共用一个
+    /// NOTE: 主栏历史列表与内嵌置顶区是两个独立列表。早前共用一个
     /// `f32`，而绘制每帧都会把它灌进 `ScrollArea`，于是滚其中一个
     /// 会把另一个一起带走。
     ///
@@ -191,7 +191,7 @@ pub struct UiState {
 
     // ---- 交互热区（供自动化测试定位）----
     //
-    // ⚠️ 为什么让被测代码**自报坐标**而不是测试去算：
+    // NOTE: 为什么让被测代码**自报坐标**而不是测试去算：
     //
     // 早前测试按「顶栏高 × 0.7、间距 8」自己估按钮位置，结果算出的
     // 矩形是 `[328,76]-[580,324]`（横跨整窗），**所有点击都落在按钮
@@ -201,7 +201,7 @@ pub struct UiState {
     // 几个 Rect 的写入（可忽略），换来的是「布局改了测试自动跟随」。
     /// 本帧各命名热区的矩形（逻辑点），**按窗口命名空间分隔**。
     ///
-    /// ⚠️ 必须按窗口分开：主窗口、设置窗口、每个子窗口是**不同的
+    /// IMPORTANT: 必须按窗口分开：主窗口、设置窗口、每个子窗口是**不同的
     /// 坐标空间**，却共用同一个 `UiState`（因此共用一张热区表）。
     /// 早前是一张 flat map、且只有主窗口的 `draw()` 会 clear，于是：
     ///
@@ -324,7 +324,7 @@ pub struct Frame<'a> {
     ///
     /// `None` 表示画主窗口（顶栏 + 全部停靠卡片）。
     ///
-    /// ⚠️ 不能在 `draw_child` 里"找第一张 host==Window 的卡片"：
+    /// CAUTION: 不能在 `draw_child` 里"找第一张 host==Window 的卡片"：
     /// 详情与视图都是 Window 型，两个子窗口会各自找到同一张卡片。
     pub card_id: Option<crate::card::CardId>,
     /// 本帧的热区写到**哪个窗口的命名空间**。
@@ -371,7 +371,7 @@ pub fn draw_child(f: &mut Frame<'_>) {
 
     // 找到本窗口对应的那张卡片。
     //
-    // ⚠️ 不 `expect`：`draw_child` 是生产路径，而「窗口存在但卡片
+    // NOTE: 不 `expect`：`draw_child` 是生产路径，而「窗口存在但卡片
     // 不在列表里」是**可能发生**的短暂不一致（卡片刚被删、窗口
     // 还没销毁）。这里降级为空画而不是 panic——一个附属面板
     // 的状态问题不该让整个程序崩掉。
@@ -438,7 +438,7 @@ pub fn draw(f: &mut Frame<'_>) {
     draw_topbar(f, top);
     draw_cards(f, body);
 
-    // ⚠️ 设置界面**不在这里画**——它已移到独立窗口
+    // NOTE: 设置界面**不在这里画**——它已移到独立窗口
     // （见 `crate::settingswin`）。主窗口只负责响应齿轮点击，
     // 把 `show_settings` 置 true，由设置窗口的绘制入口接管。
     //
@@ -472,7 +472,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     let gap = pal.space_sm * 2.0;
     // 三枚按钮：关闭 / 清空 / 设置（「最小化」已去掉，见 draw_topbar_icons）。
     //
-    // ⚠️ 这里的 `3.0` 必须与 `draw_topbar_icons` 里的 `step = r.width() / 3.0`
+    // IMPORTANT: 这里的 `3.0` 必须与 `draw_topbar_icons` 里的 `step = r.width() / 3.0`
     // 一致。两处各写一份数字，改一处忘另一处 ⇒ 按钮区与实际按钮错位，
     // 表现为「最右那枚被搜索框压住」或「点齿轮变成拖窗口」。
     let btn_count = 3.0;
@@ -533,7 +533,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
 
     // 顶栏拖动区 = 顶栏**减去交互控件**。
     //
-    // ⚠️ 这里必须是「挖空」而不是「整块上报」。`WM_NCHITTEST` 对拖动区
+    // IMPORTANT: 这里必须是「挖空」而不是「整块上报」。`WM_NCHITTEST` 对拖动区
     // 返回 `HTCAPTION`，系统随后把按下转成 `WM_NCLBUTTONDOWN`
     // ——**不会产生 `WM_LBUTTONDOWN`**，egui 于是收不到点击。
     //
@@ -549,7 +549,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     if left_end - bar.min.x > 8.0 {
         drag.push(Rect::from_min_max(bar.min, pos2(left_end - 2.0, bar.max.y)));
     }
-    // ⚠️ 这里**不设**「两按钮之间」那一段。
+    // NOTE: 这里**不设**「两按钮之间」那一段。
     //
     // `btn_area` 宽 `btn*2 + space_sm`、两按钮各占一半——它们是
     // **紧邻**的（`space_sm` 落在 `btn_area` 内部，两侧各一半）。
@@ -561,7 +561,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     //
     // 右段：从**设置按钮的真实右缘**到窗口右缘。
     //
-    // ⚠️ 不能用 `btn_area.max.x + pal.space_sm` 估——
+    // CAUTION: 不能用 `btn_area.max.x + pal.space_sm` 估——
     // `space_sm` 已经算进 `btn_area` 的宽度里了（见 `btn_area` 的
     // 构造：宽 `btn*2 + space_sm`），再加一次会**侵入按钮**。
     // 实测该段`[[688,0]-[700,44]]` 与齿轮 `[[664.7,8.4]-[696,35.6]]`
@@ -610,7 +610,7 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
 
     // 自左向右：关闭 / 清空 / 设置。
     //
-    // ⚠️ 只有三枚了——「最小化」已去掉。它与「关闭到托盘」的实际
+    // NOTE: 只有三枚了——「最小化」已去掉。它与「关闭到托盘」的实际
     // 效果几乎相同（都让窗口消失），区别仅在任务栏是否留条目，
     // 而本程序常驻托盘，用户极少需要「留在任务栏但看不见」。
     // 两个近乎重复的按钮并排反而增加误点。
@@ -668,7 +668,7 @@ fn icon_button(
     // `Button` 的文本留空：真正的内容是下面自绘的图标。
     // `frame(false)` 去掉它自带的边框，只保留命中与悬停。
     //
-    // ⚠️ `Button::frame` 收的是 **bool**（是否画框），而
+    // NOTE: `Button::frame` 收的是 **bool**（是否画框），而
     // `TextEdit::frame` 收的是 `egui::Frame` 枚举。两者同名不同签名，
     // 写反了会报 E0308。
     let resp = f.ui.scope_builder(
@@ -691,7 +691,7 @@ fn icon_button(
             _ => pal.text_dim,
         },
     );
-    // ⚠️ 顺序硬性：`on_hover_text` 按**值**消耗 `Response`，所以
+    // NOTE: 顺序硬性：`on_hover_text` 按**值**消耗 `Response`，所以
     // `clicked()` 必须在它之前取。把两者写反会 E0382（值已移动）。
     let clicked = resp.clicked();
     resp.on_hover_text(tip);
@@ -751,7 +751,7 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     }
     // 自报热区给测试用（见 `UiState::hit` 的说明）。
     //
-    // ⚠️ 登记**两个**：`search_box` 是外框，`search` 是输入区。
+    // NOTE: 登记**两个**：`search_box` 是外框，`search` 是输入区。
     //
     // 只登记输入区不够——外框左侧那条约 22pt 宽的图标带**也是可点的**
     //（点它会聚焦搜索框），而它恰好是最容易被拖动区吃掉的地方。
@@ -762,7 +762,7 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     f.hit_insert("search", edit_rect);
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
-            // ⚠️ **必须给显式 id**。不给的话 egui 按调用位置自动生成，
+            // IMPORTANT: **必须给显式 id**。不给的话 egui 按调用位置自动生成，
             // 于是：焦点断言没法稳定地指向它（只能退化成
             // 「有没有任何控件获得焦点」这种恒真判断），且任何调整
             // 布局的改动都可能悄悄换掉 id。
@@ -777,7 +777,7 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
                 egui::TextEdit::singleline(&mut f.state.query)
                     .hint_text("搜索历史…")
                     .desired_width(f32::INFINITY)
-                    // ⚠️ 字号必须给**不带scale 的逻辑字号**。
+                    // IMPORTANT: 字号必须给**不带scale 的逻辑字号**。
                     //
                     // 早前传的是 `sized(pal.font_md, scale)`——它已经把
                     // DPI 系数乘进去了，而 egui 在计算可用高度时会
@@ -794,7 +794,7 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
                     // 去掉 TextEdit 自带的外框：外框已由上面的
                     // `rect_stroke` 画好，两层框叠在一起会显得脏。
                     //
-                    // ⚠️ 这里必须给 `egui::Frame` 枚举而不是 `false`：
+                    // IMPORTANT: 这里必须给 `egui::Frame` 枚举而不是 `false`：
                     // 0.36 的 `frame()` 收的是容器框类型，不是 bool。
                     .frame(egui::Frame::NONE),
             )
@@ -862,13 +862,13 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
 fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
     let side = r.width().min(r.height());
     // 线宽取边长的 9%：约 1.6px（side=16），比字体字形明显纤细。
-    // ⚠️ 下限 1.5——太细在1x 屏上会断续，虚化。
+    // NOTE: 下限 1.5——太细在1x 屏上会断续，虚化。
     let stroke_w = (side * 0.09).max(1.5);
     let c = r.center();
 
     // 圆环：直径 52%，圆心偏左上。
     //
-    // ⚠️ 早前取 62% + 手柄起点在环**内**：放大截图看到手柄被圆环
+    // NOTE: 早前取 62% + 手柄起点在环**内**：放大截图看到手柄被圆环
     // 盖住，整个图标只剩一个空心圆，完全不像放大镜。
     // 现在环缩小、手柄起点移到环**外**（环边缘 + 线宽一半），
     // 两段在视觉上连成一体。
@@ -884,7 +884,7 @@ fn draw_search_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
     let diag = 0.707_106_78_f32; // √2/2
     let start_off = (ring_r + stroke_w * 0.5) * diag;
     let start = pos2(ring_c.x + start_off, ring_c.y + start_off);
-    // ⚠️ `reach` 必须留够「线宽的一半」的余量：`end` 还要描边，
+    // IMPORTANT: `reach` 必须留够「线宽的一半」的余量：`end` 还要描边，
     // 取 0.47 时终点 8.45 + 0.81 = 9.26 会**溢出**包围盒 9.0
     // （被裁掉一小截）。0.43 留 0.7pt 余量。
     let reach = side * 0.43;
@@ -910,13 +910,13 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     // 不该再让调用方传一个进来（那两个值必须一致，传错就是 bug）。
     let area = f.area;
 
-    // ⚠️ 清空必须**早于**下面所有提前 return。
+    // IMPORTANT: 清空必须**早于**下面所有提前 return。
     //
     // 若只在「画成了」的路径里清，那么某一帧尺寸异常跳过绘制时，
     // 上一帧的热区就留在表里——自动化拿着它去点，点的是不存在的位置。
     f.hit_clear();
 
-    // ⚠️ **首帧的 `area` 可能荒谬**（实测 6666x6666）。
+    // NOTE: **首帧的 `area` 可能荒谬**（实测 6666x6666）。
     //
     // `ui.max_rect()` 取的是子 `Ui` 的可用矩形，而首帧 `screen_rect`
     // 尚未由 `egui_input` 正确设置（`RawInput.screen_rect` 是默认值）。
@@ -955,7 +955,7 @@ pub fn draw_settings(f: &mut Frame<'_>) {
 
     // 设置项会随版本增加，窗口高度固定 ⇒ 必须能滚。
     //
-    // ⚠️ 高度必须用「**剩余可用高度**」而不是估算常量：标题行实际
+    // IMPORTANT: 高度必须用「**剩余可用高度**」而不是估算常量：标题行实际
     // 高度随字号缩放变化，写死一个系数会在窗口越矮时误差越大
     // （此前实测 600x400 下开关被排到客户区之外，点不到）。
     // `ScrollArea` 会**扩展**到内容高度，所以这里必须显式封顶。
@@ -1026,7 +1026,7 @@ fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
     let _ = f.scale;
     let cur = f.ws.pinned_mode();
 
-    // ⚠️ 必须把配置值**逐个拷出来**，不能 `let cfg = &f.svc.state.config`
+    // CAUTION: 必须把配置值**逐个拷出来**，不能 `let cfg = &f.svc.state.config`
     // 然后边遍历边调需要 `&mut Frame` 的函数。
     //
     // 那个借用会活到函数结束，于是后面每次 `draw_switch(f, ...)` /
@@ -1136,7 +1136,7 @@ fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
         f, ui, "max_items", "历史条数上限", "留空表示只按容量淘汰",
         sto_cfg.max_items, 1000.0, 100.0, " 条",
     );
-    // ⚠️ 「去重窗口」控件已**移除**。
+    // NOTE: 「去重窗口」控件已**移除**。
     //
     // `dedup_window_secs` 的注释已写明「此字段保留仅为兼容已落盘的旧
     // 配置文件，**不再参与去重逻辑**」—— 去重改成按哈希查**全部历史**，
@@ -1236,7 +1236,7 @@ fn setting_row(ui: &mut Ui, label: &str, desc: &str, control: impl FnOnce(&mut U
 fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut bool) -> bool {
     let pal = f.pal;
     let s = 18.0_f32;
-    // ⚠️ 同一个矩形只准注册**一次**交互。
+    // NOTE: 同一个矩形只准注册**一次**交互。
     //
     // 早前这里写的是 `allocate_exact_size(size, Sense::click())`
     // 紧接着又 `interact(rect, Id::new(("switch", …)), Sense::click())`
@@ -1280,7 +1280,7 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     if resp.clicked() {
         *v = !*v;
     }
-    // ⚠️ 热区 key 必须**带上字段名**。
+    // IMPORTANT: 热区 key 必须**带上字段名**。
     //
     // 早前所有开关都登记成同一个 `"settings_switch"`，而 `hit` 是
     // `HashMap<&str, Rect>`——后写的覆盖先写的， map 里只剩**最后一个**
@@ -1380,7 +1380,7 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
     // 置顶**不占一栏**：要么独立成窗、要么内嵌在历史栏顶部。
     // 两种情况主窗口都不画置顶卡片。
     //
-    // ⚠️ 判据必须与 solver 用的一致（`pinned_is_embedded`），
+    // IMPORTANT: 判据必须与 solver 用的一致（`pinned_is_embedded`），
     // 否则会出现「solver 按占一栏分了宽度、paint 又在历史栏内画
     // 一份」—— 实测界面就是这样：置顶与历史并排，
     // 而用户要的是不分栏。
@@ -1410,7 +1410,7 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
     // `draw_expanded_card` 里随历史卡片一起处理：那里会先把历史
     // 卡片的 body 切成两段（置顶在上、历史在下），两段各画各的。
     //
-    // ⚠️ 早前是「画完历史再往上叠一层」，于是标题叠字 + 列表重叠。
+    // NOTE: 早前是「画完历史再往上叠一层」，于是标题叠字 + 列表重叠。
     // 而且这里也拿不到「置顶该占多高」——那是切分时才确定的量。
 }
 
@@ -1475,7 +1475,7 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
 
     // 头部：标题 + 折叠/分离按钮。
     //
-    // ⚠️ 历史栏的标题「历史」已按用户要求去掉——头部高度压为 0，
+    // NOTE: 历史栏的标题「历史」已按用户要求去掉——头部高度压为 0，
     // 列表从卡片顶部直接开始（不占位置）。其它卡片保留头部标题。
     let head_h = if card.kind == CardKind::History {
         0.0
@@ -1495,7 +1495,7 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     }
     match card.kind {
         CardKind::History => {
-            // ⚠️ 历史栏整卡是「暗容器」：frame 底色也用 `list_bg`，
+            // NOTE: 历史栏整卡是「暗容器」：frame 底色也用 `list_bg`，
             // 否则列表四周（frame 与 body 之间的边距）仍露出 frame
             // 的 `surface` 底色——浅色主题下就是一圈白色（用户反馈
             // 「列表边上还是白色」）。描边由 `draw_card_frame` 已画，
@@ -1504,7 +1504,7 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
             // 置顶内嵌在历史卡片**顶部** ⇒ 先把 body 切成两段，
             // 历史列表用下面那段。
             //
-            // ⚠️ 早前是「先画完整历史列表，再事后往上叠一层置顶」——
+            // NOTE: 早前是「先画完整历史列表，再事后往上叠一层置顶」——
             // 于是「置顶」标签与卡片标题「历史」画在**同一个 y**
             // （都是 `inner.min`），而置顶列表一直铺到卡片底部，
             // 盖住历史的前 N 行。用户看到的是两层内容叠在一起的乱字，
@@ -1656,7 +1656,7 @@ fn first_visible_row(offsets: &[f32], heights: &[f32], scroll: f32) -> usize {
 fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 自报列表可视区。
     //
-    // ⚠️ 这个 key **不是**给绘制用的，是给「热区自报」机制用的：
+    // NOTE: 这个 key **不是**给绘制用的，是给「热区自报」机制用的：
     // 测试与自动化脚本从 `UiState::hit` 里读坐标，而不是自己按
     // `pal` 常量重算一遍公式——重算等于把实现抄进测试，实现改对了
     // 测试反而挂。
@@ -1681,7 +1681,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 
     // 本列表用哪个滚动槽位。
     //
-    // ⚠️ 两个列表的滚动位置必须**分开存**。早前共用一个
+    // IMPORTANT: 两个列表的滚动位置必须**分开存**。早前共用一个
     // `f32`，而 `vertical_scroll_offset` 每帧都会把它写进 egui ——
     // 于是滚主栏会把内嵌置顶区一起带走（反之亦然）。
     let pinned_slot = only_pinned == Some(true);
@@ -1692,7 +1692,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 悬浮在留白中；左右留白竖条同时上报为**拖动区**（WM_NCHITTEST
     // 返回 HTCAPTION），用户按住列表两侧的空白即可拖动窗口。
     //
-    // ⚠️ 滚动条放在内容区右缘（`ScrollArea` 的 `max_rect` 用
+    // NOTE: 滚动条放在内容区右缘（`ScrollArea` 的 `max_rect` 用
     // `content`），因此滚动条不会压进右留白拖动区——若滚动条贴着
     // `body.max.x` 画，右拖动区就正好压在滚动条上，拖滚动条会变成
     // 拖窗口。
@@ -1718,7 +1718,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
         .state
         .items
         .iter()
-        // ⚠️ 主栏（`None`）**排除置顶条目**：置顶内容由置顶区（共用单栏）
+        // NOTE: 主栏（`None`）**排除置顶条目**：置顶内容由置顶区（共用单栏）
         // 或置顶卡（独立分栏）单独负责，主栏再画一份会产生两处同名
         // 行 Id（`("row", item.id)`）→ egui 的 ID 冲突检查在界面上
         // 画出「First use of widget ID … / Second use of …」警告。
@@ -1754,7 +1754,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 对剪贴板这类「几十到几百条」的场景可接受。
     let pal = f.pal;
     let scale = f.scale;
-    // ⚠️ 必须用 `preview_width`——与 `draw_item_row` 共用同一个算式。
+    // IMPORTANT: 必须用 `preview_width`——与 `draw_item_row` 共用同一个算式。
     // 宽度取内容区（左右已扣边距），保证测量与渲染一致。
     let text_w = preview_width(content.width(), pal);
     let heights: Vec<f32> = items
@@ -1801,7 +1801,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     let out = egui::ScrollArea::vertical()
-        // ⚠️ 0.36 用 `id_salt`（不再是旧版的 `id_source`）。
+        // NOTE: 0.36 用 `id_salt`（不再是旧版的 `id_source`）。
         // 必须给：主栏与内嵌置顶区是两个独立列表，共用默认 Id 会
         // 共享滚动位置——滚主栏会把置顶区一起带走。
         .id_salt(("history_scroll", pinned_slot))
@@ -1811,7 +1811,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
         .vertical_scroll_offset(scroll)
         // 滚轮交给 egui 处理，步长用 multiplier 调。
         //
-        // ⚠️ 这里**不能**再自己读 `smooth_scroll_delta` 手动加一次：
+        // CAUTION: 这里**不能**再自己读 `smooth_scroll_delta` 手动加一次：
         // `ScrollArea` 内部已经消费了同一个事件（它同样只在指针悬停
         // 于本区域时生效），两边叠加会以两倍速度滚。早前就是双份的。
         //
@@ -1827,7 +1827,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 
             // ---- 坐标系：**一律用全局坐标** --------------------------------
             //
-            // ⚠️ egui 的 `Rect` **永远是全局（窗口）坐标**，不存在
+            // NOTE: egui 的 `Rect` **永远是全局（窗口）坐标**，不存在
             // 「相对某个 Ui 的本地坐标」。`ScrollArea` 内部虽然把内容
             // Ui 建成 `content_max_rect = from_min_size(inner_rect.min
             // - state.offset, …)`，但那只是**可用区域**的偏移，用来让
@@ -1841,7 +1841,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 正确做法与改 ScrollArea 之前一致——用绝对坐标：
             // `body.min.y + offsets[i] - scroll`。ScrollArea 在这套
             // 手工虚拟化里的作用只剩**裁剪**与**滚动条**。
-            // ⚠️ 判据必须用**每行自己的实际高度**，不能用 `ROW_HEIGHT_MIN`。
+            // CAUTION: 判据必须用**每行自己的实际高度**，不能用 `ROW_HEIGHT_MIN`。
             //
             // 早前写成 `offsets[i] + ROW_HEIGHT_MIN <= scroll`：
             // 「第 i 行已经滚过去了」的真正条件是
@@ -1863,7 +1863,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // heights 非负），满足 `partition_point` 的分段前提。
             let first = first_visible_row(&offsets, &heights, scroll);
 
-            // ⚠️ 行矩形本身必须避开垂直滚动条（仅**可滚动**时）。
+            // IMPORTANT: 行矩形本身必须避开垂直滚动条（仅**可滚动**时）。
             //
             // egui 0.36 默认 `ScrollStyle` 是 **floating**：滚动条
             // **不占布局宽度**，而是浮在 `content` 右缘覆盖
@@ -1906,7 +1906,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 // 为拖动区：WM_NCHITTEST 返回 HTCAPTION，用户按住行间
                 // 缝隙即可拖动窗口，不必精确瞄准左右留白。
                 //
-                // ⚠️ 右缘让出垂直滚动条占位（`content.max.x - RESERVE`），
+                // NOTE: 右缘让出垂直滚动条占位（`content.max.x - RESERVE`），
                 // 否则「拖滚动条」会被系统判成 HTCAPTION 变成拖窗口——
                 // 与左右留白拖动区避开滚动条是同一个原因。
                 let gap_top = if i == 0 { content.min.y } else { r.min.y - ROW_GAP };
@@ -1922,7 +1922,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 最后可视行之后的空白（内容不满一屏时的列表底部）也作为拖动
             // 区——它不覆盖任何卡片，按住中部空白即可拖动窗口。
             //
-            // ⚠️ 只在**内容不满一屏**（无滚动条）时补这条：滚动状态下底部
+            // NOTE: 只在**内容不满一屏**（无滚动条）时补这条：滚动状态下底部
             // 会被下一行占据，误报会把下一行的可点击区域吃成 HTCAPTION。
             if content_h < content.height() {
                 f.state.drag_regions.push(Rect::from_min_max(
@@ -1934,7 +1934,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 
     // ---- 回读 egui 的真实滚动位置 --------------------------------
     //
-    // ⚠️ 必须回读，否则**拖动滚动条无效**：拖动改变的是 `ScrollArea`
+    // CAUTION: 必须回读，否则**拖动滚动条无效**：拖动改变的是 `ScrollArea`
     // 自己的状态，而我们每帧开头又用旧值把它覆盖回去了。
     //
     // 回读后两者就一致了：滚轮、拖条、触屏都由 egui 处理，我们只
@@ -1966,7 +1966,7 @@ fn preview_width(body_w: f32, pal: &Palette) -> f32 {
 /// 预览一行 ≈ 19pt、上下两行 meta 各 ≈ 11pt、内边距 2×5 + 行间 4，
 /// 合计 ≈ 55pt，取下限 58 兜底按钮区域。
 ///
-/// ⚠️ 这是**下限**不是固定值：早前用固定 40pt 时预览只够放一行半，
+/// NOTE: 这是**下限**不是固定值：早前用固定 40pt 时预览只够放一行半，
 /// 长内容被省略号截断（用户反馈「需要完整显示内容」）。
 /// 实际行高由 [`row_height_for`] 按每条内容的折行数动态算出。
 const ROW_HEIGHT_MIN: f32 = 58.0;
@@ -2001,7 +2001,7 @@ const SEARCH_EXPAND_W: f32 = 140.0;
 /// （与左右留白拖动区避开滚动条是同一个原因）。
 /// 垂直滚动条占用的宽度。
 ///
-/// ⚠️ 必须对齐 egui 的 `ScrollStyle::floating().bar_width`（**10.0**，
+/// IMPORTANT: 必须对齐 egui 的 `ScrollStyle::floating().bar_width`（**10.0**，
 /// 见 egui 0.36.2 `style.rs:646`）。
 ///
 /// 早前这里是 8.0，比滚动条实际宽度**小 2pt** —— 于是按它算出的
@@ -2026,7 +2026,7 @@ const LINE_H: f32 = 1.35;
 fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, text_w: f32) -> f32 {
     let preview_font = sized(pal.font_md, scale);
     let meta_font = sized(pal.font_xs, scale);
-    // ⚠️ 行高也必须用**逻辑点**、不乘 ppp：字号已经改成逻辑点，
+    // IMPORTANT: 行高也必须用**逻辑点**、不乘 ppp：字号已经改成逻辑点，
     // 这里再乘一次会让行高与实际字形高度对不上（留白/裁剪都错）。
     let line_h = pal.font_md * LINE_H;
     let meta_h = meta_font.size.max(10.0);
@@ -2045,7 +2045,7 @@ fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, tex
     job.wrap.max_width = text_w;
     // 不限行数，先量出「到底需要几行」。
     //
-    // ⚠️ 必须用 `usize::MAX` 而不是 `0`：`TextWrapping::max_rows` 的
+    // IMPORTANT: 必须用 `usize::MAX` 而不是 `0`：`TextWrapping::max_rows` 的
     // 默认值是 `usize::MAX`（不限），而它的文档明确写着
     // 「If set to `0`, no text will be outputted」——
     // **0 表示一行都不输出**，不是「不限」。
@@ -2098,7 +2098,7 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     // 来源与时间。
     let meta_y = text_area.min.y + font.size * 2.4;
     if meta_y < text_area.max.y {
-        // ⚠️ `max.y` 只能是 `meta_y + 高`，**不能**再叠加 `text_area.min.y`。
+        // CAUTION: `max.y` 只能是 `meta_y + 高`，**不能**再叠加 `text_area.min.y`。
         // 叠加后高度会变成 `min.y + 高`（几百 pt），而文字画在
         // `meta_area.left_center()` —— 「来源 · 时间」会跑到卡片中部甚至
         // 卡片之外；而 `painter_at(meta_area)` 的裁剪就是它自己，
@@ -2152,7 +2152,7 @@ fn draw_rail_body(f: &mut Frame<'_>, body: Rect) {
 fn draw_empty(f: &mut Frame<'_>, body: Rect, msg: &str) {
     let pal = f.pal;
     let font = sized(pal.font_sm, f.scale);
-    // ⚠️ painter_at(body)：空状态文案是居中的，而窄卡片（折叠把手
+    // NOTE: painter_at(body)：空状态文案是居中的，而窄卡片（折叠把手
     // 旁的详情栏）装不下整句，根 painter 会让它溢出到相邻卡片上。
     f.ui.painter_at(body).text(
         body.center(),
@@ -2168,7 +2168,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let scale = f.scale;
     let selected = f.svc.state.selected == Some(item.id);
 
-    // ⚠️ 交互必须挂在**滚动区的内容 `ui`** 上，不能挂根 `f.ui`。
+    // CAUTION: 交互必须挂在**滚动区的内容 `ui`** 上，不能挂根 `f.ui`。
     //
     // `f.ui` 是整个主区的 Ui，它的裁剪矩形是**整个窗口**——于是
     // 被滚出可视区的那半行仍然可点：点在卡片标题、甚至顶栏上，
@@ -2184,10 +2184,10 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 常态 = `surface_raised`（提亮后的卡片）底 + 1px 描边，浮在暗色
     // 列表区（`list_bg`）之上；悬停在半透明提亮上叠一层；选中换主题
     // 高亮 + 左侧强调条。
-    // ⚠️ 圆角用 `pal.radius_sm` 而不是 `CornerRadius::ZERO`——后者是
+    // NOTE: 圆角用 `pal.radius_sm` 而不是 `CornerRadius::ZERO`——后者是
     // 早前「通栏行」的直角样式，与卡片语义不符。
     //
-    // ⚠️ 描边在所有状态都画：悬停/选中若只换底色，边框会「消失一瞬」
+    // NOTE: 描边在所有状态都画：悬停/选中若只换底色，边框会「消失一瞬」
     // （从有到无再到有），视觉上跳变。
     let radius = pal.radius_sm;
     let stroke = Stroke::new(CARD_STROKE * scale, pal.border_subtle);
@@ -2216,7 +2216,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 右下：类型标签 · 大小（小字弱化，右对齐，大小自适应单位）
     // 右上：置顶 / 复制 / 删除 三个小图标按钮
     //
-    // ⚠️ 目标是「**完整显示内容**」：预览**不再截断**，而是按宽度
+    // NOTE: 目标是「**完整显示内容**」：预览**不再截断**，而是按宽度
     // 折行。折行数由 `wrap` 直接给出，不用手工估算——
     // 早前版本按 `preview.chars().take(30)` 硬砍，中文一个字算一个
     // char、英文一个词算一个 char，两者的实际显示宽度差了好几倍，
@@ -2228,7 +2228,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 「量出来的行高」与「画出来的宽度」严格一致。
     let text_x1 = text_x0 + preview_width(r.width(), &pal);
     if text_x1 - text_x0 < 20.0 {
-        // ⚠️ 太窄画不下文字，但**行仍必须可点**。
+        // IMPORTANT: 太窄画不下文字，但**行仍必须可点**。
         //
         // 早前这里是裸`return`，直接跳到函数末尾的
         // `resp.clicked()` / `resp.double_clicked()` 之前——
@@ -2285,7 +2285,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         // 用 `Painter::layout_job` 按宽度折行，返回**完整** Galley——
         // 这才是「完整显示」：不丢任何字符，只是折行。
         //
-        // ⚠️ 不能用 `Ui::layout`/`Context::layout`：那是给「让出矩形」
+        // CAUTION: 不能用 `Ui::layout`/`Context::layout`：那是给「让出矩形」
         // 的控件做换行用的，会受子 `Ui` 的布局约束影响，而我们只要
         // 一个纯文本排版结果。`Painter::layout_job` 才是纯排版入口。
         let mut job = egui::text::LayoutJob::default();
@@ -2312,7 +2312,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         // 行数上限：`row_height_for` 已按同一份预览文本算出行数并据此
         // 定好行高，这里给同样的上限只是兜底（防止两次排版结果不一致）。
         //
-        // ⚠️ **不能设 0**：egui 文档写明「If set to 0, no text will be
+        // CAUTION: **不能设 0**：egui 文档写明「If set to 0, no text will be
         // outputted」——0 表示一行都不输出。默认值 `usize::MAX` 才是「不限」。
         job.wrap.max_rows = ((preview_band.height() / (pal.font_md * LINE_H))
             .floor()
@@ -2328,7 +2328,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
     let meta_shown = crate::text::elide_text(f.ui, &meta, &meta_font, top_band.width());
     if !meta_shown.is_empty() {
-        // ⚠️ painter_at(top_band)：来源名可能很长（长 exe 路径），
+        // NOTE: painter_at(top_band)：来源名可能很长（长 exe 路径），
         // 根 painter 会让它横跨到相邻卡片上。
         ui.painter_at(top_band).text(
             top_band.left_center(),
@@ -2361,7 +2361,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 
     // 右侧三个操作：置顶 / 复制 / 删除。
     //
-    // ⚠️ **必须用图标字体**（[`crate::icons::Icon`]，PUA 码位
+    // IMPORTANT: **必须用图标字体**（[`crate::icons::Icon`]，PUA 码位
     // `U+E000..=U+E011`），不能用 Unicode 字形。
     //
     // 实测：早前这里写的是 `"⧉"` / `"✕"` / `"★"`，其中 `⧉`(U+29C9)
@@ -2381,7 +2381,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
                 crate::icons::Icon::Unpinned
             },
             Op::TogglePin(item.id),
-            // ⚠️ 必须始终可点：置顶条目正是靠这个按钮取消置顶。
+            // IMPORTANT: 必须始终可点：置顶条目正是靠这个按钮取消置顶。
             // 早前写成 `!item.pinned` —— 条目置顶后按钮变灰、点击不触发，
             // 于是「置顶后无法取消置顶」。图标已区分 Pinned/Unpinned 状态，
             // 语义就是置顶 ↔ 取消置顶的开关，任何状态下都可点。
@@ -2395,7 +2395,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         // 三个操作按钮排**卡片右上角**（小图标）：从右缘向左排，
         // 垂直对齐顶部来源行（中心 y = pad_v + btn/2）。
         //
-        // ⚠️ 基准右缘必须让出 `SCROLLBAR_RESERVE`。
+        // IMPORTANT: 基准右缘必须让出 `SCROLLBAR_RESERVE`。
         //
         // egui 0.36 默认 `ScrollStyle` 是 **floating** —— 滚动条
         // **不占布局宽度**，而是浮在 `content` 右缘覆盖
@@ -2530,7 +2530,7 @@ mod tests {
     // 交互测试夹具
     // ------------------------------------------------------------------
     //
-    // ⚠️ 为什么单独一个 `Harness` 而不在每个测试里现搭：
+    // NOTE: 为什么单独一个 `Harness` 而不在每个测试里现搭：
     //
     // 测「点击齿轮能打开设置」需要**跑完整帧**并把结果反馈到下一帧，
     // 中间要正确的 `screen_rect`、字体注册、`Service` 与临时数据目录。
@@ -2617,7 +2617,7 @@ mod tests {
         ///
         /// # 为什么必须显式提供
         ///
-        /// ⚠️ 默认的 `Harness` 是**空列表**，于是 `draw_history_body`
+        /// NOTE: 默认的 `Harness` 是**空列表**，于是 `draw_history_body`
         /// 每次都走 `draw_empty` 分支直接 return —— **列表行的绘制
         /// 路径从未被任何测试覆盖过**。
         ///
@@ -2678,14 +2678,14 @@ fn with_pinned(mut self, n: usize) -> Self {
         /// 跑一帧主界面，返回收集到的 `Op`。
         fn frame_with(&mut self, events: Vec<egui::Event>) -> Vec<Op> {
             let input = self.input(events);
-            // ⚠️ 必须先跑 solver，否则卡片矩形全是 `Rect::ZERO`。
+            // CAUTION: 必须先跑 solver，否则卡片矩形全是 `Rect::ZERO`。
             //
             // `draw()` 只负责**画** `card.rect`，求解是 App 层的事。
             // 夹具只调 `draw` 时拿到的就是零矩形——症状是
             // 「测试里卡片矩形全空」，看起来像布局坏了。
             //
             // 这里复刻 `App::draw_frame` 的顺序：先 solve+apply，再画。
-            // ⚠️ 必须放在解构 `self` 之前：解构出的 `&self.ws`
+            // IMPORTANT: 必须放在解构 `self` 之前：解构出的 `&self.ws`
             // 会让它在后面无法可变借用。
             // 与 `App::draw_frame` 用同一个 scale（生产路径传真实 ppp；
             // 测试夹具的 ppp 恰好是 1.0，`solve` 与 `solve_scaled` 等价）。
@@ -2725,7 +2725,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         /// 设置界面已移到独立窗口（见 `crate::settingswin`），
         /// 主界面的 `draw` 不再画它——所以要用这条专用入口来测。
         ///
-        /// ⚠️ 不跑 solver：设置面板不读 `card.rect`，只需要
+        /// NOTE: 不跑 solver：设置面板不读 `card.rect`，只需要
         /// `svc`/`state`/`pal` 与客户区。
         fn settings_frame(&mut self) -> Vec<Op> {
             self.settings_frame_with(Vec::new())
@@ -2801,7 +2801,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 设置窗口的热区。
     ///
-    /// ⚠️ 不能直接从共享表读：主窗口与设置窗口是**两套坐标**，
+    /// CAUTION: 不能直接从共享表读：主窗口与设置窗口是**两套坐标**，
     /// 共表会让自动化拿着设置窗口的坐标去点主窗口。
     fn settings_hit(h: &Harness, name: &str) -> Rect {
         hit_in(h, HitNs::Settings, name)
@@ -2830,7 +2830,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 点设置齿轮 ⇒ 产生 `ToggleSettings`。
     ///
-    // ⚠️ 断言的是**操作**而不是 `show_settings` 变成 true。
+    // NOTE: 断言的是**操作**而不是 `show_settings` 变成 true。
     //
     // `draw()` 只**收集** `Op`，落地在 `App::apply_ops`。所以在
     // paint 层测试里点一下齿轮，`show_settings` 不会变——那是正确的
@@ -2882,7 +2882,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
 /// 点垃圾桶 ⇒ 产生清空操作。
     ///
-    /// ⚠️ 清空是**破坏性**操作，所以必须真的能点出来——否则用户
+    /// CAUTION: 清空是**破坏性**操作，所以必须真的能点出来——否则用户
     /// 想清空历史时只能去改配置文件。
     #[test]
     fn clicking_trash_emits_clear_all() {
@@ -2912,7 +2912,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 坐标从热区表读，不猜。
         let p = hit(&h, "search").center();
 
-        // ⚠️ 点击与文字必须**分两帧**。
+        // IMPORTANT: 点击与文字必须**分两帧**。
         //
         // egui 的 `TextEdit` 在收到点击的**那一帧**还没拿到焦点
         // （焦点要等这次 `interact` 的结果被消费后才成立），
@@ -2937,10 +2937,10 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 确认真的拿到焦点了——不确认的话下面的打字断言失败时
         // 不知道是「焦点没拿到」还是「输入没写进去」。
         //
-        // ⚠️ 本版 egui 的 `Context` **没有** `wants_keyboard_input()`，
+        // NOTE: 本版 egui 的 `Context` **没有** `wants_keyboard_input()`，
         // 焦点态要从 `memory` 读。
         //
-        // ⚠️ 判据必须指出**是哪个控件**拿到了焦点。
+        // IMPORTANT: 判据必须指出**是哪个控件**拿到了焦点。
         //
         // 原先是 `has_focus(Id::new("search_edit")) || focused().is_some()`
         // —— 后半句只要「有任何控件获得焦点」就成立，于是这条断言
@@ -2948,7 +2948,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 修掉它之后这条测试立刻变红，正好证明了它此前是恒真的。
         //
         //
-        // ⚠️ 也不能按 id 的 debug 串匹配：egui 0.36 的 `Id` 是**哈希值**，
+        // CAUTION: 也不能按 id 的 debug 串匹配：egui 0.36 的 `Id` 是**哈希值**，
         // `format!("{id:?}")` 只得到 `Id::new(3070286450358649230)`。
         //
         // 所以绘制层把**自己用的那个 id** 记进 `UiState::search_edit_id`，
@@ -3007,7 +3007,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 卡片行间缝隙（`ROW_GAP` 横带）与首行顶部半条缝必须是拖动区：
     /// 按住行间空白即可拖动窗口，不必精确瞄准左右留白。
     ///
-    /// ⚠️ 缝隙横条右缘让出滚动条占位（`SCROLLBAR_RESERVE`），否则
+    /// CAUTION: 缝隙横条右缘让出滚动条占位（`SCROLLBAR_RESERVE`），否则
     /// 拖滚动条会被系统判成 HTCAPTION 变成拖窗口。
     #[test]
     fn row_gap_is_drag_region() {
@@ -3083,7 +3083,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
         // 点头部右侧（原先两枚按钮所在的位置）不产生任何**卡片结构**操作。
         //
-        // ⚠️ 不能写成「不产生任何 Op」——那个位置仍可能命中顶栏的
+        // CAUTION: 不能写成「不产生任何 Op」——那个位置仍可能命中顶栏的
         // 设置齿轮（`ToggleSettings`），那是合法的。真正要守的是
         // 「折叠/分离已不存在」，即没有 `Op` 变体与之对应。
         let ops = h.click_at(pos2(680.0, 30.0));
@@ -3326,7 +3326,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     // ------------------------------------------------------------------
     // 列表行：坐标与虚拟化
     //
-    // ⚠️ 这几条存在的唯一理由：**默认的 Harness 列表是空的**。
+    // NOTE: 这几条存在的唯一理由：**默认的 Harness 列表是空的**。
     // `draw_history_body` 一进来就走 `draw_empty` 分支 return，
     // 于是行的绘制路径从未被覆盖——「列表坐标算错」才能一路溜到
     // 实机。下面每条都必须用 `with_items(n)`。
@@ -3417,7 +3417,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         // scroll=100：第 0 行（3..61）已滚过，第 1 行仍在。
         assert_eq!(first_visible_row(&offsets, &heights, 100.0), 1);
 
-        // ⚠️ 关键档位：scroll=200。
+        // IMPORTANT: 关键档位：scroll=200。
         // 第 1 行占 67..3883，铺满整个视口，必须仍是 1。
         // 用 ROW_HEIGHT_MIN 的旧写法在这里会得到 2（跳过长行）⇒ 空白。
         assert_eq!(
@@ -3563,7 +3563,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         // (3) 上沿内侧：可视区**顶部**必须有行（不留空白）。
         //
-        // ⚠️ 这里**不**测左/右边界：egui 的 `interact` 会把命中矩形
+        // NOTE: 这里**不**测左/右边界：egui 的 `interact` 会把命中矩形
         // 按 `item_spacing` 外扩（实测左边界比 `body.min.x` 还靠左
         // 4pt），而「行 x 原点写错」只差 8pt —— 点击根本区分不出来，
         // 硬写一条只会导致假绿。左右由 (1)(2) 的纵向不变量间接覆盖。
@@ -3690,7 +3690,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 必须走 `settings_frame`，否则热区表是空的。
         h.settings_frame();
         //
-        // ⚠️ 早前所有开关共用一个键（`"settings_switch"`），`hit` 是
+        // NOTE: 早前所有开关共用一个键（`"settings_switch"`），`hit` 是
         // `HashMap` 会互相覆盖，map 里只剩最后一个，于是这条断言
         // 永远只能看到一项。现在键是配置字段名，可以逐项核对。
         let keys: Vec<&str> = h
@@ -3724,7 +3724,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             "多枚开关应各自登记热区（否则 HashMap 互相覆盖），实际只有 {keys:?}"
         );
 
-        // ⚠️ 这里**不能**断言「所有开关都在客户区内」。
+        // CAUTION: 这里**不能**断言「所有开关都在客户区内」。
         //
         // `ScrollArea` 里的控件按内容高度排布，超出可视区的那些矩形
         // 本来就在客户区之外——它负责裁剪（用户滚一下才看得到）。
@@ -3823,11 +3823,11 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         // 逐个控件验证：**整个矩形**（含四角）都不得落在任何一段拖动区内。
         //
-        // ⚠️ 名单必须**逐个列出**，不要用「遍历 hit表」的写法：
+        // CAUTION: 名单必须**逐个列出**，不要用「遍历 hit表」的写法：
         // 遍历只能验证「已存在的控件」，新加的按钮若忘了登记热区就会
         // 静默漏测——而那正是「按钮存在却点不动」的成因。
         //
-        // ⚠️ 必须查**四角**而不只是中心。早前只查中心，漏掉了
+        // IMPORTANT: 必须查**四角**而不只是中心。早前只查中心，漏掉了
         // 「拖动区伸进搜索框左侧约 22pt」这个 bug——中心在框内没问题，
         // 但点左边缘会被系统判成 HTCAPTION，搜索框点不动。
         //
@@ -4138,7 +4138,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn row_height_grows_with_content_length() {
         let ctx = settled_ctx();
         let pal = crate::theme::Palette::dark();
-        // ⚠️ `run_ui` 返回 `FullOutput`（不是闭包的返回值），
+        // NOTE: `run_ui` 返回 `FullOutput`（不是闭包的返回值），
         // 所以要通过外部变量把结果取出来。
         let mut h = 0.0_f32;
         let mk = |text: &str, h: &mut f32| {
@@ -4151,7 +4151,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
                 *h = row_height_for(ui, &item, &pal, 1.0, 200.0);
             });
-            // ⚠️ 必须 `clear()`：排版会往纹理图集里加新字形，
+            // IMPORTANT: 必须 `clear()`：排版会往纹理图集里加新字形，
             // `FullOutput` 被 drop 时若还带着未应用的 deltas，egui 会 panic
             // （「Dropped TexturesDelta with N unapplied deltas」）。
             // 生产代码走 `FrameRenderer` 消费 delta，测试里没人消费。
