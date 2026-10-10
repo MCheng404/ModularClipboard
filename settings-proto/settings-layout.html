@@ -19,6 +19,7 @@
     --accent: #0067c0;
     --accent-bg: #e8f1fb;
     --switch-off: #c8c8c8;
+    --overlay-bg: rgba(255,255,255,.48);
     --radius: 8px;
     --card-radius: 12px;
     --win-radius: 16px;
@@ -37,6 +38,7 @@
       --accent: #60a8ff;
       --accent-bg: #26344a;
       --switch-off: #5a5a5a;
+      --overlay-bg: rgba(0,0,0,.52);
     }
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -225,9 +227,10 @@
   /* ---- 覆盖层（MCP 调用设置）---- */
   .overlay {
     position: absolute; inset: 0; z-index: 50;
-    background: rgba(0,0,0,.38);
+    /* 白/黑覆盖层随主题切换；背景整体模糊失焦 */
+    background: var(--overlay-bg);
+    backdrop-filter: blur(7px) saturate(1.2);
     display: flex; align-items: center; justify-content: center;
-    backdrop-filter: blur(2px);
   }
   .overlay.hidden { display: none; }
   .overlay-panel {
@@ -315,21 +318,22 @@ const S = {
     max_items: 10000, max_bytes: 512,
     hotkey_toggle: ["Ctrl", "Shift", "V"], hotkey_paste: ["Win", "Shift", "V"],
     mcp_enabled: true,
-    mcp_github: true, mcp_filesystem: true, mcp_sqlite: true, mcp_browser: true,
-    mcp_websearch: true, mcp_calculator: true, mcp_calendar: true, mcp_email: true,
+    mcp_resize_window: true, mcp_read_layout: true, mcp_click_element: true,
+    mcp_type_text: true, mcp_scroll_view: true, mcp_screen_capture: true,
+    mcp_window_focus: true, mcp_drag_drop: true,
   },
 };
 
-// 可调用的 MCP 服务清单（默认全部开启）
+// 可调用的 MCP 服务清单（界面自动化能力，默认全部开启）
 const MCPS = [
-  { id: "github", name: "GitHub", desc: "代码仓库、Issue 与 Pull Request", ready: true },
-  { id: "filesystem", name: "文件系统", desc: "读写本地文件与目录", ready: true },
-  { id: "sqlite", name: "SQLite", desc: "本地数据库查询与管理", ready: true },
-  { id: "browser", name: "浏览器", desc: "网页交互与内容提取", ready: true },
-  { id: "websearch", name: "网络搜索", desc: "检索网络信息与资料", ready: true },
-  { id: "calculator", name: "计算器", desc: "数学计算与单位换算", ready: true },
-  { id: "calendar", name: "日历", desc: "日程与提醒管理", ready: false },
-  { id: "email", name: "邮件", desc: "邮件收发与整理", ready: false },
+  { id: "resize_window", name: "调节窗口大小", desc: "调整任意窗口的尺寸与位置", ready: true },
+  { id: "read_layout", name: "获取元素布局", desc: "读取界面元素的几何与层级信息", ready: true },
+  { id: "click_element", name: "点击界面元素", desc: "在任意位置点击或激活元素", ready: true },
+  { id: "type_text", name: "输入文本", desc: "向焦点控件键入文字与快捷键", ready: true },
+  { id: "scroll_view", name: "滚动视图", desc: "滚动页面与列表到目标位置", ready: true },
+  { id: "screen_capture", name: "屏幕截图", desc: "截取屏幕或窗口画面", ready: true },
+  { id: "window_focus", name: "切换焦点窗口", desc: "激活指定窗口或应用", ready: false },
+  { id: "drag_drop", name: "拖拽操作", desc: "拖拽元素或执行拖放", ready: false },
 ];
 
 // 最近修改记录：key → 修改时间戳
@@ -346,8 +350,9 @@ const DEFAULTS = {
   max_items: 10000, max_bytes: 512,
   hotkey_toggle: ["Ctrl", "Shift", "V"], hotkey_paste: ["Win", "Shift", "V"],
   mcp_enabled: true,
-  mcp_github: true, mcp_filesystem: true, mcp_sqlite: true, mcp_browser: true,
-  mcp_websearch: true, mcp_calculator: true, mcp_calendar: true, mcp_email: true,
+  mcp_resize_window: true, mcp_read_layout: true, mcp_click_element: true,
+  mcp_type_text: true, mcp_scroll_view: true, mcp_screen_capture: true,
+  mcp_window_focus: true, mcp_drag_drop: true,
 };
 
 // ===== 分类与设置项定义 =====
@@ -487,25 +492,7 @@ function groupHtml(g) {
   if (changed) html += `<button class="group-reset" data-group-reset title="重置本卡片">${ICONS.reset}</button>`;
   html += `</div>`;
   g.items.forEach(it => { html += rowHtml(it); });
-  // MCP 卡片：总开关开启时在卡片内展开所有可调用开关
-  if (g.mcp) html += mcpListHtml();
-  html += `</div>`;
-  return html;
-}
-
-// MCP 子列表：总开关开启时显示；关闭时整块隐藏（MCP 无法调用）
-function mcpListHtml() {
-  if (!S.vals.mcp_enabled) return "";
-  const on = MCPS.filter(m => S.vals["mcp_" + m.id]).length;
-  let html = `<div class="mcp-list"><div class="mcp-list-title">可调用 MCP <span class="count">${on}/${MCPS.length}</span></div>`;
-  MCPS.forEach(m => {
-    const enabled = S.vals["mcp_" + m.id];
-    html += `<div class="mcp-row ${S.vals.mcp_enabled ? "" : "disabled"}">
-      <div class="label">${m.name}<small>${m.desc}</small></div>
-      <span class="mcp-badge ${m.ready ? "on" : ""}">${m.ready ? "已连接" : "未连接"}</span>
-      <label class="switch"><input type="checkbox" data-key="mcp_${m.id}" ${enabled ? "checked" : ""}><span class="track"></span></label>
-    </div>`;
-  });
+  // MCP 卡片：可调用开关只在叠加层显示，内容区不展开列表
   html += `</div>`;
   return html;
 }
@@ -568,10 +555,16 @@ function renderSearch(box, q) {
 }
 
 function rowHtml(it) {
-  // 带左侧信息按钮的开关行（MCP 总开关）：按钮在标签左侧，点击打开覆盖层
-  const info = it.info ? `<button class="info-btn" data-info="${it.key}" title="MCP 调用设置" aria-label="MCP 调用设置">
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M12 12v5"/></svg></button>` : "";
-  return `<div class="row"><div class="label">${info}${it.label}<small>${it.desc || ""}</small></div>${rowBody(it)}</div>`;
+  // 带「MCP 详细」入口的开关行：详细按钮紧贴**总开关左边**（即
+  // 「MCP 详细」在总开关按钮的左边），点击打开叠加层查看/设置所有
+  // MCP 可调用开关。
+  if (it.info) {
+    return `<div class="row"><div class="label">${it.label}<small>${it.desc || ""}</small></div>
+      <button class="info-btn" data-info="${it.key}" title="MCP 调用设置" aria-label="MCP 调用设置">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M12 12v5"/></svg>
+      </button>${rowBody(it)}</div>`;
+  }
+  return `<div class="row"><div class="label">${it.label}<small>${it.desc || ""}</small></div>${rowBody(it)}</div>`;
 }
 
 function rowBody(it) {
@@ -669,8 +662,8 @@ function bindRows(box) {
     btn.addEventListener("click", () => {
       const group = btn.closest(".group");
       const keys = [...new Set([...group.querySelectorAll("[data-key]")].map(el => el.dataset.key))];
-      // MCP 卡片：子列表开关也一并重置
-      if (group.querySelector(".mcp-list")) {
+      // MCP 卡片：叠加层里的所有可调用开关也一并重置
+      if (group.querySelector(".info-btn")) {
         MCPS.forEach(m => keys.push("mcp_" + m.id));
       }
       const title = group.querySelector(".group-title")?.textContent || "";
@@ -784,6 +777,7 @@ function applyTheme(t) {
   r.setProperty("--accent", light ? "#0067c0" : "#60a8ff");
   r.setProperty("--accent-bg", light ? "#e8f1fb" : "#26344a");
   r.setProperty("--switch-off", light ? "#c8c8c8" : "#5a5a5a");
+  r.setProperty("--overlay-bg", light ? "rgba(255,255,255,.48)" : "rgba(0,0,0,.52)");
 }
 
 // 搜索框：点击（空）显示最近修改；输入后显示搜索结果；失焦（空）恢复分类
