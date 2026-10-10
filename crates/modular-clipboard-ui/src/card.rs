@@ -168,15 +168,6 @@ impl Card {
         }
     }
 
-    /// 本卡片在主窗口布局里占的宽度。
-    pub fn layout_width(&self) -> f32 {
-        if !self.is_visible() {
-            0.0
-        } else {
-            self.target_width
-        }
-    }
-
     /// 本帧是否要绘制。
     ///
     /// 分离成子窗口的卡片**不由主窗口绘制**，它在自己的窗口里画。
@@ -188,17 +179,6 @@ impl Card {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detached_card_takes_no_layout_width() {
-        // 已分离的卡片在子窗口里画，主窗口不能给它留位置，
-        // 否则工作区右边会多出一条空白缝。
-        let mut c = Card::new(CardId(1), CardKind::Detail);
-        assert!(c.layout_width() > 0.0, "停靠时应占宽度");
-        c.host = CardHost::Window;
-        assert_eq!(c.layout_width(), 0.0, "分离后不应占宽度");
-        assert!(!c.is_visible(), "分离后主窗口不画它");
-    }
 
     #[test]
     fn every_card_kind_has_a_distinct_min_width() {

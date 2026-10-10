@@ -77,26 +77,26 @@ impl Solution {
 /// 次要卡片折成把手）。已随折叠功能整体移除：主界面固定为
 /// 置顶 + 历史两栏，窄窗口下平分宽度即可，折叠只会让用户
 /// 「找不到历史在哪」。
-/// 按 `scale`（`pixels_per_point`）求解，落位对齐设备像素栅格。
+/// 每张停靠卡片**参与本次分配**的宽度需求，与 `ws.cards` 同序。
 ///
-/// # 为什么要scale
+/// # 这是唯一的宽度口径
 ///
-/// 落位若直接用浮点累加，ppp=1.5（本项目默认场景）时卡片边界落在
-/// 非整数设备像素上 ⇒ 1px 描边发虚、相邻卡的描边叠成 2px、末张卡
-/// 右缘可能超出 `body.max.x` 约 1e-5pt 或留一条亚像素缝。
-/// 详见落位循环处的说明。
-pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
-    let body = card_area(area);
-    if body.width() <= 0.0 || body.height() <= 0.0 {
-        return Solution {
-            rects: vec![Rect::ZERO; ws.cards.len()],
-        };
-    }
-
-    // ---- 分配宽度 --------------------------------------------------
-    //
-    // ⚠️ 判据必须与 [`crate::workspace::Workspace::docked`] 一致：
-    // **内嵌的置顶卡片宽度必须是 0**。
+/// 早前有三套并存的口径，彼此规则不同：
+///
+/// | 来源 | 排除已分离 | 排除内嵌置顶 | 钳到 ≥1pt |
+/// |---|---|---|---|
+/// | `solve` 里的内联 `layout` | ✅ | ✅ | ✅ |
+/// | `Card::layout_width` | ✅ | ❌ | ❌ |
+/// | `Workspace::required_width` | 间接 | ❌ | ❌ |
+///
+/// 于是 `required_width()` 会算出一个 `solve` 永远不会兑现的数字：
+/// 置顶内嵌时它把置顶那一栏也算进去，`n` 与 solver 不同，连带
+/// `gaps` 也不一致。那种漂移极难查——两个函数各自都「看起来对」。
+///
+/// 现在 `solve` 与 `Workspace::required_width` 都走这里，口径由
+/// 构造保证一致。
+pub fn layout_demand(ws: &Workspace) -> Vec<f32> {
+    // ⚠️ 判据必须与 paint 一致：**内嵌的置顶卡片宽度必须是 0**。
     //
     // 早前这里只看 `c.host == Docked`，于是置顶（停靠态）仍分到一栏
     // 宽度，而 paint 又在历史栏顶部内嵌画了一份—— 实测界面左边
@@ -105,8 +105,7 @@ pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
     // 抽成 `pinned_is_embedded()` 是为了让它与 paint 用**同一个**
     // 判定函数，避免两处各自判断再次漂移。
     let pinned_embedded = ws.pinned_is_embedded();
-    let layout: Vec<f32> = ws
-        .cards
+    ws.cards
         .iter()
         .map(|c| {
             if c.host != crate::card::CardHost::Docked
@@ -125,7 +124,27 @@ pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
                 c.target_width.max(1.0)
             }
         })
-        .collect();
+        .collect()
+}
+
+/// 按 `scale`（`pixels_per_point`）求解，落位对齐设备像素栅格。
+///
+/// # 为什么要scale
+///
+/// 落位若直接用浮点累加，ppp=1.5（本项目默认场景）时卡片边界落在
+/// 非整数设备像素上 ⇒ 1px 描边发虚、相邻卡的描边叠成 2px、末张卡
+/// 右缘可能超出 `body.max.x` 约 1e-5pt 或留一条亚像素缝。
+/// 详见落位循环处的说明。
+pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
+    let body = card_area(area);
+    if body.width() <= 0.0 || body.height() <= 0.0 {
+        return Solution {
+            rects: vec![Rect::ZERO; ws.cards.len()],
+        };
+    }
+
+    // ---- 分配宽度 --------------------------------------------------
+    let layout = layout_demand(ws);
 
     let n = layout.iter().filter(|&&w| w > 0.0).count();
     if n == 0 {
@@ -414,6 +433,47 @@ mod tests {
     /// （gap=0、只有历史一张参与分配），任何宽度下都拿满可用宽度，
     /// 触发不到「0 宽」「gap 吃光 avail」这些风险区间。
     /// 实测界面左边空出约 1/3、历史栏只占右边 2/3。
+    /// 宽度需求只有一个口径：`layout_demand`。
+    ///
+    /// # 这条替代了原先在 `card.rs` 的 `detached_card_takes_no_layout_width`
+    ///
+    /// 那时有两套判据并存（`Card::layout_width` 与 `solve` 的内联
+    /// `layout`），这条随 `layout_width` 一起迁移到**唯一口径**上，
+    /// 顺便把「内嵌置顶」这条规则也纳入同一断言 —— 那正是早前
+    /// `Card::layout_width` 漏掉的规则。
+    #[test]
+    fn layout_demand_excludes_detached_and_embedded_pinned() {
+        let mut ws = Workspace::empty();
+        ws.add(CardKind::History);
+        let detail = ws.add(CardKind::Detail);
+        ws.add(CardKind::Pinned);
+
+        let idx = |ws: &Workspace, k: CardKind| {
+            ws.cards
+                .iter()
+                .position(|c| c.kind == k)
+                .expect("卡片存在")
+        };
+
+        // 停靠时都要占位（除了内嵌的置顶）。
+        let demand = layout_demand(&ws);
+        assert!(demand[idx(&ws, CardKind::History)] > 0.0, "历史应占位");
+        assert!(demand[idx(&ws, CardKind::Detail)] > 0.0, "详情应占位");
+        assert_eq!(
+            demand[idx(&ws, CardKind::Pinned)],
+            0.0,
+            "默认模式下置顶是内嵌的，不该占一栏 —— 早前 Card::layout_width 漏了这条，\
+             于是 required_width 多算整整一栏（120pt）"
+        );
+
+        // 已分离的卡片在子窗口里画，主窗口不能给它留位置，
+        // 否则工作区右边会多出一条空白缝。
+        ws.detach(detail);
+        let demand = layout_demand(&ws);
+        assert_eq!(demand[idx(&ws, CardKind::Detail)], 0.0, "分离后不应占宽度");
+        assert!(demand[idx(&ws, CardKind::History)] > 0.0, "未分离的仍占位");
+    }
+
     #[test]
     fn embedded_pinned_leaves_history_full_width() {
         let ws = Workspace::default();

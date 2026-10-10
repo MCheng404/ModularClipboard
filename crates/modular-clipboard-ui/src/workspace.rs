@@ -218,13 +218,20 @@ impl Workspace {
     }
 
     /// 停靠卡片的总需求宽度（含间隔）。
+    ///
+    /// ⚠️ 必须走 [`crate::solver::layout_demand`] —— 那里是**唯一**的
+    /// 宽度口径（见它的文档：早前三套口径各自漂移）。
+    ///
+    /// 特别地：`n` 由「需求宽度 > 0」推断，和 solver 用的是同一个判据。
+    /// 早前这里用 `docked().count()`，置顶内嵌时会把那一栏也数进去，
+    /// 于是算出的需求比 solver 实际兑现的多一栏。
     pub fn required_width(&self) -> f32 {
-        let n = self.docked().count();
+        let demand = crate::solver::layout_demand(self);
+        let n = demand.iter().filter(|&&w| w > 0.0).count();
         if n == 0 {
             return 0.0;
         }
-        let sum: f32 = self.docked().map(|c| c.layout_width()).sum();
-        sum + self.gap * (n as f32 - 1.0)
+        demand.iter().sum::<f32>() + self.gap * (n as f32 - 1.0)
     }
 
     /// 把卡片移到Z 序的某一层（`to_front` 传卡片当前索引）。
@@ -441,20 +448,56 @@ mod tests {
         for k in CardKind::ALL {
             ws.add(k);
         }
-        let n = ws.docked().count() as f32;
-        // ⚠️ `sum` 必须与 `n` **取自同一来源**：都用 `docked()`。
-        //
-        // 早前这里写 `CardKind::ALL.iter().map(min_width)`—— 那是
-        // 「全部四种卡片」的宽度和，而 `n` 是 `docked()` 的数量。
-        // 置顶内嵌后 `docked()` 少一张，两者口径不一致，
-        // 期望值凭空多出一张卡的宽度（实测 560 vs 440）。
-        let sum: f32 = ws.docked().map(|c| c.kind.min_width()).sum();
+        // ⚠️ 参与者的判定必须**与 solver 同源**（`layout_demand`）：
+        // 置顶默认内嵌，不占一栏宽度。早前这里按 `docked()` 数人头，
+        // 于是 `n` 比 solver 实际分配的多一个，`gaps` 也跟着多一份。
+        let demand = crate::solver::layout_demand(&ws);
+        let n = demand.iter().filter(|&&w| w > 0.0).count() as f32;
+        let sum: f32 = demand.iter().sum();
         let expect = sum + ws.gap * (n - 1.0);
         assert!(
             (ws.required_width() - expect).abs() < 0.01,
             "总需求应含 {} 个间隔，期望 {expect}，实际 {}",
             n as i32 - 1,
             ws.required_width()
+        );
+    }
+
+    /// 退化宽度（0 / 负数）应按 **每张至少 1pt** 计入总需求。
+    ///
+    /// # 这条为什么有判别力
+    ///
+    /// `layout_demand` 把每张卡的宽度钳到 ≥1pt；早前 `required_width`
+    /// 直接拿 `target_width` 求和，**没有钳**。两者只在「某张卡宽度
+    /// 退化」时 diverge —— 而 `target_width` 是 pub 字段，拖分隔条或
+    /// 读回脏配置都可能写进 0 甚至负数。
+    ///
+    /// # 另一条看起来更像重点的差异其实不存在
+    ///
+    /// 我最初以为 `required_width` 会把内嵌置顶那一栏也算进去
+    /// （多算 120pt），并据此写了一条测试 —— 结果注入旧实现它照样绿：
+    /// `Workspace::docked()` **早就**排除了内嵌置顶。
+    /// 教训：写「外部可观察」的判据之前必须先读实现，否则会为一个
+    /// 不成立的前提写测试，而那种测试永远只能恒绿。
+    #[test]
+    fn required_width_clamps_degenerate_card_widths() {
+        let mut ws = Workspace::empty();
+        let a = ws.add(CardKind::History);
+        let b = ws.add(CardKind::Detail);
+        let healthy = ws.required_width();
+
+        ws.get_mut(a).expect("a 仍在").target_width = 0.0;
+        ws.get_mut(b).expect("b 仍在").target_width = -50.0;
+        let degenerate = ws.required_width();
+
+        let floor = 1.0 + 1.0 + ws.gap;
+        assert!(
+            degenerate >= floor - 0.01,
+            "退化宽度至少要按每张 1pt 计：总需求 {degenerate} < 下界 {floor}。             若偏低 ⇒ `required_width` 没走 `layout_demand` 的钳制口径"
+        );
+        assert!(
+            degenerate < healthy,
+            "退化后总需求应小于正常值：{degenerate} vs {healthy}"
         );
     }
 
@@ -468,11 +511,8 @@ mod tests {
         assert!(!ws.detach(b), "重复分离应返回 false（幂等）");
         let after = ws.required_width();
         assert!(after < before, "分离后总需求应变小：{before} -> {after}");
-        // 且 a 必须仍然占位
-        assert!(
-            ws.get(a).expect("a 仍在").layout_width() > 0.0,
-            "未分离的卡片必须继续占位"
-        );
+        // 且 a 必须仍然占位。
+        assert!(ws.get(a).expect("a 仍在").is_visible(), "未分离的卡片必须继续占位");
     }
 
     /// 收回工作区是幂等的。
