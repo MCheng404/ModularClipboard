@@ -29,7 +29,8 @@
 ## 1. 组件树
 
 ```text
-App  (无边框窗口；整个界面按「逻辑点」布局，外层 zoom = pixels_per_point)
+App  (无边框窗口；整个界面按「逻辑点」布局，zoom = pixels_per_point)
+│    · 窗口圆角 12 —— 由 DWM 提供（chrome::apply_rounded_corners，Win11 生效）
 │
 ├─ TopBar  h=44 · bg=surface_variant · 底边 1px border_subtle
 │  │        内边距左右各 space_md(12)
@@ -39,10 +40,11 @@ App  (无边框窗口；整个界面按「逻辑点」布局，外层 zoom = pix
 │  ├─ SearchIcon ........... 17×17 · 折叠 ⇄ 展开（不占位，点击才弹出）
 │  ├─ IconButton·close ..... Icon::Minimize ·「关闭到托盘」· Op::CloseWindow
 │  ├─ IconButton·clear ..... Icon::Trash · 破坏性 · hover=danger · Op::ClearAll
+│  ├─ IconButton·pin ....... 新增 · 开关态 · 见 §3.1.1
 │  ├─ IconButton·settings .. Icon::Settings · Op::ToggleSettings
 │  └─ DragRegion·right ..... 设置按钮**真实右缘** → 窗口右缘
-└─ CardArea  (bg)
-   └─ Card·History  整卡底=list_bg · 1px border_subtle · r=0 · 无标题行
+└─ CardArea  (bg) · 内缩 space_sm(8)（圆角改造新增，见 §2.3）
+   └─ Card·History  整卡底=list_bg · 1px border_subtle · r=10 · 无标题行
       │  head_h = 0（历史栏按用户要求去掉「历史」标题）
       │
       ├─ PinnedBand  仅当「置顶内嵌」且存在置顶条目；高度封顶 34%
@@ -53,7 +55,7 @@ App  (无边框窗口；整个界面按「逻辑点」布局，外层 zoom = pix
       └─ List  左右 padding 8（同时是拖动区）
          │  ScrollArea: floating · bar_width=10 · 覆盖内容右缘，不占布局宽度
          └─ Row × N  gap 6 · min-h 58 · 右缘让出 SCROLLBAR_RESERVE(10)
-            │  背景 surface_raised + 1px border_subtle + r=4
+            │  背景 surface_raised + 1px border_subtle + r=6
             ├─ Act·pin ........... 15.4×15.4 · 右上角 · Icon::Pinned/Unpinned
             ├─ Act·copy .......... Icon::File（无更贴切图标，近似表达「复制」）
             ├─ Act·delete ........ Icon::Close · hover=danger
@@ -146,6 +148,9 @@ step      = btn_area 宽 / 3                       = 37.95   （slot 步距）
 | 组 | Token | 值 |
 |---|---|---|
 | 圆角 | `radius_sm` / `radius_md` / `radius_lg` | 4 / 6 / 10 |
+| | **`win_radius`**（新增） | 12 · 窗口圆角，DWM 设置 |
+| | **`card_radius`**（新增） | 10 · 卡片圆角（原 `CARD_RADIUS = 0`） |
+| | **`row_radius`**（新增） | 6 · 行卡片圆角（原用 `radius_sm = 4`） |
 | 间距 | `space_xs` / `_sm` / `_md` / `_lg` / `_xl` | 4 / 8 / 12 / 16 / 24 |
 | 字号 | `font_xs` / `_sm` / `_md` / `_lg` | 11 / 12 / 14 / 16 |
 | 控件 | `control_height` / `icon_size` | 28 / 16 |
@@ -185,6 +190,37 @@ step      = btn_area 宽 / 3                       = 37.95   （slot 步距）
 早前卡片 frame 用 `surface`，结果列表四周露出一圈底色（浅色主题下
 是白边，用户反馈「列表边上还是白色」）。
 
+### 2.5 圆角改造（本次提案）
+
+现状：**窗口圆角已经有了**（`chrome::apply_rounded_corners` 在
+`window.rs:330` 调用，Win11 生效），但**内容全是直角**——
+`CARD_RADIUS = 0`，这是与窗口圆角最违和的一处。
+
+要改三处：
+
+| # | 项 | 现状 | 改为 |
+|---|---|---|---|
+| 1 | 卡片圆角 `CARD_RADIUS` | `0.0`（直角） | `10.0` |
+| 2 | 行卡片圆角 | `pal.radius_sm` = 4 | `6` |
+| 3 | `card_area` 内边距 | **无**（卡片贴窗口边缘） | 四周 `space_sm(8)` |
+
+第 3 条是必须一起改的，不能只改前两条：
+
+```text
+card_area() = 顶栏之下 → 窗口底部，gap 默认 0，卡片紧贴窗口边缘
+```
+
+直角风格下没问题；一旦卡片有了圆角，**卡片四角（自绘 10px）与窗口
+四角（DWM 12px）会错开**，边缘露出两道弧。加 8pt 内缩后，圆角弧落在
+窗口圆角的内侧，视觉上变成「窗口圆角 → 缝隙 → 卡片圆角」的层次。
+
+而且这个方案**不依赖 DWM**：Win10 上 `DWMWA_WINDOW_CORNER_PREFERENCE`
+返回 `E_INVALIDARG`（代码里已优雅降级），窗口仍是直角，但卡片圆角照常
+成立——不会出现「窗口直角 + 卡片圆角探出边缘」的破相。
+
+圆角半径与内边距的关系是硬约束：**内边距 ≥ 卡片圆角半径**，
+否则内容（行卡片的方角）会从圆角底下露出来。当前 12 ≥ 10，成立。
+
 ---
 
 ## 3. 交互清单
@@ -198,7 +234,50 @@ step      = btn_area 宽 / 3                       = 37.95   （slot 步距）
 | SearchBox | 输入 | — | 单行；走 FTS 过滤 |
 | close | 单击 | `CloseWindow` | 「关闭到托盘」，**不是退出** |
 | clear | 单击 | `ClearAll` | 破坏性，hover 用 `danger` |
+| **pin** | 单击 | `SetBool{Ui, always_on_top}` | 新增 · 切换窗口置顶，见 §3.1.1 |
 | settings | 单击 | `ToggleSettings` | 打开独立设置窗口 |
+
+#### 3.1.1 窗口置顶（新增）
+
+**不需要新建机制**——基础设施已经齐了：
+
+| 已有 | 位置 |
+|---|---|
+| `presence::set_topmost(hwnd, bool)` | 启动时应用一次 |
+| 每帧比对 `always_on_top` 配置并应用 | 帧循环末尾，用 `applied_topmost` 去重 |
+| `Op::SetBool { group: Ui, field: "always_on_top" }` | `set_bool_field` 已有该分支 |
+
+所以按钮只需要：**发一个 `Op::SetBool`**。写入后每帧比对会自动调
+`SetWindowPos`，而设置面板里那个同名开关也会同步（两处读同一个配置字段）。
+
+**按钮几何**：顶栏按钮从 3 枚变 4 枚。
+
+```text
+            3 枚              4 枚
+btn         27.28   →  27.28   （topbar_h × 0.62，不变）
+btn_area 宽 113.84  →  157.12  （btn×n + gap×(n−1)，gap = 16）
+step        37.95   →  39.28   （btn_area 宽 / n）
+热区 sq     23.53   →  24.35   （step × 0.62）
+字形        16      →  16      （icon_size，不变）
+```
+
+> CAUTION: `btn_count` 与 `step` 的分母**写在两个地方**
+> （`draw_topbar` 的 `btn_count` 与 `draw_topbar_icons` 的 `step`）。
+> 两边不一致 ⇒ 按钮区与实际按钮错位，表现为「最右那枚被搜索框压住」
+> 或「点齿轮变成拖窗口」。改一处必须同步另一处。
+
+**图标与配色**：
+
+- 未置顶 → `Icon::Unpinned`（描边图钉）+ `text_dim`
+- 已置顶 → `Icon::Pinned`（实心图钉）+ **`accent`**（已置顶）/ `accent_hover`（悬停）
+
+只换图标形状是不够的：16pt 下实心与描边的差异很小，不配色用户分不出
+「已置顶」和「没置顶」。所以 `icon_button` 需要加一个 `active` 参数，
+配色优先级为 **破坏性悬停 > 激活态 > 悬停提亮 > 常态弱化**。
+
+**位置**：放在「清空」与「设置」之间（自左向右 close / clear / **pin** / settings）。
+「设置」保持最右端——`draw_topbar` 的右段拖动区是按 `topbar_settings`
+的**真实右缘**算的，动了顺序要一并复核。
 
 ### 3.2 列表行
 
@@ -267,7 +346,23 @@ step      = btn_area 宽 / 3                       = 37.95   （slot 步距）
 `FollowSystem`（默认）/ `Dark` / `Light`。
 半透明 token 的对比度必须先合成到 `surface` 再算，不能直接取值比较。
 
-### 4.5 窗口状态
+### 4.5 窗口置顶状态（新增）
+
+| 状态 | 表现 |
+|---|---|
+| 未置顶 | 图钉描边 · `text_dim`；窗口会被其它窗口盖住、失焦后沉到下层 |
+| 已置顶 | 图钉实心 · `accent`；窗口始终在其它窗口之上，**包括它失去焦点时** |
+| 悬停 | 已置顶 → `accent_hover`；未置顶 → `text` |
+
+「包括焦点」这一条是置顶的**完整语义**：普通窗口在被点击到别的程序时
+会沉下去，`WS_EX_TOPMOST` 不会——它只是在 z 序上常驻最上层，不抢焦点。
+两者是不同的事，`SetWindowPos` + `HWND_TOPMOST` 正好是前者。
+
+> 原型的桌面场景（两个假的「别的程序窗口」）就是为了让这个差异可见：
+> 置顶关掉时它们会压住主窗口，打开时主窗口完整浮在上面。
+> 光看单窗口截图是看不出置顶的——它改变的是 z 序，不是外观。
+
+### 4.6 窗口状态
 
 隐藏到托盘（顶栏「关闭」）/ 失焦隐藏（可配置，默认关）/ 最小化。
 隐藏态下仍要 poll 消息并**排空**事件，否则事件积压会在下次打开时
@@ -303,6 +398,9 @@ step      = btn_area 宽 / 3                       = 37.95   （slot 步距）
 | 4 | **没有最小化按钮** | 与「关闭到托盘」效果近似（都让窗口消失），程序常驻托盘 | 已定 |
 | 5 | **行的预览不截断、按宽度折行** | 行高因此可变，长内容会把行撑高 | 已定（用户要求「完整显示内容」） |
 | 6 | **置顶区封顶 34%** | 置顶过多时靠置顶区自己滚动 | 34% 是拍的，可按实际使用调 |
+| 7 | **窗口圆角在 Win10 不生效** | DWM 属性返回 `E_INVALIDARG`，代码已优雅降级为直角 | 若必须 Win10 也圆角，只能 `SetWindowRgn`（像素级裁剪、无抗锯齿，边缘会有锯齿）——不推荐 |
+| 8 | **三个圆角值** | 窗口 12 / 卡片 10 / 行 6 是本轮的提案值 | 可以整体放大或统一（例如全部 8）；原型里改 token 即可实时比对 |
+| 9 | **置顶按钮的默认状态** | 配置默认 `always_on_top: true` | 若希望默认不置顶，改 `config.rs` 的默认值而不是按钮 |
 
 > 第 1 条我一度判断成「长来源名会排到按钮底下被盖住」，
 > 读了 `preview_width()` 才发现那里已经减掉了 `acts_w`——
@@ -317,17 +415,30 @@ step      = btn_area 宽 / 3                       = 37.95   （slot 步距）
 
 | 文件 | 内容 |
 |---|---|
-| `main-normal.png` | 浅色 · 正常 |
-| `main-dark.png` | 深色 · 正常 |
-| `main-pinned.png` | 含内嵌置顶区 |
-| `main-selected.png` | 选中行 |
+| `zoom-normal.png` | **圆角 · 未置顶**（被其它窗口遮挡） |
+| `zoom-wintop.png` | **圆角 · 已置顶**（覆盖在其它窗口之上） |
+| `zoom-normal-square.png` | 直角（对照，用于确认圆角改动确实生效） |
+| `main-dark-wintop.png` | 深色 · 已置顶 |
+| `main-embedded.png` | 含内嵌置顶区 |
 
 重拍：
 
 ```bash
 CHROME=~/.agent-browser/browsers/chrome-*/chrome.exe
 "$CHROME" --headless --disable-gpu --no-sandbox --hide-scrollbars \
-  --virtual-time-budget=2500 --window-size=1400,1000 \
-  --screenshot=_shots/main-normal.png \
+  --virtual-time-budget=2200 --window-size=1140,900 \
+  --screenshot=_shots/zoom-normal.png \
   "file://$PWD/main-window.html#normal"
 ```
+
+> NOTE: 截图路径**用正斜杠**。反斜杠在 bash 双引号里会让 `\$nm` 之类的
+> 变量引用失效，Chrome 会写到别处，表现为「命令成功但文件没出现」。
+
+> NOTE: 视口宽度要**两头兼顾**，第一版两个值都踩过坑：
+>
+> - **1400 太宽** —— 窗口在整图里只占一半，12px 圆角肉眼分不出，
+>   对比「圆角 / 直角」两张图居然看不出差别；
+> - **1000 太窄** —— 右侧规范面板固定 420px，留给画布只剩 580，
+>   640 宽的桌面会被裁，主窗口直接溢出桌面。
+>
+> 1140 是实测下来能同时满足「圆角看得清」和「桌面装得下」的值。

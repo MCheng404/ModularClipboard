@@ -49,6 +49,14 @@
   --radius-md: 6px;
   --radius-lg: 10px;
 
+  /* ---- 圆角风格（本次提案，Rust 侧对应值待定）----
+     窗口圆角由 DWM 提供（chrome::apply_rounded_corners，Win11 生效），
+     这里用 --win-radius 表达它；--card-radius 是内容层要跟着改的那一个：
+     现在 Rust 里 CARD_RADIUS = 0（直角），这是与窗口圆角最违和的一处。 */
+  --win-radius:  12px;
+  --card-radius: 10px;
+  --row-radius:  6px;
+
   /* ---- 间距 ---- */
   --space-xs: 4px;
   --space-sm: 8px;
@@ -149,6 +157,45 @@ button.chip {
 button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 .scale-hint { color: #5c6572; font-size: 11px; }
 
+/* ---- 桌面场景：用来演示「置顶」到底改变了什么 ----
+   置顶的语义是 z 序，不是外观。光看窗口截图看不出区别，
+   所以这里摆两个「别的程序窗口」，让遮挡关系可见。 */
+/* 高度按「窗口 533 逻辑点 × 1.5 缩放 = 800」留够，否则主窗口会被裁顶，
+   而顶栏（含新增的置顶按钮）恰好最先被裁掉。 */
+/* 桌面要比窗口大出一圈：置顶时两个假窗口被压在下面，**必须还能从
+   主窗口边缘露出来**，否则「置顶」和「没置顶」两张图看起来一样。
+   640 − 48(padding) = 592，窗口 480 居中后左右各余 56 —— 够露出一角。 */
+.desktop {
+  position: relative; width: 640px;
+  padding: 24px;
+  background: linear-gradient(160deg, #2b3a52 0%, #1b2434 55%, #14202e 100%);
+  border-radius: 10px;
+  display: flex; align-items: center; justify-content: center;
+}
+.other-win {
+  position: absolute; background: #22262c; color: #8b93a0;
+  border: 1px solid #333944; border-radius: 8px; padding: 10px 12px;
+  font-size: 11px; box-shadow: 0 6px 22px rgba(0,0,0,.45);
+}
+.other-win b { display: block; color: #aeb6c2; font-size: 11px; margin-bottom: 6px; font-weight: 500; }
+.other-win .lines { display: flex; flex-direction: column; gap: 5px; }
+.other-win .lines i { display: block; height: 5px; background: #333944; border-radius: 3px; }
+/* 固定像素定位，不用百分比：百分比相对 padding box，而 box 宽度会
+   随视口变，假窗口就会跑出「露出多少」的可控范围。 */
+.ow-a { left: 6px;  top: 14px;  width: 200px; z-index: 3; }
+.ow-b { right: 6px; bottom: 14px; width: 190px; z-index: 3; }
+/* 主窗口：置顶时压在其它窗口之上（z 4），不置顶时被它们压住（z 2） */
+.app-wrap { position: relative; z-index: 2; transition: z-index 0s; }
+.desktop.pinned .app-wrap { z-index: 4; }
+/* 不置顶时，让 ow-a 明确压住主窗口左上角——一眼看出「没置顶」 */
+.desktop:not(.pinned) .ow-a { z-index: 5; }
+.pin-badge {
+  position: absolute; left: 12px; bottom: 10px; z-index: 6;
+  font-size: 11px; padding: 4px 10px; border-radius: 999px;
+  background: #16202c; color: #6f7885; border: 1px solid #2a3441;
+}
+.desktop.pinned .pin-badge { color: #8fc0f2; border-color: #2f5480; background: #16283d; }
+
 /* ==========================================================================
    应用窗口（严格按 Rust 的绘制顺序与几何）
    ========================================================================== */
@@ -156,7 +203,7 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   /* 应用内所有尺寸都是「逻辑点」；外层用 zoom 表达 DPI 缩放 */
   width: var(--win-w, 480px);
   height: var(--win-h, 533px);
-  border-radius: 8px;
+  border-radius: var(--win-radius);
   overflow: hidden;
   background: var(--bg);
   border: 1px solid var(--border-subtle);
@@ -176,20 +223,24 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 }
 .tb-drag { flex: 1 1 auto; height: 100%; align-self: stretch; }
 .tb-search { flex: 0 0 auto; margin-right: var(--space-md); }
-/* 顶栏按钮的几何来自 draw_topbar_icons，三层尺寸各不相同，别混：
-     btn   = topbar_h × 0.62        = 27.28  （btn_area 的宽高基准）
-     容器宽 = btn×3 + gap×2，gap = space_sm×2 = 16  → 113.84
-     step  = 容器宽 / 3 = 37.95      （每个 slot 的步距）
-     热区  = step × 0.62 = 23.53     ← 按钮实际可点区域
-     字形  = icon_size = 16          ← 图标比热区小一圈 */
+/* 顶栏按钮的几何来自 draw_topbar_icons，三层尺寸各不相同，别混。
+   现在有 **4** 枚（新增「窗口置顶」），btn_count 与 step 的分母必须
+   同时从 3 改到 4 —— Rust 侧这两个数字写在两处（btn_area 与
+   draw_topbar_icons 的 step），改一处忘另一处 ⇒ 按钮与实际热区错位。
+
+     btn   = topbar_h × 0.62                  = 27.28  （btn_area 基准）
+     容器宽 = btn×4 + gap×3，gap = space_sm×2 = 16 → 157.12
+     step  = 容器宽 / 4                         = 39.28  （slot 步距）
+     热区  = step × 0.62                        = 24.35  ← 实际可点区域
+     字形  = icon_size                          = 16     ← 比热区小一圈 */
 .tb-buttons {
   flex: 0 0 auto;
-  width: calc(var(--topbar-h) * .62 * 3 + var(--space-sm) * 2 * 2);
+  width: calc(var(--topbar-h) * .62 * 4 + var(--space-sm) * 2 * 3);
   display: flex; justify-content: space-between;
 }
 .tb-btn {
-  width: calc((var(--topbar-h) * .62 * 3 + var(--space-sm) * 4) / 3 * .62);
-  height: calc((var(--topbar-h) * .62 * 3 + var(--space-sm) * 4) / 3 * .62);
+  width: calc((var(--topbar-h) * .62 * 4 + var(--space-sm) * 2 * 3) / 4 * .62);
+  height: calc((var(--topbar-h) * .62 * 4 + var(--space-sm) * 2 * 3) / 4 * .62);
   border: 0; background: transparent; color: var(--text-dim);
   display: grid; place-items: center; cursor: pointer; padding: 0;
   border-radius: var(--radius-sm);
@@ -197,6 +248,11 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 .tb-btn svg { width: var(--icon-size); height: var(--icon-size); }
 .tb-btn:hover { background: var(--row-hover); color: var(--text); }
 .tb-btn.danger:hover { color: var(--danger); background: var(--row-hover); }
+/* 「窗口置顶」是开关态按钮：激活时用 accent 高亮。
+   只用实心/描边图钉区分是不够的 —— 16pt 下形状差异太小，
+   不配色的话分不出「已置顶」和「没置顶」。 */
+.tb-btn.active { color: var(--accent); }
+.tb-btn.active:hover { color: var(--accent-hover); }
 .searchbox {
   width: var(--search-expand-w); height: calc(var(--topbar-h) - 2 * var(--space-sm));
   background: var(--surface); border: 1px solid var(--border);
@@ -217,13 +273,32 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 .tb-searchicon:hover { color: var(--text); background: var(--row-hover); }
 
 /* ---- 卡片区 ---- */
-.cardarea { flex: 1 1 auto; min-height: 0; background: var(--bg); display: flex; }
+/* NOTE: 现有实现里 card_area 是「顶栏之下到窗口底部」，**没有内边距**，
+   卡片直接贴到窗口边缘（gap 默认 0）。直角风格下这没问题；
+   一旦窗口有了圆角，卡片四角（自绘 10px）与窗口四角（DWM 12px）
+   会错开，边缘露出两道弧。
+
+   这里改为卡片内缩 space_sm(8)：两套系统都对 ——
+   Win11 有 DWM 圆角时是「窗口圆角 → 缝 → 卡片圆角」的层次，
+   Win10 没有 DWM 圆角时卡片圆角依然成立。
+   Rust 侧对应改动：card_area() 加内边距。 */
+.cardarea {
+  flex: 1 1 auto; min-height: 0; background: var(--bg); display: flex;
+  padding: 0 var(--space-sm) var(--space-sm);
+}
 .card {
   flex: 1 1 auto; min-width: 0;
   background: var(--list-bg);              /* 历史整卡 = 暗容器 */
   border: var(--card-stroke) solid var(--border-subtle);
   border-radius: var(--card-radius);
   display: flex; flex-direction: column;
+  /* 圆角后内容必须让开圆角区域，否则行卡片的方角会从圆角底下露出来。
+     内边距 ≥ 圆角半径是硬要求：space_md(12) > radius_lg(10)。 */
+  padding: var(--space-md);
+}
+/* 列表内容整体也要裁进圆角里，否则第一行/最后一行会压到圆角上 */
+.list, .pinned {
+  border-radius: calc(var(--card-radius) - var(--space-md));
 }
 .card-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 
@@ -255,7 +330,7 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   position: relative; flex: 0 0 auto;
   background: var(--surface-raised);
   border: var(--card-stroke) solid var(--border-subtle);
-  border-radius: var(--radius-sm);
+  border-radius: var(--row-radius);
   /* 右缘让出滚动条：egui 的 floating scrollbar 覆盖右缘 10pt，
      不让开的话最后一个按钮会被滚动条压住 */
   margin-right: calc(var(--scrollbar-reserve) - var(--list-pad-x));
@@ -361,15 +436,13 @@ svg { display: block; }
         ×
         <input type="number" id="winH" value="533" min="200" max="900" step="10" style="width:70px">
       </label>
-      <label>DPI 缩放
-        <select id="zoomSel">
-          <option value="1">1.0</option>
-          <option value="1.25">1.25</option>
-          <option value="1.5" selected>1.5</option>
-          <option value="2">2.0</option>
-        </select>
+      <span class="scale-hint">1:1 逻辑点显示。默认配置 720×800 物理像素 ÷ DPI 1.5 = 480×533 逻辑点</span>
+      <label style="margin-left:8px">
+        <input type="checkbox" id="pinChk"> 窗口置顶
       </label>
-      <span class="scale-hint">默认配置 720×800 物理像素 ÷ 1.5 = 480×533 逻辑点</span>
+      <label>
+        <input type="checkbox" id="roundChk" checked> 圆角风格
+      </label>
     </div>
 
     <div class="toolbar" style="justify-content:center;background:none;border:0;padding:0">
@@ -382,7 +455,12 @@ svg { display: block; }
       <button class="chip" data-state="narrow">窄窗</button>
     </div>
 
-    <div id="zoomWrap"><div class="app" id="app"></div></div>
+    <div class="desktop" id="desktop">
+      <div class="other-win ow-a"><b>记事本</b><div class="lines"><i></i><i style="width:70%"></i><i style="width:88%"></i></div></div>
+      <div class="other-win ow-b"><b>文件资源管理器</b><div class="lines"><i></i><i style="width:60%"></i><i style="width:75%"></i><i style="width:40%"></i></div></div>
+      <div class="app-wrap"><div class="app" id="app"></div></div>
+      <div class="pin-badge" id="pinBadge">未置顶 —— 会被其它窗口盖住</div>
+    </div>
   </div>
 
   <aside class="inspector">
@@ -461,7 +539,11 @@ const FIX = {
 /* ==========================================================================
    渲染
    ========================================================================== */
-const state = { theme: 'light', view: 'normal', w: 480, h: 533, zoom: 1.5 };
+const state = {
+  theme: 'light', view: 'normal', w: 480, h: 533, zoom: 1.5,
+  winPinned: false,   // 窗口置顶（新增）
+  rounded: true,      // 圆角风格（新增；false = 现在的直角风格，便于对比）
+};
 
 function rowHtml(item, i, mode) {
   // 主列表里的行都是未置顶 ⇒ 图钉用**描边**版；置顶区里的行才是实心。
@@ -496,9 +578,9 @@ function render() {
   const app = document.getElementById('app');
   app.style.setProperty('--win-w', w + 'px');
   app.style.setProperty('--win-h', state.h + 'px');
-  document.getElementById('zoomWrap').style.zoom = state.zoom;
 
   const searchOpen = v === 'search';
+  const pinIcon = state.winPinned ? ICON.pinSolid : ICON.pinOutline;
   const topbar = `
     <div class="topbar">
       <div class="tb-drag"></div>
@@ -508,6 +590,8 @@ function render() {
       <div class="tb-buttons">
         <button class="tb-btn" title="关闭到托盘">${ICON.minimize}</button>
         <button class="tb-btn danger" title="清空全部历史">${ICON.trash}</button>
+        <button class="tb-btn ${state.winPinned ? 'active' : ''}" id="pinBtn"
+                title="${state.winPinned ? '取消窗口置顶' : '窗口置顶'}">${pinIcon}</button>
         <button class="tb-btn" title="设置">${ICON.settings}</button>
       </div>
     </div>`;
@@ -533,6 +617,39 @@ function render() {
     </div></div>`;
   }
   app.innerHTML = topbar + body;
+
+  // 顶栏那枚置顶按钮在每次 render 后都是新节点，要重新挂监听。
+  const pb = document.getElementById('pinBtn');
+  if (pb) pb.addEventListener('click', () => {
+    state.winPinned = !state.winPinned;
+    document.getElementById('pinChk').checked = state.winPinned;
+    syncDesktop();
+    render();
+  });
+}
+
+/* 置顶改变的是 z 序，不是外观 —— 靠桌面场景把它表达出来 */
+function syncDesktop() {
+  const d = document.getElementById('desktop');
+  d.classList.toggle('pinned', state.winPinned);
+  document.getElementById('pinBadge').textContent = state.winPinned
+    ? '已置顶 —— 覆盖在其它窗口之上（含获得焦点时）'
+    : '未置顶 —— 会被其它窗口盖住';
+}
+
+/* 圆角风格：改的是 3 个 token 变量。关掉它就能和现在的直角风格直接对比 */
+function syncRound() {
+  const app = document.getElementById('app');
+  const set = (k, v) => app.style.setProperty(k, v);
+  if (state.rounded) {
+    set('--win-radius', '12px');
+    set('--card-radius', '10px');
+    set('--row-radius', '6px');
+  } else {
+    set('--win-radius', '0px');
+    set('--card-radius', '0px');
+    set('--row-radius', '4px');
+  }
 }
 
 /* ==========================================================================
@@ -748,7 +865,13 @@ document.getElementById('themeSel').addEventListener('change', e => {
   state.theme = e.target.value;
   document.documentElement.dataset.theme = state.theme;
 });
-document.getElementById('zoomSel').addEventListener('change', e => { state.zoom = +e.target.value; render(); });
+document.getElementById('pinChk').addEventListener('change', e => {
+  state.winPinned = e.target.checked; syncDesktop(); render();
+});
+document.getElementById('roundChk').addEventListener('change', e => {
+  state.rounded = e.target.checked; render(); syncRound();
+});
+
 document.getElementById('winW').addEventListener('input', e => { state.w = +e.target.value; render(); });
 document.getElementById('winH').addEventListener('input', e => { state.h = +e.target.value; render(); });
 
@@ -761,19 +884,32 @@ render();
   const h = (location.hash || '').replace('#', '');
   if (!h) return;
   const parts = h.split(/[+,]/);
-  const VIEWS = ['normal','hover','selected','search','empty','pinned','narrow'];
+  const VIEWS = ['normal','hover','selected','search','empty','narrow'];
+  // 注意：`pinned` 在 hash 里表示**窗口置顶**（列表里的置顶条目用
+  // `embedded`，避免同一个词指两件不同的事）。
   const view = parts.find(p => VIEWS.includes(p));
   if (view) {
     state.view = view;
     document.querySelectorAll('.chip').forEach(x =>
       x.classList.toggle('on', x.dataset.state === view));
   }
+  if (parts.includes('embedded')) state.view = 'pinned';
   if (parts.includes('dark')) {
     state.theme = 'dark';
     document.documentElement.dataset.theme = 'dark';
     document.getElementById('themeSel').value = 'dark';
   }
+  if (parts.includes('wintop')) {
+    state.winPinned = true;
+    document.getElementById('pinChk').checked = true;
+  }
+  if (parts.includes('square')) {
+    state.rounded = false;
+    document.getElementById('roundChk').checked = false;
+  }
+  syncDesktop();
   render();
+  syncRound();
 })();
 </script>
 </body>
