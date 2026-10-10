@@ -289,6 +289,44 @@
   .overlay-summary .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
   .overlay-summary.off { background: var(--hover); }
   .overlay-summary.off .dot { background: var(--switch-off); }
+  /* ---- 自定义 MCP 参数 ---- */
+  .custom-block {
+    border-top: 1px solid var(--border);
+    margin: 12px 6px 0; padding-top: 10px;
+  }
+  .custom-head {
+    display: flex; align-items: baseline; gap: 8px;
+    font-size: 12.5px; font-weight: 600; color: var(--text);
+    padding: 0 4px 8px;
+  }
+  .custom-head small { font-size: 11px; font-weight: 400; color: var(--text-dim); }
+  .custom-empty { font-size: 12px; color: var(--text-dim); padding: 2px 4px 8px; }
+  .param-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 4px;
+  }
+  .param-row input {
+    height: 26px; padding: 0 8px; font-size: 12px;
+    border: 1px solid var(--border); border-radius: 7px;
+    background: var(--bg); color: var(--text); outline: none;
+  }
+  .param-row input:focus { border-color: var(--accent); }
+  .param-k { flex: 2; min-width: 0; }
+  .param-v { flex: 3; min-width: 0; }
+  .param-del {
+    width: 24px; height: 24px; flex-shrink: 0;
+    border: none; border-radius: 7px; background: transparent;
+    color: var(--text-dim); cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .param-del:hover { background: var(--active); color: var(--text); }
+  .param-add {
+    margin: 6px 4px 2px; padding: 5px 12px;
+    border: 1px dashed var(--border); border-radius: 8px;
+    background: transparent; color: var(--accent);
+    font-size: 12px; cursor: pointer;
+  }
+  .param-add:hover { background: var(--accent-bg); border-color: var(--accent); }
   .overlay-foot {
     display: flex; justify-content: flex-end; gap: 8px;
     padding: 10px 18px 14px; border-top: 1px solid var(--border);
@@ -349,6 +387,8 @@ const S = {
     mcp_resize_window: true, mcp_read_layout: true, mcp_click_element: true,
     mcp_type_text: true, mcp_scroll_view: true, mcp_screen_capture: true,
     mcp_window_focus: true, mcp_drag_drop: true,
+    // 自定义 MCP 参数（键值对列表，仅叠加层内编辑）
+    mcp_custom_params: [],
   },
 };
 
@@ -424,6 +464,7 @@ const DEFAULTS = {
   mcp_resize_window: true, mcp_read_layout: true, mcp_click_element: true,
   mcp_type_text: true, mcp_scroll_view: true, mcp_screen_capture: true,
   mcp_window_focus: true, mcp_drag_drop: true,
+  mcp_custom_params: [],
 };
 
 // ===== 分类与设置项定义 =====
@@ -547,7 +588,8 @@ function catDesc(id) {
 function isDefault(key) {
   const cur = S.vals[key], def = DEFAULTS[key];
   if (Array.isArray(def)) {
-    return Array.isArray(cur) && cur.length === def.length && cur.every((v, i) => v === def[i]);
+    // 数组设置（快捷键组合 / 自定义参数列表）：按内容比较
+    return Array.isArray(cur) && JSON.stringify(cur) === JSON.stringify(def);
   }
   return cur === def;
 }
@@ -556,21 +598,16 @@ function groupHtml(g) {
   // 只读组（关于页）不显示重置按钮
   const readonly = g.items.every(it => it.kind === "plain" || it.kind === "link");
   // 仅当本卡片任一设置项偏离默认值时显示重置按钮
-  // （MCP 卡片还要统计子列表里的每个 MCP 开关）
+  // （MCP 卡片还要统计叠加层里的每个 MCP 开关与自定义参数）
   const allChanged = g.items.some(it => it.key && !isDefault(it.key)) ||
-    (g.mcp && MCPS.some(m => !isDefault("mcp_" + m.id)));
+    (g.mcp && (MCPS.some(m => !isDefault("mcp_" + m.id)) || !isDefault("mcp_custom_params")));
   const changed = !readonly && allChanged;
   let html = `<div class="group"><div class="group-header"><span class="group-title">${g.title}</span>`;
   if (changed) html += `<button class="group-reset" data-group-reset title="重置本卡片">${ICONS.reset}</button>`;
   html += `</div>`;
   g.items.forEach(it => { html += rowHtml(it); });
-  // MCP 卡片：协议头参数 + 一键 AI 配对提示词（可调用开关只在叠加层显示）
+  // MCP 卡片：一键 AI 配对提示词（可调用开关与自定义参数只在叠加层）
   if (g.mcp) {
-    html += `<div class="proto-block"><div class="proto-title">协议头参数</div>`;
-    MCP_PROTO.forEach(p => {
-      html += `<div class="proto-row"><span class="proto-k">${p.k}</span><span class="proto-v">${p.v}</span></div>`;
-    });
-    html += `</div>`;
     html += `<button class="pair-btn" data-pair>${ICONS.spark} 一键 AI 配对提示词</button>`;
   }
   html += `</div>`;
@@ -746,9 +783,10 @@ function bindRows(box) {
     btn.addEventListener("click", () => {
       const group = btn.closest(".group");
       const keys = [...new Set([...group.querySelectorAll("[data-key]")].map(el => el.dataset.key))];
-      // MCP 卡片：叠加层里的所有可调用开关也一并重置
+      // MCP 卡片：叠加层里的所有可调用开关与自定义参数也一并重置
       if (group.querySelector(".info-btn")) {
         MCPS.forEach(m => keys.push("mcp_" + m.id));
+        keys.push("mcp_custom_params");
       }
       const title = group.querySelector(".group-title")?.textContent || "";
       keys.forEach(k => { S.vals[k] = (typeof DEFAULTS[k] === "object") ? DEFAULTS[k].slice() : DEFAULTS[k]; untouch(k); });
@@ -793,6 +831,23 @@ function renderOverlay() {
             <label class="switch"><input type="checkbox" data-mcp-key="mcp_${m.id}" ${enabled && onState ? "checked" : ""} ${enabled ? "" : "disabled"}><span class="track"></span></label>
           </div>`;
         }).join("")}
+        <div class="custom-block">
+          <div class="custom-head">
+            <span>自定义 MCP 参数</span>
+            <small>额外传递给 MCP 服务的键值参数</small>
+          </div>
+          ${S.vals.mcp_custom_params.length === 0
+            ? `<div class="custom-empty">暂无自定义参数，点击下方添加</div>`
+            : S.vals.mcp_custom_params.map((p, i) => `
+              <div class="param-row">
+                <input class="param-k" data-param-k="${i}" placeholder="参数名" value="${esc(p.k)}">
+                <input class="param-v" data-param-v="${i}" placeholder="参数值" value="${esc(p.v)}">
+                <button class="param-del" data-param-del="${i}" title="删除参数" aria-label="删除参数">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                </button>
+              </div>`).join("")}
+          <button class="param-add" data-param-add>+ 添加参数</button>
+        </div>
       </div>
       <div class="overlay-foot">
         <button class="btn" data-overlay-close>取消</button>
@@ -812,6 +867,33 @@ function renderOverlay() {
       renderOverlay();
       // 同步卡片内列表（若当前在通信页）
       render();
+    });
+  });
+  // 自定义 MCP 参数：编辑 / 添加 / 删除
+  ov.querySelectorAll("input[data-param-k]").forEach(el => {
+    el.addEventListener("input", () => {
+      S.vals.mcp_custom_params[+el.dataset.paramK].k = el.value; touch("mcp_custom_params");
+    });
+  });
+  ov.querySelectorAll("input[data-param-v]").forEach(el => {
+    el.addEventListener("input", () => {
+      S.vals.mcp_custom_params[+el.dataset.paramV].v = el.value; touch("mcp_custom_params");
+    });
+  });
+  ov.querySelectorAll("[data-param-del]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      S.vals.mcp_custom_params.splice(+btn.dataset.paramDel, 1); touch("mcp_custom_params");
+      renderOverlay(); render();
+    });
+  });
+  ov.querySelectorAll("[data-param-add]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      S.vals.mcp_custom_params.push({ k: "", v: "" }); touch("mcp_custom_params");
+      renderOverlay();
+      // 聚焦新行的参数名输入框
+      const rows = ov.querySelectorAll(".param-row");
+      const last = rows[rows.length - 1];
+      if (last) last.querySelector("input").focus();
     });
   });
 }
@@ -895,6 +977,11 @@ document.getElementById("btn-close").addEventListener("click", () => {
 });
 
 let toastTimer;
+// HTML 转义（自定义参数名/值可能含特殊字符）
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
 function toast(msg) {
   const t = document.getElementById("toast");
   t.textContent = msg;
