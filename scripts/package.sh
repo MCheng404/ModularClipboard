@@ -73,7 +73,14 @@ cp -f "$SRC" "$DIST/$BIN_NAME"
 # 而"这个 exe 是哪次提交编出来的"恰恰是最需要回答的问题。
 # 非 git 环境（例如从 tarball 构建）降级为 unknown，不中断。
 COMMIT=$(git rev-parse --short=12 HEAD 2>/dev/null || echo "unknown")
-DIRTY=$(git status --porcelain 2>/dev/null | head -1 | grep -q . && echo " (有未提交改动)" || true)
+# dirty 只看**已跟踪文件**是否与 HEAD 不同。未跟踪文件（原型草稿、
+# 本地笔记）不参与编译，不该让产物被标成 dirty —— 那会把这个标记
+# 稀释成一个几乎恒为真的噪音，用户也就懒得看了。
+if git diff --quiet HEAD -- 2>/dev/null; then
+    DIRTY=""
+else
+    DIRTY=" (有未提交改动)"
+fi
 VERSION=$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed -E 's/.*"(.*)".*/\1/')
 BUILD_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
