@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>剪贴板管理器 - 设置布局原型 v2</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='3' y='3' width='18' height='18' rx='6' fill='%235b8def'/%3E%3Cpath d='M9 8h6M9 12h6M9 16h4' stroke='white' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f2f4f7;
+    --sidebar: #f7f8fa;
+    --content: #f2f4f7;
+    --card: #ffffff;
+    --text: #1f1f1f;
+    --text-dim: #616161;
+    --border: #e2e5ea;
+    --hover: #f0f1f4;
+    --active: #e6e8ee;
+    --accent: #0067c0;
+    --accent-bg: #e8f1fb;
+    --switch-off: #c8c8c8;
+    --radius: 8px;
+    --card-radius: 12px;
+    --win-radius: 16px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1e1f22;
+      --sidebar: #222428;
+      --content: #1e1f22;
+      --card: #2b2d31;
+      --text: #e8e8e8;
+      --text-dim: #9a9a9a;
+      --border: #3a3c40;
+      --hover: #2e3035;
+      --active: #35373c;
+      --accent: #60a8ff;
+      --accent-bg: #26344a;
+      --switch-off: #5a5a5a;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+    background: #16181c;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 24px; color: var(--text);
+  }
+  .win {
+    width: 780px; height: 560px; max-width: 100%;
+    background: var(--content);
+    border-radius: var(--win-radius); overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0,0,0,.35);
+    display: flex; flex-direction: column;
+    position: relative;
+  }
+  .body { min-height: 0; } /* 允许 content 内部滚动 */
+  /* ===== 顶部栏（右侧区域，仅关闭按钮） ===== */
+  .titlebar {
+    display: flex; align-items: center; justify-content: flex-end;
+    padding: 10px 14px;
+    margin-left: 190px; /* 左侧列让位 */
+  }
+  .titlebar .close-btn {
+    width: 30px; height: 30px;
+    border: none; border-radius: 50%;
+    background: transparent; color: var(--text-dim);
+    font-size: 15px; line-height: 1; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .titlebar .close-btn:hover { background: var(--active); color: var(--text); }
+  /* ===== 主体 ===== */
+  .body { display: flex; margin-left: 190px; padding: 10px; gap: 8px; }
+  /* ---- 左侧列：搜索框在导航背景上方，同宽 ---- */
+  .leftcol {
+    position: absolute; left: 12px; top: 12px; bottom: 12px;
+    width: 190px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .searchbox { width: 100%; position: relative; }
+  .searchbox input {
+    width: 100%; padding: 8px 12px 8px 30px;
+    border: none; border-radius: 10px;
+    background: var(--card); color: var(--text); font-size: 13px; outline: none;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+  }
+  .searchbox input:focus { box-shadow: 0 0 0 2px var(--accent); }
+  .searchbox svg { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); opacity: .55; }
+  /* 左侧导航：固定圆角背景块，长度与搜索框一致 */
+  .sidebar {
+    flex: 1;
+    background: var(--sidebar);
+    border-radius: var(--card-radius);
+    padding: 12px 8px;
+    display: flex; flex-direction: column; gap: 4px;
+    overflow: hidden;
+  }
+  .nav-item {
+    flex: none; height: 44px;
+    display: flex; align-items: center; gap: 10px;
+    padding: 0 12px; border-radius: 10px;
+    font-size: 13px; cursor: pointer; user-select: none;
+  }
+  .nav-item svg { flex-shrink: 0; opacity: .8; }
+  .nav-item:hover { background: var(--hover); }
+  .nav-item.active { background: var(--active); font-weight: 600; }
+  /* ---- 右侧内容 ---- */
+  .content { flex: 1; overflow-y: auto; padding: 4px 4px 8px; }
+  .page-desc { padding: 10px 16px 12px; font-size: 12.5px; color: var(--text-dim); }
+  /* 卡片分组 */
+  .group {
+    background: var(--card); border-radius: var(--card-radius);
+    margin: 0 6px 14px; padding: 6px 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.05);
+  }
+  .group-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 14px 2px;
+  }
+  .group-title { font-size: 12.5px; font-weight: 600; color: var(--text-dim); }
+  .group-reset {
+    width: 24px; height: 24px; flex-shrink: 0;
+    border: none; border-radius: 7px; background: transparent;
+    color: var(--text-dim); cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    opacity: .55;
+  }
+  .group-reset:hover { background: var(--active); color: var(--accent); opacity: 1; }
+  .row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; margin: 0 4px; border-radius: 10px;
+  }
+  .row:hover { background: var(--hover); }
+  .row .label { flex: 1; font-size: 13px; }
+  .row .label small { display: block; font-size: 11.5px; color: var(--text-dim); margin-top: 2px; }
+  /* 开关 */
+  .switch { position: relative; width: 40px; height: 22px; flex-shrink: 0; cursor: pointer; }
+  .switch input { display: none; }
+  .switch .track {
+    position: absolute; inset: 0; border-radius: 11px;
+    background: var(--switch-off); transition: background .15s;
+  }
+  .switch .track::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+    border-radius: 50%; background: #fff; transition: left .15s; box-shadow: 0 1px 3px rgba(0,0,0,.3);
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::after { left: 21px; }
+  /* 单选（胶囊） */
+  .seg { display: inline-flex; background: var(--bg); border-radius: 10px; padding: 2px; }
+  .seg button {
+    padding: 5px 12px; font-size: 12px; border: none; border-radius: 8px;
+    background: transparent; color: var(--text); cursor: pointer; white-space: nowrap;
+  }
+  .seg button.on { background: var(--card); color: var(--accent); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.1); }
+  /* 滑块 */
+  .slider { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .slider input[type=range] { width: 120px; accent-color: var(--accent); }
+  .slider .val { width: 36px; text-align: right; font-size: 12px; color: var(--text-dim); }
+  .slider.disabled { opacity: .45; pointer-events: none; }
+  /* 数字输入 */
+  .num {
+    width: 76px; padding: 5px 10px; border: none; border-radius: 8px;
+    background: var(--bg); color: var(--text); font-size: 13px; text-align: right; outline: none;
+  }
+  .num:focus { box-shadow: 0 0 0 2px var(--accent); }
+  .num-unit { font-size: 12px; color: var(--text-dim); flex-shrink: 0; }
+  /* 链接行（关于页） */
+  .link {
+    font-size: 13px; color: var(--accent); text-decoration: none;
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px;
+    border-radius: 8px;
+  }
+  .link:hover { background: var(--accent-bg); text-decoration: underline; }
+  /* 快捷键行 */
+  .kbd {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 12px;
+    background: var(--bg); border-radius: 8px; padding: 4px 8px;
+  }
+  .kbd .key { background: var(--card); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; }
+  .record-btn { font-size: 11px; padding: 4px 10px; border: none; border-radius: 8px;
+                background: var(--bg); color: var(--text-dim); cursor: pointer; }
+  .record-btn:hover { color: var(--accent); background: var(--accent-bg); }
+  /* 搜索跨分类结果 */
+  .search-hit { padding: 0 10px; }
+  .search-hit .hit-group { font-size: 11.5px; color: var(--text-dim); padding: 10px 10px 4px; font-weight: 600; }
+  .search-empty { padding: 48px 20px; text-align: center; color: var(--text-dim); font-size: 13px; }
+  .toast {
+    position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+    background: #323232; color: #fff; padding: 8px 18px; border-radius: 10px;
+    font-size: 12.5px; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  /* ---- MCP 服务 ---- */
+  .info-btn {
+    width: 22px; height: 22px; flex-shrink: 0;
+    border: none; border-radius: 50%;
+    background: var(--accent-bg); color: var(--accent);
+    display: inline-flex; align-items: center; justify-content: center;
+    cursor: pointer; opacity: .85;
+  }
+  .info-btn:hover { opacity: 1; background: var(--accent); color: #fff; }
+  .mcp-list {
+    border-top: 1px solid var(--border);
+    margin: 6px 4px 2px; padding: 4px 8px 6px;
+  }
+  .mcp-list-title {
+    font-size: 11px; color: var(--text-dim); font-weight: 600;
+    padding: 8px 6px 4px; display: flex; align-items: center; gap: 6px;
+  }
+  .mcp-list-title .count { color: var(--accent); }
+  .mcp-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 10px;
+  }
+  .mcp-row:hover { background: var(--hover); }
+  .mcp-row .label { flex: 1; font-size: 13px; }
+  .mcp-row .label small { display: block; font-size: 11.5px; color: var(--text-dim); margin-top: 1px; }
+  .mcp-row.disabled { opacity: .45; pointer-events: none; }
+  .mcp-badge {
+    font-size: 10.5px; padding: 2px 8px; border-radius: 99px;
+    background: var(--bg); color: var(--text-dim); white-space: nowrap;
+  }
+  .mcp-badge.on { background: var(--accent-bg); color: var(--accent); }
+  /* ---- 覆盖层（MCP 调用设置）---- */
+  .overlay {
+    position: absolute; inset: 0; z-index: 50;
+    background: rgba(0,0,0,.38);
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(2px);
+  }
+  .overlay.hidden { display: none; }
+  .overlay-panel {
+    width: 460px; max-width: 92%; max-height: 82%;
+    background: var(--card); border-radius: 16px;
+    box-shadow: 0 18px 60px rgba(0,0,0,.45);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .overlay-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px 10px;
+  }
+  .overlay-head .t { font-size: 14.5px; font-weight: 600; }
+  .overlay-head .sub { font-size: 11.5px; color: var(--text-dim); margin-top: 2px; }
+  .overlay-close {
+    width: 28px; height: 28px; flex-shrink: 0;
+    border: none; border-radius: 8px; background: transparent;
+    color: var(--text-dim); cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .overlay-close:hover { background: var(--active); color: var(--text); }
+  .overlay-body { overflow-y: auto; padding: 4px 12px 14px; }
+  .overlay-summary {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; margin: 0 6px 10px; border-radius: 10px;
+    background: var(--accent-bg); font-size: 12.5px; color: var(--text);
+  }
+  .overlay-summary .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+  .overlay-summary.off { background: var(--hover); }
+  .overlay-summary.off .dot { background: var(--switch-off); }
+  .overlay-foot {
+    display: flex; justify-content: flex-end; gap: 8px;
+    padding: 10px 18px 14px; border-top: 1px solid var(--border);
+  }
+  .btn {
+    padding: 6px 16px; font-size: 12.5px; border: none; border-radius: 8px;
+    background: var(--bg); color: var(--text); cursor: pointer;
+  }
+  .btn:hover { background: var(--active); }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn.primary:hover { opacity: .9; }
+</style>
+</head>
+<body>
+<div class="win">
+  <!-- ===== 左侧列：搜索框 + 导航背景 ===== -->
+  <div class="leftcol">
+    <div class="searchbox">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="search" type="text" placeholder="查找设置">
+    </div>
+    <nav class="sidebar" id="sidebar"></nav>
+  </div>
+
+  <!-- ===== 右上角关闭 ===== -->
+  <div class="titlebar">
+    <button class="close-btn" id="btn-close" title="关闭设置" aria-label="关闭设置">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+
+  <!-- ===== 右侧内容 ===== -->
+  <div class="body">
+    <div class="content" id="content"></div>
+  </div>
+</div>
+
+<!-- ===== MCP 调用设置覆盖层（初始隐藏，点击 ⓘ 打开） ===== -->
+<div class="overlay hidden" id="overlay"></div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ===== 状态 =====
+const S = {
+  cat: "general",
+  search: "",
+  view: "cat", // cat | recent | results
+  theme: (matchMedia && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light",
+  vals: {
+    always_on_top: true, hide_on_focus_lost: false, show_tray: true, start_minimized: false,
+    pinned_mode: "shared",
+    theme_mode: "system", backdrop: "none", opacity: 0.8, font_scale: 1.0,
+    capture_enabled: true, skip_password: true, dedup: true, dedup_secs: 3,
+    max_items: 10000, max_bytes: 512,
+    hotkey_toggle: ["Ctrl", "Shift", "V"], hotkey_paste: ["Win", "Shift", "V"],
+    mcp_enabled: true,
+    mcp_github: true, mcp_filesystem: true, mcp_sqlite: true, mcp_browser: true,
+    mcp_websearch: true, mcp_calculator: true, mcp_calendar: true, mcp_email: true,
+  },
+};
+
+// 可调用的 MCP 服务清单（默认全部开启）
+const MCPS = [
+  { id: "github", name: "GitHub", desc: "代码仓库、Issue 与 Pull Request", ready: true },
+  { id: "filesystem", name: "文件系统", desc: "读写本地文件与目录", ready: true },
+  { id: "sqlite", name: "SQLite", desc: "本地数据库查询与管理", ready: true },
+  { id: "browser", name: "浏览器", desc: "网页交互与内容提取", ready: true },
+  { id: "websearch", name: "网络搜索", desc: "检索网络信息与资料", ready: true },
+  { id: "calculator", name: "计算器", desc: "数学计算与单位换算", ready: true },
+  { id: "calendar", name: "日历", desc: "日程与提醒管理", ready: false },
+  { id: "email", name: "邮件", desc: "邮件收发与整理", ready: false },
+];
+
+// 最近修改记录：key → 修改时间戳
+const MOD = {};
+function touch(key) { MOD[key] = Date.now(); }
+function untouch(key) { delete MOD[key]; }
+
+// 每个设置项的独立默认值（点行内重置按钮恢复到它）
+const DEFAULTS = {
+  always_on_top: true, hide_on_focus_lost: false, show_tray: true, start_minimized: false,
+  pinned_mode: "shared",
+  theme_mode: "system", backdrop: "none", opacity: 0.8, font_scale: 1.0,
+  capture_enabled: true, skip_password: true, dedup: true, dedup_secs: 3,
+  max_items: 10000, max_bytes: 512,
+  hotkey_toggle: ["Ctrl", "Shift", "V"], hotkey_paste: ["Win", "Shift", "V"],
+  mcp_enabled: true,
+  mcp_github: true, mcp_filesystem: true, mcp_sqlite: true, mcp_browser: true,
+  mcp_websearch: true, mcp_calculator: true, mcp_calendar: true, mcp_email: true,
+};
+
+// ===== 分类与设置项定义 =====
+// kind: switch / seg / slider / num / kbd / plain
+const CATS = [
+  { id: "general", name: "常规", icon: "gear" },
+  { id: "appearance", name: "外观", icon: "palette" },
+  { id: "capture", name: "捕获", icon: "copy" },
+  { id: "storage", name: "存储", icon: "db" },
+  { id: "hotkeys", name: "快捷键", icon: "key" },
+  { id: "comm", name: "通信", icon: "comm" },
+  { id: "about", name: "关于", icon: "info" },
+];
+
+const GROUPS = {
+  general: [
+    { title: "窗口", items: [
+      { kind: "switch", key: "always_on_top", label: "窗口置顶", desc: "始终显示在其它窗口之上" },
+      { kind: "switch", key: "hide_on_focus_lost", label: "失焦时隐藏", desc: "切换到别的程序后隐藏窗口" },
+      { kind: "switch", key: "show_tray", label: "显示托盘图标", desc: "后台常驻，保留右键菜单入口" },
+      { kind: "switch", key: "start_minimized", label: "启动时最小化", desc: "启动后隐藏到托盘" },
+    ]},
+    { title: "置顶布局", items: [
+      { kind: "seg", key: "pinned_mode", label: "置顶模式", desc: "置顶内容在列表中的展示方式",
+        options: [{v:"shared",t:"共用单栏"},{v:"own",t:"独立分栏"}] },
+    ]},
+  ],
+  appearance: [
+    { title: "主题", items: [
+      { kind: "seg", key: "theme_mode", label: "主题", desc: "深色 / 浅色 / 跟随系统",
+        options: [{v:"system",t:"跟随系统"},{v:"dark",t:"深色"},{v:"light",t:"浅色"}] },
+      { kind: "slider", key: "font_scale", label: "字体缩放", desc: "界面字号整体比例", min: 0.8, max: 1.4, step: 0.05, unit: "x", fmt: v => v.toFixed(2) },
+    ]},
+    { title: "背景效果", items: [
+      { kind: "seg", key: "backdrop", label: "窗口背景", desc: "无 / 磨砂（Win11 毛玻璃）/ 半透明",
+        options: [{v:"none",t:"无"},{v:"acrylic",t:"磨砂"},{v:"translucent",t:"半透明"}] },
+      { kind: "slider", key: "opacity", label: "背景不透明度", desc: "磨砂=背景强度，半透明=整窗淡出", min: 0.3, max: 1.0, step: 0.05, unit: "%", fmt: v => Math.round(v*100), disabledWhen: () => S.vals.backdrop === "none" },
+    ]},
+  ],
+  capture: [
+    { title: "记录", items: [
+      { kind: "switch", key: "capture_enabled", label: "记录剪贴板", desc: "关闭后不再新增历史" },
+      { kind: "switch", key: "skip_password", label: "跳过密码字段", desc: "疑似输入密码时不记录" },
+      { kind: "switch", key: "dedup", label: "复制去重", desc: "复制相同内容不再新增记录，自动置顶更新" },
+      { kind: "num", key: "dedup_secs", label: "去重窗口", desc: "该时长内的相同内容视为重复", min: 1, max: 60, unit: "秒" },
+    ]},
+  ],
+  storage: [
+    { title: "容量", items: [
+      { kind: "num", key: "max_items", label: "历史条数上限", desc: "超过后按时间淘汰最旧条目", min: 100, max: 100000, unit: "条" },
+      { kind: "num", key: "max_bytes", label: "单条大小上限", desc: "超过大小的内容不保存", min: 1, max: 4096, unit: "MB" },
+    ]},
+  ],
+  hotkeys: [
+    { title: "全局快捷键", items: [
+      { kind: "kbd", key: "hotkey_toggle", label: "显示 / 隐藏主窗口", desc: "任意应用中按下即唤起" },
+      { kind: "kbd", key: "hotkey_paste", label: "粘贴上一个条目", desc: "直接粘贴最近一次复制" },
+    ]},
+  ],
+  comm: [
+    { title: "MCP 服务", mcp: true, items: [
+      { kind: "switch", key: "mcp_enabled", label: "MCP 服务", desc: "关闭后所有 MCP 调用不可用", info: true },
+    ]},
+  ],
+  about: [
+    { title: "剪贴板管理器", items: [
+      { kind: "plain", label: "版本", desc: "v0.1.0（开发版）" },
+      { kind: "plain", label: "数据目录", desc: "%APPDATA%\\modular-clipboard" },
+      { kind: "plain", label: "技术栈", desc: "Rust · egui · Vulkan（Win32）" },
+    ]},
+    { title: "链接", items: [
+      { kind: "link", label: "项目主页", href: "https://github.com/你的用户名/modular-clipboard", desc: "源码与 Release" },
+      { kind: "link", label: "作者主页", href: "https://github.com/你的用户名", desc: "更多项目与联系方式" },
+    ]},
+  ],
+};
+
+// ===== 图标 =====
+const ICONS = {
+  gear: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.7 1.7 0 0 0 1.87.34h0a1.7 1.7 0 0 0 1-1.55V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l-.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v0a1.7 1.7 0 0 0 1.55 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg>',
+  palette: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22a10 10 0 1 1 10-10c0 2.2-1.8 3-3 3h-2a2 2 0 0 0-2 2 2 2 0 0 1-2 2c-.6 0-1 .4-1 1z"/><circle cx="7.5" cy="10.5" r="1.2"/><circle cx="12" cy="7.5" r="1.2"/><circle cx="16.5" cy="10.5" r="1.2"/></svg>',
+  copy: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
+  db: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>',
+  key: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.5" cy="15.5" r="4.5"/><path d="m11 12 9-9M15 8l3 3"/><path d="m18 5 2 2"/></svg>',
+  comm: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2v5M15 2v5"/><path d="M6 7h12v4a6 6 0 0 1-12 0z"/><path d="M12 17v5"/></svg>',
+  info: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M12 12v5"/></svg>',
+  reset: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>',
+};
+
+// ===== 渲染 =====
+function render() {
+  document.getElementById("sidebar").innerHTML = CATS.map(c =>
+    `<div class="nav-item ${S.cat === c.id ? "active" : ""}" data-cat="${c.id}">${ICONS[c.icon]}<span>${c.name}</span></div>`
+  ).join("");
+  document.querySelectorAll(".nav-item").forEach(el =>
+    el.addEventListener("click", () => { S.cat = el.dataset.cat; S.search = ""; S.view = "cat"; document.getElementById("search").value = ""; document.getElementById("search").blur(); render(); })
+  );
+
+  const box = document.getElementById("content");
+  const q = S.search.trim().toLowerCase();
+  if (q) renderSearch(box, q);
+  else if (S.view === "recent") renderRecent(box);
+  else renderCat(box);
+}
+
+function renderCat(box) {
+  let html = "";
+  GROUPS[S.cat].forEach(g => {
+    html += groupHtml(g);
+  });
+  box.innerHTML = html;
+  bindRows(box);
+}
+
+function catDesc(id) {
+  return { general: "窗口行为与置顶布局", appearance: "主题、背景与字体", capture: "复制记录与去重规则",
+           storage: "历史容量上限", hotkeys: "全局快捷键", comm: "MCP 服务与外部调用", about: "版本与数据信息" }[id] || "";
+}
+
+function isDefault(key) {
+  const cur = S.vals[key], def = DEFAULTS[key];
+  if (Array.isArray(def)) {
+    return Array.isArray(cur) && cur.length === def.length && cur.every((v, i) => v === def[i]);
+  }
+  return cur === def;
+}
+
+function groupHtml(g) {
+  // 只读组（关于页）不显示重置按钮
+  const readonly = g.items.every(it => it.kind === "plain" || it.kind === "link");
+  // 仅当本卡片任一设置项偏离默认值时显示重置按钮
+  // （MCP 卡片还要统计子列表里的每个 MCP 开关）
+  const allChanged = g.items.some(it => it.key && !isDefault(it.key)) ||
+    (g.mcp && MCPS.some(m => !isDefault("mcp_" + m.id)));
+  const changed = !readonly && allChanged;
+  let html = `<div class="group"><div class="group-header"><span class="group-title">${g.title}</span>`;
+  if (changed) html += `<button class="group-reset" data-group-reset title="重置本卡片">${ICONS.reset}</button>`;
+  html += `</div>`;
+  g.items.forEach(it => { html += rowHtml(it); });
+  // MCP 卡片：总开关开启时在卡片内展开所有可调用开关
+  if (g.mcp) html += mcpListHtml();
+  html += `</div>`;
+  return html;
+}
+
+// MCP 子列表：总开关开启时显示；关闭时整块隐藏（MCP 无法调用）
+function mcpListHtml() {
+  if (!S.vals.mcp_enabled) return "";
+  const on = MCPS.filter(m => S.vals["mcp_" + m.id]).length;
+  let html = `<div class="mcp-list"><div class="mcp-list-title">可调用 MCP <span class="count">${on}/${MCPS.length}</span></div>`;
+  MCPS.forEach(m => {
+    const enabled = S.vals["mcp_" + m.id];
+    html += `<div class="mcp-row ${S.vals.mcp_enabled ? "" : "disabled"}">
+      <div class="label">${m.name}<small>${m.desc}</small></div>
+      <span class="mcp-badge ${m.ready ? "on" : ""}">${m.ready ? "已连接" : "未连接"}</span>
+      <label class="switch"><input type="checkbox" data-key="mcp_${m.id}" ${enabled ? "checked" : ""}><span class="track"></span></label>
+    </div>`;
+  });
+  html += `</div>`;
+  return html;
+}
+
+function findCatOf(key) {
+  for (const c of CATS) for (const g of (GROUPS[c.id] || [])) for (const it of g.items)
+    if (it.key === key) return { cat: c, item: it };
+  return null;
+}
+
+// 最近修改的设置：按修改时间倒序，点击跳转对应分类
+function renderRecent(box) {
+  const keys = Object.keys(MOD).sort((a, b) => MOD[b] - MOD[a]);
+  let html = `<div class="page-title">最近修改</div>`;
+  if (!keys.length) {
+    html += `<div class="search-empty">还没有修改过设置</div>`;
+    box.innerHTML = html;
+    return;
+  }
+  html += `<div class="page-desc">最近改动的设置，点击直接跳转</div><div class="group">`;
+  keys.slice(0, 8).forEach(k => {
+    const hit = findCatOf(k);
+    if (!hit) return;
+    html += `<div class="row" style="cursor:pointer" data-jump="${hit.cat.id}">
+      <div class="label">${hit.item.label}<small>${hit.cat.name}</small></div>
+      ${ICONS[hit.cat.icon]}</div>`;
+  });
+  html += `</div>`;
+  box.innerHTML = html;
+  box.querySelectorAll("[data-jump]").forEach(el => {
+    el.addEventListener("click", () => {
+      S.cat = el.dataset.jump; S.search = ""; S.view = "cat";
+      document.getElementById("search").value = "";
+      render();
+    });
+  });
+}
+
+function renderSearch(box, q) {
+  const hits = [];
+  CATS.forEach(c => {
+    (GROUPS[c.id] || []).forEach(g => {
+      g.items.forEach(it => {
+        if ((it.label + (it.desc || "")).toLowerCase().includes(q)) hits.push({ cat: c, item: it });
+      });
+    });
+  });
+  if (!hits.length) {
+    renderRecent(box); // 搜索结果为空时展示最近修改的设置
+    return;
+  }
+  let html = `<div class="page-title">搜索结果</div><div class="page-desc">“${S.search}” 共 ${hits.length} 项</div>`;
+  let lastCat = "";
+  hits.forEach(h => {
+    if (h.cat.id !== lastCat) { lastCat = h.cat.id; html += `<div class="search-hit hit-group">${h.cat.name}</div>`; }
+    html += groupHtml({ title: h.item.label, items: [h.item] });
+  });
+  box.innerHTML = html;
+  bindRows(box);
+}
+
+function rowHtml(it) {
+  // 带左侧信息按钮的开关行（MCP 总开关）：按钮在标签左侧，点击打开覆盖层
+  const info = it.info ? `<button class="info-btn" data-info="${it.key}" title="MCP 调用设置" aria-label="MCP 调用设置">
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M12 12v5"/></svg></button>` : "";
+  return `<div class="row"><div class="label">${info}${it.label}<small>${it.desc || ""}</small></div>${rowBody(it)}</div>`;
+}
+
+function rowBody(it) {
+  switch (it.kind) {
+    case "switch": {
+      const on = S.vals[it.key];
+      return `<label class="switch"><input type="checkbox" data-key="${it.key}" ${on ? "checked" : ""}><span class="track"></span></label>`;
+    }
+    case "seg": {
+      const cur = S.vals[it.key];
+      return `<div class="seg" data-key="${it.key}">${it.options.map(o =>
+        `<button type="button" data-v="${o.v}" class="${cur === o.v ? "on" : ""}">${o.t}</button>`).join("")}</div>`;
+    }
+    case "slider": {
+      const dis = it.disabledWhen && it.disabledWhen();
+      return `<div class="slider ${dis ? "disabled" : ""}">
+        <input type="range" data-key="${it.key}" min="${it.min}" max="${it.max}" step="${it.step}"
+               value="${S.vals[it.key]}" ${dis ? "disabled" : ""}>
+        <span class="val">${it.fmt(S.vals[it.key])}</span></div>`;
+    }
+    case "num": {
+      return `<input class="num" type="number" data-key="${it.key}" min="${it.min}" max="${it.max}"
+              value="${S.vals[it.key]}"><span class="num-unit">${it.unit}</span>`;
+    }
+    case "kbd": {
+      return `<div class="kbd">${S.vals[it.key].map(k => `<span class="key">${k}</span>`).join("")}</div>
+              <button class="record-btn" data-kbd="${it.key}">录制</button>`;
+    }
+    case "link": {
+      return `<a class="link" href="${it.href}" target="_blank" rel="noopener">${it.desc || it.href}</a>`;
+    }
+    case "plain": {
+      return `<span class="num-unit" style="font-size:13px">${it.desc}</span>`;
+    }
+  }
+  return "";
+}
+
+function bindRows(box) {
+  box.querySelectorAll("input[type=checkbox]").forEach(el => {
+    el.addEventListener("change", () => {
+      S.vals[el.dataset.key] = el.checked; touch(el.dataset.key);
+      // MCP 总开关：控制整个子列表显隐；单个 MCP 开关仅重画计数
+      if (el.dataset.key === "mcp_enabled") render();
+      else if (el.dataset.key && el.dataset.key.startsWith("mcp_")) {
+        // 只更新计数徽标，不整体重渲染（避免滚动位置跳动）
+        const on = MCPS.filter(m => S.vals["mcp_" + m.id]).length;
+        const count = box.querySelector(".mcp-list-title .count");
+        if (count) count.textContent = `${on}/${MCPS.length}`;
+        // 覆盖层开着时同步其中的开关状态
+        const ov = document.querySelector(".overlay");
+        if (ov) renderOverlay();
+      }
+    });
+  });
+  box.querySelectorAll(".info-btn").forEach(el => {
+    el.addEventListener("click", () => { openMcpOverlay(); });
+  });
+  box.querySelectorAll(".seg button").forEach(el => {
+    el.addEventListener("click", () => {
+      const seg = el.closest(".seg"); const key = seg.dataset.key;
+      S.vals[key] = el.dataset.v;
+      if (key === "theme_mode") applyThemeMode(S.vals.theme_mode);
+      touch(key);
+      render();
+    });
+  });
+  box.querySelectorAll("input[type=range]").forEach(el => {
+    el.addEventListener("input", () => {
+      S.vals[el.dataset.key] = parseFloat(el.value);
+      touch(el.dataset.key);
+      const it = findItem(el.dataset.key);
+      el.nextElementSibling.textContent = it ? it.fmt(parseFloat(el.value)) : el.value;
+    });
+  });
+  box.querySelectorAll("input[type=number]").forEach(el => {
+    el.addEventListener("change", () => {
+      let v = parseFloat(el.value);
+      if (!isFinite(v)) v = el.min;
+      v = Math.min(Math.max(v, parseFloat(el.min)), parseFloat(el.max));
+      el.value = v; S.vals[el.dataset.key] = v; touch(el.dataset.key);
+    });
+  });
+  box.querySelectorAll(".record-btn").forEach(el => {
+    el.addEventListener("click", () => {
+      const key = el.dataset.kbd;
+      el.textContent = "按组合键…";
+      const orig = S.vals[key].slice();
+      window.__record = { done: (combo) => { S.vals[key] = (combo && combo.length) ? combo : orig; touch(key); render(); } };
+      setTimeout(() => { if (window.__record) { window.__record = null; render(); } }, 5000);
+    });
+  });
+  // 整卡片重置：恢复本卡片内所有设置项默认值，并清除其修改记录
+  box.querySelectorAll(".group-reset").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const group = btn.closest(".group");
+      const keys = [...new Set([...group.querySelectorAll("[data-key]")].map(el => el.dataset.key))];
+      // MCP 卡片：子列表开关也一并重置
+      if (group.querySelector(".mcp-list")) {
+        MCPS.forEach(m => keys.push("mcp_" + m.id));
+      }
+      const title = group.querySelector(".group-title")?.textContent || "";
+      keys.forEach(k => { S.vals[k] = (typeof DEFAULTS[k] === "object") ? DEFAULTS[k].slice() : DEFAULTS[k]; untouch(k); });
+      render();
+      toast(`已恢复默认：${title}`);
+    });
+  });
+}
+
+// ===== MCP 调用设置覆盖层 =====
+function openMcpOverlay() {
+  const ov = document.getElementById("overlay");
+  ov.classList.remove("hidden");
+  renderOverlay();
+}
+function closeMcpOverlay() {
+  document.getElementById("overlay").classList.add("hidden");
+}
+function renderOverlay() {
+  const ov = document.getElementById("overlay");
+  const enabled = S.vals.mcp_enabled;
+  const on = MCPS.filter(m => S.vals["mcp_" + m.id]).length;
+  ov.innerHTML = `<div class="overlay">
+    <div class="overlay-panel">
+      <div class="overlay-head">
+        <div><div class="t">MCP 调用设置</div>
+        <div class="sub">Model Context Protocol · 共 ${MCPS.length} 个服务，${enabled ? on : 0} 个可调用</div></div>
+        <button class="overlay-close" data-overlay-close title="关闭" aria-label="关闭">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="overlay-body">
+        <div class="overlay-summary ${enabled ? "" : "off"}">
+          <span class="dot"></span>
+          ${enabled ? "MCP 服务已开启，以下服务可被调用" : "MCP 服务已关闭，所有服务均无法调用"}
+        </div>
+        ${MCPS.map(m => {
+          const onState = S.vals["mcp_" + m.id];
+          return `<div class="mcp-row">
+            <div class="label">${m.name}<small>${m.desc}</small></div>
+            <span class="mcp-badge ${m.ready ? "on" : ""}">${m.ready ? "已连接" : "未连接"}</span>
+            <label class="switch"><input type="checkbox" data-mcp-key="mcp_${m.id}" ${enabled && onState ? "checked" : ""} ${enabled ? "" : "disabled"}><span class="track"></span></label>
+          </div>`;
+        }).join("")}
+      </div>
+      <div class="overlay-foot">
+        <button class="btn" data-overlay-close>取消</button>
+        <button class="btn primary" data-overlay-done>完成</button>
+      </div>
+    </div>
+  </div>`;
+  ov.querySelectorAll("[data-overlay-close]").forEach(el =>
+    el.addEventListener("click", closeMcpOverlay));
+  ov.querySelector("[data-overlay-done]").addEventListener("click", closeMcpOverlay);
+  ov.querySelector(".overlay").addEventListener("click", (e) => {
+    if (e.target === e.currentTarget) closeMcpOverlay();
+  });
+  ov.querySelectorAll("input[data-mcp-key]").forEach(el => {
+    el.addEventListener("change", () => {
+      S.vals[el.dataset.mcpKey] = el.checked; touch(el.dataset.mcpKey);
+      renderOverlay();
+      // 同步卡片内列表（若当前在通信页）
+      render();
+    });
+  });
+}
+
+function findItem(key) {
+  for (const c of CATS) for (const g of (GROUPS[c.id] || [])) for (const it of g.items)
+    if (it.key === key) return it;
+  return null;
+}
+
+// ===== 键盘：全局快捷键录制 =====
+document.addEventListener("keydown", (e) => {
+  if (!window.__record) return;
+  e.preventDefault();
+  const mods = [];
+  if (e.ctrlKey) mods.push("Ctrl");
+  if (e.shiftKey) mods.push("Shift");
+  if (e.altKey) mods.push("Alt");
+  if (e.metaKey) mods.push("Win");
+  const k = e.key.length === 1 ? e.key.toUpperCase() :
+    ({ " ": "Space", ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→" }[e.key] || e.key);
+  if (!["Control", "Shift", "Alt", "Meta"].includes(e.key)) {
+    const combo = mods.concat(k);
+    const done = window.__record.done;
+    window.__record = null;
+    done(combo);
+  }
+});
+
+// ===== 主题：由「外观 → 主题」设置项统一控制 =====
+function applyThemeMode(mode) {
+  const sys = matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  applyTheme(mode === "system" ? sys : mode);
+}
+function applyTheme(t) {
+  const light = t === "light";
+  const r = document.documentElement.style;
+  r.setProperty("--bg", light ? "#f2f4f7" : "#1e1f22");
+  r.setProperty("--sidebar", light ? "#f7f8fa" : "#222428");
+  r.setProperty("--content", light ? "#f2f4f7" : "#1e1f22");
+  r.setProperty("--card", light ? "#ffffff" : "#2b2d31");
+  r.setProperty("--text", light ? "#1f1f1f" : "#e8e8e8");
+  r.setProperty("--text-dim", light ? "#616161" : "#9a9a9a");
+  r.setProperty("--border", light ? "#e2e5ea" : "#3a3c40");
+  r.setProperty("--hover", light ? "#f0f1f4" : "#2e3035");
+  r.setProperty("--active", light ? "#e6e8ee" : "#35373c");
+  r.setProperty("--accent", light ? "#0067c0" : "#60a8ff");
+  r.setProperty("--accent-bg", light ? "#e8f1fb" : "#26344a");
+  r.setProperty("--switch-off", light ? "#c8c8c8" : "#5a5a5a");
+}
+
+// 搜索框：点击（空）显示最近修改；输入后显示搜索结果；失焦（空）恢复分类
+const searchEl = document.getElementById("search");
+searchEl.addEventListener("focus", () => {
+  if (!S.search.trim()) { S.view = "recent"; render(); }
+});
+searchEl.addEventListener("input", (e) => {
+  S.search = e.target.value;
+  S.view = S.search.trim() ? "results" : "cat";
+  render();
+});
+searchEl.addEventListener("blur", () => {
+  setTimeout(() => {
+    if (!S.search.trim()) { S.view = "cat"; render(); }
+  }, 180);
+});
+
+// 初始渲染：按「主题」设置项（默认跟随系统）应用外观
+applyThemeMode(S.vals.theme_mode);
+// 支持 #分类名 直达（如 #comm），方便原型演示各分类效果
+{
+  const want = location.hash.slice(1);
+  if (CATS.some(c => c.id === want)) { S.cat = want; S.view = "cat"; }
+}
+render();
+
+// 关闭按钮（原型演示）
+document.getElementById("btn-close").addEventListener("click", () => {
+  toast("关闭设置（原型演示）");
+});
+
+let toastTimer;
+function toast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 1800);
+}
+
+render();
+</script>
+</body>
+</html>
