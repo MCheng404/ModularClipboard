@@ -664,17 +664,34 @@ mod tests {
     ///
     /// `hit_test` 不碰 Win32，只需要一个能区分身份的值。用明显不像
     /// 真句柄的数（0xA 起），即便哪天误传给 Win32 也容易看出来。
+    ///
+    /// ⚠️ **每条测试必须用自己专属的句柄**。
+    ///
+    /// `CHROME` 是**进程级**全局表（`OnceLock<Mutex<Vec<…>>>`）——
+    /// per-HWND 指的是「按 HWND 索引」，不是「每窗一份存储」。
+    /// cargo 默认**并行**跑测试，两条测试若共用同一个假句柄，就会
+    /// 互相看见对方的写入：实测 `multi_drag_regions_round_trip` 在
+    /// `drag_regions_are_isolated_per_window` 的 `forget(A)` 落地时
+    /// 读到空 vec，panic 于 `index out of bounds: len is 0`。
+    /// 那看起来是「测试偶发不稳」，真因是测试之间串了状态。
     const TEST_HWND_A: HWND = HWND(0xA11 as *mut std::ffi::c_void);
     const TEST_HWND_B: HWND = HWND(0xB22 as *mut std::ffi::c_void);
     const TEST_HWND_C: HWND = HWND(0xC33 as *mut std::ffi::c_void);
+    // 以下三条各自的专用句柄，见上面的说明。
+    const HWND_ROUND_TRIP: HWND = HWND(0xD44 as *mut std::ffi::c_void);
+    const HWND_MULTI: HWND = HWND(0xE55 as *mut std::ffi::c_void);
+    const HWND_BORDER: HWND = HWND(0xF66 as *mut std::ffi::c_void);
 
     #[test]
     fn drag_region_round_trips() {
         let r = Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0));
-        set_drag_region(TEST_HWND_A, Some(r));
-        assert_eq!(drag_regions(TEST_HWND_A), vec![r]);
-        set_drag_region(TEST_HWND_A, None);
-        assert!(drag_regions(TEST_HWND_A).is_empty(), "None 必须真的禁用拖动区");
+        set_drag_region(HWND_ROUND_TRIP, Some(r));
+        assert_eq!(drag_regions(HWND_ROUND_TRIP), vec![r]);
+        set_drag_region(HWND_ROUND_TRIP, None);
+        assert!(
+            drag_regions(HWND_ROUND_TRIP).is_empty(),
+            "None 必须真的禁用拖动区"
+        );
     }
 
     /// **窗口之间不得串味**——这是改成 per-HWND 要解决的那个 bug。
@@ -724,13 +741,13 @@ mod tests {
             Rect::from_min_max(p(80.0, 0.0), p(110.0, 32.0)),
             Rect::from_min_max(p(160.0, 0.0), p(200.0, 32.0)),
         ];
-        set_drag_regions(TEST_HWND_A, &segs);
-        assert_eq!(drag_regions(TEST_HWND_A).len(), 3, "三段都应保留");
+        set_drag_regions(HWND_MULTI, &segs);
+        assert_eq!(drag_regions(HWND_MULTI).len(), 3, "三段都应保留");
         for (i, s) in segs.iter().enumerate() {
-            assert_eq!(drag_regions(TEST_HWND_A)[i], *s, "第 {i} 段应原样往返");
+            assert_eq!(drag_regions(HWND_MULTI)[i], *s, "第 {i} 段应原样往返");
         }
-        set_drag_regions(TEST_HWND_A, &[]);
-        assert!(drag_regions(TEST_HWND_A).is_empty());
+        set_drag_regions(HWND_MULTI, &[]);
+        assert!(drag_regions(HWND_MULTI).is_empty());
     }
 
     /// 拖动区里的点判`Caption`，区外的点判 `Client`。
@@ -756,12 +773,12 @@ mod tests {
 
     #[test]
     fn resize_border_round_trips() {
-        set_resize_border(TEST_HWND_A, 9.5);
-        assert_eq!(resize_border(TEST_HWND_A), 9.5);
-        set_resize_border(TEST_HWND_A, DEFAULT_RESIZE_BORDER);
-        assert_eq!(resize_border(TEST_HWND_A), DEFAULT_RESIZE_BORDER);
+        set_resize_border(HWND_BORDER, 9.5);
+        assert_eq!(resize_border(HWND_BORDER), 9.5);
+        set_resize_border(HWND_BORDER, DEFAULT_RESIZE_BORDER);
+        assert_eq!(resize_border(HWND_BORDER), DEFAULT_RESIZE_BORDER);
         // 负值禁用（钳到 0），不该出现负边框。
-        set_resize_border(TEST_HWND_A, -3.0);
-        assert_eq!(resize_border(TEST_HWND_A), 0.0, "负边框应钳到 0");
+        set_resize_border(HWND_BORDER, -3.0);
+        assert_eq!(resize_border(HWND_BORDER), 0.0, "负边框应钳到 0");
     }
 }

@@ -1175,6 +1175,7 @@ impl App {
                 area,
                 // `None` = 画主窗口（顶栏 + 全部停靠卡片）。
                 card_id: None,
+                hit_ns: crate::paint::HitNs::Main,
             };
             crate::paint::draw(&mut frame);
         }
@@ -1322,6 +1323,7 @@ impl App {
             scale: ppp,
             area,
             card_id: Some(card_id),
+            hit_ns: crate::paint::HitNs::Child(card_id),
         };
         crate::paint::draw_child(&mut frame);
         // 子窗口里的操作（点叉收回、点拖动条收回）也要落地。
@@ -1347,6 +1349,7 @@ impl App {
             scale: ppp,
             area,
             card_id: None,
+            hit_ns: crate::paint::HitNs::Settings,
         };
         crate::paint::draw_settings(&mut frame);
         // 设置项的改动要立刻落盘——用户在设置窗口里点了开关就

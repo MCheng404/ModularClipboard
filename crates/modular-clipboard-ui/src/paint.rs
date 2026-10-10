@@ -199,10 +199,72 @@ pub struct UiState {
     //
     // 这里让绘制层把真实矩形登记进来，测试只读。代价是生产代码多
     // 几个 Rect 的写入（可忽略），换来的是「布局改了测试自动跟随」。
-    /// 本帧各命名热区的矩形（逻辑点）。
-    pub hit: std::collections::HashMap<&'static str, Rect>,
+    /// 本帧各命名热区的矩形（逻辑点），**按窗口命名空间分隔**。
+    ///
+    /// ⚠️ 必须按窗口分开：主窗口、设置窗口、每个子窗口是**不同的
+    /// 坐标空间**，却共用同一个 `UiState`（因此共用一张热区表）。
+    /// 早前是一张 flat map、且只有主窗口的 `draw()` 会 clear，于是：
+    ///
+    /// - 设置窗口写进来的热区**永不清空**——关窗后仍留在表里，
+    ///   自动化按它去点会点到「上一次的位置」甚至点到空气；
+    /// - 主窗口隐藏（停止绘制）时，它自己的热区也**永不过期**；
+    /// - 同名 key（`history_body` 等）在窗口之间互相覆盖。
+    ///
+    /// 每个绘制入口在开始时会清空**自己那一份**，互不影响。
+    pub hit: HitTable,
     /// 关闭 / 最小化请求。
     pub close_requested: bool,
+}
+
+/// 热区属于**哪个窗口**。
+///
+/// 子窗口按卡片 Id 区分：同一时刻可以有多个子窗口，混在一张表里
+/// 彼此覆盖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HitNs {
+    /// 主窗口。
+    Main,
+    /// 附属子窗口：负责画 `id` 这张卡片。
+    Child(crate::card::CardId),
+    /// 设置窗口。
+    Settings,
+}
+
+/// 按窗口分隔的热区表（见 [`UiState::hit`]）。
+#[derive(Default)]
+pub struct HitTable(std::collections::HashMap<HitNs, HitMap>);
+
+type HitMap = std::collections::HashMap<&'static str, Rect>;
+
+impl HitTable {
+    /// 清空某个窗口的热区。每个绘制入口开工前调一次。
+    pub fn clear(&mut self, ns: HitNs) {
+        self.0.remove(&ns);
+    }
+
+    /// 登记一个热区。
+    pub fn insert(&mut self, ns: HitNs, key: &'static str, r: Rect) {
+        self.0.entry(ns).or_default().insert(key, r);
+    }
+
+    /// 查某个窗口的热区。
+    pub fn get(&self, ns: HitNs, key: &str) -> Option<Rect> {
+        self.0.get(&ns).and_then(|m| m.get(key).copied())
+    }
+
+    /// 某个窗口是否登记了该热区。
+    pub fn contains_key(&self, ns: HitNs, key: &str) -> bool {
+        self.0.get(&ns).is_some_and(|m| m.contains_key(key))
+    }
+
+    /// 某个窗口登记的所有 key（顺序不定，断言前请排序）。
+    pub fn keys(&self, ns: HitNs) -> Vec<&'static str> {
+        self.0
+            .get(&ns)
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
 }
 
 impl UiState {
@@ -225,6 +287,20 @@ impl UiState {
     /// 写某个列表的滚动偏移（见 [`Self::list_scroll`]）。
     pub fn set_list_scroll(&mut self, pinned: bool, v: f32) {
         self.list_scroll[usize::from(pinned)] = v;
+    }
+
+    // ---- 热区（`Frame` 的便捷方法转到这儿来）----
+    //
+    // 显式带 ns 的版本留给 `Frame` 之外的使用方（测试）。
+
+    /// 把热区写进**指定窗口**的命名空间。
+    pub fn hit_insert_to(&mut self, ns: HitNs, key: &'static str, r: Rect) {
+        self.hit.insert(ns, key, r);
+    }
+
+    /// 从**指定窗口**的命名空间读热区。
+    pub fn hit_get_from(&self, ns: HitNs, key: &str) -> Option<Rect> {
+        self.hit.get(ns, key)
     }
 }
 
@@ -251,6 +327,30 @@ pub struct Frame<'a> {
     /// ⚠️ 不能在 `draw_child` 里"找第一张 host==Window 的卡片"：
     /// 详情与视图都是 Window 型，两个子窗口会各自找到同一张卡片。
     pub card_id: Option<crate::card::CardId>,
+    /// 本帧的热区写到**哪个窗口的命名空间**。
+    ///
+    /// 由构造方给出，绘制代码经 [`Self::hit_insert`] 写入时不接触它——
+    /// 免得某个窗口的控件被误标成另一个窗口的（那正是这次要修的
+    /// 问题本身）。
+    pub hit_ns: HitNs,
+}
+
+impl<'a> Frame<'a> {
+    /// 清空本窗口的热区。每个绘制入口开工前调一次。
+    pub fn hit_clear(&mut self) {
+        self.state.hit.clear(self.hit_ns);
+    }
+
+    /// 登记一个热区到本窗口。
+    pub fn hit_insert(&mut self, key: &'static str, r: Rect) {
+        let ns = self.hit_ns;
+        self.state.hit_insert_to(ns, key, r);
+    }
+
+    /// 读本窗口的热区。
+    pub fn hit_get(&self, key: &str) -> Option<Rect> {
+        self.state.hit_get_from(self.hit_ns, key)
+    }
 }
 
 /// 画一个**独立子窗口**的整帧内容。
@@ -265,6 +365,9 @@ pub struct Frame<'a> {
 pub fn draw_child(f: &mut Frame<'_>) {
     let area = f.area;
     f.ui.painter().rect_filled(area, 0.0, f.pal.bg);
+
+    // 子窗口有自己的一套坐标，热区必须写在自己的命名空间里。
+    f.hit_clear();
 
     // 找到本窗口对应的那张卡片。
     //
@@ -331,7 +434,7 @@ pub fn draw(f: &mut Frame<'_>) {
     // 热区是**每帧重算**的：跨帧留着旧值会让测试点到一个
     // 「上一帧存在、这一帧已消失」的位置，症状是改了布局后
     // 测试仍通过但测的是空气。
-    f.state.hit.clear();
+    f.hit_clear();
     draw_topbar(f, top);
     draw_cards(f, body);
 
@@ -400,7 +503,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
         pos2(btn_area.min.x - pal.space_md - sq * 0.5, bar.center().y),
         vec2(sq, sq),
     );
-    f.state.hit.insert("search_icon", search_icon_r);
+    f.hit_insert("search_icon", search_icon_r);
     if search_toggle_button(f, search_icon_r) {
         f.state.search_expanded = !f.state.search_expanded;
         if f.state.search_expanded {
@@ -465,7 +568,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     // 重叠，于是点齿轮变成拖窗口。
     //
     // 用热区表里按钮的真实矩形——它就是按钮实际交互的区域。
-    let settings_r = f.state.hit.get("topbar_settings").copied();
+    let settings_r = f.hit_get("topbar_settings");
     let right_start = settings_r.map(|r| r.max.x).unwrap_or(btn_area.max.x);
     if bar.max.x - right_start > 8.0 {
         drag.push(Rect::from_min_max(
@@ -522,9 +625,9 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
 
     // 登记热区给测试用（见 `UiState::hit` 的说明）。**必须在点击判定
     // 之前登记**：`draw_topbar` 随后要读这张表来挖拖动区。
-    f.state.hit.insert("topbar_close", r_close);
-    f.state.hit.insert("topbar_clear", r_clear);
-    f.state.hit.insert("topbar_settings", r_set);
+    f.hit_insert("topbar_close", r_close);
+    f.hit_insert("topbar_clear", r_clear);
+    f.hit_insert("topbar_settings", r_set);
 
     if icon_button(f, "topbar_close", r_close, Icon::Minimize, "关闭到托盘", false) {
         f.state.push(Op::CloseWindow);
@@ -655,8 +758,8 @@ fn draw_search(f: &mut Frame<'_>, r: Rect) {
     // 没有 `search_box` 这条热区，`topbar_controls_are_not_in_drag_region`
     // 就探测不到那个 bug：输入区左缘与拖动区终点只差 2pt，四角全落在
     // 拖动区**之外**，测试照样绿。
-    f.state.hit.insert("search_box", r);
-    f.state.hit.insert("search", edit_rect);
+    f.hit_insert("search_box", r);
+    f.hit_insert("search", edit_rect);
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
             // ⚠️ **必须给显式 id**。不给的话 egui 按调用位置自动生成，
@@ -807,6 +910,12 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     // 不该再让调用方传一个进来（那两个值必须一致，传错就是 bug）。
     let area = f.area;
 
+    // ⚠️ 清空必须**早于**下面所有提前 return。
+    //
+    // 若只在「画成了」的路径里清，那么某一帧尺寸异常跳过绘制时，
+    // 上一帧的热区就留在表里——自动化拿着它去点，点的是不存在的位置。
+    f.hit_clear();
+
     // ⚠️ **首帧的 `area` 可能荒谬**（实测 6666x6666）。
     //
     // `ui.max_rect()` 取的是子 `Ui` 的可用矩形，而首帧 `screen_rect`
@@ -895,7 +1004,7 @@ fn settings_header(f: &mut Frame<'_>, ui: &mut Ui) {
                 egui::Rect::from_center_size(r.center(), egui::vec2(12.0, 12.0) * scale),
                 if btn.hovered() { f.pal.text_bright } else { f.pal.text_dim },
             );
-            f.state.hit.insert("settings_close", r);
+            f.hit_insert("settings_close", r);
             let clicked = btn.clicked();
             btn.on_hover_text("关闭设置");
             if clicked {
@@ -1070,7 +1179,7 @@ fn settings_body(f: &mut Frame<'_>, ui: &mut Ui) {
         ),
     );
     // 自报热区供测试定位（见 `UiState::hit` 的说明）。
-    f.state.hit.insert("settings_quit", quit_resp.rect);
+    f.hit_insert("settings_quit", quit_resp.rect);
     if quit_resp.clicked() {
         f.state.push(Op::Quit);
     }
@@ -1168,7 +1277,7 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // 而所有断言都通过（它们只读得到的那一个键）。
     //
     // 逐个登记还有一个好处：测试能逐项核对边界，而不是只看最后一个。
-    f.state.hit.insert(id_suffix, rect);
+    f.hit_insert(id_suffix, rect);
     *v != on
 }
 
@@ -1543,7 +1652,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     //
     // 两个列表（主栏 / 内嵌置顶区）必须用**不同 key**：`hit` 是
     // `HashMap<&str, Rect>`，同名会互相覆盖（settings 开关就踩过）。
-    f.state.hit.insert(
+    f.hit_insert(
         if only_pinned == Some(true) {
             "pinned_body"
         } else {
@@ -2586,6 +2695,7 @@ fn with_pinned(mut self, n: usize) -> Self {
                     scale: ppp,
                     area,
                     card_id: None,
+                    hit_ns: HitNs::Main,
                 };
                 draw(&mut f);
             });
@@ -2627,6 +2737,7 @@ fn with_pinned(mut self, n: usize) -> Self {
                     scale: ppp,
                     area,
                     card_id: None,
+                    hit_ns: HitNs::Settings,
                 };
                 draw_settings(&mut f);
             });
@@ -2672,11 +2783,24 @@ fn with_pinned(mut self, n: usize) -> Self {
     ///
     /// 坐标由绘制层自报（`UiState::hit`），测试**不自己算**——
     /// 早前自己估算导致所有点击落在按钮外、测试全失败。
+    /// 主窗口的热区。
     fn hit(h: &Harness, name: &str) -> Rect {
-        *h.state
+        hit_in(h, HitNs::Main, name)
+    }
+
+    /// 设置窗口的热区。
+    ///
+    /// ⚠️ 不能直接从共享表读：主窗口与设置窗口是**两套坐标**，
+    /// 共表会让自动化拿着设置窗口的坐标去点主窗口。
+    fn settings_hit(h: &Harness, name: &str) -> Rect {
+        hit_in(h, HitNs::Settings, name)
+    }
+
+    fn hit_in(h: &Harness, ns: HitNs, name: &str) -> Rect {
+        h.state
             .hit
-            .get(name)
-            .unwrap_or_else(|| panic!("热区 {name} 未登记（首帧后才有）"))
+            .get(ns, name)
+            .unwrap_or_else(|| panic!("热区 {name:?} 未在 {ns:?} 里登记（首帧后才有）"))
     }
 
     /// 设置（齿轮）按钮矩形。
@@ -2731,11 +2855,11 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.state.show_settings = true;
         h.settings_frame();
         assert!(
-            h.state.hit.contains_key("settings_close"),
+            h.state.hit.contains_key(HitNs::Settings, "settings_close"),
             "前置条件：面板应登记关闭按钮热区，实际={:?}",
-            h.state.hit.keys().collect::<Vec<_>>()
+            h.state.hit.keys(HitNs::Settings)
         );
-        let p = hit(&h, "settings_close").center();
+        let p = settings_hit(&h, "settings_close").center();
         h.settings_click_at(p);
         // 关闭按钮把 `show_settings` 置回 false（不走 Op——
         // 它改的是本窗口的可见性，不是工作区状态）。
@@ -2941,9 +3065,9 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 头部不再登记任何按钮热区。
         for name in ["card_collapse", "card_detach"] {
             assert!(
-                !h.state.hit.contains_key(name),
+                !h.state.hit.contains_key(HitNs::Main, name),
                 "卡片头部不应再登记 {name} 热区，实际热区={:?}",
-                h.state.hit.keys().collect::<Vec<_>>()
+                h.state.hit.keys(HitNs::Main)
             );
         }
         // 点头部右侧（原先两枚按钮所在的位置）不产生任何**卡片结构**操作。
@@ -2962,7 +3086,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 编译期能保证的已由「`Op` 枚举无这些变体」保证，
         // 这里跑一帧确认界面确实画出来了（否则上面的断言是空跑）。
         assert!(
-            !h.state.hit.is_empty(),
+            !h.state.hit.keys(HitNs::Main).is_empty(),
             "应至少登记一处热区，否则上面的点击断言没有意义"
         );
     }
@@ -3007,17 +3131,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.state.show_settings = true;
         h.settings_frame();
 
-        let rect = h
-            .state
-            .hit
-            .get("settings_quit")
-            .copied()
-            .unwrap_or_else(|| {
-                panic!(
-                    "设置面板应登记「退出程序」按钮热区，实际热区={:?}",
-                    h.state.hit.keys().collect::<Vec<_>>()
-                )
-            });
+        let rect = settings_hit(&h, "settings_quit");
         let ops = h.settings_click_at(rect.center());
         assert!(
             ops.iter().any(|o| matches!(o, Op::Quit)),
@@ -3138,7 +3252,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("pin-empty", vec2(700.0, 600.0)).with_items(5);
         h.frame();
         assert!(
-            !h.state.hit.contains_key("pinned_body"),
+            !h.state.hit.contains_key(HitNs::Main, "pinned_body"),
             "没有置顶条目时不应绘制置顶区（否则白占一条横幅）"
         );
         let history = hit(&h, "history_body");
@@ -3222,8 +3336,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let body = h
             .state
             .hit
-            .get("history_body")
-            .copied()
+            .get(HitNs::Main, "history_body")
             .expect("历史列表应自报 `history_body` 热区");
         let hist = h
             .ws
@@ -3399,8 +3512,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let body = h
             .state
             .hit
-            .get("history_body")
-            .copied()
+            .get(HitNs::Main, "history_body")
             .expect("历史列表应自报 `history_body` 热区");
         assert!(body.height() > 60.0, "历史卡片应有可用高度，实际={body:?}");
 
@@ -3451,6 +3563,55 @@ fn with_pinned(mut self, n: usize) -> Self {
              body={body:?} 实际={top:?}"
         );
     }
+
+    /// 热区必须**按窗口分开**：一个窗口的绘制不得清掉另一个的。
+    ///
+    /// # 守的是什么
+    ///
+    /// 主窗口、设置窗口、每个子窗口共用同一个 `UiState` —— 因此也
+    /// 共用同一张热区表 —— 但它们各自有一套**坐标**。早前那张表是
+    /// flat 的，且只有主窗口的 `draw()` 会 `clear()`，于是：
+    ///
+    /// - 画完主窗口，设置窗口刚登记的坐标**没了**；
+    /// - 反过来设置窗口写的坐标**永不清空**，关窗后仍留在表里，
+    ///   自动化拿着它去点的是「上次的位置」甚至空气。
+    ///
+    /// # 为什么这条能抓到
+    ///
+    /// 断言的是**跨绘制**的并存关系，而共享 flat 表做不到并存：
+    /// 两帧之后必有一方的坐标被清掉。
+    #[test]
+    fn hit_regions_are_isolated_per_window() {
+        let mut h = Harness::new("hit-ns", vec2(700.0, 500.0)).with_items(3);
+
+        // 第一帧：只画设置窗口。
+        h.state.show_settings = true;
+        h.settings_frame();
+        let settings_key = "settings_close";
+        assert!(
+            h.state.hit.get(HitNs::Settings, settings_key).is_some(),
+            "设置窗口应把热区登记在**自己**的命名空间里"
+        );
+        assert!(
+            h.state.hit.keys(HitNs::Main).is_empty(),
+            "只画了设置窗口，主窗口不该凭空出现热区，实际={:?}",
+            h.state.hit.keys(HitNs::Main)
+        );
+
+        // 第二帧：画主窗口。两边必须**同时在**，且互不串味。
+        let before = h.state.hit.get(HitNs::Settings, settings_key);
+        h.frame();
+        assert!(
+            h.state.hit.get(HitNs::Main, "history_body").is_some(),
+            "主窗口应有自己的热区"
+        );
+        assert_eq!(
+            h.state.hit.get(HitNs::Settings, settings_key),
+            before,
+            "画主窗口不该动到设置窗口的热区——两套坐标不能互相清"
+        );
+    }
+
     // ------------------------------------------------------------------
     // 交互测试：设置面板
     // ------------------------------------------------------------------
@@ -3496,8 +3657,8 @@ fn with_pinned(mut self, n: usize) -> Self {
         let keys: Vec<&str> = h
             .state
             .hit
-            .keys()
-            .copied()
+            .keys(HitNs::Settings)
+            .into_iter()
             .filter(|k| {
                 matches!(
                     *k,
@@ -3515,7 +3676,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             !keys.is_empty(),
             "设置面板应至少画出一枚开关，实际热区={:?}",
-            h.state.hit.keys().collect::<Vec<_>>()
+            h.state.hit.keys(HitNs::Settings)
         );
 
         // 逐个登记 —— 共用键会静默覆盖，而任何断言都看不出来。
@@ -3533,11 +3694,14 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 真正要守的是：**至少第一枚开关可见**。若连它都跑到窗口外，
         // 说明面板布局整体算错了（早前 `max_height` 写死估算值时
         // 实测就是这样：600x400 下开关被排到 y=444，整排点不到）。
-        let first = keys
-            .iter()
-            .map(|k| h.state.hit[*k])
-            .min_by(|a, b| a.min.y.partial_cmp(&b.min.y).unwrap())
-            .expect("已断言非空");
+        let mut first: Option<Rect> = None;
+        for k in &keys {
+            let r = settings_hit(&h, k);
+            if first.is_none_or(|f| r.min.y < f.min.y) {
+                first = Some(r);
+            }
+        }
+        let first = first.expect("已断言非空");
         assert!(
             h.area.intersects(first),
             "最靠上的开关 {first:?} 完全落在客户区 {:?} 之外，设置面板不可用",
@@ -3828,11 +3992,11 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 默认折叠：没有输入区热区，只有图标。
         assert!(!h.state.search_expanded, "搜索框应默认折叠");
         assert!(
-            h.state.hit.contains_key("search_icon"),
+            h.state.hit.contains_key(HitNs::Main, "search_icon"),
             "应有搜索图标热区"
         );
         assert!(
-            !h.state.hit.contains_key("search_box"),
+            !h.state.hit.contains_key(HitNs::Main, "search_box"),
             "折叠态不应有输入框外框热区"
         );
 
@@ -3841,7 +4005,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.click_at(icon);
         assert!(h.state.search_expanded, "点图标应展开搜索框");
         assert!(
-            h.state.hit.contains_key("search_box"),
+            h.state.hit.contains_key(HitNs::Main, "search_box"),
             "展开后应有输入框外框热区"
         );
 
@@ -3850,7 +4014,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.click_at(icon);
         assert!(!h.state.search_expanded, "再点图标应收起搜索框");
         assert!(
-            !h.state.hit.contains_key("search_box"),
+            !h.state.hit.contains_key(HitNs::Main, "search_box"),
             "收起后输入框外框热区应消失"
         );
     }

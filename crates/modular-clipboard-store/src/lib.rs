@@ -237,12 +237,19 @@ impl Store {
     /// 全局查找、不设时间窗口：无论隔了多久再次复制相同内容，
     /// 都视为重复（不新增、只置顶更新时间）。窗口语义已被全局去重
     /// 取代——剪贴板管理器对「复制同一段内容」的期望就是只留一条。
+    /// > ⚠️ `ORDER BY` 必须带 **`id DESC` 兜底**。
+    ///
+    /// `created_at` 只到**毫秒**。同一毫秒内插入两条同哈希记录时
+    /// 时间戳完全相同，SQLite 这时返回哪一条是**未定义**的——实测
+    /// 表现为 `find_by_hash_finds_latest_unpinned` 偶发失败（有时拿
+    /// 到先插入的那条）。`id` 是 `AUTOINCREMENT`，在并列时按插入
+    /// 顺序取后到的那条，结果与「最新」一致。
     pub fn find_by_hash(&self, hash: &str) -> Result<Option<EntryId>> {
         let id = self
             .conn
             .query_row(
                 "SELECT id FROM items WHERE hash = ?1 AND pinned = 0
-                 ORDER BY created_at DESC LIMIT 1",
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
                 params![hash],
                 |r| r.get::<_, EntryId>(0),
             )
@@ -959,6 +966,11 @@ mod tests {
         store.set_payload_limit(1024 * 1024);
 
         // 同一哈希插入两条（时间不同）→ 全局查找命中最新一条。
+        //
+        // ⚠️ 两条间隔极短，**常常落在同一毫秒内**。这正是本条最值钱
+        // 的地方：它顺带守住 `find_by_hash` 的 `id DESC` 兜底排序。
+        // 去掉那个兜底，本条会退化成**偶发**失败——最容易被当成
+        // 「测试不稳定」而放过去的一类缺陷。
         let a = ClipItem::new(ClipKind::Text, "same-hash".into(), "first".into(), "app".into());
         store.insert(a, b"first".to_vec()).unwrap();
         let b = ClipItem::new(ClipKind::Text, "same-hash".into(), "second".into(), "app".into());
