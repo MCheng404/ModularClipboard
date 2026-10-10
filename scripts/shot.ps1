@@ -1,10 +1,10 @@
-
-# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+﻿
+# NOTE: 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
 # 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 $ErrorActionPreference = 'Stop'
-# ⚠️ 必须先让本进程Per-Monitor DPI 感知，否则 GetClientRect 返回的是
+# CAUTION: 必须先让本进程Per-Monitor DPI 感知，否则 GetClientRect 返回的是
 # **DPI 虚拟化后的逻辑坐标**，而 CopyFromScreen 按物理像素抓取。
 # 两者不一致时会截到窗口的一个角（实测 150% 缩放下拿到 280x373，
 # 真实客户区是 420x560），据此做的像素判据全是错的。
@@ -66,7 +66,7 @@ $main = [IntPtr]::Zero
 foreach ($h in [Cap]::TopLevel([uint32]$p.Id)) { if ([Cap]::Cls($h) -eq 'ModularClipboardWindow') { $main = $h; break } }
 if ($main -eq [IntPtr]::Zero) { Write-Host "找不到主窗口"; Stop-Process -Id $p.Id -Force; exit 1 }
 
-# ⚠️ 必须先把窗口移到**屏幕空白区**再截图。
+# IMPORTANT: 必须先把窗口移到**屏幕空白区**再截图。
 # 窗口默认创建在 (120,120)，那里往往被用户的浏览器/终端/编辑器盖住——
 # 截出来的是别的程序，客户区截图完全无效（曾据此误判过渲染 bug）。
 # 这里移到屏幕最左侧（0,0），那里通常只有桌面或侧边栏。
@@ -77,7 +77,7 @@ public static class Move {
   [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hgt, bool repaint);
 }
 '@
-# ⚠️ MoveWindow 的宽高**不能传 0**——那会把窗口缩成 0×0
+# CAUTION: MoveWindow 的宽高**不能传 0**——那会把窗口缩成 0×0
 # （客户区真的变成 0 0，Bitmap 构造直接抛 "Parameter is not valid"）。
 # 先读当前窗口尺寸再原样传回，只改位置。
 $wr = New-Object Cap+RECT
@@ -124,7 +124,7 @@ $gfx.Dispose(); $bmp.Dispose()
 Write-Host "客户区截图已存: $png"
 
 # 全屏截图（看窗口在屏幕上的实际位置与大小）
-# ⚠️ 必须先加载程序集再用 [System.Windows.Forms.SystemInformation]：
+# IMPORTANT: 必须先加载程序集再用 [System.Windows.Forms.SystemInformation]：
 # 未加载时该类型不存在，PowerShell 会在此抛「无法找到类型」而不是返回 $null，
 # 于是 `if (-not $sb)` 这类兜底判断根本没机会执行（原脚本的 bug）。
 Add-Type -AssemblyName System.Windows.Forms

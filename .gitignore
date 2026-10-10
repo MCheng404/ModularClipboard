@@ -8,28 +8,29 @@
 # 本地 Agent 工作数据，不应进入仓库
 /.workbuddy/
 
-# 各 Agent 的隔离构建目录（避免文件锁冲突 +确保测的是当前源码）
-target-lead-verify/
-target-split-*/
-
-# 各类隔离构建目录与Agent 临时目录（动态产生，统一忽略）
+# 各类隔离构建目录与 Agent 临时目录（动态产生，统一忽略）
+# 覆盖 target-lead-verify/、target-split-*/、target-*/ 等全部变体。
 target-*/
 .racehunt/
 .vuidfix/
 .perimage/
 .verify-logs/
 
-# 构建产物（8MB 可执行文件）。
+# 交付产物（8MB 可执行文件 + 校验和 + 构建信息）。
+# 规范见 BUILD.md：产物只允许出现在 dist/，由 scripts/package.sh 生成。
 # 不入库：二进制每次构建都是新 blob，历史会持续膨胀，且无法合并。
 # 需要给用户分发时走 GitHub Release，而不是仓库。
 /dist/
 
+# Python 解释器产物（清理工具自测时会生成）
+__pycache__/
+*.pyc
+
 # 临时提交信息文件（用 git commit -F 绕过 shell 拦截时产生）
-.git-commit-msg.txt
+*.commit-msg.txt
 
 # 本地快捷方式（指向 deps 构建产物，环境相关，不入库）
 modular_clipboard.lnk
 shot-*.png
 *.log
 *.err
-# 验证脚本的临时产物（截图、stdout/stderr 重定向）

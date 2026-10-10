@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 UI 渲染端到端验证：在多个窗口宽度下截图，并用**像素判据**检查渲染覆盖率。
 
@@ -10,7 +10,7 @@ UI 渲染端到端验证：在多个窗口宽度下截图，并用**像素判据
     若 UI 真的按客户区尺寸铺满，包围盒应接近整个客户区。
     若 UI 只画了一角（历史缺陷：ppp 恒为 1.0 导致内容缩在左上 1/scale），
     包围盒宽度只有 1/scale ⇒ 直接判FAIL。
-    ⚠️ 窗口被遮挡时截到的是别的程序 ⇒ 也会 FAIL。
+    NOTE: 窗口被遮挡时截到的是别的程序 ⇒ 也会 FAIL。
     所以判据 A 失败时必须先看判据 B。
 
   判据 B（唯一性）：检查 clear color 区域是否**连通成一片**。
@@ -39,7 +39,7 @@ param(
   [switch]$Settings
 )
 
-# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# NOTE: 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
 # 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
@@ -115,7 +115,7 @@ foreach ($h in [V]::TopLevel([uint32]$p.Id)) {
   if ([V]::Cls($h) -eq 'ModularClipboardWindow' -and [V]::IsWindowVisible($h)) { $main = $h; break }
 }
 if ($main -eq [IntPtr]::Zero) {
-  # ⚠️ 必须把实际枚举到的窗口全打出来。
+  # IMPORTANT: 必须把实际枚举到的窗口全打出来。
   #
   # 症状：改动后脚本报「找不到主窗口句柄」，但程序日志显示
   # 「窗口已创建」且手动运行完全正常——说明问题在**查找方式**，
@@ -133,7 +133,7 @@ if ($main -eq [IntPtr]::Zero) {
 }
 
 # 屏幕右下角实测是唯一稳定的空白区（(0,0) 与 (120,120) 常被浏览器/终端占据）。
-# ⚠️ 屏幕尺寸必须**动态查询**，不能写死。
+# CAUTION: 屏幕尺寸必须**动态查询**，不能写死。
 #
 # 原先硬编码 2560x1600，换台显示器（或改缩放）就会把窗口放到
 # 屏幕外，`CopyFromScreen` 抓到的就是别的窗口 —— 表现为
@@ -153,7 +153,7 @@ foreach ($w in $Widths) {
   [void][V]::MoveWindow($main, $mX, $mY, $w, $shotH, $true)
   [void][V]::BringWindowToTop($main)
   [void][V]::SetForegroundWindow($main)
-  # ⚠️ 移动/改尺寸后必须给程序**充分时间**处理完，否则拍到旧布局。
+  # CAUTION: 移动/改尺寸后必须给程序**充分时间**处理完，否则拍到旧布局。
   #
   # 程序侧要连走几步：收 WM_SIZE → 重建 Vulkan 交换链 →
   # 下一帧 egui 才拿到新的 `screen_rect` → 按新尺寸重算布局。
@@ -172,7 +172,7 @@ foreach ($w in $Widths) {
 
   $bmp = New-Object System.Drawing.Bitmap $cw, $ch
   $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-  # ⚠️ 用 `PrintWindow` 而不是 `CopyFromScreen`。
+  # NOTE: 用 `PrintWindow` 而不是 `CopyFromScreen`。
   #
   # `CopyFromScreen` 抓的是**屏幕像素**，所以结果取决于「那一刻谁的
   # 像素在这个矩形里」。程序开了 `always_on_top` 时，它压过任何窗口；
@@ -194,7 +194,7 @@ foreach ($w in $Widths) {
   $b2 = New-Object System.Drawing.Bitmap $png
 
   # ---- 判据 0：先区分「窗口不在」与「窗口在但没画」-------------------
-  # ⚠️ 这是判据 A 之前必须做的检查。
+  # IMPORTANT: 这是判据 A 之前必须做的检查。
   #
   # 实测踩坑：某次 720px 宽度跑出「覆盖率 0.0%」的 FAIL，截图却是
   # **一片纯白**——窗口被别的程序盖住了（或已被移开），截到的是
@@ -222,7 +222,7 @@ foreach ($w in $Widths) {
 
   $minX = 99999; $maxX = -1; $minY = 99999; $maxY = -1
   $inkCount = 0
-  # ⚠️ 早前版本硬编码clear 底色≈240，把**深灰 clear 区**也算成「内容」，
+  # NOTE: 早前版本硬编码clear 底色≈240，把**深灰 clear 区**也算成「内容」，
   # 于是「UI 只占左上角」这个真实缺陷被判成 PASS（假守卫）。
   # 现在改成自适应：先扫出全图最暗值（clear color 的代表），
   # 再以「明显亮于它」为内容判据，与具体主题色无关。
@@ -264,7 +264,7 @@ foreach ($w in $Widths) {
   Write-Host ("横向覆盖 {0:P1}  纵向覆盖 {1:P1}  墨迹像素比 {2:P1}" -f $coverX, $coverY, $ratio)
   Write-Host "截图: $png"
 
-  # ⚠️ 先判「窗口在不在」，再判「画没画满」。
+  # NOTE: 先判「窗口在不在」，再判「画没画满」。
   # 顺序反了会把「被别的程序遮挡」报成「渲染失败」，
   # 让人去改本来正确的渲染代码（实测踩过一次）。
   if ($isBlankShot) {
@@ -290,7 +290,7 @@ if ($fail -gt 0) {
   exit 1
 }
 if ($skip -gt 0) {
-  # ⚠️ 有跳过项时**不能宣布全部通过**：那等于把「没测到」说成「测过了」。
+  # CAUTION: 有跳过项时**不能宣布全部通过**：那等于把「没测到」说成「测过了」。
   Write-Host "结果: $($Widths.Count - $skip) / $($Widths.Count) 个宽度通过，$skip 个因截图不可用被跳过" -ForegroundColor Yellow
   exit 0
 }

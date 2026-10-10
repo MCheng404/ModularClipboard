@@ -1,5 +1,5 @@
-
-# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+﻿
+# NOTE: 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
 # 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
@@ -109,7 +109,7 @@ function RunCase($dir, $darkModeJson, $label) {
   "rules": []
 }
 "@
-  # ⚠️ 必须用 `WriteAllText` + `UTF8Encoding($false)`：**不能**用
+  # CAUTION: 必须用 `WriteAllText` + `UTF8Encoding($false)`：**不能**用
   #    `Set-Content -Encoding UTF8`，它会写UTF-8 BOM，而 serde_json
   #    不接受BOM —— `Config::load` 解析失败后**静默回退默认值**，
   #    于是 dark_mode 被吃掉、日志打出 configured=None，
@@ -140,7 +140,7 @@ function RunCase($dir, $darkModeJson, $label) {
   Start-Sleep -Seconds 2
   $luma = SampleLuma $main
   Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-  # ⚠️ 必须在停进程**之后**读日志：`Start-Process -RedirectStandardError`
+  # IMPORTANT: 必须在停进程**之后**读日志：`Start-Process -RedirectStandardError`
   #    的写句柄由子进程持有，进程活着时 `ReadAllText` 会因共享锁抛异常。
   Start-Sleep -Milliseconds 700
   # 另：日志是 UTF-8 且带 ANSI 转义（tracing 的 with_ansi 会给级别上色），
@@ -166,7 +166,7 @@ $sys = RunCase "$base\sys" 'null'   'dark_mode=None(跟随系统)'
 
 # ---- 断言 ----
 Write-Host "`n== 断言 =="
-# ⚠️ 下面用 `.Contains()` 而不是 `-match`：日志行里可能带 ANSI 转义序列
+# NOTE: 下面用 `.Contains()` 而不是 `-match`：日志行里可能带 ANSI 转义序列
 #    （tracing 的 `with_ansi` 会给级别上色），`-match` 遇到非法转义
 #    会静默返回 False，`.Contains` 是纯字面比较，不受转义影响。
 function HasDark($o, $want) {
@@ -193,7 +193,7 @@ if ($sys) {
       't6 跟随系统解析成确定值' $sys.line
 }
 
-# ⚠️ 不用 `Remove-Item -Recurse` 清目录：受删除策略保护时会直接抛
+# NOTE: 不用 `Remove-Item -Recurse` 清目录：受删除策略保护时会直接抛
 #    safe-delete 失败并中断脚本，而此时断言其实已经跑完了。
 #    每个 case 用**独立子目录**互不干扰，清不清都不影响正确性。
 try { Remove-Item $base -Recurse -Force -ErrorAction SilentlyContinue } catch {}

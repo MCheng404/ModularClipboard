@@ -1,15 +1,15 @@
-param(
+﻿param(
     [string]$Png = '$RepoRoot\shot-client.png'
 )
 
-# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# NOTE: 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
 # 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 
 # 分析客户区截图：统计 clear color 像素占比，判断 UI 是否铺满客户区。
 #
-# ⚠️ 判据必须与视觉**同源**：直接读shot-client.png 的像素，
+# IMPORTANT: 判据必须与视觉**同源**：直接读shot-client.png 的像素，
 # 而不是复算布局数值——「数字判据与视觉判据不同源」是本项目吃过的亏
 # （三段宽度之和 <= 可用宽度 数值通过，用户仍看到重影）。
 #
@@ -56,7 +56,7 @@ Write-Host ("最下一行 clear 占比   : {0:N2}%  ({1}/{2})" -f (100.0*$bottom
 
 # ---- 找出内容实际覆盖到的边界（诊断用）----
 # 逐列找**最后一个**非 clear 像素（= 内容右边缘），逐行同理。
-# ⚠️ 必须扫到「最后一个」而不是「第一个」：从左往右遇到的第一个非 clear
+# IMPORTANT: 必须扫到「最后一个」而不是「第一个」：从左往右遇到的第一个非 clear
 # 像素恒为x=0（最左列一定有内容），用它当右边缘会得出「空白 419px」的
 # 荒谬结论——这正是判据失效的一种形态。
 $maxX = -1
@@ -104,9 +104,9 @@ if ($maxY -ge 0 -and $maxY -lt $h-1) {
 
 # ---- 结论（阈值判据，不能是「有没有非 clear 像素」）----
 #
-# ⚠️ 这里踩过一次判据失效：早先的判据是「最右列/最下一行**存在**非 clear
+# NOTE: 这里踩过一次判据失效：早先的判据是「最右列/最下一行**存在**非 clear
 # 像素就算铺满」。但截图边缘总有零星非 clear 像素（窗口边框、resize 边框、
-# 抗锯齿），于是**修前的 95.89% 也被判成 ✅** —— 与「数字过了但用户
+# 抗锯齿），于是**修前的 95.89% 也被判成 DONE:** —— 与「数字过了但用户
 # 看到重影」是同一种错误。判据必须是**占比**低于阈值。
 Write-Host ""
 Write-Host "=== 结论 ==="
@@ -118,11 +118,11 @@ $bottomPct = 100.0 * $bottomClear / $w
 $totalPct = 100.0 * $clearCount / $total
 
 if ($rightPct -gt $EDGE_MAX -or $bottomPct -gt $EDGE_MAX -or $totalPct -gt $TOTAL_MAX) {
-    Write-Host ("❌ 未铺满客户区：全图 clear {0:N2}%（阈值 {1}%）/ 最右列 {2:N2}%（阈值 {3}%）/ 最下行 {4:N2}%" -f `
+    Write-Host ("ERROR: 未铺满客户区：全图 clear {0:N2}%（阈值 {1}%）/ 最右列 {2:N2}%（阈值 {3}%）/ 最下行 {4:N2}%" -f `
         $totalPct, $TOTAL_MAX, $rightPct, $EDGE_MAX, $bottomPct) -ForegroundColor Red
     Write-Host "   典型成因：set_pixels_per_point 被漏设 ⇒ ppp=1.0，布局与换算差一个 scale 因子"
 } else {
-    Write-Host ("✅ 已铺满客户区：全图 clear {0:N2}%，最右列 {1:N2}%，最下行 {2:N2}%（均低于阈值）" -f `
+    Write-Host ("DONE: 已铺满客户区：全图 clear {0:N2}%，最右列 {1:N2}%，最下行 {2:N2}%（均低于阈值）" -f `
         $totalPct, $rightPct, $bottomPct) -ForegroundColor Green
 }
 

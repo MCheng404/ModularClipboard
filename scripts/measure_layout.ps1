@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 量出真实布局数字：三段宽度之和 vs 可用宽度。
 
@@ -29,7 +29,7 @@ param(
   [switch]$SkipMove
 )
 
-# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# NOTE: 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
 # 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
@@ -43,7 +43,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 public static class M {
   public delegate bool EnumProc(IntPtr h, IntPtr l);
-  // ⚠️ 量测进程必须自己声明 DPI 感知，否则 GetClientRect / MoveWindow
+  // CAUTION: 量测进程必须自己声明 DPI 感知，否则 GetClientRect / MoveWindow
   // 拿到的是**虚拟化坐标**（被系统按 1/scale 缩小）。
   // 实测踩坑：exe 客户区真实是 420x560 物理像素、scale=1.5，
   // 而未声明感知的 PowerShell 读出来是 280x373 —— 正好差一个 1.5 倍，
@@ -97,7 +97,7 @@ $tierName = @('三栏全展开','详情转浮动','置顶折叠','侧栏隐藏',
 #   Detail -> Right (折叠)
 #   Rail   -> Right (折叠)
 # 每项：名称 / 槽位(0=Left,1=Center,2=Right) / 保底宽 min / 舒适宽 comfy / 折叠宽 coll
-# ⚠️ comfy = Panel::default_width。侧栏是 96（展开态舒适宽），
+# NOTE: comfy = Panel::default_width。侧栏是 96（展开态舒适宽），
 #    **不是**折叠窄条 28——它的默认放置才是折叠的。
 $panels = @(
   @{ n='Pinned';  slot=0; min=$PINNED_MIN;   comfy=200.0; coll=$HANDLE         },
@@ -268,7 +268,7 @@ function Get-Layout([double]$bodyW) {
   $usable = $bodyW - $nSpl * $SPL
 
   # --- segment_floor：成员保底之和 + 段内分隔条（与 layout.rs 同口径）---
-  # ⚠️ 分隔条必须算进保底：否则「这一段至少要58」的判断少算6，
+  # CAUTION: 分隔条必须算进保底：否则「这一段至少要58」的判断少算6，
   #    分配时`split_within` 再扣一次就把折叠把手压窄了。
   $floor = @(0.0, 0.0, 0.0)
   for ($s = 0; $s -lt 3; $s++) {
@@ -294,7 +294,7 @@ function Get-Layout([double]$bodyW) {
   }
 
   # --- allocate：先给三段保底，剩余额度按注水分给左右两段 ---
-  # ⚠️ 必须与 layout.rs 的 allocate 同一套顺序：先预留保底、再分富余。
+  # IMPORTANT: 必须与 layout.rs 的 allocate 同一套顺序：先预留保底、再分富余。
   #    早前版本「左段先按期望宽取、取完给右段剩下的」会让左段吃掉右段的保底。
   $sideBudget = [Math]::Max($usable - $floor[1], 0.0)
   $left = 0.0; $right = 0.0

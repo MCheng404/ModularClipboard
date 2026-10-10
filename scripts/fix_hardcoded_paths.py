@@ -1,4 +1,4 @@
-"""把脚本里的硬编码仓库路径改为按脚本位置自动推导。
+﻿"""把脚本里的硬编码仓库路径改为按脚本位置自动推导。
 
 # 为什么必须做
 
@@ -36,14 +36,14 @@ from pathlib import Path
 OLD_PREFIX = r"D:\WorkBuddy\Tiez"
 
 # 逐个脚本要替换的目标形式：(旧串, 新串)
-# ⚠️ 这里**不能用 rf-string**：`rf"...\\"` 里的 `\\` 是**两个**反斜杠，
+# CAUTION: 这里**不能用 rf-string**：`rf"...\\"` 里的 `\\` 是**两个**反斜杠，
 # 而文件里只有一个（`D:\WorkBuddy\Tiez\`）。raw string 不会处理 `\\` 转义，
 # 第一版就因此「改了个寂寞」—— 文件原封不动，只多了段引导代码。
 #
 # 用普通字符串 + 双写反斜杠：`OLD_PREFIX + "\\"` 才是「前缀 + 一个反斜杠」。
 _BACKSLASH = "\\"
 REPLACEMENTS = [
-    # ⚠️ 顺序要紧：具体的必须在通配的前面，否则 `...\Tiez\scripts\xxx`
+    # CAUTION: 顺序要紧：具体的必须在通配的前面，否则 `...\Tiez\scripts\xxx`
     # 会被通配规则先吃掉、变成 `$RepoRoot\scripts\xxx`（语义仍对，
     # 但之后再想单独调整 scripts 基准就没法匹配了）。
     #
@@ -57,7 +57,7 @@ REPLACEMENTS = [
 
 # 需要在每个改过的脚本里插入的引导代码。
 BOILERPLATE = """
-# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+# NOTE: 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
 # 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 """
@@ -75,7 +75,7 @@ def apply(text: str) -> str:
 
     # 插引导代码：放在 param 块之后、正文第一个语句之前。
     #
-    # ⚠️ 判据是「**还没有**插过引导代码」，而不是「文本里出现过 $RepoRoot」——
+    # NOTE: 判据是「**还没有**插过引导代码」，而不是「文本里出现过 $RepoRoot」——
     # 后者会在刚做完替换时就成立，导致这里误判成「已处理过」而
     # **把替换结果整个丢掉**（第一版就踩了这个：替换后文件原封不动）。
     if "$RepoRoot =" not in text:

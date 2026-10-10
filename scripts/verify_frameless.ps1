@@ -1,5 +1,5 @@
-
-# ⚠️ 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
+﻿
+# NOTE: 由 scripts/fix_hardcoded_paths.py 插入：按**脚本自身位置**推导仓库根，
 # 不再硬编码绝对路径。项目目录改名 / 搬走后，验证脚本依然能用。
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
@@ -45,7 +45,7 @@ public static class W {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int x, y; }
   public const int GWL_STYLE = -16;
-  // ⚠️ 必须用 long：0x80000000 超出 int 正范围，C# 会报
+  // IMPORTANT: 必须用 long：0x80000000 超出 int 正范围，C# 会报
   // 「无法将类型 uint 隐式转换为 int」。
   public const long WS_POPUP   = 0x80000000L;
   public const long WS_CAPTION = 0x00C00000L;  // WS_BORDER|WS_DLGFRAME
@@ -62,7 +62,7 @@ public static class W {
     IntPtr lp = (IntPtr)((sy << 16) | (sx & 0xFFFF));
     return SM(h, WM_NCHITTEST, IntPtr.Zero, lp);
   }
-  //⚠️ 必须绑真正的 ClientToScreen。曾误绑成 ScreenToClient（反了），
+  //IMPORTANT: 必须绑真正的 ClientToScreen。曾误绑成 ScreenToClient（反了），
   //    导致屏幕坐标被反向换算、指针落到负数区，命中测试全部退化成
   //    HTCLIENT——看起来像「resize 坏了」，实际是测试自己的 bug。
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
@@ -70,7 +70,7 @@ public static class W {
 '@
 
 function Say($ok, $label, $detail) {
-  # ⚠️ 计数器不能用 `$script:pass++`：PowerShell 在这个上下文里会把
+  # CAUTION: 计数器不能用 `$script:pass++`：PowerShell 在这个上下文里会把
   #    `$ok`（bool）卷进算术，抛 "The '++' operator works only on
   #    numbers"。显式 [int] 赋值最省事，也无隐式转换的坑。
   if ($ok) {
