@@ -240,11 +240,26 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
     solve_scaled(ws, area, 1.0)
 }
 
-/// 卡片可用区：扣掉顶部标题栏与底部状态栏。
+/// 卡片区四周的内缩（逻辑点）。
+///
+/// 早前卡片**紧贴**窗口边缘（`gap` 默认 0）。直角风格下这没问题；
+/// 一旦卡片有了 16pt 圆角，卡片四角就与窗口四角（DWM 裁出的 8pt）
+/// **错开**，边缘露出两道对不上的弧。
+///
+/// 内缩之后变成「窗口圆角 → 8pt 缝 → 卡片圆角」的层次，而且不依赖
+/// DWM：Win10 上 `DWMWA_WINDOW_CORNER_PREFERENCE` 返回 `E_INVALIDARG`
+/// （`apply_rounded_corners` 已优雅降级），窗口仍是直角，
+/// 卡片圆角照常成立。
+const CARD_AREA_INSET: f32 = 8.0;
+
+/// 卡片可用区：扣掉顶部标题栏与底部状态栏，再四周内缩 [`CARD_AREA_INSET`]。
 pub fn card_area(area: Rect) -> Rect {
     Rect::from_min_max(
-        pos2(area.min.x, area.min.y + TOPBAR_HEIGHT),
-        pos2(area.max.x, area.max.y - STATUSBAR_HEIGHT),
+        pos2(area.min.x + CARD_AREA_INSET, area.min.y + TOPBAR_HEIGHT),
+        pos2(
+            area.max.x - CARD_AREA_INSET,
+            area.max.y - STATUSBAR_HEIGHT,
+        ),
     )
 }
 

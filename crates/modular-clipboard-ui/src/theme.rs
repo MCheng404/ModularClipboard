@@ -276,6 +276,16 @@ palette! {
     /// 选中底色。强调色的低透明色调，其上仍用 `text` / `text_dim`。
     row_selected: color = egui::Color32::from_rgba_unmultiplied(0x84, 0xB7, 0xEB, 56)
                    => egui::Color32::from_rgba_unmultiplied(0x1D, 0x65, 0xAF, 52),
+    /// 置顶条目的底色微亮。
+    ///
+    /// 置顶条目与普通条目**在同一个列表里**，靠这个区分。
+    ///
+    /// NOTE: 刻意压得很淡（浅色 alpha 18 ≈ 7%）。实测更浓的色调会
+    /// 让整行读起来像「另一类条目」，而置顶只是一个次要状态。
+    /// 主要的形状线索其实来自行内 pin 按钮的实心/描边，
+    /// 底色只是辅助——纯色差本身不足以让人一眼分辨。
+    pin_tint: color = egui::Color32::from_rgba_unmultiplied(0x1D, 0x65, 0xAF, 18)
+                => egui::Color32::from_rgba_unmultiplied(0x84, 0xB7, 0xEB, 30),
     /// 按下底色。**刻意不用 accent 色调**——按下时再叠一层强调色会
     /// 把底色推得太亮/太深，`text_dim` 落在其上就跌破 4.5:1。
     /// 「压下一层」也更贴合直觉：深色下提亮、浅色下压深。
@@ -1038,6 +1048,8 @@ mod tests {
         "info", "info_hover", "info_active",
         // 交互态背景
         "row_alt", "row_hover", "row_selected", "row_active",
+        // 置顶条目标记（同列表内的次要状态）
+        "pin_tint",
     ];
 
     /// 期望的非颜色令牌清单。登记规则同 [`EXPECTED_COLOR_TOKENS`]。

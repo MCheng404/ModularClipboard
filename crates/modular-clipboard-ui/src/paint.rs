@@ -38,18 +38,21 @@ use crate::workspace::Workspace;
 const CARD_STROKE: f32 = 1.0;
 
 /// 卡片圆角（逻辑点）。
-/// 卡片圆角（逻辑点）。
 ///
-/// NOTE: **取 0（直角）**，不是原先的 8。
+/// 早前取 0（直角），理由是「相邻卡片之间与窗口边缘会留下 4 个缺口」，
+/// 以及「纯平毛玻璃语言禁止装饰性圆角」。用户明确要求整体改圆角风格，
+/// 那两条理由让位于新的视觉需求，但**缺口问题需要另行处理**：
+/// 相邻卡片的间隙必须 ≥ 两个圆角之和，否则两张卡的圆角之间会留下
+/// 一条「花瓣缝」。见 [`card_area`] 四周的内缩。
 ///
-/// 圆角会在相邻卡片之间与窗口边缘留下 4 个「缺口」：卡片明明
-/// 紧贴（实测底部间隙 0px），但视觉上像有一条缝——用户报的
-/// 「窗口与窗口之间存在间隙」有一部分就来自这里。
-/// 直角 + 1px 描边才能得到连续的、真正无缝的面板。
-///
-/// 这也符合本项目「**纯平毛玻璃**」的视觉语言：禁止一切装饰性
-/// 圆角带来的拟物暗示。
-const CARD_RADIUS: f32 = 0.0;
+/// NOTE: 窗口本身的圆角是 DWM 给的（`DWMWCP_ROUND`，约 8pt），
+/// **改不了**——微软枚举只有 DEFAULT/DONOTROUND/ROUND/ROUNDSMALL
+/// 四档，没有更大的值。所以「整体更圆润」只能靠内容层承担：
+/// 本值 16 > [`ROW_RADIUS`] 12 > 窗口 8，三层形成梯度。
+const CARD_RADIUS: f32 = 16.0;
+
+/// 行卡片圆角（逻辑点）。略小于 [`CARD_RADIUS`]，避免与卡片圆角重复。
+const ROW_RADIUS: f32 = 12.0;
 
 /// 一帧内要执行的操作。
 ///
@@ -1482,19 +1485,38 @@ fn get_mcp_cap(cfg: &modular_clipboard_core::config::Config, field: &str) -> boo
     }
 }
 
-/// 一键 AI 配对提示词：可调用能力清单 + 接入参数（协议头）。
+/// 一键 AI 配对提示词：可调用能力清单 + stdio / HTTP 两种接入配置。
 ///
 /// `pub`：`App::apply_ops` 的 `CopyMcpPairPrompt` 分支读取它写入剪贴板。
 pub fn mcp_pair_prompt(cfg: &modular_clipboard_core::config::Config) -> String {
-    let mut s = String::from("【modular-clipboard · MCP 服务接入说明】\nmodular-clipboard 提供 Model Context Protocol (MCP) 服务，可对电脑执行界面自动化操作。\n\n可调用能力（8 项）：\n");
+    let mut s = String::from("【modular-clipboard · MCP 服务配对】\nmodular-clipboard 提供 Model Context Protocol（MCP）服务，可对本机执行界面自动化操作。\n\n可调用工具（8 项）：\n");
     for cap in MCP_CAPS {
         s.push_str(&format!("- {}：{}\n", cap.name, cap.desc));
     }
+
+    // 当前 exe 完整路径（stdio 配置里 command 用）；取不到时用占位。
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<modular-clipboard.exe 的完整路径>".into());
+
     s.push_str(&format!(
-        "\n接入参数：\n- 协议：Model Context Protocol（MCP）\n- 协议版本：2025-06-18\n- 传输方式：stdio\n- 启动命令：modular-clipboard.exe --mcp-server\n- 服务地址：{}\n- 端口：{}\n- 认证：{}\n\n请将上述参数配置到你的 MCP 客户端（如 Claude Desktop / Cursor / VS Code），配置完成后即可通过工具调用对本电脑执行界面自动化操作。",
-        if cfg.mcp.host.is_empty() { "127.0.0.1（默认）".to_string() } else { cfg.mcp.host.clone() },
-        if cfg.mcp.port == 0 { "未设置".to_string() } else { cfg.mcp.port.to_string() },
-        if cfg.mcp.token.is_empty() { "无".to_string() } else { "Bearer Token（已在设置中配置）".to_string() },
+        "\n=== 方式一：stdio（本地，推荐） ===\n适用于 Claude Desktop / Cursor 等本地客户端，在 MCP 配置中加入：\n{{\n  \"mcpServers\": {{\n    \"modular-clipboard\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"--mcp-server\"]\n    }}\n  }}\n}}\n"
+    ));
+
+    // HTTP 段：地址、端口、认证。
+    let host = if cfg.mcp.host.is_empty() {
+        "127.0.0.1".to_string()
+    } else {
+        cfg.mcp.host.clone()
+    };
+    let port = if cfg.mcp.port == 0 { 9123 } else { cfg.mcp.port };
+    let auth = if cfg.mcp.token.is_empty() {
+        "无".to_string()
+    } else {
+        "Bearer Token（已在设置中配置）".to_string()
+    };
+    s.push_str(&format!(
+        "\n=== 方式二：HTTP（远程 / 自定义地址） ===\n服务地址：http://{host}:{port}/mcp\n认证：{auth}\n配置：\n{{\n  \"mcpServers\": {{\n    \"modular-clipboard\": {{\n      \"url\": \"http://{host}:{port}/mcp\"\n    }}\n  }}\n}}\n启动 HTTP 服务：modular-clipboard.exe --mcp-http\n"
     ));
     s
 }
@@ -2317,7 +2339,10 @@ fn setting_row(ui: &mut Ui, label: &str, desc: &str, control: impl FnOnce(&mut U
 /// 交互状态（hover/active）被反复丢弃。所以传配置**字段名**。
 fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut bool) -> bool {
     let pal = f.pal;
-    let s = 18.0_f32;
+    // 尺寸：高 20、宽 38（约 1.9 倍），比旧版 18×32 更饱满，
+    // 与放大后的正文字号（15）协调。
+    let h = 20.0_f32;
+    let w = h * 1.9;
     // NOTE: 同一个矩形只准注册**一次**交互。
     //
     // 早前这里写的是 `allocate_exact_size(size, Sense::click())`
@@ -2330,34 +2355,42 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // 正确分工：`allocate_exact_size` 只负责**占位**（`Sense::empty()`，
     // 纯粹向后推游标），点击交互由下面那条显式 `interact` 承担——
     // 它的 Id 绑定字段名，跨帧稳定。
-    let (rect, _alloc) = ui.allocate_exact_size(egui::vec2(s * 1.8, s), Sense::empty());
+    let (rect, _alloc) = ui.allocate_exact_size(egui::vec2(w, h), Sense::empty());
     let resp = ui.interact(rect, egui::Id::new(("switch", id_suffix)), Sense::click());
 
-    // 开关本体：宽 = 高的 1.8 倍。
-    let h = s;
-    let w = h * 1.8;
-    let knob_r = h * 0.5 - 2.0;
     let track = Rect::from_center_size(rect.center(), vec2(w, h));
     let p = ui.painter_at(rect);
     let on = *v;
-    if on {
-        p.rect_filled(track, h * 0.5, pal.accent);
+    // 轨道：
+    // - 开：accent 实底（hover 时 accent_hover）
+    // - 关：中性灰实底（surface_variant），**无描边**——旧版那圈
+    //   border 灰边 + 灰色滑块整体灰扑扑，是「丑」的主要来源。
+    //   关闭态 hover 叠一层白提亮。
+    let track_color = if on {
+        if resp.hovered() { pal.accent_hover } else { pal.accent }
+    } else if resp.hovered() {
+        crate::theme::composite(egui::Color32::from_white_alpha(16), pal.surface_variant)
     } else {
-        p.rect_filled(track, h * 0.5, pal.surface_variant);
-        p.rect_stroke(
-            track,
-            h * 0.5,
-            Stroke::new(1.0, pal.border),
-            egui::StrokeKind::Inside,
-        );
-    }
-    // 滑块：开时靠右、关时靠左。
-    let knob_x = if on { track.max.x - h * 0.5 } else { track.min.x + h * 0.5 };
-    let knob = Rect::from_center_size(
-        pos2(knob_x, track.center().y),
-        vec2(knob_r * 2.0, knob_r * 2.0),
+        pal.surface_variant
+    };
+    p.rect_filled(track, h * 0.5, track_color);
+
+    // 滑块位置：平滑动画（egui 按帧插值），不再硬切。
+    let anim = ui
+        .ctx()
+        .animate_bool(egui::Id::new(("switch_anim", id_suffix)), on);
+    let knob_r = h * 0.5 - 3.0;
+    let left_x = track.min.x + h * 0.5;
+    let right_x = track.max.x - h * 0.5;
+    let knob_center = pos2(left_x + (right_x - left_x) * anim, track.center().y);
+    // 轻微投影（增加层次），再画白色滑块——开/关都用白滑块
+    // （Win11 风格：关闭态白滑块在灰底上比旧版灰滑块干净）。
+    p.circle_filled(
+        knob_center + vec2(0.0, 0.8),
+        knob_r,
+        egui::Color32::from_black_alpha(45),
     );
-    p.circle_filled(knob.center(), knob_r, if on { pal.text_bright } else { pal.text_dim });
+    p.circle_filled(knob_center, knob_r, egui::Color32::WHITE);
 
     if resp.clicked() {
         *v = !*v;
@@ -2812,41 +2845,6 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
     // 而且这里也拿不到「置顶该占多高」——那是切分时才确定的量。
 }
 
-/// 在**给定的**矩形里画内嵌置顶区。
-///
-/// # `area` 是谁给的
-///
-/// 由 [`draw_expanded_card`] 提前算好并从历史卡片的 body 顶部切出来。
-/// 早前这个函数自己去读 `history.rect` 并从 `inner.min` 铺到
-/// `inner.max.y` —— 那等于无视历史列表已经占了整块 body，必然重叠。
-///
-/// 不画自己的边框：它不是独立卡片，画了会与历史卡片边框叠成双线。
-fn draw_embedded_pinned(f: &mut Frame<'_>, area: Rect) {
-    let pal = f.pal;
-    let font: FontId = sized(pal.font_xs, f.scale);
-    let label_h = (pal.font_xs * 1.6).max(14.0);
-
-    // 标题行「置顶」。画在 `area` 顶部 —— 即历史卡片**头部之下**，
-    // 与标题「历史」不再同一个 y。
-    let label = Rect::from_min_size(area.min, vec2(area.width(), label_h));
-    f.ui.painter_at(label).text(
-        label.left_center(),
-        Align2::LEFT_CENTER,
-        "置顶",
-        font,
-        pal.text_dim,
-    );
-
-    let list = Rect::from_min_max(
-        pos2(area.min.x, label.max.y + pal.space_xs),
-        area.max,
-    );
-    if list.height() <= 8.0 || list.width() <= 8.0 {
-        return;
-    }
-    draw_history_body(f, list, Some(true));
-}
-
 fn draw_card_frame(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     let scale = f.scale;
@@ -2899,88 +2897,14 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
             // 「列表边上还是白色」）。描边由 `draw_card_frame` 已画，
             // 这里只盖底色，不动描边。
             f.ui.painter_at(r).rect_filled(r, CARD_RADIUS, pal.list_bg);
-            // 置顶内嵌在历史卡片**顶部** ⇒ 先把 body 切成两段，
-            // 历史列表用下面那段。
-            //
-            // NOTE: 早前是「先画完整历史列表，再事后往上叠一层置顶」——
-            // 于是「置顶」标签与卡片标题「历史」画在**同一个 y**
-            // （都是 `inner.min`），而置顶列表一直铺到卡片底部，
-            // 盖住历史的前 N 行。用户看到的是两层内容叠在一起的乱字，
-            // 且被盖住的历史行仍然可点（命中矩形还在）。
-            let pinned_h = if f.ws.pinned_is_embedded() {
-                embedded_pinned_height(f, body.width(), body.height())
-            } else {
-                0.0
-            };
-            if pinned_h > 0.0 {
-                let split_y = body.min.y + pinned_h;
-                let pinned_area =
-                    Rect::from_min_max(body.min, pos2(body.max.x, split_y));
-                draw_embedded_pinned(f, pinned_area);
-                // 分隔线画在置顶区与历史区之间。
-                f.ui.painter_at(body).hline(
-                    body.x_range(),
-                    split_y,
-                    Stroke::new(1.0, f.pal.border_subtle),
-                );
-                // 历史区直接从分隔线下方开始。早前这里画了一个
-                // 「历史」标签并让出 label_h 一行；按用户要求去掉
-                // 标签后，历史列表向上多占一行（不占列表位置）。
-                let rest = Rect::from_min_max(
-                    pos2(body.min.x, split_y + pal.space_xs),
-                    body.max,
-                );
-                if rest.height() > 8.0 {
-                    draw_history_body(f, rest, None);
-                }
-            } else {
-                draw_history_body(f, body, None);
-            }
+            // 置顶条目**就在这个列表里**（排在最前 + 底色微亮标记），
+            // 不再有独立的「置顶区」，也没有第二段 body。
+            draw_history_body(f, body, None);
         }
         CardKind::Pinned => draw_history_body(f, body, Some(true)),
         CardKind::Detail => draw_detail_body(f, body),
         CardKind::Rail => draw_rail_body(f, body),
     }
-}
-
-/// 内嵌置顶区应当占用的**高度**；没有置顶条目时返回 0。
-///
-/// # 为什么必须提前算
-///
-/// 历史列表的矩形要让出这一段。事后叠画（早前的做法）必然重叠——
-/// 历史列表不知道自己头顶被占了一块，照样从 `body.min` 开始铺。
-///
-/// # 封顶 1/3
-///
-/// 置顶条目可能很多（用户能钉几十条）。全给会让历史列表被挤没，
-/// 而历史才是主区。所以封顶 1/3，剩下的靠 `ScrollArea` 自己滚。
-fn embedded_pinned_height(f: &mut Frame<'_>, avail_w: f32, avail_h: f32) -> f32 {
-    let pal = f.pal;
-    if !f.svc.state.items.iter().any(|it| it.pinned) {
-        return 0.0;
-    }
-    if avail_w <= 8.0 || avail_h <= 32.0 {
-        return 0.0;
-    }
-    // 标题行 + 上下留白 + 一条分隔线。
-    let chrome = (pal.font_xs * 1.6).max(14.0) + pal.space_xs * 2.0 + pal.space_sm;
-
-    // 行高必须用与 `draw_history_body` **同一个** `row_height_for`，
-    // 否则预留高度与实际内容对不上（多留浪费空间，少留又盖住）。
-    let icon_w = pal.icon_size + pal.space_sm;
-    let text_w = (avail_w - icon_w - pal.space_sm).max(20.0);
-    let rows: f32 = f
-        .svc
-        .state
-        .items
-        .iter()
-        .filter(|it| it.pinned)
-        .map(|it| row_height_for(f.ui, it, pal, f.scale, text_w))
-        .sum();
-
-    (chrome + rows)
-        .min(avail_h * 0.34)
-        .max(chrome.min(avail_h))
 }
 
 /// 卡片头部：只有标题。
@@ -3079,9 +3003,11 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 
     // 本列表用哪个滚动槽位。
     //
-    // IMPORTANT: 两个列表的滚动位置必须**分开存**。早前共用一个
-    // `f32`，而 `vertical_scroll_offset` 每帧都会把它写进 egui ——
-    // 于是滚主栏会把内嵌置顶区一起带走（反之亦然）。
+    // 内嵌置顶区已移除，所以常态下**只有一个列表、一个槽位**。
+    // 仅当工作区里存在 `CardKind::Pinned` 独立卡片时才会出现第二个，
+    // 此时才需要分开存 —— 早前内嵌置顶区与主栏共用一个 `f32`，
+    // 而 `vertical_scroll_offset` 每帧都会把它写进 egui，
+    // 于是滚主栏会把置顶区一起带走（反之亦然）。
     let pinned_slot = only_pinned == Some(true);
 
     // ---- 列表边距 ------------------------------------------------------
@@ -3111,21 +3037,30 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     ));
 
     // 过滤：全部 / 仅置顶。
+    //
+    // 主栏（`None`）**默认包含置顶条目**——置顶就在同一个列表里，
+    // 只靠标记区分（底色微亮）。但若工作区里真的存在一张
+    // `CardKind::Pinned` 独立卡片（`PinnedMode = 独立分栏`），
+    // 主栏必须让位，否则同一个 `("row", item.id)` 会被画两次，
+    // egui 的 ID 冲突检查会在界面上直接打出警告。
+    let has_pinned_card = f.ws.cards.iter().any(|c| c.kind == CardKind::Pinned);
     let items: Vec<ClipItem> = f
         .svc
         .state
         .items
         .iter()
-        // NOTE: 主栏（`None`）**排除置顶条目**：置顶内容由置顶区（共用单栏）
-        // 或置顶卡（独立分栏）单独负责，主栏再画一份会产生两处同名
-        // 行 Id（`("row", item.id)`）→ egui 的 ID 冲突检查在界面上
-        // 画出「First use of widget ID … / Second use of …」警告。
         .filter(|it| match only_pinned {
             Some(p) => it.pinned == p,
-            None => !it.pinned,
+            None => !(has_pinned_card && it.pinned),
         })
         .cloned()
         .collect();
+    // NOTE: 这里**不排序**。置顶排最前是**数据层**保证的 ——
+    // store 的 SQL 写着 `ORDER BY pinned DESC, created_at DESC`
+    // （见 `modular-clipboard-store` 的 `list()`）。绘制层再排一次
+    // 属于重复且错层：排序规则要改就得改两个地方，而早前内嵌置顶区
+    // 与主栏各画一份时，两边排序规则一旦不一致就会出现
+    // 「同一条目在两处位置不同」。
 
     if items.is_empty() {
         let msg = match only_pinned {
@@ -3353,10 +3288,30 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 /// 「动态行高」的价值就在于贴合内容，两处不一致会让它稳定地偏大，
 /// 而且偏差随窗口宽度变化、不同机器表现不同，极难定位。
 fn preview_width(body_w: f32, pal: &Palette) -> f32 {
-    let icon_w = pal.icon_size + pal.space_sm;
-    let acts_w = 3.0 * (pal.control_height * 0.55 + pal.space_xs);
-    (body_w - icon_w - acts_w).max(20.0)
+    let acts_w = acts_width(pal);
+    (body_w - ROW_PAD_H - acts_w - ROW_PAD_H).max(20.0)
 }
+
+/// 行内三个操作按钮的总宽（含间隙）。
+///
+/// 三处都用它：[`preview_width`] 算文本区右边界、`draw_item_row`
+/// 算按钮位置、`row_height_for` 兜底检查。**必须同源**，
+/// 否则文本会伸到按钮底下、或按钮被提前 break 掉。
+fn acts_width(pal: &Palette) -> f32 {
+    3.0 * (pal.control_height * 0.55 + pal.space_xs)
+}
+
+/// 行卡片的**左右**内边距（逻辑点）。
+///
+/// 早前只有垂直的 `pad_v`，左右为 0 —— 三段文字直接贴死卡片边缘，
+/// 视觉上像溢出卡面。去掉类型图标后左侧空出来的位置正好用作内边距。
+const ROW_PAD_H: f32 = 12.0;
+
+/// 行内三个操作按钮相对来源行的**下移量**（逻辑点）。
+///
+/// 按钮贴在右上角、但比来源行低这么多。来源行字高 11pt、按钮 15.4pt，
+/// 两者顶部对齐时按钮会探进来源行里，下移 4pt 让开字形上沿。
+const ROW_ACTS_DROP: f32 = 4.0;
 
 /// 列表行的**最小**高度（逻辑点）。
 ///
@@ -3580,30 +3535,38 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 卡片样式：每条历史是一张圆角小卡。
     //
     // 常态 = `surface_raised`（提亮后的卡片）底 + 1px 描边，浮在暗色
-    // 列表区（`list_bg`）之上；悬停在半透明提亮上叠一层；选中换主题
-    // 高亮 + 左侧强调条。
-    // NOTE: 圆角用 `pal.radius_sm` 而不是 `CornerRadius::ZERO`——后者是
+    // 列表区（`list_bg`）之上；悬停在半透明提亮上叠一层。
+    //
+    // NOTE: 圆角用 `ROW_RADIUS` 而不是 `CornerRadius::ZERO`——后者是
     // 早前「通栏行」的直角样式，与卡片语义不符。
     //
-    // NOTE: 描边在所有状态都画：悬停/选中若只换底色，边框会「消失一瞬」
+    // NOTE: 描边在所有状态都画：悬停若只换底色，边框会「消失一瞬」
     // （从有到无再到有），视觉上跳变。
-    let radius = pal.radius_sm;
+    let radius = ROW_RADIUS;
     let stroke = Stroke::new(CARD_STROKE * scale, pal.border_subtle);
+    // 选中态描边加粗到 2pt。用 `StrokeKind::Inside` 向内生长、
+    // 不占布局 —— 内容位置与常态完全一致。
     if selected {
         painter.rect_filled(r, radius, pal.surface_raised);
         painter.rect_filled(r, radius, pal.row_selected);
-        painter.rect_filled(
-            Rect::from_min_size(r.min, vec2(2.0 * scale, r.height())),
-            CornerRadius::ZERO,
-            pal.accent,
+        painter.rect_stroke(
+            r,
+            radius,
+            Stroke::new(2.0 * scale, pal.accent),
+            egui::StrokeKind::Inside,
         );
-        painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
-    } else if resp.hovered() {
-        painter.rect_filled(r, radius, pal.surface_raised);
-        painter.rect_filled(r, radius, pal.row_hover);
-        painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     } else {
         painter.rect_filled(r, radius, pal.surface_raised);
+        // 置顶标记：底色微亮。置顶条目就在同一个列表里，靠这个区分。
+        //
+        // NOTE: 只靠色差是不够的 —— 实测 7% 透明叠加几乎看不出差别。
+        // 行内 pin 按钮的实心/描边是主要的形状线索，底色只是辅助。
+        if item.pinned {
+            painter.rect_filled(r, radius, pal.pin_tint);
+        }
+        if resp.hovered() {
+            painter.rect_filled(r, radius, pal.row_hover);
+        }
         painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
     }
 
@@ -3614,15 +3577,18 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 右下：类型标签 · 大小（小字弱化，右对齐，大小自适应单位）
     // 右上：置顶 / 复制 / 删除 三个小图标按钮
     //
+    // NOTE: 左侧的类型图标已移除 —— 类型信息在右下角「类型 · 大小」
+    // 那行已经表达，左侧再挂一枚是重复；而且它占的 24pt（`icon_w`）
+    // 会白白吃掉文本宽度。
+    //
     // NOTE: 目标是「**完整显示内容**」：预览**不再截断**，而是按宽度
     // 折行。折行数由 `wrap` 直接给出，不用手工估算——
     // 早前版本按 `preview.chars().take(30)` 硬砍，中文一个字算一个
     // char、英文一个词算一个 char，两者的实际显示宽度差了好几倍，
     // 于是「看起来还有空间」但已经被砍掉了。
-    let icon_w = pal.icon_size + pal.space_sm;
-    let acts_w = 3.0 * (pal.control_height * 0.55 + pal.space_xs);
-    let text_x0 = r.min.x + icon_w;
-    // 宽度同样取自 `preview_width`（减去已扣掉的 icon 区），保证
+    let acts_w = acts_width(&pal);
+    let text_x0 = r.min.x + ROW_PAD_H;
+    // 宽度同样取自 `preview_width`（已含左右 `ROW_PAD_H`），保证
     // 「量出来的行高」与「画出来的宽度」严格一致。
     let text_x1 = text_x0 + preview_width(r.width(), &pal);
     if text_x1 - text_x0 < 20.0 {
@@ -3643,19 +3609,6 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         }
         return;
     }
-
-    // 左侧类型图标，垂直居中。
-    crate::icons::Icon::for_kind(item.kind).paint(
-        &ui.painter_at(r),
-        Rect::from_center_size(
-            pos2(
-                r.min.x + icon_w * 0.5,
-                r.center().y,
-            ),
-            vec2(pal.icon_size, pal.icon_size) * scale,
-        ),
-        if selected { pal.accent } else { pal.text_dim },
-    );
 
     let pad_v = 5.0;
     let meta_font = sized(pal.font_xs, scale);
@@ -3791,9 +3744,10 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 
     for (i, (icon, op, enabled)) in acts.iter().enumerate() {
         // 三个操作按钮排**卡片右上角**（小图标）：从右缘向左排，
-        // 垂直对齐顶部来源行（中心 y = pad_v + btn/2）。
+        // 纵向比来源行再下移 `ROW_ACTS_DROP`（避开字形上沿）。
         //
-        // IMPORTANT: 基准右缘必须让出 `SCROLLBAR_RESERVE`。
+        // IMPORTANT: 基准右缘必须让出 `SCROLLBAR_RESERVE` **和**
+        // `ROW_PAD_H`。
         //
         // egui 0.36 默认 `ScrollStyle` 是 **floating** —— 滚动条
         // **不占布局宽度**，而是浮在 `content` 右缘覆盖
@@ -3809,10 +3763,11 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         // 现象（极难自查）：条目少、列表不满一屏时**没有滚动条**，一切
         // 正常；条目一多（有滚动条）删除按钮就点不动——而这是常态。
         // 「条目少就好、条目多就坏」是这条 bug 的指纹。
+        let acts_right = r.max.x - ROW_PAD_H;
         let b = Rect::from_center_size(
             pos2(
-                r.max.x - acts_w + (i as f32 + 0.5) * (btn + pal.space_xs),
-                r.min.y + pad_v + btn * 0.5,
+                acts_right - acts_w + (i as f32 + 0.5) * (btn + pal.space_xs),
+                r.min.y + pad_v + ROW_ACTS_DROP + btn * 0.5,
             ),
             vec2(btn, btn),
         );
@@ -4621,41 +4576,92 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 判据取两个自报热区（`pinned_body` / `history_body`）的**几何关系**，
     /// 而不是像素颜色——后者在无 GPU 的测试环境里拿不到。
     #[test]
-    fn embedded_pinned_does_not_overlap_history() {
-        let mut h = Harness::new("pin-overlap", vec2(700.0, 600.0))
+    /// 置顶条目与普通条目**共用同一个列表**，且没有独立的「置顶区」。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// 早前置顶条目住在历史卡片顶部的一条内嵌区里（标签 + 分隔线 +
+    /// 第二个滚动槽位）。它带来两个问题：
+    ///
+    /// - 两个滚动槽位各存一份 `vertical_scroll_offset`，而那个值每帧
+    ///   都会写进 egui —— 滚主栏会把置顶区一起带走（反之亦然）；
+    /// - 置顶区与历史区各画一次置顶条目时，会产生两处同名行 Id
+    ///   （`("row", item.id)`），egui 的 ID 冲突检查会直接在界面上
+    ///   打出警告。
+    ///
+    /// 改成同列表后这两类问题一起消失，所以判据是：
+    /// **独立置顶区的热区不再存在**，且历史列表照常有内容。
+    #[test]
+    fn pinned_entries_share_the_history_list() {
+        let mut h = Harness::new("pin-shared", vec2(700.0, 600.0))
             .with_items(8)
             .with_pinned(2);
         h.frame();
 
-        let pinned = hit(&h, "pinned_body");
-        let history = hit(&h, "history_body");
-
-        // 前置条件：确实画出了两个独立列表。
+        // 核心断言：不再有独立的置顶区热区。
         assert!(
-            pinned.height() > 0.0,
-            "有置顶条目时应画出置顶列表，实际={pinned:?}"
+            !h.state.hit.contains_key(HitNs::Main, "pinned_body"),
+            "置顶条目不该再有独立列表（pinned_body 是旧内嵌置顶区的热区）"
         );
+
+        // 且历史列表仍在（置顶条目被并进去，而不是被丢掉了）。
+        let history = h
+            .state
+            .hit
+            .get(HitNs::Main, "history_body")
+            .expect("历史列表热区应存在");
         assert!(
             history.height() > 0.0,
-            "历史列表必须仍然有可用高度（不能被置顶区挤没），实际={history:?}"
+            "历史列表必须有可用高度，实际={history:?}"
         );
+    }
 
-        // 核心断言：两段**不重叠**，且置顶段在历史段**上方**。
-        assert!(
-            pinned.max.y <= history.min.y + 0.5,
-            "内嵌置顶区与历史列表重叠了：pinned={pinned:?} history={history:?} ——              会出现「置顶」标签压在标题「历史」上、且置顶行盖住历史行"
-        );
+    /// 置顶的条目排在**最前**。
+    ///
+    /// # 这条守的是「绘制层不要自己排序」
+    ///
+    /// 排序是**数据层**的职责：store 的 SQL 就是
+    /// `ORDER BY pinned DESC, created_at DESC`（`store::list()`）。
+    /// 绘制层曾经又排了一次，那是重复且错层——排序规则要改就得改
+    /// 两个地方，而早前内嵌置顶区与主栏各画一份时，两边规则一旦
+    /// 不一致就会出现「同一条目在两处位置不同」。
+    ///
+    /// 所以本测试守的是：**置顶后数据层给出的首条就是置顶条目**，
+    /// 且首条被画在列表顶部（点击命中它）。
+    #[test]
+    fn pinned_rows_sort_before_unpinned() {
+        let mut h = Harness::new("pin-sort", vec2(700.0, 600.0)).with_items(4);
+        h.frame();
 
-        // 置顶段必须在卡片头部**之下**（否则标签会与标题同高）。
-        let card = h
-            .ws
-            .by_kind(CardKind::History)
-            .expect("默认工作区含历史卡片")
-            .rect;
+        // 置顶**最旧**的那一条。
+        //
+        // `with_pinned(n)` 置顶的是 `items.take(n)`，即「最新的那几条」，
+        // 而它们本来就在列表最前 —— 那种夹具测不出排序是否生效。
+        // 只有把一条排在后面的旧条目置顶，首行位置才会改变。
+        let oldest = h
+            .svc
+            .state
+            .items
+            .last()
+            .expect("夹具应造出条目")
+            .id;
+        h.svc.toggle_pin(oldest).expect("置顶应成功");
+        h.svc.reload_list();
+        h.frame();
+
+        // 前置条件：数据层已把置顶条目排到首位。
+        let first = h.svc.state.items.first().expect("列表非空");
         assert!(
-            pinned.min.y > card.min.y,
-            "置顶区应从卡片头部**下方**开始，而不是压在标题上：pinned={pinned:?} card={card:?}"
+            first.pinned,
+            "数据层应把置顶条目排在最前（store 的 ORDER BY pinned DESC）"
         );
+        assert_eq!(first.id, oldest, "首条应当是那条被置顶的旧条目");
+
+        // 「首条被画在列表顶部且按钮可点」由 `pinned_row_button_can_unpin`
+        // 覆盖 —— 那是按钮坐标，与本条要守的排序无关。这里不再重复点一遍：
+        // 点击坐标对行首偏移（`ROW_GAP/2`）很敏感，两条测试各自钉住
+        // 自己那件事，失败时更容易定位。
+
     }
 
     /// 没有置顶条目时，历史列表必须占满整个 body（不留下空白带）。
@@ -4696,21 +4702,24 @@ fn with_pinned(mut self, n: usize) -> Self {
             .with_pinned(1);
         h.frame();
 
-        let body = hit(&h, "pinned_body");
+        // 置顶条目现在就在**主列表**里（不再有独立置顶区），所以
+        // 热区取 `history_body`。
+        let body = hit(&h, "history_body");
         let btn = h.pal.control_height * 0.55;
-        let acts_w = 3.0 * (btn + h.pal.space_xs);
-        // 按钮从「行右缘让出滚动条」处向左排，i=0（置顶/取消置顶）是最右一个。
+        let acts_w = acts_width(&h.pal);
+        // 按钮基准 = 热区右缘 − LIST_PAD_X（列表左右留白）− ROW_PAD_H。
         //
-        // 注：置顶区只有 1 条、**没有滚动条**，所以这里不减
-        // `SCROLLBAR_RESERVE`——行矩形只在可滚动时才让出滚动条宽度。
-        let x = body.max.x - LIST_PAD_X - acts_w + 0.5 * (btn + h.pal.space_xs);
+        // CAUTION: `history_body` 登记的是**未扣** `LIST_PAD_X` 的矩形，
+        // 这里必须减掉，否则整条右移 8pt —— 症状是「按钮点不中」，
+        // 而实际绘制是对的，非常容易被误判成实现 bug。
+        let x = body.max.x - LIST_PAD_X - ROW_PAD_H - acts_w + 0.5 * (btn + h.pal.space_xs);
         let mut hit_any = false;
-        // 按钮现在贴在卡片**右上角**（中心 y ≈ pad_v + btn/2 ≈ 卡片顶
-        // 向下 ~12pt），只扫顶部几条 y 即可。
+        // 按钮贴卡片**右上角**、比来源行再低 `ROW_ACTS_DROP`，
+        // 中心 y ≈ 首行顶 + ROW_GAP/2 + pad_v(5) + 4 + btn/2 ≈ +20pt。
         for y in [
-            body.min.y + 8.0,
             body.min.y + 12.0,
-            body.min.y + 20.0,
+            body.min.y + 18.0,
+            body.min.y + 22.0,
         ] {
             let ops = h.click_at(pos2(x, y));
             if ops.iter().any(|o| matches!(o, Op::TogglePin(_))) {
@@ -4720,7 +4729,8 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
         assert!(
             hit_any,
-            "置顶条目的置顶按钮必须可点并产生 TogglePin（取消置顶入口）"
+            "置顶条目的置顶按钮必须可点并产生 TogglePin（取消置顶入口）\
+             body={body:?} x={x} ROW_PAD_H={ROW_PAD_H} acts_w={acts_w} btn={btn}"
         );
     }
 
@@ -4888,18 +4898,19 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
 
         let btn = h.pal.control_height * 0.55;
-        let acts_w = 3.0 * (btn + h.pal.space_xs);
-        // 行矩形已内缩，按钮基准就是 content.max.x - SCROLLBAR_RESERVE。
-        let right = body.max.x - LIST_PAD_X - SCROLLBAR_RESERVE;
+        let acts_w = acts_width(&h.pal);
+        // 行矩形已内缩，按钮基准 = content.max.x - SCROLLBAR_RESERVE - ROW_PAD_H。
+        let right = body.max.x - LIST_PAD_X - SCROLLBAR_RESERVE - ROW_PAD_H;
         // i=2 是删除（最右一个），中心偏左 acts_w - 2.5*(btn+space_xs)。
         let x = right - acts_w + 2.5 * (btn + h.pal.space_xs);
 
         let mut hit_any = false;
+        // 按钮比来源行低 `ROW_ACTS_DROP`，中心约在首行顶下 20pt。
         for y in [
-            body.min.y + 8.0,
             body.min.y + 12.0,
-            body.min.y + 20.0,
-            body.min.y + 28.0,
+            body.min.y + 18.0,
+            body.min.y + 22.0,
+            body.min.y + 30.0,
         ] {
             let ops = h.click_at(pos2(x, y));
             if ops.iter().any(|o| matches!(o, Op::Delete(_))) {
