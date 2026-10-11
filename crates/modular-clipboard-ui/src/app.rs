@@ -1256,6 +1256,21 @@ impl App {
                     set_number_field(&mut self.svc.state.config, group, field, value);
                     self.after_config_change();
                 }
+                Op::SetText { group, field, value } => {
+                    set_text_field(&mut self.svc.state.config, group, field, &value);
+                    self.after_config_change();
+                }
+                Op::CopyMcpPairPrompt => {
+                    // 把按当前 MCP 配置动态拼接的接入说明复制到剪贴板。
+                    //
+                    // CAUTION: `write_clipboard_text` 内部在写之前武装抑制
+                    // （同 `copy_item` 规则），防止捕获线程把自己写的内容再记一条。
+                    let prompt = crate::paint::mcp_pair_prompt(&self.svc.state.config);
+                    match self.svc.write_clipboard_text(&prompt) {
+                        Ok(()) => self.svc.notify("已复制 AI 配对提示词".into()),
+                        Err(e) => self.svc.notify(format!("复制配对提示词失败: {e}")),
+                    }
+                }
                 Op::SetOptNumber { group, field, value } => {
                     set_opt_number_field(&mut self.svc.state.config, group, field, value);
                     self.after_config_change();
@@ -1554,6 +1569,15 @@ fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate::paint::Con
         (G::Ui, "show_tray") => cfg.ui.show_tray = v,
         (G::Ui, "start_minimized") => cfg.ui.start_minimized = v,
         (G::Storage, "cleanup_on_start") => cfg.storage.cleanup_on_start = v,
+        (G::Mcp, "enabled") => cfg.mcp.enabled = v,
+        (G::Mcp, "resize_window") => cfg.mcp.resize_window = v,
+        (G::Mcp, "read_layout") => cfg.mcp.read_layout = v,
+        (G::Mcp, "click_element") => cfg.mcp.click_element = v,
+        (G::Mcp, "type_text") => cfg.mcp.type_text = v,
+        (G::Mcp, "scroll_view") => cfg.mcp.scroll_view = v,
+        (G::Mcp, "screen_capture") => cfg.mcp.screen_capture = v,
+        (G::Mcp, "window_focus") => cfg.mcp.window_focus = v,
+        (G::Mcp, "drag_drop") => cfg.mcp.drag_drop = v,
         _ => tracing::warn!(?g, field, "未知的布尔配置字段，已忽略"),
     }
 }
@@ -1572,7 +1596,18 @@ fn set_number_field(
         (G::Ui, "font_scale") => cfg.ui.font_scale = (v.clamp(0.75, 2.0)) as f32,
         (G::Storage, "max_bytes") => cfg.storage.max_bytes = v.max(1.0) as u64,
         (G::Storage, "max_payload_bytes") => cfg.storage.max_payload_bytes = v.max(1.0) as u64,
+        (G::Mcp, "port") => cfg.mcp.port = v.clamp(0.0, 65535.0) as u16,
         _ => tracing::warn!(?g, field, "未知的数值配置字段，已忽略"),
+    }
+}
+
+/// 改一个文本配置字段（MCP 服务地址 / 密钥）。
+fn set_text_field(cfg: &mut modular_clipboard_core::Config, g: crate::paint::ConfigGroup, field: &str, v: &str) {
+    use crate::paint::ConfigGroup as G;
+    match (g, field) {
+        (G::Mcp, "host") => cfg.mcp.host = v.trim().to_string(),
+        (G::Mcp, "token") => cfg.mcp.token = v.trim().to_string(),
+        _ => tracing::warn!(?g, field, "未知的文本配置字段，已忽略"),
     }
 }
 

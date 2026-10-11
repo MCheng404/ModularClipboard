@@ -115,6 +115,17 @@ pub enum Op {
         /// 新绑定。
         hotkey: modular_clipboard_core::config::Hotkey,
     },
+    /// 改一个文本配置字段（MCP 服务地址 / 密钥）。
+    SetText {
+        group: ConfigGroup,
+        field: &'static str,
+        value: String,
+    },
+    /// 复制「一键 AI 配对提示词」到系统剪贴板。
+    ///
+    /// 内容由当前 MCP 配置动态生成（可调用能力清单 + 接入参数），
+    /// 由 `App::apply_ops` 落地：写剪贴板（带自身捕获抑制）。
+    CopyMcpPairPrompt,
     /// 打开/关闭设置界面。
     ToggleSettings,
     /// 清空全部历史。
@@ -143,6 +154,8 @@ pub enum ConfigGroup {
     Ui,
     Capture,
     Storage,
+    /// MCP 服务（通信分类卡片）。
+    Mcp,
 }
 
 impl ConfigGroup {
@@ -152,6 +165,7 @@ impl ConfigGroup {
             ConfigGroup::Ui => "界面",
             ConfigGroup::Capture => "捕获",
             ConfigGroup::Storage => "存储",
+            ConfigGroup::Mcp => "通信",
         }
     }
 }
@@ -211,18 +225,21 @@ pub enum SettingsCat {
     Storage,
     /// 快捷键：全局热键绑定。
     Shortcuts,
+    /// 通信：MCP 服务与外部调用。
+    Comm,
     /// 关于：版本 / 数据目录 / 退出。
     About,
 }
 
 impl SettingsCat {
     /// 全部分类（导航顺序）。
-    pub const ALL: [SettingsCat; 6] = [
+    pub const ALL: [SettingsCat; 7] = [
         SettingsCat::General,
         SettingsCat::Appearance,
         SettingsCat::Capture,
         SettingsCat::Storage,
         SettingsCat::Shortcuts,
+        SettingsCat::Comm,
         SettingsCat::About,
     ];
 
@@ -234,6 +251,7 @@ impl SettingsCat {
             SettingsCat::Capture => "捕获",
             SettingsCat::Storage => "存储",
             SettingsCat::Shortcuts => "快捷键",
+            SettingsCat::Comm => "通信",
             SettingsCat::About => "关于",
         }
     }
@@ -246,6 +264,7 @@ impl SettingsCat {
             SettingsCat::Capture => crate::icons::Icon::Text,
             SettingsCat::Storage => crate::icons::Icon::Table,
             SettingsCat::Shortcuts => crate::icons::Icon::Pinned,
+            SettingsCat::Comm => crate::icons::Icon::Code,
             SettingsCat::About => crate::icons::Icon::Code,
         }
     }
@@ -258,6 +277,7 @@ impl SettingsCat {
             SettingsCat::Capture => "settings_cat_capture",
             SettingsCat::Storage => "settings_cat_storage",
             SettingsCat::Shortcuts => "settings_cat_shortcuts",
+            SettingsCat::Comm => "settings_cat_comm",
             SettingsCat::About => "settings_cat_about",
         }
     }
@@ -270,6 +290,7 @@ impl SettingsCat {
             SettingsCat::Capture => "settings_reset_capture",
             SettingsCat::Storage => "settings_reset_storage",
             SettingsCat::Shortcuts => "settings_reset_shortcuts",
+            SettingsCat::Comm => "settings_reset_comm",
             SettingsCat::About => "settings_reset_about",
         }
     }
@@ -344,6 +365,12 @@ pub struct UiState {
     pub settings_recent: Vec<(String, u64)>,
     // 注：原先这里有 `settings_scroll`（手写滚动偏移）。设置面板
     // 改用 `ScrollArea` 后由 egui 自己管理滚动位置，该字段整体删除。
+
+    /// MCP 调用设置覆盖层是否打开。
+    ///
+    /// 打开时设置界面整体蒙上白/黑遮罩（视觉失焦），面板内列出
+    /// 全部可调用 MCP 开关；关闭后所有调用不可用（叠加层内禁用）。
+    pub mcp_overlay_open: bool,
 
     // ---- 交互热区（供自动化测试定位）----
     //
@@ -1152,6 +1179,13 @@ pub fn draw_settings(f: &mut Frame<'_>) {
         .show(&mut ui, |ui| {
             settings_content(f, ui);
         });
+
+    // MCP 调用设置覆盖层（限制在本窗口客户区内，不遮桌面）。
+    //
+    // 画在内容区**之后**：视觉上盖住卡片，交互区也后注册 → 命中优先。
+    if f.state.mcp_overlay_open {
+        settings_mcp_overlay(f, area);
+    }
 }
 
 /// 右上角关闭按钮（绝对定位，不随滚动）。
@@ -1372,10 +1406,77 @@ enum ItemKind {
     Opacity,
     /// 快捷键绑定（只读展示）。
     Hotkey(HotkeySlot),
+    /// MCP 总开关行：右侧先画开关（最右），再画 ⓘ 详细按钮（开关左边），
+    /// 点 ⓘ 打开 MCP 调用设置覆盖层。
+    McpToggle,
+    /// 文本输入行（MCP 服务地址 / 密钥）。
+    ///
+    /// `secret=true` 时用密码样式输入（密钥，默认无）。
+    Text {
+        group: ConfigGroup,
+        field: &'static str,
+        ph: &'static str,
+        secret: bool,
+    },
+    /// MCP 端口（数字输入，留空 = 未设置）。
+    McpPort,
     /// 只读信息行（关于页）。
     Info(&'static str),
     /// 退出程序按钮（关于页）。
     Quit,
+}
+
+/// MCP 可调用能力清单（叠加层内展示，顺序即显示顺序）。
+struct McpCap {
+    field: &'static str,
+    name: &'static str,
+    desc: &'static str,
+    ready: bool,
+}
+
+/// 全部 MCP 可调用能力（与 `config::McpConfig` 字段一一对应）。
+static MCP_CAPS: &[McpCap] = &[
+    McpCap { field: "resize_window", name: "调节窗口大小", desc: "调整任意窗口的尺寸与位置", ready: true },
+    McpCap { field: "read_layout", name: "获取元素布局", desc: "读取界面元素的几何与层级信息", ready: true },
+    McpCap { field: "click_element", name: "点击界面元素", desc: "在任意位置点击或激活元素", ready: true },
+    McpCap { field: "type_text", name: "输入文本", desc: "向焦点控件键入文字与快捷键", ready: true },
+    McpCap { field: "scroll_view", name: "滚动视图", desc: "滚动页面与列表到目标位置", ready: true },
+    McpCap { field: "screen_capture", name: "屏幕截图", desc: "截取屏幕或窗口画面", ready: true },
+    McpCap { field: "window_focus", name: "切换焦点窗口", desc: "激活指定窗口或应用", ready: false },
+    McpCap { field: "drag_drop", name: "拖拽操作", desc: "拖拽元素或执行拖放", ready: false },
+];
+
+/// 读一个 MCP 能力开关。
+fn get_mcp_cap(cfg: &modular_clipboard_core::config::Config, field: &str) -> bool {
+    let m = &cfg.mcp;
+    match field {
+        "resize_window" => m.resize_window,
+        "read_layout" => m.read_layout,
+        "click_element" => m.click_element,
+        "type_text" => m.type_text,
+        "scroll_view" => m.scroll_view,
+        "screen_capture" => m.screen_capture,
+        "window_focus" => m.window_focus,
+        "drag_drop" => m.drag_drop,
+        _ => false,
+    }
+}
+
+/// 一键 AI 配对提示词：可调用能力清单 + 接入参数（协议头）。
+///
+/// `pub`：`App::apply_ops` 的 `CopyMcpPairPrompt` 分支读取它写入剪贴板。
+pub fn mcp_pair_prompt(cfg: &modular_clipboard_core::config::Config) -> String {
+    let mut s = String::from("【modular-clipboard · MCP 服务接入说明】\nmodular-clipboard 提供 Model Context Protocol (MCP) 服务，可对电脑执行界面自动化操作。\n\n可调用能力（8 项）：\n");
+    for cap in MCP_CAPS {
+        s.push_str(&format!("- {}：{}\n", cap.name, cap.desc));
+    }
+    s.push_str(&format!(
+        "\n接入参数：\n- 协议：Model Context Protocol（MCP）\n- 协议版本：2025-06-18\n- 传输方式：stdio\n- 启动命令：modular-clipboard.exe --mcp-server\n- 服务地址：{}\n- 端口：{}\n- 认证：{}\n\n请将上述参数配置到你的 MCP 客户端（如 Claude Desktop / Cursor / VS Code），配置完成后即可通过工具调用对本电脑执行界面自动化操作。",
+        if cfg.mcp.host.is_empty() { "127.0.0.1（默认）".to_string() } else { cfg.mcp.host.clone() },
+        if cfg.mcp.port == 0 { "未设置".to_string() } else { cfg.mcp.port.to_string() },
+        if cfg.mcp.token.is_empty() { "无".to_string() } else { "Bearer Token（已在设置中配置）".to_string() },
+    ));
+    s
 }
 
 /// 一个设置项。
@@ -1404,6 +1505,15 @@ impl SettingsItem {
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::Hotkey(slot) => slot.current(cfg) != slot.default(),
+            ItemKind::McpToggle => {
+                get_bool(cfg, ConfigGroup::Mcp, "enabled") != get_bool(&d, ConfigGroup::Mcp, "enabled")
+            }
+            ItemKind::Text { group, field, .. } => {
+                get_text(cfg, *group, field) != get_text(&d, *group, field)
+            }
+            ItemKind::McpPort => {
+                get_number(cfg, ConfigGroup::Mcp, "port") != get_number(&d, ConfigGroup::Mcp, "port")
+            }
             ItemKind::Info(_) | ItemKind::Quit => false,
         }
     }
@@ -1434,6 +1544,21 @@ impl SettingsItem {
             ItemKind::Hotkey(slot) => Some(Op::SetHotkey {
                 slot: *slot,
                 hotkey: slot.default(),
+            }),
+            ItemKind::McpToggle => Some(Op::SetBool {
+                group: ConfigGroup::Mcp,
+                field: "enabled",
+                value: get_bool(&d, ConfigGroup::Mcp, "enabled"),
+            }),
+            ItemKind::Text { group, field, .. } => Some(Op::SetText {
+                group: *group,
+                field,
+                value: get_text(&d, *group, field),
+            }),
+            ItemKind::McpPort => Some(Op::SetNumber {
+                group: ConfigGroup::Mcp,
+                field: "port",
+                value: get_number(&d, ConfigGroup::Mcp, "port"),
             }),
             ItemKind::Info(_) | ItemKind::Quit => None,
         }
@@ -1570,6 +1695,32 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
         ],
     },
     SettingsCard {
+        cat: SettingsCat::Comm,
+        title: "MCP 服务",
+        items: &[
+            SettingsItem {
+                label: "MCP 服务",
+                desc: "关闭后所有 MCP 调用不可用",
+                kind: ItemKind::McpToggle,
+            },
+            SettingsItem {
+                label: "服务地址",
+                desc: "MCP 服务监听地址",
+                kind: ItemKind::Text { group: ConfigGroup::Mcp, field: "host", ph: "127.0.0.1", secret: false },
+            },
+            SettingsItem {
+                label: "端口",
+                desc: "MCP 服务端口，留空不设置",
+                kind: ItemKind::McpPort,
+            },
+            SettingsItem {
+                label: "密钥",
+                desc: "默认无，留空表示无需认证",
+                kind: ItemKind::Text { group: ConfigGroup::Mcp, field: "token", ph: "无", secret: true },
+            },
+        ],
+    },
+    SettingsCard {
         cat: SettingsCat::About,
         title: "关于",
         items: &[
@@ -1619,6 +1770,8 @@ fn get_bool(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, field:
         (G::Ui, "show_tray") => cfg.ui.show_tray,
         (G::Ui, "start_minimized") => cfg.ui.start_minimized,
         (G::Storage, "cleanup_on_start") => cfg.storage.cleanup_on_start,
+        (G::Mcp, "enabled") => cfg.mcp.enabled,
+        (G::Mcp, f) if MCP_CAPS.iter().any(|c| c.field == f) => get_mcp_cap(cfg, f),
         _ => false,
     }
 }
@@ -1630,7 +1783,18 @@ fn get_number(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, fiel
         (G::Capture, "poll_interval_ms") => cfg.capture.poll_interval_ms as f64,
         (G::Ui, "font_scale") => cfg.ui.font_scale as f64,
         (G::Storage, "max_payload_bytes") => cfg.storage.max_payload_bytes as f64,
+        (G::Mcp, "port") => cfg.mcp.port as f64,
         _ => 0.0,
+    }
+}
+
+/// 读一个文本配置字段（MCP 服务地址 / 密钥）。
+fn get_text(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, field: &str) -> String {
+    use ConfigGroup as G;
+    match (g, field) {
+        (G::Mcp, "host") => cfg.mcp.host.clone(),
+        (G::Mcp, "token") => cfg.mcp.token.clone(),
+        _ => String::new(),
     }
 }
 
@@ -1670,13 +1834,15 @@ fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
 /// 一张卡片：圆角背景 + 标题行（标题 + 条件重置按钮）+ 设置行。
 ///
 /// 卡片高度由 `head_h + row_h * 行数` 算出，整块 `allocate` 推进滚动游标。
+/// 「通信」卡片底部额外有「一键 AI 配对提示词」按钮，占用 44pt。
 fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
     let pal = f.pal;
     let w = ui.available_width();
     let row_h = 44.0;
     let head_h = 40.0;
     let pad = 12.0;
-    let h = head_h + row_h * card.items.len() as f32 + pad * 2.0;
+    let extra = if card.cat == SettingsCat::Comm { 44.0 } else { 0.0 };
+    let h = head_h + row_h * card.items.len() as f32 + pad * 2.0 + extra;
     let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
     ui.painter_at(r).rect_filled(r, pal.radius_lg, pal.surface);
 
@@ -1718,6 +1884,17 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
                             f.state.push(op);
                         }
                     }
+                    // 通信卡片重置 = 整卡内容回到默认：MCP 总开关 +
+                    // 8 个可调用能力全部恢复开启。
+                    if card.cat == SettingsCat::Comm {
+                        for cap in MCP_CAPS {
+                            f.state.push(Op::SetBool {
+                                group: ConfigGroup::Mcp,
+                                field: cap.field,
+                                value: true,
+                            });
+                        }
+                    }
                     // 该卡片全部项从「最近修改」里移除。
                     f.state
                         .settings_recent
@@ -1737,6 +1914,31 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
 
     for it in card.items {
         settings_item_row(f, &mut inner, it);
+    }
+
+    // 通信卡片底部：「一键 AI 配对提示词」按钮。
+    //
+    // 点击后由 `App::apply_ops` 把按当前 MCP 配置动态拼接的接入说明
+    // 复制到系统剪贴板（写剪贴板带自身捕获抑制，见 `copy_mcp_pair_prompt`）。
+    if card.cat == SettingsCat::Comm {
+        inner.add_space(4.0);
+        let btn_w = inner.available_width();
+        // 用 allocate 推进游标再自绘（纯平风格，不用默认 Button 边框）。
+        let (bb, resp) = inner.allocate_exact_size(vec2(btn_w, 36.0), egui::Sense::click());
+        let p = inner.painter_at(bb);
+        let hovered = resp.hovered();
+        p.rect_filled(bb, pal.radius_md, if hovered { pal.accent_hover } else { pal.accent });
+        p.text(
+            bb.center(),
+            egui::Align2::CENTER_CENTER,
+            "⚡ 一键 AI 配对提示词",
+            egui::FontId::proportional(pal.font_sm),
+            pal.text_on_accent,
+        );
+        f.hit_insert("settings_mcp_pair", bb);
+        if resp.clicked() {
+            f.state.push(Op::CopyMcpPairPrompt);
+        }
     }
 }
 
@@ -1898,6 +2100,83 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 );
                 false
             });
+        }
+        ItemKind::McpToggle => {
+            let mut v = get_bool(&f.svc.state.config, ConfigGroup::Mcp, "enabled");
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                // control 位于 right_to_left 容器：先 add 的控件靠右。
+                // 先画开关（最右），再画 ⓘ 详细按钮（紧贴开关**左边**，
+                // 即「MCP 详细在总开关按钮的左边」）。
+                let sw = draw_switch(f, ui, "mcp_enabled", &mut v);
+                let info = draw_mcp_info_btn(f, ui);
+                if info.clicked() {
+                    f.state.mcp_overlay_open = !f.state.mcp_overlay_open;
+                }
+                sw
+            });
+            if changed {
+                f.state.push(Op::SetBool {
+                    group: ConfigGroup::Mcp,
+                    field: "enabled",
+                    value: v,
+                });
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::Text {
+            group,
+            field,
+            ph,
+            secret,
+        } => {
+            let cur = get_text(&f.svc.state.config, *group, field);
+            let mut buf = cur;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .hint_text(*ph)
+                        .password(*secret)
+                        .frame(egui::Frame::NONE)
+                        .text_color(pal.text)
+                        .desired_width(if *secret { 170.0 } else { 230.0 }),
+                )
+                .changed()
+            });
+            if changed {
+                f.state.push(Op::SetText {
+                    group: *group,
+                    field,
+                    value: buf,
+                });
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::McpPort => {
+            let port = f.svc.state.config.mcp.port;
+            let mut buf = if port == 0 {
+                String::new()
+            } else {
+                port.to_string()
+            };
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut buf)
+                        .hint_text("9123")
+                        .frame(egui::Frame::NONE)
+                        .text_color(pal.text)
+                        .desired_width(110.0),
+                )
+                .changed()
+            });
+            if changed {
+                let v: u16 = buf.trim().parse().unwrap_or(0);
+                f.state.push(Op::SetNumber {
+                    group: ConfigGroup::Mcp,
+                    field: "port",
+                    value: v as f64,
+                });
+                record_recent(f, it.label);
+            }
         }
         ItemKind::Info(text) => {
             setting_row(ui, it.label, "", |ui| {
@@ -2115,6 +2394,283 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // 逐个登记还有一个好处：测试能逐项核对边界，而不是只看最后一个。
     f.hit_insert(id_suffix, rect);
     *v != on
+}
+
+/// MCP 总开关左侧的 ⓘ 详细按钮（打开 MCP 调用设置覆盖层）。
+///
+/// 自绘圆形信息图标：accent 底色 + 圆点 + 竖线（不依赖字体字形，
+/// 图标字体里没有 info 码位，新增字形需要重新生成 TTF）。
+fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Response {
+    let pal = f.pal;
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    let p = ui.painter_at(r);
+    // `row_selected` = accent 低透明底（Palette 无 `accent_bg` 令牌）。
+    let bg = if resp.hovered() {
+        pal.accent
+    } else {
+        pal.row_selected
+    };
+    p.circle_filled(r.center(), 11.0, bg);
+    let ic = if resp.hovered() {
+        pal.text_on_accent
+    } else {
+        pal.accent
+    };
+    // 信息图标：点 + 竖线。
+    p.circle_filled(r.center() + vec2(0.0, -2.5), 1.3, ic);
+    p.line_segment(
+        [r.center() + vec2(0.0, 1.0), r.center() + vec2(0.0, 5.0)],
+        Stroke::new(1.6, ic),
+    );
+    f.hit_insert("settings_mcp_info", r);
+    resp
+}
+
+/// MCP 调用设置覆盖层。
+///
+/// 结构：全窗遮罩（白/黑随主题，模拟失焦）+ 圆角面板（限制在窗口
+/// 客户区内，max 92% 宽 / 82% 高）+ 8 个可调用能力开关 + 取消/完成。
+///
+/// NOTE: 模糊失焦（blur）是后续渲染管线工作：`renderer.rs` 目前
+/// `continue` 跳过 `PaintCallback`，自研模糊需扩展 GPU 管线后接入。
+/// 当前用半透明遮罩近似「失焦」效果。
+fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
+    let pal = f.pal;
+
+    // 遮罩色随主题：亮色界面用白、暗色界面用黑（透明度 ~58%）。
+    let dark = pal.surface.r() < 128;
+    let shade = if dark {
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 148)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 148)
+    };
+    f.ui.painter_at(area).rect_filled(area, 0.0, shade);
+
+    // 面板：居中，限制在窗口客户区内。
+    let pw = 480.0_f32.min(area.width() * 0.92);
+    let ph = 560.0_f32.min(area.height() * 0.82);
+    let panel = Rect::from_center_size(area.center(), vec2(pw, ph));
+
+    // 点击面板外关闭。
+    let bg = f.ui.interact(area, egui::Id::new("mcp_overlay_bg"), egui::Sense::click());
+    if bg.clicked() && bg.interact_pointer_pos().is_some_and(|p| !panel.contains(p)) {
+        f.state.mcp_overlay_open = false;
+    }
+
+    let painter = f.ui.painter_at(panel);
+    painter.rect_filled(panel, pal.radius_lg, pal.surface);
+
+    let mut ui = f.ui.new_child(
+        egui::UiBuilder::new()
+            .id(egui::Id::new("mcp_overlay"))
+            .max_rect(panel.shrink2(vec2(16.0, 14.0)))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
+
+    // 标题行：左标题，右 × 关闭。
+    let total_on = MCP_CAPS.iter().filter(|c| get_mcp_cap(&f.svc.state.config, c.field)).count();
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("MCP 调用设置")
+                .strong()
+                .size(pal.font_md)
+                .color(pal.text_bright),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), egui::Sense::click());
+            let p = ui.painter_at(r);
+            if resp.hovered() {
+                p.rect_filled(r, pal.radius_sm, pal.row_hover);
+            }
+            crate::icons::Icon::Close.paint(
+                &p,
+                Rect::from_center_size(r.center(), vec2(13.0, 13.0)),
+                if resp.hovered() { pal.text_bright } else { pal.text_dim },
+            );
+            f.hit_insert("settings_mcp_overlay_close", r);
+            if resp.clicked() {
+                f.state.mcp_overlay_open = false;
+            }
+        });
+    });
+
+    // 副标题：能力总数 / 当前可调用数。
+    ui.label(
+        egui::RichText::new(format!(
+            "共 {} 个能力 · {} 个可调用 · 关闭后全部不可用",
+            MCP_CAPS.len(),
+            if f.svc.state.config.mcp.enabled { total_on } else { 0 }
+        ))
+        .size(pal.font_xs)
+        .color(pal.text_dim),
+    );
+
+    // 分隔线。
+    let sep_y = ui.min_rect().max.y + 4.0;
+    let panel_p = f.ui.painter_at(panel);
+    panel_p.hline(
+        panel.min.x + 16.0..=panel.max.x - 16.0,
+        sep_y,
+        egui::Stroke::new(1.0, pal.border_subtle),
+    );
+
+    // 能力列表（可滚动）。
+    let list_top = sep_y + 8.0;
+    let list_bottom = panel.max.y - 52.0;
+    let list_rect = Rect::from_min_max(pos2(panel.min.x + 16.0, list_top), pos2(panel.max.x - 16.0, list_bottom));
+    if list_bottom > list_top + 8.0 {
+        let mut lu = f.ui.new_child(
+            egui::UiBuilder::new()
+                .id(egui::Id::new("mcp_overlay_list"))
+                .max_rect(list_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        lu.spacing_mut().item_spacing = vec2(0.0, 2.0);
+        egui::ScrollArea::vertical()
+            .id_salt("mcp_overlay_scroll")
+            .auto_shrink([false, false])
+            .show(&mut lu, |ui| {
+                for cap in MCP_CAPS {
+                    settings_mcp_overlay_row(f, ui, cap);
+                }
+            });
+    }
+
+    // 底部：取消 / 完成。
+    let mut bu = f.ui.new_child(
+        egui::UiBuilder::new()
+            .id(egui::Id::new("mcp_overlay_bottom"))
+            .max_rect(Rect::from_min_max(
+                pos2(panel.min.x + 16.0, list_bottom),
+                pos2(panel.max.x - 16.0, panel.max.y - 10.0),
+            ))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    bu.spacing_mut().item_spacing = vec2(8.0, 0.0);
+    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_done", "完成", true);
+    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_cancel", "取消", false);
+}
+
+/// 覆盖层底部按钮（自绘小按钮：圆角 + 文字，右对齐顺序）。
+fn draw_mcp_overlay_btn(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    key: &'static str,
+    label: &str,
+    primary: bool,
+) {
+    let pal = f.pal;
+    let (r, resp) = ui.allocate_exact_size(vec2(84.0, 32.0), egui::Sense::click());
+    let p = ui.painter_at(r);
+    let hovered = resp.hovered();
+    let fill = if primary {
+        if hovered { pal.accent_hover } else { pal.accent }
+    } else if hovered {
+        pal.row_hover
+    } else {
+        pal.surface_variant
+    };
+    p.rect_filled(r, pal.radius_md, fill);
+    let color = if primary {
+        pal.text_on_accent
+    } else {
+        pal.text
+    };
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(pal.font_sm),
+        color,
+    );
+    f.hit_insert(key, r);
+    if resp.clicked() {
+        f.state.mcp_overlay_open = false;
+    }
+}
+
+/// 覆盖层里的一行能力：左 label+desc，右 徽标 + 开关。
+fn settings_mcp_overlay_row(f: &mut Frame<'_>, ui: &mut Ui, cap: &McpCap) {
+    let total_enabled = f.svc.state.config.mcp.enabled;
+    let mut v = get_mcp_cap(&f.svc.state.config, cap.field);
+    let changed = setting_row(ui, cap.name, cap.desc, |ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
+            if total_enabled {
+                // 开关（最右）。id 直接用字段名（主卡片开关只用 "enabled"，
+                // 与能力字段不冲突；热区 key 同理不冲突）。
+                let sw = draw_switch(f, ui, cap.field, &mut v);
+                // 徽标：已连接 / 未连接（未连接 = 能力尚未就绪）。
+                draw_mcp_badge(f, ui, cap.ready);
+                sw
+            } else {
+                // 总开关关闭：画灰色静态开关 + 灰色徽标（不可交互）。
+                draw_mcp_badge_disabled(f, ui);
+                draw_static_switch_off(f, ui);
+                false
+            }
+        })
+        .inner
+    });
+    if changed {
+        f.state.push(Op::SetBool {
+            group: ConfigGroup::Mcp,
+            field: cap.field,
+            value: v,
+        });
+        record_recent(f, cap.name);
+    }
+}
+
+/// 「已连接 / 未连接」徽标。
+fn draw_mcp_badge(f: &mut Frame<'_>, ui: &mut Ui, ready: bool) {
+    let pal = f.pal;
+    let (text, fg) = if ready {
+        ("已连接", pal.accent)
+    } else {
+        ("未连接", pal.text_dim)
+    };
+    let w = 44.0_f32;
+    let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), egui::Sense::hover());
+    let p = ui.painter_at(r);
+    p.rect_filled(r, 10.0, pal.surface_variant);
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(pal.font_xs),
+        fg,
+    );
+}
+
+/// 总开关关闭时的灰色徽标。
+fn draw_mcp_badge_disabled(f: &mut Frame<'_>, ui: &mut Ui) {
+    let pal = f.pal;
+    let w = 44.0_f32;
+    let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), egui::Sense::hover());
+    let p = ui.painter_at(r);
+    p.rect_filled(r, 10.0, pal.surface_variant);
+    p.text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        "已禁用",
+        egui::FontId::proportional(pal.font_xs),
+        pal.text_dim,
+    );
+}
+
+/// 灰色静态开关（关闭态，不可交互）。
+fn draw_static_switch_off(f: &mut Frame<'_>, ui: &mut Ui) {
+    let pal = f.pal;
+    let h = 18.0_f32;
+    let w = h * 1.8;
+    let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
+    let track = Rect::from_center_size(r.center(), vec2(w, h));
+    let p = ui.painter_at(r);
+    p.rect_filled(track, h * 0.5, pal.surface_variant);
+    p.rect_stroke(track, h * 0.5, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+    p.circle_filled(pos2(track.min.x + h * 0.5, track.center().y), h * 0.5 - 2.0, pal.text_dim);
 }
 
 
@@ -4967,5 +5523,118 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert_eq!(kind_label(Html), "HTML");
         assert_eq!(kind_label(Image), "图片");
         assert_eq!(kind_label(Files), "文件");
+    }
+
+    // ------------------------------------------------------------------
+    // MCP 服务（通信分类）测试
+    // ------------------------------------------------------------------
+
+    /// 通信分类下：MCP 总开关行必须同时登记「开关」与「ⓘ 详细」两个热区。
+    #[test]
+    fn mcp_comm_card_registers_toggle_and_info() {
+        let mut h = Harness::new("mcp-comm", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Comm;
+        h.settings_frame();
+        // 总开关（唯一 id `mcp_enabled`，避免与捕获页 `enabled` 撞 id）
+        // 与 ⓘ 详细按钮都必须画出来。
+        let sw = settings_hit(&h, "mcp_enabled");
+        let info = settings_hit(&h, "settings_mcp_info");
+        assert!(sw.width() > 0.0 && info.width() > 0.0);
+        // ⓘ 必须在开关**左边**（x 更小）。
+        assert!(
+            info.max.x <= sw.min.x + 0.5,
+            "ⓘ 应在开关左边：info.max.x={} vs switch.min.x={}",
+            info.max.x,
+            sw.min.x
+        );
+    }
+
+    /// 点 ⓘ ⇒ 打开 MCP 调用设置覆盖层；点遮罩（面板外）⇒ 关闭。
+    #[test]
+    fn mcp_info_toggles_overlay() {
+        let mut h = Harness::new("mcp-overlay", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Comm;
+        h.settings_frame();
+        assert!(!h.state.mcp_overlay_open);
+
+        // 点 ⓘ → 打开。
+        let info = settings_hit(&h, "settings_mcp_info");
+        h.settings_click_at(info.center());
+        assert!(h.state.mcp_overlay_open, "点 ⓘ 应打开覆盖层");
+
+        // 覆盖层内应登记关闭 ×、完成、取消与 8 个能力开关热区。
+        let close = settings_hit(&h, "settings_mcp_overlay_close");
+        let done = settings_hit(&h, "settings_mcp_overlay_done");
+        assert!(close.width() > 0.0 && done.width() > 0.0);
+        let first = settings_hit(&h, MCP_CAPS[0].field);
+        assert!(first.width() > 0.0, "覆盖层应列出能力开关");
+
+        // 点面板外（窗口角落）→ 关闭。
+        h.settings_click_at(h.area.min + vec2(3.0, 3.0));
+        assert!(!h.state.mcp_overlay_open, "点遮罩应关闭覆盖层");
+    }
+
+    /// 覆盖层打开时，能力开关点击 ⇒ 产生对应字段的 `SetBool`。
+    #[test]
+    fn mcp_overlay_switch_emits_set_bool() {
+        let mut h = Harness::new("mcp-overlay-sw", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Comm;
+        h.state.mcp_overlay_open = true;
+        h.settings_frame();
+        let sw = settings_hit(&h, "click_element");
+        let ops = h.settings_click_at(sw.center());
+        assert!(
+            ops.iter().any(|o| matches!(
+                o,
+                Op::SetBool { group: ConfigGroup::Mcp, field: "click_element", .. }
+            )),
+            "覆盖层点「点击界面元素」应产生 SetBool(Mcp, click_element)，实际={ops:?}"
+        );
+    }
+
+    /// 通信卡片重置 ⇒ 总开关与全部能力恢复默认（开启）。
+    #[test]
+    fn mcp_comm_card_reset_restores_defaults() {
+        let mut h = Harness::new("mcp-reset", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Comm;
+        // 先改坏一项（总开关关闭），重置按钮才会出现。
+        h.svc.state.config.mcp.enabled = false;
+        h.svc.state.config.mcp.click_element = false;
+        h.settings_frame();
+        let reset = settings_hit(&h, "settings_reset_comm");
+        let ops = h.settings_click_at(reset.center());
+        let bools: Vec<&Op> = ops
+            .iter()
+            .filter(|o| matches!(o, Op::SetBool { group: ConfigGroup::Mcp, .. }))
+            .collect();
+        // 总开关 + 8 项能力 = 9 个 SetBool，且值全为 true。
+        assert_eq!(bools.len(), 9, "重置应推 9 个 MCP SetBool，实际={ops:?}");
+        for op in bools {
+            match op {
+                Op::SetBool { value, .. } => assert!(*value, "重置应恢复为开启：{op:?}"),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// 一键配对提示词：包含 8 项能力与接入参数，随配置动态拼接。
+    #[test]
+    fn mcp_pair_prompt_is_complete() {
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.mcp.host = "192.168.1.10".into();
+        cfg.mcp.port = 9123;
+        cfg.mcp.token = "sk-123".into();
+        let p = mcp_pair_prompt(&cfg);
+        for cap in MCP_CAPS {
+            assert!(p.contains(cap.name), "提示词应含能力「{}」", cap.name);
+        }
+        assert!(p.contains("192.168.1.10"), "提示词应含自定义服务地址");
+        assert!(p.contains("9123"), "提示词应含自定义端口");
+        assert!(p.contains("Bearer Token"), "提示词应反映已配置密钥");
+        assert!(p.contains("--mcp-server"), "提示词应含启动命令");
     }
 }

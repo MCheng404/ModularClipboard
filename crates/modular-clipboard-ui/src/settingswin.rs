@@ -77,7 +77,7 @@ impl<'a> SettingsWindow<'a> {
         // 主窗口居中时右侧放不下、左侧也没空间，设置窗口被钳到
         // 屏幕右缘——右侧内容贴屏幕边缘，观感上「内容文字位置
         // 不对」（2026-10-11 用户反馈）。
-        let (mut x, mut y) = (
+        let (mut x, y) = (
             ((anchor.x + main_w + 12.0) * s) as i32,
             (anchor.y * s) as i32,
         );

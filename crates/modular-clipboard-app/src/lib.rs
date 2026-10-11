@@ -301,7 +301,10 @@ impl Service {
     /// 用时间戳而非一次性标志：UI 每帧都会调用 `pump`，
     /// 布尔标志会在下一次 pump（16ms 后）就被清除，起不到抑制作用。
     /// 时间戳由捕获线程自行判断窗口是否过期，两侧无需同步。
-    fn suppress_self_capture(&self) {
+    ///
+    /// `pub`：设置界面的「一键 AI 配对提示词」等写剪贴板的入口
+    /// 也要在写前调用（同 [`Self::copy_item`] 的抑制规则）。
+    pub fn suppress_self_capture(&self) {
         self.last_self_write
             .store(now_ms() as u64, Ordering::Relaxed);
     }
@@ -583,6 +586,16 @@ impl Service {
     /// 标记当前 `capture.enabled` 是命令行临时覆盖，保存配置时应跳过。
     pub fn set_capture_override(&mut self, is_override: bool) {
         self.capture_override = is_override;
+    }
+
+    /// 把一段文本写回系统剪贴板（自带自写回抑制）。
+    ///
+    /// 供设置界面「一键 AI 配对提示词」等入口使用——与 [`Self::copy_item`]
+    /// 同规则：抑制必须在写之前武装，防止捕获线程把自己写的内容再记一条。
+    pub fn write_clipboard_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.suppress_self_capture();
+        let mut reader = ClipboardReader::new()?;
+        reader.write_text(text)
     }
 
     /// 在状态栏显示一条消息，3 秒后过期。

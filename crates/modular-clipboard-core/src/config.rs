@@ -322,6 +322,65 @@ pub struct ActionRule {
     pub sort_order: i64,
 }
 
+/// MCP（Model Context Protocol）服务配置。
+///
+/// 应用对外暴露 MCP 服务，供 AI 客户端（Claude Desktop / Cursor 等）
+/// 调用界面自动化能力：调节窗口大小、获取元素布局、点击元素等。
+///
+/// `enabled=false` 时所有 MCP 调用不可用；其余 8 个布尔字段是
+/// **逐项可调用开关**，默认全部开启。
+///
+/// NOTE: 容器级 `#[serde(default)]`：语义同 [`Hotkey`]——缺字段时用
+/// 默认值补齐，不会让旧 config.json 整体失效。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// MCP 服务总开关。关闭后所有调用不可用。
+    pub enabled: bool,
+    /// 服务监听地址（自定义，默认空 = 未设置）。
+    pub host: String,
+    /// 服务端口（自定义，`0` = 未设置）。
+    pub port: u16,
+    /// 访问密钥（默认空 = 无需认证）。
+    pub token: String,
+    // ---- 可调用能力（默认全部开启）----
+    /// 调节任意窗口的尺寸与位置。
+    pub resize_window: bool,
+    /// 读取界面元素的几何与层级信息。
+    pub read_layout: bool,
+    /// 在任意位置点击或激活元素。
+    pub click_element: bool,
+    /// 向焦点控件键入文字与快捷键。
+    pub type_text: bool,
+    /// 滚动页面与列表到目标位置。
+    pub scroll_view: bool,
+    /// 截取屏幕或窗口画面。
+    pub screen_capture: bool,
+    /// 激活指定窗口或应用。
+    pub window_focus: bool,
+    /// 拖拽元素或执行拖放。
+    pub drag_drop: bool,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host: String::new(),
+            port: 0,
+            token: String::new(),
+            resize_window: true,
+            read_layout: true,
+            click_element: true,
+            type_text: true,
+            scroll_view: true,
+            screen_capture: true,
+            window_focus: true,
+            drag_drop: true,
+        }
+    }
+}
+
 /// 全量配置。
 ///
 /// NOTE: 容器级 `#[serde(default)]`：**这是整个配置文件的最后一道防线**。
@@ -340,6 +399,7 @@ pub struct Config {
     pub hotkey_toggle: Hotkey,
     pub hotkey_paste_previous: Hotkey,
     pub rules: Vec<ActionRule>,
+    pub mcp: McpConfig,
 }
 
 impl Default for Config {
@@ -357,6 +417,7 @@ impl Default for Config {
                 win: true,
             },
             rules: Vec::new(),
+            mcp: McpConfig::default(),
         }
     }
 }
