@@ -72,6 +72,7 @@
      切点上，亚像素舍入会让它偶尔露出一点点方角。 */
   --card-pad:    17px;
   --cardarea-pad: 8px;
+  --row-pad:     12px;   /* 行卡片左右内边距（Rust: pad_v 的横向版，目前无对应值）*/
 
   /* ---- 间距 ---- */
   --space-xs: 4px;
@@ -388,7 +389,9 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   /* 右缘让出滚动条：egui 的 floating scrollbar 覆盖右缘 10pt，
      不让开的话最后一个按钮会被滚动条压住 */
   margin-right: calc(var(--scrollbar-reserve) - var(--list-pad-x));
-  padding: 5px 0;
+  /* 左右内边距：原先是 `5px 0`，文字直接**贴死卡片左右边缘**，
+     视觉上像是溢出了卡面。现在给 --row-pad(12)，三段文字都离边有距离。 */
+  padding: 5px var(--row-pad);
   min-height: var(--row-min-h);
   cursor: default;
   transition: border-color .14s ease, background-color .14s ease,
@@ -423,7 +426,7 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
    位置不影响 text_x1 —— 那一律要减去 acts_w，否则长来源名会排到
    按钮底下（preview_width 里已经减过了，别在这里再减一次）。 */
 .row-acts {
-  position: absolute; right: var(--space-sm);
+  position: absolute; right: var(--row-pad);
   display: flex; flex-direction: row-reverse; gap: var(--space-xs);
   transition: opacity .14s ease, transform .14s ease;
 }
@@ -445,13 +448,22 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
    类型信息本来就在右下角「类型 · 大小」那行，再放一枚图标是重复表达。 */
 .row-text {
   margin-left: 0;
-  /* 右边界 = r.max.x − acts_w。按钮另外还右移了 space_sm，这里补上，
-     保持两者不相碰。 */
-  margin-right: calc(3 * (var(--control-height) * .55 + var(--space-xs)) + var(--space-sm));
+  /* 右边界 = padding + acts_w。按同样的公式推：
+
+       按钮容器  right = --row-pad(12)，总宽 acts_w = 58.2
+       按钮区左缘 = r.max.x − 12 − 58.2
+       文本区右缘 = r.max.x − 12(padding) − 58.2(acts_w)   ← 两者重合
+
+     所以长来源名被省略号截断时，**恰好停在按钮左缘**，不重叠。 */
+  margin-right: calc(3 * (var(--control-height) * .55 + var(--space-xs)));
 }
+/* CAUTION: 这里原来写的是 `display: flex; align-items: center`，
+   但 **`text-overflow: ellipsis` 在 flex 容器上不生效** —— 它只作用于
+   块容器的行内内容。结果就是长来源名（C:\Program Files\...）不省略、
+   直接溢出卡面。垂直居中改用 line-height，不影响 ellipsis。 */
 .row-meta-top {
-  font-size: var(--font-xs); color: var(--text-dim); line-height: 1;
-  height: 11px; display: flex; align-items: center;
+  font-size: var(--font-xs); color: var(--text-dim);
+  line-height: 11px; height: 11px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .row-preview {
@@ -460,8 +472,9 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 }
 .row.sel .row-preview { color: var(--text-bright); }
 .row-meta-bot {
-  font-size: var(--font-xs); color: var(--text-dim); line-height: 1;
-  height: 11px; display: flex; align-items: center; justify-content: flex-end;
+  font-size: var(--font-xs); color: var(--text-dim);
+  line-height: 11px; height: 11px;
+  text-align: right;                     /* 右对齐，不再用 flex */
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
@@ -487,10 +500,11 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 
 /* badge：左上角一枚小图钉。放在「来源 · 时间」之前，不占独立列。 */
 .row[data-pin="1"][data-pinmark="badge"] .pin-badge-icon {
-  position: absolute; left: var(--space-sm); top: 5px;
+  position: absolute; left: var(--row-pad); top: 5px;
   width: 11px; height: 11px; color: var(--accent);
 }
-.row[data-pin="1"][data-pinmark="badge"] .row-meta-top { padding-left: 17px; }
+/* 徽标占 11pt，加上一点间隙 → meta-top 让出 14pt */
+.row[data-pin="1"][data-pinmark="badge"] .row-meta-top { padding-left: 14px; }
 
 /* edge：左侧短竖条。
    CAUTION: 不能做成「上下顶满、与左边缘齐平」的通条 —— 卡片是圆角的，
@@ -852,11 +866,13 @@ function syncRound() {
     set('--card-radius', '16px');
     set('--row-radius', '12px');
     set('--card-pad', '17px');
+    set('--row-pad', '12px');
   } else {
     set('--win-radius', '0px');
     set('--card-radius', '0px');
     set('--row-radius', '4px');
     set('--card-pad', '8px');
+    set('--row-pad', '0px');
   }
 }
 

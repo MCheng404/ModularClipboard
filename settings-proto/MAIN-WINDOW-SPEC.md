@@ -111,19 +111,49 @@ row_h = max(折行数 × font_md × 1.35 + meta_h×2 + pad_v×2 + 4, ROW_HEIGHT_
 文本区右边界：
 
 ```text
-去掉类型图标前：preview_width = 行卡片宽 − icon_w(24) − acts_w(58.2)
-去掉类型图标后：preview_width = 行卡片宽 − acts_w(58.2)
-                 = r.max.x − 58.2        ← 恰好停在操作区左边
+去掉类型图标前：preview_width = 行宽 − icon_w(24) − acts_w(58.2)
+去掉类型图标后：preview_width = 行宽 − text_pad(12) − acts_w(58.2) − text_pad(12)
+               = 行宽 − 82.2
+               = r.max.x − 70.2          ← 恰好停在操作区左缘
 ```
 
-> CAUTION: 两处必须**同时**改，否则行高与绘制宽度对不上。
+`text_pad(12)` 是**新增的行卡片左右内边距**。原先行卡片是
+`padding: 5px 0`（只有上下），文字直接**贴死左右边缘**，视觉上像溢出卡面。
+现在：
+
+```text
+┌────────────────────────────────────────────┐
+│ ↕12                                       12↕ │
+│   密码管理器 · 今天           📌 ⧉ ✕       │  ← 按钮组也内缩 12
+│   常用验证码片段 · 一次性验证码              │
+│                    文本 · 24 B              │
+└────────────────────────────────────────────┘
+```
+
+> CAUTION: `preview_width` / `row_height_for` / `draw_item_row`
+> 三处必须**同时**改，否则行高与绘制宽度对不上。
 > `preview_width()` 与 `row_height_for()` 都算这个值，前者决定文字折行、
 > 后者决定行高；只改一处 ⇒ 行高算出来与实际排版差一截，预览带高度对不上，
 > 长内容被莫名截断（历史上就是这么查出来的）。
-> 同时 `draw_item_row` 里的 `text_x0 = r.min.x + icon_w` 要改成
-> `r.min.x`（或 `r.min.x + space_sm`，取决于要不要保留一点左内边距）。
+> 同时 `draw_item_row` 里的 `text_x0 = r.min.x + icon_w`
+> 要改成 `r.min.x + text_pad`，行内按钮的基准 `r.max.x` 也要内缩 `text_pad`
+> （否则按钮贴边、而文字留边距，两者不对齐）。
+>
+> NOTE: `draw_item_row` 里已有一句
+> `if b.min.x < text_x1 { break; }`（放不下就不画按钮），
+> 改完后这个判断依然成立，别顺手删。
 
 所以长来源名会被 `elide_text` 截成省略号，而**不会**排到按钮底下。
+
+#### 两件事要分清：哪个是真缺，哪个只是原型的问题
+
+| 现象 | Rust 侧 | 原型侧 |
+|---|---|---|
+| 文字贴死卡片左右边缘 | **真缺** —— `pad_v = 5.0` 只有垂直内边距，没有横向的 `pad_h` | 同 |
+| 长来源名溢出卡面 | **不缺** —— `elide_text` 是自绘的：先 `measure_text` 比宽度，超了就截断加省略号，不依赖 CSS | **缺** —— `.row-meta-top` 当时写的是 `display: flex`，而 `text-overflow: ellipsis` **在 flex 容器上不生效**，于是不省略、直接溢出 |
+
+所以第二条只是原型的 bug，**实现里本来就没有**。别把它当成实现缺陷去改 `elide_text`。
+原型那边已把 flex 换成 `line-height` + `text-align: right`，垂直居中不受影响。
 
 ### 顶栏按钮的三层尺寸（容易混）
 
