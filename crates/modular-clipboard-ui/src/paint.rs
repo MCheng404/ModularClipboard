@@ -1267,6 +1267,23 @@ fn draw_settings_search(f: &mut Frame<'_>, search_rect: Rect) {
 /// 导航背景是**一整块圆角矩形**，顶边与搜索框下缘对齐、底边伸到
 /// 窗口下缘留白处——「导航背景覆盖设置与搜索框」的问题由搜索框
 /// 画在导航块**上方**解决。
+/// 画「通信」分类的插头图标（自绘，不依赖图标字体）。
+///
+/// 参照 HTML 原型的插头 SVG（24 viewBox）：两个脚（插头插脚）+
+/// 圆角矩形（插头头）+ 一条线（线尾）。映射到 16×16 的 `r`。
+fn draw_plug_icon(painter: &egui::Painter, r: egui::Rect, color: egui::Color32, stroke_w: f32) {
+    let stroke = egui::Stroke::new(stroke_w, color);
+    let u = |x: f32, y: f32| -> egui::Pos2 { pos2(r.min.x + x, r.min.y + y) };
+    // 两个脚
+    painter.line_segment([u(5.5, 1.0), u(5.5, 5.5)], stroke);
+    painter.line_segment([u(10.5, 1.0), u(10.5, 5.5)], stroke);
+    // 头
+    let head = egui::Rect::from_min_max(u(4.0, 5.0), u(12.0, 10.5));
+    painter.rect_stroke(head, 2.0, stroke, egui::StrokeKind::Inside);
+    // 线
+    painter.line_segment([u(8.0, 11.0), u(8.0, 14.5)], stroke);
+}
+
 fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
     let pal = f.pal;
     let painter = f.ui.painter_at(nav_rect);
@@ -1302,11 +1319,14 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         // 观感「图标和字体离得太远」（2026-10-11 用户反馈）。改为文字
         // 起点 = 图标右缘 + 8pt，图标与标题紧凑成组。
         let icon_r = Rect::from_center_size(pos2(r.min.x + 17.0, r.center().y), vec2(16.0, 16.0));
-        cat.icon().paint(
-            &painter,
-            icon_r,
-            if selected { pal.accent } else { pal.text_dim },
-        );
+        let icon_color = if selected { pal.accent } else { pal.text_dim };
+        // 「通信」用自绘插头（图标字体里没有插头字形，新增需重新生成
+        // TTF，成本高）：头 + 两个脚 + 线。其余分类用字体图标。
+        if *cat == SettingsCat::Comm {
+            draw_plug_icon(&painter, icon_r, icon_color, pal.stroke_normal);
+        } else {
+            cat.icon().paint(&painter, icon_r, icon_color);
+        }
         painter.text(
             pos2(icon_r.max.x + 8.0, r.center().y),
             egui::Align2::LEFT_CENTER,
@@ -1919,7 +1939,7 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
         p.text(
             bb.center(),
             egui::Align2::CENTER_CENTER,
-            "⚡ 一键 AI 配对提示词",
+            "一键 AI 配对提示词",
             egui::FontId::proportional(pal.font_sm),
             pal.text_on_accent,
         );
@@ -1981,84 +2001,60 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             }
         }
         ItemKind::PinnedMode => {
-            let cur = f.ws.pinned_mode();
-            let mut picked: Option<PinnedMode> = None;
-            let changed = setting_row(ui, it.label, it.desc, |ui| {
-                let mut ch = false;
-                ui.horizontal(|ui| {
-                    for (mode, label) in [
+            setting_row(ui, it.label, it.desc, |ui| {
+                let picked = draw_segmented(
+                    f,
+                    ui,
+                    &[
                         (PinnedMode::SharedColumn, "共用单栏"),
                         (PinnedMode::OwnCard, "独立分栏"),
-                    ] {
-                        let resp = ui.selectable_label(cur == mode, label);
-                        if resp.clicked() && cur != mode {
-                            picked = Some(mode);
-                            ch = true;
-                        }
-                    }
-                });
-                ch
+                    ],
+                    f.ws.pinned_mode(),
+                );
+                if let Some(m) = picked {
+                    f.state.push(Op::SetPinnedMode(m));
+                    record_recent(f, it.label);
+                }
+                picked.is_some()
             });
-            if changed
-                && let Some(m) = picked
-            {
-                f.state.push(Op::SetPinnedMode(m));
-                record_recent(f, it.label);
-            }
         }
         ItemKind::Theme => {
-            let cur = crate::theme::ThemeMode::from_dark_mode(f.svc.state.config.ui.dark_mode);
-            let mut picked: Option<crate::theme::ThemeMode> = None;
-            let changed = setting_row(ui, it.label, it.desc, |ui| {
-                let mut ch = false;
-                ui.horizontal(|ui| {
-                    for (mode, label) in [
+            setting_row(ui, it.label, it.desc, |ui| {
+                let picked = draw_segmented(
+                    f,
+                    ui,
+                    &[
                         (crate::theme::ThemeMode::FollowSystem, "跟随系统"),
                         (crate::theme::ThemeMode::Dark, "深色"),
                         (crate::theme::ThemeMode::Light, "浅色"),
-                    ] {
-                        let resp = ui.selectable_label(cur == mode, label);
-                        if resp.clicked() && cur != mode {
-                            picked = Some(mode);
-                            ch = true;
-                        }
-                    }
-                });
-                ch
+                    ],
+                    crate::theme::ThemeMode::from_dark_mode(f.svc.state.config.ui.dark_mode),
+                );
+                if let Some(m) = picked {
+                    f.state.push(Op::SetThemeMode(m));
+                    record_recent(f, it.label);
+                }
+                picked.is_some()
             });
-            if changed
-                && let Some(m) = picked
-            {
-                f.state.push(Op::SetThemeMode(m));
-                record_recent(f, it.label);
-            }
         }
         ItemKind::Backdrop => {
-            let cur = f.svc.state.config.ui.window_backdrop;
-            let mut picked: Option<WindowBackdrop> = None;
-            let changed = setting_row(ui, it.label, it.desc, |ui| {
-                let mut ch = false;
-                ui.horizontal(|ui| {
-                    for (mode, label) in [
+            setting_row(ui, it.label, it.desc, |ui| {
+                let picked = draw_segmented(
+                    f,
+                    ui,
+                    &[
                         (WindowBackdrop::None, "无"),
                         (WindowBackdrop::Acrylic, "磨砂"),
                         (WindowBackdrop::Translucent, "半透明"),
-                    ] {
-                        let resp = ui.selectable_label(cur == mode, label);
-                        if resp.clicked() && cur != mode {
-                            picked = Some(mode);
-                            ch = true;
-                        }
-                    }
-                });
-                ch
+                    ],
+                    f.svc.state.config.ui.window_backdrop,
+                );
+                if let Some(m) = picked {
+                    f.state.push(Op::SetBackdrop(m));
+                    record_recent(f, it.label);
+                }
+                picked.is_some()
             });
-            if changed
-                && let Some(m) = picked
-            {
-                f.state.push(Op::SetBackdrop(m));
-                record_recent(f, it.label);
-            }
         }
         ItemKind::Opacity => {
             let mut op = f.svc.state.config.ui.window_opacity;
@@ -2120,15 +2116,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             let cur = get_text(&f.svc.state.config, *group, field);
             let mut buf = cur;
             let changed = setting_row(ui, it.label, it.desc, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut buf)
-                        .hint_text(*ph)
-                        .password(*secret)
-                        .frame(egui::Frame::NONE)
-                        .text_color(pal.text)
-                        .desired_width(if *secret { 170.0 } else { 230.0 }),
-                )
-                .changed()
+                draw_text_field(f, ui, &mut buf, *ph, *secret, if *secret { 170.0 } else { 230.0 })
             });
             if changed {
                 f.state.push(Op::SetText {
@@ -2147,14 +2135,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 port.to_string()
             };
             let changed = setting_row(ui, it.label, it.desc, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut buf)
-                        .hint_text("9123")
-                        .frame(egui::Frame::NONE)
-                        .text_color(pal.text)
-                        .desired_width(110.0),
-                )
-                .changed()
+                draw_text_field(f, ui, &mut buf, "9123", false, 110.0)
             });
             if changed {
                 let v: u16 = buf.trim().parse().unwrap_or(0);
@@ -2174,13 +2155,22 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
         }
         ItemKind::Quit => {
             ui.add_space(8.0);
-            let resp = ui.add_sized(
-                [ui.available_width(), 30.0],
-                egui::Button::new(
-                    egui::RichText::new("退出程序").color(pal.danger).strong(),
-                ),
+            let (r, resp) = ui.allocate_exact_size(
+                vec2(ui.available_width(), 32.0),
+                egui::Sense::click(),
             );
-            f.hit_insert("settings_quit", resp.rect);
+            let p = ui.painter_at(r);
+            if resp.hovered() {
+                p.rect_filled(r, pal.radius_md, pal.surface_variant);
+            }
+            p.text(
+                pos2(r.min.x + 4.0, r.center().y),
+                egui::Align2::LEFT_CENTER,
+                "退出程序",
+                egui::FontId::proportional(pal.font_md),
+                pal.danger,
+            );
+            f.hit_insert("settings_quit", r);
             if resp.clicked() {
                 f.state.push(Op::Quit);
             }
@@ -2388,15 +2378,127 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
 ///
 /// 自绘圆形信息图标：accent 底色 + 圆点 + 竖线（不依赖字体字形，
 /// 图标字体里没有 info 码位，新增字形需要重新生成 TTF）。
+/// 分段选择控件（segmented control）：整体一个圆角实底（surface_variant），
+/// 选中项用 surface 实底 + accent 文字，未选中 text_dim。
+///
+/// 替代 egui 的 `selectable_label`——后者选中态是半透明 row_selected，
+/// 多个胶囊标签挨着时半透明叠半透明，显脏（2026-10-11 用户反馈）。
+/// 返回 `Some(value)` 表示本帧点击了某项。
+fn draw_segmented<T: Copy + PartialEq>(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    options: &[(T, &str)],
+    cur: T,
+) -> Option<T> {
+    let pal = f.pal;
+    let h = 30.0;
+    // 每项宽度按文字测量 + 20 padding，统一取最长项（项宽一致更整齐）。
+    let font = egui::FontId::proportional(pal.font_sm);
+    let mut seg_w = 0.0_f32;
+    for (_, label) in options {
+        let w = ui
+            .painter()
+            .layout_no_wrap(label.to_string(), font.clone(), pal.text)
+            .rect
+            .width();
+        seg_w = seg_w.max(w + 20.0);
+    }
+    let total_w = seg_w * options.len() as f32;
+    let (r, _) = ui.allocate_exact_size(vec2(total_w, h), egui::Sense::empty());
+    let painter = ui.painter_at(r);
+    painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+    let mut picked = None;
+    for (i, (value, label)) in options.iter().enumerate() {
+        let seg = egui::Rect::from_min_max(
+            pos2(r.min.x + seg_w * i as f32, r.min.y),
+            pos2(r.min.x + seg_w * (i + 1) as f32, r.max.y),
+        );
+        let resp = ui.interact(seg, egui::Id::new(("seg", i, label)), egui::Sense::click());
+        if cur == *value {
+            painter.rect_filled(seg.shrink2(vec2(2.0, 2.0)), pal.radius_sm, pal.surface);
+            painter.text(
+                seg.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                font.clone(),
+                pal.accent,
+            );
+        } else {
+            let color = if resp.hovered() { pal.text } else { pal.text_dim };
+            painter.text(
+                seg.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                font.clone(),
+                color,
+            );
+        }
+        if resp.clicked() {
+            picked = Some(*value);
+        }
+    }
+    picked
+}
+
+/// 文本输入框：清晰圆角背景（surface_variant 实底 + 边框），在右侧区域里靠右。
+///
+/// 旧实现用 `frame(Frame::NONE)` 无背景，在 right_to_left 里虽靠右但没有
+/// 可见边界，文字起点不明，看起来「没有对齐右边」。改为先 allocate 固定
+/// 宽度区域、画背景，再在内部放 TextEdit；聚焦时边框变 accent。
+fn draw_text_field(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    buf: &mut String,
+    ph: &str,
+    secret: bool,
+    w: f32,
+) -> bool {
+    let pal = f.pal;
+    let h = 30.0;
+    let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::empty());
+    let painter = ui.painter_at(r);
+    painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+    painter.rect_stroke(
+        r,
+        pal.radius_md,
+        egui::Stroke::new(1.0, pal.border),
+        egui::StrokeKind::Inside,
+    );
+    let text_rect = r.shrink2(vec2(8.0, 4.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(text_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let resp = child.add(
+        egui::TextEdit::singleline(buf)
+            .hint_text(ph)
+            .password(secret)
+            .frame(egui::Frame::NONE)
+            .text_color(pal.text)
+            .desired_width(text_rect.width()),
+    );
+    if resp.has_focus() {
+        painter.rect_stroke(
+            r,
+            pal.radius_md,
+            egui::Stroke::new(1.5, pal.accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp.changed()
+}
+
 fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Response {
     let pal = f.pal;
     let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
     let p = ui.painter_at(r);
-    // `row_selected` = accent 低透明底（Palette 无 `accent_bg` 令牌）。
+    // 未 hover：surface_variant 实底（与卡片 surface 拉开一层）；
+    // hover：accent 实底。避免用半透明 row_selected 叠在卡片上显脏。
     let bg = if resp.hovered() {
         pal.accent
     } else {
-        pal.row_selected
+        pal.surface_variant
     };
     p.circle_filled(r.center(), 11.0, bg);
     let ic = if resp.hovered() {
