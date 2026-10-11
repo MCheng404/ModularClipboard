@@ -299,14 +299,15 @@ palette! {
 
     // ---- 字号阶 ----
     //
-    // 2026-10-11 用户反馈「整体字体偏小，放大一点」：全套字号 +1。
-    // 影响主窗口 / 设置窗口 / 置顶窗口全部文字（font_scale 仍可叠加）。
-    font_xs: num = 12.0 => 12.0,
-    font_sm: num = 13.0 => 13.0,
-    font_md: num = 15.0 => 15.0,
-    font_lg: num = 17.0 => 17.0,
-    font_xl: num = 21.0 => 21.0,
-    font_title: num = 25.0 => 25.0,
+    // 2026-10-11 用户反馈「整体字体偏小，放大一点」：全套字号 +1；
+    // 随后「还不够大，全部调整」：再 +2。影响主窗口 / 设置窗口 /
+    // 置顶窗口全部文字（font_scale 仍可叠加）。
+    font_xs: num = 14.0 => 14.0,
+    font_sm: num = 15.0 => 15.0,
+    font_md: num = 17.0 => 17.0,
+    font_lg: num = 19.0 => 19.0,
+    font_xl: num = 24.0 => 24.0,
+    font_title: num = 28.0 => 28.0,
 
     // ---- 描边宽度 ----
     stroke_thin: num = 1.0 => 1.0,
@@ -567,6 +568,26 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     let mut other = ctx.style_of(other_theme(theme)).visuals.clone();
     other.dark_mode = !p.is_dark;
     ctx.set_visuals_of(other_theme(theme), other);
+
+    // 字号：egui 控件层（输入框 / 下拉 / 按钮内文字）跟随调色板字号阶，
+    // 与自绘层（`pal.font_*`）同源，避免「自绘文字大、控件文字小」。
+    // 两套 theme 都写，切换主题时控件字号不回落。
+    //
+    // CAUTION: 不能把 Dark 的整个 style clone 给 Light——那会把 Dark 的
+    // `visuals.dark_mode`（及配色）带过去，浅色主题瞬间变黑（有测试守
+    // 这条：`apply_covers_every_fg_stroke_in_both_themes`）。只换字号表。
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(p.font_md));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(p.font_md));
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(p.font_sm));
+    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(p.font_xl));
+    style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(p.font_sm));
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    let ts = style.text_styles.clone();
+    let mut light_style = (*ctx.style_of(egui::Theme::Light)).clone();
+    light_style.text_styles = ts;
+    ctx.set_style_of(egui::Theme::Light, light_style);
+
     ctx.set_theme(theme);
 }
 
