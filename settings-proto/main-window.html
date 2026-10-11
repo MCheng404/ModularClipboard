@@ -399,14 +399,21 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   padding: 5px 0;
   min-height: var(--row-min-h);
   cursor: default;
+  transition: border-color .14s ease, background-color .14s ease,
+              box-shadow .14s ease;
 }
 .row:hover, .row.hover { background: color-mix(in srgb, var(--surface-raised) 100%, var(--row-hover)); }
+
+/* 选中：**围绕卡片**高亮 —— 整圈 accent 描边 + 极淡底色 + 轻微外扩光晕。
+   不再用左侧 2px 竖条：竖条是「通栏行列表」时代的做法，卡片化之后
+   它贴在圆角卡片的最左端、跟着圆角切线走，视觉上像"贴了张便签"，
+   反而把卡片切成了两半。整圈描边才符合「这张卡被选中了」的语义。 */
 .row.sel {
+  border-color: var(--accent);
+  border-width: 2px;
+  padding: 4px 0;                 /* 描边从 1→2 时不改变内容位置 */
   background: color-mix(in srgb, var(--surface-raised) 100%, var(--row-selected));
-}
-.row.sel::before {
-  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
-  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 /* 行内操作区：热区 btn = control_height×0.55 = 15.4，字形 btn×0.78 ≈ 12。
    实现里 x = r.max.x − acts_w + (i+0.5)*(btn+space_xs)，i=0 是 pin，
@@ -441,18 +448,13 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 .row-act svg { width: 12px; height: 12px; }
 .row-act:hover { color: var(--text-bright); background: var(--row-hover); }
 .row-act.del:hover { color: var(--danger); }
-.row-icon {
-  position: absolute; left: 0; top: 50%; transform: translateY(-50%);
-  width: var(--icon-size); height: var(--icon-size);
-  display: grid; place-items: center; color: var(--text-dim);
-}
-.row.sel .row-icon { color: var(--accent); }
+
+/* 类型图标已移除：左边缘 24pt 的 icon_w 全部让给文字。
+   类型信息本来就在右下角「类型 · 大小」那行，再放一枚图标是重复表达。 */
 .row-text {
-  margin-left: calc(var(--icon-size) + var(--space-sm));
-  /* 右边界 = r.max.x − acts_w —— preview_width() 里已经减掉了操作区宽度：
-     (body_w − icon_w − acts_w)，所以文字**不会**排到按钮底下，
-     长来源名是被 elide 截断（省略号），不是被覆盖。
-     按钮现在还额外右移了 space_sm，这里再补上，保持两者不相碰。 */
+  margin-left: 0;
+  /* 右边界 = r.max.x − acts_w。按钮另外还右移了 space_sm，这里补上，
+     保持两者不相碰。 */
   margin-right: calc(3 * (var(--control-height) * .55 + var(--space-xs)) + var(--space-sm));
 }
 .row-meta-top {
@@ -475,6 +477,57 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 .empty {
   flex: 1 1 auto; display: grid; place-items: center;
   color: var(--text-dim); font-size: var(--font-md);
+}
+
+/* ==========================================================================
+   一体性（unity）：把「四层灰」压成「一层底 + 浮起的卡片」
+   ==========================================================================
+
+   现状读起来是四块拼的：
+
+       窗口底  bg              #f2f4f7
+       顶栏    surface_variant #eceff3    ← 第二种灰
+       卡片区  list_bg        #e8ebf0    ← 第三种灰，且比窗口底**更暗**
+       行卡片  surface_raised #ffffff    ← 第四种，且最亮
+
+   三个相邻区域用了三种灰，再加一道 1px 描边把它们切开 —— 界面就
+   「碎」了。用户的反馈正是这个。
+
+   一体性版本的思路：**取消色块分割，改用浮起**。
+
+       整窗一块底（顶栏 / 卡片区同色，只靠 1px 分隔线区分顶栏）
+       行卡片浮在上面（浅色用阴影，深色用更亮的底 + 微光描边）
+
+   层次仍然分得清（阴影 / 圆角 / 留白），但不再靠"这块比那块浅一点"
+   来划分 —— 那是最容易显得廉价的手法。 */
+.app.unity .topbar { background: var(--bg); }
+.app.unity .card   { background: transparent; border-color: transparent; box-shadow: none; }
+.app.unity .row {
+  border-color: transparent;
+  box-shadow: 0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.04);
+}
+.app.unity .row:hover, .app.unity .row.hover {
+  box-shadow: 0 2px 6px rgba(0,0,0,.09), 0 6px 16px rgba(0,0,0,.06);
+}
+.app.unity .row.sel {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent),
+              0 2px 8px rgba(0,0,0,.07);
+}
+/* 深色下阴影几乎不可见，"浮起"改由更亮的底色承担。 */
+[data-theme="dark"] .app.unity .topbar { background: var(--bg); }
+[data-theme="dark"] .app.unity .row {
+  border-color: color-mix(in srgb, var(--text) 8%, transparent);
+  box-shadow: none;
+}
+[data-theme="dark"] .app.unity .row:hover, [data-theme="dark"] .app.unity .row.hover {
+  background: color-mix(in srgb, var(--surface-raised) 100%, var(--row-hover));
+  border-color: color-mix(in srgb, var(--text) 14%, transparent);
+}
+[data-theme="dark"] .app.unity .row.sel {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--surface-raised) 100%, var(--row-selected));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
 svg { display: block; }
@@ -534,6 +587,9 @@ svg { display: block; }
       </label>
       <label>
         <input type="checkbox" id="sbChk"> 强制显示滚动条
+      </label>
+      <label>
+        <input type="checkbox" id="unityChk" checked> 一体性（整窗一块底，卡片浮起）
       </label>
     </div>
 
@@ -598,15 +654,11 @@ const ICON = (() => {
     pinOutline: s('<path d="M6 1.8h4l-.6 4.2 2.6 2.4H4l2.6-2.4z"/><path d="M8 8.4v5.8"/>'),
     file:     s('<path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/>'),
     close:    s('<path d="M4 4l8 8M12 4l-8 8"/>'),
-    /* 类型图标（垂直居中，16pt） */
-    kindText:  s('<path d="M3 3.6h10M8 3.6v9M6 12.6h4"/>'),
-    kindCode:  s('<path d="M5.6 4.4L2.4 8l3.2 3.6M10.4 4.4L13.6 8l-3.2 3.6"/>'),
-    kindImage: s('<rect x="2.4" y="3.4" width="11.2" height="9.2" rx="1.4"/><circle cx="6" cy="6.6" r="1.1"/><path d="M3.4 11l3-3 2.4 2.2 2-1.8 2 2.6"/>'),
-    kindFiles: s('<path d="M2.6 5.4l4-2.4 4 2.4-4 2.4z"/><path d="M2.6 8l4 2.4 4-2.4M2.6 10.6L6.6 13l4-2.4"/>'),
+    /* 类型图标已移除（原 kindText / kindCode / kindImage / kindFiles）：
+       类型信息在右下角「类型 · 大小」那行已经表达，左侧再挂一枚图标
+       是重复，而且要占 24pt 宽度（icon_w），白白吃掉文本空间。 */
   };
 })();
-
-const KIND_ICON = { '文本': ICON.kindText, 'HTML': ICON.kindCode, '图片': ICON.kindImage, '文件': ICON.kindFiles };
 
 /* ==========================================================================
    夹具数据
@@ -644,6 +696,7 @@ const state = {
   rounded: true,      // 圆角风格（false = 现在的直角风格，便于对比）
   forceScroll: false, // 强制显示滚动条 —— headless 截图模拟不了 :hover
   actsPos: 'top',     // 行内按钮位置：top / topgap / center / hover
+  unity: true,        // 一体性：整窗一块底，层次靠浮起而非色块分割
 };
 
 function rowHtml(item, i, mode) {
@@ -656,14 +709,12 @@ function rowHtml(item, i, mode) {
       <button class="row-act" title="复制">${ICON.file}</button>
       <button class="row-act" title="${inPinned ? '取消置顶' : '置顶'}">${pinIcon}</button>
     </div>`;
-  const icon = KIND_ICON[item.kind] || ICON.kindText;
   const meta = `${item.app} · ${item.time}`;
   let cls = 'row';
   if (mode === 'selected' && i === 2) cls += ' sel';
   if (mode === 'hover' && i === 4) cls += ' hover';
   return `<div class="${cls}" data-acts="${state.actsPos}">
     ${acts}
-    <div class="row-icon">${icon}</div>
     <div class="row-text">
       <div class="row-meta-top">${meta}</div>
       <div class="row-preview">${item.text}</div>
@@ -677,6 +728,7 @@ function render() {
   const narrow = v === 'narrow';
   const w = narrow ? 300 : state.w;
   const app = document.getElementById('app');
+  app.classList.toggle('unity', state.unity);
   app.style.setProperty('--win-w', w + 'px');
   app.style.setProperty('--win-h', state.h + 'px');
 
@@ -797,7 +849,6 @@ SPEC.tree = `
             ├─ Act·pin <span class="k">15.4×15.4 · 右上</span>
             ├─ Act·copy <span class="k">Icon::File（无更贴切的图标）</span>
             ├─ Act·delete <span class="k">hover = danger</span>
-            ├─ KindIcon <span class="k">16×16 · 垂直居中</span>
             ├─ Meta·top <span class="k">来源 · 时间 · font_xs · text_dim · 左</span>
             ├─ Preview <span class="k">font_md · 可折行 · 不截断</span>
             └─ Meta·bottom <span class="k">类型 · 大小 · font_xs · text_dim · 右</span>
@@ -944,10 +995,20 @@ SPEC.states = `
 <tr><th>状态</th><th>表现</th></tr>
 <tr><td>常态</td><td><code>surface_raised</code> + 1px <code>border_subtle</code></td></tr>
 <tr><td>悬停</td><td>叠加 <code>row_hover</code>；描边保持（否则边框会消失一瞬，视觉跳变）</td></tr>
-<tr><td>选中</td><td>叠加 <code>row_selected</code> + 左侧 2px <code>accent</code> 条；
-    预览文字转 <code>text_bright</code>，类型图标转 <code>accent</code></td></tr>
+<tr><td>选中</td><td><b>整圈描边</b>：2px <code>accent</code> + 淡底 + 外扩光晕；
+    预览文字转 <code>text_bright</code>。<b>不再用左侧竖条</b>——
+    卡片化之后竖条像贴了张便签，把一张卡切成两半</td></tr>
 <tr><td>置顶</td><td>移入内嵌置顶区；pin 图标由 Unpinned 变 Pinned（实心）</td></tr>
 </table>
+<h3>一体性（整窗一块底，卡片浮起）</h3>
+<p>原先是四种灰叠出层次：窗口底 <code>bg</code> / 顶栏 <code>surface_variant</code>
+   / 卡片区 <code>list_bg</code>（比窗口底更暗）/ 行卡片 <code>surface_raised</code>。
+   三块相邻区域用三种灰再加描边切开，界面就「碎」了。</p>
+<p>现在顶栏与卡片区同色（<code>bg</code>），只靠 1px 分隔线区分顶栏；
+   行卡片靠<b>浮起</b>分层——浅色用两层极淡阴影、深色用更亮的底加微光描边。
+   层次仍然分得清，但不再靠「这块比那块浅一点」。</p>
+<p>代价：卡片容器那一层消失了，将来要加第二个卡片（详情/侧栏）时
+   得把 <code>list_bg</code> 加回来。</p>
 <h3>搜索状态</h3>
 <ul>
 <li><b>折叠</b>：只留 17pt 放大镜图标，顶栏左侧整片让给拖动区。</li>
@@ -1008,6 +1069,9 @@ document.getElementById('actsSel').addEventListener('change', e => {
 document.getElementById('sbChk').addEventListener('change', e => {
   state.forceScroll = e.target.checked; render();
 });
+document.getElementById('unityChk').addEventListener('change', e => {
+  state.unity = e.target.checked; render();
+});
 
 document.getElementById('winW').addEventListener('input', e => { state.w = +e.target.value; render(); });
 document.getElementById('winH').addEventListener('input', e => { state.h = +e.target.value; render(); });
@@ -1055,6 +1119,10 @@ render();
   if (acts) {
     state.actsPos = acts;
     document.getElementById('actsSel').value = acts;
+  }
+  if (parts.includes('nounity')) {
+    state.unity = false;
+    document.getElementById('unityChk').checked = false;
   }
   // headless 截图模拟不了 :hover，用这个把滚动条强行显形以便验证。
   if (parts.includes('scroll')) state.forceScroll = true;
