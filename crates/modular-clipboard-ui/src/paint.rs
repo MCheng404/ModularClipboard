@@ -638,7 +638,12 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     let pal = f.pal;
     let scale = f.scale;
     let painter = f.ui.painter_at(bar);
-    painter.rect_filled(bar, CornerRadius::ZERO, pal.surface_variant);
+    // 一体性：顶栏与卡片区**同色**（`bg`），整窗连成一片。
+    // 早前这里用 `surface_variant`（第二种灰），与下面的卡片区
+    // （第三种灰 `list_bg`）相邻 —— 两种灰 + 一条描边，界面就读成
+    // 「三块拼的」。现在顶栏只靠底部那条 1px 分隔线区分。
+    let bar_bg = if HISTORY_UNITY { pal.bg } else { pal.surface_variant };
+    painter.rect_filled(bar, CornerRadius::ZERO, bar_bg);
     painter.hline(
         bar.x_range(),
         bar.max.y,
@@ -2891,13 +2896,44 @@ fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
     // 而且这里也拿不到「置顶该占多高」——那是切分时才确定的量。
 }
 
+/// 历史卡片是否走「一体性」样式（整窗一块底 + 行卡片浮起）。
+///
+/// # 为什么有这个东西
+///
+/// 早前界面是四种灰叠出层次：
+///
+/// ```text
+/// 窗口底  bg / 顶栏 surface_variant / 卡片区 list_bg / 行卡片 surface_raised
+/// ```
+///
+/// 三个相邻区域用了三种灰，再各加一道 1px 描边把它们切开 ——
+/// 读起来是「三块拼的」。用户反馈要求「强化整体界面的一体性」。
+///
+/// 一体性版本的思路：**取消色块分割，层次改由「浮起」表达**。
+/// 顶栏与卡片区同色（`bg`），只靠一条分隔线区分顶栏；
+/// 行卡片靠阴影 / 更亮的底浮起来。
+///
+/// 关键取舍：层次仍然分得清（圆角 / 留白 / 明暗），但不再靠
+/// 「这块比那块浅一点」来划分 —— 那是最容易显得廉价的手法，
+/// 色差一点点不明显、一点点就变脏，而且每加一层都要重新调。
+///
+/// 代价要认：`list_bg` 这一层**消失**了，「卡片」与「窗口」的边界
+/// 不再可见。将来若要加第二个卡片（详情 / 侧栏），两边都是透明底
+/// 就没法区分 —— 那种场景得把 `list_bg` 加回来，所以留了这个开关。
+const HISTORY_UNITY: bool = true;
+
 fn draw_card_frame(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     let scale = f.scale;
-    // 纯平毛玻璃：纯色底 + 1px 描边 + 主题色光晕。
+    // 纯平毛玻璃：纯色底 + 1px 描边。
     // **禁止渐变、光泽、折射、内发光**——那类效果在浅色卡片上
     // 看起来廉价，且与「平」的视觉语言冲突。
     let painter = f.ui.painter_at(r);
+    if HISTORY_UNITY {
+        // 一体性：卡片**不画自己的底与描边**，让整窗连成一片。
+        // 卡片内缩 `CARD_AREA_INSET` 已经给出了边界暗示。
+        return;
+    }
     painter.rect_filled(r, CARD_RADIUS, pal.surface);
     painter.rect_stroke(
         r,
@@ -2937,11 +2973,15 @@ fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     }
     match card.kind {
         CardKind::History => {
-            // NOTE: 历史栏整卡是「暗容器」：frame 底色也用 `list_bg`，
-            // 否则列表四周（frame 与 body 之间的边距）仍露出 frame
-            // 的 `surface` 底色——浅色主题下就是一圈白色（用户反馈
-            // 「列表边上还是白色」）。描边由 `draw_card_frame` 已画，
-            // 这里只盖底色，不动描边。
+            if HISTORY_UNITY {
+                // 一体性：卡片容器透明，整窗一块 `bg`。
+                // 层次全部交给行卡片（`surface_raised` 浮起）。
+                draw_history_body(f, body, None);
+                return;
+            }
+            // NOTE: 非一体性时历史栏整卡是「暗容器」：frame 底色也用
+            // `list_bg`，否则列表四周仍露出 frame 的 `surface` 底色
+            // ——浅色主题下就是一圈白色（用户反馈「列表边上还是白色」）。
             f.ui.painter_at(r).rect_filled(r, CARD_RADIUS, pal.list_bg);
             // 置顶条目**就在这个列表里**（排在最前 + 底色微亮标记），
             // 不再有独立的「置顶区」，也没有第二段 body。
@@ -3405,7 +3445,7 @@ const SEARCH_EXPAND_W: f32 = 140.0;
 ///
 /// 早前这里是 8.0，比滚动条实际宽度**小 2pt** —— 于是按它算出的
 /// 「已避开滚动条」的位置，仍然有 2pt 落在滚动条下面。
-const SCROLLBAR_RESERVE: f32 = 10.0;
+const SCROLLBAR_RESERVE: f32 = crate::theme::SCROLLBAR_WIDTH;
 
 /// 每行文字的高度倍率。
 const LINE_H: f32 = 1.35;
@@ -3590,6 +3630,18 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // （从有到无再到有），视觉上跳变。
     let radius = ROW_RADIUS;
     let stroke = Stroke::new(CARD_STROKE * scale, pal.border_subtle);
+    // 一体性下层次**全部**靠行卡片浮起，所以描边要退到极弱
+    // （`text` 8% 混合），改由阴影 / 更亮的底承担「浮起」。
+    //
+    // 深色下阴影几乎不可见，此时靠 `surface_raised` 与底色的明暗差。
+    let unity_stroke = if HISTORY_UNITY {
+        Stroke::new(CARD_STROKE * scale, crate::theme::composite(
+            egui::Color32::from_black_alpha(18),
+            pal.surface_raised,
+        ))
+    } else {
+        stroke
+    };
     // 选中态描边加粗到 2pt。用 `StrokeKind::Inside` 向内生长、
     // 不占布局 —— 内容位置与常态完全一致。
     if selected {
@@ -3613,7 +3665,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         if resp.hovered() {
             painter.rect_filled(r, radius, pal.row_hover);
         }
-        painter.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
+        painter.rect_stroke(r, radius, unity_stroke, egui::StrokeKind::Inside);
     }
 
     // ---- 三段布局 ----------------------------------------------------
@@ -4318,6 +4370,39 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             (rightmost.max.x - rects[3].max.x).abs() < 0.5,
             "最右的槽位应当是「设置」，实际最右的是 {rightmost:?}"
+        );
+    }
+
+    /// 滚动条热区宽度必须与行内按钮让位用的 `SCROLLBAR_RESERVE` 一致。
+    ///
+    /// # 这条守的是一个「条目少就好、条目多就坏」的老 bug
+    ///
+    /// `ScrollStyle.bar_width`（`theme.rs` 里设）与
+    /// `SCROLLBAR_RESERVE`（`paint.rs` 里按它让位）两处各写一份的话，
+    /// 改一处忘另一处 ⇒ 有 2pt 落在滚动条下面 ⇒ 删除按钮被压住。
+    /// 症状在条目少（无滚动条）时完全不出现，所以极难自查。
+    ///
+    /// 现在两处共用 `theme::SCROLLBAR_WIDTH`，本测试守的是
+    /// 「主题里真的把它设成了那个值」—— 有人改了常量忘了改主题设置
+    /// 的话，这里会红。
+    #[test]
+    fn scrollbar_hot_width_matches_row_reserve() {
+        let ctx = egui::Context::default();
+        let pal = Palette::light();
+        crate::theme::apply(&ctx, &pal);
+        let style = ctx.style_of(egui::Theme::Light);
+        assert_eq!(
+            style.spacing.scroll.bar_width, SCROLLBAR_RESERVE,
+            "滚动条热区宽度必须等于行内按钮让位用的 SCROLLBAR_RESERVE"
+        );
+        assert!(
+            style.spacing.scroll.floating,
+            "必须保持 floating：滚动条不占布局宽度，行宽让位逻辑按这个假设算"
+        );
+        // 常态滑块不能全透明 —— 那会让用户不知道下面还有内容。
+        assert!(
+            style.spacing.scroll.dormant_handle_opacity > 0.0,
+            "常态滑块应当微可见，全透明会被整体忽略"
         );
     }
 

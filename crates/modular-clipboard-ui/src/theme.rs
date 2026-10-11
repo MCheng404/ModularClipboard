@@ -483,6 +483,12 @@ fn read_apps_use_light_theme() -> Option<bool> {
 /// - `ime_composition.legacy_visuals`：Windows 上默认 true 是刻意为之，
 ///   涉及 winit 的中文输入法 bug（见 egui 源码注释），改动会导致
 ///   中文候选词渲染异常
+/// 滚动条热区宽度（逻辑点）。
+///
+/// 必须与 `paint.rs` 的 `SCROLLBAR_RESERVE` 一致 —— 两处各写一份的话，
+/// 改一处忘另一处就会让「已避开滚动条」的位置失准。
+pub const SCROLLBAR_WIDTH: f32 = 10.0;
+
 pub fn apply(ctx: &egui::Context, palette: &Palette) {
     let p = palette;
     let mut v = ctx.style_of(egui::Theme::Dark).visuals.clone();
@@ -592,10 +598,43 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(p.font_sm));
     style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(p.font_xl));
     style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(p.font_sm));
+    // 滚动条：改成 Bing/Google 那种「常态微可见」。
+    //
+    // egui 0.36 的 `ScrollArea` **没有** `style()` 方法，它从
+    // `ui.spacing().scroll` 读样式（见 egui `containers/scroll_area.rs`
+    // 的 `ui.spacing().scroll`）。所以只能改 `Style.spacing`，
+    // 而这必须是**全局**设置 —— 逐个 ScrollArea 设会漏。
+    style.spacing.scroll = egui::style::ScrollStyle {
+        // floating：滚动条浮在内容之上、**不占布局宽度**。
+        // `SCROLLBAR_RESERVE`(10) 与行内按钮的让位都按这个假设算。
+        floating: true,
+        // IMPORTANT: 这里**必须**是 10 —— 它是热区宽度，不是视觉宽度。
+        // 改小会让「已避开滚动条」的位置仍落在滚动条下面，症状是
+        // 「条目少时一切正常、条目一多删除按钮点不动」。
+        // 想让滑块变细靠 `handle_min_length` 与透明度，不动这里。
+        bar_width: SCROLLBAR_WIDTH,
+        handle_min_length: 24.0,
+        bar_inner_margin: 3.0,
+        // 三级不透明度（常态 / 激活 / 可交互）。
+        //
+        // 常态刻意**不是 0**：全透明的滚动条在内容溢出时会被整体
+        // 忽略 —— 用户不知道下面还有东西，得先随手拖一下才发现能滚。
+        dormant_handle_opacity: 0.42,
+        active_handle_opacity: 0.72,
+        interact_handle_opacity: 0.85,
+        // 轨道底色也要淡：画实色会在列表右缘留下一条竖色带，
+        // 与「整窗一块底」的一体感冲突。
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        ..egui::style::ScrollStyle::floating()
+    };
     ctx.set_style_of(egui::Theme::Dark, style.clone());
     let ts = style.text_styles.clone();
+    let sc = style.spacing.clone();
     let mut light_style = (*ctx.style_of(egui::Theme::Light)).clone();
     light_style.text_styles = ts;
+    light_style.spacing = sc;
     ctx.set_style_of(egui::Theme::Light, light_style);
 
     ctx.set_theme(theme);
