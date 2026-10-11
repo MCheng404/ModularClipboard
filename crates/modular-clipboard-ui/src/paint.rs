@@ -656,12 +656,14 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     // 尺寸取顶栏高度的 60%，留出上下呼吸空间。
     let btn = bar.height() * 0.62;
     let gap = pal.space_sm * 2.0;
-    // 三枚按钮：关闭 / 清空 / 设置（「最小化」已去掉，见 draw_topbar_icons）。
+    // **四枚**按钮：关闭 / 清空 / 窗口置顶 / 设置。
     //
-    // IMPORTANT: 这里的 `3.0` 必须与 `draw_topbar_icons` 里的 `step = r.width() / 3.0`
-    // 一致。两处各写一份数字，改一处忘另一处 ⇒ 按钮区与实际按钮错位，
-    // 表现为「最右那枚被搜索框压住」或「点齿轮变成拖窗口」。
-    let btn_count = 3.0;
+    // IMPORTANT: 这个数字同时出现在 `draw_topbar_icons` 的
+    // `step = r.width() / TOPBAR_BTN_COUNT`。两处各写一份的话，
+    // 改一处忘另一处 ⇒ 按钮区与实际按钮错位，表现为
+    // 「最右那枚被搜索框压住」或「点齿轮变成拖窗口」。
+    // 所以这里用**同一个常量**，不是再抄一遍数字。
+    let btn_count = TOPBAR_BTN_COUNT;
     let btn_area = Rect::from_min_size(
         pos2(
             inner.max.x - btn * btn_count - gap * (btn_count - 1.0),
@@ -791,14 +793,13 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
 /// 所以 `Button` 只负责命中与悬停底色，图标用 [`Icon::paint`] 叠在
 /// 它自己的矩形上。
 fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
-    let step = r.width() / 3.0;
+    let step = r.width() / TOPBAR_BTN_COUNT;
     let sq = step * 0.62;
 
-    // 自左向右：关闭 / 清空 / 设置。
+    // 自左向右：关闭 / 清空 / 窗口置顶 / 设置。
     //
-    // NOTE: 只有三枚了——「最小化」已去掉。它与「关闭到托盘」的实际
-    // 效果几乎相同（都让窗口消失），区别仅在任务栏是否留条目，
-    // 而本程序常驻托盘，用户极少需要「留在任务栏但看不见」。
+    // NOTE: 「最小化」早前已去掉 —— 它与「关闭到托盘」的实际效果几乎相同
+    // （都让窗口消失），区别仅在任务栏是否留条目，而本程序常驻托盘。
     // 两个近乎重复的按钮并排反而增加误点。
     //
     // 关闭按钮用 `Icon::Minimize`（横线）而非 `Icon::Close`（叉）：
@@ -807,25 +808,60 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
     let slot = |i: f32| Rect::from_center_size(pos2(r.min.x + step * (i + 0.5), center_y), vec2(sq, sq));
     let r_close = slot(0.0);
     let r_clear = slot(1.0);
-    let r_set = slot(2.0);
+    let r_pin = slot(2.0);
+    let r_set = slot(3.0);
 
     // 登记热区给测试用（见 `UiState::hit` 的说明）。**必须在点击判定
     // 之前登记**：`draw_topbar` 随后要读这张表来挖拖动区。
     f.hit_insert("topbar_close", r_close);
     f.hit_insert("topbar_clear", r_clear);
+    f.hit_insert("topbar_pin", r_pin);
     f.hit_insert("topbar_settings", r_set);
 
-    if icon_button(f, "topbar_close", r_close, Icon::Minimize, "关闭到托盘", false) {
+    if icon_button(f, "topbar_close", r_close, Icon::Minimize, "关闭到托盘", false, false) {
         f.state.push(Op::CloseWindow);
     }
     // 破坏性操作（清空）用 danger 色，与「设置」区分开。
-    if icon_button(f, "topbar_clear", r_clear, Icon::Trash, "清空全部历史", true) {
+    if icon_button(f, "topbar_clear", r_clear, Icon::Trash, "清空全部历史", true, false) {
         f.state.push(Op::ClearAll);
     }
-    if icon_button(f, "topbar_settings", r_set, Icon::Settings, "设置", false) {
+    // 窗口置顶：切换「始终显示在最上层、不被其它应用遮住」。
+    //
+    // 写配置即可 —— `App` 帧循环每帧比对 `always_on_top` 并调
+    // `SetWindowPos`，所以这里不需要（也不该）直接碰 Win32。
+    // 设置面板里那个同名开关读同一个字段，两处自动同步。
+    let pinned = f.svc.state.config.ui.always_on_top;
+    if icon_button(
+        f,
+        "topbar_pin",
+        r_pin,
+        if pinned { Icon::Pinned } else { Icon::Unpinned },
+        if pinned { "取消窗口置顶" } else { "窗口置顶" },
+        false,
+        pinned,
+    ) {
+        f.state.push(Op::SetBool {
+            group: ConfigGroup::Ui,
+            field: "always_on_top",
+            value: !pinned,
+        });
+    }
+    if icon_button(f, "topbar_settings", r_set, Icon::Settings, "设置", false, false) {
         f.state.push(Op::ToggleSettings);
     }
 }
+
+/// 顶栏右侧的图标按钮数量。
+///
+/// 关闭 / 清空 / 窗口置顶 / 设置。
+///
+/// # 为什么是常量而不是两处各写一个数字
+///
+/// `draw_topbar` 用它算 `btn_area` 的宽度，`draw_topbar_icons` 用它算
+/// `step`（槽位步距）。两处不一致 ⇒ 按钮区与实际按钮错位，表现为
+/// 「最右那枚被搜索框压住」或「点齿轮变成拖窗口」——都不是一眼能看出
+/// 原因的症状，所以直接共用一个常量，从根上杜绝。
+const TOPBAR_BTN_COUNT: f32 = 4.0;
 
 /// 一枚方形图标按钮；返回是否被点击。
 ///
@@ -848,6 +884,7 @@ fn icon_button(
     icon: Icon,
     tip: &'static str,
     danger: bool,
+    active: bool,
 ) -> bool {
     let pal = f.pal;
     let scale = f.scale;
@@ -872,8 +909,17 @@ fn icon_button(
     icon.paint(
         &f.ui.painter_at(r),
         Rect::from_center_size(r.center(), vec2(pal.icon_size, pal.icon_size) * scale),
-        match (danger, resp.hovered()) {
-            (true, true) => pal.danger,
+        // 优先级：破坏性悬停 > 激活态 > 悬停提亮 > 常态弱化。
+        //
+        // `active` 用 `accent` 配色，而不只是换实心图标：16pt 下
+        // 实心与描边的差异很小，不配色用户分不出「已置顶」和「没置顶」。
+        // `danger` 与 `active` 分开判断，将来加「既破坏性又有开关态」
+        // 的按钮不用改签名。
+        match (danger, resp.hovered(), active) {
+            (true, true, _) => pal.danger,
+            (_, true, true) => pal.accent_hover,
+            (_, _, true) => pal.accent,
+            (_, true, false) => pal.text,
             _ => pal.text_dim,
         },
     );
@@ -4191,6 +4237,90 @@ fn with_pinned(mut self, n: usize) -> Self {
     //
     //（我最初就是这么写的，于是测试永远失败——不是代码有 bug，
     //  是我把分层理解错了。）
+    /// 点顶栏的窗口置顶按钮 ⇒ 发出 `SetBool{always_on_top}`。
+    ///
+    /// # 为什么断言 `Op` 而不是配置值
+    ///
+    /// 绘制层只**收集** `Op`，落地在 `App::apply_ops`。所以这里断言
+    /// 「发出的 Op 正确」，而不是「配置已经变了」。
+    ///
+    /// # 置顶本身不需要在这里验
+    ///
+    /// Win32 那一侧早就有：`presence::set_topmost(hwnd, bool)` +
+    /// `App` 帧循环每帧比对 `always_on_top` 并应用（用 `applied_topmost`
+    /// 去重）。按钮只需写配置，剩下的自动发生。
+    #[test]
+    fn clicking_pin_button_toggles_always_on_top() {
+        let mut h = Harness::new("topbar-pin", vec2(600.0, 400.0));
+        h.frame(); // 先跑一帧，热区才有值
+
+        let before = h.svc.state.config.ui.always_on_top;
+        let p = hit(&h, "topbar_pin").center();
+        let ops = h.click_at(p);
+
+        let emitted = ops.iter().find_map(|op| match op {
+            Op::SetBool {
+                group: ConfigGroup::Ui,
+                field: "always_on_top",
+                value,
+            } => Some(*value),
+            _ => None,
+        });
+        assert_eq!(
+            emitted,
+            Some(!before),
+            "点置顶按钮应发出 always_on_top = {before} 的取反，实际 ops={ops:?}"
+        );
+    }
+
+    /// 顶栏四枚按钮的槽位必须**互不重叠**，且都在搜索图标右侧。
+    ///
+    /// # 这条守的是一个很难自查的老坑
+    ///
+    /// 按钮区宽度在 `draw_topbar` 算（`btn_count`），槽位步距在
+    /// `draw_topbar_icons` 算（`step = r.width() / btn_count`）。
+    /// 两处各写一份数字时，改一处忘另一处 ⇒ 槽位与按钮区错位，
+    /// 症状是「最右那枚被搜索框压住」或「点齿轮变成拖窗口」——
+    /// 都不是一眼能看出原因的症状。
+    #[test]
+    fn topbar_icon_slots_do_not_overlap() {
+        let mut h = Harness::new("topbar-slots", vec2(600.0, 400.0));
+        h.frame();
+
+        let names = [
+            "topbar_close",
+            "topbar_clear",
+            "topbar_pin",
+            "topbar_settings",
+        ];
+        let rects: Vec<Rect> = names.iter().map(|n| hit(&h, n)).collect();
+
+        for (i, r) in rects.iter().enumerate() {
+            assert!(
+                r.width() > 0.0 && r.height() > 0.0,
+                "{} 的槽位不应为零面积，实际={r:?}",
+                names[i]
+            );
+            for (j, other) in rects.iter().enumerate().skip(i + 1) {
+                assert!(
+                    !r.intersects(*other),
+                    "{} 与 {} 的槽位重叠了：{r:?} vs {other:?} ——                      多半是 btn_count 与 step 的分母不一致",
+                    names[i],
+                    names[j]
+                );
+            }
+        }
+        // 最右那枚（设置）的右缘应当就是按钮区的右缘。
+        let rightmost = rects
+            .iter()
+            .max_by(|a, b| a.max.x.partial_cmp(&b.max.x).unwrap())
+            .unwrap();
+        assert!(
+            (rightmost.max.x - rects[3].max.x).abs() < 0.5,
+            "最右的槽位应当是「设置」，实际最右的是 {rightmost:?}"
+        );
+    }
+
     #[test]
     fn clicking_settings_gear_emits_toggle() {
         let mut h = Harness::new("settings-gear", vec2(600.0, 400.0));
