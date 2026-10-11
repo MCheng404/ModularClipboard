@@ -315,23 +315,15 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   padding: var(--card-pad);
 }
 /* 列表内容整体也要裁进圆角里，否则第一行/最后一行会压到圆角上 */
-.list, .pinned {
+.list {
   border-radius: calc(var(--card-radius) - var(--card-pad) + 4px);
 }
 .card-body { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
 
 /* ---- 内嵌置顶区 ---- */
-.pinned {
-  flex: 0 0 auto; display: flex; flex-direction: column;
-  max-height: 34%;                          /* embedded_pinned_height 封顶 1/3 */
-  padding: var(--space-xs) var(--space-sm) 0;
-}
-.pinned-label {
-  font-size: var(--font-xs); color: var(--text-dim);
-  line-height: 1.6; padding: 0 var(--space-sm);
-}
-.pinned-sep { height: 1px; background: var(--border-subtle); margin: var(--space-xs) 0; }
-.pinned-rows { overflow: hidden; display: flex; flex-direction: column; gap: var(--row-gap); }
+/* 内嵌置顶区已移除 —— 置顶条目与普通条目共用一个列表。
+   代价：Rust 侧 draw_embedded_pinned / embedded_pinned_height /
+   draw_history_body(only_pinned) 的双滚动槽位逻辑都可以删掉。 */
 
 /* ---- 列表 ---- */
 .list {
@@ -473,6 +465,42 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 
+/* ==========================================================================
+   置顶标记：置顶条目与普通条目在同一个列表里，只靠视觉区分
+   ==========================================================================
+
+   四种方案，`data-pinmark` 可切换：
+
+     tone     底色微亮（accent 低透明叠加）+ 边框转 accent 30%
+     badge    底色微亮 + 左上角一枚小图钉徽标
+     edge     底色微亮 + 左侧 3pt 圆头竖条
+     sort     不加任何标记，只靠"置顶的排最前"这个位置信息
+
+   默认用 tone：标记要一眼可辨，但不能抢过选中态（整圈 accent 描边）。
+   置顶是**状态**、选中是**焦点**，两者同时出现时焦点必须更强。 */
+.row[data-pin="1"] { background: color-mix(in srgb, var(--surface-raised) 100%, var(--accent) 7%); }
+[data-theme="dark"] .row[data-pin="1"] { background: color-mix(in srgb, var(--surface-raised) 100%, var(--accent) 12%); }
+
+/* tone / badge / edge 都带底色微亮；纯 sort 方案不要底色 */
+.row[data-pin="1"][data-pinmark="sort"] { background: transparent; }
+.app.unity .row[data-pin="1"] { box-shadow: 0 1px 2px rgba(0,0,0,.05), 0 2px 8px rgba(0,0,0,.04); }
+
+/* badge：左上角一枚小图钉。放在「来源 · 时间」之前，不占独立列。 */
+.row[data-pin="1"][data-pinmark="badge"] .pin-badge-icon {
+  position: absolute; left: var(--space-sm); top: 5px;
+  width: 11px; height: 11px; color: var(--accent);
+}
+.row[data-pin="1"][data-pinmark="badge"] .row-meta-top { padding-left: 17px; }
+
+/* edge：左侧短竖条。
+   CAUTION: 不能做成「上下顶满、与左边缘齐平」的通条 —— 卡片是圆角的，
+   方顶竖条会从圆角切线**探出来**，形成一个直角凸起（实测很明显）。
+   上下各内缩 10pt、两端圆头才是「一枚竖条贴在卡片内侧」的样子。 */
+.row[data-pin="1"][data-pinmark="edge"]::before {
+  content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px;
+  border-radius: 3px; background: var(--accent);
+}
+
 /* ---- 空态 ---- */
 .empty {
   flex: 1 1 auto; display: grid; place-items: center;
@@ -591,6 +619,14 @@ svg { display: block; }
       <label>
         <input type="checkbox" id="unityChk" checked> 一体性（整窗一块底，卡片浮起）
       </label>
+      <label>置顶标记
+        <select id="pinSel">
+          <option value="tone">底色微亮</option>
+          <option value="badge">底色 + 图钉徽标</option>
+          <option value="edge">底色 + 左侧竖条</option>
+          <option value="sort">仅排在最前</option>
+        </select>
+      </label>
     </div>
 
     <div class="toolbar note" style="background:none;border:0;padding:0">
@@ -681,11 +717,14 @@ const FIX = {
     //   这类"看起来像 bug"的判断，先读代码再下结论。）
     { app: 'C:\\Program Files\\Microsoft VS Code\\insiders\\Code.exe', time: '01:23', text: 'let total = rows.iter().filter(|r| r.ok).map(|r| r.v).sum::<f64>();', kind: '文本', size: '1.2 KB' },
   ],
-  pinned: [
-    { app: '密码管理器', time: '今天', text: '常用验证码片段', kind: '文本', size: '24 B' },
-    { app: '终端', time: '昨天', text: 'export DATABASE_URL=postgres://localhost:5432/clip', kind: '文本', size: '62 B' },
-  ],
 };
+/* 置顶条目**就在同一份列表里**，只是带 pinned 标记 —— 不再单独分区。
+   排序上置顶的排前面，所以「哪几条是置顶」一眼可见；
+   视觉上另有标记方式可切换（见工具栏「置顶标记」）。 */
+FIX.pinnedSeeds = [
+  { app: '密码管理器', time: '今天', text: '常用验证码片段 · 一次性验证码', kind: '文本', size: '24 B' },
+  { app: '终端', time: '昨天', text: 'export DATABASE_URL=postgres://localhost:5432/clip', kind: '文本', size: '62 B' },
+];
 
 /* ==========================================================================
    渲染
@@ -697,24 +736,28 @@ const state = {
   forceScroll: false, // 强制显示滚动条 —— headless 截图模拟不了 :hover
   actsPos: 'top',     // 行内按钮位置：top / topgap / center / hover
   unity: true,        // 一体性：整窗一块底，层次靠浮起而非色块分割
+  pinMark: 'tone',    // 置顶标记方式：tone / badge / edge / sort
 };
 
 function rowHtml(item, i, mode) {
-  // 主列表里的行都是未置顶 ⇒ 图钉用**描边**版；置顶区里的行才是实心。
-  const inPinned = FIX.pinned.some(p => p.text === item.text);
-  const pinIcon = (inPinned || item.pinned) ? ICON.pinSolid : ICON.pinOutline;
+  // 置顶行的图钉按钮是**实心**（表示"当前已置顶，点一下取消"），
+  // 普通行是描边。这是行内操作按钮，不是列表标记 —— 列表标记见下方标记方案。
+  const isPin = !!item.pinned;
+  const pinIcon = isPin ? ICON.pinSolid : ICON.pinOutline;
   const acts = `
     <div class="row-acts">
       <button class="row-act del" title="删除">${ICON.close}</button>
       <button class="row-act" title="复制">${ICON.file}</button>
-      <button class="row-act" title="${inPinned ? '取消置顶' : '置顶'}">${pinIcon}</button>
+      <button class="row-act" title="${isPin ? '取消置顶' : '置顶'}">${pinIcon}</button>
     </div>`;
   const meta = `${item.app} · ${item.time}`;
   let cls = 'row';
   if (mode === 'selected' && i === 2) cls += ' sel';
   if (mode === 'hover' && i === 4) cls += ' hover';
-  return `<div class="${cls}" data-acts="${state.actsPos}">
+  return `<div class="${cls}" data-acts="${state.actsPos}"
+       ${isPin ? `data-pin="1" data-pinmark="${state.pinMark}"` : ''}>
     ${acts}
+    ${isPin && state.pinMark === 'badge' ? `<div class="pin-badge-icon">${ICON.pinSolid}</div>` : ''}
     <div class="row-text">
       <div class="row-meta-top">${meta}</div>
       <div class="row-preview">${item.text}</div>
@@ -753,18 +796,15 @@ function render() {
   if (v === 'empty') {
     body = `<div class="card"><div class="card-body"><div class="empty">还没有剪贴板记录</div></div></div>`;
   } else {
+    // 置顶条目与普通条目在**同一个列表**里，只有 pinned 标记不同。
+    // 置顶的排前面 —— 顺带让"哪几条置顶了"变成位置信息，不需要标题栏。
     const showPinned = v === 'pinned';
-    const rows = FIX.rows.map((r, i) => rowHtml(r, i, v === 'selected' || v === 'hover' ? v : 'normal')).join('');
-    const pinnedBlock = showPinned ? `
-      <div class="pinned">
-        <div class="pinned-label">置顶</div>
-        <div class="pinned-sep"></div>
-        <div class="pinned-rows">${FIX.pinned.map((r, i) => rowHtml(r, i, 'normal')).join('')}</div>
-      </div>` : '';
+    const items = showPinned
+      ? [...FIX.pinnedSeeds.map(x => ({ ...x, pinned: true })), ...FIX.rows]
+      : [...FIX.rows];
+    const rows = items.map((r, i) => rowHtml(r, i, v === 'selected' || v === 'hover' ? v : 'normal')).join('');
     body = `<div class="cardarea"><div class="card">
       <div class="card-body">
-        ${pinnedBlock}
-        ${showPinned ? '<div class="pinned-sep" style="margin:0 var(--space-sm) var(--space-xs)"></div>' : ''}
         <div class="list${state.forceScroll ? ' force-scrollbar' : ''}">${rows}</div>
       </div>
     </div></div>`;
@@ -839,10 +879,6 @@ SPEC.tree = `
 │  └─ <b>DragRegion·right</b> <span class="k">设置按钮真实右缘 → 窗口右缘</span>
 └─ <b>CardArea</b> <span class="k">bg</span>
    └─ <b>Card·History</b> <span class="k">整卡 list_bg · 1px border_subtle · r=0</span>
-      ├─ <b>PinnedBand</b> <span class="k">仅当置顶内嵌且有置顶 · 封顶 34%</span>
-      │  ├─ Label "置顶" <span class="k">font_xs · text_dim</span>
-      │  ├─ <b>Row</b>* <span class="k">独立滚动槽位</span>
-      │  └─ Separator <span class="k">1px border_subtle</span>
       └─ <b>List</b> <span class="k">左右 padding 8（同时是拖动区）</span>
          ├─ <b>ScrollArea</b> <span class="k">floating · bar_width=10 · 覆盖右缘</span>
          └─ <b>Row</b>* <span class="k">gap 6 · min-h 58</span>
@@ -1000,6 +1036,27 @@ SPEC.states = `
     卡片化之后竖条像贴了张便签，把一张卡切成两半</td></tr>
 <tr><td>置顶</td><td>移入内嵌置顶区；pin 图标由 Unpinned 变 Pinned（实心）</td></tr>
 </table>
+<h3>置顶条目：不分区，只标记</h3>
+<p>原先置顶条目住在历史卡片顶部的一条<b>内嵌区</b>（标签 + 分隔线 +
+   独立滚动槽位 + 34% 高度封顶）。本轮取消——置顶与普通条目共用<b>同一个列表</b>，
+   只靠标记区分，且置顶的排在最前。</p>
+<table>
+<tr><th>方案</th><th>表现</th><th>评价</th></tr>
+<tr><td><code>tone</code></td><td>底色微亮</td><td>偏弱，色差小到要盯一会儿</td></tr>
+<tr><td><code>badge</code></td><td>底色 + 左上角图钉徽标</td><td><b>推荐</b>：形状信息，扫一眼就知道</td></tr>
+<tr><td><code>edge</code></td><td>底色 + 左侧短竖条</td><td>清晰，但比 badge 重</td></tr>
+<tr><td><code>sort</code></td><td>仅排在最前</td><td>最干净，条目一多就得靠回忆</td></tr>
+</table>
+<p>推荐 <code>badge</code> 与推荐整圈选中描边是同一条道理：
+   <b>标记必须携带形状信息，纯色差不够</b>。</p>
+<p><b>CAUTION</b>：<code>edge</code> 的竖条不能做成上下顶满、与卡片左缘齐平的通条——
+   卡片是圆角的，方顶竖条会从圆角切线探出来，形成直角凸起（实测很明显）。
+   必须上下各内缩 10pt、两端圆头。</p>
+<p>Rust 侧连带：<code>draw_embedded_pinned</code> 与
+   <code>embedded_pinned_height</code> 整个可删；
+   <code>draw_history_body</code> 的 <code>only_pinned</code> 参数可删
+   （顺带少一个滚动槽位 —— 少一类「滚主栏把置顶区一起带走」的 bug）。
+   另需新增排序规则 <code>pinned DESC, created_at DESC</code>。</p>
 <h3>一体性（整窗一块底，卡片浮起）</h3>
 <p>原先是四种灰叠出层次：窗口底 <code>bg</code> / 顶栏 <code>surface_variant</code>
    / 卡片区 <code>list_bg</code>（比窗口底更暗）/ 行卡片 <code>surface_raised</code>。
@@ -1072,6 +1129,9 @@ document.getElementById('sbChk').addEventListener('change', e => {
 document.getElementById('unityChk').addEventListener('change', e => {
   state.unity = e.target.checked; render();
 });
+document.getElementById('pinSel').addEventListener('change', e => {
+  state.pinMark = e.target.value; render();
+});
 
 document.getElementById('winW').addEventListener('input', e => { state.w = +e.target.value; render(); });
 document.getElementById('winH').addEventListener('input', e => { state.h = +e.target.value; render(); });
@@ -1079,25 +1139,28 @@ document.getElementById('winH').addEventListener('input', e => { state.h = +e.ta
 render();
 
 /* URL hash 支持状态直达，便于批量截图与分享：
-     列表视图  #normal #hover #selected #search #empty #narrow
-     #embedded  含内嵌置顶区      #wintop  窗口置顶
-     #dark      深色主题          #square  直角对照
-     #scroll    强制显示滚动条（截图模拟不了 :hover，只能这样验）
-   例：main-window.html#dark+wintop+scroll */
+     列表视图  #normal #hover #selected #search #empty #narrow #pinned
+     #pinned  含置顶条目          #wintop  窗口置顶（另一个东西）
+     #dark      深色主题          #square  直角对照      #nounity  关掉一体性
+     #sb        强制显示滚动条（截图模拟不了 :hover，只能这样验）
+     置顶标记  #tone #badge #edge #sort
+     行内按钮  #top #topgap #center #hover
+   例：main-window.html#dark+wintop+pinned+badge+sb
+
+   注意 `pinned` 与 `wintop` 是两件不同的事：
+     pinned  = 列表里的**条目**被置顶
+     wintop  = **窗口**本身置顶 */
 (function applyHash() {
   const h = (location.hash || '').replace('#', '');
   if (!h) return;
   const parts = h.split(/[+,]/);
-  const VIEWS = ['normal','hover','selected','search','empty','narrow'];
-  // 注意：`pinned` 在 hash 里表示**窗口置顶**（列表里的置顶条目用
-  // `embedded`，避免同一个词指两件不同的事）。
+  const VIEWS = ['normal','hover','selected','search','empty','narrow','pinned'];
   const view = parts.find(p => VIEWS.includes(p));
   if (view) {
     state.view = view;
     document.querySelectorAll('.chip').forEach(x =>
       x.classList.toggle('on', x.dataset.state === view));
   }
-  if (parts.includes('embedded')) state.view = 'pinned';
   if (parts.includes('dark')) {
     state.theme = 'dark';
     document.documentElement.dataset.theme = 'dark';
@@ -1119,6 +1182,11 @@ render();
   if (acts) {
     state.actsPos = acts;
     document.getElementById('actsSel').value = acts;
+  }
+  const pm = parts.find(p => ['tone','badge','edge','sort'].includes(p));
+  if (pm) {
+    state.pinMark = pm;
+    document.getElementById('pinSel').value = pm;
   }
   if (parts.includes('nounity')) {
     state.unity = false;
