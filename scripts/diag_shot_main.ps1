@@ -1,6 +1,11 @@
 # 临时诊断：PrintWindow 抓主窗口内容（PW_RENDERFULLCONTENT=2），保存 PNG。
 param([int]$TargetPid, [string]$OutPath)
 
+# CAUTION: 必须显式加载 System.Drawing —— PowerShell 7 在部分宿主下
+# 不会自动加载它，缺这行的症状是 `New-Object System.Drawing.Bitmap`
+# 报「找不到类型」，与脚本本身无关，很容易误判成脚本坏了。
+Add-Type -AssemblyName System.Drawing
+
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -17,6 +22,7 @@ public static class PWC {
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   public static List<IntPtr> OfPid(uint want) { var r = new List<IntPtr>(); EnumWindows((h,l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == want) r.Add(h); return true; }, IntPtr.Zero); return r; }
   public static string Txt(IntPtr h) { var sb = new StringBuilder(256); GetWindowTextW(h, sb, 256); return sb.ToString(); }
@@ -30,8 +36,19 @@ Write-Output "主窗口=$main 设置=$settings"
 if ($main -eq [IntPtr]::Zero) { exit 1 }
 $r = New-Object PWC+RECT; [void][PWC]::GetWindowRect($main, [ref]$r)
 $w = $r.R - $r.L; $h = $r.B - $r.T
-Write-Output "窗口尺寸 ${w}x${h}"
-$bmp = New-Object System.Drawing.Bitmap($w, $h)
+
+# CAUTION: 本脚本进程**不是** per-monitor DPI aware，GetWindowRect /
+# PrintWindow 返回的都是**逻辑点**。而窗口客户区是物理像素
+# （720x800 物理 = 480x533 逻辑，1.5x 缩放）。
+# 直接拿逻辑尺寸建 Bitmap ⇒ 只画进左上 1/1.5 的内容，
+# 症状是「截图右边被裁掉一截，按钮看不见」—— 很容易误判成
+# 「按钮没画出来」，实际是截图尺寸错了。
+$dpi = 96
+if ([PWC]::GetDpiForWindow -ne $null) { $dpi = [PWC]::GetDpiForWindow($main) }
+$scale = [double]$dpi / 96.0
+$pw = [int][Math]::Round($w * $scale); $ph = [int][Math]::Round($h * $scale)
+Write-Output "窗口尺寸 ${w}x${h} (dpi=$dpi scale=$scale => bitmap ${pw}x${ph}"
+$bmp = New-Object System.Drawing.Bitmap($pw, $ph)
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $dc = $g.GetHdc()
 $ok = [PWC]::PrintWindow($main, $dc, 2)  # PW_RENDERFULLCONTENT

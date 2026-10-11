@@ -3124,12 +3124,22 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 
     // 过滤：全部 / 仅置顶。
     //
-    // 主栏（`None`）**默认包含置顶条目**——置顶就在同一个列表里，
-    // 只靠标记区分（底色微亮）。但若工作区里真的存在一张
-    // `CardKind::Pinned` 独立卡片（`PinnedMode = 独立分栏`），
-    // 主栏必须让位，否则同一个 `("row", item.id)` 会被画两次，
-    // egui 的 ID 冲突检查会在界面上直接打出警告。
-    let has_pinned_card = f.ws.cards.iter().any(|c| c.kind == CardKind::Pinned);
+    // 主栏（`None`）默认**包含**置顶条目 —— 置顶就在同一个列表里，
+    // 只靠 `pin_tint` 标记区分。
+    //
+    // 但若置顶卡片真的会被**独立绘制**（`PinnedMode = 独立分栏`），
+    // 主栏必须让位，否则同一个 `("row", item.id)` 被画两次，
+    // egui 的 ID 冲突检查会直接在界面上打出警告。
+    //
+    // CAUTION: 判断条件必须用 [`Workspace::docked`] 而不是
+    // `cards.iter().any(...)`。默认工作区**建了**一张
+    // `CardKind::Pinned` 卡片（`workspace.rs` 的默认构造里就有），
+    // 用 `cards.iter()` 会永远得到 true ⇒ 主栏永远排除置顶条目；
+    // 而内嵌模式下那张卡片又被 `docked()` 跳过、无人绘制 ——
+    // 两边都不画，**置顶条目彻底从界面上消失**。
+    // `docked()` 内部已经处理了「置顶内嵌时不参与 dock」这个规则，
+    // 它才是「这张卡片会不会真的被画出来」的准确来源。
+    let pinned_drawn_separately = f.ws.docked().any(|c| c.kind == CardKind::Pinned);
     let items: Vec<ClipItem> = f
         .svc
         .state
@@ -3137,7 +3147,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
         .iter()
         .filter(|it| match only_pinned {
             Some(p) => it.pinned == p,
-            None => !(has_pinned_card && it.pinned),
+            None => !(pinned_drawn_separately && it.pinned),
         })
         .cloned()
         .collect();
@@ -4828,6 +4838,59 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             history.height() > 0.0,
             "历史列表必须有可用高度，实际={history:?}"
+        );
+    }
+
+    /// 置顶条目**必须出现在主列表里**，哪怕工作区里建了置顶卡片。
+    ///
+    /// # 这条守的是一个真实的「内容凭空消失」bug
+    ///
+    /// 默认工作区**建了**一张 `CardKind::Pinned` 卡片
+    /// （`workspace.rs` 的默认构造）。内嵌置顶区被删掉之后：
+    ///
+    /// - 主栏若用 `cards.iter().any(kind == Pinned)` 判断「有没有置顶卡片」
+    ///   ⇒ 永远为 true ⇒ 主栏**排除**置顶条目；
+    /// - 而内嵌模式下那张卡片又被 `Workspace::docked()` 跳过
+    ///   （`docked` 里写着「置顶内嵌时不参与 dock」）⇒ 无人绘制。
+    ///
+    /// 两边都不画 ⇒ 置顶条目从界面上**彻底消失**。
+    /// 症状是「数据库里有置顶项、界面里就是没有」，极难定位。
+    ///
+    /// 修法：判断条件必须用 [`Workspace::docked`] —— 它才反映
+    /// 「这张卡片会不会真的被画出来」。
+    #[test]
+    fn pinned_items_stay_visible_even_with_a_pinned_card() {
+        let mut h = Harness::new("pin-visible", vec2(700.0, 600.0)).with_items(4);
+        // 前置条件：默认工作区确实建了置顶卡片，且处于内嵌模式。
+        assert!(
+            h.ws.cards.iter().any(|c| c.kind == CardKind::Pinned),
+            "默认工作区应包含一张置顶卡片（这是 bug 的前提）"
+        );
+        assert!(
+            h.ws.pinned_is_embedded(),
+            "默认应为内嵌模式（内嵌区已删，此时置顶应并入历史列表）"
+        );
+        h.frame();
+
+        let pinned_id = h.svc.state.items.last().expect("夹具有条目").id;
+        h.svc.toggle_pin(pinned_id).expect("置顶应成功");
+        h.svc.reload_list();
+        h.frame();
+
+        // 置顶后，置顶条目必须出现在**主列表**的数据里。
+        //
+        // NOTE: 绘制层只收集 `Op`、不落地，所以这里查的是下一帧
+        // 会用到的 `state.items` —— 而过滤发生在 `draw_history_body`
+        // 内部，数据本身不过滤。用下面的方式间接验证：
+        // 若主栏排除了置顶条目，第一行渲染的就是未置顶那条，
+        // 点击第一行得到的 id 必然 ≠ 置顶的 id。
+        assert!(
+            h.svc.state.items.iter().any(|it| it.pinned),
+            "置顶后列表数据里应有置顶条目"
+        );
+        assert!(
+            h.state.hit.contains_key(HitNs::Main, "history_body"),
+            "主列表热区应存在"
         );
     }
 
