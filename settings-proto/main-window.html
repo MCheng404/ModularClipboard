@@ -50,20 +50,27 @@
   --radius-lg: 10px;
 
   /* ---- 圆角风格 ----
-     CAUTION: --win-radius 在原型里可以随便调，但**系统真实值调不了**。
-     DWMWA_WINDOW_CORNER_PREFERENCE 收的是枚举（DWMWCP_ROUND），
-     半径由系统决定（Win11 约 8pt）。想要任意半径只有 SetWindowRgn，
-     代价是像素级裁剪、四角锯齿。
+     CAUTION: --win-radius 在原型里**不能随便调**，它表达的是系统给的值。
 
-     所以「整体看起来更圆」要靠内容层主导：卡片圆角足够大 + 卡片
-     内缩足够多，让卡片的圆角成为视觉主体，窗口圆角只作外层。 */
-  --win-radius:  16px;   /* 原型示意值；真实约 8pt（系统定） */
-  --card-radius: 12px;   /* Rust: CARD_RADIUS，现为 0 */
+     DWMWA_WINDOW_CORNER_PREFERENCE 只收 4 个枚举（微软 dwmapi.h）：
+         DWMWCP_DEFAULT=0 / DONOTROUND=1 / ROUND=2 / ROUNDSMALL=3
+     ——**没有 DWMWCP_ROUNDLARGE**，也不存在 DWMWA_WINDOW_CORNER_RADIUS
+     之类的属性能请求任意半径。ROUND 已经是最"large"的一档（约 8px），
+     半径烧在 dwm.exe 里。
+
+     所以「窗口圆角更大」在 Win32 层面**做不到**，除非改用
+     SetWindowRgn + CreateRoundRectRgn —— 代价是四角锯齿（区域裁剪
+     无抗锯齿）、DWM 阴影消失、每次 resize 都要重新应用。不划算。
+
+     于是「整体更圆润」只能靠**内容层**承担：卡片与行取更大的半径，
+     窗口圆角作为最外层固定值。这里按真实值渲染，不是示意。 */
+  --win-radius:   8px;   /* DWM DWMWCP_ROUND，系统定，改不了 */
+  --card-radius: 16px;   /* Rust: CARD_RADIUS，现为 0 —— 视觉主体 */
   --row-radius:  12px;   /* Rust: 行卡片现用 pal.radius_sm = 4 */
   /* 卡片内边距 ≥ 卡片圆角，否则行卡片的方角会从圆角底下露出来。
-     取 13（比 12 大 1）而不是相等：相切时行卡片边缘正好落在圆角
+     取 17（比 16 大 1）而不是相等：相切时行卡片边缘正好落在圆角
      切点上，亚像素舍入会让它偶尔露出一点点方角。 */
-  --card-pad:    13px;
+  --card-pad:    17px;
   --cardarea-pad: 8px;
 
   /* ---- 间距 ---- */
@@ -165,6 +172,8 @@ button.chip {
 }
 button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 .scale-hint { color: #5c6572; font-size: 11px; }
+.note-line { color: #6f7885; font-size: 11px; }
+.note-line b { color: #8fc0f2; font-weight: 500; }
 
 /* ---- 桌面场景：用来演示「置顶」到底改变了什么 ----
    置顶的语义是 z 序，不是外观。光看窗口截图看不出区别，
@@ -348,28 +357,34 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
 .list::-webkit-scrollbar { width: var(--scrollbar-reserve); background: transparent; }
 .list::-webkit-scrollbar-track { background: transparent; }
 .list::-webkit-scrollbar-thumb {
-  background: transparent;
+  /* 常态**微可见**而不是全透明 —— 全透明的滚动条在内容溢出时
+     会被忽略，用户不知道「下面还有」，反而要拖一下才知道。
+     主流搜索站点（Bing / Google）也是常驻低透明、悬停加深。 */
+  background: color-mix(in srgb, var(--border) 38%, transparent);
   border-radius: 999px;
-  border: 3px solid transparent;      /* 10 − 2×3 = 4px 视觉宽度 */
+  /* 3.5px 的边框把 10px 轨道挖成 3px 视觉宽度；同时让滑块两端
+     各留 3.5px，不顶到轨道头尾。 */
+  border: 3.5px solid transparent;
   background-clip: content-box;
   transition: background-color .18s ease, border-width .18s ease;
 }
 .list:hover::-webkit-scrollbar-thumb,
+.list.scrolling::-webkit-scrollbar-thumb,
 .list.force-scrollbar::-webkit-scrollbar-thumb {
-  background: color-mix(in srgb, var(--border) 60%, transparent);
+  background: color-mix(in srgb, var(--border) 72%, transparent);
 }
 .list::-webkit-scrollbar-thumb:hover {
   background: var(--border-strong);
-  border-width: 2px;                  /* → 6px */
+  border-width: 2.5px;                 /* → 5px，比常态粗一档 */
 }
 /* Firefox：scrollbar-width 只有 auto/thin/none 三档，给不了具体宽度，
    但 scrollbar-color 支持 transparent，同样能做出「悬停才显形」。 */
 .list {
   scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
+  scrollbar-color: color-mix(in srgb, var(--border) 38%, transparent) transparent;
 }
-.list:hover, .list.force-scrollbar {
-  scrollbar-color: color-mix(in srgb, var(--border) 60%, transparent) transparent;
+.list:hover, .list.scrolling, .list.force-scrollbar {
+  scrollbar-color: color-mix(in srgb, var(--border) 72%, transparent) transparent;
 }
 
 /* ---- 行卡片 ---- */
@@ -398,15 +413,26 @@ button.chip.on { background: #1c3350; color: #8fc0f2; border-color: #2f5480; }
    所以自左向右是 pin → copy → delete，delete 在最右。
    DOM 按 delete,copy,pin 写，配 row-reverse 得到同样的视觉顺序。
 
-   **位置改动**：原先 `top: 5px` 与左上的「来源 · 时间」同一水平线，
-   两处争那一行的空间，长来源名会把按钮挤掉。改为**垂直居中**
-   （与左侧类型图标对齐）：上下都留出余量，不再和来源行打架，
-   视觉上也更平衡。右侧再留 6px，不贴边。 */
+   位置有 4 种方案（工具栏可切换），差别在于「贴右上角」还是
+   「居中」，以及「常驻」还是「悬停才出现」：
+
+     top      贴右上角，与「来源 · 时间」同一水平线
+     topgap   贴右上角，但整体再下移一点，避开来源行的字形上沿
+     center   右侧垂直居中（与左侧类型图标对齐）
+     hover    贴右上角，且**只在悬停该行时**出现
+
+   位置不影响 text_x1 —— 那一律要减去 acts_w，否则长来源名会排到
+   按钮底下（preview_width 里已经减过了，别在这里再减一次）。 */
 .row-acts {
-  position: absolute; top: 50%; transform: translateY(-50%);
-  right: var(--space-sm);
+  position: absolute; right: var(--space-sm);
   display: flex; flex-direction: row-reverse; gap: var(--space-xs);
+  transition: opacity .14s ease, transform .14s ease;
 }
+.row[data-acts="top"]     .row-acts { top: 5px; }
+.row[data-acts="topgap"]  .row-acts { top: 9px; }
+.row[data-acts="center"]  .row-acts { top: 50%; transform: translateY(-50%); }
+.row[data-acts="hover"]   .row-acts { top: 5px; opacity: 0; }
+.row[data-acts="hover"]:hover .row-acts { opacity: 1; }
 .row-act {
   width: 15.4px; height: 15.4px; border: 0; background: none; padding: 0;
   color: var(--text-dim); cursor: pointer; display: grid; place-items: center;
@@ -493,10 +519,29 @@ svg { display: block; }
       <span class="scale-hint">1:1 逻辑点显示。默认配置 720×800 物理像素 ÷ DPI 1.5 = 480×533 逻辑点</span>
       <label style="margin-left:8px">
         <input type="checkbox" id="pinChk"> 窗口置顶
+        <span class="scale-hint">= 始终在最上层，不被其它应用遮住</span>
       </label>
       <label>
         <input type="checkbox" id="roundChk" checked> 圆角风格
       </label>
+      <label>行内按钮
+        <select id="actsSel">
+          <option value="top">贴右上角</option>
+          <option value="topgap">贴右上·下移</option>
+          <option value="center">右侧居中</option>
+          <option value="hover">右上·悬停才显示</option>
+        </select>
+      </label>
+      <label>
+        <input type="checkbox" id="sbChk"> 强制显示滚动条
+      </label>
+    </div>
+
+    <div class="toolbar note" style="background:none;border:0;padding:0">
+      <span class="note-line">
+        圆角梯度 <b>窗口 8（系统锁定，调不了）</b> → <b>卡片 16</b> → <b>行 12</b>。
+        DWM 的 `DWMWCP_ROUND` 已是最大一档，微软枚举里没有更大的值。
+      </span>
     </div>
 
     <div class="toolbar" style="justify-content:center;background:none;border:0;padding:0">
@@ -594,10 +639,11 @@ const FIX = {
    渲染
    ========================================================================== */
 const state = {
-  theme: 'light', view: 'normal', w: 480, h: 533, zoom: 1.5,
-  winPinned: false,   // 窗口置顶（新增）
-  rounded: true,      // 圆角风格（新增；false = 现在的直角风格，便于对比）
+  theme: 'light', view: 'normal', w: 480, h: 533,
+  winPinned: false,   // 窗口置顶 = 始终在最上层，不被其它应用遮住
+  rounded: true,      // 圆角风格（false = 现在的直角风格，便于对比）
   forceScroll: false, // 强制显示滚动条 —— headless 截图模拟不了 :hover
+  actsPos: 'top',     // 行内按钮位置：top / topgap / center / hover
 };
 
 function rowHtml(item, i, mode) {
@@ -615,7 +661,7 @@ function rowHtml(item, i, mode) {
   let cls = 'row';
   if (mode === 'selected' && i === 2) cls += ' sel';
   if (mode === 'hover' && i === 4) cls += ' hover';
-  return `<div class="${cls}">
+  return `<div class="${cls}" data-acts="${state.actsPos}">
     ${acts}
     <div class="row-icon">${icon}</div>
     <div class="row-text">
@@ -681,6 +727,17 @@ function render() {
     syncDesktop();
     render();
   });
+
+  // 滚动条：滚动时也显示（不只是悬停）。现代列表的惯例——
+  // 用户正在滚，说明他需要知道滑块在哪；停下后自动淡回常态。
+  document.querySelectorAll('.list').forEach(l => {
+    let t = 0;
+    l.addEventListener('scroll', () => {
+      l.classList.add('scrolling');
+      clearTimeout(t);
+      t = setTimeout(() => l.classList.remove('scrolling'), 700);
+    }, { passive: true });
+  });
 }
 
 /* 置顶改变的是 z 序，不是外观 —— 靠桌面场景把它表达出来 */
@@ -697,13 +754,17 @@ function syncRound() {
   const app = document.getElementById('app');
   const set = (k, v) => app.style.setProperty(k, v);
   if (state.rounded) {
-    set('--win-radius', '12px');
-    set('--card-radius', '10px');
-    set('--row-radius', '6px');
+    // 与 :root 保持一致，且是**真实值**：窗口圆角 8 由 DWM 锁定，
+    // 视觉主体交给卡片（16）与行（12）——三层圆角梯度 8 / 16 / 12。
+    set('--win-radius', '8px');
+    set('--card-radius', '16px');
+    set('--row-radius', '12px');
+    set('--card-pad', '17px');
   } else {
     set('--win-radius', '0px');
     set('--card-radius', '0px');
     set('--row-radius', '4px');
+    set('--card-pad', '8px');
   }
 }
 
@@ -941,6 +1002,12 @@ document.getElementById('pinChk').addEventListener('change', e => {
 document.getElementById('roundChk').addEventListener('change', e => {
   state.rounded = e.target.checked; render(); syncRound();
 });
+document.getElementById('actsSel').addEventListener('change', e => {
+  state.actsPos = e.target.value; render();
+});
+document.getElementById('sbChk').addEventListener('change', e => {
+  state.forceScroll = e.target.checked; render();
+});
 
 document.getElementById('winW').addEventListener('input', e => { state.w = +e.target.value; render(); });
 document.getElementById('winH').addEventListener('input', e => { state.h = +e.target.value; render(); });
@@ -979,6 +1046,15 @@ render();
   if (parts.includes('square')) {
     state.rounded = false;
     document.getElementById('roundChk').checked = false;
+  }
+  if (parts.includes('sb')) {
+    state.forceScroll = true;
+    document.getElementById('sbChk').checked = true;
+  }
+  const acts = parts.find(p => ['top','topgap','center','hover'].includes(p));
+  if (acts) {
+    state.actsPos = acts;
+    document.getElementById('actsSel').value = acts;
   }
   // headless 截图模拟不了 :hover，用这个把滚动条强行显形以便验证。
   if (parts.includes('scroll')) state.forceScroll = true;
