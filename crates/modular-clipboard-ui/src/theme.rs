@@ -298,12 +298,15 @@ palette! {
     space_xl: num = 24.0 => 24.0,
 
     // ---- 字号阶 ----
-    font_xs: num = 11.0 => 11.0,
-    font_sm: num = 12.0 => 12.0,
-    font_md: num = 14.0 => 14.0,
-    font_lg: num = 16.0 => 16.0,
-    font_xl: num = 20.0 => 20.0,
-    font_title: num = 24.0 => 24.0,
+    //
+    // 2026-10-11 用户反馈「整体字体偏小，放大一点」：全套字号 +1。
+    // 影响主窗口 / 设置窗口 / 置顶窗口全部文字（font_scale 仍可叠加）。
+    font_xs: num = 12.0 => 12.0,
+    font_sm: num = 13.0 => 13.0,
+    font_md: num = 15.0 => 15.0,
+    font_lg: num = 17.0 => 17.0,
+    font_xl: num = 21.0 => 21.0,
+    font_title: num = 25.0 => 25.0,
 
     // ---- 描边宽度 ----
     stroke_thin: num = 1.0 => 1.0,

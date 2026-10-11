@@ -2285,7 +2285,7 @@ fn section(ui: &mut Ui, title: &str) {
     ui.label(
         egui::RichText::new(title)
             .strong()
-            .size(12.0)
+            .size(13.0)
             .color(ui.visuals().weak_text_color()),
     );
 }
