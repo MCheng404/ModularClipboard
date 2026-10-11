@@ -1839,7 +1839,8 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
     let pal = f.pal;
     let w = ui.available_width();
     let row_h = 44.0;
-    let head_h = 40.0;
+    // 无卡片标题：顶部只留一行放右上角「重置」按钮（有变化时才出现）。
+    let head_h = 26.0;
     let pad = 12.0;
     let extra = if card.cat == SettingsCat::Comm { 44.0 } else { 0.0 };
     let h = head_h + row_h * card.items.len() as f32 + pad * 2.0 + extra;
@@ -1852,22 +1853,17 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
             .max_rect(inner_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
-    inner.spacing_mut().item_spacing = vec2(0.0, 2.0);
+    // 行间距：设置项之间拉开呼吸感（2.0 太挤，文字贴在一起）。
+    inner.spacing_mut().item_spacing = vec2(0.0, 8.0);
 
-    // 标题行：左标题，右「重置」（仅当有项偏离默认值时出现）。
+    // 顶部行：无标题文字，仅当有项偏离默认值时在**右上方**出现「重置」。
     let changed_any = {
         let cfg = &f.svc.state.config;
         card.items.iter().any(|it| it.is_changed(cfg, f.ws))
     };
-    inner.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(card.title)
-                .strong()
-                .size(pal.font_md)
-                .color(pal.text_bright),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if changed_any {
+    if changed_any {
+        inner.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let resp = ui.add(
                     egui::Button::new(
                         egui::RichText::new("重置").size(pal.font_sm).color(pal.text_dim),
@@ -1900,17 +1896,9 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
                         .settings_recent
                         .retain(|(l, _)| !card.items.iter().any(|it| it.label == *l));
                 }
-            }
+            });
         });
-    });
-
-    // 标题下细分隔线。
-    let line_y = inner_rect.min.y + head_h - 10.0;
-    ui.painter_at(r).hline(
-        r.min.x + pad..=r.max.x - pad,
-        line_y,
-        egui::Stroke::new(1.0, pal.border_subtle),
-    );
+    }
 
     for it in card.items {
         settings_item_row(f, &mut inner, it);
