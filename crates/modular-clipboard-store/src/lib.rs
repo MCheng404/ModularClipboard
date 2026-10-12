@@ -905,7 +905,10 @@ impl Store {
 }
 
 /// 分组过滤条件。
-#[derive(Debug, Clone, Copy)]
+///
+/// `Serialize` 是为了让它能跨进程传递（见 `modular-clipboard-ipc`）：
+/// 界面进程不打开数据库，过滤条件只能走通道发给常驻进程。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GroupFilter {
     Group(i64),
     Ungrouped,

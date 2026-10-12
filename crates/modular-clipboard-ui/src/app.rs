@@ -143,9 +143,63 @@ pub fn run_with_options(
     capture_is_override: bool,
     data_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    // NOTE: 先取 `show_tray` 快照：`config` 后面会被移动进 `App::new`，
+    let svc = match Service::with_data_dir(config.clone(), data_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(%e, "服务初始化失败，界面将以空状态运行");
+            // 用内存库兜底，避免整个应用无法启动。
+            Service::in_memory()
+        }
+    };
+    run_mode(config, svc, capture_is_override, false)
+}
+
+/// 界面进程入口：连常驻进程、建窗口、关闭即退出本进程。
+///
+/// # 与单进程模式的两点差别
+///
+/// 1. **不建托盘**：托盘在常驻进程里。界面自己建托盘的话，
+///    关掉界面托盘就消失，用户再也唤不回程序。
+/// 2. **关闭窗口 = 退出进程**：这正是拆进程的目的——
+///    进程一退，Vulkan/字体/纹理那些销毁了也拿不回的内存
+///    由操作系统整体回收。
+pub fn run_remote() -> anyhow::Result<()> {
+    // 实例守卫：让常驻进程知道「界面已在运行」，
+    // 从而在托盘点击时选择「唤起」而不是「再起一个」。
+    //
+    // 抢不到说明已经有一个界面在跑——此时本进程不该继续，
+    // 否则两个界面会互相抢窗口前台。
+    let _instance = match modular_clipboard_ipc::UiInstanceGuard::acquire() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::info!(%e, "界面已在运行，本进程退出");
+            return Ok(());
+        }
+    };
+    // 5 秒缓冲：托盘刚拉起界面时，常驻进程的管道可能还没建好。
+    let svc = Service::connect_remote(std::time::Duration::from_secs(5))?;
+    // 界面配置以常驻进程那份为准（见 `App::new_remote` 的说明）。
+    let config = svc.state.config.clone();
+    // 界面进程**不**持有捕获开关的临时覆盖：那是常驻进程的事。
+    run_mode(config, svc, false, true)
+}
+
+/// 两种模式共用的帧循环。
+///
+/// `remote` 为真时界面不建托盘、关闭窗口即退出进程，
+/// 其余（渲染、绘制、事件）完全一致。
+fn run_mode(
+    config: modular_clipboard_core::Config,
+    svc: Service,
+    capture_is_override: bool,
+    remote: bool,
+) -> anyhow::Result<()> {
+    // NOTE: 先取 `show_tray` 快照：`config` 后面会被移动进 `App`，
     // 到那时就访问不到了。
-    let want_tray = config.ui.show_tray;
+    //
+    // 远端模式下**恒为 false**：托盘归常驻进程所有。界面自己建托盘的话，
+    // 关掉界面托盘就没了，用户再也唤不回程序。
+    let want_tray = config.ui.show_tray && !remote;
 
     // `Window::new` 的宽高是**物理像素**，而配置里存的是逻辑点。
     // DPI 缩放在窗口创建后才可查，因此先按 1.0 换算——创建后第一帧的
@@ -257,7 +311,11 @@ pub fn run_with_options(
         crate::multiwindow::SharedGfx::create(&gpu)?.with_font_path(font_path.as_deref());
 
     // ---- egui -----------------------------------------------------------
-    let mut app = App::new(config, capture_is_override, data_dir);
+    let mut svc = svc;
+    // 标记临时覆盖（见 `App::new` 的说明）：远端模式下 `set_capture_override`
+    // 只是界面侧的标记，真正落盘由常驻进程决定。
+    svc.set_capture_override(capture_is_override);
+    let mut app = App::from_service(config, svc);
     let ctx = app.ctx.clone();
 
     // 恢复上次退出时的置顶窗口位置。
@@ -292,6 +350,11 @@ pub fn run_with_options(
                 None
             }
         }
+    } else if remote {
+        // 界面进程永远不建托盘：托盘归常驻进程。界面自己建的话，
+        // 关掉界面托盘就没了，用户再也唤不回程序。
+        tracing::info!("界面进程不创建托盘（托盘与后台记录都在常驻进程里）");
+        None
     } else {
         tracing::info!("配置已关闭托盘图标，不启动托盘");
         None
@@ -410,7 +473,25 @@ pub fn run_with_options(
         // 这也正是「藏起来唤不回来」家族里最实的一条。
         //
         // 放在循环开头后，最迟下一帧就会生效（延迟一帧无感）。
+        // 常驻进程失联（被任务管理器杀掉、崩溃）：界面自己退出，
+        // 而不是留一扇永远不更新的窗口让用户以为程序还活着。
+        if app.svc.daemon_gone() {
+            tracing::warn!("与常驻进程的连接已断开，界面退出");
+            break;
+        }
+
         if app.should_quit {
+            // 设置里的「退出程序」是**整个程序**退出，不只是关掉界面：
+            // 远端模式下还要让常驻进程一起收工，否则用户点了退出，
+            // 托盘图标与后台记录都还在（他会以为程序没退干净）。
+            //
+            // 「关闭窗口 ✕」不走这里——那条路径由 `decide_on_close`
+            // 处理，远端模式下只退出界面进程，常驻进程继续干活。
+            if app.svc.is_remote()
+                && let Err(e) = app.svc.request_quit()
+            {
+                tracing::warn!(%e, "通知常驻进程退出失败");
+            }
             break;
         }
 
@@ -1142,23 +1223,48 @@ Ok(w) => {
         }
     }
 
+    // 设置窗口的**生命周期**：关闭 = 销毁，下次打开重建。
+    //
+    // 早前关闭只是 `SW_HIDE`，窗口与其全部资源**永远留着**：它自带一个
+    // `egui::Context`（含一份中文字体数据与字形图集）与一条交换链。
+    // 实测（2026-10-12，私有提交）：打开设置 244MB / 不打开 179MB ——
+    // 那 65MB 在关闭后**一分钱都没还**，因为对象还在。
+    //
+    // 取舍：重建要付一次「读字体 + 建交换链」的代价（百毫秒量级），
+    // 换来的是关闭后真正腾出内存。托盘常驻工具里，关掉的设置窗口
+    // 不该比开着的更占地方——这是默认值该有的行为。
+    //
+    // NOTE: 重建路径是现成的（`SettingsWindow::create` 本来就只在需要
+    // 时才调用），销毁由 `Drop` 收尾（连 `vk::SurfaceKHR` 一起），
+    // 因此这里什么都不用额外清理。
+    let mut destroy_settings = false;
     if let Some(w) = settings_win.as_mut() {
-        // 置顶同步：设置窗口跟随主窗口置顶状态（幂等）。
-        w.apply_topmost(topmost);
-        // NOTE: 先取 `want_open` 再进函数：`sync_and_render(&mut app, …)`
-        // 会可变借用 `app`，而在参数里读 `app.paint_state` 会二次借用。
+        // 开场先判断：本帧已经不需要它了（齿轮被再次点击 / 别处改了状态），
+        // 直接销毁，连 `sync_and_render` 都不必跑。
         let want_open = app.paint_state.show_settings;
-        match w.sync_and_render(&mut *app, want_open) {
-            Ok(true) => {
-                // 用户关了设置窗口 ⇒ 状态同步回false。
-                app.paint_state.show_settings = false;
-                tracing::info!("设置窗口已被用户关闭");
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(%e, "设置窗口渲染失败，跳过本帧");
+        if !want_open {
+            destroy_settings = true;
+        } else {
+            // 置顶同步：设置窗口跟随主窗口置顶状态（幂等）。
+            w.apply_topmost(topmost);
+            match w.sync_and_render(&mut *app, true) {
+                Ok(true) => {
+                    // 用户关了设置窗口（标题栏 ✕）⇒ 状态同步回 false。
+                    app.paint_state.show_settings = false;
+                    destroy_settings = true;
+                    tracing::info!("设置窗口已被用户关闭");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(%e, "设置窗口渲染失败，跳过本帧");
+                }
             }
         }
+    }
+    if destroy_settings {
+        // Drop 在这里发生：交换链、表面、egui Context（含字体数据）一并释放。
+        *settings_win = None;
+        tracing::debug!("设置窗口资源已释放");
     }
 
 }
@@ -1287,6 +1393,38 @@ impl App {
         capture_is_override: bool,
         data_dir: Option<&std::path::Path>,
     ) -> Self {
+        let mut svc = match Service::with_data_dir(config.clone(), data_dir) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(%e, "服务初始化失败，界面将以空状态运行");
+                // 用内存库兜底，避免整个应用无法启动。
+                Service::in_memory()
+            }
+        };
+        // 标记 `--no-capture` 这类临时覆盖，使 save_config 跳过落盘——
+        // 否则退出时会把 false 写进用户的 config.json，
+        // 让剪贴板监听**永久关闭**且无任何提示。
+        svc.set_capture_override(capture_is_override);
+        Self::from_service(config, svc)
+    }
+
+    /// 界面进程入口：连到常驻进程，以它那份配置为界面配置。
+    ///
+    /// # 为什么配置要以来常驻进程为准
+    ///
+    /// 界面进程是**临时的**：关掉就没了。若它读自己的 config.json
+    /// 再用它初始化窗口，而常驻进程同时也在写同一个文件，
+    /// 两边就会互相覆盖（典型的「读 A 写 B」）。统一以来常驻进程为准，
+    /// 配置就只有一个权威来源。
+    pub fn new_remote() -> anyhow::Result<Self> {
+        // 5 秒缓冲：托盘刚拉起界面时，常驻进程的管道可能还没建好。
+        let svc = Service::connect_remote(std::time::Duration::from_secs(5))?;
+        let config = svc.state.config.clone();
+        Ok(Self::from_service(config, svc))
+    }
+
+    /// 用**已有的**服务实例构造界面（两种模式共用）。
+    pub fn from_service(config: modular_clipboard_core::Config, mut svc: Service) -> Self {
         let ctx = egui::Context::default();
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
         // 图标字体必须排在 CJK 之后：`install_cjk_font` 用 `set_fonts`
@@ -1302,19 +1440,6 @@ impl App {
         if !theme::install_icon_font(&ctx) {
             tracing::warn!("图标字体注册失败，界面图标将缺失");
         }
-
-        let mut svc = match Service::with_data_dir(config, data_dir) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(%e, "服务初始化失败，界面将以空状态运行");
-                // 用内存库兜底，避免整个应用无法启动。
-                Service::in_memory()
-            }
-        };
-        // 标记 `--no-capture` 这类临时覆盖，使 save_config 跳过落盘——
-        // 否则退出时会把 false 写进用户的 config.json，
-        // 让剪贴板监听**永久关闭**且无任何提示。
-        svc.set_capture_override(capture_is_override);
 
         // 载入界面偏好。未指定时跟随系统（`set_theme` 内部会探测）。
         //
@@ -1839,7 +1964,12 @@ impl App {
     }
 
     pub fn shutdown(&mut self) {
-        self.svc.stop_capture();
+        // 远端模式**不能**停捕获：捕获线程在常驻进程里，
+        // 界面关掉只是「不看了」，不该把后台记录也停掉——
+        // 那会让用户「关掉窗口 = 剪贴板不再记录」，与常驻的初衷相反。
+        if !self.svc.is_remote() {
+            self.svc.stop_capture();
+        }
         // 旧版这里还调`persist_layout()` 把 `LayoutState` 写回
         // `config.ui.layout`。那套布局连同 `layout.rs` 已删除，
         // 保留只会把一份没人读的旧格式配置原样写回磁盘。

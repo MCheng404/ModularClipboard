@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 modular-clipboard-core = { workspace = true }
 modular-clipboard-store = { workspace = true }
+# 界面进程 ⇄ 常驻进程：`Service` 的远端后端走它（见 lib.rs 的 Backend）。
+modular-clipboard-ipc = { workspace = true }
 modular-clipboard-capture = { workspace = true }
 modular-clipboard-platform = { workspace = true }
 anyhow = { workspace = true }

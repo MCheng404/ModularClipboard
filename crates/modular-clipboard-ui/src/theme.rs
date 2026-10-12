@@ -738,17 +738,17 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
 
     // 自定义路径优先。
     if let Some(p) = custom_path
-        && let Ok(bytes) = std::fs::read(p)
-        && insert_font(&mut defs, "custom_cjk", bytes, 0) {
+        && let Some(data) = shared_font_data(p, 0)
+        && insert_font(&mut defs, "custom_cjk", data) {
             log_font_loaded(ctx, &mut defs, "自定义字体");
             return true;
         }
 
     for (name, path, index) in CJK_CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
+        let Some(data) = shared_font_data(path, *index) else {
             continue;
         };
-        if insert_font(&mut defs, name, bytes, *index) {
+        if insert_font(&mut defs, name, data) {
             log_font_loaded(ctx, &mut defs, path);
             return true;
         }
@@ -828,16 +828,54 @@ pub fn install_icon_font(ctx: &egui::Context) -> bool {
     true
 }
 
-fn insert_font(defs: &mut FontDefinitions, name: &str, bytes: Vec<u8>, index: u32) -> bool {
-    // egui 0.36 的 FontData 没有 with_index，直接设置公开的 index 字段。
-    //
-    // NOTE: 按值收 `Vec<u8>`（PF-14）：早前收 `&[u8]` 再 `to_vec()`，
-    // 35MB 中文字体在启动时被多拷贝一份（fs::read 的 Vec → 副本）。
-    // 调用方的 Vec 都是 `fs::read` 的所有物，直接移进来即可。
+/// 读取字体文件，并**跨 `Context` 共享同一份字节**。
+///
+/// # 为什么必须缓存
+///
+/// 每个窗口（主窗口 / 设置窗口 / 卡片子窗口）都需要自己的
+/// `egui::Context`，而每个 Context 都要装一套字体。若各自 `fs::read`
+/// 一份，中文字体（实测 `msyh.ttc` ≈ 14MB 计入私有提交）就按窗口数
+/// 复制：开一次设置窗口多一份，反复开关会**一直涨**。
+///
+/// `FontDefinitions::font_data` 存的是 `Arc<FontData>`，因此这里缓存
+/// `Arc` 即可让所有 Context 引用同一份字节——只有引用计数在涨。
+///
+/// # 为什么不直接 `Box::leak`
+///
+/// 缓存的 `Arc` 由 `CACHE` 持有，进程退出时才随静态表释放；语义上
+/// 与「泄漏一份」等价，但保留了 `FontData`（含 `index` / `tweak`）
+/// 的完整构造，也便于按路径复用。
+/// 字体字节缓存表：按（路径, 字体面 index）索引一份共享的 [`FontData`]。
+type FontCache = std::sync::Mutex<
+    std::collections::HashMap<(String, u32), std::sync::Arc<FontData>>,
+>;
+
+fn shared_font_data(path: &str, index: u32) -> Option<std::sync::Arc<FontData>> {
+    use std::sync::Arc;
+    static CACHE: std::sync::OnceLock<FontCache> = std::sync::OnceLock::new();
+    let key = (path.to_string(), index);
+    // 表被毒化（持有锁时 panic）时仍要能继续：退化为直接用旧表的
+    // 不可变视图（此时读不到缓存只是慢一点，不是错）。
+    let mut map = match CACHE.get_or_init(Default::default).lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(found) = map.get(&key) {
+        return Some(found.clone());
+    }
+    let bytes = std::fs::read(path).ok()?;
     let mut data = FontData::from_owned(bytes);
     data.index = index;
-    defs.font_data
-        .insert(name.to_string(), std::sync::Arc::new(data));
+    let arc = Arc::new(data);
+    map.insert(key, arc.clone());
+    Some(arc)
+}
+
+fn insert_font(defs: &mut FontDefinitions, name: &str, data: std::sync::Arc<FontData>) -> bool {
+    // NOTE: 收 `Arc<FontData>` 而不是 `Vec<u8>`：字体字节由
+    // [`shared_font_data`] 进程级共享，这里只是多一个引用。
+    // 早前收 `&[u8]` 再 `to_vec()`，35MB 字体会被多拷贝一份。
+    defs.font_data.insert(name.to_string(), data);
 
     // 插到每个字体族的首位，保证 CJK 字形优先命中，
     // 同时保留原有回退（缺字时仍能用内置字体）。
@@ -1620,11 +1658,29 @@ mod tests {
         assert!(first.1.contains("msyh"), "应优先使用微软雅黑");
     }
 
+    /// 字体字节必须**跨 Context 共享**：每个窗口一份的话，开一次设置
+    /// 窗口就多驻留一份中文字体（实测约 14MB），反复开关只涨不落。
+    #[test]
+    fn font_bytes_are_shared_between_contexts() {
+        let (path, index) = (CJK_CANDIDATES[0].1, CJK_CANDIDATES[0].2);
+        // 候选字体在这台机器上不存在时跳过（不是本测试要守的东西）。
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let a = shared_font_data(path, index).expect("候选字体应能读到");
+        let b = shared_font_data(path, index).expect("第二次同样应能读到");
+        assert!(
+            std::sync::Arc::ptr_eq(&a, &b),
+            "同一路径两次取到的应是同一份字体数据（共享字节），而不是各读一份"
+        );
+    }
+
     #[test]
     fn insert_font_adds_to_both_families() {
         let mut defs = FontDefinitions::default();
         // 用任意字节验证注册流程不 panic（epaint 会延后解析）
-        let ok = insert_font(&mut defs, "x", b"not-a-real-font".to_vec(), 0);
+        let data = std::sync::Arc::new(FontData::from_owned(b"not-a-real-font".to_vec()));
+        let ok = insert_font(&mut defs, "x", data);
         assert!(ok);
         assert!(
             defs.families[&FontFamily::Proportional].contains(&"x".to_string()),

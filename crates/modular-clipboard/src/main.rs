@@ -1,10 +1,19 @@
 //! ModularClipboard 剪贴板管理器 —— 纯 Rust 实现。
 //!
-//! 单进程启动流程：
+//! 启动流程（默认）：
 //! 1. 解析命令行；
 //! 2. 加载配置（损坏时回退默认值，不阻断启动）；
 //! 3. 初始化日志；
-//! 4. 启动界面与后台捕获。
+//! 4. 启动**常驻进程**（捕获 + 存储 + 托盘 + IPC），并由它拉起界面进程。
+//!
+//! # 为什么要两个进程
+//!
+//! 窗口的渲染开销（Vulkan 设备 + 交换链 + 字体图集）销毁后进的是
+//! 驱动的池子，不会还给系统——同进程时「关掉窗口」永远换不回内存。
+//! 拆开之后界面进程关掉即退出，内存由操作系统整体回收，
+//! 常驻进程只留十几 MB。
+//!
+//! `--single` 可以退回旧的单进程行为（排查问题时更好调）。
 
 // GUI 子系统：不弹控制台窗口。
 //
@@ -32,6 +41,12 @@ struct Args {
     mcp_server: bool,
     /// 以 Streamable HTTP 传输运行 MCP 服务（监听 host:port）。
     mcp_http: bool,
+    /// 只跑常驻进程（后台记录 + 托盘），不弹界面。
+    daemon: bool,
+    /// 只跑界面进程（连常驻进程），由常驻进程/托盘拉起。
+    ui: bool,
+    /// 单进程模式：界面与后台同进程（旧行为，保留用于排查与回退）。
+    single: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -41,6 +56,9 @@ fn parse_args() -> Result<Args, String> {
         version: false,
         mcp_server: false,
         mcp_http: false,
+        daemon: false,
+        ui: false,
+        single: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -52,6 +70,9 @@ fn parse_args() -> Result<Args, String> {
             "--no-capture" => args.no_capture = true,
             "--mcp-server" => args.mcp_server = true,
             "--mcp-http" => args.mcp_http = true,
+            "--daemon" => args.daemon = true,
+            "--ui" => args.ui = true,
+            "--single" => args.single = true,
             "-V" | "--version" => args.version = true,
             "-h" | "--help" => {
                 show_message_box("模块化剪贴板 - 帮助", HELP_TEXT);
@@ -59,6 +80,12 @@ fn parse_args() -> Result<Args, String> {
             }
             other => return Err(format!("未知参数: {other}")),
         }
+    }
+    if args.daemon && args.ui {
+        return Err("--daemon 与 --ui 不能同时使用".into());
+    }
+    if args.single && (args.daemon || args.ui) {
+        return Err("--single 不能与 --daemon/--ui 同时使用".into());
     }
     Ok(args)
 }
@@ -75,10 +102,15 @@ const HELP_TEXT: &str = "ModularClipboard 剪贴板管理器
 选项:
       --data-dir <路径>   指定数据目录
       --no-capture         启动时不监听剪贴板（调试用）
+      --daemon             只启动后台常驻进程（不弹界面）
+      --ui                 只启动界面进程（由后台拉起，一般不用手敲）
+      --single             单进程模式（界面与后台同进程，排查用）
       --mcp-server         以 stdio 方式运行 MCP 服务
       --mcp-http           以 HTTP 方式运行 MCP 服务
   -V, --version           显示版本
-  -h, --help              显示帮助";
+  -h, --help              显示帮助
+
+默认（不带参数）会启动后台常驻进程并打开界面。";
 
 /// 弹一个消息框。
 ///
@@ -210,6 +242,42 @@ fn main() {
         return;
     }
 
+    // ---- 界面进程模式 ------------------------------------------------
+    //
+    // 由常驻进程（或用户手工）拉起。**不争取主实例锁**：那把锁属于
+    // 常驻进程，界面只是它的客户端。界面自己用另一个互斥体
+    // （`ipc::UiInstanceGuard`）保证「同时只有一个界面窗口」。
+    if args.ui {
+        run_ui(data_dir.as_deref());
+        return;
+    }
+
+    // ---- 单进程模式（旧行为，保留）------------------------------------
+    //
+    // 界面与后台同进程。拆进程之后它不再是默认路径，但保留着很有用：
+    // 排查「到底是界面还是后台出问题」时，一个进程比两个好调得多。
+    if args.single {
+        match SingleInstanceGuard::acquire() {
+            Ok(guard) => {
+                let _guard = guard;
+                let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+                init_tracing(&log_dir.join("app.log"));
+                run_app(args, data_dir);
+            }
+            Err(e) => {
+                if modular_clipboard_ui::activate_running_instance() {
+                    tracing::info!("已有实例在运行，已请求其显示主窗口");
+                    return;
+                }
+                show_message_box("模块化剪贴板", &format!("已有实例在运行，本次启动退出。\n\n{e}"));
+                std::process::exit(3);
+            }
+        }
+        return;
+    }
+
+    // ---- 常驻进程（默认路径）------------------------------------------
+    //
     // 单实例保护。
     //
     // 剪贴板工具必须后台常驻，用户可能反复双击 exe。
@@ -230,14 +298,20 @@ fn main() {
             // 日志落在数据目录里（GUI 程序无 stderr可用）。
             let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
             init_tracing(&log_dir.join("app.log"));
-            run_app(args, data_dir);
+            run_daemon(args, data_dir);
         }
         Err(e) => {
-            // 用户重复双击图标 ⇒ 意图是「打开它」，不是「被告知它已经开着」。
-            // 找到已有主窗口、请求它显示并置前，成功就静默退出。
+            // 用户重复双击图标 ⇒ 意图是「打开界面」，不是「被告知它已经开着」。
             //
-            // 只有**找不到窗口**时才弹提示（对端可能刚启动还没建窗，
-            // 或互斥体属于另一个登录会话——那种情况下确实没有窗口可唤起）。
+            // 拆进程之后这件事由**常驻进程**决定：它知道界面是否在跑，
+            // 没跑就拉起一个、跑着就把它显示出来。所以这里只需发一条
+            // `ShowWindow` 请求，不需要自己去找窗口。
+            if request_daemon_show() {
+                tracing::info!("已有常驻进程，已请求它打开界面");
+                return;
+            }
+            // 兜底：常驻进程在跑但管道连不上（例如管道被占用），
+            // 直接找窗口也能达到目的。
             if modular_clipboard_ui::activate_running_instance() {
                 tracing::info!("已有实例在运行，已请求其显示主窗口");
                 return;
@@ -248,6 +322,64 @@ fn main() {
             std::process::exit(3);
         }
     }
+}
+
+/// 以界面进程身份启动。
+///
+/// 连不上常驻进程时**弹窗说明**，而不是静默退出：用户双击图标却
+/// 什么都没发生，是这类程序最容易被投诉的失败方式。
+fn run_ui(data_dir: Option<&Path>) {
+    let log_dir = data_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_data_dir);
+    // 独立的日志文件：界面进程与常驻进程同时写 app.log 会互相截断
+    // （两边都是 truncate 打开），查日志时会看到「内容随机缺一半」。
+    init_tracing(&log_dir.join("ui.log"));
+    if let Err(e) = modular_clipboard_ui::run_remote() {
+        tracing::error!(%e, "界面启动失败");
+        show_message_box(
+            "模块化剪贴板",
+            &format!("无法打开界面：{e}\n\n后台进程可能没有在运行。"),
+        );
+        std::process::exit(1);
+    }
+}
+
+/// 启动常驻进程。
+///
+/// `start_ui` 决定是否顺带把界面拉起来：
+/// - 默认（用户双击图标）⇒ 拉起界面；
+/// - `--daemon` ⇒ 只常驻（配合配置里的「启动时最小化」）；
+/// - 配置 `ui.start_minimized` ⇒ 也不主动弹窗。
+fn run_daemon(args: Args, data_dir: Option<PathBuf>) {
+    let cfg_path = config_path(data_dir.as_deref());
+    let mut config = Config::load(&cfg_path).unwrap_or_default();
+    if args.no_capture && config.capture.enabled {
+        tracing::warn!("--no-capture 已启用：本次运行不监听剪贴板（不影响持久配置）");
+        config.capture.enabled = false;
+    }
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        data_dir = ?data_dir.as_deref().map(|d| d.display().to_string()),
+        config = ?cfg_path,
+        "ModularClipboard 常驻进程启动"
+    );
+
+    let start_ui = !args.daemon && !config.ui.start_minimized;
+    if let Err(e) = modular_clipboard_app::daemon::run(config, data_dir.as_deref(), start_ui) {
+        tracing::error!(%e, "常驻进程启动失败");
+        std::process::exit(1);
+    }
+}
+
+/// 请求常驻进程打开界面。返回 `false` 表示连不上它。
+fn request_daemon_show() -> bool {
+    use modular_clipboard_ipc::{Client, Command};
+    // 800ms 足够本地管道往返；不必等满——用户还在等窗口出来。
+    let Ok(mut client) = Client::connect(std::time::Duration::from_millis(800)) else {
+        return false;
+    };
+    client.command(Command::ShowWindow).is_ok()
 }
 
 fn run_app(args: Args, data_dir: Option<PathBuf>) {

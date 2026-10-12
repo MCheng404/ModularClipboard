@@ -241,7 +241,7 @@ fn files_payload_produces_summary_preview() {
 fn large_payload_is_dropped_but_metadata_survives() {
     let mut s = svc();
     // 设置一个很小的上限
-    s.store.set_payload_limit(16);
+    s.store().expect("本地后端").set_payload_limit(16);
     let big = "x".repeat(4096);
     s.ingest(text_payload(&big, "app"));
 

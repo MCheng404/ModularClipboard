@@ -42,13 +42,14 @@ pub mod solver;
 pub mod text;
 pub mod workspace;
 pub mod icons;
+pub mod mem;
 pub mod presence;
 pub mod settingswin;
 pub mod renderer;
 pub mod theme;
 pub mod thumbnail;
 
-pub use app::{run, run_with_capture_override, run_with_options, App};
+pub use app::{run, run_remote, run_with_capture_override, run_with_options, App};
 pub use presence::Resident;
 
 /// 尝试唤起**已在运行**的本程序主窗口，用于单实例处理。

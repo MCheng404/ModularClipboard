@@ -27,7 +27,12 @@ use modular_clipboard_gfx::texture::{DeviceImage, FONT_FORMAT, Sampler};
 use std::time::Instant;
 
 /// 窗口标题，同时作为 Vulkan 应用标识。
-pub const WINDOW_TITLE: &str = "ModularClipboard";
+/// 主窗口标题。
+///
+/// 单一数据源在 `modular-clipboard-ipc`：常驻进程要用同一个字符串
+/// `FindWindow` 来唤起界面（托盘点击 / 重复双击图标）。两边各写一份时，
+/// 改标题会让「点了托盘没反应」，且很难联想到是标题漂移。
+pub const WINDOW_TITLE: &str = modular_clipboard_ipc::UI_WINDOW_TITLE;
 
 /// 顶点缓冲初始容量（顶点数）。不足时按 [`next_capacity`] 扩容。
 pub const INITIAL_VERTEX_CAPACITY: usize = 8192;

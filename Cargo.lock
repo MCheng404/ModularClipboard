@@ -785,6 +785,7 @@ dependencies = [
  "directories",
  "modular-clipboard-app",
  "modular-clipboard-core",
+ "modular-clipboard-ipc",
  "modular-clipboard-mcp",
  "modular-clipboard-ui",
  "tracing",
@@ -801,6 +802,7 @@ dependencies = [
  "image",
  "modular-clipboard-capture",
  "modular-clipboard-core",
+ "modular-clipboard-ipc",
  "modular-clipboard-platform",
  "modular-clipboard-store",
  "rtrb",
@@ -846,6 +848,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "modular-clipboard-ipc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "modular-clipboard-core",
+ "modular-clipboard-store",
+ "serde",
+ "serde_json",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "modular-clipboard-mcp"
 version = "0.1.0"
 dependencies = [
@@ -881,6 +896,7 @@ dependencies = [
  "image",
  "modular-clipboard-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",
@@ -899,6 +915,7 @@ dependencies = [
  "modular-clipboard-app",
  "modular-clipboard-core",
  "modular-clipboard-gfx",
+ "modular-clipboard-ipc",
  "modular-clipboard-platform",
  "modular-clipboard-store",
  "tracing",

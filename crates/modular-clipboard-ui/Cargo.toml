@@ -8,6 +8,8 @@ license.workspace = true
 modular-clipboard-core = { workspace = true }
 modular-clipboard-store = { workspace = true }
 modular-clipboard-app = { workspace = true }
+# 窗口标题常量与实例守卫（界面进程的单实例互斥体）。
+modular-clipboard-ipc = { workspace = true }
 # 渲染后端：ash 直驱的原生 Vulkan（原先经 eframe/wgpu，现已移除）。
 modular-clipboard-gfx = { workspace = true }
 # 托盘常驻与全局快捷键：presence.rs 需要 tray::Tray 与 hotkey 描述。
@@ -36,4 +38,7 @@ windows = { version = "0.62", features = [
     # 必须显式声明——cargo feature 是**交集**，不能依赖
     # modular-clipboard-platform 顺带开启（MEMORY.md 有记录）。
     "Win32_System_Registry",
+    # mem.rs：进程内存账目（GetProcessMemoryInfo）。配合 mem.rs 的
+    # 阶段打点，用于定位窗口/GPU 子系统各自的驻留成本。
+    "Win32_System_ProcessStatus",
 ] }

@@ -9,6 +9,7 @@
 //! 会连带卡住界面；解耦后即使读取失败也只影响后台线程。
 
 pub mod action;
+pub mod daemon;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,6 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use modular_clipboard_capture::ClipboardReader;
 use modular_clipboard_core::{CapturedPayload, ClipItem, ClipKind, Config, DropStats, EntryId, now_ms};
+use modular_clipboard_ipc::{Command, Response};
 use modular_clipboard_store::{GroupFilter, Store, fingerprint};
 
 /// 界面与应用共享的状态。
@@ -81,9 +83,41 @@ enum Signal {
 const SELF_WRITE_GUARD_MS_FLOOR: i64 = 900;
 
 pub struct Service {
-    pub store: Store,
     pub state: AppState,
-    pub registry: action::ActionRegistry,
+    /// 业务在哪里执行。**界面代码不应感知这个字段**——
+    /// 它只调方法、只读 `state`，两种后端的方法签名完全一致。
+    backend: Backend,
+    /// 当前 `capture.enabled` 是否为命令行临时覆盖（如 `--no-capture`）。
+    /// 保存配置时会被还原，避免永久改写用户的监听开关。
+    capture_override: bool,
+}
+
+/// 服务的执行位置。
+///
+/// # 为什么有两种
+///
+/// 渲染一个窗口的固定成本（Vulkan 设备 + 交换链 + 字体图集）在
+/// 80~100MB 量级，且销毁后被驱动收进池子、不还给系统。窗口与后台
+/// 同进程时，「关掉窗口」就永远换不回内存。
+///
+/// 拆进程后，界面进程持 [`Backend::Remote`]：它不打开数据库、
+/// 不监听剪贴板，业务操作全部转发给常驻进程；窗口一关进程就退出，
+/// 内存由操作系统整体回收。
+///
+/// 单进程模式（[`Backend::Local`]）保留下来，用于测试与应急回退。
+#[allow(clippy::large_enum_variant)]
+enum Backend {
+    // 本地变体大是必然的：它握着 SQLite 连接与捕获线程句柄。
+    // 装箱它只会给每一次 `pump()`（每帧一次）多加一层间接，
+    // 换不来任何内存收益——同一时刻只有一个 `Service`。
+    Local(LocalBackend),
+    Remote(RemoteBackend),
+}
+
+/// 本地后端：本进程直接操作存储与剪贴板。
+struct LocalBackend {
+    store: Store,
+    registry: action::ActionRegistry,
     /// 事件接收端。`None` 表示捕获未启动。
     ///
     /// rtrb 的 Producer 不可克隆，因此它在启动捕获时被移动进后台线程，
@@ -92,14 +126,54 @@ pub struct Service {
     capture: Option<CaptureHandle>,
     /// 最近一次自写剪贴板的时刻（Unix 毫秒，0 表示从未写过）。
     last_self_write: Arc<AtomicU64>,
-    /// 当前 `capture.enabled` 是否为命令行临时覆盖（如 `--no-capture`）。
-    /// 保存配置时会被还原，避免永久改写用户的监听开关。
-    capture_override: bool,
     /// 配置落盘路径。`None` 表示无法确定（`save_config` 静默跳过）。
     ///
     /// 存字段而非每次现算：`--data-dir` 生效后配置写在指定目录下，
     /// 现算会退回 `%APPDATA%`，导致「读 A 写 B」。
     config_path: Option<std::path::PathBuf>,
+}
+
+/// 远端后端：一条到常驻进程的连接。
+///
+/// `known` 是界面侧已看到的数据版本。带上它，每帧同步的常态回答是
+/// 「没变」（几十字节），而不是把两千条历史重新序列化一遍。
+struct RemoteBackend {
+    client: modular_clipboard_ipc::Client,
+    known: modular_clipboard_ipc::DataVersion,
+    /// 与常驻进程的连接是否已经断了。
+    ///
+    /// 断了之后界面**不该继续装作没事**：用户会看到列表永远不变、
+    /// 点什么都没反应，却不知道是后台没了。置上这个标志，界面会自己退出，
+    /// 用户下次点托盘就能重新拉起一对进程。
+    dead: bool,
+}
+
+impl Service {
+    /// 本进程是否只是界面（业务在常驻进程里）。
+    ///
+    /// 界面侧有几件事必须据此分叉：不启动捕获线程、不创建托盘、
+    /// 关闭窗口即退出进程。
+    pub fn is_remote(&self) -> bool {
+        matches!(self.backend, Backend::Remote(_))
+    }
+
+    /// 常驻进程是否已经失联（仅远端模式可能为真）。
+    pub fn daemon_gone(&self) -> bool {
+        matches!(&self.backend, Backend::Remote(r) if r.dead)
+    }
+}
+
+/// 把一份常驻进程的同步结果写进界面状态。
+///
+/// 刻意**不**覆盖 `config` / `query` / `selected` / `notice`：
+/// 那是界面进程自己的瞬时状态（用户可能正在设置里改、正在搜索框里输），
+/// 被后台的一次同步冲掉是纯粹的 bug。
+fn apply_snapshot(snap: modular_clipboard_ipc::Snapshot, state: &mut AppState) {
+    state.items = snap.items;
+    state.groups = snap.groups;
+    state.stats = snap.stats;
+    state.capturing = snap.capturing;
+    state.list_version = snap.list_version;
 }
 
 impl Service {
@@ -159,7 +233,6 @@ impl Service {
         let groups = store.list_groups().unwrap_or_default();
 
         Ok(Self {
-            store,
             state: AppState {
                 config,
                 items,
@@ -172,13 +245,90 @@ impl Service {
                 stats: DropStats::default(),
                 capturing: false,
             },
-            registry: action::ActionRegistry::with_builtins(),
-            rx: Some(rx),
-            capture: None,
-            last_self_write: Arc::new(AtomicU64::new(0)),
+            backend: Backend::Local(LocalBackend {
+                store,
+                registry: action::ActionRegistry::with_builtins(),
+                rx: Some(rx),
+                capture: None,
+                last_self_write: Arc::new(AtomicU64::new(0)),
+                config_path,
+            }),
             capture_override: false,
-            config_path,
         })
+    }
+
+    /// 连到常驻进程并以它的数据为初始状态。
+    ///
+    /// 用于**界面进程**：它自己不打开数据库，`state` 的初值来自握手
+    /// 返回的那份快照。
+    ///
+    /// `timeout` 是给常驻进程的启动缓冲（托盘刚拉起它时管道可能还没建好）。
+    pub fn connect_remote(timeout: std::time::Duration) -> Result<Self> {
+        use modular_clipboard_ipc::{Client, Snapshot};
+
+        let mut client = Client::connect(timeout)?;
+        let Snapshot { version, config, .. } = client.hello()?;
+        let mut svc = Self {
+            state: AppState {
+                config,
+                items: Vec::new(),
+                list_version: 1,
+                groups: Vec::new(),
+                selected: None,
+                query: String::new(),
+                group_filter: None,
+                notice: None,
+                stats: DropStats::default(),
+                capturing: false,
+            },
+            backend: Backend::Remote(RemoteBackend {
+                client,
+                known: version,
+                dead: false,
+            }),
+            capture_override: false,
+        };
+        // 握手只带配置，列表还要再取一次（与本地路径一致：build 之后
+        // 列表由 reload_list 填充）。
+        svc.reload_list();
+        Ok(svc)
+    }
+
+    /// 请求常驻进程退出（托盘「退出程序」/ 设置里的退出按钮）。
+    ///
+    /// 本地后端下这就是设置退出标志；远端后端下还要让常驻进程自己也退。
+    pub fn request_quit(&mut self) -> Result<()> {
+        if let Backend::Remote(r) = &mut self.backend {
+            r.client.command(modular_clipboard_ipc::Command::Quit)?;
+        }
+        Ok(())
+    }
+
+    /// 请求唤起界面进程（用户重复双击图标时由第二个进程转发）。
+    pub fn request_show_window(&mut self) -> Result<()> {
+        if let Backend::Remote(r) = &mut self.backend {
+            r.client.command(modular_clipboard_ipc::Command::ShowWindow)?;
+        }
+        Ok(())
+    }
+
+    /// 本地后端的存储句柄。远端后端下恒为 `None`。
+    ///
+    /// 界面侧**不应**用它——那等于绕开常驻进程直接读写数据库，
+    /// 拆进程就白拆了。保留它是给常驻进程与测试用。
+    pub fn store(&mut self) -> Option<&mut Store> {
+        match &mut self.backend {
+            Backend::Local(l) => Some(&mut l.store),
+            Backend::Remote(_) => None,
+        }
+    }
+
+    /// 配置落盘路径。`None` 表示本进程不持有配置（界面进程）或路径不可确定。
+    pub fn config_path(&self) -> Option<&std::path::Path> {
+        match &self.backend {
+            Backend::Local(l) => l.config_path.as_deref(),
+            Backend::Remote(_) => None,
+        }
     }
 
     /// 使用内存存储构造。仅在默认数据目录不可用时作为降级方案，
@@ -215,20 +365,285 @@ impl Service {
     ///   隐藏态必须继续 pump，否则「看不见 = 停止记录」，
     ///   与后台常驻的初衷相反
     pub fn is_capturing(&self) -> bool {
-        self.capture.is_some()
+        match &self.backend {
+            Backend::Local(l) => l.capture.is_some(),
+            // 远端：界面进程看不到捕获线程，只能读同步下来的状态。
+            Backend::Remote(_) => self.state.capturing,
+        }
     }
 
+
     pub fn start_capture(&mut self) {
+        match &mut self.backend {
+            Backend::Local(l) => l.start_capture(&mut self.state),
+            Backend::Remote(r) => r.set_capture(&mut self.state, true),
+        }
+    }
+
+
+    /// 停止捕获。
+    pub fn stop_capture(&mut self) {
+        match &mut self.backend {
+            Backend::Local(l) => l.stop_capture(&mut self.state),
+            Backend::Remote(r) => r.set_capture(&mut self.state, false),
+        }
+    }
+
+
+    /// 抑制接下来的若干次捕获，防止自写回被记录。
+    ///
+    /// 用时间戳而非一次性标志：UI 每帧都会调用 `pump`，
+    /// 布尔标志会在下一次 pump（16ms 后）就被清除，起不到抑制作用。
+    /// 时间戳由捕获线程自行判断窗口是否过期，两侧无需同步。
+    ///
+    /// `pub`：设置界面的「一键 AI 配对提示词」等写剪贴板的入口
+    /// 也要在写前调用（同 [`Self::copy_item`] 的抑制规则）。
+    pub fn suppress_self_capture(&mut self) {
+        match &mut self.backend {
+            Backend::Local(l) => {
+                l.last_self_write
+                    .store(now_ms() as u64, Ordering::Relaxed)
+            }
+            // 远端：写剪贴板的是常驻进程，抑制必须在**它那边**武装。
+            // 在界面进程里记时间戳没有用——捕获线程看不见它。
+            Backend::Remote(r) => {
+                if let Err(e) = r.suppress_self_capture() {
+                    tracing::warn!(%e, "通知常驻进程抑制自写回失败");
+                }
+            }
+        }
+    }
+
+
+    // ---------- 事件处理 ----------
+
+    /// 排空后台事件并处理。返回是否有界面需要重绘。
+    pub fn pump(&mut self) -> bool {
+        match &mut self.backend {
+            Backend::Local(l) => l.pump(&mut self.state),
+            Backend::Remote(r) => r.pump(&mut self.state),
+        }
+    }
+
+
+    /// 处理一条捕获内容：过滤 → 去重 → 入库。
+    ///
+    /// 返回是否产生了界面变更。
+    ///
+    /// 指纹在**本线程**就地计算：供测试与同步调用路径使用。捕获线程的
+    /// 热路径走 [`Self::ingest_with_fingerprint`]（PF-2）——那边算哈希
+    /// 不占 UI 线程预算。
+    pub fn ingest(&mut self, payload: CapturedPayload) -> bool {
+        match &mut self.backend {
+            Backend::Local(l) => {
+                let hash = fingerprint(&payload.bytes);
+                l.ingest_with_fingerprint(&mut self.state, payload, hash)
+            }
+            // 远端：指纹由常驻进程算（只有它握着库与捕获配置）。
+            Backend::Remote(r) => r.ingest(&mut self.state, payload),
+        }
+    }
+
+
+    /// 同 [`Self::ingest`]，但指纹由调用方预计算（捕获线程路径，PF-2）。
+    pub fn ingest_with_fingerprint(&mut self, payload: CapturedPayload, hash: String) -> bool {
+        match &mut self.backend {
+            Backend::Local(l) => l.ingest_with_fingerprint(&mut self.state, payload, hash),
+            Backend::Remote(r) => {
+                // 远端侧自己重算指纹，传入值仅作调试线索。
+                let _ = hash;
+                r.ingest(&mut self.state, payload)
+            }
+        }
+    }
+
+
+    /// 重新读取列表。列表量级在数千条内，直接全量读取比增量维护更不容易出错。
+    pub fn reload_list(&mut self) {
+        match &mut self.backend {
+            Backend::Local(l) => l.reload_list(&mut self.state),
+            Backend::Remote(r) => {
+                r.reload_list(&mut self.state);
+            }
+        }
+    }
+
+
+    /// 搜索。
+    pub fn search(&mut self, query: String) {
+        self.state.query = query.clone();
+        match &mut self.backend {
+            Backend::Local(l) => l.reload_list(&mut self.state),
+            Backend::Remote(r) => {
+                r.search(&mut self.state, query);
+            }
+        }
+    }
+
+
+    /// 设置分组过滤。
+    pub fn filter_group(&mut self, filter: Option<GroupFilter>) {
+        self.state.group_filter = filter;
+        match &mut self.backend {
+            Backend::Local(l) => l.reload_list(&mut self.state),
+            Backend::Remote(r) => {
+                r.filter_group(&mut self.state, filter);
+            }
+        }
+    }
+
+
+    /// 把条目写回系统剪贴板。
+    pub fn copy_item(&mut self, id: EntryId) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.copy_item(&mut self.state, id),
+            Backend::Remote(r) => r.copy_item(id),
+        }
+    }
+
+
+    /// 复制并自动粘贴到前台窗口。
+    pub fn copy_and_paste(&mut self, id: EntryId) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.copy_and_paste(&mut self.state, id),
+            // 自动粘贴要向前台窗口发按键，那是常驻进程更适合做的事
+            // （它不需要抢焦点）。界面侧暂不支持。
+            Backend::Remote(_) => anyhow::bail!("界面进程不支持自动粘贴"),
+        }
+    }
+
+
+    /// 执行联动动作。
+    pub fn run_action(&mut self, item: &ClipItem, proposal: &action::ActionProposal) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.run_action(&mut self.state, item, proposal),
+            Backend::Remote(_) => anyhow::bail!("界面进程不支持联动动作"),
+        }
+    }
+
+
+    /// 计算某条目的可用动作。
+    pub fn proposals_for(&self, item: &ClipItem) -> Vec<action::ActionProposal> {
+        match &self.backend {
+            Backend::Local(l) => l.proposals_for(&self.state, item),
+            // 联动动作尚未接入界面（见 `run_action`）。给空集而不是 panic：
+            // 建议动作只是锦上添花，不该让它拖垮整帧。
+            Backend::Remote(_) => Vec::new(),
+        }
+    }
+
+
+    // ---------- 条目操作 ----------
+
+    pub fn delete_item(&mut self, id: EntryId) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.delete_item(&mut self.state, id),
+            Backend::Remote(r) => {
+                r.delete_item(&mut self.state, id);
+                Ok(())
+            }
+        }
+    }
+
+
+    pub fn toggle_pin(&mut self, id: EntryId) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.toggle_pin(&mut self.state, id),
+            Backend::Remote(r) => {
+                r.toggle_pin(&mut self.state, id);
+                Ok(())
+            }
+        }
+    }
+
+
+    pub fn move_to_group(&mut self, id: EntryId, group: Option<i64>) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.move_to_group(&mut self.state, id, group),
+            Backend::Remote(_) => anyhow::bail!("界面进程不支持移动分组"),
+        }
+    }
+
+
+    pub fn create_group(&mut self, name: &str) -> Result<i64> {
+        match &mut self.backend {
+            Backend::Local(l) => l.create_group(&mut self.state, name),
+            Backend::Remote(_) => anyhow::bail!("界面进程不支持创建分组"),
+        }
+    }
+
+
+    pub fn clear_all(&mut self) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.clear_all(&mut self.state),
+            Backend::Remote(r) => {
+                r.clear_all(&mut self.state);
+                Ok(())
+            }
+        }
+    }
+
+
+    /// 保存配置到磁盘。
+    /// 保存配置到磁盘。
+    ///
+    /// # `--no-capture` 覆盖必须跳过
+    ///
+    /// 命令行 `--no-capture` 会把 `capture.enabled` 置 false
+    /// 以便调试时不动真实剪贴板。但这个覆盖是**临时**的——
+    /// 若被写进 config.json，用户下次启动监听就是关的，
+    /// **且没有任何提示**（这会静默破坏产品的核心功能）。
+    ///
+    /// 故用 [`Self::set_capture_override`] 标记的临时值
+    /// 在保存时还原为磁盘上的真实配置。
+    pub fn save_config(&mut self) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.save_config(&mut self.state, self.capture_override),
+            // 远端：配置由界面侧编辑、交常驻进程落盘——它才是
+            // config.json 与数据库的持有者（避免「读 A 写 B」）。
+            Backend::Remote(r) => r.save_config(&self.state),
+        }
+    }
+
+
+    /// 标记当前 `capture.enabled` 是命令行临时覆盖，保存配置时应跳过。
+    pub fn set_capture_override(&mut self, is_override: bool) {
+        self.capture_override = is_override;
+    }
+
+
+    /// 把一段文本写回系统剪贴板（自带自写回抑制）。
+    ///
+    /// 供设置界面「一键 AI 配对提示词」等入口使用——与 [`Self::copy_item`]
+    /// 同规则：抑制必须在写之前武装，防止捕获线程把自己写的内容再记一条。
+    pub fn write_clipboard_text(&mut self, text: &str) -> anyhow::Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => l.write_clipboard_text(&mut self.state, text),
+            Backend::Remote(r) => r.write_clipboard_text(text),
+        }
+    }
+
+
+    /// 在状态栏显示一条消息，3 秒后过期。
+    pub fn notify(&mut self, msg: String) {
+        // 通知只在本进程的状态栏显示：它是界面的瞬时反馈，
+        // 不该跨进程（常驻进程里没有状态栏可画）。
+        set_notice(&mut self.state, msg);
+    }
+
+}
+impl LocalBackend {
+    fn start_capture(&mut self, state: &mut AppState) {
         if self.capture.is_some() {
             return;
         }
-        if !self.state.config.capture.enabled {
+        if !state.config.capture.enabled {
             tracing::info!("capture.enabled = false，不启动剪贴板监听");
             return;
         }
         let running = Arc::new(AtomicBool::new(true));
         let counted = Arc::new(AtomicU64::new(0));
-        let interval = self.state.config.capture.poll_interval_ms.max(50);
+        let interval = state.config.capture.poll_interval_ms.max(50);
         // 捕获线程要用它算抑制窗口（见 `self_write_guard_ms`）。
         let interval_ms = interval as i64;
         let last_self_write = self.last_self_write.clone();
@@ -306,41 +721,24 @@ impl Service {
             });
 
         if spawned.is_err() {
-            self.notify("无法创建捕获线程".into());
+            set_notice(state, "无法创建捕获线程".into());
             return;
         }
 
-        self.state.capturing = true;
+        state.capturing = true;
         self.capture = Some(CaptureHandle {
             running,
             captured_count: counted,
         });
         tracing::info!(interval_ms = interval, "捕获线程已启动");
-    }
+        }
 
-    /// 停止捕获。
-    pub fn stop_capture(&mut self) {
+    fn stop_capture(&mut self, state: &mut AppState) {
         self.capture.take();
-        self.state.capturing = false;
-    }
+        state.capturing = false;
+        }
 
-    /// 抑制接下来的若干次捕获，防止自写回被记录。
-    ///
-    /// 用时间戳而非一次性标志：UI 每帧都会调用 `pump`，
-    /// 布尔标志会在下一次 pump（16ms 后）就被清除，起不到抑制作用。
-    /// 时间戳由捕获线程自行判断窗口是否过期，两侧无需同步。
-    ///
-    /// `pub`：设置界面的「一键 AI 配对提示词」等写剪贴板的入口
-    /// 也要在写前调用（同 [`Self::copy_item`] 的抑制规则）。
-    pub fn suppress_self_capture(&self) {
-        self.last_self_write
-            .store(now_ms() as u64, Ordering::Relaxed);
-    }
-
-    // ---------- 事件处理 ----------
-
-    /// 排空后台事件并处理。返回是否有界面需要重绘。
-    pub fn pump(&mut self) -> bool {
+    fn pump(&mut self, state: &mut AppState) -> bool {
         // 先把队列排空到本地缓冲，再逐条处理。
         // 若直接在循环里持有 rx 的借用，处理事件时又调用 self.ingest()
         // 会形成对 self 的重复可变借用。
@@ -354,51 +752,43 @@ impl Service {
         }
         let mut dirty = false;
         for (payload, hash) in batch {
-            if self.ingest_with_fingerprint(payload, hash) {
+            if self.ingest_with_fingerprint(state, payload, hash) {
                 dirty = true;
             }
         }
         dirty
-    }
+        }
 
-    /// 处理一条捕获内容：过滤 → 去重 → 入库。
-    ///
-    /// 返回是否产生了界面变更。
-    ///
-    /// 指纹在**本线程**就地计算：供测试与同步调用路径使用。捕获线程的
-    /// 热路径走 [`Self::ingest_with_fingerprint`]（PF-2）——那边算哈希
-    /// 不占 UI 线程预算。
-    pub fn ingest(&mut self, payload: CapturedPayload) -> bool {
-        let hash = fingerprint(&payload.bytes);
-        self.ingest_with_fingerprint(payload, hash)
-    }
-
-    /// 同 [`Self::ingest`]，但指纹由调用方预计算（捕获线程路径，PF-2）。
-    pub fn ingest_with_fingerprint(&mut self, payload: CapturedPayload, hash: String) -> bool {
-        let cfg = &self.state.config;
+    fn ingest_with_fingerprint(
+        &mut self,
+        state: &mut AppState,
+        payload: CapturedPayload,
+        hash: String,
+    ) -> bool {
+        let cfg = &state.config;
 
         if !cfg.capture.enabled {
-            self.state.stats.duplicate += 0; // 不计入丢弃统计
+            state.stats.duplicate += 0; // 不计入丢弃统计
             return false;
         }
 
         // 空白内容直接忽略：用户按了 Ctrl+C 但没选中任何东西。
         if payload.bytes.iter().all(|b| b.is_ascii_whitespace()) {
-            self.state.stats.empty += 1;
+            state.stats.empty += 1;
             tracing::debug!("捕获被过滤：空白内容");
             return false;
         }
 
         // 来源程序屏蔽。
         if !payload.source_app.is_empty() && cfg.is_app_blocked(&payload.source_app) {
-            self.state.stats.app_blocked += 1;
+            state.stats.app_blocked += 1;
             tracing::debug!(app = %payload.source_app, "捕获被过滤：来源程序被屏蔽");
             return false;
         }
 
         // 密码框启发式：仅在敏感窗口为前台时跳过。
         if cfg.capture.skip_password_fields && modular_clipboard_platform::is_password_field() {
-            self.state.stats.secret_field += 1;
+            state.stats.secret_field += 1;
             tracing::debug!(class = %modular_clipboard_capture::foreground_class_name(), "捕获被过滤：疑似密码框");
             return false;
         }
@@ -414,8 +804,8 @@ impl Service {
             match self.store.find_by_hash(&hash) {
                 Ok(Some(existing)) => {
                     if self.store.bump_to_top(existing).is_ok() {
-                        self.reload_list();
-                        self.state.stats.duplicate += 1;
+                        self.reload_list(state);
+                        state.stats.duplicate += 1;
                         return true;
                     }
                 }
@@ -437,55 +827,41 @@ impl Service {
                 tracing::debug!(id = saved.id, kind = ?saved.kind, "新条目已入库");
                 self.store.touch(saved.id).ok();
                 // 写入后立刻执行保留策略，避免高频复制时库无限增长。
-                if let Err(e) = self.store.enforce_retention(&self.state.config.storage) {
+                if let Err(e) = self.store.enforce_retention(&state.config.storage) {
                     tracing::warn!(%e, "保留策略执行失败");
                 }
-                self.reload_list();
+                self.reload_list(state);
                 true
             }
             Err(e) => {
                 tracing::error!(%e, "入库失败");
-                self.notify(format!("保存失败: {e}"));
+                set_notice(state, format!("保存失败: {e}"));
                 false
             }
         }
-    }
+        }
 
-    /// 重新读取列表。列表量级在数千条内，直接全量读取比增量维护更不容易出错。
-    pub fn reload_list(&mut self) {
-        let result = match self.state.query.trim() {
+    fn reload_list(&mut self, state: &mut AppState) {
+        let result = match state.query.trim() {
             "" => {
-                let filter = self.state.group_filter;
+                let filter = state.group_filter;
                 self.store.list(PAGE_LIMIT, 0, filter)
             }
             q => self.store.search(q, PAGE_LIMIT),
         };
         match result {
-            Ok(items) => self.state.items = items,
+            Ok(items) => state.items = items,
             Err(e) => {
                 tracing::error!(%e, "读取列表失败");
-                self.state.items.clear();
+                state.items.clear();
             }
         }
         // 列表整体换过：行高缓存（绘制层按本版本号判断失效）必须知道。
-        self.state.list_version = self.state.list_version.wrapping_add(1);
-        self.state.groups = self.store.list_groups().unwrap_or_default();
-    }
+        state.list_version = state.list_version.wrapping_add(1);
+        state.groups = self.store.list_groups().unwrap_or_default();
+        }
 
-    /// 搜索。
-    pub fn search(&mut self, query: String) {
-        self.state.query = query;
-        self.reload_list();
-    }
-
-    /// 设置分组过滤。
-    pub fn filter_group(&mut self, filter: Option<GroupFilter>) {
-        self.state.group_filter = filter;
-        self.reload_list();
-    }
-
-    /// 把条目写回系统剪贴板。
-    pub fn copy_item(&mut self, id: EntryId) -> Result<()> {
+    fn copy_item(&mut self, _state: &mut AppState, id: EntryId) -> Result<()> {
         let Some(item) = self.store.get(id)? else {
             anyhow::bail!("条目不存在");
         };
@@ -505,7 +881,8 @@ impl Service {
         //
         // 现象：从历史里点一条复制出去，列表顶部立刻多出一条内容
         // 相同的记录。
-        self.suppress_self_capture();
+        self.last_self_write
+            .store(now_ms() as u64, Ordering::Relaxed);
 
         match item.kind {
             ClipKind::Text | ClipKind::Html => {
@@ -528,121 +905,238 @@ impl Service {
 
         self.store.touch(id).ok();
         Ok(())
-    }
+        }
 
-    /// 复制并自动粘贴到前台窗口。
-    pub fn copy_and_paste(&mut self, id: EntryId) -> Result<()> {
-        self.copy_item(id)?;
+    fn copy_and_paste(&mut self, state: &mut AppState, id: EntryId) -> Result<()> {
+        self.copy_item(state, id)?;
         modular_clipboard_platform::auto_paste(Duration::from_millis(250))?;
         Ok(())
-    }
+        }
 
-    /// 执行联动动作。
-    pub fn run_action(&mut self, item: &ClipItem, proposal: &action::ActionProposal) -> Result<()> {
+    fn run_action(
+        &mut self,
+        state: &mut AppState,
+        item: &ClipItem,
+        proposal: &action::ActionProposal,
+    ) -> Result<()> {
         action::dispatch(&proposal.plan)?;
         self.store.touch(item.id).ok();
-        self.notify(format!("已执行：{}", proposal.label));
+        set_notice(state, format!("已执行：{}", proposal.label));
         Ok(())
-    }
-
-    /// 计算某条目的可用动作。
-    pub fn proposals_for(&self, item: &ClipItem) -> Vec<action::ActionProposal> {
-        action::propose(&self.registry, item, &self.state.config.rules)
-    }
-
-    // ---------- 条目操作 ----------
-
-    pub fn delete_item(&mut self, id: EntryId) -> Result<()> {
-        self.store.delete(id)?;
-        if self.state.selected == Some(id) {
-            self.state.selected = None;
         }
-        self.reload_list();
-        Ok(())
-    }
 
-    pub fn toggle_pin(&mut self, id: EntryId) -> Result<()> {
+    fn proposals_for(&self, state: &AppState, item: &ClipItem) -> Vec<action::ActionProposal> {
+        action::propose(&self.registry, item, &state.config.rules)
+        }
+
+    fn delete_item(&mut self, state: &mut AppState, id: EntryId) -> Result<()> {
+        self.store.delete(id)?;
+        if state.selected == Some(id) {
+            state.selected = None;
+        }
+        self.reload_list(state);
+        Ok(())
+        }
+
+    fn toggle_pin(&mut self, state: &mut AppState, id: EntryId) -> Result<()> {
         if let Some(item) = self.store.get(id)? {
             let new_state = !item.pinned;
             self.store.set_pinned(id, new_state)?;
-            self.reload_list();
+            self.reload_list(state);
         }
         Ok(())
-    }
+        }
 
-    pub fn move_to_group(&mut self, id: EntryId, group: Option<i64>) -> Result<()> {
+    fn move_to_group(
+        &mut self,
+        state: &mut AppState,
+        id: EntryId,
+        group: Option<i64>,
+    ) -> Result<()> {
         self.store.move_to_group(id, group)?;
-        self.reload_list();
+        self.reload_list(state);
         Ok(())
-    }
+        }
 
-    pub fn create_group(&mut self, name: &str) -> Result<i64> {
+    fn create_group(&mut self, state: &mut AppState, name: &str) -> Result<i64> {
         let id = self.store.create_group(name, DEFAULT_GROUP_COLOR)?;
-        self.reload_list();
+        self.reload_list(state);
         Ok(id)
-    }
+        }
 
-    pub fn clear_all(&mut self) -> Result<()> {
+    fn clear_all(&mut self, state: &mut AppState) -> Result<()> {
         self.store.clear_all()?;
-        self.state.selected = None;
-        self.reload_list();
+        state.selected = None;
+        self.reload_list(state);
         Ok(())
-    }
+        }
 
-    /// 保存配置到磁盘。
-    /// 保存配置到磁盘。
-    ///
-    /// # `--no-capture` 覆盖必须跳过
-    ///
-    /// 命令行 `--no-capture` 会把 `capture.enabled` 置 false
-    /// 以便调试时不动真实剪贴板。但这个覆盖是**临时**的——
-    /// 若被写进 config.json，用户下次启动监听就是关的，
-    /// **且没有任何提示**（这会静默破坏产品的核心功能）。
-    ///
-    /// 故用 [`Self::set_capture_override`] 标记的临时值
-    /// 在保存时还原为磁盘上的真实配置。
-    pub fn save_config(&mut self) -> Result<()> {
+    fn save_config(&mut self, state: &mut AppState, capture_override: bool) -> Result<()> {
         if let Some(path) = self.config_path.clone() {
             // 临时覆盖不落盘：读回磁盘上的真实值。
-            let persisted = self
-                .capture_override
+            let persisted = capture_override
                 .then(|| std::fs::read_to_string(&path).ok())
                 .flatten()
                 .and_then(|raw| serde_json::from_str::<Config>(&raw).ok());
             if let Some(real) = persisted
-                && real.capture.enabled != self.state.config.capture.enabled {
+                && real.capture.enabled != state.config.capture.enabled {
                     tracing::info!(
                         persisted = real.capture.enabled,
                         "不把 --no-capture 临时覆盖写入 config.json"
                     );
-                    self.state.config.capture.enabled = real.capture.enabled;
+                    state.config.capture.enabled = real.capture.enabled;
                 }
-            self.state.config.save(&path)?;
-            self.store.apply_config(&self.state.config);
+            state.config.save(&path)?;
+            self.store.apply_config(&state.config);
         }
         Ok(())
-    }
+        }
 
-    /// 标记当前 `capture.enabled` 是命令行临时覆盖，保存配置时应跳过。
-    pub fn set_capture_override(&mut self, is_override: bool) {
-        self.capture_override = is_override;
-    }
-
-    /// 把一段文本写回系统剪贴板（自带自写回抑制）。
-    ///
-    /// 供设置界面「一键 AI 配对提示词」等入口使用——与 [`Self::copy_item`]
-    /// 同规则：抑制必须在写之前武装，防止捕获线程把自己写的内容再记一条。
-    pub fn write_clipboard_text(&mut self, text: &str) -> anyhow::Result<()> {
-        self.suppress_self_capture();
+    fn write_clipboard_text(
+        &mut self,
+        _state: &mut AppState,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.last_self_write
+            .store(now_ms() as u64, Ordering::Relaxed);
         let mut reader = ClipboardReader::new()?;
         reader.write_text(text)
+        }
+
+}
+
+impl RemoteBackend {
+    /// 把常驻进程带回的新列表写进界面状态。返回状态是否变了。
+    fn apply(&mut self, state: &mut AppState, resp: Response) -> bool {
+        match resp {
+            Response::Snapshot(s) => {
+                self.known = s.version;
+                apply_snapshot(s, state);
+                true
+            }
+            Response::Ok | Response::Unchanged | Response::Bytes(_) => false,
+            Response::VersionMismatch { server } => {
+                tracing::error!(server, "与常驻进程的协议版本不一致");
+                false
+            }
+            Response::Error(msg) => {
+                tracing::error!(%msg, "常驻进程返回错误");
+                false
+            }
+        }
     }
 
-    /// 在状态栏显示一条消息，3 秒后过期。
-    pub fn notify(&mut self, msg: String) {
-        self.state.notice = Some((msg, Instant::now()));
+    /// 发一条**会改变列表**的命令，并就地应用结果。
+    fn mutate(&mut self, state: &mut AppState, cmd: Command) -> bool {
+        match self.client.command(cmd) {
+            Ok(resp) => self.apply(state, resp),
+            Err(e) => {
+                // 通道断了（常驻进程退出）比业务失败严重得多。
+                // 界面不崩，但要把自己标记成「失联」——继续跑下去
+                // 只会让用户对着一扇不响应的窗口发呆。
+                tracing::error!(%e, "向常驻进程发送命令失败");
+                self.dead = true;
+                false
+            }
+        }
+    }
+
+    /// 发一条**没有返回数据**的命令。
+    fn unit(&mut self, cmd: Command) -> anyhow::Result<()> {
+        self.client.command(cmd).map(|_| ())
+    }
+
+    fn reload_list(&mut self, state: &mut AppState) -> bool {
+        self.mutate(state, Command::ReloadList)
+    }
+
+    fn search(&mut self, state: &mut AppState, query: String) -> bool {
+        self.mutate(state, Command::Search(query))
+    }
+
+    fn filter_group(&mut self, state: &mut AppState, filter: Option<GroupFilter>) -> bool {
+        self.mutate(state, Command::FilterGroup(filter))
+    }
+
+    fn ingest(&mut self, state: &mut AppState, payload: CapturedPayload) -> bool {
+        self.mutate(state, Command::Ingest(payload))
+    }
+
+    fn delete_item(&mut self, state: &mut AppState, id: EntryId) -> bool {
+        let changed = self.mutate(state, Command::DeleteItem(id));
+        if state.selected == Some(id) {
+            state.selected = None;
+        }
+        changed
+    }
+
+    fn toggle_pin(&mut self, state: &mut AppState, id: EntryId) -> bool {
+        self.mutate(state, Command::TogglePin(id))
+    }
+
+    fn clear_all(&mut self, state: &mut AppState) -> bool {
+        let changed = self.mutate(state, Command::ClearAll);
+        state.selected = None;
+        changed
+    }
+
+    /// 每帧一次：问常驻进程「有新内容吗」。
+    ///
+    /// 版本没变时回答是 `Unchanged`（几十字节），所以这可以每帧跑。
+    fn pump(&mut self, state: &mut AppState) -> bool {
+        match self.client.sync(self.known) {
+            Ok(Some(s)) => {
+                self.known = s.version;
+                apply_snapshot(s, state);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::error!(%e, "与常驻进程同步失败");
+                self.dead = true;
+                false
+            }
+        }
+    }
+
+    /// 启停剪贴板监听。
+    ///
+    /// 与本地后端同规则：配置里关着的时候，「启动」是空操作——
+    /// 否则用户在设置里关掉监听、界面一重启就又把它打开了。
+    fn set_capture(&mut self, state: &mut AppState, on: bool) {
+        if on && !state.config.capture.enabled {
+            tracing::info!("capture.enabled = false，不启动剪贴板监听");
+            return;
+        }
+        match self.client.command(Command::SetCaptureEnabled(on)) {
+            Ok(_) => state.capturing = on,
+            Err(e) => tracing::error!(%e, "切换剪贴板监听失败"),
+        }
+    }
+
+    fn suppress_self_capture(&mut self) -> anyhow::Result<()> {
+        self.unit(Command::SuppressSelfCapture)
+    }
+
+    fn copy_item(&mut self, id: EntryId) -> anyhow::Result<()> {
+        self.unit(Command::CopyItem(id))
+    }
+
+    fn write_clipboard_text(&mut self, text: &str) -> anyhow::Result<()> {
+        self.unit(Command::WriteClipboardText(text.to_string()))
+    }
+
+    fn save_config(&mut self, state: &AppState) -> anyhow::Result<()> {
+        self.unit(Command::SaveConfig(state.config.clone()))
     }
 }
+
+
+/// 在状态栏显示一条消息（3 秒后由绘制层过期）。
+fn set_notice(state: &mut AppState, msg: String) {
+    state.notice = Some((msg, Instant::now()));
+}
+
 
 /// 捕获循环的单步决策：这一轮是否应该读取剪贴板内容。
 ///
@@ -978,7 +1472,7 @@ mod tests {
         let svc = Service::with_data_dir(Config::default(), None)
             .expect("默认数据目录应能打开");
         assert!(
-            svc.config_path.is_some(),
+            svc.config_path().is_some(),
             "默认启动路径必须有配置写入路径，否则设置永不落盘 \\
              （历史 bug：所有不带 --data-dir 的用户设置重启即丢）"
         );

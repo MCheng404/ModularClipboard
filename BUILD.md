@@ -32,6 +32,20 @@ source scripts/env.sh --print         # 只打印关键变量，便于排查
 **不要**在 shell 里直接 `cargo build`：`cl.exe` 不在系统 PATH 里，
 cc-rs 编译 `sqlite3.c` 会失败（`failed to find tool "cl.exe"`）。
 
+### 运行时的三个角色
+
+程序拆成了两个进程（原因见 `docs/内存分析-2026-10-12.md` 第七节）：
+
+```bash
+./modular-clipboard.exe                  # 默认：起常驻进程 + 拉起界面
+./modular-clipboard.exe --daemon         # 只常驻（后台记录 + 托盘），不弹界面
+./modular-clipboard.exe --ui             # 只起界面（一般由常驻进程拉起）
+./modular-clipboard.exe --single         # 单进程模式（旧行为，排查用）
+```
+
+排查问题时先看日志：常驻进程写 `{数据目录}/app.log`，
+界面进程写 `{数据目录}/ui.log`（分开写，否则两边各自 truncate 会互相截断）。
+
 ---
 
 ## 二、产物规范

@@ -317,6 +317,21 @@ pub struct UiState {
     /// 用来实现「悬停一小会儿才展开」：鼠标**划过**图标时不应该弹出搜索框，
     /// 只有**停在**上面才展开。`None` 表示当前没停在图标上。
     pub search_hover_since: Option<f64>,
+    /// 光标离开搜索区域（图标 + 输入框）的时刻（egui 时间，秒）。
+    ///
+    /// 用来实现「离开后宽限一小会儿再折叠」。没有这个宽限期的话，
+    /// 鼠标从图标移向输入框的途中（两者之间有 `space_md` 的间隙）
+    /// 会瞬间判定「既不在图标上也不在输入框里」⇒ 立刻折叠，输入框
+    /// 在指针抵达前就消失——**永远进不去输入框**（用户反馈：
+    /// 「根本不给输入的机会」）。
+    pub search_leave_since: Option<f64>,
+    /// 点击搜索图标后待办的「把焦点交给输入框」请求。
+    ///
+    /// 之所以要跨帧挂起：点击的那一帧输入框可能还没画出来（它要先被
+    /// 悬停/点击判定判为展开），而焦点只能请求给**已经存在**的控件 id。
+    /// 真正发出请求是在本帧的 `draw_search` 之后（那时 id 已自报），
+    /// 拿不到就留到下一帧再说。
+    pub search_focus_pending: bool,
     /// 上一帧提交给窗口的拖动区（标题栏）。
     ///
     /// IMPORTANT: 必须是**多段**而不是「整个顶栏一块」：拖动区会被系统转成
@@ -831,16 +846,22 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     let icon_resp = search_toggle_button(f, search_icon_r);
     let hover_icon = icon_resp.hovered();
 
-    // ---- 悬停展开 / 离开折叠 -------------------------------------------
+    // ---- 悬停展开 / 延迟折叠 -------------------------------------------
     //
-    // 交互契约（用户指定）：
+    // 交互契约：
     // - 光标**停在**图标上 ≥ [`SEARCH_HOVER_DELAY`] ⇒ 展开；
-    // - 离开图标**且**不在输入框里 ⇒ 立即折叠。
+    // - 离开图标与输入框 ⇒ **宽限** [`SEARCH_COLLAPSE_DELAY`] 后才折叠；
+    // - 输入框持有焦点、或里面有查询词 ⇒ 永不折叠。
     //
     // 为什么必须「停留一会儿」而不是一碰就展开：图标紧挨着设置按钮，
     // 鼠标从顶栏左侧移到设置**必然划过它**。一碰就展开的话，弹出的
     // 输入框会把设置按钮往左顶走，用户永远点不到设置——这正是
     // 「划过」与「停住」必须分开的原因。
+    //
+    // 为什么必须有宽限期（用户反馈「根本不给输入的机会」）：输入框弹在
+    // 图标**左侧**、两者之间是 `space_md` 的间隙。指针从图标移向输入框
+    // 必然穿过那段既不属于图标也不属于输入框的空隙，若「离开即折叠」，
+    // 输入框会在指针抵达前消失——鼠标永远追不上。
     let now = f.ui.ctx().input(|i| i.time);
     if hover_icon {
         f.state.search_hover_since.get_or_insert(now);
@@ -854,43 +875,92 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
         .is_some_and(|t| now - t >= SEARCH_HOVER_DELAY)
     {
         f.state.search_expanded = true;
+        f.state.search_leave_since = None;
     }
 
-    // 点击图标 = 把焦点交给输入框。
+    // ---- 输入框几何：按可用宽度动态收缩 --------------------------------
     //
-    // NOTE: 展开/折叠**不再由点击切换**。早前是点击 toggle，与悬停展开
-    // 叠加会互相打架：点一下折叠，可光标还停在图标上，下一帧又被悬停
-    // 展开——表现为「点不动」。
-    if icon_resp.clicked() && f.state.search_expanded {
-        f.ui
-            .memory_mut(|m| m.request_focus(egui::Id::new("search_edit")));
-    }
-
-    // 展开时输入框弹出在图标左侧。
+    // 固定 140pt 在窄窗口下会溢出：输入框从 `search_icon_r.left()` 向
+    // 左伸展，窗口宽度不够时它会伸到顶栏左缘之外，`painter_at(r)` 按
+    // 可见区裁剪 ⇒ 左半边被切掉（实机「搜索框渲染不完整」）。
     //
-    // IMPORTANT: 顺序是「先算矩形 → 判折叠 → 再画」。反过来（先画再判）
-    // 会让**折叠的那一帧**仍然把输入框画出来并登记热区，外部（测试、
-    // 自动化脚本）读到的热区表与实际状态差一帧——表现是「已经收起了，
-    // 但热区还在」。
+    // 可用宽度 = 图标左缘 − 间隙 − 顶栏左缘 − 拖动区保留宽度。
+    // 取它与期望宽度的**较小者**；不够最小可用宽度就不展开。
+    let avail_w = search_icon_r.min.x - pal.space_md * 2.0 - bar.min.x - SEARCH_DRAG_RESERVE;
+    let input_w = avail_w.min(SEARCH_EXPAND_W);
     let input = Rect::from_min_max(
-        pos2(search_icon_r.min.x - pal.space_md - SEARCH_EXPAND_W, bar.min.y + pal.space_sm),
+        pos2(search_icon_r.min.x - pal.space_md - input_w, bar.min.y + pal.space_sm),
         pos2(search_icon_r.min.x - pal.space_md, bar.max.y - pal.space_sm),
     );
-    let input_ok = input.width() > 40.0 && input.height() > 8.0;
+    let input_ok = input_w >= SEARCH_MIN_W && input.height() > 8.0;
     // 「离开搜索框区域」的判据用**指针是否落在输入框矩形内**，而不是
     // 逐个控件响应的 `hovered()`：框内还有文本光标、清除按钮等子交互，
     // 逐个子响应去 or 一定会漏掉某一处。
     let hover_input = input_ok && f.ui.rect_contains_pointer(input);
-    // 既不在图标上、也不在输入框里 ⇒ 折叠。
-    if f.state.search_expanded && !hover_icon && !hover_input {
-        f.state.search_expanded = false;
-        f.state.search_hover_since = None;
+    // 输入框持有焦点 / 有查询词：无条件保持展开。
+    //
+    // 焦点这条最关键：用户要点进输入框打字。而点击图标到 `TextEdit`
+    // 拿到焦点之间隔着一帧、鼠标移动到输入框又要几帧，这段时间里
+    // 既不悬停图标也不悬停输入框——没有这条判定，输入框会在焦点
+    // 建立之前自己收回去，然后焦点被丢弃，字永远打不进去。
+    //
+    // CAUTION: 焦点 id 必须用输入框**自报的真实 id**
+    // （`UiState::search_edit_id`，见 `draw_search`），不能用上层猜的
+    // `Id::new("search_edit")`：`TextEdit` 的最终 id 由 egui 在容器 id
+    // 上派生，两者并不相等——猜的那个永远匹配不上，这条判定会恒假。
+    let focused = f
+        .state
+        .search_edit_id
+        .is_some_and(|id| f.ui.memory(|m| m.focused()) == Some(id));
+    let hold_open = focused || !f.state.query.is_empty();
+
+    // 点击图标 = 展开 + 把焦点交给输入框。
+    //
+    // NOTE: 展开/折叠**不再由点击切换**。早前是点击 toggle，与悬停展开
+    // 叠加会互相打架：点一下折叠，可光标还停在图标上，下一帧又被悬停
+    // 展开——表现为「点不动」。
+    // ……但**现在**还不能写焦点：输入框本帧可能一次都没画过，
+    // `search_edit_id` 还是 `None`（首次展开就是这种情况）。真正的
+    // 请求挂在 [`UiState::search_focus_pending`] 上，等 `draw_search`
+    // 自报出真实 id 之后再发。
+    if icon_resp.clicked() {
+        f.state.search_expanded = true;
+        f.state.search_leave_since = None;
+        f.state.search_focus_pending = true;
+    }
+
+    // CAUTION: 顺序是「先算矩形 → 判折叠 → 再画」。反过来（先画再判）
+    // 会让**折叠的那一帧**仍然把输入框画出来并登记热区，外部（测试、
+    // 自动化脚本）读到的热区表与实际状态差一帧——表现是「已经收起了，
+    // 但热区还在」。
+    if f.state.search_expanded && !hover_icon && !hover_input && !hold_open {
+        match f.state.search_leave_since {
+            None => f.state.search_leave_since = Some(now),
+            Some(t) if now - t >= SEARCH_COLLAPSE_DELAY => {
+                f.state.search_expanded = false;
+                f.state.search_hover_since = None;
+                f.state.search_leave_since = None;
+            }
+            _ => {}
+        }
+    } else {
+        // 仍在区域内（或被焦点/查询词钉住）：取消在途的折叠倒计时。
+        f.state.search_leave_since = None;
     }
 
     let mut search_left = search_icon_r.min.x;
     if f.state.search_expanded && input_ok {
         draw_search(f, input);
         search_left = input.min.x;
+        if f.state.search_focus_pending
+            && let Some(id) = f.state.search_edit_id
+        {
+            // CAUTION: 必须是 `draw_search` 自报的**真实 id**。拿上层猜的
+            // `Id::new("search_edit")` 请求焦点会打水漂——那个 id 与
+            // TextEdit 实际用的 id 不相等（`UiBuilder::id` 只是容器 id）。
+            f.ui.memory_mut(|m| m.request_focus(id));
+            f.state.search_focus_pending = false;
+        }
     }
 
     let _ = scale;
@@ -2241,101 +2311,99 @@ fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
 
 /// 一张卡片：圆角背景 + 标题行（标题 + 条件重置按钮）+ 设置行。
 ///
-/// 卡片高度由 `head_h + row_h * 行数` 算出，整块 `allocate` 推进滚动游标。
-/// 「通信」卡片底部额外有「一键 AI 配对提示词」按钮，占用 44pt。
+/// # 背景为什么用 `egui::Frame` 而不是先算高度再 `rect_filled`
+///
+/// 早前高度用固定公式 `head_h + 44×行数 + pad×2` 估算，而行高实际随内容
+/// 变化：描述文字换行、分段控件（30pt）、滑块、文本输入框都比 44pt 的
+/// 假设高。公式低估时底部几行超出背景——用户看到「内容下半截露在卡片
+/// 外」（外观卡有多行描述 + 分段控件，最明显）。
+///
+/// `Frame::show` 内部先往 painter 塞一个 `Noop` 占位，内容测量完再把背景
+/// 形状填进那个占位符：背景尺寸恒等于内容尺寸，且 z 序在内容之下
+/// （不会盖住文字）。这是「背景包裹内容」的标准做法，行高怎么变都不会露底。
 fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
     let pal = f.pal;
-    let w = ui.available_width();
-    let row_h = 44.0;
-    // 无卡片标题：顶部只留一行放右上角「重置」按钮（有变化时才出现）。
-    let head_h = 26.0;
-    let pad = 12.0;
-    let extra = if card.cat == SettingsCat::Comm { 44.0 } else { 0.0 };
-    let h = head_h + row_h * card.items.len() as f32 + pad * 2.0 + extra;
-    let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
-    ui.painter_at(r).rect_filled(r, pal.radius_lg, pal.surface);
+    egui::Frame::new()
+        .fill(pal.surface)
+        .corner_radius(pal.radius_lg)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            // 行间距：设置项之间拉开呼吸感（2.0 太挤，文字贴在一起）。
+            ui.spacing_mut().item_spacing = vec2(0.0, 8.0);
 
-    let inner_rect = r.shrink2(vec2(pad, pad * 0.5));
-    let mut inner = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(inner_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-    );
-    // 行间距：设置项之间拉开呼吸感（2.0 太挤，文字贴在一起）。
-    inner.spacing_mut().item_spacing = vec2(0.0, 8.0);
+            // 顶部行：无标题文字，仅当有项偏离默认值时在**右上方**出现「重置」。
+            let changed_any = {
+                let cfg = &f.svc.state.config;
+                card.items.iter().any(|it| it.is_changed(cfg, f.ws))
+            };
+            if changed_any {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("重置").size(pal.font_sm).color(pal.text_dim),
+                            )
+                            .frame(false),
+                        );
+                        let rect = resp.rect;
+                        let clicked = resp.clicked();
+                        resp.on_hover_text("恢复该卡片默认值");
+                        f.hit_insert(card.cat.reset_key(), rect);
+                        if clicked {
+                            for it in card.items {
+                                if let Some(op) = it.reset_op() {
+                                    f.state.push(op);
+                                }
+                            }
+                            // 通信卡片重置 = 整卡内容回到默认：MCP 总开关 +
+                            // 8 个可调用能力全部恢复开启。
+                            if card.cat == SettingsCat::Comm {
+                                for cap in MCP_CAPS {
+                                    f.state.push(Op::SetBool {
+                                        group: ConfigGroup::Mcp,
+                                        field: cap.field,
+                                        value: true,
+                                    });
+                                }
+                            }
+                            // 该卡片全部项从「最近修改」里移除。
+                            f.state
+                                .settings_recent
+                                .retain(|(l, _)| !card.items.iter().any(|it| it.label == *l));
+                        }
+                    });
+                });
+            }
 
-    // 顶部行：无标题文字，仅当有项偏离默认值时在**右上方**出现「重置」。
-    let changed_any = {
-        let cfg = &f.svc.state.config;
-        card.items.iter().any(|it| it.is_changed(cfg, f.ws))
-    };
-    if changed_any {
-        inner.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let resp = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new("重置").size(pal.font_sm).color(pal.text_dim),
-                    )
-                    .frame(false),
+            for it in card.items {
+                settings_item_row(f, ui, it);
+            }
+
+            // 通信卡片底部：「一键 AI 配对提示词」按钮。
+            //
+            // 点击后由 `App::apply_ops` 把按当前 MCP 配置动态拼接的接入说明
+            // 复制到系统剪贴板（写剪贴板带自身捕获抑制，见 `copy_mcp_pair_prompt`）。
+            if card.cat == SettingsCat::Comm {
+                ui.add_space(4.0);
+                let btn_w = ui.available_width();
+                // 用 allocate 推进游标再自绘（纯平风格，不用默认 Button 边框）。
+                let (bb, resp) = ui.allocate_exact_size(vec2(btn_w, 36.0), egui::Sense::click());
+                let p = ui.painter_at(bb);
+                let hovered = resp.hovered();
+                p.rect_filled(bb, pal.radius_md, if hovered { pal.accent_hover } else { pal.accent });
+                p.text(
+                    bb.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "一键 AI 配对提示词",
+                    egui::FontId::proportional(pal.font_sm),
+                    pal.text_on_accent,
                 );
-                let rect = resp.rect;
-                let clicked = resp.clicked();
-                resp.on_hover_text("恢复该卡片默认值");
-                f.hit_insert(card.cat.reset_key(), rect);
-                if clicked {
-                    for it in card.items {
-                        if let Some(op) = it.reset_op() {
-                            f.state.push(op);
-                        }
-                    }
-                    // 通信卡片重置 = 整卡内容回到默认：MCP 总开关 +
-                    // 8 个可调用能力全部恢复开启。
-                    if card.cat == SettingsCat::Comm {
-                        for cap in MCP_CAPS {
-                            f.state.push(Op::SetBool {
-                                group: ConfigGroup::Mcp,
-                                field: cap.field,
-                                value: true,
-                            });
-                        }
-                    }
-                    // 该卡片全部项从「最近修改」里移除。
-                    f.state
-                        .settings_recent
-                        .retain(|(l, _)| !card.items.iter().any(|it| it.label == *l));
+                f.hit_insert("settings_mcp_pair", bb);
+                if resp.clicked() {
+                    f.state.push(Op::CopyMcpPairPrompt);
                 }
-            });
+            }
         });
-    }
-
-    for it in card.items {
-        settings_item_row(f, &mut inner, it);
-    }
-
-    // 通信卡片底部：「一键 AI 配对提示词」按钮。
-    //
-    // 点击后由 `App::apply_ops` 把按当前 MCP 配置动态拼接的接入说明
-    // 复制到系统剪贴板（写剪贴板带自身捕获抑制，见 `copy_mcp_pair_prompt`）。
-    if card.cat == SettingsCat::Comm {
-        inner.add_space(4.0);
-        let btn_w = inner.available_width();
-        // 用 allocate 推进游标再自绘（纯平风格，不用默认 Button 边框）。
-        let (bb, resp) = inner.allocate_exact_size(vec2(btn_w, 36.0), egui::Sense::click());
-        let p = inner.painter_at(bb);
-        let hovered = resp.hovered();
-        p.rect_filled(bb, pal.radius_md, if hovered { pal.accent_hover } else { pal.accent });
-        p.text(
-            bb.center(),
-            egui::Align2::CENTER_CENTER,
-            "一键 AI 配对提示词",
-            egui::FontId::proportional(pal.font_sm),
-            pal.text_on_accent,
-        );
-        f.hit_insert("settings_mcp_pair", bb);
-        if resp.clicked() {
-            f.state.push(Op::CopyMcpPairPrompt);
-        }
-    }
 }
 
 /// 一行设置项：按类型分派到开关 / 数值 / 单选 / 只读。
@@ -2447,12 +2515,14 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
         ItemKind::Opacity => {
             let mut op = f.svc.state.config.ui.window_opacity;
             let enabled = f.svc.state.config.ui.window_backdrop != WindowBackdrop::None;
+            let pal = f.pal;
             let changed = setting_row(ui, it.label, it.desc, |ui| {
-                ui.add_enabled(
-                    enabled,
-                    egui::Slider::new(&mut op, 0.3..=1.0).show_value(true),
-                )
-                .changed()
+                // right_to_left 布局：先加的靠右 ⇒ 百分比显示在滑条右侧。
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("{}%", (op * 100.0).round() as i32))
+                        .color(pal.text_dim),
+                ));
+                draw_slider(f, ui, "window_opacity", &mut op, 0.3..=1.0, enabled)
             });
             if changed && enabled {
                 f.state.push(Op::SetOpacity(op));
@@ -2771,6 +2841,103 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // 逐个登记还有一个好处：测试能逐项核对边界，而不是只看最后一个。
     f.hit_insert(id_suffix, rect);
     *v != on
+}
+
+/// 圆角滑块（替代 `egui::Slider`）：纯平毛玻璃风格。
+///
+/// # 为什么不用 `egui::Slider`
+///
+/// 与 [`draw_switch`] 同理：默认滑块是细方轨 + 方划块，与本仓自绘的
+/// 开关 / 分段控件不是一套视觉语言，设置页里并排出现「三种控件三种
+/// 质感」。这里统一为：全圆角轨道（半径 = 轨高一半）+ accent 填充
+/// 已选部分 + 白色圆 knob（带轻投影，与开关滑块一致）。
+///
+/// # 交互
+///
+/// 点击轨道任意处跳转到该值，按住拖动连续调整。禁用态（如背景效果为
+/// 「无」时不透明度无意义）只绘制不交互，整体压暗。
+fn draw_slider(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    id_suffix: &'static str,
+    v: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    enabled: bool,
+) -> bool {
+    let pal = f.pal;
+    // 轨道 150x6，knob 直径 16——比开关轨道（20）细，但 knob 同为白圆，
+    // 两个控件摆在一页里粗细有致又不散。
+    let track_w = 150.0;
+    let track_h = 6.0;
+    let knob_d: f32 = 16.0;
+    let cell_h = knob_d.max(track_h);
+    // 分工同 draw_switch：allocate 只占位，交互走显式 interact（Id 绑字段名）。
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("slider", id_suffix)),
+        if enabled {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+
+    let (lo, hi) = (*range.start(), *range.end());
+    let orig = *v;
+    // 拖动/点击 → 值：指针在轨道上的相对位置直接映射。
+    // `is_pointer_button_down_on` 覆盖「按下即跳转」，`dragged` 覆盖按住拖动
+    // 连续调整。两者都要：只用 dragged 的话必须先移动一像素才响应。
+    if enabled
+        && (resp.dragged() || resp.is_pointer_button_down_on())
+        && let Some(pp) = resp.interact_pointer_pos()
+    {
+        let t = ((pp.x - rect.min.x) / track_w).clamp(0.0, 1.0);
+        *v = lo + (hi - lo) * t;
+    }
+    let t = ((*v - lo) / (hi - lo)).clamp(0.0, 1.0);
+
+    let p = ui.painter_at(rect);
+    let track = Rect::from_min_size(
+        pos2(rect.min.x, rect.center().y - track_h * 0.5),
+        vec2(track_w, track_h),
+    );
+    let fill_w = track_w * t;
+    // 禁用态整体压暗：轨道退到描边色，填充退到弱文字色，knob 不再纯白。
+    let track_bg = if enabled { pal.surface_variant } else { pal.border_subtle };
+    let fill = if !enabled {
+        pal.text_dim
+    } else if resp.hovered() || resp.dragged() {
+        pal.accent_hover
+    } else {
+        pal.accent
+    };
+    p.rect_filled(track, track_h * 0.5, track_bg);
+    if fill_w > 0.5 {
+        p.rect_filled(
+            Rect::from_min_size(track.min, vec2(fill_w, track_h)),
+            track_h * 0.5,
+            fill,
+        );
+    }
+    // knob 圆心钳在轨道内：值到两端时圆不出轨。
+    let knob_x = (track.min.x + fill_w).clamp(track.min.x + knob_d * 0.5, track.max.x - knob_d * 0.5);
+    let knob_c = pos2(knob_x, track.center().y);
+    let knob_r = knob_d * 0.5;
+    p.circle_filled(
+        knob_c + vec2(0.0, 0.8),
+        knob_r,
+        egui::Color32::from_black_alpha(45),
+    );
+    p.circle_filled(
+        knob_c,
+        knob_r,
+        if enabled { egui::Color32::WHITE } else { pal.text_dim },
+    );
+
+    // 热区登记：自动化按字段名定位（同开关的约定）。
+    f.hit_insert(id_suffix, rect);
+    (*v - orig).abs() > f32::EPSILON
 }
 
 /// MCP 总开关左侧的 ⓘ 详细按钮（打开 MCP 调用设置覆盖层）。
@@ -3865,15 +4032,40 @@ const LIST_PAD_X: f32 = 8.0;
 /// 首项顶部再留半条，让整体上下边缘也有留白。
 const ROW_GAP: f32 = 6.0;
 
-/// 顶栏搜索框展开时的宽度（逻辑点）。
+/// 顶栏搜索框的**期望**宽度（逻辑点）。
 ///
 /// 搜索框默认折叠成一枚放大镜图标（贴在窗口按钮左侧），顶栏左侧
-/// 整片让给拖动区；点击图标后输入框向左弹出这段宽度。
+/// 整片让给拖动区；展开后输入框向左弹出。
+///
+/// CAUTION: 这是**期望**值不是最终宽度。主窗口窄时要按可用空间
+/// 收窄（见 [`draw_topbar`]），写死就会溢出到顶栏之外、被 `painter`
+/// 裁掉——实机表现「渲染不完整」。
 ///
 /// 取值平衡：太窄（<120）输入体验差；太宽（>180）展开时把拖动区
 /// 挤到 <30pt，用户搜索完要拖窗口又拖不动。140pt ≈ 物理 210px，
 /// 足够输入，且展开后拖动区仍剩约 46pt。
 const SEARCH_EXPAND_W: f32 = 140.0;
+
+/// 输入框的**最小可用宽度**（逻辑点）。
+///
+/// 低于这个宽度连「搜索历史…」的提示文字都放不下，展开也失去意义；
+/// 此时宁可不展开（`draw_topbar` 判 `input_ok=false`），也不要挤出一
+/// 条被裁切的输入框（这正是「主窗口小时渲染不完整」的来源）。
+const SEARCH_MIN_W: f32 = 88.0;
+
+/// 展开输入框后，顶栏左侧**至少**要留给拖动区的宽度。
+///
+/// 窗口窄时若不设下限，输入框会一路向左扩张把拖动区吃光，
+/// 窗口就拖不动了。剩下的宽度不够就把输入框缩窄——它是被限制的
+/// 一方，拖动区优先。24pt 约等于一个图标按钮的宽度，仍然按得住。
+const SEARCH_DRAG_RESERVE: f32 = 24.0;
+
+/// 离开搜索区域后延迟多久折叠（秒）。
+///
+/// 必须 >0：见 [`UiState::search_leave_since`]。0.35s 足以覆盖
+/// 「从图标移到输入框」的正常鼠标行程（图标与输入框之间是
+/// `space_md` 的间隙），又不至于让输入框赖着不走。
+const SEARCH_COLLAPSE_DELAY: f64 = 0.35;
 
 /// 悬停多久才自动展开搜索框（秒）。
 ///
@@ -4517,6 +4709,11 @@ mod tests {
         pal: crate::theme::Palette,
         /// 客户区（逻辑点）。
         area: Rect,
+        /// 夹具时钟（秒），喂给 egui 的 `RawInput::time`。
+        ///
+        /// 见 [`Self::input`] 与 [`Self::advance_secs`]。起始 1.0 而非 0：
+        /// 避开 egui 内部若干 `if time > 0.0` 之类的特判分支。
+        clock: f64,
         _dir: tempdir::TempDir,
     }
 
@@ -4578,6 +4775,7 @@ mod tests {
                 state: UiState::default(),
                 pal: crate::theme::Palette::light(),
                 area: Rect::from_min_size(pos2(0.0, 0.0), size),
+                clock: 1.0,
                 _dir: dir,
             }
         }
@@ -4636,17 +4834,35 @@ fn with_pinned(mut self, n: usize) -> Self {
 }
 
         /// 组装这一帧的 [`RawInput`]。
+        ///
+        /// `time` **显式给出**：egui 在它为 `None` 时只按
+        /// `predicted_dt`（≈16.7ms/帧）自增，要覆盖 0.35s 的折叠宽限
+        /// 得跑二十多帧。这里由夹具自己掌钟（[`Self::clock`]），
+        /// 测试可用 [`Self::advance_secs`] 一步跨过去——判据代码本身
+        /// 仍是真的（`now - since >= SEARCH_COLLAPSE_DELAY`），
+        /// 只是「多久」由夹具说了算。
         fn input(&self, events: Vec<egui::Event>) -> egui::RawInput {
             egui::RawInput {
                 screen_rect: Some(self.area),
                 events,
+                time: Some(self.clock),
                 ..Default::default()
             }
+        }
+
+        /// 把夹具时钟向前拨 `secs` 秒（模拟时间流逝）。
+        ///
+        /// 拨完**不自动跑帧**——留给调用方决定这一帧要带什么输入事件。
+        fn advance_secs(&mut self, secs: f64) {
+            self.clock += secs;
         }
 
         /// 跑一帧主界面，返回收集到的 `Op`。
         fn frame_with(&mut self, events: Vec<egui::Event>) -> Vec<Op> {
             let input = self.input(events);
+            // 每帧推进 1/60s：与真实帧率同量级，这样「没拨时钟」的
+            // 帧不会把时间冻结、也不会一步跨过时间判定。
+            self.clock += 1.0 / 60.0;
             // CAUTION: 必须先跑 solver，否则卡片矩形全是 `Rect::ZERO`。
             //
             // `draw()` 只负责**画** `card.rect`，求解是 App 层的事。
@@ -6323,14 +6539,15 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
-    /// 搜索框折叠式：默认折叠、**悬停图标**展开、光标移开即收起。
+    /// 搜索框折叠式：默认折叠、**悬停图标**展开、离开后**延迟**收起。
     ///
-    /// 交互契约（用户指定）：
+    /// 交互契约：
     /// - 光标停在图标上 ≥ `SEARCH_HOVER_DELAY` ⇒ 展开；
-    /// - 离开图标与输入框 ⇒ 立即折叠。
+    /// - 离开图标与输入框 ⇒ 宽限 `SEARCH_COLLAPSE_DELAY` 后才折叠；
+    /// - 输入框持有焦点、或里面有查询词 ⇒ 永不折叠。
     ///
-    /// NOTE: 早前是「点击图标切换」。改成悬停驱动后，点击只负责把焦点
-    /// 交给输入框——两者叠加会互相打架（点一下折叠、下一帧又被悬停展开）。
+    /// NOTE: 早前是「点击图标切换」，后来改悬停驱动（点击只负责给焦点），
+    /// 现在是「悬停展开 + 宽限折叠」三段式——见下面的宽限测试。
     #[test]
     fn search_expands_on_hover_and_collapses_on_leave() {
         let mut h = Harness::new("search-toggle", vec2(700.0, 500.0));
@@ -6355,12 +6572,159 @@ fn with_pinned(mut self, n: usize) -> Self {
             "展开后应有输入框外框热区"
         );
 
-        // 光标移开 → 立即折叠：输入区消失。
+        // 光标移开 —— **当帧还开着**：这是用户能真正进到输入框的前提
+        // （详见 `search_stays_open_during_grace_period`）。
         h.move_pointer_away();
-        assert!(!h.state.search_expanded, "离开后应收起搜索框");
+        assert!(
+            h.state.search_expanded,
+            "刚离开的那一帧必须还开着，否则鼠标从图标移向输入框的途中就被收掉"
+        );
+
+        // 宽限期耗尽 → 折叠。
+        h.advance_secs(SEARCH_COLLAPSE_DELAY + 0.05);
+        h.frame();
+        assert!(!h.state.search_expanded, "宽限期过后应收起搜索框");
         assert!(
             !h.state.hit.contains_key(HitNs::Main, "search_box"),
             "收起后输入框外框热区应消失"
+        );
+    }
+
+    /// 宽限期必须撑过「鼠标从图标走到输入框」这段行程。
+    ///
+    /// 守着实机缺陷（用户反馈「根本不给输入的机会」）：输入框弹在图标
+    /// **左侧**、中间隔着 `space_md` 的空隙。指针跨过那段空隙的帧既不
+    /// 悬停图标、也不悬停输入框，若此刻立即折叠，输入框会在指针抵达
+    /// 之前消失 —— 鼠标永远追不上，用户一次也点不进去。
+    ///
+    /// 这里模拟的就是那几帧：一步一步把光标从图标挪到输入框中心。
+    #[test]
+    fn search_stays_open_during_grace_period() {
+        let mut h = Harness::new("search-grace", vec2(700.0, 500.0));
+        h.frame();
+        h.hover_search_icon();
+        assert!(h.state.search_expanded, "前置条件：已展开");
+
+        let icon = h.state.hit.get(HitNs::Main, "search_icon").unwrap().center();
+        let input = h.state.hit.get(HitNs::Main, "search_box").unwrap();
+
+        // 图标 → 输入框中心，分 8 步走（每步一帧）。真实鼠标在一帧里
+        // 也走不完这段：1/60s 的移动远不到百来像素。
+        for i in 1..=8 {
+            let t = i as f32 / 8.0;
+            let p = egui::pos2(
+                icon.x + (input.center().x - icon.x) * t,
+                icon.y + (input.center().y - icon.y) * t,
+            );
+            h.frame_with(vec![egui::Event::PointerMoved(p)]);
+            assert!(
+                h.state.search_expanded,
+                "走向输入框的第 {i} 步（{p:?}）就把搜索框收了 —— 用户永远点不进输入框"
+            );
+        }
+        // 落在输入框里：回填 bimahi倒计时，之后怎么动都不折叠。
+        assert!(h.state.search_leave_since.is_none(), "落在框内应取消折叠倒计时");
+    }
+
+    /// 输入框一旦拿到焦点就**永不折叠**（无论光标在哪、等多久）。
+    ///
+    /// 焦点是「用户正在搜索」的唯一可靠判据：他可能已经把手移开去
+    /// 看列表结果了。这一条不做的话，打字打到一半框自己没了。
+    #[test]
+    fn focused_search_box_never_collapses() {
+        let mut h = Harness::new("search-focus", vec2(700.0, 500.0));
+        h.frame();
+        // 点图标：展开 + 请求焦点。
+        let icon = h.state.hit.get(HitNs::Main, "search_icon").unwrap().center();
+        h.click_at(icon);
+        assert!(h.state.search_expanded, "点击图标应展开");
+        // 焦点要到下一帧 `TextEdit` 参与布局后才建立。
+        h.frame();
+        // CAUTION: 判据必须用输入框自报的真实 id（`search_edit_id`），
+        // 用上层猜的 `Id::new("search_edit")` 永远匹配不上。
+        let edit_id = h.state.search_edit_id.expect("绘制层应自报输入框 Id");
+        assert_eq!(
+            h.ctx.memory(|m| m.focused()),
+            Some(edit_id),
+            "点击图标后输入框应拿到焦点"
+        );
+
+        // 光标移到列表中间 + 时间往前拨 5 秒：仍然不能折叠。
+        let away = egui::pos2(h.area.center().x, h.area.max.y - 20.0);
+        h.advance_secs(5.0);
+        h.frame_with(vec![egui::Event::PointerMoved(away)]);
+        assert!(
+            h.state.search_expanded,
+            "持有焦点时搜索框不能折叠——用户正在打字"
+        );
+    }
+
+    /// 输入框宽度必须随窗口收窄，且**永远不越出客户区左缘**。
+    ///
+    /// 守着实机缺陷（用户反馈「主窗口小时渲染不完整」）：宽度写死
+    /// 140pt 时，窄窗口下输入框从图标位置向左伸展，越过顶栏左缘之后
+    /// 被 `painter_at` 裁掉 —— 左半个框连同提示文字一起没了。
+    #[test]
+    fn search_box_shrinks_instead_of_overflowing() {
+        // 360pt：solver 断点里偏窄的一档，也是「主窗口拉小」时的常态。
+        let mut h = Harness::new("search-narrow", vec2(360.0, 500.0));
+        h.frame();
+        h.hover_search_icon();
+        assert!(h.state.search_expanded, "窄窗口下悬停也应展开");
+
+        let r = hit(&h, "search_box");
+        assert!(
+            r.min.x >= h.area.min.x,
+            "输入框左缘 {:.1} 越出了客户区左缘 {:.1} —— 左上角被裁，\
+             实机表现「搜索框渲染不完整」",
+            r.min.x,
+            h.area.min.x
+        );
+        assert!(
+            h.area.contains_rect(r),
+            "输入框 {r:?} 未完整落在客户区 {:?} 内",
+            h.area
+        );
+        assert!(
+            r.width() >= SEARCH_MIN_W - 0.5,
+            "即使收窄也应保住最小可用宽度 {}（实际 {:.1}）",
+            SEARCH_MIN_W,
+            r.width()
+        );
+        // 必须严格窄于宽窗口下的宽度——证明它真的按可用空间算了。
+        let wide_h = {
+            let mut w = Harness::new("search-wide", vec2(700.0, 500.0));
+            w.frame();
+            w.hover_search_icon();
+            hit(&w, "search_box").width()
+        };
+        assert!(
+            r.width() < wide_h,
+            "窄窗宽度 {:.1} 应与宽窗 {wide_h:.1} 不同 —— 没走动态计算",
+            r.width()
+        );
+        // 拖动区不能被吃光：左侧仍要留得下一截可拖的顶栏。
+        let drag = h.state.drag_regions.clone();
+        assert!(
+            drag.iter().any(|d| d.min.x <= h.area.min.x + 1.0 && d.width() > 8.0),
+            "展开后左侧拖动区被吃光，窗口就拖不动了：{drag:?}"
+        );
+    }
+
+    /// 窄到连[`SEARCH_MIN_W`]都放不下时：**不画**，而不是画一条残缺的框。
+    ///
+    /// 另一半保证：旧实现在这里画的是**固定 140pt**的框，左半截越出
+    /// 客户区被 `painter_at` 裁掉（「搜索框渲染不完整」）。现在的取舍是
+    /// 「宁可不展开，也不画被裁的框」。
+    #[test]
+    fn search_box_is_not_drawn_when_there_is_no_room() {
+        let mut h = Harness::new("search-too-narrow", vec2(260.0, 500.0));
+        h.frame();
+        h.hover_search_icon();
+        // 展开标记可能是 true（悬停判据仍成立），但绝不许出现输入框热区。
+        assert!(
+            !h.state.hit.contains_key(HitNs::Main, "search_box"),
+            "空间不足时不该画输入框——画出来必然被裁切"
         );
     }
 
