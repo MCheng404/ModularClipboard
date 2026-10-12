@@ -253,3 +253,42 @@ python scripts/strip_comment_icons.py             # 实际改写
 | 跑测试特别慢 | 在两套增量缓存之间横跳 | 去掉命令行上的 `CARGO_INCREMENTAL`，用 config 里的固定值 |
 | PowerShell 脚本乱码 / 报错 | 文件被存成错误编码 | 改后用 `Parser::ParseFile` 校验语法；必要时用 `scripts/fix_script_encoding.py` |
 | `git commit -F` 被安全拦截 | 提交信息里出现 `.cmd` / `.vbs` 文件名 | 把提交信息写到文件再 `-F`，并在文字里避开这些文件名 |
+
+---
+
+## 六、图标资源
+
+程序图标与托盘图标都由脚本生成，**不要手工改二进制**。
+
+```bash
+python scripts/make_icons.py       # 生成 assets/icon.ico 与托盘 PNG
+python scripts/preview_icons.py    # 生成各尺寸/明暗背景的观感对照图
+```
+
+| 文件 | 用途 | 谁消费 |
+|---|---|---|
+| `assets/icon.ico` | 应用程序图标（任务栏 / Alt+Tab / 资源管理器） | `crates/modular-clipboard/build.rs` 用 `rc.exe` 缝进 exe |
+| `assets/icon-256.png` | 大尺寸预览 | 只用来看 |
+| `crates/modular-clipboard-platform/assets/tray.png` | 托盘图标（32×32） | `platform::tray` 用 `include_bytes!` 内嵌 |
+| `assets/source/icon-ai-source.png` | AI 生成的设计原图 | 改设计时对着它改几何参数 |
+
+### 为什么要脚本，不直接放一张 PNG
+
+图标要在三个尺寸段各自成立：**16px（托盘）**要减元素加粗笔画、
+**32~48px（任务栏）**要能看出是剪贴板、**128~256px（资源管理器）**
+可以带细节。同一张图缩放做不到——大图缩到 16px 会把文本线糊成灰块。
+所以脚本按同一套几何为不同尺寸分别绘制。
+
+### 换图标时
+
+1. 改 `scripts/make_icons.py` 里的几何/配色（或换 AI 原图后重新描一遍几何）；
+2. 重跑两个脚本；
+3. `cargo test -p modular-clipboard` —— `tests/icon_resource.rs` 会用
+   Win32 的 `ExtractIconExW` 数一遍 exe 里的图标资源，防止
+   `build.rs` 静默失效（那时资源管理器里会是一张白纸）。
+
+### 图标没了怎么查
+
+`build.rs` 找不到 `rc.exe` 时**只警告不报错**（构建机可能没装 SDK）。
+症状是资源管理器/任务栏显示白纸。先看构建日志里有没有
+`cargo:warning=... rc.exe ...`，再确认 `assets/icon.ico` 存在。

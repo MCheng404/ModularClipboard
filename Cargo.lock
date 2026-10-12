@@ -881,6 +881,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "image",
  "modular-clipboard-capture",
  "modular-clipboard-core",
  "tracing",

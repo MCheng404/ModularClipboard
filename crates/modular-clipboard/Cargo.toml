@@ -29,4 +29,6 @@ windows = { version = "0.62", features = [
     # `MessageBoxW`：GUI 子系统没有 stdout/stderr，
     # `--version` / `--help` / 启动失败只能靠它告知用户。
     "Win32_UI_WindowsAndMessaging",
+    # tests/icon_resource.rs：ExtractIconExW 数 exe 自带的图标资源。
+    "Win32_UI_Shell",
 ] }

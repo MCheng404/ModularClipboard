@@ -203,12 +203,12 @@ fn main() {
     assert_eq!(desc, "Ctrl+Shift+V", "默认快捷键描述不正确");
     println!("[6] 默认全局快捷键：{desc}");
 
-    let buf = tray::icon_rgba();
+    let buf = tray::icon_rgba().expect("内置托盘图标应能解码");
     assert_eq!(buf.len(), tray::ICON_SIZE * tray::ICON_SIZE * 4);
     let opaque = buf.chunks_exact(4).filter(|p| p[3] > 0).count();
-    assert!(opaque > 100, "程序化图标应有可见像素，实际 {opaque}");
+    assert!(opaque > 100, "内置图标应有可见像素，实际 {opaque}");
     println!(
-        "[6] 程序化图标 {}x{}，可见像素 {opaque} 个（非emoji/字符）",
+        "[6] 内置图标 {}x{}，可见像素 {opaque} 个（非emoji/字符）",
         tray::ICON_SIZE,
         tray::ICON_SIZE
     );

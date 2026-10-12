@@ -47,93 +47,52 @@ pub enum TrayEvent {
 /// 图标边长（像素）。托盘小图标标准尺寸为 16，取 32 让高分屏缩放后仍清晰。
 pub const ICON_SIZE: usize = 32;
 
-/// 托盘图标配色（BGRA，非预乘 alpha）。
+/// 内嵌的托盘图标（32×32，透明 PNG）。
 ///
-/// 画的是一块「剪贴板」：板身 + 顶部夹子 + 三条文本线，
-/// 语义与剪贴板管理器一致，且缩到 16px 仍可辨识。
-const COLOR_BOARD: [u8; 4] = [0xeb, 0x6f, 0x1f, 0xff]; // B,G,R,A
-const COLOR_CLIP: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
-const COLOR_TEXT: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+/// 由 `scripts/make_icons.py` 生成，与应用程序图标（`assets/icon.ico`）
+/// **同一套几何**——只在小尺寸上做了简化：文本线两条而不是三条，
+/// 因为 16px 下板身只有十几像素高，三条线会糊成一片灰。
+///
+/// # 为什么用资源文件而不是代码画像素
+///
+/// 前几版是拿整数矩形判定逐个像素画出来的（`Rect::contains`）。那样
+/// 做有两个死结：抗锯齿画不出来（托盘把 32px 缩到 16px 时边缘发虚），
+/// 而且改一次造型就要改一次绘图代码——设计变更被绑在代码逻辑上。
+/// 换成资源文件后，改图标 = 重跑脚本 + 换文件。
+const TRAY_PNG: &[u8] = include_bytes!("../assets/tray.png");
+
+/// 板身主色（BGRA）。
+///
+/// 测试用它断言「内嵌的确实是我们的图标」，而不是某个占位图。
+/// 值取自 `scripts/make_icons.py` 里的 `BLUE = #1F6FEB`。
+#[cfg(test)]
+const COLOR_BOARD: [u8; 4] = [0xeb, 0x6f, 0x1f, 0xff];
 
 /// 生成托盘图标的 BGRA 缓冲，长度 `ICON_SIZE * ICON_SIZE * 4`。
 ///
-/// 用整数像素判定而非抗锯齿：托盘会把图标缩到 16px，抗锯齿边反而发虚。
-pub fn icon_rgba() -> Vec<u8> {
-    let n = ICON_SIZE;
-    let mut buf = vec![0u8; n * n * 4];
-
-    let clip = Rect::new(12, 4, 20, 12, 2);
-    let board = Rect::new(4, 8, 28, 30, 3);
-    let line1 = Rect::new(9, 15, 24, 17, 0);
-    let line2 = Rect::new(9, 19, 24, 21, 0);
-    let line3 = Rect::new(9, 23, 19, 25, 0);
-
-    for y in 0..n {
-        for x in 0..n {
-            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            // 夹子先判，才能盖住板身上缘。
-            let color = if clip.contains(px, py) {
-                COLOR_CLIP
-            } else if board.contains(px, py) {
-                if line1.contains(px, py) || line2.contains(px, py) || line3.contains(px, py) {
-                    COLOR_TEXT
-                } else {
-                    COLOR_BOARD
-                }
-            } else {
-                continue;
-            };
-            let i = (y * n + x) * 4;
-            buf[i..i + 4].copy_from_slice(&color);
-        }
+/// # 为什么返回 BGRA
+///
+/// `CreateDIBSection` 的 32bpp 位图在内存里通道序是 **B,G,R,A**
+/// （与文件里的 RGBA 相反），而调用方会把它整块 `memcpy` 进 DIB。
+/// 在这里换好通道，省掉调用侧一次全缓冲遍历。
+///
+/// 返回 `Result` 而不是直接 panic：图标解码失败只该让「没有托盘图标」，
+/// 不该把整个常驻进程带走——剪贴板监听比托盘图标重要得多。
+pub fn icon_rgba() -> Result<Vec<u8>> {
+    let img = image::load_from_memory(TRAY_PNG)
+        .context("内置托盘图标解码失败")?
+        .to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    if (w, h) != (ICON_SIZE as u32, ICON_SIZE as u32) {
+        anyhow::bail!(
+            "内置托盘图标尺寸为 {w}×{h}，应为 {ICON_SIZE}×{ICON_SIZE}（重跑 scripts/make_icons.py）"
+        );
     }
-    buf
-}
-
-/// 轴对齐圆角矩形，纯整数判定（便于精确单测）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Rect {
-    x0: i32,
-    y0: i32,
-    /// 右边界，**开区间**。
-    x1: i32,
-    /// 下边界，**开区间**。
-    y1: i32,
-    r: i32,
-}
-
-impl Rect {
-    const fn new(x0: i32, y0: i32, x1: i32, y1: i32, r: i32) -> Self {
-        Self { x0, y0, x1, y1, r }
+    let mut buf = img.into_raw();
+    for px in buf.chunks_exact_mut(4) {
+        px.swap(0, 2); // RGBA -> BGRA
     }
-
-    /// 点是否落在矩形内（含圆角切口）。
-    fn contains(&self, px: f32, py: f32) -> bool {
-        let (x, y) = (px as i32, py as i32);
-        if x < self.x0 || x >= self.x1 || y < self.y0 || y >= self.y1 {
-            return false;
-        }
-        if self.r <= 0 {
-            return true;
-        }
-        // 只有四角需要圆角判定：先定位到该角的内切圆心。
-        let cx = if x < self.x0 + self.r {
-            self.x0 + self.r
-        } else if x >= self.x1 - self.r {
-            self.x1 - self.r - 1
-        } else {
-            return true; // 位于上下边之间，整列通过
-        };
-        let cy = if y < self.y0 + self.r {
-            self.y0 + self.r
-        } else if y >= self.y1 - self.r {
-            self.y1 - self.r - 1
-        } else {
-            return true; // 位于左右边之间，整行通过
-        };
-        let (dx, dy) = (x - cx, y - cy);
-        dx * dx + dy * dy <= self.r * self.r
-    }
+    Ok(buf)
 }
 
 /// 托盘回调消息 ID。
@@ -625,7 +584,7 @@ mod imp {
             )
             .context("CreateDIBSection 失败")?;
 
-            let src = icon_rgba();
+            let src = icon_rgba()?;
             if bits.is_null() {
                 let _ = DeleteObject(color.into());
                 anyhow::bail!("CreateDIBSection 返回了空像素指针");
@@ -957,12 +916,16 @@ mod tests {
 
     #[test]
     fn icon_buffer_length_matches_size() {
-        assert_eq!(icon_rgba().len(), ICON_SIZE * ICON_SIZE * 4);
+        assert_eq!(
+            icon_rgba().unwrap().len(),
+            ICON_SIZE * ICON_SIZE * 4,
+            "缓冲长度必须与 CreateDIBSection 申请的字节数一致"
+        );
     }
 
     #[test]
     fn icon_has_visible_pixels() {
-        let buf = icon_rgba();
+        let buf = icon_rgba().unwrap();
         let opaque = buf.chunks_exact(4).filter(|p| p[3] > 0).count();
         assert!(opaque > 100, "图标应有可见像素，实际 {opaque}");
         assert!(opaque < ICON_SIZE * ICON_SIZE, "四角应透明，不应铺满");
@@ -970,7 +933,7 @@ mod tests {
 
     #[test]
     fn icon_corners_are_transparent() {
-        let buf = icon_rgba();
+        let buf = icon_rgba().unwrap();
         let n = ICON_SIZE;
         // 四个角像素的 alpha 必须是 0，否则托盘显示为方块。
         for (x, y) in [(0, 0), (n - 1, 0), (0, n - 1), (n - 1, n - 1)] {
@@ -978,44 +941,36 @@ mod tests {
         }
     }
 
+    /// 板身中部必须是板色：这一条守住「换图标时别把配色换了」。
+    ///
+    /// 坐标取自托盘版几何（板身 x 0.11~0.89、白线 y 0.38~0.47 与
+    /// 0.59~0.68，见 `scripts/make_icons.py::draw_tray_master`）。
     #[test]
     fn icon_has_board_body() {
-        // 板身中部（避开文本线与夹子）必须是板色，且不透明。
-        let buf = icon_rgba();
+        let buf = icon_rgba().unwrap();
         let n = ICON_SIZE;
-        let i = (13 * n + 6) * 4;
-        assert_eq!(&buf[i..i + 4], &COLOR_BOARD);
+        // (6, 11)：板身内、两条白线之间、夹子下方。
+        let i = (11 * n + 6) * 4;
+        assert_eq!(&buf[i..i + 4], &COLOR_BOARD, "板身应为主题蓝（BGRA）");
     }
 
+    /// 白线必须真的画出来了，而且要**两条都**在位。
+    ///
+    /// 判据是「接近白」而不是「精确等于 255」：白线在 32px 下只有
+    /// 两像素高，LANCZOS 缩放会让其中一行落在过渡带上（实测 237,244,254）。
+    /// 卡死精确值会让这条测试在图标做了任何微调后误报。
     #[test]
     fn icon_has_text_lines() {
-        // 三条文本线之一（第16 行）应为白色。
-        let buf = icon_rgba();
+        let buf = icon_rgba().unwrap();
         let n = ICON_SIZE;
-        let i = (16 * n + 12) * 4;
-        assert_eq!(&buf[i..i + 4], &COLOR_TEXT, "文本线应为白色");
-    }
-
-    #[test]
-    fn rect_without_radius_is_full() {
-        let r = Rect::new(0, 0, 10, 10, 0);
-        assert!(r.contains(0.5, 0.5));
-        assert!(r.contains(9.5, 9.5));
-    }
-
-    #[test]
-    fn rect_cuts_corners() {
-        let r = Rect::new(0, 0, 10, 10, 3);
-        assert!(!r.contains(0.5, 0.5), "左上角应被切掉");
-        assert!(r.contains(5.5, 5.5), "中心应命中");
-    }
-
-    #[test]
-    fn rect_respects_open_bounds() {
-        let r = Rect::new(2, 2, 5, 5, 0);
-        assert!(!r.contains(1.5, 3.5), "左界外");
-        assert!(r.contains(2.5, 2.5), "左上角含");
-        assert!(!r.contains(4.5 + 1.0, 2.5), "右界开区间");
+        for y in [13usize, 20usize] {
+            let i = (y * n + 12) * 4;
+            let px = &buf[i..i + 4];
+            assert!(
+                px[0] >= 240 && px[1] >= 240 && px[2] >= 240 && px[3] == 255,
+                "第 {y} 行应是文本线（白），实际 {px:?}"
+            );
+        }
     }
 
     #[test]

@@ -10,6 +10,8 @@ modular-clipboard-capture = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 arboard = { workspace = true }
+# 托盘图标是内嵌的 PNG（assets/tray.png），启动时解码一次。
+image = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
