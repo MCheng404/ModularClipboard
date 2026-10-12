@@ -108,6 +108,11 @@ impl ClipboardReader {
     }
 
     /// 是否有新变化（基于序列号比较）。
+    ///
+    /// CAUTION: 本方法**无条件推进基线**。读取可能失败（剪贴板正被其他
+    /// 进程持有）——先推进基线再读，失败的那次变化就永久丢了。需要
+    /// 「失败可重试」语义的调用方必须用 [`Self::peek_changed`] +
+    /// [`Self::commit_sequence`] 两步式。
     pub fn changed(&mut self) -> bool {
         let seq = current_sequence();
         if seq != self.last_sequence {
@@ -116,6 +121,21 @@ impl ClipboardReader {
         } else {
             false
         }
+    }
+
+    /// 窥探序列号是否变化，**不推进基线**（DF-05）。
+    ///
+    /// 与 [`Self::changed`] 的区别：读取失败时基线未被消费，下一轮还能
+    /// 重试——「复制瞬间剪贴板被 Office/远程桌面等短暂占用」不再永久
+    /// 漏捕这一次复制。
+    pub fn peek_changed(&self) -> bool {
+        current_sequence() != self.last_sequence
+    }
+
+    /// 把当前序列号提交为基线。读取成功、或确认「本次变化无需读取」
+    /// （如自写回抑制期）之后调用。
+    pub fn commit_sequence(&mut self) {
+        self.last_sequence = current_sequence();
     }
 
     /// 同步序列号基线，避免启动瞬间把已有内容当成新复制。
@@ -268,6 +288,28 @@ pub fn current_sequence() -> u32 {
 #[cfg(not(windows))]
 pub fn current_sequence() -> u32 {
     0
+}
+
+/// 剪贴板是否正被其他窗口持有（`OpenClipboard` 后未 `CloseClipboard`）。
+///
+/// 此刻任何读取都会失败，且**失败的读数不可信**——不能据此判定
+/// 「这次变化无需处理」。捕获循环见到 true 时应跳过本轮、保留基线，
+/// 下一轮重试（DF-05：瞬时读取失败不永久丢捕获）。
+#[cfg(windows)]
+pub fn clipboard_held_by_other() -> bool {
+    use windows::Win32::System::DataExchange::GetOpenClipboardWindow;
+    // SAFETY: 纯查询函数，无参数，不持有任何资源。
+    match unsafe { GetOpenClipboardWindow() } {
+        // 非空句柄 = 有窗口正持有剪贴板。
+        Ok(hwnd) => !hwnd.0.is_null(),
+        // 查询失败保守视为「未持有」：不影响主流程，下一轮照常尝试。
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_held_by_other() -> bool {
+    false
 }
 
 /// 前台窗口所属进程名（不含扩展名）。

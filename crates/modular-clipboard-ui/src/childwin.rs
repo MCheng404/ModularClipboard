@@ -283,6 +283,12 @@ impl<'a> ChildWindows<'a> {
     }
 }
 
+impl<'a> Default for ChildWindows<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a> Drop for ChildWindows<'a> {
     fn drop(&mut self) {
         // 元素是 `ChildWindow`，它自己的 `Drop` 会销毁表面；
@@ -321,7 +327,9 @@ impl<'a> ChildWindow<'a> {
         scale_factor: f32,
         shared: &crate::multiwindow::SharedGfx<'a>,
     ) -> anyhow::Result<Self> {
-        let window = Window::new(title, width, height)?;
+        let mut window = Window::new(title, width, height)?;
+        // 与主窗口一致：告知设备纹理上限，否则超采样下字体图集会溢出。
+        window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
         // 立刻定位到卡片记录的位置。
         //
         // NOTE: 早前 `window_pos` 只在「收回时写入」、**从不读取**，
@@ -398,6 +406,14 @@ impl<'a> ChildWindow<'a> {
         }
 
         let raw_input = self.events.egui_input(&self.ctx, &frame_events);
+        // 子窗口的 Context 也要灌主题（F-33 / UI-P1-1）。
+        //
+        // 主窗口（paint.rs 的 draw 入口）与设置窗口每帧都调
+        // `theme::apply` 把 Palette 灌进 egui::Visuals，子窗口却用
+        // egui 默认 visuals——后果是滚动条样式/tooltip 观感与主窗口
+        // 断裂，且 paint.rs 的 `SCROLLBAR_RESERVE` 假设的是主题改过
+        // 的 floating 滚动条宽度，默认样式下内容会被滚动条遮挡。
+        crate::theme::apply(&self.ctx, app.palette());
         // 绘制委托给 `App::draw_child_frame`：它把私有字段的访问
         // 收敛在 app.rs 内部，子窗口模块不需要知道 App 的内部布局。
         let card_id = self.card_id;
@@ -405,6 +421,13 @@ impl<'a> ChildWindow<'a> {
             .ctx
             .run_ui(raw_input, |ui| app.draw_child_frame(ui, card_id));
         let ppp = out.pixels_per_point;
+
+        // 上报拖动区（F-17 / UI-P0-3）：必须在 run_ui **之后**——
+        // 区域是本帧布局算出来的（draw_child 写进 paint_state，
+        // 已在入口 clear，只含本窗的）。WS_POPUP 没有系统标题栏，
+        // 不上报 HTCAPTION 区鼠标就无法移动窗口。
+        let drag = app.drag_regions().to_vec();
+        self.window.set_drag_region_multi(&drag);
         let mut textures_delta = std::mem::take(&mut out.textures_delta);
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
         drop(out);
@@ -419,7 +442,13 @@ impl<'a> ChildWindow<'a> {
         if let Err(e) = self
             .gfx
             .painter
-            .paint(&mut self.gfx.fr, &primitives, ppp, &mut textures_delta)
+            .paint(
+                &mut self.gfx.fr,
+                &primitives,
+                ppp,
+                self.window.scale_factor(),
+                &mut textures_delta,
+            )
         {
             // CAUTION: 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
             // 每次 `acquire()` 都 bail ⇒ **该窗口永久死掉**（黑屏 +

@@ -15,10 +15,16 @@
 
 use ash::vk;
 use modular_clipboard_gfx::Gpu;
+use modular_clipboard_gfx::backdrop::{
+    capture_due, capture_size, DesktopCapture, CAPTURE_INTERVAL,
+};
+use modular_clipboard_gfx::blur::{BlurChain, BlurPipeline, DEFAULT_DIVISOR};
 use modular_clipboard_gfx::buffer::{Buffer, UniformBuffer, Vertex};
 use modular_clipboard_gfx::frame::{DrawInput, FrameRenderer};
 use modular_clipboard_gfx::pipeline::Uniforms;
 use modular_clipboard_gfx::texture::{DeviceImage, FONT_FORMAT, Sampler};
+
+use std::time::Instant;
 
 /// 窗口标题，同时作为 Vulkan 应用标识。
 pub const WINDOW_TITLE: &str = "ModularClipboard";
@@ -158,6 +164,21 @@ impl Batch {
 /// 把一批 [`egui::epaint::ClippedPrimitive`] 转换后写入三个向量
 /// （三者都会被先清空，可反复复用而不重新分配）。
 ///
+/// # 返回值：模糊分割点
+///
+/// 返回**首个** `Primitive::Callback` 出现时已生成的批次数。
+///
+/// # 为什么用 `PaintCallback` 当分割标记
+///
+/// 自研模糊要求把界面拆成「覆盖层之前的内容（要被模糊）」与
+/// 「覆盖层本身（保持清晰）」两段。`ClippedPrimitive` 本身不带
+/// 「这是第几段」的信息，而 `PaintCallback` 是 egui **自带**的
+/// 「此处插入自定义绘制」机制——把它当成渲染层与 UI 层之间的
+/// 分段信号，不需要额外发明协议，且它在 tessellation 里必然保留
+/// 为一个独立的 primitive（不会与相邻网格合并）。
+///
+/// 没有标记时返回 `batches.len()`，调用方据此走普通绘制路径。
+///
 /// # 索引偏移
 ///
 /// egui 的 `Mesh::indices` 是**相对该 mesh 自身顶点数组**的下标。多个 mesh
@@ -174,16 +195,25 @@ pub fn tessellate_into(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
     batches: &mut Vec<Batch>,
-) {
+) -> usize {
     vertices.clear();
     indices.clear();
     batches.clear();
+    // 首个 Callback 出现时的批次数。`None` 表示本帧没有分割标记。
+    let mut blur_split: Option<usize> = None;
 
     for prim in primitives {
         let mesh = match &prim.primitive {
             egui::epaint::Primitive::Mesh(m) => m,
             // PaintCallback 需要用户代码参与光栅化，本渲染器不支持。
-            egui::epaint::Primitive::Callback(_) => continue,
+            //
+            // 但**不丢弃它的位置信息**：它标记了「模糊分割点」——
+            // 之前的批次画到离屏场景图并卷积，之后的批次保持清晰。
+            // 只取第一个标记（一帧内最多一段模糊背景）。
+            egui::epaint::Primitive::Callback(_) => {
+                blur_split.get_or_insert(batches.len());
+                continue;
+            }
         };
         if mesh.indices.is_empty() {
             continue;
@@ -226,41 +256,34 @@ pub fn tessellate_into(
             });
         }
     }
+
+    // 没有分割标记时返回批次数（等价于「全部内容」），调用方据此走普通路径。
+    blur_split.unwrap_or(batches.len())
 }
 
-/// egui 的 `Color32` → 顶点色 `u32`（小端 ABGR）。
+/// egui 的 `Color32` → 顶点色 `u32`（小端 RGBA，着色器按
+/// `unpack4x8unorm` 逐字节展开）。
 ///
-/// # 为什么必须反预乘
+/// # IMPORTANT: 必须原样上传，**不能**反预乘
 ///
 /// epaint 的顶点色是 **sRGBA 预乘 alpha**（`r,g,b` 已乘过 `a`），而
-/// `pipeline.rs` 的混合是 `SRC_ALPHA / ONE_MINUS_SRC_ALPHA`——**非预乘**混合。
-/// 直接上传会让 alpha 被乘两次，半透明区域明显发黑。这类错误不报任何 GPU 错误，
-/// 只是「看起来脏」，极易被漏掉。
+/// `pipeline.rs` 的混合是预乘公式 `ONE / ONE_MINUS_SRC_ALPHA`（与
+/// egui-wgpu 一致）。两者恰好配套：预乘色交给预乘混合，一次完成。
 ///
-/// 着色器输出 `color * vec4(1,1,1,texel.r)`：rgb 不乘覆盖率、只有 alpha 乘覆盖率，
-/// 这正是标准非预乘「over」运算期望的形式。因此这里把颜色还原成非预乘，
-/// 把那一次乘法交回混合阶段完成。
+/// 早前这里做过一次「反预乘」——依据是当时认为混合是直通公式
+/// （`SRC_ALPHA`）。后来管线为修「圆角羽化边缘发暗」改成了预乘公式，
+/// 这里的反预乘却没有跟着删，于是 alpha 被抵消两次：
+/// 半透明填充（选中行 `row_selected`、悬停 `row_hover`、遮罩）的 RGB
+/// 以**全强度**叠加进画面，超出 1.0 的通道被裁剪——浅色主题下
+/// 选中行 (29,101,175)@α52 叠在近白底上裁成 (228,255,255)，即
+/// 用户看到的「选中态发青偏绿」。文字不受影响（alpha=255 时反预乘
+/// 是恒等），所以这个错误长期只在这类低 alpha 大面积填充上显形。
+///
+/// 着色器输出 `color * vec4(1,1,1,cov)`（覆盖率乘全部四通道）：
+/// 预乘色 × 覆盖率仍是预乘色，正是预乘「over」期望的形式。
 pub fn pack_color(c: egui::Color32) -> u32 {
     let [r, g, b, a] = c.to_array();
-    let (r, g, b) = unpremultiply(r, g, b, a);
     u32::from_le_bytes([r, g, b, a])
-}
-
-/// 预乘 → 非预乘。`a == 0` 时 rgb 的信息已在预乘时丢失（乘 0），取 0：
-/// 该像素最终 alpha 为 0，对画面的贡献本来就是 0。
-pub fn unpremultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
-    if a == 255 {
-        return (r, g, b);
-    }
-    if a == 0 {
-        // 除零边界。理论上不可达（egui 的Color32 是预乘的，a=0 时 rgb 必为 0），
-        // 但仍显式返回 0 而不是让除法panic —— 一个「理论上不可达」的分支
-        // 恰恰是最需要写对的地方。
-        return (0, 0, 0);
-    }
-    // 用 u32 计算：r * 255 最大 65025，会溢出 u8。
-    let f = |c: u8| -> u8 { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-    (f(r), f(g), f(b))
 }
 
 /// 构造本帧的 uniform。
@@ -400,8 +423,65 @@ pub struct Painter<'a> {
     bindings_dirty: bool,
     /// 上次写入 uniform 时的内容指纹。
     last_uniform: Option<UniformKey>,
+    /// 后处理资源：超采样离屏目标 + 模糊链（懒创建）。
+    ///
+    /// 超采样倍率 > 1 时每个窗口都需要它（内容先画到 N× 离屏目标再
+    /// 降采样）；模糊链只是复用同一套资源。倍率为 1 时永远为 `None`。
+    post: Option<PostFx>,
+    /// 自研磨砂背景（懒创建，仅主窗口在 Acrylic 模式下存在）。
+    backdrop: BackdropState,
+    /// 磨砂是否已降级过（只记一次告警，避免每帧刷屏）。
+    backdrop_warned: bool,
     /// 累计统计，供上层显示与诊断。
     pub stats: FrameStats,
+}
+
+/// 一帧后处理所需的全部 GPU 资源。
+///
+/// 生命周期与「窗口的**渲染目标**尺寸」绑定：尺寸或超采样倍率变化时
+/// 整体重建。重建前必须 `device_wait_idle`——旧的 framebuffer 与
+/// 图像可能仍被在途命令引用。
+struct PostFx {
+    pipeline: BlurPipeline,
+    chain: BlurChain,
+}
+
+/// 自研磨砂的一帧资源：模糊管线 + 链 + 捕获纹理。
+struct BackdropFx {
+    pipeline: BlurPipeline,
+    chain: BlurChain,
+    /// 捕获的桌面纹理（窗口物理像素尺寸，交换链同格式）。
+    capture_img: DeviceImage,
+    /// 捕获图是否至少上传过一次。
+    ///
+    /// `DeviceImage::new` 只分配内存、不写数据：未上传就采样是未定义
+    /// 行为。首帧捕获失败（最小化/GDI 异常）时底图合成必须跳过，
+    /// 等待第一次成功上传。
+    uploaded: bool,
+}
+
+/// 磨砂背景的运行状态：GPU 资源 + GDI 捕获器 + 节流时间戳 + 背景亮度。
+#[derive(Default)]
+struct BackdropState {
+    fx: Option<BackdropFx>,
+    capture: Option<DesktopCapture>,
+    last_capture: Option<Instant>,
+    /// 上一次成功捕获的背景平均亮度（0~1），供上层决定背景层实度。
+    luminance: Option<f32>,
+}
+
+impl BackdropState {
+    /// 销毁全部 GPU 资源。前置条件：调用方已 `device_wait_idle`。
+    fn destroy(&mut self, gpu: &Gpu) {
+        if let Some(mut fx) = self.fx.take() {
+            fx.chain.destroy(&gpu.device);
+            fx.pipeline.destroy(gpu);
+            fx.capture_img.destroy(&gpu.device);
+        }
+        self.capture = None;
+        self.last_capture = None;
+        self.luminance = None;
+    }
 }
 
 /// 累计统计。
@@ -417,6 +497,17 @@ pub struct FrameStats {
     pub texture_uploads: u64,
     /// 交换链累计重建次数。
     pub rebuilds: u32,
+}
+
+/// 帧合成路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaintMode {
+    /// 普通路径：内容直接画到交换链（或经超采样离屏）。
+    Plain,
+    /// 设置窗口 MCP 覆盖层：分割点之前的内容离屏模糊。
+    OverlayBlur,
+    /// 主窗口自研磨砂：窗口身后桌面的实时模糊作底图。
+    BackdropBlur,
 }
 
 impl<'a> Painter<'a> {
@@ -449,6 +540,10 @@ impl<'a> Painter<'a> {
             // 字体图集尚未创建，首帧上传后必然要绑一次。
             bindings_dirty: true,
             last_uniform: None,
+            // 后处理资源按需创建，见 `ensure_post`。
+            post: None,
+            backdrop: BackdropState::default(),
+            backdrop_warned: false,
             stats: FrameStats::default(),
         })
     }
@@ -469,9 +564,121 @@ impl<'a> Painter<'a> {
         fr: &mut FrameRenderer<'a>,
         primitives: &[egui::epaint::ClippedPrimitive],
         pixels_per_point: f32,
+        dpi_scale: f32,
         textures_delta: &mut egui::TexturesDelta,
     ) -> anyhow::Result<()> {
-        tessellate_into(
+        self.paint_inner(
+            fr,
+            primitives,
+            pixels_per_point,
+            dpi_scale,
+            textures_delta,
+            PaintMode::Plain,
+            None,
+        )
+    }
+
+    /// 与 [`Self::paint`] 相同，但**启用自研 GPU 模糊**。
+    ///
+    /// 当图元里含 `PaintCallback` 分割标记时（见 [`tessellate_into`] 的
+    /// 返回值），把标记**之前**的内容画到离屏场景图并卷积，标记**之后**
+    /// 的内容（覆盖层面板）保持清晰、叠加在模糊底图之上。
+    ///
+    /// 没有标记时行为与 [`Self::paint`] 完全一致——调用方可以无条件
+    /// 走本方法，不必自己判断「这一帧有没有覆盖层」。
+    pub fn paint_blurred(
+        &mut self,
+        fr: &mut FrameRenderer<'a>,
+        primitives: &[egui::epaint::ClippedPrimitive],
+        pixels_per_point: f32,
+        dpi_scale: f32,
+        textures_delta: &mut egui::TexturesDelta,
+    ) -> anyhow::Result<()> {
+        self.paint_inner(
+            fr,
+            primitives,
+            pixels_per_point,
+            dpi_scale,
+            textures_delta,
+            PaintMode::OverlayBlur,
+            None,
+        )
+    }
+
+    /// 与 [`Self::paint`] 相同，但先铺一层「窗口身后桌面的实时模糊」。
+    ///
+    /// 自研磨砂（`WindowBackdrop::Acrylic`）主路径：
+    ///
+    /// ① 节流捕获（[`CAPTURE_INTERVAL`]，约 30fps）——GDI 抓窗口客户区
+    ///    身后的桌面（配合 `WDA_EXCLUDEFROMCAPTURE` 自排除，见
+    ///    [`modular_clipboard_gfx::backdrop`]）；
+    /// ② 上传 GPU → 三趟卷积（降采样 + 横向 + 纵向高斯）；
+    /// ③ 合成：交换链先铺模糊底图（`prelude`），egui 内容叠在其上——
+    ///    背景层按调色板的半透明变体绘制，文字/卡片保持不透明。
+    ///
+    /// # 性能
+    ///
+    /// 捕获 + 上传 + 卷积在 720×800 下约 2ms/次（30fps 节流后占帧预算
+    /// 6%），1/4 分辨率卷积的 GPU 开销可忽略。节流未到或窗口最小化时
+    /// 跳过捕获，直接复用上一帧的模糊结果（`blur_a` 仍在）——不捕获
+    /// 不等于没有底图。
+    ///
+    /// `hwnd` 以 `isize` 传入（UI 层从 `HWND` 转换），仅本方法使用。
+    pub fn paint_backdrop(
+        &mut self,
+        fr: &mut FrameRenderer<'a>,
+        hwnd: isize,
+        primitives: &[egui::epaint::ClippedPrimitive],
+        pixels_per_point: f32,
+        dpi_scale: f32,
+        textures_delta: &mut egui::TexturesDelta,
+    ) -> anyhow::Result<()> {
+        self.paint_inner(
+            fr,
+            primitives,
+            pixels_per_point,
+            dpi_scale,
+            textures_delta,
+            PaintMode::BackdropBlur,
+            Some(hwnd),
+        )
+    }
+
+    /// 启用/停用自研磨砂背景。
+    ///
+    /// 停用时立即销毁 GPU 资源（用户在设置里关掉磨砂不应继续占显存）。
+    /// 需 `device_wait_idle`——在飞命令可能仍引用旧图。
+    pub fn set_backdrop_enabled(&mut self, on: bool) {
+        if on {
+            // 资源在下一帧 paint_backdrop 里懒创建。
+            return;
+        }
+        if let Some(mut fx) = self.backdrop.fx.take() {
+            self.gpu.wait_idle();
+            fx.chain.destroy(&self.gpu.device);
+            fx.pipeline.destroy(self.gpu);
+            fx.capture_img.destroy(&self.gpu.device);
+        }
+        self.backdrop.capture = None;
+        self.backdrop.last_capture = None;
+    }
+
+    /// 一帧的实际绘制逻辑。`mode` 决定走哪条合成路径；
+    /// `backdrop_hwnd` 仅在 [`PaintMode::BackdropBlur`] 下使用。
+    // 参数本来可以拆结构体，但 paint/paint_blurred/paint_backdrop 三个
+    // 薄入口共享同一份签名，拆出去只是把参数列表换个地方排——不值得。
+    #[allow(clippy::too_many_arguments)]
+    fn paint_inner(
+        &mut self,
+        fr: &mut FrameRenderer<'a>,
+        primitives: &[egui::epaint::ClippedPrimitive],
+        pixels_per_point: f32,
+        dpi_scale: f32,
+        textures_delta: &mut egui::TexturesDelta,
+        mode: PaintMode,
+        backdrop_hwnd: Option<isize>,
+    ) -> anyhow::Result<()> {
+        let blur_split = tessellate_into(
             primitives,
             &mut self.vertices,
             &mut self.indices,
@@ -524,23 +731,45 @@ impl<'a> Painter<'a> {
             self.bindings_dirty = true;
         }
 
+        // ---- 渲染目标尺寸（超采样）---------------------------------------
+        //
+        // 界面先画到 `render_extent` 的离屏目标，再降采样到交换链。
+        // `render_extent = 交换链尺寸 × 超采样倍率`。
+        //
+        // IMPORTANT: uniform 与批次裁剪都必须用 `render_extent`（不是
+        // `fr.extent()`）——它们描述的是**绘制目标**的像素空间，
+        // 而目标比交换链大 `render_scale` 倍。用错会让整幅画面只占
+        // 左上 1/N（与历史上「UI 只画左上角 2/3」同源，且同样不报错）。
+        let ssaa = if dpi_scale > 0.01 {
+            // 反推：窗口层设的 ppp = dpi_scale × 实际倍率。
+            // 夹到 [1,3] 与 `render_scale()` 的取值域一致，防脏数据。
+            (pixels_per_point / dpi_scale).clamp(1.0, 3.0)
+        } else {
+            1.0
+        };
+        let swap_extent = fr.extent();
+        let render_extent = vk::Extent2D {
+            width: ((swap_extent.width as f32 * ssaa).round() as u32).max(1),
+            height: ((swap_extent.height as f32 * ssaa).round() as u32).max(1),
+        };
+
         // ---- 描述符绑定 -------------------------------------------------
         if let Some(f) = self.font.as_ref() {
             if self.bindings_dirty {
                 self.bind_all(fr, f)?;
                 self.bindings_dirty = false;
             }
-            // uniform 内容只随「表面尺寸 / dpr」变化。多帧在途时改写同一份
+            // uniform 内容只随「渲染目标尺寸 / dpr」变化。多帧在途时改写同一份
             // uniform 缓冲会被上一帧的 GPU 读到，因此**只在内容真的变了才写**
             // ——写相同内容则不存在竞态。
             let key = UniformKey {
-                width: fr.extent().width,
-                height: fr.extent().height,
+                width: render_extent.width,
+                height: render_extent.height,
                 pixels_per_point,
             };
             if self.last_uniform != Some(key) {
                 self.uniform
-                    .write(&self.gpu.device, &uniforms_for(fr.extent(), pixels_per_point))?;
+                    .write(&self.gpu.device, &uniforms_for(render_extent, pixels_per_point))?;
                 self.last_uniform = Some(key);
             }
         }
@@ -550,15 +779,382 @@ impl<'a> Painter<'a> {
         self.draw_batches.extend(
             self.batches
                 .iter()
-                .map(|b| b.to_draw(fr.extent(), pixels_per_point)),
+                .map(|b| b.to_draw(render_extent, pixels_per_point)),
         );
+
+        // 模糊路径仅在「覆盖层模式 + 本帧确有分割标记 + 标记两侧都有内容」
+        // 时走。标记落在 0（覆盖层前没有内容）或末尾（没有覆盖层）时走
+        // 普通路径——那时模糊没有可糊的东西，白跑三趟卷积。
+        let use_blur =
+            mode == PaintMode::OverlayBlur && blur_split > 0 && blur_split < self.draw_batches.len();
+        let use_backdrop = mode == PaintMode::BackdropBlur;
+        // 模糊链相对渲染目标的降采样倍数：乘上超采样倍率后，`blur_a`
+        // 恒为交换链的 1/4——模糊强度不随超采样设置变化。
+        let divisor = (DEFAULT_DIVISOR as f32 * ssaa).round() as u32;
+        let vertex_buffer = self.slots.vertex_buffer(slot);
+        let index_buffer = self.slots.index_buffer(slot);
+
+        // ---- 自研磨砂：捕获 → 上传 → 卷积 --------------------------------
+        //
+        // 必须在**任何渲染通道**录制之前：纹理上传不允许出现在渲染通道
+        // 作用域内（Vulkan 硬约束），卷积本身也要在交换链那趟通道之前完成。
+        //
+        // 节流未到 / 最小化 / 尺寸未定时不捕获——`blur_a` 仍持有上一帧的
+        // 模糊结果，底图照铺，只是内容不更新（磨砂背景对 33ms 的延迟不敏感）。
+        if use_backdrop {
+            self.record_backdrop_blur(
+                fr,
+                backdrop_hwnd.unwrap_or_default(),
+                render_extent,
+                divisor,
+            )?;
+        }
+        // 合成底图用的句柄（`Blit` 是 Copy 的小结构，先取出避免借用冲突）。
+        // 首帧尚未上传过捕获图时不能铺底图（采样未初始化图像是 UB），
+        // 退化为透明清屏 + 半透明背景层——下一帧自动恢复。
+        let backdrop_blit = if use_backdrop
+            && self.backdrop.fx.as_ref().is_some_and(|fx| fx.uploaded)
+        {
+            Some(self.backdrop.fx.as_ref().expect("上面刚检查过").pipeline.composite())
+        } else {
+            None
+        };
+
+        // 超采样倍率为 1 时不做离屏，直接画到交换链（最省的老路径，
+        // 也是出问题时的逃生开关）。
+        if ssaa <= 1.0 {
+            let input = DrawInput {
+                vertex_buffer,
+                index_buffer,
+                batches: &self.draw_batches,
+                prelude: backdrop_blit,
+                ..Default::default()
+            };
+            return fr.record(&input);
+        }
+
+        // ---- 超采样：内容 → 离屏目标 → 降采样到交换链 ---------------------
+        //
+        // 顺序不能换：内容必须**先**画到离屏图；模糊要读它；合成也必须
+        // 发生在离屏图上（这样覆盖层面板同样获得超采样），最后统一降采样。
+        self.ensure_post(fr, render_extent, divisor)?;
+        let gpu = self.gpu;
+        let cmd = fr
+            .current_command_buffer()
+            .ok_or_else(|| anyhow::anyhow!("超采样路径要求 acquire 已成功"))?;
+        let render_pass = fr.render_pass();
+
+        let res = self.post.as_mut().expect("ensure_post 刚确保存在");
+
+        // ① 内容 → 离屏场景图（模糊时只画分割点之前的部分）。
+        let content = if use_blur {
+            &self.draw_batches[..blur_split]
+        } else {
+            &self.draw_batches[..]
+        };
+        let scene_input = DrawInput {
+            vertex_buffer,
+            index_buffer,
+            batches: content,
+            // 磨砂底图先铺进场景图（模糊结果上采样），egui 内容再叠加。
+            prelude: backdrop_blit,
+            ..Default::default()
+        };
+        fr.record_to(
+            res.chain.scene.framebuffer,
+            res.chain.scene.extent,
+            &scene_input,
+        )?;
+        // IMPORTANT: 离屏 pass 必须自己收尾——`present` 只会关闭**交换链**
+        // 那一趟通道。漏掉这里，紧随其后的卷积/合成会因「已有通道激活」
+        // 全部失败（`cmd_begin_render_pass` 报错，画面全黑）。
+        fr.end_pass();
+
+        if use_blur {
+            // ② 降采样 + 横向卷积 + 纵向卷积。
+            res.pipeline.record(gpu, cmd, &mut res.chain, render_pass)?;
+
+            // ③ 把「模糊底图 + 覆盖层清晰图元」重新画回场景图。
+            //
+            // 为什么不在交换链上直接画：交换链只有 1× 分辨率，而覆盖层
+            // 图元的顶点按 `dpr = ppp`（含超采样倍率）换算，直接画会
+            // 放大 N 倍溢出。先合成到 N× 的场景图，最后统一降采样，
+            // 覆盖层面板才能和背景一样享受抗锯齿。
+            let composite_input = DrawInput {
+                vertex_buffer,
+                index_buffer,
+                batches: &self.draw_batches[blur_split..],
+                prelude: Some(res.pipeline.composite()),
+                ..Default::default()
+            };
+            fr.record_to(
+                res.chain.scene.framebuffer,
+                res.chain.scene.extent,
+                &composite_input,
+            )?;
+            fr.end_pass();
+        }
+
+        // ④ 场景图 → 交换链（线性降采样，抗锯齿就在这里发生）。
         let input = DrawInput {
-            vertex_buffer: self.slots.vertex_buffer(slot),
-            index_buffer: self.slots.index_buffer(slot),
-            batches: &self.draw_batches,
+            vertex_buffer,
+            index_buffer,
+            batches: &[],
+            prelude: Some(res.pipeline.downsample()),
             ..Default::default()
         };
         fr.record(&input)
+    }
+
+    /// 确保后处理资源存在且与当前**渲染目标**尺寸匹配，否则（重）创建。
+    ///
+    /// # 参数
+    /// - `render_extent`：超采样后的渲染目标尺寸（交换链 × 倍率）。
+    /// - `divisor`：模糊链相对**渲染目标**的降采样倍数。它已经乘过
+    ///   超采样倍率，因此 `blur_a` 的实际分辨率始终约为交换链的 1/4
+    ///   ——不随超采样倍率变化，模糊强度保持一致。
+    ///
+    /// # 为什么在这里等 GPU 空闲
+    ///
+    /// 重建会销毁旧的 framebuffer / 图像，而在飞命令可能仍引用它们。
+    /// `wait_idle` 在本场景下代价可忽略——只在首帧或窗口 resize 后触发，
+    /// 不是每帧。
+    fn ensure_post(
+        &mut self,
+        fr: &FrameRenderer<'a>,
+        render_extent: vk::Extent2D,
+        divisor: u32,
+    ) -> anyhow::Result<()> {
+        let up_to_date = self
+            .post
+            .as_ref()
+            .is_some_and(|p| p.chain.matches(render_extent, divisor));
+        if up_to_date {
+            return Ok(());
+        }
+
+        if let Some(mut old) = self.post.take() {
+            self.gpu.wait_idle();
+            old.chain.destroy(&self.gpu.device);
+            old.pipeline.destroy(self.gpu);
+        }
+
+        let render_pass = fr.render_pass();
+        let format = fr.format();
+        let mut pipeline = BlurPipeline::new(self.gpu, render_pass)?;
+        let chain = BlurChain::new(self.gpu, render_pass, format, render_extent, divisor)?;
+        // 描述符集必须在链创建之后写一次——它引用链里的图像视图。
+        pipeline.configure(self.gpu, &chain)?;
+        tracing::debug!(
+            ?render_extent,
+            divisor,
+            low = ?chain.blur_a.extent,
+            "超采样/模糊资源已创建"
+        );
+        self.post = Some(PostFx { pipeline, chain });
+        Ok(())
+    }
+
+    /// 采样估算图像的平均亮度（0~1，sRGB 字节域的 Rec.709 加权均值）。
+///
+/// 只用于「背景该压多实」这类粗粒度决策，因此**稀疏采样**即可：
+/// 每 97 个像素取一个（素数步长，避免与行宽对齐产生条纹偏差）。
+/// 每帧成本约 260×400/97 ≈ 1000 次加法，可忽略。
+fn luminance_of(rgba: &[u8]) -> f32 {
+    let mut sum: u64 = 0;
+    let mut n: u64 = 0;
+    let mut i = 0usize;
+    while i + 2 < rgba.len() {
+        // Rec.709 亮度权重（整数化：2126/7152/722 ≈ 0.2126/0.7152/0.0722）
+        sum += 2126 * u64::from(rgba[i])
+            + 7152 * u64::from(rgba[i + 1])
+            + 722 * u64::from(rgba[i + 2]);
+        n += 10_000;
+        i += 4 * 97;
+    }
+    if n == 0 {
+        return 0.5;
+    }
+    (sum as f32 / n as f32 / 255.0).clamp(0.0, 1.0)
+}
+
+/// 背景（窗口身后桌面）的平均亮度，`None` = 还没有成功捕获过。
+pub fn backdrop_luminance(&self) -> Option<f32> {
+    self.backdrop.luminance
+}
+
+/// 交换链为 RGBA 字节序时需要 R/B 交换（GDI DIB 恒为 BGRA）。
+    ///
+    /// `pick_format` 只会给出 `B8G8R8A8_UNORM` / `R8G8B8A8_UNORM` 两种；
+    /// 其余（单格式表面报出的罕见格式）按不交换处理——错序仅影响
+    /// 磨砂底图偏色，不影响主流程。
+    fn needs_rb_swap(format: vk::Format) -> bool {
+        matches!(
+            format,
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB
+        )
+    }
+
+    /// 自研磨砂：按需创建资源，节流捕获窗口身后的桌面并卷积。
+    ///
+    /// 在 `paint_inner` 的所有渲染通道之前调用（上传不能进渲染通道，
+    /// 卷积要在交换链那趟通道前完成）。任何一步失败都只记日志并跳过
+    /// ——磨砂是观感增强，绝不能把渲染主流程带崩。
+    fn record_backdrop_blur(
+        &mut self,
+        fr: &mut FrameRenderer<'a>,
+        hwnd: isize,
+        render_extent: vk::Extent2D,
+        divisor: u32,
+    ) -> anyhow::Result<()> {
+        let swap_extent = fr.extent();
+        let format = fr.format();
+        if hwnd == 0 {
+            return Ok(());
+        }
+        self.ensure_backdrop(fr, render_extent, swap_extent, divisor, format)?;
+
+        // 节流：未到间隔直接复用上一帧的模糊结果。
+        let now = Instant::now();
+        if !capture_due(self.backdrop.last_capture, now, CAPTURE_INTERVAL) {
+            return Ok(());
+        }
+
+        // 拆字段借用：`fx` 与 `capture` 是 `BackdropState` 的两个互不相交
+        // 字段，逐字段借比整体 `&mut self.backdrop` 少一层间接冲突。
+        let BackdropState {
+            fx,
+            capture,
+            last_capture,
+            luminance,
+        } = &mut self.backdrop;
+        let fx = fx.as_mut().expect("ensure_backdrop 刚确保存在");
+
+        // 捕获。GDI 初始化失败属于「永不发生但必须兜住」的分支：
+        // 降级为本帧不更新底图（已上传过的话上一帧结果仍在用）。
+        let cap = match capture {
+            Some(c) => c,
+            None => match DesktopCapture::new(Self::needs_rb_swap(format)) {
+                Ok(c) => capture.insert(c),
+                Err(e) => {
+                    tracing::warn!("桌面捕获器初始化失败，磨砂背景停更: {e:#}");
+                    return Ok(());
+                }
+            },
+        };
+        let Some((bits, w, h)) = cap.capture_behind(hwnd)? else {
+            return Ok(()); // 最小化：跳过
+        };
+        if (w, h) != capture_size(swap_extent.width, swap_extent.height) {
+            // resize 竞态：客户区已变、交换链还没重建。跳过本帧，
+            // 等下一轮 swapchain 重建后尺寸自然对齐。
+            return Ok(());
+        }
+
+        // 上传 + 三趟卷积（降采样、横向、纵向）。
+        //
+        // CAUTION: 这两步的失败必须**就地降级**，不能往上冒泡。
+        // 早期版本让上传错误冒泡，首帧「字体图集 + 桌面捕获」同时上传
+        // 撑满 staging arena 时，主循环直接以「启动失败」退出——
+        // 一个观感增强不该有这个权限。降级后本帧沿用上一帧的底图。
+        // 记下本帧背景的**平均亮度**（0~1）。渲染层据此调整背景层实度：
+        // 纯黑壁纸 + 浅色主题时，若背景层太透，深色文字会落在被压暗的
+        // 背景上，对比度直接崩掉（这是纯色桌面下最实际的可读性问题）。
+        *luminance = Some(Self::luminance_of(bits));
+
+        let cmd = match fr.current_command_buffer() {
+            Some(c) => c,
+            None => {
+                self.warn_backdrop("拿不到当前命令缓冲");
+                return Ok(());
+            }
+        };
+        let render_pass = fr.render_pass();
+        let gpu = self.gpu;
+        if let Err(e) = fr.record_texture_upload(&mut fx.capture_img, bits, None, (w, h)) {
+            self.warn_backdrop(&format!("桌面位图上传失败: {e:#}"));
+            return Ok(());
+        }
+        if let Err(e) = fx.pipeline.record_from(
+            gpu,
+            cmd,
+            &mut fx.chain,
+            render_pass,
+            fx.pipeline.backdrop_set(),
+        ) {
+            self.warn_backdrop(&format!("模糊链录制失败: {e:#}"));
+            return Ok(());
+        }
+        fx.uploaded = true;
+        *last_capture = Some(now);
+        Ok(())
+    }
+
+    /// 磨砂降级告警：只记一次，避免每帧刷屏。
+    fn warn_backdrop(&mut self, msg: &str) {
+        if !self.backdrop_warned {
+            self.backdrop_warned = true;
+            tracing::warn!("磨砂背景降级（沿用上一张底图）: {msg}");
+        }
+    }
+
+    /// 确保磨砂资源存在且尺寸匹配，否则整体重建。
+    ///
+    /// 模糊链按 `render_extent`（超采样后）建，`divisor` 已乘过超采样
+    /// 倍率——与 `ensure_post` 同一套口径，`blur_a` 恒为交换链 1/4。
+    /// 捕获图按**交换链**尺寸建（BitBlt 读的就是客户区物理像素）。
+    fn ensure_backdrop(
+        &mut self,
+        fr: &FrameRenderer<'a>,
+        render_extent: vk::Extent2D,
+        swap_extent: vk::Extent2D,
+        divisor: u32,
+        format: vk::Format,
+    ) -> anyhow::Result<()> {
+        let (cw, ch) = capture_size(swap_extent.width, swap_extent.height);
+        let up_to_date = self.backdrop.fx.as_ref().is_some_and(|fx| {
+            fx.chain.matches(render_extent, divisor)
+                && fx.capture_img.size == vk::Extent2D { width: cw, height: ch }
+        });
+        if up_to_date {
+            return Ok(());
+        }
+        if let Some(mut old) = self.backdrop.fx.take() {
+            self.gpu.wait_idle();
+            old.chain.destroy(&self.gpu.device);
+            old.pipeline.destroy(self.gpu);
+            old.capture_img.destroy(&self.gpu.device);
+        }
+        let render_pass = fr.render_pass();
+        let mut pipeline = BlurPipeline::new(self.gpu, render_pass)?;
+        let chain = BlurChain::new(self.gpu, render_pass, format, render_extent, divisor)?;
+        // 捕获图按**降采样后**的尺寸建（见 `CAPTURE_DOWNSCALE`）：
+        // 全分辨率上传会把 staging arena 撑满。
+        let (cw, ch) = capture_size(swap_extent.width, swap_extent.height);
+        let capture_img = DeviceImage::new(
+            self.gpu,
+            vk::Extent2D {
+                width: cw,
+                height: ch,
+            },
+            format,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        )?;
+        // 描述符集引用链与捕获图的视图，两者就绪后写一次。
+        pipeline.bind_source(self.gpu, capture_img.view)?;
+        tracing::debug!(
+            ?render_extent,
+            ?swap_extent,
+            divisor,
+            "磨砂背景资源已创建"
+        );
+        self.backdrop.fx = Some(BackdropFx {
+            pipeline,
+            chain,
+            capture_img,
+            uploaded: false,
+        });
+        Ok(())
     }
 
     /// 交换链重建后重整资源。
@@ -576,6 +1172,18 @@ impl<'a> Painter<'a> {
         if self.slots.buffers.len() != want {
             self.slots.resize(self.gpu, want)?;
         }
+        // 离屏目标按交换链尺寸派生，重建后尺寸可能不符。
+        // 整体销毁，下一帧按新尺寸懒重建。
+        //
+        // IMPORTANT: 此处可以安全销毁——`rebuild_swapchain` 开头已
+        // `device_wait_idle`，在飞命令全部完成。
+        if let Some(mut b) = self.post.take() {
+            b.chain.destroy(&self.gpu.device);
+            b.pipeline.destroy(self.gpu);
+        }
+        // 磨砂资源按交换链/渲染目标尺寸派生，同样整体销毁、下帧懒重建。
+        // `rebuild_swapchain` 已 `device_wait_idle`，销毁安全。
+        self.backdrop.destroy(self.gpu);
         self.stats.rebuilds += 1;
         Ok(())
     }
@@ -725,6 +1333,8 @@ impl<'a> Painter<'a> {
                             vk::ImageUsageFlags::TRANSFER_DST
                                 | vk::ImageUsageFlags::SAMPLED,
                         )?);
+                        // 图集尺寸是「字形画错」类问题的关键数据，留一条 debug。
+                        tracing::debug!(w, h, "字体图集纹理已重建");
                     }
                 }
 
@@ -768,6 +1378,14 @@ impl Drop for Painter<'_> {
         if let Some(mut t) = self.placeholder.take() {
             t.destroy(&self.gpu.device);
         }
+        // 后处理资源（离屏图 + framebuffer + 管线 + 描述符池）同样必须销毁：
+        // 漏掉会让验证层在退出时报 `VUID-vkDestroyDevice-device-05137`。
+        if let Some(mut b) = self.post.take() {
+            b.chain.destroy(&self.gpu.device);
+            b.pipeline.destroy(self.gpu);
+        }
+        // 磨砂背景资源同理：漏销毁会在退出时报 VUID-vkDestroyDevice-device-05137。
+        self.backdrop.destroy(self.gpu);
         self.sampler.destroy(&self.gpu.device);
         self.slots.destroy(&self.gpu.device);
         self.uniform.destroy(&self.gpu.device);
@@ -982,56 +1600,18 @@ mod tests {
     }
 
     #[test]
-    fn opaque_colors_survive_unpremultiply() {
-        for c in [
-            egui::Color32::WHITE,
-            egui::Color32::BLACK,
-            egui::Color32::from_rgb(1, 127, 254),
-        ] {
-            assert_eq!(
-                unpremultiply(c.r(), c.g(), c.b(), 255),
-                (c.r(), c.g(), c.b())
-            );
-        }
-    }
-
-    #[test]
-    fn zero_alpha_yields_black_not_overflow() {
-        // a=0 是除零边界。
-        //
-        // 注意：egui 的 `Color32` 内部是**预乘**的，a=0 时rgb 必然已经是 0
-        // （预乘就是乘 alpha），所以拿一个 rgb 非零、a=0 的组合来测是
-        // 构造不出来的。这里直接验证函数在 a=0 时不panic 且返回 0。
-        assert_eq!(unpremultiply(0, 0, 0, 0), (0, 0, 0));
-        // 真实可达的边界：egui 的 TRANSPARENT。
-        let t = egui::Color32::TRANSPARENT;
-        assert_eq!(unpremultiply(t.r(), t.g(), t.b(), t.a()), (0, 0, 0));
-    }
-
-    #[test]
-    fn half_alpha_is_restored_to_full_channel() {
-        // 预乘 50% 后 rgb 约为一半；反预乘应还原到接近原值。
-        let half = egui::Color32::from_rgb(200, 100, 40).gamma_multiply(0.5);
-        let (gr, gg, gb) = unpremultiply(half.r(), half.g(), half.b(), half.a());
-        for (g, want) in [gr, gg, gb].into_iter().zip([200u8, 100, 40]) {
-            assert!(
-                (g as i32 - want as i32).abs() <= 2,
-                "反预乘误差过大：得到 {g}，期望约 {want}"
-            );
-        }
-    }
-
-    #[test]
-    fn unpremultiply_never_exceeds_255() {
-        // 预乘的舍入误差可能让反预乘结果略大于原值，函数内部必须夹住。
-        // 用 u32 中转比较——直接写 `r <= 255` 会被编译器判为恒真（u8 上界），
-        // 那样这个测试就什么都没验证。
-        for a in 1..=254u8 {
-            let (r, g, b) = unpremultiply(255, 255, 255, a);
-            for v in [r, g, b] {
-                assert!(u32::from(v) <= 255, "反预乘结果 {v} 溢出 u8");
-            }
-        }
+    fn semi_transparent_colors_are_uploaded_premultiplied() {
+        // 回归：早前这里对预乘顶点色做了「反预乘」，与管线的预乘混合
+        // （ONE / ONE_MINUS_SRC_ALPHA）双重抵消，半透明选中色以全强度
+        // 叠加、超界通道被裁剪，浅色主题下选中行发青偏绿。
+        // 正确行为：预乘色原样上传，不做任何换算。
+        let c = egui::Color32::from_rgba_unmultiplied(0x1D, 0x65, 0xAF, 52);
+        let packed = pack_color(c);
+        // egui 存储即预乘：r = round(29×52/255) = 6
+        assert_eq!(packed & 0xFF, 6, "最低字节应是预乘后的红");
+        assert_eq!((packed >> 8) & 0xFF, 21, "预乘后的绿");
+        assert_eq!((packed >> 16) & 0xFF, 36, "预乘后的蓝");
+        assert_eq!((packed >> 24) & 0xFF, 52, "alpha 原样");
     }
 
     #[test]
@@ -1134,6 +1714,70 @@ mod tests {
         let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
         tessellate_into(&[p], &mut v, &mut i, &mut b);
         assert!(b.is_empty() && v.is_empty());
+    }
+
+    /// 造一个 `PaintCallback` 图元，充当模糊分割标记。
+    fn callback_prim() -> ClippedPrimitive {
+        ClippedPrimitive {
+            clip_rect: rect_at(0.0),
+            primitive: Primitive::Callback(egui::epaint::PaintCallback {
+                rect: rect_at(0.0),
+                callback: std::sync::Arc::new(|_: &ClippedPrimitive| {}),
+            }),
+        }
+    }
+
+    #[test]
+    fn callback_marks_blur_split_at_batch_boundary() {
+        // 标记前两个网格、标记后一个 ⇒ 分割点应为 2（标记本身不成批）。
+        let prims = vec![
+            prim_with_clip(rect_at(0.0)),
+            prim_with_clip(rect_at(20.0)),
+            callback_prim(),
+            prim_with_clip(rect_at(40.0)),
+        ];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        let split = tessellate_into(&prims, &mut v, &mut i, &mut b);
+
+        assert_eq!(split, 2, "分割点必须落在标记之前已生成的批次数上");
+        assert_eq!(b.len(), 3, "标记本身不产生批次");
+        // 分割点必须严格落在批次区间内，否则调用方会切出空区间。
+        assert!(split < b.len());
+    }
+
+    #[test]
+    fn no_callback_means_split_is_all_batches() {
+        // 没有标记 ⇒ 分割点 = 批次数，调用方据此走普通绘制路径
+        // （不能把「全部内容」误判成「全部要模糊」）。
+        let prims = vec![prim_with_clip(rect_at(0.0)), prim_with_clip(rect_at(20.0))];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        let split = tessellate_into(&prims, &mut v, &mut i, &mut b);
+        assert_eq!(split, b.len(), "无标记时分割点应等于批次数");
+    }
+
+    #[test]
+    fn first_callback_wins_when_multiple_present() {
+        // 一帧内最多一段模糊背景：出现多个标记时只认第一个，
+        // 否则后面的标记会把分割点推到覆盖层内部。
+        let prims = vec![
+            prim_with_clip(rect_at(0.0)),
+            callback_prim(),
+            prim_with_clip(rect_at(20.0)),
+            callback_prim(),
+        ];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        let split = tessellate_into(&prims, &mut v, &mut i, &mut b);
+        assert_eq!(split, 1, "只认第一个标记");
+    }
+
+    #[test]
+    fn callback_at_start_yields_zero_split() {
+        // 标记在第一个图元之前 ⇒ 分割点为 0。调用方据此判定
+        // 「标记前没有内容」，退回普通路径（模糊没有可糊的东西）。
+        let prims = vec![callback_prim(), prim_with_clip(rect_at(0.0))];
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        let split = tessellate_into(&prims, &mut v, &mut i, &mut b);
+        assert_eq!(split, 0);
     }
 
     #[test]
@@ -1634,8 +2278,10 @@ mod tests {
     fn initial_capacities_cover_a_typical_frame() {
         // 初始容量太小会让首帧就触发一次缓冲重建（多一次 GPU 分配）。
         // 2000 顶点的界面在剪贴板场景里算大，8192 起步合理。
-        assert!(INITIAL_VERTEX_CAPACITY >= 2048);
-        assert!(INITIAL_INDEX_CAPACITY >= INITIAL_VERTEX_CAPACITY);
+        const {
+            assert!(INITIAL_VERTEX_CAPACITY >= 2048);
+            assert!(INITIAL_INDEX_CAPACITY >= INITIAL_VERTEX_CAPACITY);
+        }
     }
 
     #[test]

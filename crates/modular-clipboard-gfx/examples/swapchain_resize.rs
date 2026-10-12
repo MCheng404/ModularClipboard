@@ -530,10 +530,10 @@ fn move_window(
 /// 只靠一段散文约束。
 fn resize_enabled_from(value: Option<&OsStr>) -> bool {
     let Some(v) = value else { return false };
-    match v.to_string_lossy().trim().to_ascii_lowercase().as_str() {
-        "" | "0" | "false" | "off" | "no" => false,
-        _ => true,
-    }
+    !matches!(
+        v.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "off" | "no"
+    )
 }
 
 // ---------------------------------------------------------------------------

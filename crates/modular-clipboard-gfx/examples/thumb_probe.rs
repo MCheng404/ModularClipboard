@@ -388,7 +388,7 @@ fn part2_production_upload(gpu: &Gpu, fr: &mut FrameRenderer<'_>) -> UploadOutco
         }
     };
 
-    let rgba = flatten(checkerboard(h).pixels.iter().copied().collect());
+    let rgba = flatten(checkerboard(h).pixels.to_vec());
     let r8_expected = modular_clipboard_gfx::texture::staging_size_r8(w, h);
     println!("   缩略图 {w}x{h}：{} 像素，实际传 {} 字节", w * h, rgba.len());
     println!("   upload() 的字节校验期望 {r8_expected} 字节（staging_size_r8 = w*h）");
@@ -568,7 +568,7 @@ fn part3_ab_pixel_readback(
         vk::Format::R8G8B8A8_UNORM,
         vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
     )?;
-    let thumb_rgba = flatten(checkerboard(THUMB).pixels.iter().copied().collect());
+    let thumb_rgba = flatten(checkerboard(THUMB).pixels.to_vec());
 
     {
         // staging 生命周期必须覆盖 GPU 执行时间，所以活到 submit_and_wait 之后。
@@ -1004,7 +1004,7 @@ fn checkerboard(size: u32) -> egui::ColorImage {
     let mut px = Vec::with_capacity((size * size) as usize);
     for y in 0..size {
         for x in 0..size {
-            let odd = ((x / cell) + (y / cell)) % 2 == 0;
+            let odd = ((x / cell) + (y / cell)).is_multiple_of(2);
             px.push(if odd {
                 egui::Color32::from_rgb(255, 0, 0)
             } else {

@@ -15,6 +15,8 @@
 
 use std::ffi::CString;
 
+pub mod backdrop;
+pub mod blur;
 pub mod buffer;
 pub mod chrome;
 pub mod frame;
@@ -37,7 +39,7 @@ use khr::surface::Instance as SurfaceLoader;
 /// 这在 Vulkan 1.1 下是 `VUID-vkUpdateDescriptorSets-None-03047` 违规：
 ///
 /// > 绑定若创建时未带 `UPDATE_AFTER_BIND_BIT` 或
-/// `UPDATE_UNUSED_WHILE_PENDING_BIT`，其描述符集就不得被处于
+/// > `UPDATE_UNUSED_WHILE_PENDING_BIT`，其描述符集就不得被处于
 /// > pending 状态的命令缓冲使用中的描述符集。
 ///
 /// # 为什么不能靠等fence 规避
@@ -126,6 +128,84 @@ impl GpuPreference {
 /// GPU 选择偏好环境变量。
 pub const ENV_GPU_PREF: &str = "MODULARCLIPBOARD_GPU";
 
+/// 超采样倍率环境变量。
+pub const ENV_RENDER_SCALE: &str = "MODULARCLIPBOARD_SSAA";
+
+/// 默认超采样倍率。
+///
+/// 取 2.0：界面先渲染到 2× 分辨率的离屏目标，再线性降采样到交换链。
+/// 这样**几何边缘（圆角、描边）与字体**同时获得抗锯齿——MSAA 只能
+/// 改善几何，而字形的锯齿来自纹理采样，MSAA 无能为力。
+///
+/// 代价是片元工作量 ×4。本程序的界面以大面积纯色矩形为主，
+/// 720×800 的窗口放大到 1440×1600 也只有 2.3M 像素，桌面 GPU 毫无压力。
+pub const DEFAULT_RENDER_SCALE: f32 = 2.0;
+
+/// 超采样倍率上限对应的 **ppp 上限**。
+///
+/// # 为什么必须有这个上限
+///
+/// 超采样通过抬高 egui 的 `pixels_per_point` 实现（见
+/// [`crate::window::EventLoop::egui_input`]）。实测：`ppp = 2.25` 时
+/// 界面一切正常，`ppp = 3.0` 时**图标字形被画坏**——齿轮丢齿、
+/// 垃圾桶丢盖、图钉丢针，看起来像「只画出了字形中心、外围被裁掉」。
+///
+/// 根因尚未完全定位（已排除字体图集容量：上限从 2048 提到设备的
+/// 16384 后现象不变）。在查清之前，用这个上限把 ppp 挡在已知安全的
+/// 区间内——`ppp = 3.0` 恰好是 **200% DPI 屏 × 倍率 1.5** 会踩到的值，
+/// 不加限制等于给高分屏用户埋雷。
+///
+/// 取值 2.25 是**实测安全边界**，不是理论值。
+pub const MAX_RENDER_PPP: f32 = 2.25;
+
+/// 读取超采样倍率（进程内缓存）。
+///
+/// 取值来自 [`ENV_RENDER_SCALE`]，缺省 [`DEFAULT_RENDER_SCALE`]。
+/// 结果钳到 `[1.0, 3.0]`：
+/// - **下限 1.0** 表示关闭超采样，直接渲染到交换链（旧的、最省的做法），
+///   这是出问题时的逃生开关；
+/// - 上限 3.0 防止误设成 100 之类的值把显存吃光。
+///
+/// 非法值（非数字、NaN）回落到默认值而不是报错——这是显示质量选项，
+/// 不该因为一个环境变量写错就让程序起不来。
+pub fn render_scale() -> f32 {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<f32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let raw = std::env::var(ENV_RENDER_SCALE).ok();
+        let v = raw
+            .as_deref()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(DEFAULT_RENDER_SCALE)
+            .clamp(1.0, 3.0);
+        if let Some(r) = raw.as_deref() {
+            tracing::info!(raw = r, used = v, "超采样倍率（{ENV_RENDER_SCALE}）");
+        }
+        v
+    })
+}
+
+/// 按窗口 DPI 缩放求**实际生效**的超采样倍率。
+///
+/// 与 [`render_scale`] 的区别：这里把「`ppp = dpi_scale × 倍率` 不超过
+/// [`MAX_RENDER_PPP`]」这条约束算进去。
+///
+/// # 为什么窗口层与渲染层必须调用同一个函数
+///
+/// 渲染目标尺寸 = `客户区物理像素 × 倍率`，而 `ppp = dpi_scale × 倍率`。
+/// 两处若各算各的（例如窗口层夹了上限、渲染层没夹），
+/// `screen_rect × ppp == 渲染目标像素` 这条不变式就断了——
+/// 表现是画面整体缩放错误，且**不报任何 GPU 错误**。
+pub fn render_scale_for(dpi_scale: f32) -> f32 {
+    let s = if dpi_scale > 0.01 { dpi_scale } else { 1.0 };
+    let want = render_scale();
+    // ppp = s * rs ≤ MAX_RENDER_PPP ⇒ rs ≤ MAX_RENDER_PPP / s。
+    // 下限 1.0：DPI 已经很高时不再超采样（物理像素本来就密）。
+    let capped = (MAX_RENDER_PPP / s).max(1.0);
+    want.min(capped).max(1.0)
+}
+
 /// 已初始化的 Vulkan 设备上下文。
 pub struct Gpu {
     #[allow(dead_code)]
@@ -162,7 +242,7 @@ impl Gpu {
         tracing::debug!("Vulkan 动态库加载成功");
 
         let app_c = CString::new(app_name)?;
-        let mut app_info = vk::ApplicationInfo::default()
+        let app_info = vk::ApplicationInfo::default()
             .application_name(&app_c)
             .application_version(vk::make_api_version(0, 1, 0, 0))
             .engine_name(c"modular-clipboard")
@@ -190,7 +270,7 @@ impl Gpu {
         let exts = [surface_ext.as_ptr(), win32_ext.as_ptr()];
 
         let create_info = vk::InstanceCreateInfo::default()
-            .application_info(&mut app_info)
+            .application_info(&app_info)
             .enabled_extension_names(&exts);
 
         let instance = unsafe { entry.create_instance(&create_info, None)? };
@@ -269,11 +349,15 @@ impl Gpu {
         // 只启用**确实需要**的那两项：uniform 与 sampled image（采样器 + 纹理）。
         // `descriptor_binding_update_unused_while_pending` 本项目用不到
         // （见 `DescriptorUpdateCaps` 的说明），故不启用。
-        let mut feats12 = vk::PhysicalDeviceVulkan12Features::default();
-        feats12.descriptor_binding_uniform_buffer_update_after_bind =
-            desc_caps.uniform_buffer_update_after_bind.into();
-        feats12.descriptor_binding_sampled_image_update_after_bind =
-            desc_caps.sampled_image_update_after_bind.into();
+        let mut feats12 = vk::PhysicalDeviceVulkan12Features {
+            descriptor_binding_uniform_buffer_update_after_bind: desc_caps
+                .uniform_buffer_update_after_bind
+                .into(),
+            descriptor_binding_sampled_image_update_after_bind: desc_caps
+                .sampled_image_update_after_bind
+                .into(),
+            ..Default::default()
+        };
 
         let device_exts = [c"VK_KHR_swapchain".as_ptr()];
         let device_create = vk::DeviceCreateInfo::default()
@@ -373,7 +457,7 @@ impl Gpu {
         unsafe { instance.enumerate_physical_devices() }
             .unwrap_or_default()
             .iter()
-            .filter_map(|d| {
+            .map(|d| {
                 let p = unsafe { instance.get_physical_device_properties(*d) };
                 let name: Vec<u8> = p
                     .device_name
@@ -381,7 +465,7 @@ impl Gpu {
                     .map(|c| *c as u8)
                     .take_while(|b| *b != 0)
                     .collect();
-                Some((String::from_utf8_lossy(&name).to_string(), p.device_type))
+                (String::from_utf8_lossy(&name).to_string(), p.device_type)
             })
             .collect()
     }
@@ -408,7 +492,7 @@ impl Gpu {
     ///
     /// IMPORTANT: 调用前必须 `device_wait_idle()`：交换链可能还在引用该表面。
     ///
-    /// # 安全
+    /// # Safety
     ///
     /// `surface` 必须是本 `Gpu` 创建的、且尚未销毁的句柄。
     pub unsafe fn destroy_surface(&self, surface: vk::SurfaceKHR) {
@@ -803,6 +887,9 @@ fn pick_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
 /// `device` 必须是创建 `image` 的那个设备；调用方必须确保
 /// 记录的 `old_layout` 与 GPU 上的实际布局一致，且已正确
 /// 安排 `src_stage` / `dst_stage` / 访问掩码。
+// 参数逐一对应 VkImageMemoryBarrier，是 FFI 的忠实镜像；打包结构体的
+// churn 大于收益（同 texture.rs::transition_to 的取舍）。
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn record_one_shot_image_barrier(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -828,6 +915,35 @@ pub unsafe fn record_one_shot_image_barrier(
             std::slice::from_ref(&barrier),
         );
     }
+}
+
+/// 为一张图像视图创建 framebuffer。
+///
+/// 抽成公共助手的原因：交换链与离屏目标都要建 framebuffer，而
+/// Vulkan 的 framebuffer **必须绑定渲染通道**（不是裸图像视图）——
+/// 传空句柄或漏绑会让驱动在 `cmd_begin_render_pass` 时直接崩
+/// （0xC0000005，本项目的历史坑）。两处各写一份迟早分叉。
+pub fn create_framebuffer(
+    device: &Device,
+    render_pass: vk::RenderPass,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+) -> anyhow::Result<vk::Framebuffer> {
+    // 尺寸为 0 的 framebuffer 是非法对象（规范要求 width/height ≥ 1），
+    // 而驱动往往不报错、只在首次使用时崩，因此在这里提前拦下。
+    anyhow::ensure!(
+        extent.width > 0 && extent.height > 0,
+        "framebuffer 尺寸必须大于 0，得到 {extent:?}"
+    );
+    let attachments = [view];
+    let info = vk::FramebufferCreateInfo::default()
+        .render_pass(render_pass)
+        .attachments(&attachments)
+        .width(extent.width)
+        .height(extent.height)
+        .layers(1);
+    unsafe { device.create_framebuffer(&info, None) }
+        .map_err(|e| anyhow::anyhow!("创建 framebuffer 失败: {e:?}"))
 }
 
 pub(crate) fn image_barrier<'a>(

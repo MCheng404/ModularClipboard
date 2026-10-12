@@ -71,6 +71,34 @@ impl Sampler {
         Ok(Self { handle })
     }
 
+    /// 创建**线性过滤 + 钳到边缘**的采样器。
+    ///
+    /// 专供模糊链使用，与 [`Self::new_nearest`] 的用途正交：
+    ///
+    /// - **线性**：降采样时靠它做一次双线性平均（等价 2×2 盒式滤波），
+    ///   高斯卷积时让相邻 tap 之间平滑过渡。用点采样会让降采样出现
+    ///   明显锯齿、卷积出现块状伪影。
+    /// - **钳到边缘**：模糊会把采样坐标推到图像外。用 `REPEAT` 会把
+    ///   对侧边缘的内容卷进来（画面左缘渗进右缘的颜色），`MIRRORED_REPEAT`
+    ///   同理。`CLAMP_TO_EDGE` 是唯一正确的选择。
+    pub fn new_linear_clamped(device: &Device) -> anyhow::Result<Self> {
+        let info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            // 离屏目标只有一层 mip，不做 mipmap 过滤。
+            .min_lod(0.0)
+            .max_lod(0.0)
+            .anisotropy_enable(false);
+
+        let handle = unsafe { device.create_sampler(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建线性采样器失败: {e:?}"))?;
+        Ok(Self { handle })
+    }
+
     /// 按 egui 的 [`egui::TextureOptions`] 创建设备。
     ///
     /// egui 允许逐纹理指定过滤方式（`TextureOptions::NEAREST` /
@@ -485,6 +513,9 @@ impl DeviceImage {
     /// - `src_stage` / `dst_stage`：对应两端的管线阶段。
     ///
     /// 只录一道屏障。调用方负责保证这次转换的同步需求成立。
+    // 参数逐一对应 VkImageMemoryBarrier 的字段，是 FFI 的忠实镜像；
+    // 打包成结构体要在 12 个调用点（含 4 个探针）引入同等 churn，收益不抵风险。
+    #[allow(clippy::too_many_arguments)]
     pub fn transition_to(
         &mut self,
         cmd: vk::CommandBuffer,

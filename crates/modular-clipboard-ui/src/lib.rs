@@ -31,9 +31,11 @@
 //! 整体删除。`text` 是从 `titlebar` 拆出的文本度量/截断，因为卡片绘制
 //! 同样需要它，不该反向依赖标题栏模块。
 
+pub mod anim;
 pub mod app;
 pub mod card;
 pub mod childwin;
+pub mod mcp_status;
 pub mod multiwindow;
 pub mod paint;
 pub mod solver;
@@ -48,6 +50,20 @@ pub mod thumbnail;
 
 pub use app::{run, run_with_capture_override, run_with_options, App};
 pub use presence::Resident;
+
+/// 尝试唤起**已在运行**的本程序主窗口，用于单实例处理。
+///
+/// 返回 `false` 表示没找到窗口（对端可能刚启动还没建窗，或属于另一个
+/// 登录会话）——调用方据此决定是否退化为提示框。
+///
+/// # 为什么转发而不是让 `main.rs` 直接调 gfx
+///
+/// 本项目的分层约定是「bin 只依赖 core / app / ui 三层」。`main.rs`
+/// 需要这个能力（用户重复双击图标时要唤起已有窗口），但不应为此直接
+/// 依赖 `gfx`。放在这里，约定与能力都保住了。
+pub fn activate_running_instance() -> bool {
+    modular_clipboard_gfx::window::request_show_main_window(crate::renderer::WINDOW_TITLE)
+}
 
 /// 默认数据目录的展示字符串。
 ///

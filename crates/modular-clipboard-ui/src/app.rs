@@ -37,6 +37,42 @@ use crate::presence::{self, CloseDecision, Resident};
 use crate::renderer::{Painter, WINDOW_TITLE};
 use crate::theme;
 
+/// 背景层实度：在「用户滑块给的基准」之上，按**背景与主题的明暗冲突程度**上调。
+///
+/// # 为什么需要它
+///
+/// 半透明/磨砂把窗口背景与外部画面混在一起，而外部画面的明暗完全不由
+/// 主题决定。浅色主题的文字是深色（`text = #24292E`），一旦背景被身后的
+/// 纯黑桌面压暗，深色文字就落在深灰底上——对比度不足，用户只会觉得
+/// 「窗口感官坏了」，却说不清哪里坏了。
+///
+/// # 判据
+///
+/// `mismatch = 主题是暗色 ? 背景亮度 : 1 - 背景亮度`：
+/// 主题与背景同向（浅色配白桌面）时接近 0，保持用户要的通透；
+/// 反向（浅色配黑桌面、深色配白桌面）时接近 1，把背景层推向更实。
+///
+/// 上限 0.88 而不是 1.0：留一点透出，否则磨砂就成了纯色底、白改一场。
+fn backdrop_alpha(base: f32, luminance: Option<f32>, is_dark: bool) -> u8 {
+    let Some(l) = luminance else {
+        // 还没捕获成功（首帧 / 最小化），按基准走。
+        return (base.clamp(0.1, 1.0) * 255.0).round() as u8;
+    };
+    let mismatch = if is_dark { l } else { 1.0 - l };
+    let a = base + mismatch * 0.35;
+    (a.clamp(0.30, 0.88) * 255.0).round() as u8
+}
+
+/// 普通模式（无背景效果）的清屏色。与 gfx 渲染器的默认值一致，
+/// 仅在用户从磨砂/半透明切回「无」时恢复用。
+const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.10, 0.10, 0.12, 1.0];
+/// 磨砂/半透明模式的清屏色：全透明黑。
+///
+/// 这两种模式的背景层由渲染层画**低 alpha**（调色板变体），交换链
+/// 按像素 alpha 与桌面合成；清屏 alpha 若为 1，未被背景层覆盖的像素
+/// （以及背景层之下的混合底）会变成不透明，效果直接失效。
+const TRANSPARENT_CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
 /// 离开作用域时自动清空 [`egui::TexturesDelta`]。
 ///
 /// # 为什么需要它
@@ -62,6 +98,23 @@ impl Drop for DeltaGuard {
 /// 「东西还在后台跑着」，而不只是产品名——这是托盘常驻类程序
 /// 与普通窗口程序的体感差别。
 const TRAY_TOOLTIP: &str = "模块化剪切板 — 正在后台记录剪贴板";
+
+/// 环境开关查询（带缓存，PF-10）。
+///
+/// `std::env::var_os` 在 Windows 上要遍历进程环境块，而帧循环每帧要查
+/// 3~4 次（`MC_DIAG` ×3、`MC_SETTINGS` ×1）——这些开关只在启动时设定，
+/// 没有热切换需求，缓存结果不改变任何行为。每个不同的名字最多碰一次
+/// 真实环境块，此后是一次 Mutex 加锁 + HashMap 查找。
+fn env_flag(name: &str) -> bool {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    *guard
+        .entry(name.to_string())
+        .or_insert_with(|| std::env::var_os(name).is_some())
+}
 
 /// 启动图形界面。`config` 为初始配置。
 pub fn run(config: modular_clipboard_core::Config) -> anyhow::Result<()> {
@@ -122,17 +175,10 @@ pub fn run_with_options(
     //
     // `start_minimized` 配置项此前**从未被读取**（字段存在于
     // `UiConfig` 但代码里grep 不到），现已接上。
-    // 必须显式显示窗口：`CreateWindowExW` 创建的窗口**默认不可见**。
     //
-    // 实测踩坑：早前这里从不显示，窗口**从不出现**——
-    // 启动 `modular-clipboard.exe` 后 `MainWindowTitle` 为空，
-    // 用户只看到托盘图标，会以为程序没启动。
-    //
-    // 用 `presence::focus_window` 而非裸 ShowWindow：它已处理
-    // Windows 的前台窗口限制（`SetForegroundWindow` 失败时
-    // 走 `AttachThreadInput`），托盘点击唤起也需要它。
-    //
-    presence::focus_window(window.hwnd());
+    // 显示动作本身挪到了全部初始化之后（见「启动期窗口开关」一节，
+    // PF-3）：在这里就 focus_window 会让窗口在 GPU 初始化 + 字体读入
+    // + DB 打开期间以「无响应」状态可见。
 
     let mut events = EventLoop::new(&window);
     tracing::info!(
@@ -144,6 +190,15 @@ pub fn run_with_options(
 
     // ---- Vulkan 设备 ----------------------------------------------------
     let gpu = Gpu::new(WINDOW_TITLE, window.hinstance(), window.hwnd())?;
+    // IMPORTANT: 必须在**第一次 `egui_input` 之前**告知纹理上限。
+    //
+    // egui 用这个值决定字体图集能长多大；缺省 2048 在超采样下不够
+    // （图集面积按倍率平方增长），塞不下时的表现是**字形画错**
+    // （齿轮丢齿、垃圾桶变形），且不报任何错。
+    //
+    // NOTE: 设在 `events` 上而不是 `window` 上——主窗口的 `EventLoop`
+    // 建在 `Gpu::new` 之前，此刻它已经用默认值构造好了。
+    events.set_max_texture_side(gpu.properties.limits.max_image_dimension2_d);
 
     // ---- 管线 ----------------------------------------------------------
     //
@@ -266,19 +321,38 @@ pub fn run_with_options(
         }
     }
 
+    // ---- 显示窗口（PF-3）------------------------------------------------
+    //
+    // 刻意放在全部初始化**之后**：Vulkan 设备、管线、共享渲染资源、
+    // DB 打开、35MB 字体读入、托盘启动全排在前面。早前窗口在
+    // `Window::new` 之后立即 `focus_window`，于是初始化期间（冷启动
+    // 可达数百 ms～秒级）窗口已可见但主循环尚未开始——零消息泵，
+    // 拖动/关闭全部无响应，用户看到的是一扇「卡死」的窗壳，
+    // Windows 还可能给它挂上假死转圈。初始化中途失败时更糟：
+    // 窗口闪一下才退出。
+    //
+    // 用 `presence::focus_window` 而非裸 ShowWindow：它已处理
+    // Windows 的前台窗口限制（`SetForegroundWindow` 失败时
+    // 走 `AttachThreadInput`），托盘点击唤起也需要它。
+    //
+    // `start_minimized` 已在上面处理（隐藏到托盘），这里只负责显示。
+    presence::focus_window(window.hwnd());
+
     // ---- 帧循环 --------------------------------------------------------
     let mut frame_no: u64 = 0;
     let mut quit = false;
+    // 上一帧 egui 给出的重绘延时（`None` = 明确表示空闲，见
+    // `renderer::repaint_delay`）。渲染闸门（PF-4）用它判断「egui 是否
+    // 还在要求持续重绘」——光标闪烁、悬停动画都会让它非 `None`。
+    let mut last_delay: Option<std::time::Duration> = None;
     // 已应用到 Win32 的置顶状态。用来每帧比对配置，避免重复调
     // `SetWindowPos`（那会触发一次窗口样式变更）。
     let mut applied_topmost = always_on_top;
-    // 已应用到 Win32 的背景效果（磨砂/半透明 + 透明度）。
-    // 哨兵值 `(None, 1.0)`：首帧必然与配置比对并应用一次
-    // （若配置也是默认值，比对相等、无需调用——默认本来就不透明）。
-    let mut applied_backdrop = (
-        modular_clipboard_core::config::WindowBackdrop::None,
-        1.0,
-    );
+    // 已应用到 Win32 的背景效果（磨砂/半透明）。
+    // 哨兵值 `None`：首帧必然与配置比对并应用一次。
+    // 透明度不再进 Win32（整窗 LWA_ALPHA 已被逐像素半透明取代），
+    // 它只影响渲染层的调色板变体——那部分每帧直接读配置。
+    let mut applied_backdrop = modular_clipboard_core::config::WindowBackdrop::None;
     // 卡片子窗口集合（详情/视图等被拖出主窗的卡片）。
     let mut children = crate::childwin::ChildWindows::new();
     // 设置窗口（懒创建）。
@@ -347,6 +421,8 @@ pub fn run_with_options(
         // 而两者处置完全相反——前者隐藏到托盘，后者退出。
         // 区分依据是 `quit_requested()`，它**只在** `WM_QUIT` 时置位。
         let mut saw_close = false;
+        // 另一个进程请求唤起主窗口（单实例：用户又双击了一次图标）。
+        let mut saw_show = false;
         // `take_pending` 而非 `poll()` 的返回值：节流路径 `poll_for` 也会读
         // 消息并把事件记进累积缓冲，把它们一起取走才能保证关闭请求不丢。
         // 见 `gfx::window::EventLoop::poll` 的说明。
@@ -363,6 +439,12 @@ pub fn run_with_options(
                         tray = resident.is_some(),
                         "收到关闭请求"
                     );
+                }
+                WindowEvent::ShowRequested => {
+                    // 单实例唤起：另一个进程（用户重复双击）请求显示本窗口。
+                    // 与托盘「显示」走同一条路径——见下面的 `f.show` 分支。
+                    saw_show = true;
+                    tracing::info!("收到唤起请求（重复启动）");
                 }
                 WindowEvent::Resized { .. } => {
                     // 客户区尺寸变了 → 交换链必须重建。`rebuild_swapchain`
@@ -449,6 +531,22 @@ pub fn run_with_options(
             }
         }
 
+        // 单实例唤起：另一个进程（用户重复双击 exe）请求显示本窗口。
+        //
+        // IMPORTANT: 这段**不能**并进上面的托盘分支。托盘可能被用户关掉
+        // （设置里的「显示托盘图标」），而「重复启动时把窗口调出来」与
+        // 托盘无关——关掉托盘的用户照样会双击图标。
+        //
+        // 走与托盘「显示」完全相同的路径（`focus_window` 内部会
+        // `ShowWindow` + 抢前台），否则 `hidden` 标志不同步，窗口会显示
+        // 出来但**不渲染**（一片空白）。
+        if saw_show {
+            presence::focus_window(window.hwnd());
+            hidden = false;
+            rebuild(&mut fr, &mut painter)?;
+            ctx.request_repaint();
+        }
+
         // 关闭请求：托盘可用时隐藏到托盘，否则退出。
         //
         // 这里**不能**无条件 break——`WM_CLOSE` 不销毁窗口，
@@ -470,6 +568,18 @@ pub fn run_with_options(
             break;
         }
 
+        // ---- 1.7 后台捕获消费 ----
+        //
+        // 从 `draw_frame` 提到这里（PF-4）：下面的渲染闸门要能跳过
+        // `run_ui`，但捕获入库必须**每轮都跑**——隐藏/空闲时它才是
+        // 「后台持续记录剪贴板」的本体，跳过等于停止记录。
+        //
+        // 有变化时安排一次延时重绘：连续多条捕获（批量复制文件）只画
+        // 一帧，不为每条捕获都全量重绘。
+        if app.svc.pump() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+
         // ---- 1.8 卡片子窗口 ----
         //
         // 让子窗口集合与工作区的 `CardHost` 保持一致：
@@ -486,22 +596,68 @@ pub fn run_with_options(
         ));
         children.sync_with(&mut app.ws, &shared, window.scale_factor(), main_rect);
 
+        // ---- 1.9 渲染闸门（PF-4）----
+        //
+        // 空闲时整套 `run_ui + tessellate + acquire/paint/present` 产出
+        // 与上一帧完全相同的画面，纯浪费：静态界面以 ~120Hz 重绘，
+        // 单核持续占用、笔记本耗电发热（磨砂窗口还多付一次 30fps 捕获）。
+        //
+        // 打开闸门（必须渲染）的条件，任一成立即渲染：
+        //   1. 本帧有窗口事件——鼠标/键盘/resize/焦点（`take_pending` 非空）；
+        //   2. egui 有未消费的重绘请求——光标闪烁、悬停动画、以及上面
+        //      `request_repaint_after(250ms)` 的延时重绘（没有这项，
+        //      延时重绘永远等不到一帧，列表会停在旧内容）；
+        //   3. 上一帧 egui 自己要求继续重绘（`delay.is_some()`）；
+        //   4. 置顶/背景效果配置与已应用值不一致——设置窗口改的配置
+        //      走的是另一个 egui Context，不产生本窗事件，不比对就会
+        //      「改了但主窗口不应用」；
+        //   5. **有补间在飞**（`anim::busy`）——主题切换的颜色渐变、
+        //      hover 淡入淡出都靠它推进；漏掉这项会让动画只在事件
+        //      驱动的帧上走，鼠标不动时卡在半路。
+        let skip_render = frame_events.is_empty()
+            && !ctx.has_requested_repaint()
+            && last_delay.is_none()
+            && !crate::anim::busy(&ctx)
+            && app.svc.state.config.ui.always_on_top == applied_topmost
+            && app.svc.state.config.ui.window_backdrop == applied_backdrop;
+        if skip_render {
+            // 睡固定间隔：没有要画的内容，8ms 轮询足以让输入延迟感知不到。
+            events.poll_for(Some(std::time::Duration::from_millis(8)));
+            // 附属窗口**照样驱动**：它们仍留在屏幕上，不渲染就会被 Win32
+            // 标「无响应」——与隐藏态分支同理。
+            let topmost = app.svc.state.config.ui.always_on_top;
+            drive_attach_windows(
+                &mut app,
+                &mut children,
+                &mut settings_win,
+                &shared,
+                &window,
+                frame_no,
+                topmost,
+            );
+            frame_no += 1;
+            continue;
+        }
+
         // ---- 2. 业务 UI ----
         //
-        // **隐藏时也要跑**：业务 UI 里的 `svc.pump()` 才是把后台捕获
-        // 的剪贴板内容写进数据库的那一步。隐藏后跳过它等于
-        // 「窗口看不见 = 停止记录」，与后台常驻的初衷正好相反。
+        // **隐藏时也要跑**：后台捕获的消费（`svc.pump`，见 1.7）已经把
+        // 内容写进数据库，但列表的刷新要靠这一帧的绘制。隐藏态的循环
+        // 保持（见 2.5），数据不丢。
         //
         // `frame_events` 是上面 `take_pending()` 取出的本帧事件，
         // 事件**只有这一份**：既喂应用层（第 1 步的关闭/resize 判断），
         // 也喂 egui。漏掉后者会让 UI 收不到任何鼠标/键盘输入。
         let raw_input = events.egui_input(&ctx, &frame_events);
         // 诊断用：`run_ui` 按值消费 `raw_input`，之后拿不到 `screen_rect`。
-        let diag_screen_rect = if std::env::var_os("MC_DIAG").is_some() {
+        let diag_screen_rect = if env_flag("MC_DIAG") {
             raw_input.screen_rect
         } else {
             None
         };
+        // 背景亮度先于绘制：本帧的背景层实度要用它算（见 `backdrop_alpha`）。
+        // 取的是**上一帧捕获**的值，一帧延迟对这种粗粒度决策无影响。
+        app.backdrop_lum = painter.backdrop_luminance();
         let mut output = ctx.run_ui(raw_input, |ui| {
             app.draw_frame(ui);
         });
@@ -534,6 +690,7 @@ pub fn run_with_options(
         }
         // 在移动 output.shapes 之前先把重绘延时取出来。
         let delay = crate::renderer::repaint_delay(&output);
+        last_delay = delay;
 
         // ---- 2.2 窗口外壳接线 ----
         //
@@ -576,6 +733,26 @@ pub fn run_with_options(
         // 区别仅在任务栏是否留条目，而本程序常驻托盘，用户极少需要。
         if quit {
             break;
+        }
+
+        // ---- 2.4 布局变化后自适应窗口宽度 ----
+        //
+        // 置顶模式在设置里切换时栏数会变（共用单栏 ↔ 独立分栏），
+        // 而窗口尺寸只在启动时从配置读过一次。这里在**放不下**时
+        // 放宽窗口，否则卡片会被 `solve_scaled` 按比例压缩。
+        //
+        // 只放大不收缩：`take_resize_width_to` 内部已判断「够宽就不动」，
+        // 所以用户把窗口开大后切模式不会被改回来。
+        {
+            let (cw, ch) = window.inner_size_physical();
+            let scale = window.scale_factor().max(0.01);
+            if let Some(w_px) = app.take_resize_width_to((cw, ch), scale) {
+                window.set_size_physical(w_px, ch);
+                // 同步回配置，否则下次启动又回到旧尺寸 ——
+                // 用户看到「切了模式窗口变宽、重启又变回去」。
+                app.svc.state.config.ui.window_width = w_px as f32;
+                tracing::info!(width_px = w_px, "布局需要更宽，已调整主窗口宽度");
+            }
         }
 
         // ---- 2.5 隐藏态：不渲染，只保持循环 ----
@@ -663,8 +840,7 @@ pub fn run_with_options(
         let primitives = ctx.tessellate(std::mem::take(&mut output.shapes), ppp);
         drop(output);
 
-        let Some(acquired) = fr.acquire()? else {
-            rebuild(&mut fr, &mut painter)?;
+        let Some(acquired) = fr.acquire()? else {            rebuild(&mut fr, &mut painter)?;
             tracing::debug!("acquire 返回过期，已重建交换链");
             // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
             // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
@@ -681,7 +857,29 @@ pub fn run_with_options(
             continue;
         };
 
-        painter.paint(&mut fr, &primitives, ppp, &mut textures_delta.0)?;
+        // 磨砂（自研 Acrylic）走 backdrop 路径：先铺「身后桌面的实时
+        // 模糊」底图再叠加界面。半透明/无走普通路径——半透明的透出
+        // 由交换链像素 alpha 完成，不需要捕获。
+        if app.svc.state.config.ui.window_backdrop
+            == modular_clipboard_core::config::WindowBackdrop::Acrylic
+        {
+            painter.paint_backdrop(
+                &mut fr,
+                window.hwnd().0 as isize,
+                &primitives,
+                ppp,
+                window.scale_factor(),
+                &mut textures_delta.0,
+            )?;
+        } else {
+            painter.paint(
+                &mut fr,
+                &primitives,
+                ppp,
+                window.scale_factor(),
+                &mut textures_delta.0,
+            )?;
+        }
 
         if fr.present(acquired)? == PresentResult::Outdated {
             // 呈现时才发现过期：下一轮 acquire 会返回 None 再重建。
@@ -701,16 +899,25 @@ pub fn run_with_options(
             presence::set_topmost(window.hwnd(), applied_topmost);
         }
 
-        // ---- 4.4b 背景效果同步（磨砂 / 半透明）----
+        // ---- 4.4b 背景效果同步（自研磨砂 / 半透明）----
         //
-        // 与置顶同一模式：配置变了才调 Win32。`apply_backdrop` 幂等，
-        // 但 `SetLayeredWindowAttributes` 每帧调用没有意义且可能触发
-        // 重绘，所以比对后再调。
+        // 与置顶同一模式：配置变了才调 Win32（捕获排除 + 样式归位）。
+        // 同时同步渲染层：磨砂开 → 启用桌面捕获 + 模糊资源；关 → 释放。
+        // 清屏色也要跟上：半透明模式的背景层带 alpha，若清屏 alpha=1，
+        // 未被背景层覆盖的像素会变成不透明（磨砂/半透明失效）。
         let backdrop = app.svc.state.config.ui.window_backdrop;
-        let opacity = app.svc.state.config.ui.window_opacity;
-        if (backdrop, opacity) != applied_backdrop {
-            applied_backdrop = (backdrop, opacity);
-            presence::apply_backdrop(window.hwnd(), backdrop, opacity);
+        if backdrop != applied_backdrop {
+            applied_backdrop = backdrop;
+            presence::apply_backdrop(window.hwnd(), backdrop);
+            let acrylic = backdrop == modular_clipboard_core::config::WindowBackdrop::Acrylic;
+            painter.set_backdrop_enabled(acrylic);
+            fr.set_clear_color(if backdrop
+                == modular_clipboard_core::config::WindowBackdrop::None
+            {
+                DEFAULT_CLEAR_COLOR
+            } else {
+                TRANSPARENT_CLEAR_COLOR
+            });
         }
 
         // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口）----
@@ -726,7 +933,7 @@ pub fn run_with_options(
         );
 
         frame_no += 1;
-        if frame_no % 300 == 0 {
+        if frame_no.is_multiple_of(300) {
             tracing::debug!(
                 frame = frame_no,
                 vertices = painter.stats.vertices,
@@ -735,7 +942,7 @@ pub fn run_with_options(
                 "帧统计"
             );
         }
-        if std::env::var_os("MC_DIAG").is_some() && frame_no % 30 == 0 {
+        if env_flag("MC_DIAG") && frame_no.is_multiple_of(30) {
             let (pw, ph) = window.inner_size_physical();
             tracing::warn!(
                 frame = frame_no,
@@ -767,7 +974,7 @@ pub fn run_with_options(
         if moved {
             let now = std::time::Instant::now();
             let due = last_pos_save
-                .map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_millis(500));
+                .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_millis(500));
             if due && app.persist_window_pos(pos) {
                 if let Err(e) = app.svc.save_config() {
                     tracing::warn!(%e, "实时保存窗口位置失败");
@@ -919,7 +1126,7 @@ fn drive_attach_windows<'a>(
             window.screen_position_points(),
             mw,
             window.scale_factor(),
-            &shared,
+            shared,
         ) {
 Ok(w) => {
                     tracing::info!("设置窗口已创建");
@@ -927,7 +1134,7 @@ Ok(w) => {
                 }
             Err(e) => {
                 // 每帧都会走到这里，必须降频，否则日志刷屏。
-                if frame_no % 60 == 0 {
+                if frame_no.is_multiple_of(60) {
                     tracing::warn!(%e, "创建设置窗口失败，本帧不再重试");
                 }
                 app.paint_state.show_settings = false;
@@ -1036,7 +1243,14 @@ pub struct App {
     /// 由 [`theme::set_theme`] 在构造时产出：它同时把令牌灌进 egui
     /// `Visuals` 并返回自绘要用的那一份，因此「控件观感」与「自绘图形」
     /// 必然同源。每帧把它交给 [`crate::paint::draw`]。
+    ///
+    /// 主题切换时它是**显示中**的调色板（补间插值的结果），目标值在
+    /// `pal_to`——见 `draw_frame` 里的补间推进（F-34 / UI-P1-3）。
     pal: theme::Palette,
+    /// 主题补间的源调色板（切换前那一份）。未切换时等于 `pal_to`。
+    pal_from: theme::Palette,
+    /// 主题补间的目标调色板（切换后那一份）。
+    pal_to: theme::Palette,
     /// 新卡片架构的工作区（卡片的唯一权威来源）。
     ///
     /// `pub` 是因为帧循环要用它同步子窗口：
@@ -1049,6 +1263,19 @@ pub struct App {
     diag_frames: u64,
     /// 界面退出请求。
     should_quit: bool,
+    /// 窗口身后桌面的平均亮度（0~1），由帧循环从渲染器取来。
+    ///
+    /// `None` = 本帧没有成功捕获（磨砂未开 / 最小化 / 首帧）。
+    /// 只影响「背景层画多实」这一个决策，见 [`backdrop_alpha`]。
+    pub backdrop_lum: Option<f32>,
+    /// MCP 服务连通性探测器（后台线程 + 原子状态）。
+    ///
+    /// F-15 / UI-P0-1：`McpProbe` 实现了完整的四态探测，但启动以来
+    /// **全仓没有任何地方启动过它**——`UiState::mcp_conn` 的文档写着
+    /// 「由 App 每帧从探测器同步过来」，实际没有写入方，覆盖层状态行
+    /// 于是永远显示「未连接·总开关已关闭」，能力徽标永远处于未连接
+    /// 样式，即使 MCP 服务实际在运行。用户无从判断服务真实状态。
+    mcp_probe: crate::mcp_status::McpProbe,
 }
 
 impl App {
@@ -1115,14 +1342,24 @@ impl App {
 
         svc.start_capture();
 
+        // 启动 MCP 连通性探测（F-15 / UI-P0-1）：后台线程每 3s 探一次
+        // `GET /health`，界面每帧只读原子量。必须真的启动——
+        // 探测器实现齐全但从未被接线的话，MCP 覆盖层永远显示未连接。
+        let mcp_probe = crate::mcp_status::McpProbe::start();
+        mcp_probe.update(&svc.state.config.mcp);
+
         Self {
             ctx,
             svc,
-            pal,
+            pal: pal.clone(),
+            pal_from: pal.clone(),
+            pal_to: pal,
             ws,
             paint_state: crate::paint::UiState::default(),
             diag_frames: 0,
             should_quit: false,
+            backdrop_lum: None,
+            mcp_probe,
         }
     }
 
@@ -1132,21 +1369,38 @@ impl App {
         //
         // 用途是**截图验证**：设置面板是覆盖层，不点齿轮按钮就拍不到。
         // 做成环境变量而不是命令行参数，是为了让截图脚本不用改传参逻辑。
-        //
         // CAUTION: 必须**只打开一次**。早期实现每帧置 `true`，带该环境
         // 变量启动的实例里设置窗口永远关不掉——点 ✕ / 齿轮把
         // `show_settings` 置回 `false`，下一帧这里又改回 `true`，
         // 用户实测「设置窗口无法关闭，从主窗口点击也无法关闭」
         // （2026-10-11）。首帧打开一次后置位，之后关闭走正常逻辑。
-        if std::env::var_os("MC_SETTINGS").is_some() && !self.paint_state.settings_startup_opened {
+        if env_flag("MC_SETTINGS") && !self.paint_state.settings_startup_opened {
             self.paint_state.show_settings = true;
             self.paint_state.settings_startup_opened = true;
         }
 
-        // 消费后台捕获事件；有变化时安排后续重绘。
-        if self.svc.pump() {
-            self.ctx
-                .request_repaint_after(std::time::Duration::from_millis(250));
+        // MCP 连通状态同步（F-15 / UI-P0-1）：目标没变时 `update` 是
+        // 空操作（不加锁不克隆）；状态是原子读。两者都远低于一帧预算，
+        // 但探测线程的节奏是自己的（3s 一次 + 400ms 超时）。
+        self.mcp_probe.update(&self.svc.state.config.mcp);
+        self.paint_state.mcp_conn = self.mcp_probe.state();
+
+        // 主题补间推进（F-34 / UI-P1-3）：mix 0 → 1。settled 后是恒等
+        // 变换（from == to），成本只有一次 Palette 字段级克隆。
+        //
+        // egui 控件层（Visuals）也每帧重灌：只补间自绘层的话，
+        // ScrollArea/tooltip 会瞬跳而卡片在渐变，两层不同步更难看。
+        // 补值来自 `Palette::lerp`——只有颜色参与，几何令牌取目标值。
+        let pal_mix = crate::anim::tween_f32(
+            &self.ctx,
+            egui::Id::new("pal_mix"),
+            1.0,
+            std::time::Duration::from_millis(220),
+            crate::anim::Ease::InOutCubic,
+        );
+        if pal_mix < 1.0 {
+            self.pal = self.pal_from.lerp(&self.pal_to, pal_mix);
+            crate::theme::apply(&self.ctx, &self.pal);
         }
 
         // ---- 新卡片架构 ------------------------------------------------
@@ -1162,9 +1416,9 @@ impl App {
         let sol = crate::solver::solve_scaled(&self.ws, area, ppp);
         crate::solver::apply(&mut self.ws, &sol);
 
-        if std::env::var_os("MC_DIAG").is_some() {
+        if env_flag("MC_DIAG") {
             self.diag_frames += 1;
-            if self.diag_frames % 60 == 0 {
+            if self.diag_frames.is_multiple_of(60) {
                 let rs: Vec<String> = self
                     .ws
                     .cards
@@ -1181,22 +1435,37 @@ impl App {
             }
         }
 
-        // 磨砂（Acrylic）模式：背景层整体降 alpha，DWM 的磨砂透过
-        // 背景显示；内容层（卡片/文字）保持不透明。滑块越大背景越实。
-        // 半透明与无模式用原 palette——整窗 alpha 由平台层处理，
-        // 渲染层不参与。
+        // 磨砂 / 半透明模式：背景层整体降 alpha；内容层（卡片/文字）
+        // 保持不透明。滑块越大背景越实。
+        //
+        // 两条模式各自的**基准**区间（0.3~1.0 → 背景 alpha）：
+        // - 磨砂：0.18~0.60。身后是**已模糊**的桌面，透出比例高也不损
+        //   可读性；上限 0.6 保证模糊始终可见。
+        // - 半透明：0.55~0.85。身后是**未经模糊的**真实桌面，需要更实
+        //   的背景才能保住对比度。
+        //
+        // 再按**背景亮度**上调实度（见 [`backdrop_alpha`]）：纯色（无壁纸）
+        // 桌面是最常见的极端——浅色主题配纯黑桌面时，若背景层只有 33%，
+        // 合成出来是深灰底 + 深色文字，对比度直接崩掉。
+        // 无模式用原 palette。
         let backdrop = self.svc.state.config.ui.window_backdrop;
         let opacity = self.svc.state.config.ui.window_opacity;
-        let acrylic_pal;
-        let pal_ref: &theme::Palette =
-            if backdrop == modular_clipboard_core::config::WindowBackdrop::Acrylic {
-            // 0.3~1.0 映射到 0.18~0.60：上限 0.6 保证磨砂**始终可见**
-            // （1.0 也不会把 DWM 的 blur 完全盖死）。
-            let alpha = ((opacity.clamp(0.3, 1.0) * 0.6 * 255.0).round() as u8).max(1);
-            acrylic_pal = self.pal.with_backdrop_alpha(alpha);
-            &acrylic_pal
-        } else {
-            &self.pal
+        let is_dark = self.pal.is_dark;
+        let backdrop_pal;
+        let pal_ref: &theme::Palette = match backdrop {
+            modular_clipboard_core::config::WindowBackdrop::Acrylic => {
+                let base = opacity.clamp(0.3, 1.0) * 0.6;
+                let alpha = backdrop_alpha(base, self.backdrop_lum, is_dark);
+                backdrop_pal = self.pal.with_backdrop_alpha(alpha);
+                &backdrop_pal
+            }
+            modular_clipboard_core::config::WindowBackdrop::Translucent => {
+                let base = (opacity.clamp(0.3, 1.0) * 0.85).max(0.55);
+                let alpha = backdrop_alpha(base, self.backdrop_lum, is_dark);
+                backdrop_pal = self.pal.with_backdrop_alpha(alpha);
+                &backdrop_pal
+            }
+            modular_clipboard_core::config::WindowBackdrop::None => &self.pal,
         };
 
         {
@@ -1295,7 +1564,12 @@ impl App {
                     // 一起做；设置窗口自己的 `Visuals` 由 `settingswin` 每帧
                     // 从 `App.pal` 同步，这里不用管。
                     self.svc.state.config.ui.dark_mode = mode.to_dark_mode();
-                    self.pal = crate::theme::set_theme(&self.ctx, mode);
+                    // 补间切换（F-34 / UI-P1-3）：从**当前显示中**的调色板
+                    // 渐变到新主题，220ms。整窗瞬跳在纯平毛玻璃审美下刺眼
+                    // （背景模糊内容不变、全部前景色瞬换）。`pal_from` 取
+                    // 当前显示值而非上一次的目标——连续切换时从当下续接。
+                    self.pal_from = self.pal.clone();
+                    self.pal_to = crate::theme::set_theme(&self.ctx, mode);
                     self.after_config_change();
                 }
                 Op::SetHotkey { slot, hotkey } => {
@@ -1331,7 +1605,17 @@ impl App {
                     }
                 }
                 Op::SetPinnedMode(mode) => {
-                    self.ws.set_pinned_mode(mode);
+                    if self.ws.set_pinned_mode(mode) {
+                        // 栏数变了 ⇒ 宽度需求变了。窗口尺寸只在启动时
+                        // 从配置读过一次，不跟着变的话 `solve_scaled`
+                        // 会按比例压缩卡片，用户看到的是「卡片被挤扁」。
+                        //
+                        // 这里只**记下需求**，真正的 resize 留给帧循环：
+                        // `apply_ops` 拿不到 `ppp`（DPI 换算要用），
+                        // 且窗口对象不在 `self` 里。
+                        self.paint_state.resize_width_to =
+                            Some(crate::solver::needed_width(&self.ws));
+                    }
                 }
                 Op::ToggleSettings => {
                     self.paint_state.show_settings = !self.paint_state.show_settings;
@@ -1469,6 +1753,18 @@ impl App {
         self.should_quit
     }
 
+    /// 取出「布局变化后需要的客户区宽度」（逻辑点）。
+    ///
+    /// 返回 `Some(w)` 表示帧循环应当把窗口**放宽**到 `w`。
+    /// `None` 表示不需要动 —— 包括「当前已经够宽」的情况：
+    /// 用户可能故意把窗口开得很大，不该因为一次模式切换被改小。
+    ///
+    /// CAUTION: 必须**在放大前**判断够不够，不能无脑设成 `needed`。
+    /// 无脑设的话每次切换模式窗口都会跳一下，来回切两次就晃。
+    pub fn take_resize_width_to(&mut self, current_px: (u32, u32), scale: f32) -> Option<u32> {
+        resize_width_target(self.paint_state.resize_width_to.take(), current_px, scale)
+    }
+
     /// 清空全部历史（托盘菜单「清空历史」入口）。
     ///
     /// 与界面上的「清空」按钮走同一个 [`Service::clear_all`]，
@@ -1477,13 +1773,11 @@ impl App {
         self.svc.clear_all()
     }
 
-    /// 退出前保存状态。
     /// 把主窗口当前位置写回配置。
     ///
     /// 由 [`Self::shutdown`] 调用。**不覆盖**用户设置里已有的
     /// 置顶窗位置——那个由 `childwin` 在关窗时自己写。
     ///
-
     /// 取不到位置时跳过而不是写 `Some(0,0)`：窗口可能因最小化/
     /// 隐藏而没有有效位置，写进去会让下次启动跑到屏幕左上角。
     ///
@@ -1526,6 +1820,14 @@ impl App {
     /// 有独立的 `egui::Context`，`set_theme` 只灌主窗口那份。
     pub(crate) fn palette(&self) -> &theme::Palette {
         &self.pal
+    }
+
+    /// MCP 调用设置覆盖层是否打开。
+    ///
+    /// `settingswin` 用它决定这一帧要不要走「自研 GPU 模糊」绘制路径：
+    /// 覆盖层打开时，设置窗口自身的内容要先卷积成模糊底图。
+    pub(crate) fn mcp_overlay_open(&self) -> bool {
+        self.paint_state.mcp_overlay_open
     }
 
     /// 记下置顶窗口位置（供下次启动恢复）。
@@ -1630,6 +1932,83 @@ fn set_opt_number_field(
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
+
+/// 算出「该把窗口宽度设成多少物理像素」，不该动就返回 `None`。
+///
+/// 抽成纯函数是为了能直接测：`take_resize_width_to` 需要 `&mut App`，
+/// 而构造 App 要 config + 临时数据目录，放进单元测试太重。
+///
+/// `needed` 是**逻辑点**（`solver::needed_width` 的输出）。
+fn resize_width_target(
+    needed: Option<f32>,
+    current_px: (u32, u32),
+    scale: f32,
+) -> Option<u32> {
+    let needed = needed?;
+    if needed <= 0.0 || scale <= 0.0 {
+        return None;
+    }
+    let current_points = current_px.0 as f32 / scale;
+    // 已经够宽就不动。
+    //
+    // 留 1pt 容差：浮点误差会让「刚好等于」时在两个分支间反复跳，
+    // 表现为每次切模式窗口都抖一下。
+    if current_points >= needed - 1.0 {
+        return None;
+    }
+    Some(((needed * scale).round() as u32).max(1))
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::resize_width_target;
+
+    /// 放不下时必须给出目标物理宽度。
+    ///
+    /// 这条直接对应用户的反馈：「置顶模式选择后主窗口大小不会自己调整」
+    /// —— 切到独立分栏多出一栏，需求超过可用宽，`solve_scaled`
+    /// 就会按比例把卡片压扁。
+    #[test]
+    fn widens_when_current_is_too_narrow() {
+        // 需求 600 逻辑点，当前只有 400 逻辑点（= 600 物理像素 @1.5）
+        let target = resize_width_target(Some(600.0), (600, 800), 1.5);
+        assert_eq!(target, Some(900), "应放宽到 600×1.5 = 900 物理像素");
+    }
+
+    /// 已经够宽时**不动**窗口。
+    ///
+    /// 这条守的是「只放大不收缩」：用户可能故意把窗口开到很大，
+    /// 不该因为一次模式切换被改回来。无脑设成 `needed` 的话，
+    /// 来回切两次模式窗口就会来回跳。
+    #[test]
+    fn leaves_window_alone_when_already_wide_enough() {
+        assert_eq!(resize_width_target(Some(400.0), (900, 800), 1.5), None);
+        // 刚好等于也要算「够宽」（1pt 容差内），否则浮点误差会抖。
+        assert_eq!(resize_width_target(Some(400.0), (600, 800), 1.5), None);
+    }
+
+    /// 没有请求、或参数非法时不动。
+    #[test]
+    fn no_request_means_no_resize() {
+        assert_eq!(resize_width_target(None, (300, 800), 1.5), None);
+        assert_eq!(resize_width_target(Some(0.0), (300, 800), 1.5), None);
+        assert_eq!(resize_width_target(Some(-50.0), (300, 800), 1.5), None);
+        // scale = 0 会除出 inf / 除零，必须挡住。
+        assert_eq!(resize_width_target(Some(600.0), (300, 800), 0.0), None);
+    }
+
+    /// 结果必须是**正**整数：0 会让客户区塌成 0×0，
+    /// 下一帧的交换链重建拿不到可呈现的图像，窗口看着像消失了。
+    ///
+    /// 场景取「极小需求 × 极小缩放」—— 正常布局（需求数百点、
+    /// 缩放 1.0~2.0）永远走不到这里，这是纯防御性分支：
+    /// `3.0 × 0.1 = 0.3` 四舍五入就是 0，靠 `.max(1)` 兜住。
+    #[test]
+    fn target_is_never_zero() {
+        let t = resize_width_target(Some(3.0), (0, 10), 0.1).expect("应给出目标宽度");
+        assert!(t >= 1, "目标宽度必须至少 1 像素，实际 {t}");
+    }
+}
 
 #[cfg(test)]
 mod tests {

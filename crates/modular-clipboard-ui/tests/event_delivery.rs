@@ -144,7 +144,7 @@ fn hidden_branch_continues_instead_of_breaking() {
         .collect();
 
     assert!(
-        code.iter().any(|l| *l == "continue;"),
+        code.contains(&"continue;"),
         "隐藏态分支必须以 `continue;` 回到循环顶部，         否则隐藏后关闭请求等事件无人交付。实际代码行：{code:?}"
     );
     assert!(

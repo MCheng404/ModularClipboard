@@ -164,7 +164,7 @@ fn run() -> anyhow::Result<()> {
     }
     println!("OK window shown + message loop pumped");
 
-    let gpu = Gpu::new("ModularClipboardUploadProbe", hinstance.into(), hwnd.into())?;
+    let gpu = Gpu::new("ModularClipboardUploadProbe", hinstance.into(), hwnd)?;
     let device_name = device_name_of(&gpu);
     let kind = device_kind(gpu.device_type);
     println!(
@@ -380,7 +380,7 @@ fn run() -> anyhow::Result<()> {
         if done <= 20 {
             println!("    帧{done} 完成");
         }
-        if done % PROGRESS_EVERY == 0 {
+        if done.is_multiple_of(PROGRESS_EVERY) {
             let elapsed = t0.elapsed();
             println!(
                 "  进度 {done}/{frames} 帧  上传 {uploads} 次  重建 {rebuilds} 次  \
@@ -462,9 +462,7 @@ fn run() -> anyhow::Result<()> {
     // ---- 清理 --------------------------------------------------------
     //
     // 上面的 wait_idle 已经保证 GPU 不再引用任何对象，此刻销毁安全。
-    let mut image = image;
     image.destroy(&gpu.device);
-    let mut readback = readback;
     readback.destroy(&gpu.device);
     unsafe {
         gpu.device.destroy_command_pool(cmd_pool, None);
@@ -594,7 +592,7 @@ fn run_mode_c() -> anyhow::Result<()> {
         }
     }
 
-    let gpu = Gpu::new("ModularClipboardUploadProbeC", hinstance.into(), hwnd.into())?;
+    let gpu = Gpu::new("ModularClipboardUploadProbeC", hinstance.into(), hwnd)?;
     let device_name = device_name_of(&gpu);
     println!("GPU: {device_name} ({})", device_kind(gpu.device_type));
     anyhow::ensure!(
@@ -787,11 +785,8 @@ fn run_mode_c() -> anyhow::Result<()> {
     readback.unmap(&gpu.device)?;
     verify_pixels(&got, &shadow)?;
 
-    let mut image = image;
     image.destroy(&gpu.device);
-    let mut staging = staging;
     staging.destroy(&gpu.device);
-    let mut readback = readback;
     readback.destroy(&gpu.device);
     unsafe { gpu.device.destroy_command_pool(cmd_pool, None) };
     println!("OK 模式C 资源全部销毁");

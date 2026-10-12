@@ -1355,31 +1355,14 @@ fn tessellate_into(
     }
 }
 
-/// egui 的 `Color32` → 顶点色 `u32`（小端 ABGR），反预乘。
+/// egui 的 `Color32` → 顶点色 `u32`（小端 RGBA），预乘色原样上传。
 ///
-/// epaint 顶点色是 **sRGBA 预乘 alpha**，而 `pipeline.rs` 的混合是
-/// `SRC_ALPHA / ONE_MINUS_SRC_ALPHA`（**非预乘**）。不还原会让半透明区发黑
-/// ——不报任何 GPU 错误，只是「看起来脏」，极易被漏掉。
+/// epaint 顶点色是 **sRGBA 预乘 alpha**，`pipeline.rs` 的混合是预乘
+/// 公式 `ONE / ONE_MINUS_SRC_ALPHA`——两者配套，不能反预乘
+/// （否则半透明填充以全强度叠加、超界通道被裁剪而偏色）。
 fn pack_color(c: egui::Color32) -> u32 {
     let [r, g, b, a] = c.to_array();
-    let (r, g, b) = unpremultiply(r, g, b, a);
     u32::from_le_bytes([r, g, b, a])
-}
-
-/// 预乘 → 非预乘。`a == 0` 时 rgb 的信息已在预乘时丢失，取 0。
-fn unpremultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
-    if a == 255 {
-        return (r, g, b);
-    }
-    if a == 0 {
-        // 除零边界。理论上不可达（egui 的 Color32 是预乘的，a=0 时 rgb 必为 0），
-        // 但仍显式返回 0 而不是让除法 panic ——「理论上不可达」的分支
-        // 恰恰是最需要写对的地方。
-        return (0, 0, 0);
-    }
-    // 用 u32 中转：r * 255 最大 65025，会溢出 u8。
-    let f = |c: u8| -> u8 { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-    (f(r), f(g), f(b))
 }
 
 /// 一批绘制。
@@ -1658,8 +1641,8 @@ mod tests {
     #[test]
     fn alpha_channel_is_not_part_of_the_criterion() {
         // 判据只看 RGB：alpha 不同不应改变结论。
-        // 混合的 alpha 语义由 `unpremultiply` 与管线的
-        // srcAlpha/oneMinusSrcAlpha 负责，与「有没有画东西」无关。
+        // 混合的 alpha 语义由预乘顶点色与管线的
+        // ONE/oneMinusSrcAlpha 负责，与「有没有画东西」无关。
         let mut with_a = pure_background_bytes(16);
         with_a[3] = 0;
         assert_eq!(count_non_background(&with_a), 0);
@@ -1857,36 +1840,207 @@ mod tests {
     }
 
     #[test]
-    fn opaque_colors_survive_unpremultiply() {
-        for c in [
-            egui::Color32::WHITE,
-            egui::Color32::BLACK,
-            egui::Color32::from_rgb(1, 127, 254),
-        ] {
-            assert_eq!(
-                unpremultiply(c.r(), c.g(), c.b(), 255),
-                (c.r(), c.g(), c.b())
+    fn semi_transparent_colors_are_uploaded_premultiplied() {
+        // 与 renderer.rs 的 pack_color 同步：预乘色原样上传，不反预乘。
+        let c = egui::Color32::from_rgba_unmultiplied(0x1D, 0x65, 0xAF, 52);
+        let packed = pack_color(c);
+        assert_eq!(packed & 0xFF, 6);
+        assert_eq!((packed >> 8) & 0xFF, 21);
+        assert_eq!((packed >> 16) & 0xFF, 36);
+        assert_eq!((packed >> 24) & 0xFF, 52);
+    }
+
+    #[test]
+    fn readback_length_check_rejects_short_buffers() {
+        // 长度不对时 `classify` 会给出**看似合理**的结论
+        // （chunks_exact 静默丢尾部），所以长度必须被卡住。
+        let extent = vk::Extent2D {
+            width: 4,
+            height: 4,
+        };
+        assert!(verify_len(&pure_background_bytes(16), extent, "测试").is_ok());
+        assert!(verify_len(&pure_background_bytes(15), extent, "测试").is_err());
+        assert!(verify_len(&pure_background_bytes(17), extent, "测试").is_err());
+    }
+
+    // ---- 尺寸序列 -------------------------------------------------------
+
+    #[test]
+    fn target_sequence_has_distinct_neighbours() {
+        let mut prev = TARGET_SEQ[0];
+        for &s in &TARGET_SEQ[1..] {
+            assert_ne!(s, prev, "相邻两档尺寸相同则不会触发离屏资源重建");
+            prev = s;
+        }
+    }
+
+    #[test]
+    fn target_sequence_ends_where_it_started() {
+        // 最后一档回到第一档：验证「改回去」也能正确重建。
+        assert_eq!(TARGET_SEQ.last().copied(), TARGET_SEQ.first().copied());
+    }
+
+    #[test]
+    fn target_sequence_covers_both_directions() {
+        let first = TARGET_SEQ[0];
+        assert!(
+            TARGET_SEQ.iter().any(|&s| s.0 > first.0),
+            "序列应包含一次变大"
+        );
+        assert!(
+            TARGET_SEQ.iter().any(|&s| s.0 < first.0),
+            "序列应包含一次变小"
+        );
+    }
+
+    #[test]
+    fn every_target_size_is_positive() {
+        for &(tw, th) in TARGET_SEQ {
+            assert!(tw > 0 && th > 0, "靶面尺寸必须非 0：{tw}x{th}");
+        }
+    }
+
+    #[test]
+    fn target_format_byte_order_matches_clear_channels() {
+        // 判据按 R,G,B 顺序比较字节，因此格式必须是 R8G8B8A8。
+        // 换成 B8G8R8A8 会让 BG 的 R 与 B 互换——背景是接近灰度的颜色，
+        // 也许「碰巧不出错」，但那正是 MEMORY 坑 84 说的
+        // 「测试验证的是自己重算的值」。这条把选择理由固定下来。
+        assert_eq!(TARGET_FORMAT, vk::Format::R8G8B8A8_UNORM);
+        // 4 字节 / 像素：readback 的尺寸计算与 BufferImageCopy 的
+        // 紧密排列都依赖这一点。
+        assert_eq!(
+            modular_clipboard_gfx::texture::staging_size(TARGET_FORMAT, 7, 5),
+            7 * 5 * 4
+        );
+    }
+
+    // ---- 几何 -----------------------------------------------------------
+
+    #[test]
+    fn vertex_stride_matches_pipeline() {
+        // pipeline.rs 声明 pos(8)+uv(8)+color(4)+tex_id(4) = 24 字节。
+        // 断言真实大小而非重算（MEMORY 第 17 批坑 84）。
+        assert_eq!(std::mem::size_of::<Vertex>(), 24);
+    }
+
+    #[test]
+    fn capacity_growth_is_monotonic() {
+        assert!(next_capacity(1) >= 1);
+        assert!(next_capacity(2000) >= 2000);
+        assert!(next_capacity(next_capacity(2000)) > next_capacity(2000));
+    }
+
+    #[test]
+    fn placeholder_texture_is_fully_opaque_and_right_sized() {
+        let bytes = placeholder_rgba();
+        let n = (PLACEHOLDER_USER_TEX * PLACEHOLDER_USER_TEX * 4) as usize;
+        assert_eq!(bytes.len(), n);
+        assert!(
+            bytes.chunks_exact(4).all(|p| p[3] == 255),
+            "占位纹理必须不透明：半透明会让描述符布局测试失真"
+        );
+    }
+
+    #[test]
+    fn wait_timeout_is_finite() {
+        // 无限等待会把「设备卡住」变成无声挂起。
+        assert!(GPU_WAIT_TIMEOUT_NS > 0);
+        assert!(GPU_WAIT_TIMEOUT_NS <= 60_000_000_000);
+    }
+
+    // ---- egui 真实路径 ---------------------------------------------------
+
+    /// 跑一帧真实 egui，返回转换后的顶点 / 索引 / 批次。
+    fn run_one_frame(size: (u32, u32)) -> (Vec<Vertex>, Vec<u32>, Vec<Batch>) {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size.0 as f32, size.1 as f32),
+            )),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| draw_ui(ui, size));
+        // `TexturesDelta` 在 drop 时断言增量为空。本测试不消费纹理增量
+        // （那需要 GPU），必须显式清空，否则 panic 会掩盖真正的断言失败。
+        out.textures_delta.clear();
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let (mut v, mut i, mut b) = (Vec::new(), Vec::new(), Vec::new());
+        tessellate_into(&prims, &mut v, &mut i, &mut b);
+        (v, i, b)
+    }
+
+    #[test]
+    fn real_egui_produces_geometry() {
+        let (v, i, b) = run_one_frame((320, 240));
+        assert!(!v.is_empty(), "egui 应产出顶点");
+        assert!(!b.is_empty(), "应有绘制批次");
+        // 索引必须全部落在顶点数组内，否则 draw_indexed 会越界读取。
+        let n = v.len() as u32;
+        assert!(i.iter().all(|&x| x < n), "存在越界索引");
+        assert_eq!(i.len() % 3, 0, "索引数必须是 3 的倍数（三角形列表）");
+    }
+
+    #[test]
+    fn all_primitives_use_the_font_atlas() {
+        // 本探针不测缩略图，tex_id 必须恒为 0；
+        // 若混入 1，正对照会因采样占位纹理而得到非预期颜色。
+        let (v, _, _) = run_one_frame((320, 240));
+        assert!(v.iter().all(|x| x.tex_id == 0));
+    }
+
+    #[test]
+    fn batches_cover_all_indices_exactly_once() {
+        // 批次区间必须无缝铺满索引数组：既不重叠也不留空洞。
+        // 空洞会导致部分三角形没被画（画面局部空白），
+        // 而那在读回里表现为「非背景像素偏少」——不易察觉。
+        let (_, i, b) = run_one_frame((320, 240));
+        let mut next = 0u32;
+        for batch in &b {
+            assert_eq!(batch.index_offset, next, "批次之间出现空洞或重叠");
+            next = batch.index_offset + batch.index_count;
+        }
+        assert_eq!(next as usize, i.len(), "批次应覆盖全部索引");
+    }
+
+    #[test]
+    fn every_target_size_produces_geometry() {
+        // 判据的正对照要求每个尺寸都有图元；
+        // 若某个尺寸下 egui 不产出东西（例如太窄），实机才暴露。
+        for &(tw, th) in TARGET_SEQ {
+            let (v, i, b) = run_one_frame((tw, th));
+            assert!(
+                !v.is_empty() && !i.is_empty() && !b.is_empty(),
+                "尺寸 {tw}x{th} 下 egui 没有产出图元"
             );
         }
     }
 
     #[test]
-    fn unpremultiply_handles_zero_alpha() {
-        assert_eq!(unpremultiply(0, 0, 0, 0), (0, 0, 0));
-        let t = egui::Color32::TRANSPARENT;
-        assert_eq!(unpremultiply(t.r(), t.g(), t.b(), t.a()), (0, 0, 0));
+    fn batch_conversion_preserves_offsets() {
+        let b = Batch {
+            index_offset: 12,
+            index_count: 6,
+            clip: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0)),
+        };
+        let d = b.to_draw();
+        assert_eq!(d.index_offset, 12);
+        assert_eq!(d.index_count, 6);
     }
 
+    // ---- 颜色打包 -------------------------------------------------------
+
     #[test]
-    fn unpremultiply_never_exceeds_255() {
-        for a in 1..=254u8 {
-            let (r, g, b) = unpremultiply(255, 255, 255, a);
-            // 用 u32 中转比较：直接写 `v <= 255` 在 u8 上恒真。
-            for v in [r, g, b] {
-                assert!(u32::from(v) <= 255, "反预乘溢出 u8");
-            }
-        }
+    fn color_is_packed_as_abgr_little_endian() {
+        let c = egui::Color32::from_rgb(0x11, 0x22, 0x33);
+        let packed = pack_color(c);
+        assert_eq!(packed & 0xFF, 0x11, "最低字节应是红");
+        assert_eq!((packed >> 8) & 0xFF, 0x22);
+        assert_eq!((packed >> 16) & 0xFF, 0x33);
+        assert_eq!((packed >> 24) & 0xFF, 0xFF, "最高字节应是 alpha");
     }
+
 
     // ---- uniform --------------------------------------------------------
 

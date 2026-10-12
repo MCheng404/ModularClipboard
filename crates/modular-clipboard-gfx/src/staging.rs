@@ -36,6 +36,23 @@ pub const DEFAULT_STAGING_CAPACITY: vk::DeviceSize = 4 * 1024 * 1024;
 /// 按需给小缓冲，遇到大上传再涨。
 pub const MIN_STAGING_CAPACITY: vk::DeviceSize = 64 * 1024;
 
+/// 在飞帧数之外的**预留块数**。
+///
+/// 块数恰好等于在飞帧数时，任何「每帧都要上传一点」的额外上传者都会把
+/// arena 挤到无块可用：一块被某帧占用后，要等该帧的栅栏 signal 才退休，
+/// 也就是至少等一整轮在飞帧。实测触发路径：首帧字体图集 4MB 占一块，
+/// 自研磨砂的桌面捕获（约 0.4MB）每次上传再占一块，3 槽位/3 块时第 4 帧
+/// 即报「全部在途、无可分配空间」，程序直接启动失败。
+///
+/// 多给 2 块在正常帧循环里的成本是**零**：块的内存惰性分配
+/// （`allocate` 首次用到才 `create_buffer`），用不到就不占主机可见内存。
+pub const EXTRA_CHUNKS: usize = 2;
+
+/// 在飞帧数 → arena 块数（含预留，见 [`EXTRA_CHUNKS`]）。
+pub fn chunk_count_for(slot_count: usize) -> usize {
+    slot_count.saturating_add(EXTRA_CHUNKS).max(1)
+}
+
 /// arena 里 staging 块的数量。
 ///
 /// **必须 ≥ 在飞帧数**。每个在飞帧各自独占一块：本帧写入的字节在
@@ -303,6 +320,15 @@ impl<'a> StagingArena<'a> {
                 .checked_add(aligned)
                 .unwrap_or(vk::DeviceSize::MAX)
                 .max(MIN_STAGING_CAPACITY);
+            // 摊销式扩容：多留 50% 余量（与 `Vec` 的几何增长同理）。
+            //
+            // 不留余量的代价是真实的：一次大上传会把块**恰好**填满，
+            // 同一帧随后的每一次小上传都只能另起一块——块数是按在飞帧
+            // 数给的（3），一帧占满 3 块后下一帧就「全部在途、无可分配」。
+            // 实测触发路径：首帧先上传 4MB 字体图集（占满块 0），
+            // 紧接着的自研磨砂桌面捕获（约 0.4MB）只能另起块 1，
+            // 再来一次就吃掉块 2 ⇒ 程序直接启动失败。
+            let want = want.saturating_add(want / 2);
             // 只有「该块一字节未写」时才能原地重建：否则本帧已录制的
             // 拷贝命令仍引用旧 buffer，释放它就是 use-after-free。
             if used == 0 {
@@ -901,13 +927,15 @@ fn arena_capacity_constants_are_sane() {
         4 * 1024 * 1024
     );
     assert_eq!(DEFAULT_STAGING_CAPACITY, 4 * 1024 * 1024);
-    // 下限不能为 0，否则小图集会拿到 0 容量缓冲
-    assert!(MIN_STAGING_CAPACITY > 0);
-    // 对齐必须是 2 的幂且 ≥ 4（规范对 bufferOffset 的最低要求）
-    assert!(STAGING_ALIGNMENT >= 4);
-    assert_eq!(STAGING_ALIGNMENT.count_ones(), 1);
-    // 块数必须 ≥ 2，否则无法在「本帧写入」与「上帧在途」间轮转
-    assert!(UPLOAD_POOL_CAPACITY >= 2);
+    const {
+        // 下限不能为 0，否则小图集会拿到 0 容量缓冲
+        assert!(MIN_STAGING_CAPACITY > 0);
+        // 对齐必须是 2 的幂且 ≥ 4（规范对 bufferOffset 的最低要求）
+        assert!(STAGING_ALIGNMENT >= 4);
+        assert!(STAGING_ALIGNMENT.count_ones() == 1, "对齐必须是 2 的幂");
+        // 块数必须 ≥ 2，否则无法在「本帧写入」与「上帧在途」间轮转
+        assert!(UPLOAD_POOL_CAPACITY >= 2);
+    }
 }
 
 #[test]

@@ -91,7 +91,7 @@ fn main() {
     println!("OK message loop pumped");
 
     // --- Vulkan 初始化 ---
-    let gpu = match Gpu::new("ModularClipboardProbe", hinstance.into(), hwnd.into()) {
+    let gpu = match Gpu::new("ModularClipboardProbe", hinstance.into(), hwnd) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("FAIL Gpu::new: {e:#}");

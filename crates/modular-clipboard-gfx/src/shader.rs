@@ -14,10 +14,24 @@ use ash::vk;
 /// 生成文件里是一段裸的 `[..]` 数组字面量，由 build.rs 产出。
 const SPIRV_WORDS: &[u32] = &include!(concat!(env!("OUT_DIR"), "/egui.rs"));
 
+/// `shaders/blur.wgsl` 编译出的 SPIR-V 词。
+///
+/// 与 `egui.wgsl` 各是一个模块：两者的顶点输入布局、描述符布局、
+/// 管线状态都不同，合在一起没有意义。`build.rs` 会把 `shaders/` 下
+/// 每个 `.wgsl` 都编译成同名的 `{name}.rs`，这里按名 include 即可。
+const BLUR_SPIRV_WORDS: &[u32] = &include!(concat!(env!("OUT_DIR"), "/blur.rs"));
+
 /// WGSL 中的顶点入口点名。
 pub const VERTEX_ENTRY: &std::ffi::CStr = c"vs_main";
 /// WGSL 中的片元入口点名。
 pub const FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_main";
+
+/// `blur.wgsl` 的全屏三角形顶点入口。
+pub const BLUR_VERTEX_ENTRY: &std::ffi::CStr = c"vs_fullscreen";
+/// `blur.wgsl` 的分离式高斯片元入口。
+pub const BLUR_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_blur";
+/// `blur.wgsl` 的直通拷贝片元入口（降采样 / 合成）。
+pub const COPY_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_copy";
 
 /// 着色器模块。销毁时需调用 [`ShaderModule::destroy`]。
 pub struct ShaderModule {
@@ -33,9 +47,42 @@ impl ShaderModule {
         Ok(Self { module })
     }
 
+    /// 从内嵌的模糊着色器创建模块（`blur.wgsl`）。
+    ///
+    /// 与 [`Self::new`] 的唯一区别是嵌入的 SPIR-V 来源不同。两者
+    /// 刻意**分开**：`egui.wgsl` 的管线有顶点缓冲输入，模糊管线没有，
+    /// 各自引用自己那份模块可避免「拿错入口点名」这类错误在运行期
+    /// 才暴露（`create_graphics_pipelines` 报 EntryPointNotFound）。
+    pub fn new_blur(device: &ash::Device) -> anyhow::Result<Self> {
+        let info = vk::ShaderModuleCreateInfo::default().code(BLUR_SPIRV_WORDS);
+        let module = unsafe { device.create_shader_module(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建模糊着色器模块失败: {e:?}"))?;
+        Ok(Self { module })
+    }
+
     /// 句柄。
     pub fn handle(&self) -> vk::ShaderModule {
         self.module
+    }
+
+    /// 按**显式入口点名**构造顶点阶段。
+    ///
+    /// 供 `blur.wgsl` 这类「一个模块多个入口」的场景使用：
+    /// [`Self::vertex_stage`] 写死了 `vs_main`，而模糊模块的入口叫
+    /// `vs_fullscreen`。
+    pub fn vertex_stage_named(
+        &self,
+        entry: &'static std::ffi::CStr,
+    ) -> vk::PipelineShaderStageCreateInfo<'_> {
+        stage(vk::ShaderStageFlags::VERTEX, self.module, entry)
+    }
+
+    /// 按**显式入口点名**构造片元阶段。见 [`Self::vertex_stage_named`]。
+    pub fn fragment_stage_named(
+        &self,
+        entry: &'static std::ffi::CStr,
+    ) -> vk::PipelineShaderStageCreateInfo<'_> {
+        stage(vk::ShaderStageFlags::FRAGMENT, self.module, entry)
     }
 
     /// 构造顶点着色阶段。
@@ -98,6 +145,36 @@ mod tests {
         let bytes = SPIRV_WORDS.len() * 4;
         assert!(bytes > 200, "SPIR-V 过小（{bytes} 字节），可能被截断");
         assert!(bytes < 200_000, "SPIR-V 过大（{bytes} 字节），可能嵌入冗余内容");
+    }
+
+    #[test]
+    fn blur_spirv_header_is_valid() {
+        // 与 `spirv_header_is_valid` 同源的守卫，对象换成模糊模块。
+        // 两套模块各自 include 一份生成文件，任一条编译链断掉都要立刻发现。
+        assert!(!BLUR_SPIRV_WORDS.is_empty(), "模糊 SPIR-V 为空");
+        assert_eq!(
+            BLUR_SPIRV_WORDS[0], SPIRV_MAGIC,
+            "模糊 SPIR-V 魔数错误，说明 build.rs 未产出 blur.rs 或格式不对"
+        );
+        let bytes = BLUR_SPIRV_WORDS.len() * 4;
+        assert!(
+            bytes > 200,
+            "模糊 SPIR-V 过小（{bytes} 字节），可能被截断"
+        );
+    }
+
+    #[test]
+    fn blur_entry_names_are_distinct_from_egui() {
+        // 模糊模块的入口点名必须与 egui 模块**不同**：若误写成
+        // `vs_main`/`fs_main`，模糊管线会引用到一个不存在的入口，
+        // 直到 `create_graphics_pipelines` 才报 EntryPointNotFound。
+        assert_eq!(BLUR_VERTEX_ENTRY.to_str().unwrap(), "vs_fullscreen");
+        assert_eq!(BLUR_FRAGMENT_ENTRY.to_str().unwrap(), "fs_blur");
+        assert_eq!(COPY_FRAGMENT_ENTRY.to_str().unwrap(), "fs_copy");
+        for e in [BLUR_VERTEX_ENTRY, BLUR_FRAGMENT_ENTRY, COPY_FRAGMENT_ENTRY] {
+            assert_ne!(e, VERTEX_ENTRY);
+            assert_ne!(e, FRAGMENT_ENTRY);
+        }
     }
 
     #[test]

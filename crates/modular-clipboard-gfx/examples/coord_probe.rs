@@ -751,5 +751,5 @@ fn probe_titlebar() -> bool {
     if !btn_ok {
         println!("✗ 有窗口按钮落在拖动区内 ⇒ 按钮点不动");
     }
-    return swallowed || !btn_ok;
+    swallowed || !btn_ok
 }

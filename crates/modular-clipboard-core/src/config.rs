@@ -232,27 +232,32 @@ pub struct UiConfig {
     pub window_backdrop: WindowBackdrop,
     /// 背景不透明度（0.3 ~ 1.0，1.0 = 最不透明）。
     ///
-    /// - `Translucent`（整窗半透明）：直接映射为窗口级 alpha；
-    /// - `Acrylic`（磨砂）：映射为渲染层背景 alpha（强度），
-    ///   窗口级 alpha 恒为 255——磨砂由 DWM 渲染，窗口不能分层。
+    /// 映射为渲染层背景层的 alpha（强度），文字/卡片恒不透明：
+    /// - `Acrylic`（自研磨砂）：映射区间较宽，模糊底图承担可读性；
+    /// - `Translucent`（半透明）：映射区间更实，直接透出未模糊桌面。
     #[serde(default = "default_window_opacity")]
     pub window_opacity: f32,
 }
 
 /// 窗口背景效果。
 ///
-/// 三选一，互斥：磨砂靠 DWM 渲染、半透明靠窗口分层，
-/// 两者机制不同不能同时开，因此不是位标志而是单选。
+/// 三选一，互斥：磨砂与半透明都靠交换链的**像素 alpha**（PRE_MULTIPLIED）
+/// 与桌面合成，机制相同不能同时开，因此不是位标志而是单选。
+///
+/// 均为自研实现，不依赖 DWM 原生 backdrop（`DWMWA_SYSTEMBACKDROP_TYPE`
+/// 已移除：Win11 22H2+ 才可用、外观不可调、与暗色渲染层偏色）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WindowBackdrop {
     /// 无效果：纯色不透明背景。
     #[default]
     None,
-    /// Win11 原生磨砂（Acrylic）：DWM 渲染模糊 + 着色，渲染层
-    /// 背景画半透明让磨砂透出，文字/卡片保持不透明。
+    /// 自研磨砂：GDI 实时捕获窗口身后的桌面（`WDA_EXCLUDEFROMCAPTURE`
+    /// 自排除，见 `gfx::backdrop`），GPU 三趟卷积后作窗口底图；背景层
+    /// 画低 alpha 让模糊透出，文字/卡片保持不透明。
     Acrylic,
-    /// 整体半透明：`SetLayeredWindowAttributes(LWA_ALPHA)`，
-    /// 整窗按透明度淡出，渲染层不必改。
+    /// 逐像素半透明：背景层画低 alpha，桌面直接透出（无模糊）；
+    /// 文字/卡片不透明保证可读性。不再用整窗 `LWA_ALPHA` 淡出
+    /// （那会把文字一起变透明，低不透明度下不可读）。
     Translucent,
 }
 
@@ -360,6 +365,10 @@ pub struct McpConfig {
     pub window_focus: bool,
     /// 拖拽元素或执行拖放。
     pub drag_drop: bool,
+    /// 模拟按键（含组合键与功能键）。
+    pub key_press: bool,
+    /// 读写系统剪贴板文本。
+    pub clipboard: bool,
 }
 
 impl Default for McpConfig {
@@ -377,6 +386,8 @@ impl Default for McpConfig {
             screen_capture: true,
             window_focus: true,
             drag_drop: true,
+            key_press: true,
+            clipboard: true,
         }
     }
 }

@@ -128,15 +128,35 @@ pub fn open_external(target: &str) -> Result<()> {
 }
 
 /// 用默认浏览器打开 URL。
+///
+/// 走 `ShellExecuteW` 而非 `cmd /C start`：URL 经 shell 解析时 `&` 会被
+/// 当命令分隔符（带查询串的链接被截断）、`%XX` 被变量展开（百分号编码
+/// 必坏），且剪贴板内容可借此注入任意命令。ShellExecuteW 把 URL 作为
+/// 单个参数交给系统，元字符全部是普通字符。
 pub fn open_url(url: &str) -> Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const DETACHED: u32 = 0x0000_0008 | 0x0000_0020;
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .creation_flags(DETACHED)
-            .spawn()?;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::{SHOW_WINDOW_CMD, SW_SHOWNORMAL};
+        use windows::core::{HSTRING, PCWSTR};
+        let file = HSTRING::from(url);
+        let verb = HSTRING::from("open");
+        // SAFETY: 纯 FFI 调用，参数均为本函数构造的有效宽字符串。
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                &verb,
+                &file,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SHOW_WINDOW_CMD(SW_SHOWNORMAL.0),
+            )
+        };
+        // ShellExecuteW 的历史遗留约定：返回值 > 32 才算成功，
+        // ≤ 32 是 SE_ERR_* 错误码。
+        if result.0 as isize <= 32 {
+            anyhow::bail!("打开 URL 失败（ShellExecuteW 返回 {}）：{url}", result.0 as isize);
+        }
         Ok(())
     }
     #[cfg(not(windows))]
@@ -166,23 +186,33 @@ pub fn reveal_in_explorer(path: &str) -> Result<()> {
 /// 执行外部命令（联动规则入口）。
 ///
 /// `arg` 中的 `{selection}` 会被替换为选中文本。
+///
+/// # 为什么不经 shell
+///
+/// 剪贴板内容是**不可信输入**。经 `cmd /C`（或 `sh -c`）执行时，
+/// 内容里的 `& | > ^ %` 会被当语法字符：既能截断命令（带 `&` 的 URL
+/// 模板必坏），也能注入任意命令（`x&calc` 启动计算器）。本函数按
+/// **argv 直传**：替换后的模板作为单个参数交给程序，元字符全是普通字符。
+///
+/// 代价：模板里的 shell 语法（管道、重定向、`&&`）不再生效。`{selection}`
+/// 的契约本来就是「作为单个参数值替换」，直传才是这个契约的正确实现；
+/// 需要 shell 语法的场景应配一个 `.bat`/`.sh` 脚本作为 program。
 pub fn run_command(program: &str, arg: &str, selection: &str) -> Result<()> {
     let substituted = arg.replace("{selection}", selection);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const DETACHED: u32 = 0x0000_0008 | 0x0000_0020;
-        std::process::Command::new("cmd")
-            .args(["/C", program, &substituted])
+        std::process::Command::new(program)
+            .arg(&substituted)
             .creation_flags(DETACHED)
             .spawn()?;
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("{program} {substituted}"))
+        std::process::Command::new(program)
+            .arg(&substituted)
             .spawn()?;
         Ok(())
     }
@@ -254,7 +284,7 @@ pub fn set_autostart(_exe_path: &str, _enable: bool) -> Result<()> {
 pub fn is_autostart_enabled() -> bool {
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW,
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, RRF_RT_ANY, RegCloseKey, RegGetValueW,
         RegOpenKeyExW,
     };
     use windows::core::HSTRING;
@@ -270,11 +300,15 @@ pub fn is_autostart_enabled() -> bool {
             return false;
         }
         let mut len: u32 = 0;
+        // DF-04：`set_autostart` 写的是 `REG_EXPAND_SZ`，读侧若限定
+        // `RRF_RT_ANY`，RegGetValueW 会以 ERROR_UNSUPPORTED_TYPE 失败
+        // ——读函数永远看不到写函数写的值（自启已开却显示未开）。
+        // RRF_RT_ANY 接受任意类型；仅用长度判断「值存在且非空」。
         let st = RegGetValueW(
             hkey,
             windows::core::PCWSTR::null(),
             &value_name,
-            RRF_RT_REG_SZ,
+            RRF_RT_ANY,
             None,
             None,
             Some(&mut len),

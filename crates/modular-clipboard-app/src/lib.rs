@@ -23,6 +23,12 @@ use modular_clipboard_store::{GroupFilter, Store, fingerprint};
 pub struct AppState {
     pub config: Config,
     pub items: Vec<ClipItem>,
+    /// `items` 的版本号：每次整体替换（`reload_list`）时 +1。
+    ///
+    /// 绘制层靠它判断「行高缓存是否已失效」——行高只取决于条目文本与
+    /// 布局参数，跨帧不变；没有版本号就无法知道列表什么时候换过，
+    /// 只能每帧重算（PF-1：2000 次 LayoutJob 测量/帧）。
+    pub list_version: u64,
     pub groups: Vec<modular_clipboard_core::Group>,
     pub selected: Option<EntryId>,
     pub query: String,
@@ -57,7 +63,16 @@ impl Drop for CaptureHandle {
 
 /// 捕获线程发送的信号。
 enum Signal {
-    Captured(CapturedPayload),
+    Captured {
+        payload: CapturedPayload,
+        /// 内容指纹，由**捕获线程**预计算（PF-2）。
+        ///
+        /// SHA-256 对 32MB 载荷约 60~100ms：放在 UI 线程就是「复制
+        /// 大图时窗口卡住、掉帧、拖动无响应」的直接原因。捕获线程两轮
+        /// 轮询之间有整个 interval（默认 300ms）的空闲，这点计算
+        /// 不占它任何预算。
+        hash: String,
+    },
 }
 
 /// 应用服务。
@@ -148,6 +163,7 @@ impl Service {
             state: AppState {
                 config,
                 items,
+                list_version: 1,
                 groups,
                 selected: None,
                 query: String::new(),
@@ -252,24 +268,36 @@ impl Service {
                     let now = now_ms() as i64;
                     let last = last_self_write.load(Ordering::Relaxed) as i64;
 
-                    // NOTE: 抑制期内**也要**推进序列号基线（`capture_should_read`
-                    // 无条件调用 `changed()`）。
+                    // 序列号变化先**窥探**不提交（DF-05）：剪贴板可能正被
+                    // 其他进程短暂持有（Office OLE、远程桌面、VMware 同步），
+                    // 此刻读取必失败。若像旧实现那样先推进基线再读，失败的
+                    // 那次变化就永久丢了——用户少一条历史记录且无感知。
                     //
-                    // 自写回（`copy_item`）会改变剪贴板序列号；若抑制期内跳过
-                    // `changed()`，基线停留在自写前的值，抑制期结束后的第一轮
-                    // 就会把「自写导致的变化」当成用户的新复制重新捕获——每次
-                    // 把历史条目放回剪贴板都会**多记一条重复记录**。
-                    // 抑制期内的用户复制（900ms 窗口内，概率极低）会被吸收进
-                    // 基线，这正是抑制语义的本意：抑制期内的一切变化都视为
-                    // 自写引起。
-                    if capture_should_read(&mut reader, now, last, interval_ms)
-                        && let Some(payload) = reader.read()
-                    {
-                        c.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(kind = ?payload.kind, len = payload.bytes.len(), "捕获线程读取到内容");
-                        if tx.push(Signal::Captured(payload)).is_err() {
-                            // 队列满：丢弃这次事件，不能阻塞剪贴板读取。
-                            tracing::debug!("事件队列已满，丢弃一条捕获");
+                    // 三种分支（判据统一走 capture_should_read）：
+                    // 1. 抑制期内：推进基线**吸收**这次变化（自写回语义），
+                    //    不读取；
+                    // 2. 非抑制但剪贴板被占用：什么都不做，下一轮重试；
+                    // 3. 其余：提交基线并读取，成功则投递。
+                    if reader.peek_changed() {
+                        let past_guard =
+                            capture_should_read(true, now, last, interval_ms);
+                        if !past_guard {
+                            reader.commit_sequence();
+                        } else if modular_clipboard_capture::clipboard_held_by_other() {
+                            tracing::debug!("剪贴板正被其他进程持有，本轮跳过，下轮重试");
+                        } else {
+                            reader.commit_sequence();
+                            if let Some(payload) = reader.read() {
+                                // 指纹在捕获线程算（PF-2，见 Signal::Captured
+                                // 的文档）：UI 线程只做 DB 写入。
+                                let hash = fingerprint(&payload.bytes);
+                                c.fetch_add(1, Ordering::Relaxed);
+                                tracing::debug!(kind = ?payload.kind, len = payload.bytes.len(), "捕获线程读取到内容");
+                                if tx.push(Signal::Captured { payload, hash }).is_err() {
+                                    // 队列满：丢弃这次事件，不能阻塞剪贴板读取。
+                                    tracing::debug!("事件队列已满，丢弃一条捕获");
+                                }
+                            }
                         }
                     }
                     std::thread::sleep(Duration::from_millis(interval));
@@ -316,17 +344,17 @@ impl Service {
         // 先把队列排空到本地缓冲，再逐条处理。
         // 若直接在循环里持有 rx 的借用，处理事件时又调用 self.ingest()
         // 会形成对 self 的重复可变借用。
-        let mut batch: Vec<CapturedPayload> = Vec::new();
+        let mut batch: Vec<(CapturedPayload, String)> = Vec::new();
         if let Some(rx) = self.rx.as_mut() {
             while let Ok(sig) = rx.pop() {
                 match sig {
-                    Signal::Captured(p) => batch.push(p),
+                    Signal::Captured { payload, hash } => batch.push((payload, hash)),
                 }
             }
         }
         let mut dirty = false;
-        for payload in batch {
-            if self.ingest(payload) {
+        for (payload, hash) in batch {
+            if self.ingest_with_fingerprint(payload, hash) {
                 dirty = true;
             }
         }
@@ -336,7 +364,17 @@ impl Service {
     /// 处理一条捕获内容：过滤 → 去重 → 入库。
     ///
     /// 返回是否产生了界面变更。
+    ///
+    /// 指纹在**本线程**就地计算：供测试与同步调用路径使用。捕获线程的
+    /// 热路径走 [`Self::ingest_with_fingerprint`]（PF-2）——那边算哈希
+    /// 不占 UI 线程预算。
     pub fn ingest(&mut self, payload: CapturedPayload) -> bool {
+        let hash = fingerprint(&payload.bytes);
+        self.ingest_with_fingerprint(payload, hash)
+    }
+
+    /// 同 [`Self::ingest`]，但指纹由调用方预计算（捕获线程路径，PF-2）。
+    pub fn ingest_with_fingerprint(&mut self, payload: CapturedPayload, hash: String) -> bool {
         let cfg = &self.state.config;
 
         if !cfg.capture.enabled {
@@ -365,7 +403,8 @@ impl Service {
             return false;
         }
 
-        let hash = fingerprint(&payload.bytes);
+        // 指纹由参数传入（捕获线程预计算，PF-2）；`ingest` 包装器会
+        // 就地算好后转调本函数。
         let preview = build_preview(&payload);
 
         // 去重：历史中已有相同内容（无论何时复制的）就不再新增，
@@ -415,7 +454,7 @@ impl Service {
     /// 重新读取列表。列表量级在数千条内，直接全量读取比增量维护更不容易出错。
     pub fn reload_list(&mut self) {
         let result = match self.state.query.trim() {
-            q if q.is_empty() => {
+            "" => {
                 let filter = self.state.group_filter;
                 self.store.list(PAGE_LIMIT, 0, filter)
             }
@@ -428,6 +467,8 @@ impl Service {
                 self.state.items.clear();
             }
         }
+        // 列表整体换过：行高缓存（绘制层按本版本号判断失效）必须知道。
+        self.state.list_version = self.state.list_version.wrapping_add(1);
         self.state.groups = self.store.list_groups().unwrap_or_default();
     }
 
@@ -568,15 +609,14 @@ impl Service {
                 .then(|| std::fs::read_to_string(&path).ok())
                 .flatten()
                 .and_then(|raw| serde_json::from_str::<Config>(&raw).ok());
-            if let Some(real) = persisted {
-                if real.capture.enabled != self.state.config.capture.enabled {
+            if let Some(real) = persisted
+                && real.capture.enabled != self.state.config.capture.enabled {
                     tracing::info!(
                         persisted = real.capture.enabled,
                         "不把 --no-capture 临时覆盖写入 config.json"
                     );
                     self.state.config.capture.enabled = real.capture.enabled;
                 }
-            }
             self.state.config.save(&path)?;
             self.store.apply_config(&self.state.config);
         }
@@ -643,14 +683,17 @@ fn self_write_guard_ms(poll_interval_ms: i64) -> i64 {
 }
 
 /// 无符号减法会下溢成巨值，让抑制永久失效（见捕获线程的注释）。
+///
+/// 纯函数：序列号是否变化由调用方以 `peek_changed` 窥探后传入——
+/// 决策与「提交基线」分离，读取失败时才能重试（DF-05）。
 fn capture_should_read(
-    reader: &mut ClipboardReader,
+    seq_changed: bool,
     now: i64,
     last_self_write: i64,
     poll_interval_ms: i64,
 ) -> bool {
     let since = now.saturating_sub(last_self_write);
-    reader.changed() && since >= self_write_guard_ms(poll_interval_ms)
+    seq_changed && since >= self_write_guard_ms(poll_interval_ms)
 }
 
 /// 单页最多加载的条目数。
@@ -679,17 +722,28 @@ pub fn config_path_in(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join(CONFIG_FILE_NAME)
 }
 
+/// 预览文本的最大字符数（PF-5 / SEC-018）。
+///
+/// 列表只需要「是否超过 N 行」的信息量；全文已文件化在 blob 里，
+/// 详情面板可读全量。不截断的代价是三重复放大的：
+/// DB 每条存几百 KB（1 万条上限即数 GB）→ 每次 `reload_list`
+/// 全量物化 → UI 每帧再全量 clone + 全量哈希一遍（PF-1）。
+///
+/// 已知取舍：FTS 索引随 preview 截断，长文档只有前 512 字符可被
+/// 搜索到。剪贴板场景的高价值内容（URL、代码开头、报错首行）
+/// 基本都在开头；需要全文检索的场景应改用详情面板内的本地搜索。
+pub const PREVIEW_MAX_CHARS: usize = 512;
+
 /// 生成预览文本。
 fn build_preview(payload: &CapturedPayload) -> String {
     match payload.kind {
-        ClipKind::Text => payload
-            .text
-            .clone()
-            .unwrap_or_else(|| String::from_utf8_lossy(&payload.bytes).to_string()),
-        ClipKind::Html => payload
-            .text
-            .clone()
-            .unwrap_or_else(|| String::from_utf8_lossy(&payload.bytes).to_string()),
+        ClipKind::Text | ClipKind::Html => {
+            let raw = payload
+                .text
+                .clone()
+                .unwrap_or_else(|| String::from_utf8_lossy(&payload.bytes).to_string());
+            truncate_chars(&raw, PREVIEW_MAX_CHARS)
+        }
         ClipKind::Files => {
             let names: Vec<String> = payload
                 .files
@@ -715,6 +769,16 @@ fn build_preview(payload: &CapturedPayload) -> String {
             }
         }
     }
+}
+
+/// 按字符数截断（char boundary 安全），超长时追加省略号。
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 /// 读取图片尺寸（仅解析文件头，不解码像素）。
@@ -1026,17 +1090,24 @@ mod tests {
         let last_self_write = now_ms() as i64;
 
         // 1. 抑制期内（since = 0 < 900）：不读取；
-        //    但基线必须已推进——自写导致的变化被吸收。
+        //    生产循环此时会 commit_sequence 把自写的变化吸收进基线。
         assert!(
-            !capture_should_read(&mut reader, last_self_write, last_self_write, 300),
+            !capture_should_read(
+                reader.peek_changed(),
+                last_self_write,
+                last_self_write,
+                300,
+            ),
             "抑制期内不应读取剪贴板"
         );
+        // 与生产循环一致：抑制期内提交基线（吸收自写导致的变化）。
+        reader.commit_sequence();
 
         // 2. 抑制期结束后（since = 900）：序列号无新变化 ⇒ 仍不读取。
         //    旧实现在这里返回 true——把自写回当成用户新复制（bug）。
         assert!(
             !capture_should_read(
-                &mut reader,
+                reader.peek_changed(),
                 last_self_write + self_write_guard_ms(300),
                 last_self_write,
                 300,
@@ -1051,7 +1122,7 @@ mod tests {
         }
         assert!(
             capture_should_read(
-                &mut reader,
+                reader.peek_changed(),
                 last_self_write + self_write_guard_ms(300) + 1,
                 last_self_write,
                 300,

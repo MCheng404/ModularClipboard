@@ -80,7 +80,7 @@ fn run() -> anyhow::Result<()> {
     println!("OK Win32 窗口已创建并显示");
 
     // --- Vulkan ---
-    let gpu = Gpu::new("ModularClipboardDrawProbe", hinstance.into(), hwnd.into())?;
+    let gpu = Gpu::new("ModularClipboardDrawProbe", hinstance.into(), hwnd)?;
     println!(
         "OK Gpu::new  queue_family={} formats={}",
         gpu.queue_family,
@@ -264,7 +264,7 @@ fn atlas_coverage(size: u32) -> Vec<u8> {
         .map(|i| {
             let x = (i as u32) % size;
             let y = (i as u32) / size;
-            let checker = ((x / 32) + (y / 32)) % 2 == 0;
+            let checker = ((x / 32) + (y / 32)).is_multiple_of(2);
             let gradient = ((x + y) % 256) as u8;
             if checker {
                 gradient
@@ -292,7 +292,7 @@ fn create_window(hinstance: HINSTANCE) -> anyhow::Result<HWND> {
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         lpfnWndProc: Some(wnd_proc),
-        hInstance: hinstance.into(),
+        hInstance: hinstance,
         lpszClassName: cp,
         ..Default::default()
     };
@@ -315,7 +315,7 @@ fn create_window(hinstance: HINSTANCE) -> anyhow::Result<HWND> {
             H,
             None,
             None,
-            Some(hinstance.into()),
+            Some(hinstance),
             None,
         )
     }

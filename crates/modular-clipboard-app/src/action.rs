@@ -140,15 +140,26 @@ impl Action for RevealAction {
 }
 
 /// 把文本送入外部命令（联动规则的通用入口）。
+///
+/// `id` 必须每个实例唯一：早前两个内置实例共用 `"run_command"`，
+/// 第二个注册被 [`ActionRegistry::register`] 的重复 id 守卫静默拒绝
+/// ——「翻译（DeepL）」内置动作其实从未注册过。
 pub struct CommandAction {
+    id: &'static str,
     program: String,
     arg_template: String,
     label: &'static str,
 }
 
 impl CommandAction {
-    pub fn new(label: &'static str, program: impl Into<String>, arg_template: impl Into<String>) -> Self {
+    pub fn new(
+        id: &'static str,
+        label: &'static str,
+        program: impl Into<String>,
+        arg_template: impl Into<String>,
+    ) -> Self {
         Self {
+            id,
             program: program.into(),
             arg_template: arg_template.into(),
             label,
@@ -158,7 +169,7 @@ impl CommandAction {
 
 impl Action for CommandAction {
     fn id(&self) -> ActionId {
-        "run_command"
+        self.id
     }
     fn label(&self) -> &'static str {
         self.label
@@ -167,12 +178,34 @@ impl Action for CommandAction {
         matches!(item.kind, ClipKind::Text | ClipKind::Files)
     }
     fn plan(&self, item: &ClipItem) -> Option<ActionPlan> {
+        let selection = item.preview.trim();
         Some(ActionPlan::RunCommand {
             program: self.program.clone(),
-            arg: self.arg_template
-                .replace("{selection}", item.preview.trim()),
+            // `{selection_urlencoded}`：percent-encode 后的文本，供 URL
+            // 模板使用。剪贴板内容进入命令行前必须编码，否则 `&`/`%`
+            // 等字符会改变命令结构（见 platform::run_command 的安全说明）。
+            arg: self
+                .arg_template
+                .replace("{selection_urlencoded}", &percent_encode(selection))
+                .replace("{selection}", selection),
         })
     }
+}
+
+/// 按 URL 分量规则 percent-encode：未保留字符全部编成 `%XX`。
+///
+/// 自实现而非引 crate：保留集固定（RFC 3986 unreserved），一个函数足够。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// 动作注册表。持有全部可用动作。
@@ -190,15 +223,20 @@ impl ActionRegistry {
         let _ = reg.register(Box::new(OpenUrlAction));
         let _ = reg.register(Box::new(OpenExternalAction));
         let _ = reg.register(Box::new(RevealAction));
+        // URL 类内置动作用 `explorer`（真实可执行文件）+ percent-encode：
+        // 早前用 `start`（cmd 内建命令）+ 裸 `{selection}`，既依赖 shell
+        // 解析（`&` 截断、命令注入），`start` 也无法被 argv 直传 spawn。
         let _ = reg.register(Box::new(CommandAction::new(
+            "run_command",
             "在浏览器中搜索",
-            "start",
-            "https://www.bing.com/search?q={selection}",
+            "explorer",
+            "https://www.bing.com/search?q={selection_urlencoded}",
         )));
         let _ = reg.register(Box::new(CommandAction::new(
+            "translate_deepl",
             "翻译（DeepL 网页版）",
-            "start",
-            "https://www.deepl.com/translator#en/zh/{selection}",
+            "explorer",
+            "https://www.deepl.com/translator#en/zh/{selection_urlencoded}",
         )));
         reg
     }
@@ -290,6 +328,21 @@ pub fn propose(
             continue;
         };
         if let Some(plan) = action.plan(item) {
+            // 规则自带的 `arg` 是命令行模板，对 RunCommand 是**覆盖**而非
+            // 补充：用户配的模板必须生效，否则「联动规则可自定义命令」
+            // 只是摆设（rule.arg 曾经只写不读，规则永远跑内置模板）。
+            let plan = match (rule.arg.as_deref(), &plan) {
+                (Some(arg), ActionPlan::RunCommand { program, .. }) if !arg.trim().is_empty() => {
+                    let selection = item.preview.trim();
+                    ActionPlan::RunCommand {
+                        program: program.clone(),
+                        arg: arg
+                            .replace("{selection_urlencoded}", &percent_encode(selection))
+                            .replace("{selection}", selection),
+                    }
+                }
+                _ => plan,
+            };
             out.push(ActionProposal {
                 action: action.id(),
                 label: if rule.name.is_empty() {
@@ -329,8 +382,9 @@ pub fn dispatch(plan: &ActionPlan) -> anyhow::Result<()> {
         ActionPlan::OpenUrl(u) => modular_clipboard_platform::open_url(u),
         ActionPlan::RevealInExplorer(p) => modular_clipboard_platform::reveal_in_explorer(p),
         ActionPlan::RunCommand { program, arg } => {
-            let selection = arg.replace("{selection}", "");
-            modular_clipboard_platform::run_command(program, arg, &selection)
+            // `arg` 在 plan 构造时已完成 `{selection}` 替换；此处传空
+            // selection，run_command 内的替换是无副作用的幂等操作。
+            modular_clipboard_platform::run_command(program, arg, "")
         }
         ActionPlan::CopyToClipboard => Ok(()),
         ActionPlan::Notice(_) => Ok(()),
@@ -338,12 +392,35 @@ pub fn dispatch(plan: &ActionPlan) -> anyhow::Result<()> {
 }
 
 /// 内置规则模板，供设置页「一键添加」。
+///
+/// 元组为（名称, 关键词, 动作 id, 命令行模板）。URL 模板一律用
+/// `{selection_urlencoded}`：剪贴板文本进入 URL 前必须 percent-encode。
 pub fn builtin_rule_templates() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
     vec![
-        ("在浏览器搜索", "", "run_command", "https://www.bing.com/search?q={selection}"),
-        ("翻译成中文", "", "run_command", "https://www.deepl.com/translator#en/zh/{selection}"),
-        ("查 GitHub 代码", "", "run_command", "https://github.com/search?q={selection}"),
-        ("翻译（Google）", "", "run_command", "https://translate.google.com/?sl=auto&tl=zh-CN&text={selection}&op=translate"),
+        (
+            "在浏览器搜索",
+            "",
+            "run_command",
+            "https://www.bing.com/search?q={selection_urlencoded}",
+        ),
+        (
+            "翻译成中文",
+            "",
+            "translate_deepl",
+            "https://www.deepl.com/translator#en/zh/{selection_urlencoded}",
+        ),
+        (
+            "查 GitHub 代码",
+            "",
+            "run_command",
+            "https://github.com/search?q={selection_urlencoded}",
+        ),
+        (
+            "翻译（Google）",
+            "",
+            "run_command",
+            "https://translate.google.com/?sl=auto&tl=zh-CN&text={selection_urlencoded}&op=translate",
+        ),
     ]
 }
 
@@ -457,12 +534,65 @@ mod tests {
 
     #[test]
     fn command_action_substitutes_selection() {
-        let action = CommandAction::new("搜索", "start", "https://x/?q={selection}");
+        let action = CommandAction::new("search_test", "搜索", "explorer", "https://x/?q={selection}");
         let item = text_item("rust lang");
         let plan = action.plan(&item).unwrap();
         match plan {
             ActionPlan::RunCommand { arg, .. } => {
                 assert_eq!(arg, "https://x/?q=rust lang");
+            }
+            other => panic!("预期 RunCommand，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_action_percent_encodes_for_url_templates() {
+        // DF-03 / SEC-001 回归：剪贴板文本进入 URL 前必须编码。
+        // `&` 不被编码时会截断/改写命令结构。
+        let action = CommandAction::new(
+            "search_enc",
+            "搜索",
+            "explorer",
+            "https://x/?q={selection_urlencoded}",
+        );
+        let item = text_item("a&b c%d");
+        let plan = action.plan(&item).unwrap();
+        match plan {
+            ActionPlan::RunCommand { arg, .. } => {
+                assert_eq!(arg, "https://x/?q=a%26b%20c%25d");
+            }
+            other => panic!("预期 RunCommand，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builtin_url_actions_have_unique_ids() {
+        // 回归：两个内置 CommandAction 曾共用 "run_command"，第二个
+        // 被重复 id 守卫静默拒绝——DeepL 翻译其实从未注册。
+        let reg = ActionRegistry::with_builtins();
+        assert!(reg.get("run_command").is_some(), "浏览器搜索应注册");
+        assert!(reg.get("translate_deepl").is_some(), "DeepL 翻译应注册");
+    }
+
+    #[test]
+    fn rule_arg_overrides_builtin_template() {
+        // 回归：rule.arg 曾经只写不读——用户配的命令行模板永远不生效，
+        // 规则跑的一直是内置模板。
+        let reg = ActionRegistry::with_builtins();
+        let rules = vec![ActionRule {
+            id: 7,
+            name: "我的搜索".into(),
+            keyword: None,
+            kind: Some(ClipKind::Text),
+            action: "run_command".into(),
+            arg: Some("https://example.com/?q={selection_urlencoded}".into()),
+            sort_order: 0,
+        }];
+        let props = propose(&reg, &text_item("hello world"), &rules);
+        let mine = props.iter().find(|p| p.rule_id == Some(7)).unwrap();
+        match &mine.plan {
+            ActionPlan::RunCommand { arg, .. } => {
+                assert_eq!(arg, "https://example.com/?q=hello%20world");
             }
             other => panic!("预期 RunCommand，实际 {other:?}"),
         }

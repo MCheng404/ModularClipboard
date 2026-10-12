@@ -530,7 +530,7 @@ fn main() {
     let main_hwnd = wait_for_main_window(pid, STARTUP_TIMEOUT);
     let Some(main_hwnd) = main_hwnd else {
         println!("[FAIL] {STARTUP_TIMEOUT:?} 内主窗口未出现。子进程日志：\n{}", log_text(&log));
-        let _ = backup.restore();
+        backup.restore();
         std::process::exit(checks.finish());
     };
     let visible_at_start = unsafe { IsWindowVisible(main_hwnd) }.as_bool();

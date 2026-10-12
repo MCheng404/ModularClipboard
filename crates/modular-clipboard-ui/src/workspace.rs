@@ -107,15 +107,14 @@ impl Workspace {
     /// 只写位置，**不写** `host` —— 是否独立成窗是运行期的用户选择，
     /// 不该跨重启恢复（否则用户关掉置顶窗，下次启动它又自己冒出来）。
     pub fn apply_saved_positions(&mut self, ui: &modular_clipboard_core::UiConfig) {
-        if let Some(p) = ui.pinned_window_pos {
-            if let Some(c) = self
+        if let Some(p) = ui.pinned_window_pos
+            && let Some(c) = self
                 .cards
                 .iter_mut()
                 .find(|c| c.kind == CardKind::Pinned)
             {
                 c.window_pos = egui::epaint::emath::vec2(p.x, p.y);
             }
-        }
     }
     /// 新建空工作区。
     pub fn empty() -> Self {
@@ -366,8 +365,10 @@ mod tests {
         //
         // 早前位置只存在内存里，重启就丢——用户每次都要重新摆。
         let mut ws = Workspace::default();
-        let mut ui = modular_clipboard_core::UiConfig::default();
-        ui.pinned_window_pos = Some(modular_clipboard_core::WindowPos::new(333.0, 222.0));
+        let ui = modular_clipboard_core::UiConfig {
+            pinned_window_pos: Some(modular_clipboard_core::WindowPos::new(333.0, 222.0)),
+            ..Default::default()
+        };
 
         ws.apply_saved_positions(&ui);
 
@@ -397,8 +398,10 @@ mod tests {
         // 用户关掉置顶窗口就是不想看到它；下次启动若因为恢复了
         // 位置就把它重新拉起来，等于用户的关闭操作被无视了。
         let mut ws = Workspace::default();
-        let mut ui = modular_clipboard_core::UiConfig::default();
-        ui.pinned_window_pos = Some(modular_clipboard_core::WindowPos::new(50.0, 60.0));
+        let ui = modular_clipboard_core::UiConfig {
+            pinned_window_pos: Some(modular_clipboard_core::WindowPos::new(50.0, 60.0)),
+            ..Default::default()
+        };
         ws.apply_saved_positions(&ui);
         assert!(
             ws.by_kind(CardKind::Pinned)

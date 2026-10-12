@@ -226,17 +226,21 @@ impl<'a> WindowGfx<'a> {
     /// 画一帧。
     ///
     /// `acquired` 为 `None` 表示需要重建交换链（调用方应重建后重试）。
+    ///
+    /// `dpi_scale` 是窗口的 DPI 缩放（`Window::scale_factor`），
+    /// 渲染器用它从 `ppp` 反推超采样倍率（`ppp / dpi_scale`）。
     pub fn render(
         &mut self,
         primitives: &[egui::epaint::ClippedPrimitive],
         ppp: f32,
+        dpi_scale: f32,
         textures_delta: &mut egui::TexturesDelta,
     ) -> anyhow::Result<PresentResult> {
         let Some(acquired) = self.fr.acquire()? else {
             return Ok(PresentResult::Outdated);
         };
         self.painter
-            .paint(&mut self.fr, primitives, ppp, textures_delta)?;
+            .paint(&mut self.fr, primitives, ppp, dpi_scale, textures_delta)?;
         self.fr.present(acquired)
     }
 }

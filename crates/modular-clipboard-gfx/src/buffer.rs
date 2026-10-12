@@ -369,7 +369,7 @@ impl Buffer {
         );
         let bytes = self.size as usize;
         anyhow::ensure!(
-            bytes % size_of::<T>() == 0,
+            bytes.is_multiple_of(size_of::<T>()),
             "缓冲大小 {} 不是 {} 的整数倍，无法按该类型读回",
             bytes,
             size_of::<T>()
@@ -663,8 +663,10 @@ mod tests {
 
     /// 构造一份可注入的内存属性表。
     fn props(entries: &[(vk::MemoryPropertyFlags, u32)]) -> vk::PhysicalDeviceMemoryProperties {
-        let mut p = vk::PhysicalDeviceMemoryProperties::default();
-        p.memory_type_count = entries.len() as u32;
+        let mut p = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: entries.len() as u32,
+            ..Default::default()
+        };
         for (i, (flags, heap)) in entries.iter().enumerate() {
             p.memory_types[i] = vk::MemoryType {
                 property_flags: *flags,

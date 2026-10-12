@@ -28,6 +28,7 @@ bytemuck = { workspace = true }
 # 不能依赖其它 crate 顺带开启（MEMORY.md 记录过由此产生的编译失败）。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    # presence.rs：SetWindowDisplayAffinity（磨砂的捕获自排除）。
     "Win32_UI_WindowsAndMessaging",
     # presence.rs：AttachThreadInput / GetCurrentThreadId
     "Win32_System_Threading",
@@ -35,7 +36,4 @@ windows = { version = "0.62", features = [
     # 必须显式声明——cargo feature 是**交集**，不能依赖
     # modular-clipboard-platform 顺带开启（MEMORY.md 有记录）。
     "Win32_System_Registry",
-    # presence.rs：磨砂背景（DWMWA_SYSTEMBACKDROP_TYPE）。
-    # 同样必须显式声明，不能依赖 gfx crate 顺带开启。
-    "Win32_Graphics_Dwm",
 ] }

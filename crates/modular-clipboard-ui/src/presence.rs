@@ -27,11 +27,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_RESTORE, IDC_ARROW, IDC_IBEAM, IDC_HAND,
 };
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::COLORREF;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, LoadCursorW, SetCursor, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+    GetWindowLongPtrW, LoadCursorW, SetCursor, SetWindowDisplayAffinity, SetWindowLongPtrW,
+    GWL_EXSTYLE, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_LAYERED,
 };
 
 /// 窗口隐藏时的轮询间隔。
@@ -407,66 +405,58 @@ pub fn set_topmost(hwnd: HWND, on: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// 背景效果（磨砂 / 半透明）
+// 背景效果（自研磨砂 / 半透明）
 // ---------------------------------------------------------------------------
 
 /// 应用窗口背景效果（磨砂 / 半透明 / 无），幂等可重入。
 ///
-/// `opacity` 语义为「背景不透明度」，取值 0.3~1.0：
+/// # 自研方案（不再依赖 DWM backdrop）
 ///
-/// - [`WindowBackdrop::Acrylic`]：窗口级 alpha 恒 255（磨砂窗口
-///   **不能**是分层窗口——DWM 的 backdrop 在 `WS_EX_LAYERED` 窗口上
-///   不生效），背景透明度由渲染层的 palette 变体控制（见
-///   [`crate::theme::Palette::with_backdrop_alpha`]）；
-/// - [`WindowBackdrop::Translucent`]：`WS_EX_LAYERED` +
-///   `SetLayeredWindowAttributes(LWA_ALPHA, opacity*255)`——整窗按
-///   alpha 淡出，渲染层不必改；
-/// - [`WindowBackdrop::None`]：清掉 DWM backdrop 与分层样式，恢复
-///   纯色不透明背景。
+/// 早前的「磨砂」是 `DWMWA_SYSTEMBACKDROP_TYPE`（Win11 22H2+ Acrylic）——
+/// 效果与系统深度耦合（Win10 不可用、外观不可调、与暗色渲染层偏色）。
+/// 现改为**自研管线**：窗口后方桌面由 `gfx::backdrop` 实时捕获、GPU 卷积
+/// 后作底图（见 `renderer.rs` 的 `BackdropFx`），窗口按**像素 alpha** 合成。
+/// 本函数只负责两件事：捕获自排除 + 窗口样式归位。
+///
+/// - [`WindowBackdrop::Acrylic`]：`SetWindowDisplayAffinity(
+///   WDA_EXCLUDEFROMCAPTURE)`——DWM 构建**捕获表面**时跳过本窗口，
+///   桌面 DC 的 BitBlt 读到的才是身后内容而非自己的上一帧
+///   （否则模糊形成反馈回路，表现为拖影）。副作用（刻意接受）：
+///   磨砂模式下窗口不出现在录屏/截图里。窗口**必须非分层**——
+///   `WS_EX_LAYERED` 的旧式合成路径会与交换链像素 alpha 冲突；
+/// - [`WindowBackdrop::Translucent`]：逐像素半透明——背景层由渲染层
+///   画低 alpha（调色板变体），文字/卡片不透明，交换链 PRE_MULTIPLIED
+///   交给 DWM 合成。不再用整窗 `LWA_ALPHA` 淡出（那会把文字一起变透明，
+///   低不透明度下不可读）；
+/// - [`WindowBackdrop::None`]：清除捕获排除与分层样式，恢复纯色不透明。
 ///
 /// 调用方在帧循环里比对配置后调用（与 [`set_topmost`] 相同的幂等
 /// 模式），失败只记日志——背景效果是锦上添花，不能影响主流程。
-pub fn apply_backdrop(hwnd: HWND, mode: WindowBackdrop, opacity: f32) {
+pub fn apply_backdrop(hwnd: HWND, mode: WindowBackdrop) {
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         tracing::warn!("设置背景效果失败：主窗口句柄已失效");
         return;
     }
-    let opacity = opacity.clamp(0.3, 1.0);
-    match mode {
+    // 窗口一律非分层：逐像素 alpha 由交换链（PRE_MULTIPLIED）承担，
+    // 分层窗口的 LWA_ALPHA 是整窗淡出，与磨砂/半透明的新语义互斥。
+    // 幂等：样式已正确时跳过，避免每帧触发窗口重算。
+    let _ = unsafe { set_layered(hwnd, false) };
+    let affinity = match mode {
+        // 捕获自排除：让桌面捕获「看见」窗口身后而不是窗口自己。
+        // （`MC_NO_EXCLUDE` 只是验证用的临时开关：关闭排除后外部截图
+        //  才能拍到窗口本身，用于量化验证模糊效果。）
         WindowBackdrop::Acrylic => {
-            // 磨砂 = DWM 渲染：`DWMWA_SYSTEMBACKDROP_TYPE =
-            // DWMSBT_TRANSIENTWINDOW(2)`（Win11 22H2+ 的 Acrylic）。
-            let _ = unsafe { set_layered(hwnd, false) };
-            let _ = unsafe { set_layered_alpha(hwnd, 255) };
-            if let Err(e) = unsafe { set_dwm_backdrop(hwnd, 2) } {
-                tracing::warn!("设置磨砂背景失败（需 Win11 22H2+ 且 DWM 可用）: {e:?}");
+            if std::env::var_os("MC_NO_EXCLUDE").is_some() {
+                WDA_NONE
+            } else {
+                WDA_EXCLUDEFROMCAPTURE
             }
         }
-        WindowBackdrop::Translucent => {
-            let _ = unsafe { set_dwm_backdrop(hwnd, 0) };
-            let _ = unsafe { set_layered(hwnd, true) };
-            let _ = unsafe { set_layered_alpha(hwnd, (opacity * 255.0).round() as u8) };
-        }
-        WindowBackdrop::None => {
-            let _ = unsafe { set_dwm_backdrop(hwnd, 0) };
-            let _ = unsafe { set_layered(hwnd, false) };
-            let _ = unsafe { set_layered_alpha(hwnd, 255) };
-        }
-    }
-}
-
-/// 设置/清除 DWM 系统背景（`DWMWA_SYSTEMBACKDROP_TYPE`，0 = 无）。
-///
-/// # SAFETY: `hwnd` 须由调用方先经 `IsWindow` 校验。
-unsafe fn set_dwm_backdrop(hwnd: HWND, mode: i32) -> windows::core::Result<()> {
-    // SAFETY: 调用方已保证 hwnd 是有效窗口。
-    unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            &mode as *const i32 as *const std::ffi::c_void,
-            std::mem::size_of::<i32>() as u32,
-        )
+        WindowBackdrop::Translucent | WindowBackdrop::None => WDA_NONE,
+    };
+    // SAFETY: hwnd 已由上面的 IsWindow 校验。
+    if let Err(e) = unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
+        tracing::warn!("设置窗口捕获排除失败（需 Win10 2004+）: {e:?}");
     }
 }
 
@@ -488,14 +478,6 @@ unsafe fn set_layered(hwnd: HWND, on: bool) -> windows::core::Result<()> {
     // SAFETY: 同上；只改扩展样式标志位。
     let _ = unsafe { SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style as isize) };
     Ok(())
-}
-
-/// 设置窗口级 alpha（`LWA_ALPHA`，255 = 不透明）。
-///
-/// # SAFETY: `hwnd` 须由调用方先经 `IsWindow` 校验。
-unsafe fn set_layered_alpha(hwnd: HWND, alpha: u8) -> windows::core::Result<()> {
-    // SAFETY: 调用方已保证 hwnd 是有效窗口。
-    unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA) }
 }
 
 pub fn minimize_window(hwnd: HWND) {

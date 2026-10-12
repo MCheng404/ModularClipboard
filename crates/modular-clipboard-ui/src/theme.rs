@@ -53,11 +53,29 @@ macro_rules! palette_token {
     (dur, $v:expr) => { TokenValue::Dur($v) };
 }
 
+/// 调色板按 `t ∈ [0,1]` 插值时逐字段的取值规则（F-34 / UI-P1-3）。
+///
+/// 只有**颜色**参与补间。几何令牌（圆角/间距/字号）与时长令牌直接取
+/// 目标值：它们瞬时生效不产生可感知的「过渡中」状态，插值只会让布局
+/// 在 220ms 里持续抖动——那比硬切更糟。
+macro_rules! palette_lerp {
+    (color, $a:expr, $b:expr, $t:expr) => {{
+        // sRGB 分量线性插值。对 220ms 的短暂过渡，人眼对中间色不敏感，
+        // 感知均匀（oklab）插值的成本不划算。
+        let [ar, ag, ab, aa] = $a.to_array();
+        let [br, bg, bb, ba] = $b.to_array();
+        let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * $t).round() as u8;
+        egui::Color32::from_rgba_unmultiplied(m(ar, br), m(ag, bg), m(ab, bb), m(aa, ba))
+    }};
+    (num, $a:expr, $b:expr, $_t:expr) => { $b };
+    (dur, $a:expr, $b:expr, $_t:expr) => { $b };
+}
+
 /// 背景层变体：`color` 类且属于背景层时整体降 alpha，其余原样返回。
 ///
 /// 供 [`Palette::with_backdrop_alpha`] 逐字段展开使用。四个背景层名
 /// 是**编译期**常量分支——新增背景 token 必须同步加入这里的名单，
-/// 否则磨砂模式下新背景不透明、遮住 DWM 磨砂。
+/// 否则磨砂/半透明模式下新背景不透明、遮住透出的模糊底图。
 macro_rules! backdrop_layer_value {
     (color, $name:ident, $v:expr, $alpha:expr) => {{
         if matches!(stringify!($name), "bg" | "surface" | "surface_variant" | "list_bg") {
@@ -84,6 +102,10 @@ macro_rules! palette {
         ),* $(,)?
     ) => {
         /// 配色与尺寸令牌。集中定义，避免界面里出现魔法数字。
+        ///
+        /// `Clone`：主题补间（[`Palette::lerp`]）每帧都要从源/目标两份
+        /// 派生显示中的调色板，没有 Clone 就得逐字段手抄。
+        #[derive(Clone)]
         pub struct Palette {
             $(
                 $(#[$meta])*
@@ -114,11 +136,25 @@ macro_rules! palette {
             ///
             /// 不含 [`Palette::is_dark`]。
             pub fn tokens(&self) -> Vec<(&'static str, TokenValue)> {
-                let mut v: Vec<(&'static str, TokenValue)> = Vec::new();
-                $(
-                    v.push((stringify!($name), palette_token!($kind, self.$name)));
-                )*
-                v
+                vec![$((stringify!($name), palette_token!($kind, self.$name))),*]
+            }
+
+            /// 与另一份调色板按 `t ∈ [0,1]` 插值（F-34 / UI-P1-3）。
+            ///
+            /// 主题切换用：整窗瞬跳改成 220ms 的颜色渐变——纯平毛玻璃的
+            /// 审美下，背景模糊内容不变而全部前景色瞬换尤其刺眼。
+            ///
+            /// 只插值颜色字段；几何/时长令牌取目标值（见
+            /// [`palette_lerp`] 的理由）。`is_dark` 在中点翻转，
+            /// 避免出现「深色文字配浅色底」的中间态。
+            pub fn lerp(&self, other: &Palette, t: f32) -> Palette {
+                let t = t.clamp(0.0, 1.0);
+                Palette {
+                    $(
+                        $name: palette_lerp!($kind, self.$name, other.$name, t),
+                    )*
+                    is_dark: if t >= 0.5 { other.is_dark } else { self.is_dark },
+                }
             }
 
             // ---- 旧字段别名 ----
@@ -143,8 +179,9 @@ macro_rules! palette {
             /// / `list_bg`）整体降 alpha，内容层（文字/卡片/状态色）
             /// 保持不变。
             ///
-            /// 磨砂（Acrylic）模式下用：窗口背景画半透明，DWM 的
-            /// 磨砂透过这些区域显示；卡片与文字仍不透明保证可读性。
+            /// 磨砂 / 半透明模式下用：窗口背景画半透明，磨砂底图
+            /// （自研实时模糊）或桌面透过这些区域显示；卡片与文字
+            /// 仍不透明保证可读性。
             ///
             /// `alpha` 取值 0-255，255 等于原色（不透明）。
             pub fn with_backdrop_alpha(&self, alpha: u8) -> Palette {
@@ -483,6 +520,7 @@ fn read_apps_use_light_theme() -> Option<bool> {
 /// - `ime_composition.legacy_visuals`：Windows 上默认 true 是刻意为之，
 ///   涉及 winit 的中文输入法 bug（见 egui 源码注释），改动会导致
 ///   中文候选词渲染异常
+///
 /// 滚动条热区宽度（逻辑点）。
 ///
 /// 必须与 `paint.rs` 的 `SCROLLBAR_RESERVE` 一致 —— 两处各写一份的话，
@@ -701,18 +739,16 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
     // 自定义路径优先。
     if let Some(p) = custom_path
         && let Ok(bytes) = std::fs::read(p)
-    {
-        if insert_font(&mut defs, "custom_cjk", &bytes, 0) {
+        && insert_font(&mut defs, "custom_cjk", bytes, 0) {
             log_font_loaded(ctx, &mut defs, "自定义字体");
             return true;
         }
-    }
 
     for (name, path, index) in CJK_CANDIDATES {
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
-        if insert_font(&mut defs, name, &bytes, *index) {
+        if insert_font(&mut defs, name, bytes, *index) {
             log_font_loaded(ctx, &mut defs, path);
             return true;
         }
@@ -792,9 +828,13 @@ pub fn install_icon_font(ctx: &egui::Context) -> bool {
     true
 }
 
-fn insert_font(defs: &mut FontDefinitions, name: &str, bytes: &[u8], index: u32) -> bool {
+fn insert_font(defs: &mut FontDefinitions, name: &str, bytes: Vec<u8>, index: u32) -> bool {
     // egui 0.36 的 FontData 没有 with_index，直接设置公开的 index 字段。
-    let mut data = FontData::from_owned(bytes.to_vec());
+    //
+    // NOTE: 按值收 `Vec<u8>`（PF-14）：早前收 `&[u8]` 再 `to_vec()`，
+    // 35MB 中文字体在启动时被多拷贝一份（fs::read 的 Vec → 副本）。
+    // 调用方的 Vec 都是 `fs::read` 的所有物，直接移进来即可。
+    let mut data = FontData::from_owned(bytes);
     data.index = index;
     defs.font_data
         .insert(name.to_string(), std::sync::Arc::new(data));
@@ -1345,14 +1385,14 @@ mod tests {
                     span = hi - lo
                 );
                 // 三态必须真的互不相同，否则「按下」没有视觉反馈。
-                for i in 0..lumas.len() {
-                    for j in i + 1..lumas.len() {
+                for (i, name_i) in STATE_NAMES.iter().enumerate().take(lumas.len()) {
+                    for name_j in STATE_NAMES.iter().skip(i + 1).take(lumas.len() - i - 1) {
                         assert_ne!(
-                            state(&p, base, STATE_NAMES[i]),
-                            state(&p, base, STATE_NAMES[j]),
+                            state(&p, base, name_i),
+                            state(&p, base, name_j),
                             "[{m}] {base} 的 {} 与 {} 不应同色",
-                            STATE_NAMES[i],
-                            STATE_NAMES[j]
+                            name_i,
+                            name_j
                         );
                     }
                 }
@@ -1464,9 +1504,8 @@ mod tests {
             let v = ctx.style_of(theme_of(p.is_dark)).visuals.clone();
 
             assert_eq!(v.dark_mode, p.is_dark, "[{}] dark_mode", mode_of(&p));
-            assert_eq!(
+            assert!(
                 ctx.theme() == theme_of(p.is_dark),
-                true,
                 "[{}] theme_preference 应与调色板一致",
                 mode_of(&p)
             );
@@ -1562,7 +1601,7 @@ mod tests {
         }
     }
 
-    fn state<'a>(p: &'a Palette, base: &str, suffix: &str) -> egui::Color32 {
+    fn state(p: &Palette, base: &str, suffix: &str) -> egui::Color32 {
         let key: String = format!("{base}{suffix}");
         match p
             .tokens()
@@ -1585,7 +1624,7 @@ mod tests {
     fn insert_font_adds_to_both_families() {
         let mut defs = FontDefinitions::default();
         // 用任意字节验证注册流程不 panic（epaint 会延后解析）
-        let ok = insert_font(&mut defs, "x", b"not-a-real-font", 0);
+        let ok = insert_font(&mut defs, "x", b"not-a-real-font".to_vec(), 0);
         assert!(ok);
         assert!(
             defs.families[&FontFamily::Proportional].contains(&"x".to_string()),
@@ -1595,6 +1634,28 @@ mod tests {
             defs.families[&FontFamily::Monospace].contains(&"x".to_string()),
             "应加入 Monospace"
         );
+    }
+
+    #[test]
+    fn palette_lerp_interpolates_colors_and_snaps_geometry() {
+        // F-34：颜色字段必须真的在两端之间，几何令牌直接取目标值
+        // （插值几何会让布局在过渡期抖动，比硬切更糟）。
+        let dark = Palette::dark();
+        let light = Palette::light();
+        let mid = dark.lerp(&light, 0.5);
+        let dr = dark.bg.r();
+        let lr = light.bg.r();
+        let mr = mid.bg.r();
+        let expect = ((dr as f32 + lr as f32) / 2.0).round() as u8;
+        assert!((mr as i16 - expect as i16).abs() <= 1, "bg 中点应约为两端均值：{mr} vs {expect}");
+        // 端点：t=0 完全是源，t=1 完全是目标。
+        assert_eq!(dark.lerp(&light, 0.0).bg, dark.bg, "t=0 应等于源");
+        assert_eq!(dark.lerp(&light, 1.0).bg, light.bg, "t=1 应等于目标");
+        // 几何令牌取目标值（不插值）。
+        assert_eq!(mid.radius_md, light.radius_md, "几何令牌应取目标值");
+        // is_dark 中点翻转：避免「深色文字配浅色底」的中间态。
+        assert!(dark.lerp(&light, 0.4).is_dark, "t<0.5 应保持源的明暗");
+        assert!(!dark.lerp(&light, 0.6).is_dark, "t≥0.5 应翻到目标的明暗");
     }
 
     #[test]

@@ -81,10 +81,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 代价：失去三线性过滤的自动选择。我们用 nearest 采样器
     // （字体图集本就需要 nearest，避免字形糊），故无实际损失。
     if (in.tex_id == 0u) {
-        // 字体图集是单通道覆盖率，乘顶点色得到最终 RGBA
+        // 字体图集是单通道覆盖率。顶点色是**预乘**的（egui 的 `Color32`
+        // 语义：RGB 已经乘过 alpha），因此覆盖率必须乘到**全部四个通道**上，
+        // 结果才是预乘色，才能交给 `ONE, ONE_MINUS_SRC_ALPHA` 混合。
+        //
+        // ERROR: 早前写成 `in.color * vec4<f32>(1.0, 1.0, 1.0, cov)`
+        // ——只把 alpha 乘了覆盖率、RGB 没乘。文字恰好「看起来对」（因为
+        // 文字顶点色通常不透明），但**形状**（矩形/圆角）走的是同一条
+        // 分支且覆盖率恒为 1，配上当时错误的直通 alpha 混合，颜色被乘了
+        // 两次 alpha，每条边都镶一圈深色。
         let cov = textureSampleLevel(font_tex, tex_sampler, in.uv, 0.0).r;
-        return in.color * vec4<f32>(1.0, 1.0, 1.0, cov);
+        return in.color * cov;
     }
-    // 用户纹理是 RGBA 彩色图（图片缩略图），已含颜色
-    return textureSampleLevel(user_tex, tex_sampler, in.uv, 0.0);
+    // 用户纹理（图片缩略图）是**直通 alpha**（PNG 解码结果），
+    // 必须先预乘再交给预乘混合，否则半透明像素会偏亮。
+    let c = textureSampleLevel(user_tex, tex_sampler, in.uv, 0.0);
+    return vec4<f32>(c.rgb * c.a, c.a);
 }

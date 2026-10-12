@@ -263,6 +263,44 @@ pub fn card_area(area: Rect) -> Rect {
     )
 }
 
+/// 让所有停靠卡片都装得下所需的**客户区宽度**（逻辑点）。
+///
+/// # 什么时候需要
+///
+/// 布局的栏数会变：置顶模式从「共用单栏」（置顶卡片宽度需求 = 0）
+/// 切到「独立分栏」（多一栏 120pt），或者反过来。窗口尺寸原先只在
+/// 启动时从配置读一次，不跟着变 —— 结果是 `solve_scaled` 发现
+/// 「需求 > 可用」而按比例压缩，用户看到的就是**卡片被挤扁**。
+///
+/// # 公式
+///
+/// ```text
+/// needed = Σ layout_demand(参与分配的卡片)
+///        + gap × (栏数 − 1)
+///        + CARD_AREA_INSET × 2
+///        + 余量
+/// ```
+///
+/// `CARD_AREA_INSET × 2` 来自 [`card_area`] 的四周内缩；余量给 24pt，
+/// 免得刚好卡在临界值上——需求再涨一点（比如卡片 `target_width` 被拖宽）
+/// 就又开始压缩了。
+///
+/// # 只放大不收缩
+///
+/// 返回值是 `None` 表示「不需要调整」。当前可用宽度已经够时也返回
+/// `None`：用户可能故意把窗口开到很大，不该因为一次模式切换被改小。
+/// 上层据此只在**放不下**时放大。
+pub fn needed_width(ws: &Workspace) -> f32 {
+    let layout = layout_demand(ws);
+    let n = layout.iter().filter(|&&w| w > 0.0).count();
+    if n == 0 {
+        return 0.0;
+    }
+    let gaps = ws.gap.max(0.0) * (n as f32 - 1.0);
+    let sum: f32 = layout.iter().sum();
+    sum + gaps + CARD_AREA_INSET * 2.0 + 24.0
+}
+
 /// 把解写回工作区。
 ///
 /// # 为什么长度不等要**拒绝**而不是 `zip` 静默截断
@@ -361,7 +399,7 @@ pub fn apply(ws: &mut Workspace, sol: &Solution) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::card::CardKind;
+    use crate::card::{CardKind, PinnedMode};
     use crate::workspace::Workspace;
     /// 检查解满足三条不变式，返回违反的描述列表（空 = 全部满足）。
     fn check(ws: &Workspace, sol: &Solution, area: Rect) -> Vec<String> {
@@ -456,6 +494,59 @@ mod tests {
     /// `layout`），这条随 `layout_width` 一起迁移到**唯一口径**上，
     /// 顺便把「内嵌置顶」这条规则也纳入同一断言 —— 那正是早前
     /// `Card::layout_width` 漏掉的规则。
+    /// 切到「独立分栏」后，宽度需求必须**变大**。
+    ///
+    /// # 这条守的是「切换置顶模式后窗口不变」那个 bug
+    ///
+    /// 窗口尺寸原先只在**启动时**从 `UiConfig::window_width` 读一次。
+    /// 用户在设置里把置顶模式从「共用单栏」切成「独立分栏」后多出一栏，
+    /// 没人去改窗口宽度 ⇒ `solve_scaled` 发现「需求 > 可用」而按比例压缩
+    /// ⇒ 用户看到卡片被挤扁。
+    ///
+    /// `needed_width` 就是为这个加的：上层在 `SetPinnedMode` 后算一次，
+    /// 放不下就放宽窗口。
+    #[test]
+    fn needed_width_grows_when_pinned_gets_its_own_column() {
+        let mut ws = Workspace::empty();
+        ws.add(CardKind::History);
+        ws.add(CardKind::Pinned);
+
+        // 共用单栏（默认）：置顶内嵌，不占栏。
+        assert!(ws.pinned_is_embedded(), "默认应为共用单栏");
+        let shared = needed_width(&ws);
+
+        // 独立分栏：置顶多占一栏。
+        assert!(ws.set_pinned_mode(PinnedMode::OwnCard), "应能设置模式");
+        assert!(!ws.pinned_is_embedded(), "独立分栏下不应再算内嵌");
+        let own = needed_width(&ws);
+
+        assert!(
+            own > shared,
+            "独立分栏需要更宽：own={own} 应 > shared={shared}"
+        );
+
+        // 而且必须真的能装下：按 `needed_width` 求解后，各栏宽度都 ≥ 需求。
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(own, 600.0));
+        let sol = solve_scaled(&ws, area, 1.0);
+        let demands = layout_demand(&ws);
+        for (i, d) in demands.iter().enumerate() {
+            if *d > 0.0 {
+                assert!(
+                    sol.rects[i].width() + 0.5 >= *d,
+                    "第 {i} 栏宽度 {} 被压到需求 {d} 以下",
+                    sol.rects[i].width()
+                );
+            }
+        }
+    }
+
+    /// 空工作区不该要求任何宽度（否则会拿到一个无意义的正数）。
+    #[test]
+    fn needed_width_is_zero_without_docked_cards() {
+        let ws = Workspace::empty();
+        assert_eq!(needed_width(&ws), 0.0);
+    }
+
     #[test]
     fn layout_demand_excludes_detached_and_embedded_pinned() {
         let mut ws = Workspace::empty();
@@ -717,7 +808,7 @@ mod tests {
             .fold(f32::NEG_INFINITY, f32::max);
         let slack = body.max.x - rightmost;
         assert!(
-            slack >= -0.01 && slack <= 0.51,
+            (-0.01..=0.51).contains(&slack),
             "分配后右侧剩余 {slack:.2}pt：应≈0（末端有半个gap）或恰好铺满"
         );
     }

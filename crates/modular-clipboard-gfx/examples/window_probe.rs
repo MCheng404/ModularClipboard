@@ -59,8 +59,7 @@ const WHEEL_DELTA: usize = 120;
 /// 与 [`unpack_size`] 不同：鼠标坐标在指针移出客户区时为负，
 /// 必须做符号扩展，否则 `65535` 会被当成合法坐标。
 fn pack_pos(x: i32, y: i32) -> LPARAM {
-    LPARAM(((y as u32 as u16 as i16 as u32) << 16 | (x as u32 as u16 as i16 as u32) as u32)
-        as isize)
+    LPARAM((((y as u32 as u16 as i16 as u32) << 16) | (x as u32 as u16 as i16 as u32)) as isize)
 }
 
 /// 向窗口投递一条消息。
@@ -309,7 +308,7 @@ fn main() -> anyhow::Result<()> {
     println!("OK scale_factor {scale}（dpi = {}）", (scale * 96.0) as u32);
 
     // 缩放必须为正且有限。0 或 NaN 会让后面的坐标换算全部崩。
-    if !(scale > 0.0) || !scale.is_finite() {
+    if !scale.is_finite() || scale <= 0.0 {
         anyhow::bail!("scale_factor 非法：{scale}，坐标换算会全部失效");
     }
 
@@ -394,7 +393,7 @@ fn main() -> anyhow::Result<()> {
         last_time = Some(now);
 
         // predicted_dt 为 0 会让 egui 动画除零（NaN 扩散后整个界面卡死）。
-        if !(raw.predicted_dt > 0.0) || !raw.predicted_dt.is_finite() {
+        if !raw.predicted_dt.is_finite() || raw.predicted_dt <= 0.0 {
             anyhow::bail!("predicted_dt 非法：{}", raw.predicted_dt);
         }
 

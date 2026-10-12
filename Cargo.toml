@@ -6,6 +6,7 @@ members = [
     "crates/modular-clipboard-capture",
     "crates/modular-clipboard-platform",
     "crates/modular-clipboard-app",
+    "crates/modular-clipboard-mcp",
     "crates/modular-clipboard-gfx",
     "crates/modular-clipboard-ui",
     "crates/modular-clipboard",
@@ -23,6 +24,7 @@ modular-clipboard-store = { path = "crates/modular-clipboard-store" }
 modular-clipboard-capture = { path = "crates/modular-clipboard-capture" }
 modular-clipboard-platform = { path = "crates/modular-clipboard-platform" }
 modular-clipboard-app = { path = "crates/modular-clipboard-app" }
+modular-clipboard-mcp = { path = "crates/modular-clipboard-mcp" }
 modular-clipboard-gfx = { path = "crates/modular-clipboard-gfx" }
 modular-clipboard-ui = { path = "crates/modular-clipboard-ui" }
 

@@ -130,8 +130,24 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let blob_dir = std::env::temp_dir()
-            .join(format!("{DATA_DIR_NAME}-mem-{}-{n}", std::process::id()));
+        // SEC-005：目录名带随机分量。「pid + 序号」是可预测的——本地攻击者
+        // 能预置 junction，让降级模式下写入的明文剪贴板载荷落进任意目录。
+        // RandomState 每进程随机播种，hash_one 混入 pid 与序号后不可预测。
+        use std::hash::{BuildHasher, RandomState};
+        let rand = RandomState::new().hash_one((std::process::id(), n));
+        let blob_dir = std::env::temp_dir().join(format!(
+            "{DATA_DIR_NAME}-mem-{}-{n}-{rand:016x}",
+            std::process::id()
+        ));
+        // 路径若已存在且是链接（symlink / junction），拒绝：create_dir_all
+        // 对已存在的 reparse point 不报错，写入会静默落到链接目标。
+        if let Ok(meta) = std::fs::symlink_metadata(&blob_dir) {
+            anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "载荷目录已被预置为链接，拒绝写入：{}",
+                blob_dir.display()
+            );
+        }
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
@@ -195,6 +211,13 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_items_created ON items(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_items_hash    ON items(hash);
             CREATE INDEX IF NOT EXISTS idx_items_group   ON items(group_id);
+            -- 列表查询的排序键（PF-6）：`list()` 固定
+            -- `ORDER BY pinned DESC, created_at DESC`，没有这个复合索引时
+            -- 每次查询都对全表（上限 1 万条）做一次 temp B-tree 排序。
+            -- 与 idx_items_created 并存不浪费：前者服务单列倒序扫描，
+            -- 本索引服务 (pinned, created_at) 的两列组合。
+            CREATE INDEX IF NOT EXISTS idx_items_pinned_created
+                ON items(pinned DESC, created_at DESC);
 
             CREATE TABLE IF NOT EXISTS groups (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,10 +289,15 @@ impl Store {
         let cfg_max = self.current_payload_limit();
 
         // 载荷落盘，超限则只保留元数据。
+        //
+        // 原子写（先 .tmp 再 rename）：`std::fs::write` 是 create(截断)+write，
+        // 写一半失败（磁盘满）会把**已有**载荷毁掉。而同哈希条目共享同一
+        // 载荷文件（置顶条目不参与去重、dedup=false 时每次复制都插入一条），
+        // 一个文件损坏会同时摧毁多条历史记录。
         let payload_ref = if payload.len() as u64 <= cfg_max {
             let dims = compute_dims(&item.kind, &payload);
-            let name = format!("{}.bin", &item.hash);
-            std::fs::write(self.blob_dir.join(&name), &payload)?;
+            let name = format!("{}.bin", item.hash);
+            write_blob_atomic(&self.blob_dir, &name, &payload)?;
             Some(PayloadRef {
                 file: name,
                 len: payload.len() as u64,
@@ -285,43 +313,59 @@ impl Store {
             _ => None,
         };
 
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO items
-                (kind, hash, preview, blob_file, blob_len, img_w, img_h,
-                 source_app, created_at, pinned, group_id, use_count, last_used_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                item.kind.as_str(),
-                item.hash,
-                item.preview,
-                payload_ref.as_ref().map(|p| p.file.as_str()),
-                payload_ref.as_ref().map(|p| p.len as i64).unwrap_or(0),
-                payload_ref.as_ref().and_then(|p| p.dims).map(|d| d.0 as i64),
-                payload_ref.as_ref().and_then(|p| p.dims).map(|d| d.1 as i64),
-                item.source_app,
-                item.created_at,
-                item.pinned as i64,
-                item.group_id,
-                item.use_count,
-                item.last_used_at,
-            ],
-        )?;
-        let id = tx.last_insert_rowid();
+        // DB 事务失败时清掉刚写的载荷文件：否则它成为孤儿，要等下次启动的
+        // gc_orphan_blobs 才回收（期间反复失败会累积）。
+        let written_file = payload_ref.as_ref().map(|p| p.file.clone());
+        let inserted = (|| -> Result<EntryId> {
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO items
+                    (kind, hash, preview, blob_file, blob_len, img_w, img_h,
+                     source_app, created_at, pinned, group_id, use_count, last_used_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    item.kind.as_str(),
+                    item.hash,
+                    item.preview,
+                    payload_ref.as_ref().map(|p| p.file.as_str()),
+                    payload_ref.as_ref().map(|p| p.len as i64).unwrap_or(0),
+                    payload_ref.as_ref().and_then(|p| p.dims).map(|d| d.0 as i64),
+                    payload_ref.as_ref().and_then(|p| p.dims).map(|d| d.1 as i64),
+                    item.source_app,
+                    item.created_at,
+                    item.pinned as i64,
+                    item.group_id,
+                    item.use_count,
+                    item.last_used_at,
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
 
-        if let Some(text) = text_for_fts {
-            // 显式指定 rowid = items.id，让两表键完全一致；
-            // 这样删除时只需按 id 定位，不必再维护 last_insert_rowid 的对应关系。
-            tx.execute(
-                "INSERT INTO items_fts(rowid, text) VALUES (?1, ?2)",
-                params![id, text],
-            )?;
-            tx.execute(
-                "INSERT INTO items_fts_map(rowid, item_id) VALUES (?1, ?2)",
-                params![id, id],
-            )?;
-        }
-        tx.commit()?;
+            if let Some(text) = text_for_fts {
+                // 显式指定 rowid = items.id，让两表键完全一致；
+                // 这样删除时只需按 id 定位，不必再维护 last_insert_rowid 的对应关系。
+                tx.execute(
+                    "INSERT INTO items_fts(rowid, text) VALUES (?1, ?2)",
+                    params![id, text],
+                )?;
+                tx.execute(
+                    "INSERT INTO items_fts_map(rowid, item_id) VALUES (?1, ?2)",
+                    params![id, id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(id)
+        })();
+
+        let id = match inserted {
+            Ok(id) => id,
+            Err(e) => {
+                if let Some(f) = written_file {
+                    let _ = std::fs::remove_file(self.blob_dir.join(f));
+                }
+                return Err(e);
+            }
+        };
 
         item.id = id;
         item.payload = payload_ref;
@@ -406,7 +450,12 @@ impl Store {
             }
         }
         // 置顶优先，其余按时间倒序。
-        sql.push_str(" ORDER BY pinned DESC, created_at DESC LIMIT ? OFFSET ?");
+        //
+        // `id DESC` 是并列兜底：`created_at` 只到毫秒，同一毫秒插入的多条
+        // 记录时间戳完全相同，不加兜底时排序结果未定义（分页会重复/漏行）。
+        sql.push_str(
+            " ORDER BY pinned DESC, created_at DESC, id DESC LIMIT ? OFFSET ?",
+        );
         args.push(Box::new(limit as i64));
         args.push(Box::new(offset as i64));
 
@@ -425,12 +474,20 @@ impl Store {
             return self.list(limit, 0, None);
         }
 
+        // FTS5 trigram 分词器以 **3 字符**为最小匹配单位：1-2 字符的查询
+        // 不会报错，而是静默返回 0 行——`Err` 兜底等不到它该出场的时机。
+        // 中文两字词（「剪贴」）恰好处在最常用的检索长度上，必须提前闸断。
+        // 判据按字符数而非字节数：一个汉字 3 字节，按字节会把两字词放过去。
+        if q.chars().count() < 3 {
+            return self.like_search(q, limit);
+        }
+
         let fts_sql = format!(
             "SELECT {} FROM items
              JOIN items_fts_map m ON m.item_id = items.id
              JOIN items_fts f ON f.rowid = m.rowid
              WHERE items_fts MATCH ?1
-             ORDER BY items.pinned DESC, bm25(items_fts), items.created_at DESC
+             ORDER BY items.pinned DESC, bm25(items_fts), items.created_at DESC, items.id DESC
              LIMIT ?2",
             Self::SELECT_COLS
         );
@@ -491,7 +548,9 @@ impl Store {
             .payload
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("该条目无载荷（可能已被淘汰）"))?;
-        std::fs::read(self.blob_dir.join(&p.file)).map_err(Into::into)
+        let path = safe_blob_path(&self.blob_dir, &p.file)
+            .ok_or_else(|| anyhow::anyhow!("载荷文件名不合法：{}", p.file))?;
+        std::fs::read(path).map_err(Into::into)
     }
 
     // ---------- 更新与删除 ----------
@@ -538,12 +597,117 @@ impl Store {
         tx.commit()?;
 
         if let Some(f) = file {
-            let path = self.blob_dir.join(f);
-            if path.exists() {
+            // 同哈希多条目共享同一载荷文件（`{hash}.bin`）：置顶条目不参与
+            // 去重，`dedup=false` 时每次复制也都插入一条。删文件会摧毁仍在
+            // 引用它的条目——默认配置下「置顶 → 重复制 → 删重复项」即可触发，
+            // 保留策略的自动淘汰也会走到这里。只有最后一个引用消失后才删。
+            //
+            // 文件名先过 safe_blob_path：DB 行内容不可信，含目录分量的
+            // blob_file 会把删除操作变成任意文件删除原语（SEC-006）。
+            let Some(path) = safe_blob_path(&self.blob_dir, &f) else {
+                tracing::warn!(file = %f, "载荷文件名不合法，跳过删除");
+                return Ok(());
+            };
+            let remaining: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
+                    params![f],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if remaining == 0 && path.exists() {
                 let _ = std::fs::remove_file(path);
             }
         }
         Ok(())
+    }
+
+    /// 批量删除（PF-7）：N 次 [`Self::delete`] 是 N 个独立事务（各带一次
+    /// WAL 提交），保留策略一次淘汰上百条时成串同步 IO。这里合并为
+    /// **单事务**——contentless FTS 的 `'delete'` 命令仍需逐条提供原文，
+    /// 但全部在同一个事务里提交，DB 侧从 N 次事务降到 1 次。
+    ///
+    /// 文件删除仍逐個做引用计数检查（DF-01）：同一批里多条记录可能共享
+    /// 同一载荷文件（`{hash}.bin`），提交后的计数对整批生效，语义与逐条
+    /// 删除完全一致——只有最后一个引用消失才删文件。
+    fn delete_many(&mut self, ids: &[EntryId]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // 先读后写：事务开始前取好（blob_file, FTS 原文）。
+        // blob_file 对所有条目都取；FTS 原文只对进了索引的条目存在
+        // （图片/文件类不进 FTS），用子查询而非 JOIN，避免漏取 blob_file。
+        let mut files: Vec<String> = Vec::with_capacity(ids.len());
+        let mut texts: Vec<(EntryId, String)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let row: Option<(Option<String>, Option<String>)> = self
+                .conn
+                .query_row(
+                    "SELECT i.blob_file,
+                            (SELECT i2.preview FROM items i2
+                             JOIN items_fts_map m ON m.item_id = i2.id
+                             WHERE i2.id = i.id)
+                     FROM items i WHERE i.id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((file, text)) = row {
+                if let Some(f) = file {
+                    files.push(f);
+                }
+                if let Some(t) = text {
+                    texts.push((id, t));
+                }
+            }
+        }
+
+        {
+            let tx = self.conn.transaction()?;
+            for (id, text) in &texts {
+                tx.execute(
+                    "INSERT INTO items_fts(items_fts, rowid, text) VALUES('delete', ?1, ?2)",
+                    params![id, text],
+                )?;
+            }
+            // IN 列表的占位符数量由 ids.len() 决定——SQL 文本里只有 `?`，
+            // 没有任何外部输入，格式拼接是安全的。
+            let marks = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            tx.execute(
+                &format!("DELETE FROM items_fts_map WHERE item_id IN ({marks})"),
+                params_from_iter(ids.iter()),
+            )?;
+            tx.execute(
+                &format!("DELETE FROM items WHERE id IN ({marks})"),
+                params_from_iter(ids.iter()),
+            )?;
+            tx.commit()?;
+        }
+
+        for f in &files {
+            // 路径规范化（SEC-006）：DB 行内容不可信。
+            let Some(path) = safe_blob_path(&self.blob_dir, f) else {
+                tracing::warn!(file = %f, "载荷文件名不合法，跳过删除");
+                continue;
+            };
+            let remaining: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
+                    params![f],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if remaining == 0 && path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Ok(ids.len())
     }
 
     /// 清空全部历史。分组定义保留。
@@ -589,37 +753,52 @@ impl Store {
             let ids: Vec<EntryId> = {
                 let mut stmt = self.conn.prepare(
                     "SELECT id FROM items WHERE pinned = 0
-                     ORDER BY created_at DESC LIMIT -1 OFFSET ?1",
+                     ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?1",
                 )?;
                 let rows = stmt.query_map(params![unpinned_keep], |r| r.get::<_, EntryId>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            for id in ids {
-                self.delete(id)?;
-                removed += 1;
-            }
+            // 批量删（PF-7）：逐条 delete 每条一个事务，淘汰上千条即上千次
+            // WAL 提交。
+            removed += self.delete_many(&ids)?;
         }
 
         // 容量淘汰：仅统计已落盘载荷。
+        //
+        // 批量版（PF-7）：按「超出量」一次取一批最旧受害者，累计释放量
+        // 覆盖超出量即止，单事务删除后重新核对总量——原来每条一个事务。
         loop {
-            let (total, victim): (i64, Option<EntryId>) = self.conn.query_row(
-                "SELECT COALESCE(SUM(blob_len),0),
-                        (SELECT id FROM items WHERE pinned = 0 AND blob_len > 0
-                         ORDER BY created_at ASC LIMIT 1)
-                 FROM items",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
+            let total: i64 = self
+                .conn
+                .query_row("SELECT COALESCE(SUM(blob_len),0) FROM items", [], |r| r.get(0))?;
             if total as u64 <= cfg.max_bytes {
                 break;
             }
-            match victim {
-                Some(id) => {
-                    self.delete(id)?;
-                    removed += 1;
+            let excess = total as u64 - cfg.max_bytes;
+            let mut victims: Vec<EntryId> = Vec::new();
+            let mut freed = 0u64;
+            {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, blob_len FROM items WHERE pinned = 0 AND blob_len > 0
+                     ORDER BY created_at ASC, id ASC LIMIT 512",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, EntryId>(0)?, r.get::<_, i64>(1)?))
+                })?;
+                for row in rows {
+                    let (id, len) = row?;
+                    victims.push(id);
+                    freed += len.max(0) as u64;
+                    if freed >= excess {
+                        break;
+                    }
                 }
-                None => break,
             }
+            // 没有可淘汰者（全是置顶/无载荷）或本批零释放：退出防死循环。
+            if victims.is_empty() || freed == 0 {
+                break;
+            }
+            removed += self.delete_many(&victims)?;
         }
         Ok(removed)
     }
@@ -739,6 +918,43 @@ fn parse_kind(s: &str) -> ClipKind {
         "files" => ClipKind::Files,
         _ => ClipKind::Text,
     }
+}
+
+/// 把 DB 行里的 `blob_file` 收敛为「blobs 目录下的一个纯文件名」。
+///
+/// 库文件可被外部篡改，行内容不可信：含目录分量或 `..` 的 `blob_file`
+/// 会让 `blob_dir.join(file)` 逃出 blobs 目录，把「读历史载荷」变成
+/// 任意文件读取原语、把「删历史」变成任意文件删除原语（SEC-006）。
+/// 正常的 `blob_file` 恒为 `{hash}.bin`（本 crate 自己写入）。
+fn safe_blob_path(blob_dir: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
+    if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
+        return None;
+    }
+    let name = std::path::Path::new(file).file_name()?;
+    if name != std::ffi::OsStr::new(file) {
+        return None;
+    }
+    Some(blob_dir.join(name))
+}
+
+/// 原子写载荷文件：先写 `.tmp` 再 rename 覆盖。
+///
+/// `std::fs::write` 是 `create`(截断) + `write`：写一半失败（磁盘满、
+/// 句柄异常）时原文件已被截断，内容全失。而同哈希条目共享同一载荷文件，
+/// 一个文件损坏会同时摧毁多条历史记录（见 [`Store::delete`] 的引用计数）。
+/// rename 在同一目录内是原子操作，要么旧内容完好、要么新内容完整。
+fn write_blob_atomic(blob_dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<()> {
+    let tmp = blob_dir.join(format!("{name}.tmp"));
+    let final_path = blob_dir.join(name);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// 尝试解析图片尺寸，失败返回 `None`。不解码全部像素，因此很快。
@@ -1059,6 +1275,142 @@ mod tests {
         assert!(!store.blob_dir.join(&file).exists());
         assert!(store.get(saved.id).unwrap().is_none());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn delete_keeps_blob_shared_with_pinned_entry() {
+        // DF-01 回归：载荷按 `{hash}.bin` 命名，而置顶条目不参与去重
+        // （find_by_hash 带 `AND pinned = 0`）。于是「置顶 A → 再次复制
+        // 同一内容得到 B」两条记录共享同一文件。删 B 绝不能摧毁 A 的载荷
+        // ——保留策略的自动淘汰同样会走到 delete，默认配置即可触发。
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let a = ClipItem::new(ClipKind::Text, "shared-hash".into(), "same content".into(), "a".into());
+        let saved_a = store.insert(a, b"same content".to_vec()).unwrap();
+        let mut b = ClipItem::new(
+            ClipKind::Text,
+            "shared-hash".into(),
+            "same content".into(),
+            "a".into(),
+        );
+        b.pinned = true;
+        let saved_b = store.insert(b, b"same content".to_vec()).unwrap();
+        assert_ne!(saved_a.id, saved_b.id, "同哈希应插入两条（置顶不参与去重）");
+        let file = saved_a.payload.as_ref().unwrap().file.clone();
+        assert_eq!(saved_b.payload.as_ref().unwrap().file, file, "两条应共享同一载荷文件");
+
+        store.delete(saved_a.id).unwrap();
+
+        assert!(
+            store.blob_dir.join(&file).exists(),
+            "仍有条目引用时不得删除载荷文件"
+        );
+        let reloaded = store.get(saved_b.id).unwrap().expect("置顶条目应在");
+        let payload = store.load_payload(&reloaded).unwrap();
+        assert_eq!(payload, b"same content", "置顶条目的载荷必须完好可读");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn insert_leaves_no_tmp_files_behind() {
+        // 原子写的 .tmp 必须在成功 rename 后消失；残留会累积且不被
+        // gc_orphan_blobs 识别（它只收「无引用」的正式文件）。
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let item = ClipItem::new(ClipKind::Text, "tmp-h".into(), "atomic".into(), "a".into());
+        store.insert(item, b"atomic".to_vec()).unwrap();
+        let leftovers: Vec<String> = std::fs::read_dir(&store.blob_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "原子写不得留下 .tmp 残留：{leftovers:?}");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn two_char_query_falls_back_to_like() {
+        // DF-02 回归：trigram 以 3 字符为最小匹配单位，1-2 字符查询
+        // **不报错**、静默返回 0 行——Err 兜底等不到出场时机。
+        // 两字中文词（最常用的检索长度）必须经 LIKE 命中。
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let item = ClipItem::new(
+            ClipKind::Text,
+            "h2c".into(),
+            "剪贴板历史记录".into(),
+            "a".into(),
+        );
+        store.insert(item, b"x".to_vec()).unwrap();
+        let hits = store.search("剪贴", 10).unwrap();
+        assert_eq!(hits.len(), 1, "两字查询必须经 LIKE 兜底命中");
+        assert_eq!(hits[0].preview, "剪贴板历史记录");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn batch_delete_keeps_blob_shared_with_survivor() {
+        // DF-01 × PF-7 交互：批量删除（保留策略）与共享载荷的交点。
+        // 一批里删掉同哈希的多条，只要还有一条（置顶）在引用，
+        // 文件就必须留下——逐条删与批量删的语义必须一致。
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        // 三条同哈希（共享 {hash}.bin），两条未置顶 + 一条置顶。
+        let mut ids = Vec::new();
+        for pinned in [false, false, true] {
+            let mut item = ClipItem::new(
+                ClipKind::Text,
+                "batch-shared".into(),
+                "batch shared content".into(),
+                "a".into(),
+            );
+            item.pinned = pinned;
+            let saved = store.insert(item, b"batch shared content".to_vec()).unwrap();
+            ids.push(saved.id);
+        }
+        let file = store
+            .get(ids[2])
+            .unwrap()
+            .unwrap()
+            .payload
+            .unwrap()
+            .file
+            .clone();
+
+        // 批量删前两条（未置顶）。
+        store.delete_many(&ids[..2]).unwrap();
+
+        assert!(
+            store.blob_dir.join(&file).exists(),
+            "置顶条目仍引用载荷文件，批量删不得删它"
+        );
+        let survivor = store.get(ids[2]).unwrap().expect("置顶条目应在");
+        assert_eq!(store.load_payload(&survivor).unwrap(), b"batch shared content");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn safe_blob_path_rejects_traversal_and_absolute() {
+        // SEC-006 回归：DB 行里的 blob_file 不可信，含目录分量或 `..`
+        // 的取值必须被拒绝，否则 join 会逃出 blobs 目录。
+        let dir = std::path::Path::new("/data/blobs");
+        assert_eq!(
+            safe_blob_path(dir, "abc123.bin"),
+            Some(dir.join("abc123.bin")),
+            "正常载荷名应放行"
+        );
+        assert_eq!(safe_blob_path(dir, ""), None, "空名拒绝");
+        assert_eq!(safe_blob_path(dir, ".."), None, ".. 拒绝");
+        assert_eq!(safe_blob_path(dir, "../secret.bin"), None, "相对逃逸拒绝");
+        assert_eq!(safe_blob_path(dir, "a/b.bin"), None, "含 / 拒绝");
+        assert_eq!(safe_blob_path(dir, "a\\b.bin"), None, "含 \\ 拒绝");
+        assert_eq!(
+            safe_blob_path(dir, r"C:\Windows\system32\cfg"),
+            None,
+            "绝对路径拒绝"
+        );
+        assert_eq!(safe_blob_path(dir, "/etc/passwd"), None, "绝对路径拒绝");
     }
 
     #[test]

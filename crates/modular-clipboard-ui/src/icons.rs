@@ -867,7 +867,6 @@ mod tests {
         let img = ctx.fonts_mut(|f| f.image());
         let w = img.width();
         let h = img.height();
-        let img = img;
         let x0 = (uv_min.x * w as f32).floor().max(0.0) as usize;
         let x1 = ((uv_max.x * w as f32).ceil() as usize).min(w);
         let y0 = (uv_min.y * h as f32).floor().max(0.0) as usize;
@@ -911,7 +910,6 @@ mod tests {
             let img = ctx.fonts_mut(|f| f.image());
             let w = img.width();
             let h = img.height();
-            let img = img;
             let x0 = (uv_min.x * w as f32).floor().max(0.0) as usize;
             let x1 = ((uv_max.x * w as f32).ceil() as usize).min(w);
             let y0 = (uv_min.y * h as f32).floor().max(0.0) as usize;
@@ -943,10 +941,12 @@ mod tests {
             "OS/2 lineGap 变了：BASELINE_FACTOR 需重算（它是补偿的唯一来源）"
         );
         // 补偿存在的前提：行盒比em 高。高出量必须等于 lineGap。
-        assert!(
-            ROW_HEIGHT_UNITS > EM_UNITS,
-            "行盒({ROW_HEIGHT_UNITS}) 未高于 em({EM_UNITS})：BASELINE_FACTOR 应为 0"
-        );
+        const {
+            assert!(
+                ROW_HEIGHT_UNITS > EM_UNITS,
+                "行盒未高于 em：BASELINE_FACTOR 应为 0"
+            );
+        }
         assert_eq!(
             ROW_HEIGHT_UNITS - EM_UNITS,
             LINE_GAP_UNITS,

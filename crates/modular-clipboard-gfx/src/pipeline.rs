@@ -223,6 +223,46 @@ impl DescriptorLayout {
         ];
 
         // 标志数组与 bindings 一一对应，长度必须相同（由构造器按切片长度设置）。
+        // 具体构造逻辑与 `blur` 共用，见 [`Self::from_bindings`]。
+        Self::from_bindings(device, &bindings, update_after_bind)
+    }
+
+    /// 创建模糊管线的描述符布局：uniform + sampler + combined image sampler。
+    ///
+    /// 绑定号与 [`Self::new`] 的前三项**刻意相同**（`0/1/2`）：
+    /// 同一套 `BINDING_*` 常量在两条管线上语义一致，避免出现
+    /// 「同一个常量在不同布局里指向不同资源」的隐式分歧。
+    /// 模糊管线不需要字体图集与用户纹理两个独立绑定——它只采样一张
+    /// 中间图像，所以少一个 binding。
+    pub fn blur(device: &Device, update_after_bind: bool) -> anyhow::Result<Self> {
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_UNIFORM)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_TEXTURE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        Self::from_bindings(device, &bindings, update_after_bind)
+    }
+
+    /// 由绑定列表构造布局。两个公开构造函数共用，保证
+    /// 「`UPDATE_AFTER_BIND` 的启用规则」只有一份实现。
+    fn from_bindings(
+        device: &Device,
+        bindings: &[vk::DescriptorSetLayoutBinding],
+        update_after_bind: bool,
+    ) -> anyhow::Result<Self> {
+        // 标志数组与 bindings 一一对应，长度必须相同（由构造器按切片长度设置）。
         let binding_flags: Vec<vk::DescriptorBindingFlags> = bindings
             .iter()
             .map(|_| {
@@ -236,7 +276,7 @@ impl DescriptorLayout {
         let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
             .binding_flags(&binding_flags);
 
-        let mut info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+        let mut info = vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings);
         if update_after_bind {
             // 加了绑定的 UPDATE_AFTER_BIND_BIT，**布局本身**就必须带
             // `UPDATE_AFTER_BIND_POOL`（规范强制，验证层实测报
@@ -352,10 +392,27 @@ impl GraphicsPipeline {
         let multisample = vk::PipelineMultisampleStateCreateInfo::default()
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
-        // egui 的字体图集是覆盖率图，需与顶点色相乘，故为标准 alpha 混合。
+        // egui 的 `Color32` 是**预乘 alpha**（RGB 已乘过 alpha），
+        // 因此混合必须用预乘公式 `ONE, ONE_MINUS_SRC_ALPHA`。
+        //
+        // # 用直通公式（`SRC_ALPHA`）会怎样
+        //
+        // 颜色会被**再乘一次 alpha**。不透明处（alpha=255）看不出来，
+        // 但抗锯齿的羽化边缘 alpha<1 —— 结果比「填充色」和「背景色」
+        // **都暗**，表现为每条边都镶一圈深色描边。
+        //
+        // 实测（白色卡片、背景 #F2F4F7）：羽化边缘覆盖率 c≈0.7 处，
+        // 直通公式给出 `255×0.7² + 242×0.3 = 197.5`——比白(255)和背景(242)
+        // 都暗；而正确公式 `255×0.7 + 242×0.3 = 251` 才是应有的浅过渡。
+        //
+        // 用户反馈的「圆角弧线末端一段深色短线」就是这个：弧线的羽化带
+        // 最长，偏色最明显。**这是全局性的渲染缺陷，不是某个控件的问题。**
+        //
+        // 与 egui 官方后端一致：`egui-wgpu` 用的正是
+        // `src_factor: One, dst_factor: OneMinusSrcAlpha`。
         let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
@@ -425,6 +482,116 @@ impl GraphicsPipeline {
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("管线创建成功但返回列表为空"))?;
+
+        Ok(Self { handle })
+    }
+
+    /// 创建**无顶点输入**的全屏管线（模糊 / 降采样 / 合成用）。
+    ///
+    /// 与 [`Self::new`] 的差别只有三处，其余状态（动态视口与剪裁、
+    /// 无背面剔除、无深度、单采样）完全一致：
+    ///
+    /// 1. **顶点输入为空**：顶点位置由 `blur.wgsl` 的
+    ///    `@builtin(vertex_index)` 现算，不需要顶点缓冲；
+    /// 2. **关闭混合**：模糊与合成都是**覆盖写**——混进旧内容会让
+    ///    每一趟卷积都把上一次的结果再叠一次，画面逐帧变亮/变脏；
+    /// 3. 顶点阶段入口是 `vs_fullscreen` 而非 `vs_main`。
+    ///
+    /// `fragment_entry` 决定这是「高斯卷积」还是「直通拷贝」：
+    /// 两者共用同一套顶点阶段与管线状态，只是片元入口不同。
+    pub fn fullscreen(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        layout: vk::PipelineLayout,
+        shader: &ShaderModule,
+        fragment_entry: &'static std::ffi::CStr,
+    ) -> anyhow::Result<Self> {
+        // 顶点输入状态留空：无绑定、无属性。全屏三角形的顶点由
+        // `vertex_index` 生成，绑定任何缓冲都是多余的。
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        // 动态视口与剪裁：每趟模糊的目标尺寸不同（全分辨率场景 /
+        // 1/N 的中间图），靠动态状态切换，无需为每种尺寸重建管线。
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        // IMPORTANT: 混合必须**关闭**。开启后 dst 是上一次写入的内容，
+        // 全屏覆盖写会变成「叠加上一层」，模糊结果逐趟偏移、合成时
+        // 半透明底图与清晰界面互相污染。
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(false)
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            );
+
+        let blend_attachments = [blend_attachment];
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(&blend_attachments);
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false);
+
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+        ];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+
+        let stages = [
+            shader.vertex_stage_named(crate::shader::BLUR_VERTEX_ENTRY),
+            shader.fragment_stage_named(fragment_entry),
+        ];
+
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
+        let handle = unsafe {
+            device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&info),
+                None,
+            )
+        }
+        .map_err(|(partial, res)| {
+            unsafe {
+                for p in partial {
+                    device.destroy_pipeline(p, None);
+                }
+            }
+            anyhow::anyhow!("创建全屏管线失败: {res:?}")
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("全屏管线创建成功但返回列表为空"))?;
 
         Ok(Self { handle })
     }

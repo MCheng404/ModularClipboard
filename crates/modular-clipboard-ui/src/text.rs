@@ -32,8 +32,11 @@ pub fn measure_text(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
 /// egui 自带的 `Label::truncate` 需要真实的布局上下文（要占一个 `Ui`），
 /// 而这里是在 painter 上按绝对坐标画字，只能自己按实测宽度裁。
 ///
-/// 按**实测**宽度逐字累加，而不是估算：与 [`measure_text`] 同源，
-/// 保证「裁完一定放得下」。
+/// PF-9：截断点用**二分**找最长可容前缀，而不是逐字累加。逐字方案对每个
+/// 字符调一次 `layout_no_wrap`（含一次 galley cache 键哈希），一个 40
+/// 字符的行每帧 2 处 × 10 行就是 800 次查找；前缀布局还天然包含字距，
+/// 比逐字宽度累加更准。二分只做 O(log n) 次前缀测量，且每帧的前缀序列
+/// 相同，稳定命中 galley cache。
 pub fn elide_text(ui: &Ui, text: &str, font: &egui::FontId, max_w: f32) -> String {
     if text.is_empty() || max_w <= 0.0 {
         return String::new();
@@ -41,23 +44,28 @@ pub fn elide_text(ui: &Ui, text: &str, font: &egui::FontId, max_w: f32) -> Strin
     if measure_text(ui, text, font) <= max_w {
         return text.to_owned();
     }
-    // 省略号本身也要占宽度，所以先给 ellipsis 留出预算再逐字加。
+    // 省略号本身也要占宽度，所以先给 ellipsis 留出预算。
     let ellipsis = "…";
     let ellipsis_w = measure_text(ui, ellipsis, font);
     if ellipsis_w > max_w {
         // 连省略号都放不下：一个字都不给，返回空串而不是画出半截。
         return String::new();
     }
-    let mut budget = max_w - ellipsis_w;
-    let mut out = String::new();
-    for ch in text.chars() {
-        let w = measure_text(ui, &ch.to_string(), font);
-        if w > budget {
-            break;
+    let budget = max_w - ellipsis_w;
+    let chars: Vec<char> = text.chars().collect();
+    // 不变量：chars[..lo] 放得下，chars[..hi] 放不下。
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        let prefix: String = chars[..mid].iter().collect();
+        if measure_text(ui, &prefix, font) <= budget {
+            lo = mid;
+        } else {
+            hi = mid;
         }
-        budget -= w;
-        out.push(ch);
     }
+    let mut out: String = chars[..lo].iter().collect();
     out.push_str(ellipsis);
     out
 }

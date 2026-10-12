@@ -9,7 +9,7 @@
 //! 1. egui tessellation 产出的 [`egui::epaint::ClippedPrimitive`] 转成顶点数据；
 //! 2. 顶点/索引数据搬进 GPU 可见的缓冲；
 //! 3. 字体图集（覆盖率图）上传并绑定到描述符集；
-//! 4. **混合模式与 egui 的预乘 alpha 语义对齐**（见 [`unpremultiply`] 的注释）。
+//! 4. **混合模式与 egui 的预乘 alpha 语义对齐**（见 [`pack_color`] 的注释）。
 //!
 //! 任何一环错了，GPU 都不会报错，只会把字画成豆腐块、把半透明画成黑块。
 //! 因此这个探针只认「屏幕上出现了中文文字」为通过。
@@ -215,7 +215,7 @@ fn run() -> anyhow::Result<()> {
         // 窗口移到屏幕外，避免抢用户焦点；但**不最小化**——
         // 最小化会触发 `WM_SIZE` 把客户区压成 0×0
         // （我今天栽过这个坑，会得到 50 个假违规）。
-        if resize_mode && frame_no > 0 && frame_no % 90 == 0 {
+        if resize_mode && frame_no > 0 && frame_no.is_multiple_of(90) {
             let phase = (frame_no / 90) % 4;
             let (nw, nh) = match phase {
                 0 => (640, 480),
@@ -400,7 +400,7 @@ fn run() -> anyhow::Result<()> {
         }
         // 前若干帧逐帧打印：崩溃定位靠这个，稀疏采样会漏掉「第 3 帧就挂了」
         // 这类情况（实测设备丢失就发生在第 2~3 帧）。
-        if frame_no <= 8 || frame_no % 120 == 0 {
+        if frame_no <= 8 || frame_no.is_multiple_of(120) {
             println!(
                 "  帧 {frame_no}  {last_vertices} 顶点 / {last_draw_calls} draw call / \
                  重建 {rebuilds} 次 / 上传 {texture_uploads} 次 / 图集 {:?}",
@@ -424,9 +424,7 @@ fn run() -> anyhow::Result<()> {
         f.destroy(&gpu.device);
     }
     font_sampler.destroy(&gpu.device);
-    let mut slots = slots;
     slots.destroy(&gpu.device);
-    let mut uniform = uniform;
     uniform.destroy(&gpu.device);
     drop(fr);
     pipeline.destroy(&gpu.device);
@@ -663,39 +661,15 @@ fn tessellate_into(
     }
 }
 
-/// egui 的 `Color32` → 顶点色 `u32`（小端 ABGR）。
+/// egui 的 `Color32` → 顶点色 `u32`（小端 RGBA）。
 ///
-/// # 为什么必须反预乘
-///
-/// epaint 的顶点色是 **sRGBA 预乘 alpha**（`r,g,b` 已经乘过 `a`），
-/// 而 `pipeline.rs` 的混合是 `SRC_ALPHA / ONE_MINUS_SRC_ALPHA`——
-/// **非预乘**混合。直接上传会让 alpha 被乘两次，半透明区域明显发黑。
-/// 这类错误不报任何 GPU 错误，只是「看起来脏」，极易被漏掉。
-///
-/// 着色器输出的是 `color * vec4(1,1,1,texel.r)`，即 rgb 不乘覆盖率、
-/// 只有 alpha 乘覆盖率，这正是标准非预乘「over」运算期望的形式。
-/// 因此这里把颜色还原成非预乘，把那一次乘法交回混合阶段完成。
+/// epaint 顶点色是 **sRGBA 预乘 alpha**，而 `pipeline.rs` 的混合是预乘
+/// 公式 `ONE / ONE_MINUS_SRC_ALPHA`（与 egui-wgpu 一致）——两者恰好
+/// 配套，原样上传即可，**不能**反预乘（否则预乘混合拿到全强度 RGB，
+/// 半透明填充的超界通道被裁剪而偏色）。
 fn pack_color(c: egui::Color32) -> u32 {
     let [r, g, b, a] = c.to_array();
-    let (r, g, b) = unpremultiply(r, g, b, a);
     u32::from_le_bytes([r, g, b, a])
-}
-
-/// 预乘 → 非预乘。`a == 0` 时 rgb 的信息已在预乘时丢失（乘 0），
-/// 取 0：该像素最终 alpha 为 0，对画面的贡献本来就是 0。
-fn unpremultiply(r: u8, g: u8, b: u8, a: u8) -> (u8, u8, u8) {
-    if a == 255 {
-        return (r, g, b);
-    }
-    if a == 0 {
-        // 除零边界。理论上不可达（egui 的Color32 是预乘的，a=0 时 rgb 必为 0），
-        // 但仍显式返回 0 而不是让除法 panic —— 一个「理论上不可达」的分支
-        // 恰恰是最需要写对的地方。
-        return (0, 0, 0);
-    }
-    // 用 u32 计算：r * 255 最大 65025，会溢出 u8。
-    let f = |c: u8| -> u8 { ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8 };
-    (f(r), f(g), f(b))
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,57 +1077,14 @@ mod tests {
     }
 
     #[test]
-    fn opaque_colors_survive_unpremultiply() {
-        // alpha=255 时预乘与非预乘等价，必须逐通道不变。
-        for c in [
-            egui::Color32::WHITE,
-            egui::Color32::BLACK,
-            egui::Color32::from_rgb(1, 127, 254),
-        ] {
-            assert_eq!(
-                unpremultiply(c.r(), c.g(), c.b(), 255),
-                (c.r(), c.g(), c.b())
-            );
-        }
-    }
-
-    #[test]
-    fn zero_alpha_yields_black_not_overflow() {
-        // a=0 是除零边界。
-        //
-        // 注意：egui 的 `Color32` 内部是**预乘**的，a=0 时 rgb 必然已经是 0，
-        // 所以「rgb 非零 + a=0」这个组合构造不出来。这里验证函数不panic
-        // 且返回 0。
-        assert_eq!(unpremultiply(0, 0, 0, 0), (0, 0, 0));
-        let t = egui::Color32::TRANSPARENT;
-        assert_eq!(unpremultiply(t.r(), t.g(), t.b(), t.a()), (0, 0, 0));
-    }
-
-    #[test]
-    fn half_alpha_is_restored_to_full_channel() {
-        // 预乘 50% 后 rgb 约为一半；反预乘应还原到接近原值。
-        let full = egui::Color32::from_rgb(200, 100, 40);
-        let half = full.gamma_multiply(0.5);
-        let got = unpremultiply(half.r(), half.g(), half.b(), half.a());
-        for (g, want) in [got.0, got.1, got.2].into_iter().zip([200u8, 100, 40]) {
-            assert!(
-                (g as i32 - want as i32).abs() <= 2,
-                "反预乘误差过大：得到 {g}，期望约 {want}"
-            );
-        }
-    }
-
-    #[test]
-    fn unpremultiply_never_exceeds_255() {
-        // 预乘的舍入误差可能让反预乘结果略大于原值，必须夹住。
-        for a in 1..=254u8 {
-            let (r, g, b) = unpremultiply(255, 255, 255, a);
-            // 用 u32 中转比较——直接写 `r <= 255` 会被判为恒真（u8 上界），
-            // 那样这个测试就什么都没验证。
-            for v in [r, g, b] {
-                assert!(u32::from(v) <= 255, "反预乘结果 {v} 溢出 u8");
-            }
-        }
+    fn semi_transparent_colors_are_uploaded_premultiplied() {
+        // 与 renderer.rs 的 pack_color 同步：预乘色原样上传，不反预乘。
+        let c = egui::Color32::from_rgba_unmultiplied(0x1D, 0x65, 0xAF, 52);
+        let packed = pack_color(c);
+        assert_eq!(packed & 0xFF, 6, "预乘后的红");
+        assert_eq!((packed >> 8) & 0xFF, 21, "预乘后的绿");
+        assert_eq!((packed >> 16) & 0xFF, 36, "预乘后的蓝");
+        assert_eq!((packed >> 24) & 0xFF, 52, "alpha 原样");
     }
 
     #[test]

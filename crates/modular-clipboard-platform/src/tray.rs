@@ -24,7 +24,7 @@
 //! 见 [`icon_rgba`]。不引入 `tray-icon` 等携带渲染后端的 crate。
 
 use anyhow::{Context, Result};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -179,7 +179,7 @@ const CMD_QUIT: usize = 0x1003;
 /// 这两个值是 Win32 协议常量，`windows` crate 未导出，只能本地定义。
 mod nin {
     /// 鼠标左键点击（或键盘激活）。
-    pub const SELECT: u32 = WM_USER_BASE + 0;
+    pub const SELECT: u32 = WM_USER_BASE;
     /// 键盘激活（回车/空格）。
     pub const KEYSELECT: u32 = WM_USER_BASE + 1;
     const WM_USER_BASE: u32 = 1024;
@@ -309,11 +309,8 @@ impl Tray {
     /// 非阻塞取回全部待处理事件。
     pub fn poll(&self) -> Vec<TrayEvent> {
         let mut out = Vec::new();
-        loop {
-            match self.rx.try_recv() {
-                Ok(ev) => out.push(ev),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(ev) = self.rx.try_recv() {
+            out.push(ev);
         }
         out
     }
@@ -611,7 +608,7 @@ mod imp {
                     biHeight: -n,
                     biPlanes: 1,
                     biBitCount: 32,
-                    biCompression: BI_RGB.0 as u32,
+                    biCompression: BI_RGB.0,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -806,10 +803,10 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
         // 「建立资源」与「跑消息循环」必须分开：
         // 就绪信号要在进入循环**之前**发出，否则 `start` 会一直阻塞——
         // 循环是阻塞的，信号若在循环之后发就永远发不出去。
-        let res = setup(&tip).and_then(|ctx| {
-            let _ = ready.send(Ok(ctx.ready.clone()));
+        let res = setup(&tip).map(|ctx| {
+            let _ = ready.send(Ok(ctx.ready));
             pump(&ctx);
-            Ok(ctx.ready)
+            ctx.ready
         });
 
         // 失败路径必须通知启动方，否则 `start` 同样会一直阻塞。
@@ -1033,7 +1030,7 @@ mod tests {
     ///
     /// `lParam = (mouse << 16) | notify`，坐标不参与这两段判定。
     fn v4_lparam(mouse: u32, notify: u32) -> isize {
-        (((mouse as isize) << 16) | notify as isize) as isize
+        (mouse as isize) << 16 | notify as isize
     }
 
     #[test]

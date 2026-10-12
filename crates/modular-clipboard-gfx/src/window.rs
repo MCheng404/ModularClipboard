@@ -86,8 +86,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    SetWindowPos, GetWindowRect,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE,
+    SetWindowPos, GetWindowRect, FindWindowW, PostMessageW,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_NOMOVE,
     GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW,
     SIZE_MINIMIZED, SIZE_RESTORED, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
     WM_SYSCOMMAND,
@@ -151,6 +151,53 @@ const MAX_PREDICTED_DT: f32 = 0.1;
 /// 它会返回 0 并置 `ERROR_CLASS_ALREADY_EXISTS`。
 static CLASS_REGISTERED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
 
+/// 自定义消息：请求把主窗口显示出来并置前。
+///
+/// # 用途：单实例唤起
+///
+/// 用户重复双击 exe 时，第二个进程找到已有主窗口、发这条消息，然后退出。
+/// 早前第二个进程只弹一个「已有实例在运行」的提示框——用户的意图明明
+/// 是「打开它」，弹窗只是把意图挡回去，还得手动关掉。
+///
+/// 取 `WM_APP + 1`（`WM_APP` = 0x8000）：该值以下留给系统消息，
+/// 之上才是应用自定义，不会与任何系统消息撞号。
+pub const WM_SHOW_MAIN: u32 = 0x8000 + 1;
+
+/// 找到标题为 `title` 的已有窗口，请求它显示并置前。
+///
+/// 返回 `true` 表示消息已投递成功（不保证对端一定响应——那是另一个
+/// 进程的事）。
+///
+/// # 为什么是「投消息」而不是直接 `ShowWindow` + `SetForegroundWindow`
+///
+/// 直接改窗口状态**绕过了对端自己的状态机**：本程序内部有一个 `hidden`
+/// 标志（隐藏到托盘时置位），不同步它的话，窗口虽然被显示出来，主循环
+/// 仍会走 `hidden` 分支 `continue`——**不渲染**，用户看到的是一片空白。
+/// 发消息让对端自己走「显示」路径，状态才是一致的。
+///
+/// 另外 `SetForegroundWindow` 对非前台进程有严格限制，跨进程调用常常
+/// 静默失败；对端在自己的消息循环里调则没有这个问题。
+pub fn request_show_main_window(title: &str) -> bool {
+    // `FindWindowW` 要 NUL 结尾的宽字符串；`HSTRING` 不保证可当 PCWSTR 用，
+    // 这里手工构造最直接。
+    let mut wide: Vec<u16> = title.encode_utf16().collect();
+    wide.push(0);
+    let name = PCWSTR::from_raw(wide.as_ptr());
+
+    // SAFETY: `wide` 以 NUL 结尾且在本调用期间存活；类名传 `PCWSTR::null()`
+    // 表示不限类名，只按标题找。
+    let hwnd = match unsafe { FindWindowW(PCWSTR::null(), name) } {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    if hwnd.is_invalid() {
+        return false;
+    }
+    // SAFETY: `hwnd` 由上面取得且已判非空；`PostMessageW` 只入队、不阻塞，
+    // 因此不会因对端忙而卡住本进程。
+    unsafe { PostMessageW(Some(hwnd), WM_SHOW_MAIN, WPARAM(0), LPARAM(0)) }.is_ok()
+}
+
 /// 语义化的窗口事件。
 ///
 /// 坐标一律是**逻辑点**（已按 `scale_factor` 换算），原点为客户区左上角。
@@ -170,6 +217,13 @@ pub enum WindowEvent {
     /// 剪贴板类程序通常在这里隐藏到托盘；确实要退出就调
     /// [`Window::destroy`]。
     CloseRequested,
+
+    /// 另一个进程请求把本窗口显示并置前（见 [`WM_SHOW_MAIN`]）。
+    ///
+    /// 由应用处理成「像点了托盘图标那样」：取消隐藏、显示、抢焦点、重绘。
+    /// 只把窗口 `ShowWindow` 是不够的——应用内部还有一个 `hidden` 标志，
+    /// 不同步它的话窗口会显示出来但**不渲染**（一片空白）。
+    ShowRequested,
 
     /// 键盘焦点获得 / 丢失。
     Focused(bool),
@@ -259,6 +313,22 @@ pub enum WindowIme {
 pub struct Window {
     hwnd: HWND,
     hinstance: HINSTANCE,
+    /// 告知 egui 的纹理尺寸上限（`RawInput::max_texture_side`）。
+    ///
+    /// # 为什么必须设置
+    ///
+    /// egui 用它决定**字体图集**能长到多大。缺省值是 2048，而图集要装下
+    /// 整套中文字形 + 图标字形：在超采样（`ppp = DPI × 倍率`）下所需面积
+    /// 按倍率的平方增长，2048 很快不够。
+    ///
+    /// 图集塞不下时的表现**不是报错**，而是字形被挤掉/画错——
+    /// 实测把 `MODULARCLIPBOARD_SSAA=2` 打开后，齿轮图标丢掉了齿、
+    /// 垃圾桶变了形（字形栅格化失败后被相邻字形顶替）。
+    /// 这种「图标形状不对」极易被误判成字体文件坏了。
+    ///
+    /// 默认 2048 是「没拿到设备信息」时的安全值；拿到 `Gpu` 后调用
+    /// [`Self::set_max_texture_side`] 换成设备的真实上限。
+    max_texture_side: usize,
 }
 
 impl Window {
@@ -317,7 +387,7 @@ impl Window {
                 clamp_i32(height),
                 None,
                 None,
-                Some(hinstance.into()),
+                Some(hinstance),
                 None,
             )
         }
@@ -331,7 +401,29 @@ impl Window {
         // 给一个默认的 resize 边缘；上层可用`set_resize_border` 覆盖。
         chrome::set_resize_border(hwnd, chrome::DEFAULT_RESIZE_BORDER);
 
-        Ok(Self { hwnd, hinstance })
+        Ok(Self {
+            hwnd,
+            hinstance,
+            max_texture_side: 2048,
+        })
+    }
+
+    /// 告知 egui 纹理尺寸上限（拿到 `Gpu` 之后调用）。
+    ///
+    /// 传入设备的 `max_image_dimension_2d`。egui 内部还会再夹到 16K
+    /// （见 `epaint` 的 `fonts.rs`），所以传大值不会出事，传小了才会。
+    ///
+    /// 必须**在建 `egui::Context` 之后、第一次 `run` 之前**生效——
+    /// 本项目的调用点在 `Gpu::new` 之后，早于任何 `egui_input`，满足该条件。
+    pub fn set_max_texture_side(&mut self, side: u32) {
+        // 下限 2048：万一驱动报告了离谱的小值（软件渲染器），
+        // 也不要让字体图集退化成塞不下中文字形。
+        self.max_texture_side = (side as usize).max(2048);
+    }
+
+    /// 当前纹理上限（供 [`EventLoop::new`] 复制）。
+    pub fn max_texture_side(&self) -> usize {
+        self.max_texture_side
     }
 
     /// 窗口句柄。
@@ -404,6 +496,37 @@ impl Window {
                 0,
                 0,
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
+
+    /// 运行时改变窗口客户区大小，单位**物理像素**。
+    ///
+    /// 用途：布局需求变化（例如用户把「置顶模式」从「共用单栏」切成
+    /// 「独立分栏」，多出一栏需要更宽的客户区）时，由上层重算宽度需求
+    /// 再调这里。窗口尺寸原先只在启动时从配置读一次，那种情况下
+    /// 切换布局就会把卡片挤扁。
+    ///
+    /// NOTE: 走 `SetWindowPos` 而非 `SetWindowPos` + `SWP_NOMOVE` 省略 ——
+    /// 必须显式带上 `SWP_NOMOVE`，否则窗口会**跳回屏幕原点**：
+    /// `SetWindowPos` 的 `x/y` 在带 `SWP_NOSIZE` 时被忽略，
+    /// 但不带任何位置标志时 `x/y` 照常生效。
+    pub fn set_size_physical(&self, w_px: u32, h_px: u32) {
+        if w_px == 0 || h_px == 0 {
+            // 0 会让客户区塌成 0×0，交换链重建失败且窗口看着像消失了。
+            // 需求算错时宁可不动，也不要把窗口弄没。
+            tracing::warn!("拒绝把窗口设为 {w_px}x{h_px}：尺寸必须为正");
+            return;
+        }
+        let _ = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                w_px as i32,
+                h_px as i32,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
             )
         };
     }
@@ -488,7 +611,7 @@ fn register_class(hinstance: HINSTANCE, class_p: PCWSTR) -> anyhow::Result<()> {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             // 必须原样转发 DefWindowProcW，见模块文档。
             lpfnWndProc: Some(wnd_proc),
-            hInstance: hinstance.into(),
+            hInstance: hinstance,
             lpszClassName: class_p,
             ..Default::default()
         };
@@ -552,6 +675,8 @@ pub struct EventLoop {
     focused: bool,
     /// 已收到 `WM_QUIT`。
     quit: bool,
+    /// 告知 egui 的纹理尺寸上限，见 [`Window::max_texture_side`]。
+    max_texture_side: usize,
     /// 应用请求的下次重绘间隔。
     repaint_after: Option<Duration>,
     /// UTF-16 代理项配对状态。BMP 外的字符由两条 `WM_CHAR` 组成。
@@ -571,9 +696,18 @@ impl EventLoop {
             modifiers: Modifiers::default(),
             focused: true,
             quit: false,
+            // 从窗口复制；主窗口在 `Gpu` 就绪后还会用
+            // [`Self::set_max_texture_side`] 覆盖一次（它的 `EventLoop`
+            // 建在 `Gpu::new` 之前）。
+            max_texture_side: window.max_texture_side(),
             repaint_after: None,
             decoder: CharDecoder::new(),
         }
+    }
+
+    /// 覆盖 egui 纹理上限。见 [`Window::set_max_texture_side`]。
+    pub fn set_max_texture_side(&mut self, side: u32) {
+        self.max_texture_side = (side as usize).max(2048);
     }
 
     /// 设置帧间隔。`poll_for` 空闲时按它睡眠，避免空转烧 CPU。
@@ -750,6 +884,12 @@ impl EventLoop {
             // 剪贴板程序通常要转到托盘而不是退出，交给应用决定。
             if msg.message == WM_CLOSE {
                 events.push(WindowEvent::CloseRequested);
+                continue;
+            }
+
+            // 另一个进程请求唤起本窗口（单实例：用户又双击了一次图标）。
+            if msg.message == WM_SHOW_MAIN {
+                events.push(WindowEvent::ShowRequested);
                 continue;
             }
 
@@ -1070,21 +1210,39 @@ impl EventLoop {
     /// 这类缺陷不报任何 GPU 错误，只是「画小了」，因此必须靠上面那条
     /// 不变式当判据，而不是靠肉眼看整体比例。
     pub fn egui_input(&self, ctx: &egui::Context, events: &[WindowEvent]) -> egui::RawInput {
-        // IMPORTANT: 必须与下面的 `screen_rect` **成对**设置，且用同一个
-        // `scale_factor`。少这一句就是「UI 只画左上角 2/3」的根因。
+        // IMPORTANT: 必须与下面的 `screen_rect` **成对**设置。
+        // 少这一句就是「UI 只画左上角 2/3」的根因。
         //
         // egui 的 `ppp` 决定两件事：字体图集的栅格化分辨率，以及
         // `tessellate` 的 feathering/对齐；它**不**缩放顶点坐标
         // （`epaint::Vertex::pos` 的文档明确写的是逻辑点）。
-        // 顶点 → 物理像素的换算只发生在着色器里那一次 `* dpr`。
+        // 顶点 → 渲染目标像素的换算只发生在着色器里那一次 `* dpr`。
+        //
+        // # 超采样（SSAA）
+        //
+        // 这里乘上 [`crate::render_scale()`] 是本项目的抗锯齿方案：
+        // `ppp` 提高 N 倍 ⇒ 字体图集按 N 倍分辨率栅格化、feathering
+        // 也按 N 倍细分；渲染目标同步放大 N 倍，最后线性降采样回交换链。
+        //
+        // 为什么不用 MSAA：MSAA 只作用于**几何边缘**，而字形的锯齿来自
+        // **纹理采样**（字体图集是覆盖率图），MSAA 对它毫无作用。
+        // 超采样同时改善几何与文字，是本项目「圆角与字体都要顺」诉求的
+        // 唯一正确解。
+        //
+        // IMPORTANT: `screen_rect`（逻辑点）**不变**——它只由窗口的
+        // 真实 DPI 决定。变的只有 `ppp` 与渲染目标尺寸，于是布局完全
+        // 不受影响，只有光栅化分辨率提高。
+        // 不变式随之变为 `screen_rect.size() * ppp == 渲染目标像素`。
         //
         // `set_pixels_per_point` 内部会转成 `set_zoom_factor(ppp /
         // native_ppp)`，而本项目从不设 `native_ppp`（恒为 1.0），
-        // 所以这里传 DPI 缩放即得`ppp == scale_factor`。
+        // 所以这里传 `scale_factor * render_scale` 即得该 ppp。
         //
         // 幂等：值没变时 `set_zoom_factor` 直接返回，不触发重绘请求，
         // 因此每帧调用无代价。
-        ctx.set_pixels_per_point(self.scale_factor);
+        ctx.set_pixels_per_point(
+            self.scale_factor * crate::render_scale_for(self.scale_factor),
+        );
 
         let mut out: Vec<EguiEvent> = Vec::with_capacity(events.len() + 4);
 
@@ -1200,10 +1358,14 @@ impl EventLoop {
                 }
                 // 尺寸与缩放通过 screen_rect 表达；关闭是应用层语义；
                 // 最小化同理——客户区已是 0×0，`screen_rect` 会自动塌成空。
+                //
+                // `ShowRequested` 也是应用层语义（由主循环处理成
+                // 「像点了托盘那样显示并置前」），不进 egui。
                 WindowEvent::Resized { .. }
                 | WindowEvent::ScaleFactorChanged(_)
                 | WindowEvent::Minimized(_)
-                | WindowEvent::CloseRequested => {}
+                | WindowEvent::CloseRequested
+                | WindowEvent::ShowRequested => {}
             }
         }
 
@@ -1214,6 +1376,11 @@ impl EventLoop {
 
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.inner_size)),
+            // IMPORTANT: 必须显式给出纹理上限。留空会退回 egui 的默认值
+            // 2048，而超采样下中文字体图集需要远大于此的边长——
+            // 图集塞不下的表现是**字形画错**（图标形状不对），不报错。
+            // 见 [`Window::max_texture_side`] 的说明。
+            max_texture_side: Some(self.max_texture_side),
             time: Some(self.start.elapsed().as_secs_f64()),
             predicted_dt: self
                 .repaint_after
@@ -1495,6 +1662,8 @@ mod tests {
             modifiers: Modifiers::default(),
             focused: true,
             quit: false,
+            // 测试用默认上限（与 `Window::new` 的初值一致）。
+            max_texture_side: 2048,
             repaint_after: None,
             decoder: CharDecoder::new(),
         }
@@ -1554,31 +1723,39 @@ mod tests {
             "screen_rect 必须是逻辑点尺寸"
         );
 
-        // 关键断言：跑一帧后 egui 报告的 ppp 必须等于 DPI 缩放。
+        // 关键断言：跑一帧后 egui 报告的 ppp 必须等于
+        // 「窗口 DPI 缩放 × 超采样倍率」。
         // `set_pixels_per_point` 在下一 pass 生效，所以这里看 `FullOutput`——
         // 它正是被送进 `uniforms_for` 当 `dpr` 的那个值。
         let mut out = ctx.run_ui(raw, |_ctx| {});
         // 首帧会栅格化字体，`TexturesDelta` 的 drop 断言要求先消费掉。
         // 不清空的话这个 panic 会**掩盖**下面的真实断言失败。
         out.textures_delta.clear();
+        let want = scale * crate::render_scale_for(scale);
         assert_eq!(
-            out.pixels_per_point, scale,
-            "egui 的 ppp 必须等于窗口 DPI 缩放（本次缺陷的根因：漏调 \
+            out.pixels_per_point, want,
+            "egui 的 ppp 必须等于「窗口 DPI 缩放 × 超采样倍率」（本次缺陷的根因：漏调 \
              set_pixels_per_point，ppp 恒为 1.0，导致布局与换算差一个 \
              scale 因子，右侧与底部各空 1/3）"
         );
     }
 
-    /// **不变式本体**：`screen_rect * ppp == 客户区物理像素`。
+    /// **不变式本体**：`screen_rect * ppp == 渲染目标像素`。
     ///
-    /// 这是渲染侧 `uniforms_for` 依赖的契约：`size_in_pixels` 拿物理像素，
-    /// `dpr` 拿 egui 的 `ppp`，而顶点是逻辑点。三者任一不自洽，
-    /// 画面就整体缩放错误——且**始终不触发 GPU 错误或验证层报错**。
+    /// 这是渲染侧 `uniforms_for` 依赖的契约：`size_in_pixels` 拿**渲染目标**
+    /// 像素（= 客户区物理像素 × 超采样倍率），`dpr` 拿 egui 的 `ppp`，
+    /// 而顶点是逻辑点。三者任一不自洽，画面就整体缩放错误——
+    /// 且**始终不触发 GPU 错误或验证层报错**。
+    ///
+    /// NOTE: 引入超采样后，右侧不再是「客户区物理像素」而是它乘以
+    /// [`crate::render_scale()`]。这正是超采样的定义：布局尺寸不变、
+    /// 光栅化分辨率提高。`screen_rect` 仍是逻辑点。
     ///
     /// 直接复用实机遇到的 420×560 @1.5，而不是随手编的数字。
     #[test]
-    fn screen_rect_times_ppp_equals_physical_client_area() {
+    fn screen_rect_times_ppp_equals_render_target() {
         for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let rs = crate::render_scale_for(scale);
             let e = fake_loop_scaled(scale, REAL_CLIENT_PX / scale);
             let ctx = egui::Context::default();
             let raw = e.egui_input(&ctx, &[]);
@@ -1588,19 +1765,27 @@ mod tests {
 
             assert_eq!(
                 screen * out.pixels_per_point,
-                REAL_CLIENT_PX,
-                "scale={scale}: screen_rect({screen:?}) * ppp({}) 必须等于物理客户区 {:?}",
+                REAL_CLIENT_PX * rs,
+                "scale={scale}: screen_rect({screen:?}) * ppp({}) 必须等于渲染目标像素 {:?}",
                 out.pixels_per_point,
-                REAL_CLIENT_PX
+                REAL_CLIENT_PX * rs
+            );
+            // 布局尺寸不受超采样影响：逻辑点仍是 物理 / DPI缩放。
+            assert_eq!(
+                screen,
+                REAL_CLIENT_PX / scale,
+                "scale={scale}: screen_rect 必须保持逻辑点语义（不随超采样变化）"
             );
         }
     }
 
-    /// `scale = 1.0`（无缩放）时不变式退化为恒等，必须照样成立。
+    /// `scale = 1.0`（无 DPI 缩放）时，`screen_rect` 必须仍等于物理客户区，
+    /// 而 `ppp` 恰好等于超采样倍率。
     ///
     /// 单独列出来是因为它是最容易被「顺手乘个 scale」改坏的分支。
     #[test]
     fn coordinate_invariant_holds_at_scale_one() {
+        let rs = crate::render_scale_for(1.0);
         let e = fake_loop_scaled(1.0, REAL_CLIENT_PX);
         let ctx = egui::Context::default();
         let raw = e.egui_input(&ctx, &[]);
@@ -1608,7 +1793,9 @@ mod tests {
         let screen = raw.screen_rect.expect("必须给出 screen_rect").size();
         let mut out = ctx.run_ui(raw, |_ctx| {});
         out.textures_delta.clear();
-        assert_eq!(out.pixels_per_point, 1.0);
+        // 无 DPI 缩放时 ppp 只剩超采样倍率（倍率为 1 时即 1.0）。
+        assert_eq!(out.pixels_per_point, rs);
+        // 布局尺寸仍是物理客户区（超采样只提高光栅化分辨率，不改布局）。
         assert_eq!(screen, REAL_CLIENT_PX);
     }
 

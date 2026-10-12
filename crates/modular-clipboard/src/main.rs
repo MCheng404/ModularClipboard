@@ -28,6 +28,10 @@ struct Args {
     no_capture: bool,
     /// 打印版本后退出。
     version: bool,
+    /// 以 stdio 传输运行 MCP 服务（由 MCP 客户端 spawn）。
+    mcp_server: bool,
+    /// 以 Streamable HTTP 传输运行 MCP 服务（监听 host:port）。
+    mcp_http: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -35,6 +39,8 @@ fn parse_args() -> Result<Args, String> {
         data_dir: None,
         no_capture: false,
         version: false,
+        mcp_server: false,
+        mcp_http: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -44,6 +50,8 @@ fn parse_args() -> Result<Args, String> {
                 args.data_dir = Some(PathBuf::from(v));
             }
             "--no-capture" => args.no_capture = true,
+            "--mcp-server" => args.mcp_server = true,
+            "--mcp-http" => args.mcp_http = true,
             "-V" | "--version" => args.version = true,
             "-h" | "--help" => {
                 show_message_box("模块化剪贴板 - 帮助", HELP_TEXT);
@@ -67,6 +75,8 @@ const HELP_TEXT: &str = "ModularClipboard 剪贴板管理器
 选项:
       --data-dir <路径>   指定数据目录
       --no-capture         启动时不监听剪贴板（调试用）
+      --mcp-server         以 stdio 方式运行 MCP 服务
+      --mcp-http           以 HTTP 方式运行 MCP 服务
   -V, --version           显示版本
   -h, --help              显示帮助";
 
@@ -175,6 +185,31 @@ fn main() {
         None => None,
     };
 
+    // MCP 服务模式：**绕过单实例保护**。
+    //
+    // stdio 模式下 MCP 客户端会 spawn 本进程，而主应用可能已经在运行——
+    // 若走单实例互斥体，MCP 进程会直接退出，客户端连不上。HTTP 模式同理。
+    // MCP 进程不监听剪贴板、不创建托盘，与主应用无资源冲突。
+    if args.mcp_server || args.mcp_http {
+        let cfg_path = config_path(data_dir.as_deref());
+        let config = Config::load(&cfg_path).unwrap_or_default();
+        // 日志落文件（stdio 模式不能写 stdout，那会污染协议）。
+        let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
+        init_tracing(&log_dir.join("mcp.log"));
+        let result = if args.mcp_server {
+            tracing::info!("MCP stdio 模式启动");
+            modular_clipboard_mcp::stdio::run_stdio_blocking(config.mcp.clone())
+        } else {
+            tracing::info!("MCP HTTP 模式启动");
+            modular_clipboard_mcp::http::run_http_blocking(config.mcp.clone())
+        };
+        if let Err(e) = result {
+            tracing::error!("MCP 服务退出：{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // 单实例保护。
     //
     // 剪贴板工具必须后台常驻，用户可能反复双击 exe。
@@ -196,9 +231,17 @@ fn main() {
             let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
             init_tracing(&log_dir.join("app.log"));
             run_app(args, data_dir);
-            return;
         }
         Err(e) => {
+            // 用户重复双击图标 ⇒ 意图是「打开它」，不是「被告知它已经开着」。
+            // 找到已有主窗口、请求它显示并置前，成功就静默退出。
+            //
+            // 只有**找不到窗口**时才弹提示（对端可能刚启动还没建窗，
+            // 或互斥体属于另一个登录会话——那种情况下确实没有窗口可唤起）。
+            if modular_clipboard_ui::activate_running_instance() {
+                tracing::info!("已有实例在运行，已请求其显示主窗口");
+                return;
+            }
             // GUI 程序没有 stderr，且这属于**用户可见**的失败
             // （双击图标却什么都没发生），必须弹窗告知。
             show_message_box("模块化剪贴板", &format!("已有实例在运行，本次启动退出。\n\n{e}"));
@@ -319,9 +362,14 @@ impl SingleInstanceGuard {
             .collect();
         //签名：CreateMutexW(attributes: Option<&SECURITY_ATTRIBUTES>,
         //                   initial_owner: bool, name: PCWSTR)
-        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) };
-
-        let handle = handle.unwrap();
+        //
+        // SEC-010：创建失败不能 unwrap——那会以 panic 收场（exit 101），
+        // 用户看到的是崩溃而不是「另一个实例在运行」的解释。失败时按
+        // 「无法获得独占权」处理：提示后退出，由调用方决定是否放行。
+        let handle = match unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) } {
+            Ok(h) => h,
+            Err(e) => return Err(format!("创建单实例互斥体失败：{e}")),
+        };
         match unsafe { GetLastError() } {
             ERROR_ALREADY_EXISTS => Err("另一个实例已持有该互斥体".into()),
             _ => Ok(Self { handle }),

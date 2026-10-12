@@ -620,13 +620,13 @@ mod tests {
         let mut c = ThumbnailCache::default();
         let k = CacheKey::new(1, "h1");
         let calls = AtomicU32::new(0);
-        let mut load = || {
+        let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(encode_png(64, 64))
         };
-        c.get_or_load(k.clone(), &mut load).unwrap();
-        c.get_or_load(k.clone(), &mut load).unwrap();
-        c.get_or_load(k.clone(), &mut load).unwrap();
+        c.get_or_load(k.clone(), load).unwrap();
+        c.get_or_load(k.clone(), load).unwrap();
+        c.get_or_load(k.clone(), load).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "命中缓存不应再次 load");
         assert_eq!(c.len(), 1);
     }
@@ -705,13 +705,13 @@ mod tests {
         let mut c = ThumbnailCache::default();
         let k = CacheKey::new(1, "h");
         let calls = AtomicU32::new(0);
-        let mut failing = || {
+        let failing = || {
             calls.fetch_add(1, Ordering::SeqCst);
             Err::<Vec<u8>, String>("blob 损坏".into())
         };
         for _ in 0..10 {
             assert_eq!(
-                c.get_or_load(k.clone(), &mut failing),
+                c.get_or_load(k.clone(), failing),
                 Err(ThumbError::DecodeFailed)
             );
         }

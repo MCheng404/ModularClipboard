@@ -240,6 +240,20 @@ pub struct DrawInput<'a> {
     pub batches: &'a [DrawBatch],
     /// 覆盖默认描述符集。为 `null` 时使用该帧槽自带的描述符集。
     pub descriptor_set: vk::DescriptorSet,
+    /// 通道开启后、绘制批次**之前**先画一张全屏底图。
+    ///
+    /// # 用途
+    ///
+    /// 自研模糊的合成阶段：先把模糊结果作为全屏底图铺满交换链，
+    /// 再叠加清晰的界面图元（如设置覆盖层面板）。`None` 表示不画底图，
+    /// 与早前行为一致。
+    ///
+    /// # 为什么放在 `DrawInput` 里而不是单独一个方法
+    ///
+    /// 底图与后续图元必须在**同一个渲染通道**内完成：分开录两个通道
+    /// 意味着中间要 end/begin，且第二次 begin 会以 `load_op=CLEAR`
+    /// 把刚画的底图清掉。放进同一个 `record` 调用里，顺序天然正确。
+    pub prelude: Option<crate::blur::Blit>,
 }
 
 // 不能 derive(Default)：`vk::IndexType` 的 Default 是 UINT16，
@@ -255,6 +269,7 @@ impl Default for DrawInput<'_> {
             index_type: vk::IndexType::UINT32,
             batches: &[],
             descriptor_set: vk::DescriptorSet::null(),
+            prelude: None,
         }
     }
 }
@@ -341,7 +356,7 @@ fn clamp_axis(caps: &vk::SurfaceCapabilitiesKHR, want: vk::Extent2D) -> vk::Exte
         // Vulkan 规范允许 `current_extent == 0`（意为「应用自行决定」），
         // 并不保证 `min_image_extent > 0`。所以必须在clamp 之后再兜一次。
         if base == 0 {
-            FALLBACK_EXTENT.width.min(2048).max(1)
+            FALLBACK_EXTENT.width.clamp(1, 2048)
         } else {
             base
         }
@@ -787,8 +802,10 @@ impl<'a> FrameRenderer<'a> {
 
         // 交换链建好才知道在飞帧数，按它重建 arena 的块数。
         // 必须 ≥ slot_count：每个在飞帧各占一块，否则下一帧会覆写
-        // GPU 尚未读完的 staging 内存。
-        this.staging = StagingArena::new(gpu, this.slots.len())?;
+        // GPU 尚未读完的 staging 内存。再多留 [`staging::EXTRA_CHUNKS`]
+        // 块：块被占用后要等一整轮在飞帧才退休，磨砂捕获这类「每帧都要
+        // 上传一点」的额外上传者需要这点余量（详见该常量的注释）。
+        this.staging = StagingArena::new(gpu, crate::staging::chunk_count_for(this.slots.len()))?;
 
         tracing::debug!(
             extent = ?this.swapchain.extent,
@@ -808,6 +825,41 @@ impl<'a> FrameRenderer<'a> {
     /// 交换链格式。
     pub fn format(&self) -> vk::Format {
         self.swapchain.format
+    }
+
+    /// 结束当前渲染通道。
+    ///
+    /// # 为什么需要它
+    ///
+    /// [`Self::record`] / [`Self::record_to`] 只负责**开启**通道——
+    /// 交换链那一趟由 [`Self::present`] 关闭（那里还要先关通道再做
+    /// 呈现布局转换）。但**离屏** pass 不走 `present`：模糊链在
+    /// 交换链 pass 之前跑三趟离屏 pass，每趟都必须自成一对
+    /// begin/end，否则下一趟 `cmd_begin_render_pass` 会因
+    /// 「已有通道处于激活状态」而失败（验证层报
+    /// `VUID-vkCmdBeginRenderPass-renderPass-06055` 一类的错）。
+    ///
+    /// 因此离屏绘制必须 `record_to(...)` 之后显式调用本方法。
+    /// 交换链那一趟**不要**调用它——`present` 会做，重复调用会让
+    /// 后面的布局转换屏障落在没有激活通道的状态上（同样违规）。
+    pub fn end_pass(&mut self) {
+        let device = &self.gpu.device;
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        let cmd = self.slots[pending.slot].command_buffer;
+        // SAFETY：调用方保证此刻确实有一个由 `record_to` 开启的通道。
+        unsafe { device.cmd_end_render_pass(cmd) };
+    }
+
+    /// 本渲染器使用的渲染通道句柄。
+    ///
+    /// 离屏目标要用它创建 framebuffer：Vulkan 的 framebuffer 必须绑定
+    /// 渲染通道。离屏链刻意与交换链**同格式**，因此可以直接复用这一个
+    /// 通道，不需要为离屏再建一个（也就少一个「两个通道附件格式不一致」
+    /// 的历史坑）。
+    pub fn render_pass(&self) -> vk::RenderPass {
+        self.bundle.render_pass
     }
 
     /// 在飞帧槽位数量（等于交换链图像数）。
@@ -1173,22 +1225,50 @@ impl<'a> FrameRenderer<'a> {
     /// `allocate_descriptor_sets` 分配出的集合内容是未初始化的，
     /// 绑定后交给 GPU 会解引用垃圾值（UB → 丢设备）。
     /// 本方法不代为校验这一点——它无法知道资源层是否已写入。
-    ///
-
     /// `batches` 为空时只清屏、不绑定任何描述符集，因此是安全的。
     pub fn record(&mut self, input: &DrawInput<'_>) -> anyhow::Result<()> {
         let Some(pending) = self.pending.as_ref() else {
             anyhow::bail!("record 必须在 acquire 之后调用");
         };
-        let slot = pending.slot;
-        // 先取出再borrow self：下面 begin_render_pass 需要 &mut self。
         let framebuffer = pending.frame.framebuffer;
+        let extent = self.swapchain.extent;
+        self.record_to(framebuffer, extent, input)
+    }
+
+    /// 录制绘制命令到**指定 framebuffer**（离屏目标或交换链）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 自研模糊要求先把界面画到**离屏场景图**、再卷积、最后合成到交换链。
+    /// 早前 `record` 把目标写死为 `self.pending.frame.framebuffer`，
+    /// 无法把界面画到别处。抽出本方法后，同一套「开通道 → 绑管线 →
+    /// 逐批次绘制」逻辑对两种目标通用，只有 framebuffer 与尺寸不同。
+    ///
+    /// # 前置条件
+    ///
+    /// 与 [`Self::record`] 相同：必须在 `acquire` 之后调用；`batches`
+    /// 非空时该帧槽位的描述符集必须已填充（否则着色器解引用垃圾值）。
+    ///
+    /// # 参数
+    /// - `framebuffer`：目标。离屏目标的 framebuffer 必须与本渲染器的
+    ///   渲染通道兼容（同附件格式）——模糊链刻意复用同一格式正是为此。
+    /// - `extent`：目标尺寸，决定视口、剪裁与 `render_area`。低分辨率
+    ///   离屏目标传自己的尺寸，不能传交换链尺寸。
+    pub fn record_to(
+        &mut self,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+        input: &DrawInput<'_>,
+    ) -> anyhow::Result<()> {
+        let Some(pending) = self.pending.as_ref() else {
+            anyhow::bail!("record_to 必须在 acquire 之后调用");
+        };
+        let slot = pending.slot;
         let device = &self.gpu.device;
         let cmd = self.slots[slot].command_buffer;
 
-        // 视口与剪裁跟随当前交换链尺寸；交换链重建后自动更新，
+        // 视口与剪裁跟随**目标**尺寸；交换链重建后自动更新，
         // 不需要重建管线（管线里声明的是 dynamic state）。
-        let extent = self.swapchain.extent;
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -1222,9 +1302,30 @@ impl<'a> FrameRenderer<'a> {
             .filter(|b| b.index_count > 0)
             .collect();
 
-        // 通道总是要开——即使无批次也要走一遍 clear + present，
-        // 否则交换链图像内容未定义。
-        self.begin_render_pass(framebuffer);
+        // 通道总是要开——即使无批次也要走一遍 clear，否则目标内容未定义。
+        self.begin_render_pass(framebuffer, extent);
+
+        // 模糊合成：先铺一张全屏底图（模糊结果），再叠加清晰图元。
+        //
+        // 底图必须用**独立的管线与描述符集**：它采样的是低分辨率模糊图，
+        // 与 egui 图元管线（采样字体图集/缩略图）不是同一套布局。
+        if let Some(pre) = input.prelude {
+            let pre_sets = [pre.descriptor_set];
+            unsafe {
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pre.pipeline);
+                device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pre.layout,
+                    0,
+                    &pre_sets,
+                    &[],
+                );
+                // 全屏三角形：3 顶点、无顶点缓冲。
+                device.cmd_draw(cmd, 3, 1, 0, 0);
+            }
+        }
+
         if drawable.is_empty() {
             return Ok(());
         }
@@ -1282,7 +1383,7 @@ impl<'a> FrameRenderer<'a> {
             // 或超出 framebuffer 的rect。Vulkan 对越界 scissor 是
             // **未定义行为**（`VUID-vkCmdSetScissor-...`），而这类错误
             // **不报 GPU 错误**，只是「裁剪失效 / 画面错」，极难定位。
-            let rect = sanitize_scissor(rect, self.swapchain.extent);
+            let rect = sanitize_scissor(rect, extent);
             if rect.extent.width == 0 || rect.extent.height == 0 {
                 // 完全被裁掉 ⇒ 无需绘制。
                 continue;
@@ -1571,10 +1672,12 @@ impl<'a> FrameRenderer<'a> {
         self.layouts.reset(self.swapchain.image_count);
         self.allocate_frame_resources()?;
 
-        // 槽位数可能变化，arena 的块数必须跟着变（块数须≥ 在飞帧数）。
+        // 槽位数可能变化，arena 的块数必须跟着变（块数须≥ 在飞帧数，
+        // 额外留 `EXTRA_CHUNKS` 块余量）。
         // 本函数开头已 wait_idle，因此销毁旧 staging 是安全的。
         self.staging.destroy();
-        self.staging = StagingArena::new(self.gpu, self.slots.len())?;
+        self.staging =
+            StagingArena::new(self.gpu, crate::staging::chunk_count_for(self.slots.len()))?;
 
         tracing::debug!(
             extent = ?self.swapchain.extent,
@@ -1641,8 +1744,11 @@ impl<'a> FrameRenderer<'a> {
         Ok(())
     }
 
-    /// 开启本帧的渲染通道（由 [`FrameRenderer::record`] 调用）。
-    fn begin_render_pass(&mut self, framebuffer: vk::Framebuffer) {
+    /// 开启渲染通道（由 [`FrameRenderer::record_to`] 调用）。
+    ///
+    /// `extent` 决定 `render_area`，必须与 `framebuffer` 的实际尺寸一致，
+    /// 否则 Vulkan 报 `VUID-vkCmdBeginRenderPass-renderArea-...`。
+    fn begin_render_pass(&mut self, framebuffer: vk::Framebuffer, extent: vk::Extent2D) {
         let device = &self.gpu.device;
         let Some(pending) = self.pending.as_ref() else {
             return;
@@ -1656,7 +1762,7 @@ impl<'a> FrameRenderer<'a> {
         let clear_values = [clear];
         let area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: self.swapchain.extent,
+            extent,
         };
         let begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.bundle.render_pass)

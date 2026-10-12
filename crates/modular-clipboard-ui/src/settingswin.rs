@@ -66,11 +66,13 @@ impl<'a> SettingsWindow<'a> {
         shared: &crate::multiwindow::SharedGfx<'a>,
     ) -> anyhow::Result<Self> {
         let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
-        let window = Window::new(
+        let mut window = Window::new(
             TITLE,
             (DEFAULT_SIZE.0 * s) as u32,
             (DEFAULT_SIZE.1 * s) as u32,
         )?;
+        // 与主窗口一致：告知设备纹理上限，否则超采样下字体图集会溢出。
+        window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
         // `Window::new` 收物理像素，`anchor` 是逻辑点，要乘 `s`。
         // 设置窗口左缘 = 主窗口右缘 + 12pt 缝：两窗并排紧贴。
         // 早期实现是 `anchor.x + 780 + 12`（从主窗口左缘算起），
@@ -293,17 +295,34 @@ impl<'a> SettingsWindow<'a> {
             self.gfx.fr.rebuild_swapchain(Default::default())?;
             return Ok(false);
         };
-        if let Err(e) = self.gfx.painter.paint(
-            &mut self.gfx.fr,
-            &primitives,
-            ppp,
-            &mut textures_delta,
-        ) {
+        // 覆盖层打开时走**自研 GPU 模糊**路径：设置窗口自身的内容先
+        // 卷积成模糊底图，覆盖层面板再清晰叠加。其余情况与普通绘制
+        // 完全一致——`paint_blurred` 在没有分割标记时会自动退回普通路径。
+        let use_blur = app.mcp_overlay_open();
+        let dpi_scale = self.window.scale_factor();
+        let painted = if use_blur {
+            self.gfx.painter.paint_blurred(
+                &mut self.gfx.fr,
+                &primitives,
+                ppp,
+                dpi_scale,
+                &mut textures_delta,
+            )
+        } else {
+            self.gfx.painter.paint(
+                &mut self.gfx.fr,
+                &primitives,
+                ppp,
+                dpi_scale,
+                &mut textures_delta,
+            )
+        };
+        if let Err(e) = painted {
             // CAUTION: 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
             // 每次 `acquire()` 都 bail ⇒ **该窗口永久死掉**（黑屏 +
             // 报「上一帧尚未 present」，与真实原因毫无关系）。
             self.gfx.fr.abandon_frame();
-            return Err(e.into());
+            return Err(e);
         }
         let _ = self.gfx.fr.present(acquired)?;
         // IMPORTANT: 必须 clear：`TexturesDelta` 的 `Drop` 有debug 断言

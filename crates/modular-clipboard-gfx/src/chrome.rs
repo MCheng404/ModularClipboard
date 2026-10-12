@@ -141,7 +141,7 @@ impl HitZone {
 /// - `border <= 0` ⇒ 只有 `Client` 与 `Caption`（无 resize）。
 /// - 窗口比 `2 * border` 还小（角与角重叠）⇒ `border` 被钳到
 ///   `size / 2`，保证四角判定不会互相吞掉，且中心区始终存在。
-/// 命中测试。`drag` 是自绘标题栏拖动区（逻辑点、客户区坐标系）。
+///   命中测试。`drag` 是自绘标题栏拖动区（逻辑点、客户区坐标系）。
 ///
 /// # IMPORTANT: 调用方**必须**把交互控件从 `drag` 里排除
 ///
@@ -284,11 +284,10 @@ fn set_chrome_of(hwnd: HWND, update: impl FnOnce(&mut WindowChrome)) {
 /// 窗口销毁时清掉它的条目，否则表会随窗口创建销毁无限增长。
 pub fn forget(hwnd: HWND) {
     let key = hwnd.0 as isize;
-    if let Some(lock) = CHROME.get() {
-        if let Ok(mut g) = lock.lock() {
+    if let Some(lock) = CHROME.get()
+        && let Ok(mut g) = lock.lock() {
             g.retain(|(h, _)| *h != key);
         }
-    }
 }
 
 /// 设置自绘标题栏（拖动区）的位置，单位逻辑点、客户区坐标系。
@@ -654,7 +653,7 @@ mod tests {
     #[test]
     fn lparam_high_bit_is_negative() {
         // y 的 16 位最高位置 1 => -32768
-        let lp = ((0u32) | (0x8000u32 << 16)) as isize;
+        let lp = (0x8000u32 << 16) as isize;
         assert_eq!(y_lparam(lp), -32768);
     }
 
