@@ -201,6 +201,13 @@ fn run_mode(
     // 关掉界面托盘就没了，用户再也唤不回程序。
     let want_tray = config.ui.show_tray && !remote;
 
+    // 热键规格在这里算好再传给托盘：`config` 稍后会被移进 `App`，
+    // 到那时就访问不到了，而托盘注册需要它。
+    let toggle_spec =
+        modular_clipboard_platform::hotkey::spec_or_default(&config.hotkey_toggle);
+    let paste_spec =
+        modular_clipboard_platform::hotkey::spec_or_default(&config.hotkey_paste_previous);
+
     // `Window::new` 的宽高是**物理像素**，而配置里存的是逻辑点。
     // DPI 缩放在窗口创建后才可查，因此先按 1.0 换算——创建后第一帧的
     // `Resized` 事件（或帧循环里的尺寸兜底检查）会把交换链纠正到真实尺寸。
@@ -342,8 +349,12 @@ fn run_mode(
     // 早前这里无条件 `Resident::start`，于是 `show_tray` 只被**写入**、
     // 从不被读取：用户在设置里关掉「显示托盘图标」，托盘照样在；
     // 开着也无所谓。配置项形同虚设。
+    // 迷你面板的条目快照槽位：单进程模式下由界面进程自己维护
+    // （常驻进程模式由 daemon 维护，界面不碰）。
+    let mini_items: modular_clipboard_platform::tray::MiniItems =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let resident = if want_tray {
-        match Resident::start(TRAY_TOOLTIP) {
+        match Resident::start(TRAY_TOOLTIP, toggle_spec, paste_spec) {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::error!(%e, "托盘启动失败，关闭按钮将直接退出程序");
@@ -359,6 +370,17 @@ fn run_mode(
         tracing::info!("配置已关闭托盘图标，不启动托盘");
         None
     };
+
+    // 单进程模式：托盘归本进程所有，热键与迷你面板也归本进程管。
+    // （常驻进程模式下这两件事都在 daemon 里做，界面不碰。）
+    if let Some(r) = resident.as_ref() {
+        // 启动注册失败的快捷键要让用户知道——他按 Win+V 没反应，
+        // 只会以为程序坏了。
+        let failed = r.failed_hotkeys().join("；");
+        app.svc.state.hotkey_error = (!failed.is_empty()).then_some(failed);
+        modular_clipboard_app::daemon::sync_mini_items(&app.svc, &mini_items);
+        modular_clipboard_app::daemon::apply_mini_panel(&app.svc.state.config, &mini_items);
+    }
 
     // ---- 启动期窗口开关 ------------------------------------------------
     //
@@ -411,6 +433,12 @@ fn run_mode(
     // 已应用到 Win32 的置顶状态。用来每帧比对配置，避免重复调
     // `SetWindowPos`（那会触发一次窗口样式变更）。
     let mut applied_topmost = always_on_top;
+    // 已应用的热键组合与迷你面板掩码（单进程模式）。
+    // 与 `applied_topmost` 同一模式：配置变了才重注册 / 重装钩子。
+    let mut applied_toggle = toggle_spec;
+    let mut applied_paste = paste_spec;
+    let mut applied_mini =
+        modular_clipboard_platform::tray::mini_mask(&app.svc.state.config.mini_panel);
     // 已应用到 Win32 的背景效果（磨砂/半透明）。
     // 哨兵值 `None`：首帧必然与配置比对并应用一次。
     // 透明度不再进 Win32（整窗 LWA_ALPHA 已被逐像素半透明取代），
@@ -596,6 +624,27 @@ fn run_mode(
                 //
                 // 下一行的 `f.show` 分支本来就有 `request_repaint()`，
                 // 这里补上的是「只清空、不唤起」的那条路径。
+                ctx.request_repaint();
+            }
+            // 「粘贴上一条」：不唤起界面，直接把最新一条写回剪贴板
+            // 并发 Ctrl+V 给前台窗口（单进程模式走这里，
+            // 常驻进程模式下由 `daemon` 自己处理）。
+            if f.paste_previous {
+                if let Some(id) = app.svc.state.items.first().map(|i| i.id) {
+                    if let Err(e) = app.svc.copy_and_paste(id) {
+                        tracing::warn!(%e, "粘贴上一条失败");
+                    }
+                } else {
+                    tracing::debug!("历史为空，忽略「粘贴上一条」");
+                }
+            }
+            // 迷你面板里点了某条：写回剪贴板。
+            // 不自动粘贴——用户按住修饰键点的右键，粘贴到哪由他自己决定。
+            if let Some(id) = f.mini_pick {
+                if let Err(e) = app.svc.copy_item(id) {
+                    tracing::warn!(%e, "迷你面板复制条目失败");
+                }
+                // 复制可能改变列表顺序（最近使用），请求重绘。
                 ctx.request_repaint();
             }
             if f.show {
@@ -1001,6 +1050,40 @@ fn run_mode(
             });
         }
 
+        // ---- 4.4c 全局热键与迷你面板（仅单进程模式）----
+        //
+        // 常驻进程模式下这两件事由常驻进程做（见 `app::daemon` 的
+        // `SaveConfig` 分支），界面这边不能碰——热键注册必须发生在
+        // 托盘线程的窗口上，而界面进程没有托盘。
+        if resident.is_some() {
+            let toggle = modular_clipboard_platform::hotkey::spec_or_default(
+                &app.svc.state.config.hotkey_toggle,
+            );
+            let paste = modular_clipboard_platform::hotkey::spec_or_default(
+                &app.svc.state.config.hotkey_paste_previous,
+            );
+            if toggle != applied_toggle || paste != applied_paste {
+                applied_toggle = toggle;
+                applied_paste = paste;
+                let failed =
+                    modular_clipboard_app::daemon::rebind_hotkeys(&app.svc.state.config);
+                app.svc.state.hotkey_error =
+                    (!failed.is_empty()).then(|| failed.join("；"));
+            }
+            // 迷你面板：条目快照每帧同步（面板弹出时读的就是它，
+            // 至多 10 条短文本，量级可忽略）；掩码变了才重装钩子
+            // （它在每一次右键上都会被回调，不能无脑重装）。
+            let mini =
+                modular_clipboard_platform::tray::mini_mask(&app.svc.state.config.mini_panel);
+            if mini.is_some() {
+                modular_clipboard_app::daemon::sync_mini_items(&app.svc, &mini_items);
+            }
+            if mini != applied_mini {
+                applied_mini = mini;
+                modular_clipboard_platform::tray::set_mini_panel(mini, mini_items.clone());
+            }
+        }
+
         // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口）----
         let topmost = app.svc.state.config.ui.always_on_top;
         drive_attach_windows(
@@ -1344,6 +1427,11 @@ pub struct App {
     /// egui 上下文。内部是 `Arc`，克隆代价极低。
     pub ctx: egui::Context,
     svc: Service,
+    /// 上一次已经提示过的「快捷键注册失败」内容。
+    ///
+    /// 用于去重：失败信息在修复前一直挂在状态里，没有这个字段就会
+    /// 每帧弹一次提示。
+    last_hotkey_error: Option<String>,
     /// 已解析生效的调色板。
     ///
     /// 由 [`theme::set_theme`] 在构造时产出：它同时把令牌灌进 egui
@@ -1426,6 +1514,21 @@ impl App {
     /// 用**已有的**服务实例构造界面（两种模式共用）。
     pub fn from_service(config: modular_clipboard_core::Config, mut svc: Service) -> Self {
         let ctx = egui::Context::default();
+        // 自启动的真相在**注册表**里，配置只是缓存。
+        //
+        // 用户完全可能在「任务管理器 → 启动」里把它关掉，
+        // 那时配置仍写着 true，界面就会显示一个假状态。启动时对一次账，
+        // 顺手把配置修正过来。
+        let actual = modular_clipboard_platform::autostart::is_enabled();
+        if svc.state.config.ui.autostart != actual {
+            tracing::info!(
+                config = svc.state.config.ui.autostart,
+                registry = actual,
+                "自启动状态以注册表为准，已修正配置"
+            );
+            svc.state.config.ui.autostart = actual;
+        }
+        let _ = config;
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
         // 图标字体必须排在 CJK 之后：`install_cjk_font` 用 `set_fonts`
         // 整体替换 `FontDefinitions`，先装图标会被它冲掉。
@@ -1476,6 +1579,7 @@ impl App {
         Self {
             ctx,
             svc,
+            last_hotkey_error: None,
             pal: pal.clone(),
             pal_from: pal.clone(),
             pal_to: pal,
@@ -1609,8 +1713,16 @@ impl App {
             crate::paint::draw(&mut frame);
         }
 
+        // 录制快捷键：**必须在绘制之后**读按键，因为 egui 的事件只在
+        // 这一帧的输入里，且要先让输入框/按钮消费掉它们自己的点击。
+        let ctx = self.ctx.clone();
+        self.capture_recording(&ctx);
+
         // 绘制层只识别操作、不改布局：统一在这里落到工作区与服务上。
         self.apply_ops();
+
+        // 快捷键注册失败（常驻进程侧的反馈）要浮到界面上。
+        self.surface_hotkey_error();
 
         // CAUTION: 这里**不要**写「`should_quit` 时停捕获并存配置」——
         // 那属于退出流程，而 `shutdown()` 已经做了同样的两件事。
@@ -1620,6 +1732,106 @@ impl App {
         // 早前这段因为 `should_quit` 从没被置真而从不执行，
         // 所以看不出来；接上退出按钮后它就成了真实的性能问题。
         // 退出收尾统一由帧循环退出后的 `App::shutdown()` 负责。
+    }
+
+    /// 录制模式下捕获按键，生成新的快捷键绑定。
+    ///
+    /// # 为什么要在 UI 线程里做
+    ///
+    /// 全局热键的注册在托盘/常驻进程，但**录制**必须在界面这边：
+    /// 键是从 egui 的输入事件里读的，而输入只属于窗口所在的进程。
+    /// 录完写进配置，常驻进程收到配置保存后会自己重注册
+    /// （见 `app::daemon::rebind_hotkeys`）。
+    fn capture_recording(&mut self, ctx: &egui::Context) {
+        let Some(slot) = self.paint_state.hotkey_recording else {
+            return;
+        };
+
+        // Esc 取消：录到一半想反悔是常态，没有退路会很烦。
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.paint_state.hotkey_recording = None;
+            // 与「取消」按钮同一条恢复路径：反悔之后老键必须能用。
+            self.set_hotkeys_suspended(false);
+            return;
+        }
+
+        let captured = ctx.input(|i| {
+            i.events.iter().find_map(|ev| match ev {
+                egui::Event::Key {
+                    key,
+                    modifiers,
+                    pressed: true,
+                    ..
+                } => Some((*key, *modifiers)),
+                _ => None,
+            })
+        });
+        let Some((key, mods)) = captured else {
+            return;
+        };
+        // egui 0.36 的 `Key` 枚举**不含**修饰键（只有 Modifiers 里有），
+        // 所以拿到的一定是主键；但仍要挡掉方向键这类非字符键——
+        // 它们能触发事件，却不适合当快捷键。
+        let name = key.name();
+        let mut chars = name.chars();
+        let _first = chars.next();
+        if chars.next().is_some() && !name.starts_with('F') {
+            self.svc.notify(format!("不支持把 {name} 设为快捷键"));
+            self.paint_state.hotkey_recording = None;
+            return;
+        }
+        let hotkey = modular_clipboard_core::config::Hotkey {
+            key: name.to_string(),
+            ctrl: mods.ctrl,
+            shift: mods.shift,
+            alt: mods.alt,
+            // egui 的 `command` 在 Windows 上就是 Ctrl；Win 键它不报告，
+            // 因此单独问一次系统——Win+V 这类组合必须能录出来。
+            win: modular_clipboard_platform::win_key_down(),
+        };
+        if !hotkey.ctrl && !hotkey.shift && !hotkey.alt && !hotkey.win {
+            self.svc.notify("至少按住一个修饰键（Ctrl/Shift/Alt/Win）".into());
+            return;
+        }
+        self.paint_state.hotkey_recording = None;
+        self.paint_state
+            .ops
+            .push(crate::paint::Op::SetHotkey { slot, hotkey });
+    }
+
+    /// 录制快捷键期间暂停 / 恢复全局热键。
+    ///
+    /// # 为什么要暂停
+    ///
+    /// `RegisterHotKey` 注册的组合会被 OS 从所有窗口没收：按键不再
+    /// 产生 `WM_KEYDOWN`，而是直接送给注册窗口。于是用户点「录制」后
+    /// 按下**当前正绑着的组合**（想把 Win+V 换掉时先按一下确认）时，
+    /// 设置窗口永远收不到——录制像卡死，用户反馈「录制有问题」。
+    ///
+    /// 恢复由持有托盘的一侧按当前配置重注册：常驻进程走 IPC 命令，
+    /// 单进程模式托盘就在本进程。
+    fn set_hotkeys_suspended(&mut self, suspend: bool) {
+        if let Err(e) = self.svc.suspend_hotkeys(suspend) {
+            tracing::warn!(%e, suspend, "暂停/恢复全局热键失败");
+        }
+    }
+
+    /// 把「快捷键注册失败」这条反馈浮到界面上（状态栏提示）。
+    ///
+    /// 只在**内容变化**时提示：失败值在修复前一直挂在状态里，
+    /// 每帧都弹一遍等于状态栏永远停着这条消息。
+    ///
+    /// 来源有两个：常驻进程把它放进快照（注册发生在托盘线程里，
+    /// 只有那边拿得到结果）；单进程模式由本进程直接写入。
+    /// 两者落点都是 `svc.state.hotkey_error`，这里不区分来源。
+    fn surface_hotkey_error(&mut self) {
+        if self.svc.state.hotkey_error == self.last_hotkey_error {
+            return;
+        }
+        self.last_hotkey_error = self.svc.state.hotkey_error.clone();
+        if let Some(msg) = self.svc.state.hotkey_error.clone() {
+            self.svc.notify(msg);
+        }
     }
 
     /// 把绘制层收集到的操作落到工作区与服务上。
@@ -1697,10 +1909,69 @@ impl App {
                     self.pal_to = crate::theme::set_theme(&self.ctx, mode);
                     self.after_config_change();
                 }
+                Op::StartRecording(slot) => {
+                    self.paint_state.hotkey_recording = Some(slot);
+                    // 清这一槽位的草稿：录制态不画输入框，留着旧文本
+                    // 会在录制结束后突然出现在框里，像是「没录成」。
+                    slot.draft_mut(&mut self.paint_state).clear();
+                    // 先把已注册的组合从 OS 手里收回来，否则用户按到
+                    // 「当前正绑着」的组合时按键被送走，录不到。
+                    self.set_hotkeys_suspended(true);
+                    tracing::info!(?slot, "开始录制快捷键");
+                }
+                Op::CancelRecording => {
+                    self.paint_state.hotkey_recording = None;
+                    // 取消也要恢复：用户可能录到一半反悔，反悔之后
+                    // 老快捷键必须立刻能用。
+                    self.set_hotkeys_suspended(false);
+                }
+                Op::SetHotkeyText { slot, text } => {
+                    match modular_clipboard_core::config::Hotkey::parse(&text) {
+                        Ok(hotkey) => {
+                            match slot {
+                                crate::paint::HotkeySlot::Toggle => {
+                                    self.svc.state.config.hotkey_toggle = hotkey;
+                                }
+                                crate::paint::HotkeySlot::PastePrevious => {
+                                    self.svc.state.config.hotkey_paste_previous = hotkey;
+                                }
+                            }
+                            slot.draft_mut(&mut self.paint_state).clear();
+                            self.after_config_change();
+                            self.svc.notify(format!("已设为 {text}"));
+                        }
+                        Err(e) => {
+                            // 解析失败要说清楚**为什么**：只提示「无效」
+                            // 用户就得自己猜是不是键名写错了。
+                            self.svc.notify(format!("快捷键无效：{e}"));
+                        }
+                    }
+                }
+                Op::SetAutostart(on) => {
+                    // 先做、再改配置：注册表写不进去时界面不该假装开了。
+                    match modular_clipboard_platform::autostart::set_enabled(
+                        on,
+                        modular_clipboard_platform::autostart::LAUNCH_ARGS,
+                    ) {
+                        Ok(()) => {
+                            self.svc.state.config.ui.autostart = on;
+                            self.after_config_change();
+                            self.svc.notify(if on {
+                                "已设置开机自启动（开机后从托盘唤起）".into()
+                            } else {
+                                "已取消开机自启动".into()
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(%e, "设置开机自启动失败");
+                            self.svc.notify(format!("设置失败：{e}"));
+                        }
+                    }
+                }
                 Op::SetHotkey { slot, hotkey } => {
-                    // 写入配置。NOTE: 全局热键的实际注册在托盘线程，
-                    // 当前用硬编码 `DEFAULT_HOTKEY`，配置接入注册是
-                    // 后续任务——这里只保证绑定被记住并落盘。
+                    // 写入配置并落盘。真正的注册由持有托盘的一侧执行：
+                    // 常驻进程模式随 `SaveConfig` 走 `daemon::rebind_hotkeys`，
+                    // 单进程模式由帧循环的幂等比对重注册（4.4c）。
                     match slot {
                         crate::paint::HotkeySlot::Toggle => {
                             self.svc.state.config.hotkey_toggle = hotkey;
@@ -1708,6 +1979,19 @@ impl App {
                         crate::paint::HotkeySlot::PastePrevious => {
                             self.svc.state.config.hotkey_paste_previous = hotkey;
                         }
+                    }
+                    // 草稿一并清掉：留着旧文本，下次回车会把上次手打的
+                    // 内容再应用一遍（「录成了框里却还有字」）。
+                    slot.draft_mut(&mut self.paint_state).clear();
+                    // 录制期间热键是注销状态。常驻进程模式下
+                    // `after_config_change` 的 SaveConfig 会让它重注册；
+                    // 单进程模式只会写盘，得在这儿立即恢复——
+                    // 用户录完很可能马上按键测试，不能让他吃空窗。
+                    if !self.svc.is_remote() {
+                        let failed =
+                            modular_clipboard_app::daemon::rebind_hotkeys(&self.svc.state.config);
+                        self.svc.state.hotkey_error =
+                            (!failed.is_empty()).then(|| failed.join("；"));
                     }
                     self.after_config_change();
                 }
@@ -1836,6 +2120,13 @@ impl App {
             hit_ns: crate::paint::HitNs::Settings,
         };
         crate::paint::draw_settings(&mut frame);
+
+        // 录制快捷键可能是在**设置窗口**里发起的：按键事件落在
+        // 这个窗口自己的 egui 上下文里，主窗口那边读的是另一个
+        // 上下文，看不到。两边各读一次，谁来键谁来录。
+        let ctx = ui.ctx().clone();
+        self.capture_recording(&ctx);
+
         // 设置项的改动要立刻落盘——用户在设置窗口里点了开关就
         // 关掉窗口，不该丢。
         self.apply_ops();
@@ -2000,6 +2291,12 @@ fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate::paint::Con
         (G::Ui, "hide_on_focus_lost") => cfg.ui.hide_on_focus_lost = v,
         (G::Ui, "show_tray") => cfg.ui.show_tray = v,
         (G::Ui, "start_minimized") => cfg.ui.start_minimized = v,
+    (G::Ui, "autostart") => cfg.ui.autostart = v,
+    (G::MiniPanel, "enabled") => cfg.mini_panel.enabled = v,
+    (G::MiniPanel, "ctrl") => cfg.mini_panel.ctrl = v,
+    (G::MiniPanel, "shift") => cfg.mini_panel.shift = v,
+    (G::MiniPanel, "alt") => cfg.mini_panel.alt = v,
+    (G::MiniPanel, "win") => cfg.mini_panel.win = v,
         (G::Storage, "cleanup_on_start") => cfg.storage.cleanup_on_start = v,
         (G::Mcp, "enabled") => cfg.mcp.enabled = v,
         (G::Mcp, "resize_window") => cfg.mcp.resize_window = v,
@@ -2026,6 +2323,7 @@ fn set_number_field(
         (G::Capture, "poll_interval_ms") => cfg.capture.poll_interval_ms = v.max(50.0) as u64,
         (G::Capture, "dedup_window_secs") => cfg.capture.dedup_window_secs = v.max(0.0) as i64,
         (G::Ui, "font_scale") => cfg.ui.font_scale = (v.clamp(0.75, 2.0)) as f32,
+        (G::MiniPanel, "count") => cfg.mini_panel.count = (v.clamp(1.0, 10.0)) as usize,
         (G::Storage, "max_bytes") => cfg.storage.max_bytes = v.max(1.0) as u64,
         (G::Storage, "max_payload_bytes") => cfg.storage.max_payload_bytes = v.max(1.0) as u64,
         (G::Mcp, "port") => cfg.mcp.port = v.clamp(0.0, 65535.0) as u16,
@@ -2332,6 +2630,118 @@ mod tests {
         assert!(
             !app.svc.is_capturing(),
             "关闭「记录剪贴板」后应立即停止捕获线程"
+        );
+
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 录制：按下的组合键必须变成一条 `Op::SetHotkey`，并退出录制态。
+    ///
+    /// # 为什么用独立 ctx 跑一帧
+    ///
+    /// 录制按钮在**设置窗口**里，按键事件落在设置窗口自己的
+    /// `egui::Context` 上。主窗口的上下文里什么都看不到——
+    /// 这正是用户报「录制没反应」的根因形态。这里用独立 ctx
+    /// 复刻「设置窗口收到按键」的那一帧。
+    #[test]
+    fn recording_turns_keypress_into_hotkey_op() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-hk-record-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        app.paint_state.hotkey_recording = Some(crate::paint::HotkeySlot::Toggle);
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(1.0),
+            events: vec![egui::Event::Key {
+                key: egui::Key::K,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            // 与 `draw_settings_window` 里同一姿势：绘制之后读本窗口输入。
+            app.capture_recording(ui.ctx());
+        });
+        out.textures_delta.clear();
+
+        assert_eq!(
+            app.paint_state.hotkey_recording, None,
+            "录完一次必须退出录制态，否则后续每个按键都会被当成新绑定"
+        );
+        let ops = std::mem::take(&mut app.paint_state.ops);
+        let Some(crate::paint::Op::SetHotkey { hotkey, .. }) = ops
+            .iter()
+            .find(|o| matches!(o, crate::paint::Op::SetHotkey { .. }))
+        else {
+            panic!("录制按键应产出 Op::SetHotkey，实得 {ops:?}");
+        };
+        assert_eq!(hotkey.key, "K", "主键应按名原样记录");
+        assert!(hotkey.ctrl && hotkey.shift, "按住的修饰键应捕获：{hotkey:?}");
+        assert!(!hotkey.alt && !hotkey.win, "没按的修饰键不该被带上：{hotkey:?}");
+
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 只按主键没按修饰键：拒绝并**保持**录制态（用户可能正在按过程中）。
+    ///
+    /// 若这里直接退出录制，用户「先按主键再补修饰键」的自然顺序
+    /// 会录不到东西——而反过来先修饰键后主键才是多数人的习惯，
+    /// 两条路径都得通。
+    #[test]
+    fn recording_rejects_bare_key_and_stays_in_recording() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-hk-bare-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        app.paint_state.hotkey_recording = Some(crate::paint::HotkeySlot::Toggle);
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            time: Some(1.0),
+            events: vec![egui::Event::Key {
+                key: egui::Key::K,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(input, |ui| {
+            app.capture_recording(ui.ctx());
+        });
+        out.textures_delta.clear();
+
+        assert_eq!(
+            app.paint_state.hotkey_recording,
+            Some(crate::paint::HotkeySlot::Toggle),
+            "无修饰键应拒绝但保持录制态"
+        );
+        assert!(
+            app.paint_state.ops.is_empty(),
+            "拒绝时不应产出任何 Op，实得 {:?}",
+            app.paint_state.ops
         );
 
         app.shutdown();

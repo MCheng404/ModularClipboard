@@ -12,7 +12,7 @@
 //!    这是「图标确实存在于通知区」的可机器验证证据；
 //! 3. 程序化生成的 `HICON` 是否有效（`CreateDIBSection` →
 //!    `CreateIconIndirect` 全链路）；
-//! 4. `RegisterHotKey(Ctrl+Shift+V)` 是否成功；
+//! 4. `RegisterHotKey` 两个槽位（Win+V / Alt+Shift+V）是否成功；
 //! 5. **注入的回调消息能否走通「PostMessageW → 窗口过程 → channel
 //!    → 主线程 `poll`」全链路**。
 //!
@@ -63,11 +63,26 @@ fn main() {
     // -------------------------------------------------------------------
     // 1. 启动托盘
     // -------------------------------------------------------------------
-    let tray = match tray::start("模块化剪切板 - 托盘探针") {
+    // 两个槽位用**不同的**组合：注册相同组合时第二个必然失败——
+    // 这正是旧 `tray::start` 的毛病，探针刻意用正确姿势调用。
+    let toggle = modular_clipboard_platform::hotkey::DEFAULT_HOTKEY;
+    let paste = modular_clipboard_platform::hotkey::HotkeySpec::new(
+        modular_clipboard_platform::hotkey::MOD_ALT
+            | modular_clipboard_platform::hotkey::MOD_SHIFT
+            | modular_clipboard_platform::hotkey::MOD_NOREPEAT,
+        0x56,
+    );
+    let tray = match tray::start_with_hotkeys("模块化剪切板 - 托盘探针", toggle, paste) {
         Ok(t) => t,
         Err(e) => panic!("启动托盘失败: {e:#}"),
     };
     println!("[1] 托盘线程已启动，图标已提交 NIM_ADD");
+    if tray.failed_hotkeys().is_empty() {
+        println!("    两个快捷键（Win+V / Alt+Shift+V）均已注册");
+    } else {
+        // 被占用是常态（Win+V 常被系统剪贴板历史占着），不算探针失败。
+        println!("    WARN 部分快捷键注册失败（不算失败）：{:?}", tray.failed_hotkeys());
+    }
 
     // 托盘窗口必须真实存在。message-only 窗口 IsWindow 为真但不可见。
     let hwnd = HWND(tray.hwnd_raw() as *mut core::ffi::c_void);
@@ -200,8 +215,105 @@ fn main() {
     // -------------------------------------------------------------------
     use modular_clipboard_platform::hotkey::{DEFAULT_HOTKEY, describe};
     let desc = describe(DEFAULT_HOTKEY);
-    assert_eq!(desc, "Ctrl+Shift+V", "默认快捷键描述不正确");
+    assert_eq!(desc, "Win+V", "默认快捷键描述不正确（默认已改为 Win+V）");
     println!("[6] 默认全局快捷键：{desc}");
+
+    // 运行时重注册（设置界面改绑定的底层路径，SendMessage 同步）。
+    // 先换成另一组合、再换回默认；两步都必须成功，返回 false 就意味着
+    // 界面上会出现「注册失败」的提示。
+    use modular_clipboard_platform::hotkey::{HotkeySpec, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, Slot};
+    let alt_spec = HotkeySpec::new(MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x42); // Ctrl+Alt+B
+    assert!(
+        tray::set_hotkey(Slot::Toggle, alt_spec),
+        "运行时重注册（换成 Ctrl+Alt+B）应成功"
+    );
+    assert!(
+        tray::set_hotkey(Slot::Toggle, DEFAULT_HOTKEY),
+        "运行时重注册（换回 Win+V）应成功"
+    );
+    println!("[6] 运行时重注册 Ctrl+Alt+B → Win+V 成功（改绑定路径可用）");
+
+    // 录制暂停路径：suspend 之后，Win+V 必须能被**别的窗口**注册
+    // （否则用户在设置里录当前绑定时，按键被 OS 送走、录不到）。
+    // 用本进程另建一个 message-only 窗口当「别人」——组合冲突是
+    // 系统级的，同进程不同 hwnd 也算。
+    {
+        use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_MESSAGE, RegisterClassExW,
+            WNDCLASSEXW, WINDOW_EX_STYLE, WINDOW_STYLE,
+        };
+
+        unsafe extern "system" fn probe_wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        assert!(tray::suspend_hotkeys(), "录制暂停（注销热键）应成功");
+        // 注销后托盘自己再注册 Win+V 应当成功——这是「注销真的生效」的
+        // 直接证据（没注销的话这里会报「热键已注册」）。
+        assert!(
+            tray::set_hotkey(Slot::Toggle, DEFAULT_HOTKEY),
+            "注销后应能重新注册（证明 suspend 真的把组合交还了系统）"
+        );
+
+        // 再走一遍完整的「注销 → 别人抢占 → 收回 → 恢复」闭环。
+        let hinstance = unsafe { GetModuleHandleW(None).unwrap() };
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(probe_wndproc),
+            hInstance: hinstance.into(),
+            lpszClassName: windows::core::w!("McTrayProbeRival"),
+            ..Default::default()
+        };
+        let _ = unsafe { RegisterClassExW(&wc) };
+        let rival = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("McTrayProbeRival"),
+                windows::core::PCWSTR::null(),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+        }
+        .expect("创建竞争窗口");
+        let _ = tray::suspend_hotkeys();
+        let stolen = unsafe {
+            RegisterHotKey(
+                Some(rival),
+                0x7101,
+                HOT_KEY_MODIFIERS(DEFAULT_HOTKEY.modifiers),
+                DEFAULT_HOTKEY.vk,
+            )
+        };
+        assert!(
+            stolen.is_ok(),
+            "注销后别的窗口应能抢占 Win+V（否则录制录不到当前绑定）"
+        );
+        let _ = unsafe { UnregisterHotKey(Some(rival), 0x7101) };
+        let _ = unsafe { DestroyWindow(rival) };
+        // 恢复：托盘按默认组合重新注册。
+        assert!(
+            tray::set_hotkey(Slot::Toggle, DEFAULT_HOTKEY),
+            "恢复注册应成功"
+        );
+        println!("[6] 录制暂停闭环：注销 → 可被抢占 → 收回 → 恢复，全部成立");
+    }
 
     let buf = tray::icon_rgba().expect("内置托盘图标应能解码");
     assert_eq!(buf.len(), tray::ICON_SIZE * tray::ICON_SIZE * 4);

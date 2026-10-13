@@ -2,7 +2,7 @@
 //!
 //! # 与主窗口消息循环的关系
 //!
-//! [`tray::start`] 自带**独立线程 + message-only 窗口**，
+//! [`tray::start_with_hotkeys`] 自带**独立线程 + message-only 窗口**，
 //! 事件经 channel 回传主线程（见 `tray` 模块的架构决策）。
 //! 本模块只在帧循环里做一次 `try_recv` 排空，**不新建消息循环**，
 //! 也不改动 `gfx::window` 的消息处理。
@@ -55,6 +55,10 @@ const TRAY_SHUTDOWN_GRACE: Duration = Duration::from_millis(50);
 pub enum Action {
     /// 唤起主窗口（托盘左键、菜单「显示主窗口」、全局快捷键）。
     Show,
+    /// 把上一个条目直接粘贴到前台窗口（不唤起界面）。
+    PastePrevious,
+    /// 迷你面板里选中了某个条目（携带 id），直接复制它。
+    MiniPick(i64),
     /// 清空全部历史。
     ClearHistory,
     /// 退出进程。
@@ -70,6 +74,10 @@ pub enum Action {
 pub const fn action_of(ev: TrayEvent) -> Action {
     match ev {
         TrayEvent::Show | TrayEvent::Hotkey => Action::Show,
+        // 「粘贴上一条」不经过界面：直接写剪贴板 + 发 Ctrl+V 给前台窗口。
+        // 唤起界面再让用户选一条，就失去这个快捷键的意义了。
+        TrayEvent::HotkeyPaste => Action::PastePrevious,
+        TrayEvent::MiniPick(id) => Action::MiniPick(id),
         TrayEvent::ClearHistory => Action::ClearHistory,
         TrayEvent::Quit => Action::Quit,
     }
@@ -113,6 +121,10 @@ pub const fn decide_on_close(tray_available: bool, wm_quit: bool) -> CloseDecisi
 pub struct Frame {
     /// 需要唤起主窗口（只需一次）。
     pub show: bool,
+    /// 需要把上一个条目粘贴到前台窗口。
+    pub paste_previous: bool,
+    /// 迷你面板选中的条目 id。
+    pub mini_pick: Option<i64>,
     /// 需要清空历史。
     pub clear_history: bool,
     /// 需要退出进程。
@@ -129,6 +141,8 @@ impl Frame {
     pub fn absorb(&mut self, ev: TrayEvent) {
         match action_of(ev) {
             Action::Show => self.show = true,
+            Action::PastePrevious => self.paste_previous = true,
+            Action::MiniPick(id) => self.mini_pick = Some(id),
             Action::ClearHistory => self.clear_history = true,
             Action::Quit => self.quit = true,
         }
@@ -136,7 +150,11 @@ impl Frame {
 
     /// 本帧是否没有任何待办事项。
     pub fn is_empty(&self) -> bool {
-        !self.show && !self.clear_history && !self.quit
+        !self.show
+            && !self.paste_previous
+            && self.mini_pick.is_none()
+            && !self.clear_history
+            && !self.quit
     }
 }
 
@@ -162,18 +180,35 @@ pub struct Resident {
 }
 
 impl Resident {
-    /// 添加托盘图标并注册全局快捷键。
+    /// 添加托盘图标并按给定组合注册全局快捷键。
     ///
     /// 阻塞至图标真正出现在通知区后才返回。
-    pub fn start(tooltip: &str) -> anyhow::Result<Self> {
-        let tray = tray::start(tooltip)?;
+    ///
+    /// 组合**必须由调用方传入**（而不是在这里读配置）：单进程模式的
+    /// 托盘注册发生在启动早期，此时配置刚反序列化完，调用方本来就
+    /// 持有它；在这里再读一次要么重复 IO，要么读到旧值。
+    pub fn start(
+        tooltip: &str,
+        toggle: hotkey::HotkeySpec,
+        paste_previous: hotkey::HotkeySpec,
+    ) -> anyhow::Result<Self> {
+        let tray = tray::start_with_hotkeys(tooltip, toggle, paste_previous)?;
         tracing::info!(
-            hotkey = %hotkey::describe(hotkey::DEFAULT_HOTKEY),
+            toggle = %hotkey::describe(toggle),
+            paste = %hotkey::describe(paste_previous),
             "托盘已就绪"
         );
         Ok(Self {
             tray: Some(tray),
         })
+    }
+
+    /// 启动时注册失败的快捷键描述（空 = 全部成功）。
+    pub fn failed_hotkeys(&self) -> &[String] {
+        self.tray
+            .as_ref()
+            .map(|t| t.failed_hotkeys())
+            .unwrap_or_default()
     }
 
     /// 取出这段时间内积压的全部事件，并归约成一份意图。
@@ -572,7 +607,8 @@ mod tests {
     #[test]
     fn hotkey_description_is_stable() {
         // 设置界面会展示这个字符串，改动它等于改了用户可见文案。
-        assert_eq!(hotkey::describe(hotkey::DEFAULT_HOTKEY), "Ctrl+Shift+V");
+        // 默认已从 Ctrl+Shift+V 改为 Win+V（对齐系统剪贴板历史）。
+        assert_eq!(hotkey::describe(hotkey::DEFAULT_HOTKEY), "Win+V");
     }
 
     #[test]

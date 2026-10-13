@@ -5,11 +5,31 @@
 use anyhow::Result;
 use std::time::Duration;
 
+pub mod autostart;
 pub mod hotkey;
 pub mod tray;
 
 /// 复用捕获层的窗口探测能力，避免重复实现 Win32 调用。
 use modular_clipboard_capture::{foreground_class_name, source_process_name};
+
+/// Win 键当前是否按下。
+///
+/// egui 的  不报告 Win 键（ 在 Windows 上指的是 Ctrl），
+/// 而  这类组合恰恰是剪贴板工具最常用的。录制快捷键时单独
+/// 问一次系统，才能把 Win 组合录出来。
+#[cfg(windows)]
+pub fn win_key_down() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LWIN, VK_RWIN};
+    // 最高位为 1 表示当前按下。
+    let l = unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) };
+    let r = unsafe { GetAsyncKeyState(VK_RWIN.0 as i32) };
+    (l as u16 & 0x8000) != 0 || (r as u16 & 0x8000) != 0
+}
+
+#[cfg(not(windows))]
+pub fn win_key_down() -> bool {
+    false
+}
 
 /// 自动粘贴到前台窗口。
 ///

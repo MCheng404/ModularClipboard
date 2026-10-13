@@ -118,6 +118,24 @@ pub enum Op {
         /// 新绑定。
         hotkey: modular_clipboard_core::config::Hotkey,
     },
+    /// 进入「录制快捷键」状态：下一步按下的组合会被记为该槽位的绑定。
+    ///
+    /// 录制在 `App::draw_frame` 里消费（那里才拿得到 egui 的按键事件）。
+    StartRecording(HotkeySlot),
+    /// 取消录制（用户点了「取消」，或按了 Esc）。
+    CancelRecording,
+    /// 把输入框里的文本解析成绑定（`Ctrl+Shift+V` 形式）。
+    ///
+    /// 解析失败不 panic、也不静默丢弃：由 `App` 侧把错误显示成一条提示。
+    SetHotkeyText {
+        slot: HotkeySlot,
+        text: String,
+    },
+    /// 切换开机自启动。
+    ///
+    /// 与 [`Op::SetBool`] 分开：它不只是改配置，还要**真的去写注册表**，
+    /// 而且失败要告诉用户（权限/路径问题都可能导致写不进去）。
+    SetAutostart(bool),
     /// 改一个文本配置字段（MCP 服务地址 / 密钥）。
     SetText {
         group: ConfigGroup,
@@ -159,6 +177,8 @@ pub enum ConfigGroup {
     Storage,
     /// MCP 服务（通信分类卡片）。
     Mcp,
+    /// 迷你快捷复制面板（修饰键 + 右键唤出）。
+    MiniPanel,
 }
 
 impl ConfigGroup {
@@ -169,6 +189,7 @@ impl ConfigGroup {
             ConfigGroup::Capture => "捕获",
             ConfigGroup::Storage => "存储",
             ConfigGroup::Mcp => "通信",
+            ConfigGroup::MiniPanel => "迷你面板",
         }
     }
 }
@@ -188,6 +209,18 @@ impl HotkeySlot {
         match self {
             HotkeySlot::Toggle => "hotkey_toggle",
             HotkeySlot::PastePrevious => "hotkey_paste_previous",
+        }
+    }
+
+    /// 取该槽位输入框的草稿（可变引用）。
+    ///
+    /// 两个槽位各一个草稿：共用一个 `String` 时，用户在两行之间
+    /// 切换输入会得到「文本接在后面」的拼接结果，解析报
+    /// 「多个主键」——表现为「手动输入有问题」。
+    pub fn draft_mut(self, state: &mut UiState) -> &mut String {
+        match self {
+            HotkeySlot::Toggle => &mut state.hotkey_draft_toggle,
+            HotkeySlot::PastePrevious => &mut state.hotkey_draft_paste,
         }
     }
 
@@ -340,6 +373,19 @@ pub struct UiState {
     ///
     /// 多个矩形的并集是拖动区；控件区从中间挖空。
     pub drag_regions: Vec<Rect>,
+    /// 正在录制快捷键的槽位。`None` 表示没在录制。
+    ///
+    /// 录制状态属于界面本地瞬时状态：它不进配置、也不需要跨进程同步
+    /// （界面进程独占键盘焦点）。
+    pub hotkey_recording: Option<HotkeySlot>,
+    /// 快捷键输入框草稿，**按槽位分开存**（经 [`HotkeySlot::draft_mut`] 访问）。
+    ///
+    /// 不能共用一个 `String`：用户在 Toggle 行打了字没回车，转到
+    /// PastePrevious 行继续输入时，文本会**接在前一个草稿后面**
+    /// （egui 的 TextEdit 焦点切换不会清内容），解析出来是
+    /// 「多个主键」——用户看到的是「手动输入有问题」。
+    pub hotkey_draft_toggle: String,
+    pub hotkey_draft_paste: String,
     /// 当前悬停的卡片。
     pub hover_card: Option<crate::card::CardId>,
     /// 列表滚动偏移（逻辑点），**按列表分开存**。
@@ -1832,6 +1878,16 @@ const NUMBER_POLL_MS: NumberSpec = NumberSpec {
     display: identity_num,
     store: identity_num,
 };
+/// 迷你面板显示条数：1 ~ 10，步进 1。
+const NUMBER_MINI_COUNT: NumberSpec = NumberSpec {
+    min: 1.0,
+    max: 10.0,
+    step: 1.0,
+    unit: "条",
+    display: |v| v,
+    store: |v| v,
+};
+
 const NUMBER_MAX_PAYLOAD_MB: NumberSpec = NumberSpec {
     min: 1.0,
     max: 4096.0,
@@ -1861,6 +1917,8 @@ enum ItemKind {
     Opacity,
     /// 快捷键绑定（只读展示）。
     Hotkey(HotkeySlot),
+    /// 开机自启动开关（要写注册表，故单独一个变体）。
+    Autostart,
     /// MCP 总开关行：右侧先画开关（最右），再画 ⓘ 详细按钮（开关左边），
     /// 点 ⓘ 打开 MCP 调用设置覆盖层。
     McpToggle,
@@ -1983,6 +2041,7 @@ impl SettingsItem {
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::Hotkey(slot) => slot.current(cfg) != slot.default(),
+            ItemKind::Autostart => cfg.ui.autostart != d.ui.autostart,
             ItemKind::McpToggle => {
                 get_bool(cfg, ConfigGroup::Mcp, "enabled") != get_bool(&d, ConfigGroup::Mcp, "enabled")
             }
@@ -2019,6 +2078,7 @@ impl SettingsItem {
             ItemKind::Theme => Some(Op::SetThemeMode(crate::theme::ThemeMode::FollowSystem)),
             ItemKind::Backdrop => Some(Op::SetBackdrop(WindowBackdrop::None)),
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
+            ItemKind::Autostart => Some(Op::SetAutostart(d.ui.autostart)),
             ItemKind::Hotkey(slot) => Some(Op::SetHotkey {
                 slot: *slot,
                 hotkey: slot.default(),
@@ -2080,6 +2140,11 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: "置顶模式",
                 desc: "共用单栏与历史同列，独立分栏可拖出",
                 kind: ItemKind::PinnedMode,
+            },
+            SettingsItem {
+                label: "开机自启动",
+                desc: "开机后只启动后台记录，界面从托盘唤起",
+                kind: ItemKind::Autostart,
             },
         ],
     },
@@ -2173,6 +2238,42 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
         ],
     },
     SettingsCard {
+        cat: SettingsCat::Shortcuts,
+        title: "迷你快捷复制面板",
+        items: &[
+            SettingsItem {
+                label: "启用",
+                desc: "按住修饰键点鼠标右键，在光标处弹出最近几条",
+                kind: ItemKind::Bool(ConfigGroup::MiniPanel, "enabled"),
+            },
+            SettingsItem {
+                label: "显示条数",
+                desc: "1 ~ 10 条",
+                kind: ItemKind::Number(ConfigGroup::MiniPanel, "count", &NUMBER_MINI_COUNT),
+            },
+            SettingsItem {
+                label: "Ctrl + 右键",
+                desc: "与下面几项可叠加，至少留一个",
+                kind: ItemKind::Bool(ConfigGroup::MiniPanel, "ctrl"),
+            },
+            SettingsItem {
+                label: "Shift + 右键",
+                desc: "",
+                kind: ItemKind::Bool(ConfigGroup::MiniPanel, "shift"),
+            },
+            SettingsItem {
+                label: "Alt + 右键",
+                desc: "",
+                kind: ItemKind::Bool(ConfigGroup::MiniPanel, "alt"),
+            },
+            SettingsItem {
+                label: "Win + 右键",
+                desc: "",
+                kind: ItemKind::Bool(ConfigGroup::MiniPanel, "win"),
+            },
+        ],
+    },
+    SettingsCard {
         cat: SettingsCat::Comm,
         title: "MCP 服务",
         items: &[
@@ -2247,6 +2348,12 @@ fn get_bool(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, field:
         (G::Ui, "hide_on_focus_lost") => cfg.ui.hide_on_focus_lost,
         (G::Ui, "show_tray") => cfg.ui.show_tray,
         (G::Ui, "start_minimized") => cfg.ui.start_minimized,
+        (G::Ui, "autostart") => cfg.ui.autostart,
+        (G::MiniPanel, "enabled") => cfg.mini_panel.enabled,
+        (G::MiniPanel, "ctrl") => cfg.mini_panel.ctrl,
+        (G::MiniPanel, "shift") => cfg.mini_panel.shift,
+        (G::MiniPanel, "alt") => cfg.mini_panel.alt,
+        (G::MiniPanel, "win") => cfg.mini_panel.win,
         (G::Storage, "cleanup_on_start") => cfg.storage.cleanup_on_start,
         (G::Mcp, "enabled") => cfg.mcp.enabled,
         (G::Mcp, f) if MCP_CAPS.iter().any(|c| c.field == f) => get_mcp_cap(cfg, f),
@@ -2260,6 +2367,7 @@ fn get_number(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, fiel
     match (g, field) {
         (G::Capture, "poll_interval_ms") => cfg.capture.poll_interval_ms as f64,
         (G::Ui, "font_scale") => cfg.ui.font_scale as f64,
+        (G::MiniPanel, "count") => cfg.mini_panel.count as f64,
         (G::Storage, "max_payload_bytes") => cfg.storage.max_payload_bytes as f64,
         (G::Mcp, "port") => cfg.mcp.port as f64,
         _ => 0.0,
@@ -2530,18 +2638,72 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             }
         }
         ItemKind::Hotkey(slot) => {
-            // NOTE: 托盘线程当前注册的是硬编码 `DEFAULT_HOTKEY`，配置里的
-            // 绑定尚未接入注册。这里只读展示当前配置值；「录制」与
-            // 热键重注册是后续任务。
+            //
+            // 两条输入路径都要有：
+            // - **文本输入**：能精确表达 Win+V 这类组合，也能复制粘贴；
+            // - **录制**：用户不用记键名，按一下就好。
+            // 只做其中一个都会有人卡住（记不住键名 / 不知道 Win 怎么写）。
             let cur = slot.current(&f.svc.state.config);
-            setting_row(ui, it.label, it.desc, |ui| {
-                ui.label(
-                    egui::RichText::new(cur.display())
-                        .monospace()
-                        .color(pal.text_dim),
-                );
-                false
+            let recording = f.state.hotkey_recording == Some(*slot);
+            let mut changed = false;
+            let _ = setting_row(ui, it.label, it.desc, |ui| {
+                if recording {
+                    ui.label(
+                        egui::RichText::new("请按下组合键…")
+                            .color(pal.accent)
+                            .size(12.0),
+                    );
+                    if ui.small_button("取消").clicked() {
+                        f.state.push(Op::CancelRecording);
+                    }
+                    false
+                } else {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(slot.draft_mut(f.state))
+                            .desired_width(112.0)
+                            .hint_text(cur.display())
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    // 回车即应用：设置项里再放一个「确定」按钮太重了。
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        // 先取文本再 push：两个字段同属 `f.state`，
+                        // 一起借会撞借用检查。
+                        let text = slot.draft_mut(f.state).trim().to_string();
+                        f.state.push(Op::SetHotkeyText { slot: *slot, text });
+                        changed = true;
+                    }
+                    if ui.small_button("录制").clicked() {
+                        f.state.push(Op::StartRecording(*slot));
+                    }
+                    changed
+                }
             });
+            // 注册失败要在**配置它的地方**可见：状态栏提示只闪 3 秒，
+            // 用户回到设置页时早就没了。失败信息里含该行当前的组合文本
+            // （格式由 `hotkey::failed_message` 固定），据此匹配行列。
+            if !recording
+                && let Some(err) = f.svc.state.hotkey_error.as_ref()
+                && err.contains(cur.display().as_str())
+            {
+                ui.horizontal(|ui| {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {err}"))
+                            .color(pal.danger)
+                            .size(11.0),
+                    );
+                });
+            }
+            let _ = changed;
+        }
+        ItemKind::Autostart => {
+            let mut v = f.svc.state.config.ui.autostart;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                draw_switch(f, ui, "autostart", &mut v)
+            });
+            if changed {
+                f.state.push(Op::SetAutostart(v));
+            }
         }
         ItemKind::McpToggle => {
             let mut v = get_bool(&f.svc.state.config, ConfigGroup::Mcp, "enabled");

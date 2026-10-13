@@ -40,6 +40,11 @@ pub struct AppState {
     pub stats: DropStats,
     /// 监听是否处于运行状态。
     pub capturing: bool,
+    /// 最近一次全局快捷键注册失败的信息（`None` = 正常）。
+    ///
+    /// 单进程模式下由界面进程自己写入；常驻进程模式下随快照下发。
+    /// 界面只在它**变化**时提示，见 `App::surface_hotkey_error`。
+    pub hotkey_error: Option<String>,
 }
 
 impl AppState {
@@ -173,6 +178,7 @@ fn apply_snapshot(snap: modular_clipboard_ipc::Snapshot, state: &mut AppState) {
     state.groups = snap.groups;
     state.stats = snap.stats;
     state.capturing = snap.capturing;
+    state.hotkey_error = snap.hotkey_error;
     state.list_version = snap.list_version;
 }
 
@@ -244,6 +250,7 @@ impl Service {
                 notice: None,
                 stats: DropStats::default(),
                 capturing: false,
+                hotkey_error: None,
             },
             backend: Backend::Local(LocalBackend {
                 store,
@@ -280,6 +287,7 @@ impl Service {
                 notice: None,
                 stats: DropStats::default(),
                 capturing: false,
+                hotkey_error: None,
             },
             backend: Backend::Remote(RemoteBackend {
                 client,
@@ -369,6 +377,24 @@ impl Service {
             Backend::Local(l) => l.capture.is_some(),
             // 远端：界面进程看不到捕获线程，只能读同步下来的状态。
             Backend::Remote(_) => self.state.capturing,
+        }
+    }
+
+    /// 录制快捷键期间暂停 / 恢复全局热键。
+    ///
+    /// 恢复由持有托盘的一侧按当前配置重新注册。
+    pub fn suspend_hotkeys(&mut self, suspend: bool) -> anyhow::Result<()> {
+        match &mut self.backend {
+            Backend::Local(_) => {
+                if suspend {
+                    modular_clipboard_platform::tray::suspend_hotkeys();
+                } else {
+                    // 单进程：托盘就在本进程，按当前配置直接重注册。
+                    daemon::rebind_hotkeys(&self.state.config);
+                }
+                Ok(())
+            }
+            Backend::Remote(r) => r.unit(modular_clipboard_ipc::Command::SuspendHotkeys(suspend)),
         }
     }
 
@@ -601,7 +627,8 @@ impl Service {
             Backend::Local(l) => l.save_config(&mut self.state, self.capture_override),
             // 远端：配置由界面侧编辑、交常驻进程落盘——它才是
             // config.json 与数据库的持有者（避免「读 A 写 B」）。
-            Backend::Remote(r) => r.save_config(&self.state),
+            // 应用响应里的快照：热键注册失败信息就在里面。
+            Backend::Remote(r) => r.save_config(&mut self.state),
         }
     }
 
@@ -1126,8 +1153,22 @@ impl RemoteBackend {
         self.unit(Command::WriteClipboardText(text.to_string()))
     }
 
-    fn save_config(&mut self, state: &AppState) -> anyhow::Result<()> {
-        self.unit(Command::SaveConfig(state.config.clone()))
+    fn save_config(&mut self, state: &mut AppState) -> anyhow::Result<()> {
+        // 用 `command` + `apply` 而不是 `unit`：常驻进程的响应里带着
+        // **刚更新的快照**（含快捷键注册失败信息），就地应用才能让界面
+        // 立刻显示「已被占用」；丢掉响应就只能等下一次列表变化顺带
+        // 带过来。错误照旧上抛（保存失败要提示用户）。
+        let cmd = Command::SaveConfig(state.config.clone());
+        match self.client.command(cmd) {
+            Ok(resp) => {
+                self.apply(state, resp);
+                Ok(())
+            }
+            Err(e) => {
+                self.dead = true;
+                Err(e)
+            }
+        }
     }
 }
 

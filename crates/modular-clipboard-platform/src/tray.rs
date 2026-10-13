@@ -24,6 +24,7 @@
 //! 见 [`icon_rgba`]。不引入 `tray-icon` 等携带渲染后端的 crate。
 
 use anyhow::{Context, Result};
+use crate::hotkey;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -40,8 +41,18 @@ pub enum TrayEvent {
     ClearHistory,
     /// 菜单「退出」。
     Quit,
-    /// 全局快捷键被按下。
+    /// 「显示主窗口」快捷键被按下。
     Hotkey,
+    /// 迷你面板里选中了某个条目（携带条目 id）。
+    ///
+    /// 面板本身在托盘线程里弹出（系统菜单），但**复制动作必须由
+    /// 持有数据的那一侧执行**——托盘线程没有数据库。
+    MiniPick(i64),
+    /// 「粘贴上一条」快捷键被按下。
+    ///
+    /// 与 [`Self::Hotkey`] 分开：两个槽位可以绑到不同组合，
+    /// 语义也不一样（一个是唤界面、一个是直接把上一条粘到前台窗口）。
+    HotkeyPaste,
 }
 
 /// 图标边长（像素）。托盘小图标标准尺寸为 16，取 32 让高分屏缩放后仍清晰。
@@ -262,6 +273,8 @@ pub struct Tray {
     /// 托盘的 message-only 窗口句柄。仅供探针注入消息与诊断使用。
     #[cfg_attr(not(windows), allow(dead_code))]
     hwnd: isize,
+    /// 启动时注册失败的快捷键（已含槽位名与组合文本）。
+    failed_hotkeys: Vec<String>,
 }
 
 impl Tray {
@@ -290,6 +303,14 @@ impl Tray {
     pub fn hwnd_raw(&self) -> isize {
         self.hwnd
     }
+
+    /// 启动时注册失败的快捷键描述（空 = 全部注册成功）。
+    ///
+    /// 调用方（常驻进程）把它转成给用户看的信息——
+    /// 失败发生在托盘线程里，只有这里能把结果递出去。
+    pub fn failed_hotkeys(&self) -> &[String] {
+        &self.failed_hotkeys
+    }
 }
 
 impl Drop for Tray {
@@ -306,17 +327,131 @@ impl Drop for Tray {
 // 启动入口
 // ---------------------------------------------------------------------------
 
-/// 启动托盘线程并添加图标。
+/// 迷你面板触发所需的修饰键位（与 Win32 `MOD_*` 同值）。
 ///
-/// 阻塞至图标真正出现在通知区后才返回，失败则返回 `Err`
-/// （不会留下半初始化的后台线程）。
-pub fn start(tooltip: &str) -> Result<Tray> {
-    imp::start(tooltip)
+/// 公开在模块外：掩码由调用方（常驻进程按配置）组装后传进来，
+/// 托盘这边只负责比对。
+pub const MINI_MOD_CTRL: u32 = 0x0002;
+pub const MINI_MOD_SHIFT: u32 = 0x0004;
+pub const MINI_MOD_ALT: u32 = 0x0001;
+pub const MINI_MOD_WIN: u32 = 0x0008;
+
+/// 从配置计算迷你面板的修饰键掩码。
+///
+/// `None` = 不启用。两种情形都算不启用：开关没开；开关开了但一个
+/// 修饰键都没勾——后者会让**每次右键**都弹面板，用户的右键等于被
+/// 抢走，比没有这个功能更糟。
+///
+/// 判定集中在这里：常驻进程与单进程模式的界面都要做同一个判断，
+/// 两边各写一份迟早会漂移。
+pub fn mini_mask(cfg: &modular_clipboard_core::config::MiniPanelConfig) -> Option<u32> {
+    if !cfg.enabled {
+        return None;
+    }
+    let mut mask = 0u32;
+    if cfg.ctrl {
+        mask |= MINI_MOD_CTRL;
+    }
+    if cfg.shift {
+        mask |= MINI_MOD_SHIFT;
+    }
+    if cfg.alt {
+        mask |= MINI_MOD_ALT;
+    }
+    if cfg.win {
+        mask |= MINI_MOD_WIN;
+    }
+    if mask == 0 {
+        tracing::warn!("迷你面板已启用但没勾任何修饰键，视为停用");
+        return None;
+    }
+    Some(mask)
+}
+
+/// 迷你面板的条目快照：`(条目 id, 预览文本)`。
+///
+/// 由持有数据的那一侧（常驻进程）更新，托盘线程只读它弹菜单。
+/// 用 `Arc<Mutex<..>>` 而不是每次弹菜单时临时传：钩子是异步触发的，
+/// 触发的那一刻没有机会去问「现在有哪些条目」。
+pub type MiniItems = std::sync::Arc<std::sync::Mutex<Vec<(i64, String)>>>;
+
+/// 启用 / 停用迷你面板。
+///
+/// `modifiers` 是触发所需的修饰键位掩码，取值见 [`MINI_MOD_CTRL`] 等。
+/// `None` 表示停用（卸载钩子）。
+pub fn set_mini_panel(modifiers: Option<u32>, items: MiniItems) -> bool {
+    imp::set_mini_panel(modifiers, items)
 }
 
 #[cfg(not(windows))]
-pub fn start(_tooltip: &str) -> Result<Tray> {
+pub fn set_mini_panel(_modifiers: Option<u32>, _items: MiniItems) -> bool {
+    false
+}
+
+/// 运行时改绑定（**同步**，返回注册是否成功）。
+///
+/// `false` 有两种可能：组合已被其它程序占用，或托盘窗口已经不在了
+/// （正在退出）。调用方应把它变成用户可见的提示——静默失败等于
+/// 「改了键位但按键没反应」的老 bug。
+pub fn set_hotkey(slot: hotkey::Slot, spec: hotkey::HotkeySpec) -> bool {
+    imp::set_hotkey(slot, spec)
+}
+
+/// 录制快捷键期间临时注销全部全局热键。
+///
+/// # 为什么需要它
+///
+/// `RegisterHotKey` 注册的组合会被 OS **从所有窗口没收**：按键不再
+/// 产生 `WM_KEYDOWN`，而是直接送给注册窗口。于是用户在设置里点
+/// 「录制」后按下**当前正绑着的组合**（比如想把 Win+V 换掉，先按
+/// 一下 Win+V 确认）时，设置窗口永远收不到这个按键——录制像卡死，
+/// 用户反馈就是「录制有问题」。
+///
+/// 恢复**不在本函数里做**：托盘线程不持有配置，「原来绑的什么」
+/// 只有调用方知道。恢复 = 按当前配置逐槽位调 [`set_hotkey`]。
+///
+/// 用 `SendMessageW` 而不是 `PostMessageW`：必须与随后的恢复注册
+/// **严格有序**——sent message 优先级高于队列里的 posted message，
+/// 用 PostMessage 会出现「恢复先跑、紧接着被注销覆盖、热键全丢」。
+pub fn suspend_hotkeys() -> bool {
+    imp::suspend_hotkeys()
+}
+
+#[cfg(not(windows))]
+pub fn suspend_hotkeys() -> bool {
+    false
+}
+
+/// 启动托盘线程并添加图标，同时注册两个热键槽位。
+///
+/// 阻塞至图标真正出现在通知区后才返回，失败则返回 `Err`
+/// （不会留下半初始化的后台线程）。
+///
+/// # 为什么要显式传进来
+///
+/// 托盘线程只能注册**它自己创建窗口时**拿到的组合。若让托盘去读
+/// 配置文件，就要把配置跨线程搬过去；而调用方（常驻进程）本来
+/// 就持有配置，传进来最直接。
+pub fn start_with_hotkeys(
+    tooltip: &str,
+    toggle: hotkey::HotkeySpec,
+    paste_previous: hotkey::HotkeySpec,
+) -> Result<Tray> {
+    imp::start(tooltip, toggle, paste_previous)
+}
+
+#[cfg(not(windows))]
+pub fn start_with_hotkeys(
+    _tooltip: &str,
+    _toggle: hotkey::HotkeySpec,
+    _paste: hotkey::HotkeySpec,
+) -> Result<Tray> {
     anyhow::bail!("当前平台尚未实现托盘")
+}
+
+#[cfg(not(windows))]
+pub fn set_hotkey(_slot: hotkey::Slot, _spec: hotkey::HotkeySpec) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +469,7 @@ mod imp {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, RegisterHotKey, UnregisterHotKey, VK_V,
+        HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
     };
     use windows::Win32::UI::Shell::{
         NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICONDATAW,
@@ -344,7 +479,7 @@ mod imp {
         AppendMenuW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
         DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
         ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
-        PostMessageW, RegisterClassExW, SetForegroundWindow, ShowWindow, SW_HIDE,
+        PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, ShowWindow, SW_HIDE,
         SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
         TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_HOTKEY,
         WM_NULL, WM_QUIT, WNDCLASSEXW, HWND_MESSAGE, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -370,8 +505,12 @@ mod imp {
     /// 弹出期间在屏幕上几乎看不见。
     const MENU_HOST_CLASS: &str = "ModularClipboardTrayMenuHost";
 
-    /// 全局热键 id。任意非零值即可，只要在本进程内唯一。
-    const HOTKEY_ID: i32 = 0x0BEE;
+    /// 通知托盘线程「重注册某个热键」的内部消息。
+    ///
+    /// 用窗口消息而不是共享可变状态：注册必须在**托盘线程**里执行
+    /// （`WM_HOTKEY` 只会投递到注册窗口所属线程），而调用方在主线程。
+    /// `wparam` 放槽位 id，`lparam` 放打包后的 `modifiers<<32 | vk`。
+    const WM_TRAY_SET_HOTKEY: u32 = 0x8000 + 4;
 
     /// 托盘图标的资源 ID。
     const ICON_ID: u32 = 1;
@@ -381,6 +520,221 @@ mod imp {
     ///
     /// 安全前提：全局只有一个托盘实例，且 `Sender` 仅用于发值类型，
     /// 不跨线程暴露内部引用。
+    /// 通知托盘线程「启用/停用迷你面板」。
+    ///
+    /// `wparam`：`1` 启用、`0` 停用；`lparam`：修饰键掩码。
+    const WM_TRAY_SET_MINI: u32 = 0x8000 + 5;
+    /// 鼠标钩子捕获到「修饰键 + 右键」，请求弹面板。
+    ///
+    /// `wparam` = x，`lparam` = y（屏幕坐标，打包成一个 isize 传不下，
+    /// 故 x 放 wparam、y 放 lparam）。
+    const WM_TRAY_MINI: u32 = 0x8000 + 6;
+
+    /// 录制快捷键期间临时注销 / 恢复全局热键。
+    ///
+    /// `wparam`：`1` 注销、`0` 恢复。
+    ///
+    /// # 为什么录制要注销
+    ///
+    /// `RegisterHotKey` 注册的组合会被 OS **从所有窗口没收**——
+    /// 按键不再产生 `WM_KEYDOWN`，而是直接发给注册窗口。于是用户想
+    /// 录制「当前正绑着的那个组合」（比如把 Win+V 改掉时先按一下
+    /// Win+V 确认）时，设置窗口**永远收不到按键**，录制像卡死。
+    /// 录期间注销、录完恢复，两条路都通。
+    const WM_TRAY_SUSPEND_HOTKEYS: u32 = 0x8000 + 7;
+
+    /// 迷你面板的运行状态。托盘线程独占读写（经消息驱动），
+    /// 条目列表由外部写、这里读。
+    fn mini_cell() -> &'static std::sync::Mutex<MiniState> {
+        static CELL: std::sync::OnceLock<std::sync::Mutex<MiniState>> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| std::sync::Mutex::new(MiniState::default()))
+    }
+
+    #[derive(Default)]
+    struct MiniState {
+        enabled: bool,
+        modifiers: u32,
+        items: Option<MiniItems>,
+        hook: Option<isize>,
+    }
+
+    /// 当前按下的修饰键是否与配置一致。
+    ///
+    /// 用 `GetAsyncKeyState` 而不是钩子事件里带的按键状态：
+    /// 低层鼠标钩子只告诉我们「鼠标发生了什么」，
+    /// 键盘状态必须另外问系统。
+    unsafe fn mini_modifiers_match(mask: u32) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+        };
+        unsafe {
+            let pressed = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| {
+                (GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000) != 0
+            };
+            let ctrl = pressed(VK_CONTROL);
+            let shift = pressed(VK_SHIFT);
+            let alt = pressed(VK_MENU);
+            let win = pressed(VK_LWIN) || pressed(VK_RWIN);
+            // 掩码里要求的一律要按下；没要求的**不要求**没按
+            // （用户可能正按着别的键在做别的事）。
+            if mask & MINI_MOD_CTRL != 0 && !ctrl {
+                return false;
+            }
+            if mask & MINI_MOD_SHIFT != 0 && !shift {
+                return false;
+            }
+            if mask & MINI_MOD_ALT != 0 && !alt {
+                return false;
+            }
+            if mask & MINI_MOD_WIN != 0 && !win {
+                return false;
+            }
+            true
+        }
+    }
+
+    /// 低层鼠标钩子回调。
+    ///
+    /// 只做一件事：修饰键 + 右键按下 ⇒ 给托盘窗口投一条消息。
+    /// 真正的弹菜单必须在消息循环里做（`TrackPopupMenu` 是模态的）。
+    extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CallNextHookEx, MSLLHOOKSTRUCT, WM_RBUTTONDOWN,
+        };
+        if code >= 0 && wparam.0 as u32 == WM_RBUTTONDOWN {
+            let mut hit = None;
+            if let Ok(st) = mini_cell().lock()
+                && st.enabled
+                && unsafe { mini_modifiers_match(st.modifiers) }
+                && let Some(hwnd) = hwnd_cell().get()
+            {
+                let data = lparam.0 as *const MSLLHOOKSTRUCT;
+                if !data.is_null() {
+                    let pt = unsafe { (*data).pt };
+                    hit = Some((*hwnd, pt.x, pt.y));
+                }
+            }
+            if let Some((raw, x, y)) = hit {
+                let hwnd = HWND(raw as *mut core::ffi::c_void);
+                let _ = unsafe {
+                    PostMessageW(Some(hwnd), WM_TRAY_MINI, WPARAM(x as usize), LPARAM(y as isize))
+                };
+                // 吃掉这次右键：否则目标程序也会弹它自己的右键菜单，
+                // 两个菜单叠在一起。
+                return LRESULT(1);
+            }
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    /// 在托盘线程里安装/卸载鼠标钩子。
+    unsafe fn apply_mini(enable: bool, modifiers: u32, items: MiniItems) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HHOOK, SetWindowsHookExW, UnhookWindowsHookEx, WH_MOUSE_LL,
+        };
+        let mut st = match mini_cell().lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        // 先卸旧的：改配置时旧钩子必须摘掉，否则会留下一个
+        // 用旧修饰键触发的钩子。
+        if let Some(raw) = st.hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(HHOOK(raw as *mut core::ffi::c_void));
+            }
+        }
+        st.items = Some(items);
+        st.modifiers = modifiers;
+        st.enabled = false;
+        if !enable {
+            return;
+        }
+        match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) } {
+            Ok(h) => {
+                st.hook = Some(h.0 as isize);
+                st.enabled = true;
+                tracing::info!("迷你快捷复制面板已启用");
+            }
+            Err(e) => tracing::error!(%e, "安装鼠标钩子失败，迷你面板不可用"),
+        }
+    }
+
+    /// 弹出迷你面板（系统菜单），返回被选中的条目 id。
+    ///
+    /// 条目为空时不弹：空面板只会让人以为程序坏了。
+    unsafe fn show_mini_menu(_hwnd: HWND, x: i32, y: i32) -> Option<i64> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, DestroyMenu, MF_STRING, TPM_RETURNCMD, TrackPopupMenu,
+        };
+        use windows::core::HSTRING;
+
+        let snapshot: Vec<(i64, String)> = match mini_cell().lock() {
+            Ok(g) => match g.items.as_ref().and_then(|a| a.lock().ok()) {
+                Some(v) => v.clone(),
+                None => Vec::new(),
+            },
+            Err(e) => {
+                let g = e.into_inner();
+                match g.items.as_ref().and_then(|a| a.lock().ok()) {
+                    Some(v) => v.clone(),
+                    None => Vec::new(),
+                }
+            }
+        };
+        if snapshot.is_empty() {
+            return None;
+        }
+
+        let host = unsafe { super::imp::create_menu_host() }?;
+        let menu = match unsafe { CreatePopupMenu() } {
+            Ok(m) => m,
+            Err(_) => {
+                unsafe {
+                    let _ = DestroyWindow(host);
+                }
+                return None;
+            }
+        };
+
+        for (id, preview) in &snapshot {
+            // 菜单文本要短：长文本会撑满屏幕，且系统不给省略号。
+            let text: String = preview.chars().take(48).collect();
+            let wide = HSTRING::from(&text);
+            unsafe {
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    // 菜单 id 直接用条目 id：省掉一层 id → 条目的映射表，
+                    // 也就不存在「映射表过期」的问题。条目 id 是正数。
+                    *id as usize,
+                    &wide,
+                );
+            }
+        }
+
+        let cmd = unsafe {
+            TrackPopupMenu(menu, TPM_RETURNCMD, x, y, None, host, None)
+        };
+        unsafe {
+            let _ = DestroyMenu(menu);
+            let _ = DestroyWindow(host);
+        }
+        if cmd.as_bool() {
+            Some(cmd.0 as i64)
+        } else {
+            None
+        }
+    }
+
+    /// 托盘窗口句柄。供主线程投递「重注册热键」消息用。
+    ///
+    /// 进程内只有一个托盘，`OnceLock` 足够；`set` 发生在窗口创建之后、
+    /// 任何 `set_hotkey` 之前（见 `start` 里的写入时机）。
+    fn hwnd_cell() -> &'static std::sync::OnceLock<isize> {
+        static CELL: std::sync::OnceLock<isize> = std::sync::OnceLock::new();
+        &CELL
+    }
+
     fn sender_cell() -> &'static std::sync::Mutex<Option<Sender<TrayEvent>>> {
         static CELL: std::sync::OnceLock<std::sync::Mutex<Option<Sender<TrayEvent>>>> =
             std::sync::OnceLock::new();
@@ -403,7 +757,9 @@ mod imp {
         hwnd: HWND,
         nid: NOTIFYICONDATAW,
         hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
-        hotkey_ok: bool,
+        /// 已成功注册的热键 id。注销时只处理这些——
+        /// 对没注册成功的 id 调 `UnregisterHotKey` 是没意义的一次系统调用。
+        hotkeys: Vec<i32>,
         class_name: HSTRING,
     }
 
@@ -411,8 +767,8 @@ mod imp {
 /// 清理。顺序与创建严格相反：热键 → 图标 → 窗口 → 窗口类。
         unsafe fn release(&self) {
             unsafe {
-                if self.hotkey_ok {
-                    let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+                for id in &self.hotkeys {
+                    let _ = UnregisterHotKey(Some(self.hwnd), *id);
                 }
                 // NIM_DELETE 必须在窗口销毁前发，否则图标残留。
                 let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
@@ -451,8 +807,57 @@ mod imp {
                 LRESULT(0)
             }
             WM_HOTKEY => {
-                emit(TrayEvent::Hotkey);
+                // 按 id 区分槽位：两个热键注册在同一个窗口上。
+                match wparam.0 as i32 {
+                    id if id == hotkey::Slot::PastePrevious.id() => emit(TrayEvent::HotkeyPaste),
+                    _ => emit(TrayEvent::Hotkey),
+                }
                 LRESULT(0)
+            }
+            WM_TRAY_SET_HOTKEY => {
+                LRESULT(unsafe { rebind_hotkey(hwnd, wparam.0 as i32, lparam.0) } as isize)
+            }
+            WM_TRAY_SET_MINI => {
+                // items 通过 `mini_cell` 传入（PostMessage 带不了 Arc），
+                // 这里只取「启用/停用 + 修饰键」。
+                if let Ok(st) = mini_cell().lock() {
+                    let items = st
+                        .items
+                        .clone()
+                        .unwrap_or_else(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+                    drop(st);
+                    unsafe { apply_mini(wparam.0 != 0, lparam.0 as u32, items) };
+                }
+                LRESULT(0)
+            }
+            WM_TRAY_MINI => {
+                if let Some(id) =
+                    unsafe { show_mini_menu(hwnd, wparam.0 as i32, lparam.0 as i32) }
+                {
+                    emit(TrayEvent::MiniPick(id));
+                }
+                LRESULT(0)
+            }
+            WM_TRAY_SUSPEND_HOTKEYS => {
+                // 录制快捷键期间：把已注册的组合从 OS 手里收回来。
+                // 注册过的组合会被 OS 从所有窗口没收（不再产生
+                // WM_KEYDOWN），设置窗口因此永远收不到「当前正绑着」
+                // 的那个按键——录制看起来像卡死。
+                //
+                // `wparam = 0`（恢复）刻意不在这里做：托盘线程不持有
+                // 配置，「该注册什么」只有调用方知道，由它按当前配置
+                // 逐槽位调 `set_hotkey` 恢复。
+                if wparam.0 != 0
+                    && let Ok(mut guard) = hotkey_ids().lock()
+                {
+                    for id in guard.iter() {
+                        // SAFETY: hwnd 是本窗口过程的窗口，id 来自
+                        // `hotkey_ids`（本进程注册成功的那些）。
+                        let _ = unsafe { UnregisterHotKey(Some(hwnd), *id) };
+                    }
+                    guard.clear();
+                }
+                LRESULT(1)
             }
             WM_COMMAND => {
                 if let Some(ev) = command_to_event(wparam.0) {
@@ -746,14 +1151,25 @@ mod imp {
 
     /// 托盘线程主体：建资源→ 加图标 → 回报就绪 → 消息循环 → 清理。
     /// 托盘线程就绪后回报给启动方的信息。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Ready {
     thread_id: u32,
     /// 托盘窗口句柄的原始地址（`HWND` 不是 `Send`，故传地址）。
     hwnd: isize,
+    /// 启动时注册失败的快捷键描述（已含槽位名）。
+    ///
+    /// 必须回传：注册失败只写日志的话，用户按 Win+V 没反应，
+    /// 而日志在用户看不到的地方——失败信息要能走到界面上。
+    failed: Vec<String>,
 }
 
-fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
+fn run(
+    tx: Sender<TrayEvent>,
+    tip: Vec<u16>,
+    ready: Sender<Result<Ready>>,
+    toggle_spec: hotkey::HotkeySpec,
+    paste_spec: hotkey::HotkeySpec,
+) {
         // 窗口过程需要能回传事件。
         if let Ok(mut guard) = sender_cell().lock() {
             *guard = Some(tx);
@@ -762,10 +1178,11 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
         // 「建立资源」与「跑消息循环」必须分开：
         // 就绪信号要在进入循环**之前**发出，否则 `start` 会一直阻塞——
         // 循环是阻塞的，信号若在循环之后发就永远发不出去。
-        let res = setup(&tip).map(|ctx| {
-            let _ = ready.send(Ok(ctx.ready));
+        let res = setup(&tip, toggle_spec, paste_spec).map(|ctx| {
+            // `Ready` 含失败清单（`Vec`），不是 `Copy`：发克隆，
+            // 原件跟着 `ctx` 活到消息循环结束。
+            let _ = ready.send(Ok(ctx.ready.clone()));
             pump(&ctx);
-            ctx.ready
         });
 
         // 失败路径必须通知启动方，否则 `start` 同样会一直阻塞。
@@ -781,7 +1198,7 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
     }
 
     /// 建立托盘窗口、图标与快捷键。**不**进入消息循环。
-    fn setup(tip: &[u16]) -> Result<Ctx> {
+    fn setup(tip: &[u16], toggle_spec: hotkey::HotkeySpec, paste_spec: hotkey::HotkeySpec) -> Result<Ctx> {
         unsafe {
             let (hwnd, class_name) = create_tray_window()?;
 
@@ -820,32 +1237,49 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
                 tracing::debug!("NIM_SETVERSION 失败，回退到旧版回调语义");
             }
 
-            // 快捷键注册失败**不致命**：被别的软件占用是常态，记日志继续跑。
-            let hotkey_ok = match RegisterHotKey(
-                Some(hwnd),
-                HOTKEY_ID,
-                MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT,
-                VK_V.0 as u32,
-            ) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!("注册全局快捷键 Ctrl+Shift+V 失败（可能已被占用）: {e}");
-                    false
+            // 快捷键注册失败**不致命**：被别的软件占用是常态
+            // （Win+V 就常被系统自带的剪贴板历史占着），记日志继续跑。
+            // 失败清单随 `Ready` 回传，由调用方决定怎么告知用户。
+            let mut hotkeys = Vec::new();
+            let mut failed = Vec::new();
+            for (slot, spec) in [
+                (hotkey::Slot::Toggle, toggle_spec),
+                (hotkey::Slot::PastePrevious, paste_spec),
+            ] {
+                match RegisterHotKey(
+                    Some(hwnd),
+                    slot.id(),
+                    HOT_KEY_MODIFIERS(spec.modifiers),
+                    spec.vk,
+                ) {
+                    Ok(()) => hotkeys.push(slot.id()),
+                    Err(e) => {
+                        tracing::warn!(
+                            "注册全局快捷键 {} 失败（可能已被占用）: {e}",
+                            hotkey::describe(spec)
+                        );
+                        failed.push(hotkey::failed_message(slot, spec));
+                    }
                 }
-            };
+            }
 
             let tid = GetCurrentThreadId();
+            let _ = hwnd_cell().set(hwnd.0 as isize);
+            if let Ok(mut guard) = hotkey_ids().lock() {
+                *guard = hotkeys.clone();
+            }
             Ok(Ctx {
                 res: Resources {
                     hwnd,
                     nid,
                     hicon,
-                    hotkey_ok,
+                    hotkeys,
                     class_name,
                 },
                 ready: Ready {
                     thread_id: tid,
                     hwnd: hwnd.0 as isize,
+                    failed,
                 },
             })
         }
@@ -853,6 +1287,104 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
 
     /// 阻塞消息循环：托盘线程的全部工作都发生在这里。
     /// 返回时（收到 `WM_QUIT`）负责回收全部 Win32 资源。
+    /// 重注册一个热键槽位（在托盘线程里执行）。
+    ///
+    /// 返回是否注册成功。失败（组合被占用）时旧的绑定也被注销了——
+    /// 这是有意的：留着一个用户已经删掉的旧热键，比暂时没有热键更糟。
+    unsafe fn rebind_hotkey(hwnd: HWND, id: i32, packed: isize) -> bool {
+        let modifiers = ((packed >> 32) & 0xFFFF_FFFF) as u32;
+        let vk = (packed & 0xFFFF_FFFF) as u32;
+        unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), id);
+            match RegisterHotKey(Some(hwnd), id, HOT_KEY_MODIFIERS(modifiers), vk) {
+                Ok(()) => {
+                    // 同步 Resources 的记录，退出时才能正确注销。
+                    if let Ok(mut guard) = hotkey_ids().lock() {
+                        guard.retain(|x| *x != id);
+                        guard.push(id);
+                    }
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!("重新注册快捷键 {id:#x} 失败（可能已被占用）: {e}");
+                    false
+                }
+            }
+        }
+    }
+
+    /// 已注册的热键 id（供窗口过程与清理共享）。
+    fn hotkey_ids() -> &'static std::sync::Mutex<Vec<i32>> {
+        static CELL: std::sync::OnceLock<std::sync::Mutex<Vec<i32>>> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    }
+
+    pub fn set_mini_panel(modifiers: Option<u32>, items: MiniItems) -> bool {
+        let Some(raw) = hwnd_cell().get() else {
+            return false;
+        };
+        let hwnd = HWND(*raw as *mut core::ffi::c_void);
+        // Arc 不能塞进消息参数，先放进共享格子里，消息只带开关与掩码。
+        if let Ok(mut st) = mini_cell().lock() {
+            st.items = Some(items);
+        }
+        let (on, mask) = match modifiers {
+            Some(m) => (1, m),
+            None => (0, 0),
+        };
+        unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_TRAY_SET_MINI,
+                WPARAM(on),
+                LPARAM(mask as isize),
+            )
+        }
+        .is_ok()
+    }
+
+    /// 运行时重注册一个热键槽位。
+    ///
+    /// 用 `SendMessageW` 而非 `PostMessageW`：调用方需要**注册结果**
+    /// 才能在界面上提示「已被占用」。投递是异步的，拿不到结果。
+    /// 每次调用的工作量是一次 UnregisterHotKey + RegisterHotKey，
+    /// 微秒级，同步阻塞可忽略。
+    ///
+    /// 窗口过程把 `rebind_hotkey` 的 bool 结果原样作为 LRESULT 返回。
+    pub fn set_hotkey(slot: hotkey::Slot, spec: hotkey::HotkeySpec) -> bool {
+        let Some(raw) = hwnd_cell().get() else {
+            return false;
+        };
+        let hwnd = HWND(*raw as *mut core::ffi::c_void);
+        let packed = ((spec.modifiers as i64) << 32) | (spec.vk as i64);
+        let result = unsafe {
+            SendMessageW(
+                hwnd,
+                WM_TRAY_SET_HOTKEY,
+                Some(WPARAM(slot.id() as usize)),
+                Some(LPARAM(packed as isize)),
+            )
+        };
+        result.0 != 0
+    }
+
+    /// 录制期间注销全部热键（同步，见公开函数的文档）。
+    pub fn suspend_hotkeys() -> bool {
+        let Some(raw) = hwnd_cell().get() else {
+            return false;
+        };
+        let hwnd = HWND(*raw as *mut core::ffi::c_void);
+        let result = unsafe {
+            SendMessageW(
+                hwnd,
+                WM_TRAY_SUSPEND_HOTKEYS,
+                Some(WPARAM(1)),
+                None,
+            )
+        };
+        result.0 != 0
+    }
+
     fn pump(ctx: &Ctx) {
         unsafe {
             let mut msg: MSG = std::mem::zeroed();
@@ -880,7 +1412,11 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
         };
     }
 
-    pub(super) fn start(tooltip: &str) -> Result<Tray> {
+    pub(super) fn start(
+        tooltip: &str,
+        toggle_spec: hotkey::HotkeySpec,
+        paste_spec: hotkey::HotkeySpec,
+    ) -> Result<Tray> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel::<Result<Ready>>();
 
@@ -889,7 +1425,7 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
         // 线程内不捕获 `tip` 的引用，只移动所有权。
         let handle = std::thread::Builder::new()
             .name("modular-clipboard-tray".into())
-            .spawn(move || run(tx, tip, ready_tx))
+            .spawn(move || run(tx, tip, ready_tx, toggle_spec, paste_spec))
             .context("创建托盘线程失败")?;
 
         match ready_rx.recv() {
@@ -897,6 +1433,7 @@ fn run(tx: Sender<TrayEvent>, tip: Vec<u16>, ready: Sender<Result<Ready>>) {
                 rx,
                 thread_id: ready.thread_id,
                 hwnd: ready.hwnd,
+                failed_hotkeys: ready.failed,
             }),
             Ok(Err(e)) => {
                 let _ = handle.join();
@@ -1093,5 +1630,36 @@ mod tests {
             assert!((1024..=1031).contains(&m).eq(&false), "消息 {m} 与 NIN_* 撞车");
             assert!(m > 1031, "消息 {m} 应落在 WM_USER 之上");
         }
+    }
+
+    /// 迷你面板的启用判定：开关 + 至少一个修饰键。
+    ///
+    /// 「开了但一个修饰键都没勾」必须视为停用——否则**每次右键**都会
+    /// 弹面板，用户的右键等于被抢走，比没有这个功能更糟。
+    #[test]
+    fn mini_mask_requires_enabled_and_a_modifier() {
+        use modular_clipboard_core::config::MiniPanelConfig;
+
+        // 默认关闭（即使默认勾了 Ctrl）。
+        let cfg = MiniPanelConfig::default();
+        assert_eq!(mini_mask(&cfg), None, "默认关闭时不应启用");
+
+        // 开启且有 Ctrl。
+        let mut cfg = cfg;
+        cfg.enabled = true;
+        assert_eq!(mini_mask(&cfg), Some(MINI_MOD_CTRL));
+
+        // 开了但没有任何修饰键 ⇒ 停用。
+        cfg.ctrl = false;
+        assert_eq!(mini_mask(&cfg), None, "无修饰键应视为停用");
+
+        // 多修饰键按位或。
+        cfg.alt = true;
+        cfg.win = true;
+        let mask = mini_mask(&cfg).expect("应启用");
+        assert_ne!(mask & MINI_MOD_ALT, 0);
+        assert_ne!(mask & MINI_MOD_WIN, 0);
+        assert_eq!(mask & MINI_MOD_CTRL, 0);
+        assert_eq!(mask & MINI_MOD_SHIFT, 0);
     }
 }

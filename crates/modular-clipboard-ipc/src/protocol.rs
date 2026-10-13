@@ -27,7 +27,7 @@ use modular_clipboard_core::{CapturedPayload, ClipItem, Config, DropStats, Entry
 use serde::{Deserialize, Serialize};
 
 /// 协议版本。结构不兼容变更时必须 +1。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 数据版本号：常驻进程每次改动历史（增/删/置顶/清空）后递增。
 ///
@@ -49,6 +49,14 @@ pub struct Snapshot {
     pub stats: DropStats,
     /// 剪贴板监听是否在运行。
     pub capturing: bool,
+    /// 最近一次全局快捷键注册失败的信息（`None` = 当前绑定全部可用）。
+    ///
+    /// 注册发生在托盘线程里，界面拿不到返回值；失败又必须让用户看见
+    /// （按 Win+V 没反应时，用户只会以为程序坏了）。常驻进程把它
+    /// 放进快照，界面负责展示。
+    ///
+    /// 它是**状态**而不是事件：失败会一直挂着，直到下一次重注册成功。
+    pub hotkey_error: Option<String>,
     /// 持久配置。只在握手与显式拉取时下发，避免覆盖界面未保存的改动。
     pub config: Config,
     /// 列表结构版本（绘制层行高缓存的失效判据，见 `AppState::list_version`）。
@@ -93,6 +101,12 @@ pub enum Command {
     ClearAll,
     /// 把界面侧的持久配置落盘。
     SaveConfig(Config),
+    /// 录制快捷键期间临时注销 / 恢复全局热键。
+    ///
+    /// 注销（`true`）让「当前正绑着的组合」能把按键送到界面窗口，
+    /// 否则被 OS 收走，录制像卡死。恢复（`false`）由常驻进程按当前
+    /// 配置重新注册——它才是持有托盘与热键的那一侧。
+    SuspendHotkeys(bool),
     /// 启动/停止剪贴板监听。
     SetCaptureEnabled(bool),
     /// 把一段文本写回剪贴板（自带自写回抑制）。
@@ -196,6 +210,7 @@ mod tests {
             groups: Vec::new(),
             stats: DropStats::default(),
             capturing: false,
+            hotkey_error: None,
             config: Config::default(),
             list_version: 0,
         };

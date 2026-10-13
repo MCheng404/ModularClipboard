@@ -4,7 +4,7 @@
 //!
 //! 已有探针全都是**进程内**的：
 //!
-//! - `tray_probe` 在自己进程里 `tray::start()`，注入消息给**自己**的托盘窗口；
+//! - `tray_probe` 在自己进程里 `tray::start_with_hotkeys()`，注入消息给**自己**的托盘窗口；
 //! - `tray.rs` 的 17 个单测是纯逻辑，从不调 Win32；
 //! - `presence.rs` 的单测只测 `decide_on_close` 这个纯函数。
 //!

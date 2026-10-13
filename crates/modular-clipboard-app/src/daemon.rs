@@ -31,6 +31,7 @@ use modular_clipboard_ipc::protocol::{
     Command, DataVersion, PROTOCOL_VERSION, Request, Response, Snapshot,
 };
 use modular_clipboard_ipc::{Server, request_show_ui, ui_is_running};
+use modular_clipboard_platform::hotkey::{self, Slot};
 use modular_clipboard_platform::tray::{self, TrayEvent};
 
 use crate::Service;
@@ -65,6 +66,11 @@ struct Core {
     /// 用户用 `--data-dir` 做的隔离测试就只隔离了一半
     /// （数据隔离了、日志没隔离，排查时看到的是两处日志各一半）。
     data_dir: Option<PathBuf>,
+    /// 最近一次快捷键注册失败的信息（`None` = 正常）。
+    ///
+    /// 放在这里而不是 Service 里：它不是业务状态，而是「环境能力」的
+    /// 快照——注册成败取决于别的程序有没有占用组合，与数据无关。
+    hotkey_error: std::sync::Mutex<Option<String>>,
 }
 
 impl Core {
@@ -83,6 +89,11 @@ impl Core {
             groups: service.state.groups.clone(),
             stats: service.state.stats,
             capturing: service.is_capturing(),
+            hotkey_error: self
+                .hotkey_error
+                .lock()
+                .ok()
+                .and_then(|g| g.clone()),
             config: service.state.config.clone(),
             list_version: service.state.list_version,
         }
@@ -130,14 +141,21 @@ impl Core {
 /// `start_ui` 为 `true` 时启动后立即拉起界面（对应「双击图标」）；
 /// 单独以 `--daemon` 启动时传 `false`（只常驻、不弹窗）。
 pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::Result<()> {
+    // 热键要从配置里来，而不是模块里的默认值——
+    // 否则用户在设置里改了绑定，重启后又被改回去。
+    let toggle = hotkey::spec_or_default(&config.hotkey_toggle);
+    let paste = hotkey::spec_or_default(&config.hotkey_paste_previous);
     let mut service = Service::with_data_dir(config, data_dir)?;
     service.start_capture();
+    // 迷你面板的条目快照：托盘线程弹菜单时要读它（那边没有数据库）。
+    let mini_items: tray::MiniItems = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let core = Arc::new(Core {
         version: AtomicU64::new(1),
         quit: AtomicBool::new(false),
         exe: std::env::current_exe().ok(),
         data_dir: data_dir.map(Path::to_path_buf),
+        hotkey_error: std::sync::Mutex::new(None),
     });
 
     if start_ui {
@@ -157,13 +175,25 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
     // 托盘自带独立线程与消息循环（见 platform::tray 的模块文档），
     // 这里只是每轮收一次事件。启动失败**不阻断**常驻进程：
     // 没有托盘时用户仍可用快捷键唤起界面（热键由托盘模块一并注册）。
-    let tray = match tray::start(TRAY_TOOLTIP) {
-        Ok(t) => Some(t),
+    let tray = match tray::start_with_hotkeys(TRAY_TOOLTIP, toggle, paste) {
+        Ok(t) => {
+            // 启动注册失败的快捷键要能走到界面上：用户按 Win+V 没反应时，
+            // 只会以为程序坏了。信息随快照下发（见 `hotkey_error`）。
+            set_hotkey_error(&core, t.failed_hotkeys().to_vec());
+            // 钩子必须**在托盘起来之后**挂：它跑在托盘线程的消息循环里。
+            sync_mini_items(&service, &mini_items);
+            apply_mini_panel(&service.state.config, &mini_items);
+            Some(t)
+        }
         Err(e) => {
-            tracing::error!(%e, "托盘启动失败：将无法从托盘唤起界面");
+            tracing::error!(%e, "托盘启动失败：迷你面板与托盘菜单都不可用");
             None
         }
     };
+
+    // 已应用的迷你面板掩码：主循环据此判断「配置变了没有」。
+    // `set_mini_panel` 每次都会重装全局鼠标钩子，不能每帧无脑调。
+    let mut applied_mini = tray::mini_mask(&service.state.config.mini_panel);
 
     tracing::info!("常驻进程已就绪（监听剪贴板 + 等待界面连接）");
 
@@ -176,6 +206,15 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok((req, reply)) => {
                 let resp = handle(&core, &mut service, req);
+                // 命令可能改了列表（增删置顶清空）⇒ 面板内容要跟着变。
+                sync_mini_items(&service, &mini_items);
+                // 设置里也可能刚改了迷你面板（开关/修饰键）：
+                // 掩码变了才重装钩子——它在每一次右键上都会被回调。
+                let mask = tray::mini_mask(&service.state.config.mini_panel);
+                if mask != applied_mini {
+                    applied_mini = mask;
+                    tray::set_mini_panel(mask, mini_items.clone());
+                }
                 if reply.send(resp).is_err() {
                     // 界面在等回应的过程中退出了，正常现象。
                     tracing::debug!("界面在请求处理期间断开");
@@ -191,15 +230,35 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
         if let Some(t) = tray.as_ref() {
             for ev in t.poll() {
                 match ev {
-                    // 托盘左键与全局热键是同一个意图：把界面叫出来。
+                    // 托盘左键与「显示」热键是同一个意图：把界面叫出来。
                     TrayEvent::Show | TrayEvent::Hotkey => {
                         core.show_ui();
+                    }
+                    // 「粘贴上一条」不经过界面：直接把最新一条写回剪贴板
+                    // 并发 Ctrl+V 给前台窗口——走界面就太慢了。
+                    TrayEvent::HotkeyPaste => {
+                        if let Some(id) = service.state.items.first().map(|i| i.id) {
+                            if let Err(e) = service.copy_and_paste(id) {
+                                tracing::error!(%e, "粘贴上一条失败");
+                            }
+                        } else {
+                            tracing::debug!("历史为空，忽略「粘贴上一条」");
+                        }
                     }
                     TrayEvent::ClearHistory => {
                         if let Err(e) = service.clear_all() {
                             tracing::error!(%e, "清空历史失败");
                         } else {
                             core.bump();
+                        }
+                    }
+                    // 迷你面板里选中一条：写回剪贴板。
+                    // 不自动粘贴——用户按住修饰键点的右键，
+                    // 粘贴到哪要他自己决定。
+                    TrayEvent::MiniPick(id) => {
+                        sync_mini_items(&service, &mini_items);
+                        if let Err(e) = service.copy_item(id) {
+                            tracing::error!(%e, "迷你面板复制条目失败");
                         }
                     }
                     TrayEvent::Quit => {
@@ -212,6 +271,7 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
 
         if service.pump() {
             core.bump();
+            sync_mini_items(&service, &mini_items);
         }
     }
 
@@ -222,6 +282,66 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
     service.stop_capture();
     tracing::info!("常驻进程退出");
     Ok(())
+}
+
+/// 按当前配置重新注册两个热键槽位；返回失败描述（空 = 全部成功）。
+///
+/// 同步等待注册结果（`tray::set_hotkey` 已是同步调用）：失败必须回传，
+/// 界面靠它显示「已被其它程序占用」——静默失败等于「改了键位但按键
+/// 没反应」的老 bug。
+///
+/// 单进程模式的界面进程也调用它（那时托盘就在本进程里）。
+pub fn rebind_hotkeys(cfg: &modular_clipboard_core::Config) -> Vec<String> {
+    let mut failed = Vec::new();
+    for (slot, hk) in [
+        (Slot::Toggle, &cfg.hotkey_toggle),
+        (Slot::PastePrevious, &cfg.hotkey_paste_previous),
+    ] {
+        let spec = hotkey::spec_or_default(hk);
+        if !tray::set_hotkey(slot, spec) {
+            failed.push(hotkey::failed_message(slot, spec));
+        }
+    }
+    failed
+}
+
+/// 记录 / 清除「快捷键注册失败」状态。空清单 = 全部成功 ⇒ 清除。
+fn set_hotkey_error(core: &Core, failed: Vec<String>) {
+    if let Ok(mut guard) = core.hotkey_error.lock() {
+        *guard = if failed.is_empty() {
+            None
+        } else {
+            Some(failed.join("；"))
+        };
+    }
+}
+
+/// 把最近若干条复制进迷你面板的共享快照。
+///
+/// 只复制**预览文本**不复制载荷：面板要显示的就只是一行字，
+/// 而载荷可能有几 MB。
+///
+/// 公开：单进程模式的界面进程也要维护同一份快照。
+pub fn sync_mini_items(service: &Service, cell: &tray::MiniItems) {
+    let n = service.state.config.mini_panel.effective_count();
+    let snapshot: Vec<(i64, String)> = service
+        .state
+        .items
+        .iter()
+        .take(n)
+        .map(|i| (i.id, i.preview.chars().take(48).collect()))
+        .collect();
+    if let Ok(mut g) = cell.lock() {
+        *g = snapshot;
+    }
+}
+
+/// 按配置启用 / 停用迷你面板。
+///
+/// 掩码判定在 [`modular_clipboard_platform::tray::mini_mask`]——
+/// 常驻进程与单进程模式的界面共用同一份判定，避免两边漂移。
+pub fn apply_mini_panel(cfg: &modular_clipboard_core::Config, cell: &tray::MiniItems) {
+    tray::set_mini_panel(tray::mini_mask(&cfg.mini_panel), cell.clone());
 }
 
 /// 接受界面连接，把请求转给主线程执行。
@@ -338,6 +458,16 @@ fn handle_cmd(core: &Core, svc: &mut Service, cmd: Command) -> Response {
             svc.suppress_self_capture();
             Response::Ok
         }
+        Command::SuspendHotkeys(suspend) => {
+            // 录制快捷键：注销让按键能到界面窗口；恢复按当前配置重注册。
+            if suspend {
+                tray::suspend_hotkeys();
+            } else {
+                let failed = rebind_hotkeys(&svc.state.config);
+                set_hotkey_error(core, failed);
+            }
+            Response::Ok
+        }
         Command::SetCaptureEnabled(on) => {
             // 界面侧改的是「用户此刻想不想监听」，因此要一并落盘——
             // 否则界面一关、常驻进程一重启，开关又回到旧值。
@@ -354,8 +484,15 @@ fn handle_cmd(core: &Core, svc: &mut Service, cmd: Command) -> Response {
         }
         Command::SaveConfig(cfg) => {
             svc.state.config = cfg;
+            // 用户可能刚改了快捷键：注册必须跟着变，否则界面上显示
+            // 新绑定、实际按旧键才有效。失败结果回传界面（hotkey_error）。
+            let failed = rebind_hotkeys(&svc.state.config);
+            set_hotkey_error(core, failed);
             match svc.save_config() {
-                Ok(()) => Response::Ok,
+                // bump 版本并回一份快照：快照里带着 `hotkey_error`
+                // 与刚保存的配置——界面这一帧就能拿到注册失败信息，
+                // 不用等下一次列表变化。
+                Ok(()) => changed!(),
                 Err(e) => Response::Error(e.to_string()),
             }
         }
@@ -446,6 +583,7 @@ mod tests {
                 quit: AtomicBool::new(false),
                 exe: None,
                 data_dir: Some(dir.path().to_path_buf()),
+                hotkey_error: std::sync::Mutex::new(None),
             },
             svc,
             _dir: dir,
@@ -570,8 +708,33 @@ mod tests {
         let mut cfg = f.svc.state.config.clone();
         cfg.ui.window_opacity = 0.42;
         let resp = handle(&f.core, &mut f.svc, Request::Cmd(Command::SaveConfig(cfg)));
-        assert!(matches!(resp, Response::Ok), "实得 {resp:?}");
+        // 回快照而不是 Ok：配置变更也是状态变更（版本 +1），
+        // 顺手把热键注册失败信息带回界面。
+        assert!(matches!(resp, Response::Snapshot(_)), "实得 {resp:?}");
         assert!((f.svc.state.config.ui.window_opacity - 0.42).abs() < 1e-6);
+    }
+
+    /// 快捷键注册失败必须随快照回传——静默失败等于「改了键位但
+    /// 按键没反应」的老 bug。
+    ///
+    /// 测试进程里没有托盘（没有可注册热键的窗口），`rebind_hotkeys`
+    /// 必然失败，正好用来验证这条链路。若这里变成 None，说明失败
+    /// 又被吞了。
+    #[test]
+    fn save_config_surfaces_hotkey_registration_failure() {
+        let mut f = fixture("save-cfg-hotkey");
+        let cfg = f.svc.state.config.clone();
+        let resp = handle(&f.core, &mut f.svc, Request::Cmd(Command::SaveConfig(cfg)));
+        let Response::Snapshot(snap) = resp else {
+            panic!("期望 Snapshot，实得 {resp:?}");
+        };
+        let err = snap
+            .hotkey_error
+            .expect("无托盘时注册必然失败，应带回失败信息");
+        assert!(err.contains("注册失败"), "信息应说明失败：{err}");
+        // 两个槽位都应出现在信息里（此处两个都注册不了）。
+        assert!(err.contains("显示主窗口"), "{err}");
+        assert!(err.contains("粘贴上一个条目"), "{err}");
     }
 
     /// 关掉监听：常驻进程要停掉捕获，并回报 `capturing = false`。

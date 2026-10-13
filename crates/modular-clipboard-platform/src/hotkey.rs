@@ -53,6 +53,48 @@ impl HotkeySpec {
         self.modifiers & MOD_NOREPEAT != 0
     }
 
+    /// 从配置里的 [`modular_clipboard_core::config::Hotkey`] 构造。
+    ///
+    /// 配置存的是**可读文本**（`key: "V"` / `"F5"`），而注册需要虚拟键码。
+    /// 转换集中在这里，避免调用方各自拼一套键名表。
+    ///
+    /// 一律带上 `MOD_NOREPEAT`：长按热键连发会把「唤一次界面」变成
+    /// 「一秒钟唤几十次」，界面表现为疯狂闪烁。
+    pub fn from_config(hk: &modular_clipboard_core::config::Hotkey) -> Result<Self> {
+        let mut mods = MOD_NOREPEAT;
+        if hk.ctrl {
+            mods |= MOD_CONTROL;
+        }
+        if hk.shift {
+            mods |= MOD_SHIFT;
+        }
+        if hk.alt {
+            mods |= MOD_ALT;
+        }
+        if hk.win {
+            mods |= MOD_WIN;
+        }
+        Self::from_key_str(mods, &hk.key)
+    }
+
+    /// 按主键名构造（支持 `V` / `5` / `F5`）。
+    pub fn from_key_str(modifiers: u32, key: &str) -> Result<Self> {
+        let t = key.trim();
+        // F1..F24
+        if let Some(rest) = t.strip_prefix(['f', 'F'])
+            && let Ok(n) = rest.parse::<u32>()
+            && (1..=24).contains(&n)
+        {
+            return Ok(Self::new(modifiers, 0x70 + n - 1));
+        }
+        let mut chars = t.chars();
+        let c = chars.next().ok_or_else(|| anyhow::anyhow!("主键为空"))?;
+        if chars.next().is_some() {
+            anyhow::bail!("主键 {key:?} 不是单个按键");
+        }
+        Self::from_key(modifiers, c)
+    }
+
     /// 把主键名（单个 ASCII 字母或数字）转成虚拟键码。
     ///
     /// 大小写都接受——用户输入 "Ctrl+V" 与 "ctrl+v" 都应可用。
@@ -76,10 +118,76 @@ pub const MOD_SHIFT: u32 = 0x0004;
 pub const MOD_WIN: u32 = 0x0008;
 pub const MOD_NOREPEAT: u32 = 0x4000;
 
-/// 默认唤起快捷键：`Ctrl+Shift+V`。
+/// 默认唤起快捷键：**Win+V**。
 ///
-/// 与主流剪贴板工具一致，用户肌肉记忆可直接迁移。
-pub const DEFAULT_HOTKEY: HotkeySpec = HotkeySpec::new(MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x56);
+/// 与 `Config::default()` 保持一致（那边才是配置权威）。
+/// 与 Windows 自带剪贴板历史同键位——接管它才能让换工具没有学习成本。
+///
+/// 注意：系统可能已经占用这个组合，那时注册会失败（只记日志，
+/// 不阻断运行），用户可以自己在设置里换。
+pub const DEFAULT_HOTKEY: HotkeySpec = HotkeySpec::new(MOD_WIN | MOD_NOREPEAT, 0x56);
+
+/// 从配置构造注册规格；键名无法解析时**回退到默认键**并记日志。
+///
+/// 配置里的键名是用户可编辑的文本（也可能是老版本写下的），
+/// 解析失败不该让常驻进程起不来，更不该让用户没有任何热键可用——
+/// 退到默认键位，用户想改在设置里改回来即可。
+pub fn spec_or_default(hk: &modular_clipboard_core::config::Hotkey) -> HotkeySpec {
+    match HotkeySpec::from_config(hk) {
+        Ok(spec) => spec,
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                fallback = %describe(DEFAULT_HOTKEY),
+                "快捷键配置无法解析，回退到默认键位"
+            );
+            DEFAULT_HOTKEY
+        }
+    }
+}
+
+/// 热键槽位。托盘按槽位注册/注销，改绑定时只动对应那个。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slot {
+    /// 显示 / 隐藏主窗口。
+    Toggle,
+    /// 粘贴上一条。
+    PastePrevious,
+}
+
+impl Slot {
+    /// Win32 热键 id。`RegisterHotKey` 用 id 区分同窗口内的多个热键。
+    pub const fn id(self) -> i32 {
+        match self {
+            Slot::Toggle => 0x0BEE,
+            Slot::PastePrevious => 0x0BEF,
+        }
+    }
+
+    /// 用户可见的槽位名。注册失败的信息会带上它——
+    /// 「某个快捷键注册失败」不告诉用户是哪一个，等于没说。
+    ///
+    /// 与设置界面的行标题保持一致（`paint.rs` 的快捷键卡片）。
+    pub const fn label(self) -> &'static str {
+        match self {
+            Slot::Toggle => "显示主窗口",
+            Slot::PastePrevious => "粘贴上一个条目",
+        }
+    }
+}
+
+/// 注册失败的用户可读信息。
+///
+/// **格式必须稳定**：设置界面靠「信息里包含该行当前的组合文本」
+/// 来判断是哪一行出了问题（见 `paint.rs` 的 Hotkey 渲染）。
+/// 启动注册与运行时重注册都用它拼，两处措辞才不会漂移。
+pub fn failed_message(slot: Slot, spec: HotkeySpec) -> String {
+    format!(
+        "{}：{} 注册失败（可能已被其它程序占用）",
+        slot.label(),
+        describe(spec)
+    )
+}
 
 /// 可读的组合键文本，用于设置界面展示与日志。
 pub fn describe(spec: HotkeySpec) -> String {
@@ -179,13 +287,44 @@ mod tests {
     }
 
     #[test]
-    fn default_hotkey_is_ctrl_shift_v() {
+    fn default_hotkey_is_win_v() {
         let d = DEFAULT_HOTKEY;
-        assert!(d.ctrl());
-        assert!(d.shift());
-        assert!(!d.alt());
+        assert!(d.win(), "默认应为 Win+V");
+        assert!(!d.ctrl());
+        assert!(!d.shift());
         assert!(d.no_repeat(), "应禁止长按连发");
         assert_eq!(d.vk, 0x56);
+    }
+
+    #[test]
+    fn slots_have_distinct_ids() {
+        assert_ne!(Slot::Toggle.id(), Slot::PastePrevious.id());
+    }
+
+    #[test]
+    fn from_config_maps_modifiers_and_key() {
+        use modular_clipboard_core::config::Hotkey;
+        let hk = Hotkey {
+            key: "F5".into(),
+            ctrl: true,
+            shift: true,
+            alt: false,
+            win: false,
+        };
+        let spec = HotkeySpec::from_config(&hk).unwrap();
+        assert!(spec.ctrl() && spec.shift() && !spec.alt() && !spec.win());
+        assert_eq!(spec.vk, 0x74, "F5 的虚拟键码是 0x74");
+        assert!(spec.no_repeat());
+    }
+
+    #[test]
+    fn from_key_str_accepts_letters_digits_and_fkeys() {
+        assert_eq!(HotkeySpec::from_key_str(0, "v").unwrap().vk, 0x56);
+        assert_eq!(HotkeySpec::from_key_str(0, "7").unwrap().vk, 0x37);
+        assert_eq!(HotkeySpec::from_key_str(0, "F1").unwrap().vk, 0x70);
+        assert_eq!(HotkeySpec::from_key_str(0, "f12").unwrap().vk, 0x7B);
+        assert!(HotkeySpec::from_key_str(0, "F25").is_err(), "超出 F24 应拒绝");
+        assert!(HotkeySpec::from_key_str(0, "中").is_err());
     }
 
     #[test]
@@ -220,7 +359,7 @@ mod tests {
 
     #[test]
     fn describe_is_readable() {
-        assert_eq!(describe(DEFAULT_HOTKEY), "Ctrl+Shift+V");
+        assert_eq!(describe(DEFAULT_HOTKEY), "Win+V");
         assert_eq!(describe(HotkeySpec::new(MOD_ALT | MOD_CONTROL, 0x41)), "Ctrl+Alt+A");
         assert_eq!(describe(HotkeySpec::new(0, 0x31)), "1");
     }
@@ -268,5 +407,48 @@ mod tests {
                 assert_eq!(a & b, 0, "修饰键位不应重叠");
             }
         }
+    }
+
+    #[test]
+    fn spec_or_default_falls_back_on_bad_key() {
+        use modular_clipboard_core::config::Hotkey;
+        let bad = Hotkey {
+            key: "中".into(),
+            ctrl: true,
+            shift: false,
+            alt: false,
+            win: false,
+        };
+        // 旧配置/手改配置里可能有解析不了的键名：不能没有热键，
+        // 也不能 panic——退回默认键位，用户改回来即可。
+        assert_eq!(spec_or_default(&bad), DEFAULT_HOTKEY);
+
+        let good = Hotkey {
+            key: "F5".into(),
+            ctrl: true,
+            shift: false,
+            alt: false,
+            win: false,
+        };
+        let spec = spec_or_default(&good);
+        assert_eq!(spec.vk, 0x74, "正常配置必须原样注册，不能退默认");
+        assert!(spec.ctrl());
+    }
+
+    #[test]
+    fn failed_message_names_slot_and_combo() {
+        // 格式是**契约**：设置界面靠「信息里包含该行当前组合文本」
+        // 定位是哪一行注册失败了（paint.rs 的 Hotkey 渲染）。
+        let msg = failed_message(Slot::Toggle, DEFAULT_HOTKEY);
+        assert!(msg.contains("显示主窗口"), "应含槽位名: {msg}");
+        assert!(msg.contains("Win+V"), "应含组合文本: {msg}");
+        assert!(msg.contains("占用"), "应说明可能的原因: {msg}");
+
+        let msg2 = failed_message(
+            Slot::PastePrevious,
+            HotkeySpec::new(MOD_CONTROL, 0x56),
+        );
+        assert!(msg2.contains("粘贴上一个条目"), "{msg2}");
+        assert!(msg2.contains("Ctrl+V"), "{msg2}");
     }
 }

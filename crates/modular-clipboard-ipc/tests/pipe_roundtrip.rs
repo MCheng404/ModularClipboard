@@ -24,6 +24,7 @@ fn snapshot(version: DataVersion) -> Snapshot {
         groups: Vec::new(),
         stats: DropStats::default(),
         capturing: true,
+        hotkey_error: Some("显示主窗口：Win+V 注册失败（测试用）".into()),
         config: Config::default(),
         list_version: 3,
     }
