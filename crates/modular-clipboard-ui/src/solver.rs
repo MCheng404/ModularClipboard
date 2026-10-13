@@ -301,6 +301,38 @@ pub fn needed_width(ws: &Workspace) -> f32 {
     sum + gaps + CARD_AREA_INSET * 2.0 + 24.0
 }
 
+/// 「舒适」宽度：每张参与布局的卡片给一个能正常显示的宽度。
+///
+/// 与 [`needed_width`] 的区别：那个用 `target_width`（未拖过时等于
+/// `min_width`），只保证「不压缩」；本函数用 `min_width × 1.75`（取整到
+/// 10pt），保证「看得舒服」。
+///
+/// # 为什么需要它
+///
+/// 切到「独立分栏」时两栏各按 min_width 算， History 160 + Pinned 120
+/// ≈ 340pt，而默认窗口 520pt ⇒ `resize_width_target` 判定「够宽」，
+/// 窗口**根本不动**——用户看不到「切换后自动放宽」这件事发生。
+/// 舒适宽度（≈520pt）会在窗口更窄时把它抬到两栏都能用的程度。
+pub fn comfortable_width(ws: &Workspace) -> f32 {
+    let layout = layout_demand(ws);
+    let n = layout.iter().filter(|&&w| w > 0.0).count();
+    if n == 0 {
+        return 0.0;
+    }
+    let gaps = ws.gap.max(0.0) * (n as f32 - 1.0);
+    let sum: f32 = layout
+        .iter()
+        .map(|&w| {
+            if w > 0.0 {
+                (w * 1.75 / 10.0).round() * 10.0
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    sum + gaps + CARD_AREA_INSET * 2.0 + 24.0
+}
+
 /// 把解写回工作区。
 ///
 /// # 为什么长度不等要**拒绝**而不是 `zip` 静默截断
@@ -545,6 +577,23 @@ mod tests {
     fn needed_width_is_zero_without_docked_cards() {
         let ws = Workspace::empty();
         assert_eq!(needed_width(&ws), 0.0);
+    }
+
+    /// 舒适宽度必须**大于**最小需求，否则切独立分栏时它兜不了底
+    /// （默认窗口 520pt 会被 needed_width 判「够宽」而一动不动）。
+    #[test]
+    fn comfortable_width_exceeds_minimum_demand() {
+        let mut ws = Workspace::empty();
+        ws.add(CardKind::History);
+        ws.add(CardKind::Pinned);
+        let min = needed_width(&ws);
+        let comfy = comfortable_width(&ws);
+        assert!(
+            comfy > min,
+            "舒适宽度 {comfy} 应大于最小需求 {min}，否则兜底无意义"
+        );
+        // 空工作区同样给 0（不留无意义正数）。
+        assert_eq!(comfortable_width(&Workspace::empty()), 0.0);
     }
 
     #[test]

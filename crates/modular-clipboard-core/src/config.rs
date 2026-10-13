@@ -615,12 +615,51 @@ impl Config {
         }
         let raw = std::fs::read_to_string(path)?;
         match serde_json::from_str(&raw) {
-            Ok(cfg) => Ok(cfg),
+            Ok(cfg) => {
+                let mut cfg: Self = cfg;
+                cfg.migrate();
+                Ok(cfg)
+            }
             Err(err) => {
                 tracing::warn!(%err, "配置解析失败，回退默认值: {}", path.display());
                 Self::backup_corrupt(path, &raw);
                 Ok(Self::default())
             }
+        }
+    }
+
+    /// 升级旧版本留下的、已证实不可用的配置值。
+    ///
+    /// # `Ctrl+Win+V` → `Ctrl+Alt+V`（paste 槽位）
+    ///
+    /// 2026-10-13 之前「粘贴上一条」的默认值是 `Ctrl+Win+V`，实测它在本机
+    /// （也很可能在多数 Windows 上）被系统/外部软件占用——
+    /// `RegisterHotKey` 回 `ERROR_HOTKEY_ALREADY_REGISTERED`，照它出厂的
+    /// 用户这个快捷键是死的，按了只会「弹个软件窗口出来」（实际触发了
+    /// 别的绑定）。新默认改为实测可用的 `Ctrl+Alt+V`。
+    ///
+    /// **只迁移恰好等于旧默认的值**：用户自己改过的绑定不动（万一他的
+    /// 机器上 Ctrl+Win+V 没被占用呢）。只做一次，不写盘也行——下一次
+    /// 保存设置时新值自然落盘。
+    fn migrate(&mut self) {
+        let legacy = Hotkey {
+            key: "V".into(),
+            ctrl: true,
+            shift: false,
+            alt: false,
+            win: true,
+        };
+        if self.hotkey_paste_previous == legacy {
+            tracing::info!(
+                "paste 槽位默认值 Ctrl+Win+V 实测被系统/外部软件占用，已迁移到 Ctrl+Alt+V"
+            );
+            self.hotkey_paste_previous = Hotkey {
+                key: "V".into(),
+                ctrl: true,
+                shift: false,
+                alt: true,
+                win: false,
+            };
         }
     }
 
@@ -683,6 +722,48 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧默认 `Ctrl+Win+V` 必须被迁移到实测可用的 `Ctrl+Alt+V`。
+    ///
+    /// 照旧默认出厂的用户「粘贴上一条」是死的（组合被系统占用），
+    /// 见 [`Config::migrate`] 的文档。
+    #[test]
+    fn migrate_replaces_legacy_paste_default() {
+        // 手工把 paste 打回旧默认，模拟老 config.json。
+        let mut cfg = Config {
+            hotkey_paste_previous: Hotkey {
+                key: "V".into(),
+                ctrl: true,
+                shift: false,
+                alt: false,
+                win: true,
+            },
+            ..Config::default()
+        };
+        cfg.migrate();
+        assert_eq!(cfg.hotkey_paste_previous.display(), "Ctrl+Alt+V");
+    }
+
+    /// 用户自己改过的绑定**不**被迁移——万一他的机器上旧值没被占用。
+    #[test]
+    fn migrate_leaves_user_chosen_bindings_alone() {
+        let mut cfg = Config {
+            hotkey_paste_previous: Hotkey {
+                key: "C".into(),
+                ctrl: true,
+                shift: true,
+                alt: false,
+                win: false,
+            },
+            ..Config::default()
+        };
+        cfg.migrate();
+        assert_eq!(
+            cfg.hotkey_paste_previous.display(),
+            "Ctrl+Shift+C",
+            "非旧默认值不该被动"
+        );
+    }
 
     #[test]
     fn hotkey_display_is_ordered() {

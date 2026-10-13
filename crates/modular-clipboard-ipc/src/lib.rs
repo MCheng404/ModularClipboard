@@ -27,5 +27,8 @@ pub use protocol::{
     Command, DataVersion, PROTOCOL_VERSION, Request, Response, Snapshot,
 };
 pub use server::{Connection, Server};
-pub use instance::{UiInstanceGuard, UI_WINDOW_TITLE, request_show_ui, ui_is_running, ui_window_exists};
+pub use instance::{
+    UiInstanceGuard, UI_WINDOW_TITLE, hide_ui_window, request_show_ui, ui_is_running,
+    ui_window_exists, ui_window_hwnd, ui_window_visible,
+};
 pub use transport::pipe_name;

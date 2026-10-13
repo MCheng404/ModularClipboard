@@ -936,9 +936,29 @@ impl LocalBackend {
 
     fn copy_and_paste(&mut self, state: &mut AppState, id: EntryId) -> Result<()> {
         self.copy_item(state, id)?;
-        modular_clipboard_platform::auto_paste(Duration::from_millis(250))?;
-        Ok(())
+        // 目标窗口在**写剪贴板的这一刻**抓住：此刻前台还是用户按热键时
+        // 正在用的程序。等 250ms 延迟结束再查（auto_paste 内部的老做法）
+        // 用户可能已经切走，按键会粘到错误的窗口上。
+        let target = modular_clipboard_platform::foreground_window();
+        // 前台是我们自己的界面窗口时不发按键：发过去只会把它激活
+        // （用户看到「软件窗口被弹到前面」而不是粘贴——正是实测反馈的
+        // 现象）。剪贴板此时已经写好，用户手动 Ctrl+V 即可。
+        if Some(target) == modular_clipboard_ipc::ui_window_hwnd() {
+            tracing::debug!("前台是本程序界面窗口，跳过自动发送按键（剪贴板已写入）");
+            return Ok(());
         }
+        // 按键发送放后台线程：auto_paste 内含 250ms 等待（让目标窗口
+        // 完成 OLE 握手），在常驻进程主循环里同步跑会连带停掉托盘
+        // 事件与 IPC 250ms。
+        std::thread::spawn(move || {
+            if let Err(e) =
+                modular_clipboard_platform::auto_paste_to(Some(target), Duration::from_millis(250))
+            {
+                tracing::warn!(%e, "自动粘贴失败");
+            }
+        });
+        Ok(())
+    }
 
     fn run_action(
         &mut self,

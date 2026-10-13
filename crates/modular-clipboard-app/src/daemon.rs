@@ -231,8 +231,23 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
             for ev in t.poll() {
                 match ev {
                     // 托盘左键与「显示」热键是同一个意图：把界面叫出来。
-                    TrayEvent::Show | TrayEvent::Hotkey => {
+                    TrayEvent::Show => {
+                        // 托盘左键保持「显示」语义：点它就是要把窗口叫出来。
                         core.show_ui();
+                    }
+                    TrayEvent::Hotkey => {
+                        // Toggle 语义：窗口可见就隐藏、不可见就显示。
+                        // 系统 Win+V 就是 toggle，用户预期「再按一次收起
+                        // 来」——只唤不藏会让热键变成单向的「显示」。
+                        if modular_clipboard_ipc::ui_window_visible() {
+                            if !modular_clipboard_ipc::hide_ui_window() {
+                                // 隐藏失败（窗口刚好在销毁）就别较劲，
+                                // 退回「确保显示」。
+                                core.show_ui();
+                            }
+                        } else {
+                            core.show_ui();
+                        }
                     }
                     // 「粘贴上一条」不经过界面：直接把最新一条写回剪贴板
                     // 并发 Ctrl+V 给前台窗口——走界面就太慢了。
@@ -324,12 +339,32 @@ fn set_hotkey_error(core: &Core, failed: Vec<String>) {
 /// 公开：单进程模式的界面进程也要维护同一份快照。
 pub fn sync_mini_items(service: &Service, cell: &tray::MiniItems) {
     let n = service.state.config.mini_panel.effective_count();
+    // 每项前缀「序号 + 置顶标记」：系统菜单是唯一能承载的元信息通道
+    // （菜单项只有一行文本，没有副标题/图标）。序号让用户知道第几项
+    // 对应第几条；置顶标记用 ASCII 的 `*` 而不是 `★`——后者依赖系统
+    // 字体是否带该字形，缺字形会显示成豆腐块。
+    //
+    // CAUTION: 前缀占了宽度，预览必须相应缩短，否则菜单项过宽会被
+    // 系统在屏幕边缘折行/截断（菜单不会省略号，只会难看）。
+    const PREVIEW_CHARS: usize = 40;
     let snapshot: Vec<(i64, String)> = service
         .state
         .items
         .iter()
         .take(n)
-        .map(|i| (i.id, i.preview.chars().take(48).collect()))
+        .enumerate()
+        .map(|(idx, i)| {
+            let mark = if i.pinned { "*" } else { " " };
+            (
+                i.id,
+                format!(
+                    "{}{}. {}",
+                    mark,
+                    idx + 1,
+                    i.preview.chars().take(PREVIEW_CHARS).collect::<String>()
+                ),
+            )
+        })
         .collect();
     if let Ok(mut g) = cell.lock() {
         *g = snapshot;

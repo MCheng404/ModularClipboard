@@ -36,17 +36,56 @@ pub fn win_key_down() -> bool {
 /// 原理：先把内容写入剪贴板，等待目标应用完成 OLE 数据握手后，
 /// 再向前台窗口发送 Ctrl+V。这是剪贴板管理器「一键粘贴」的标准做法。
 ///
-/// 延迟是必要���：若在写剪贴板后立即发送按键，Office、浏览器等应用
+/// 延迟是必要的：若在写剪贴板后立即发送按键，Office、浏览器等应用
 /// 尚未完成粘贴事件处理，按键会丢失。250ms 是兼顾可靠性的经验值。
+/// 当前前台窗口句柄（`0` = 没有前台窗口）。
+///
+/// 单独暴露是为了让调用方在**事件发生的那一刻」抓住目标窗口：
+/// 常驻进程收到「粘贴上一条」时前台还是用户正在用的程序，等 250ms
+/// 后再查（`auto_paste` 内部）可能已经是别的窗口了。
+#[cfg(windows)]
+pub fn foreground_window() -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe { GetForegroundWindow().0 as isize }
+}
+
+#[cfg(not(windows))]
+pub fn foreground_window() -> isize {
+    0
+}
+
+/// 自动粘贴：把剪贴板内容以 Ctrl+V 发给当前前台窗口。
 #[cfg(windows)]
 pub fn auto_paste(delay: Duration) -> Result<()> {
+    auto_paste_to(Some(foreground_window()), delay)
+}
+
+#[cfg(not(windows))]
+pub fn auto_paste(_delay: Duration) -> Result<()> {
+    tracing::warn!("当前平台尚未实现自动粘贴");
+    Ok(())
+}
+
+/// 自动粘贴到**指定窗口**（`None` = 当前前台）。
+///
+/// # 为什么要显式指定
+///
+/// 调用方（常驻进程）在收到热键的那一刻前台还是用户正在用的程序；
+/// 若等内部 250ms 延迟结束再查一次，用户可能已经切走，按键会粘到
+/// 错误的窗口上。
+#[cfg(windows)]
+pub fn auto_paste_to(target: Option<isize>, delay: Duration) -> Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
         VIRTUAL_KEY, VK_CONTROL, VK_V,
     };
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
 
-    let target = unsafe { GetForegroundWindow() };
+    let target = match target {
+        Some(raw) if raw != 0 => HWND(raw as *mut core::ffi::c_void),
+        _ => unsafe { GetForegroundWindow() },
+    };
     if target.0.is_null() {
         tracing::debug!("无前台窗口，跳过自动粘贴");
         return Ok(());
@@ -82,12 +121,6 @@ pub fn auto_paste(delay: Duration) -> Result<()> {
             tracing::warn!("SendInput 仅发送 {}/{} 个事件", sent, inputs.len());
         }
     }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn auto_paste(_delay: Duration) -> Result<()> {
-    tracing::warn!("当前平台尚未实现自动粘贴");
     Ok(())
 }
 
@@ -379,4 +412,10 @@ mod tests {
     fn autostart_query_does_not_panic() {
         let _ = is_autostart_enabled();
     }
+}
+
+#[cfg(not(windows))]
+pub fn auto_paste_to(_target: Option<isize>, _delay: Duration) -> Result<()> {
+    tracing::warn!("当前平台尚未实现自动粘贴");
+    Ok(())
 }

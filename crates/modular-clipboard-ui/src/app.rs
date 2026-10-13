@@ -32,6 +32,7 @@ use modular_clipboard_app::Service;
 use modular_clipboard_gfx::frame::{FrameRenderer, PipelineBundle, PresentResult};
 use modular_clipboard_gfx::window::{EventLoop, Window, WindowEvent};
 use modular_clipboard_gfx::Gpu;
+use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
 
 use crate::presence::{self, CloseDecision, Resident};
 use crate::renderer::{Painter, WINDOW_TITLE};
@@ -523,6 +524,30 @@ fn run_mode(
             break;
         }
 
+        // ---- 0.5 窗口可见性对账 ----
+        //
+        // `hidden` 是本进程的标志，但**外部也能改可见性**：常驻进程的
+        // 热键 toggle 会直接 `ShowWindow(SW_HIDE)` 收起本窗口，
+        // `request_show_ui`（托盘/重复双击）又会直接 `ShowWindow(SW_SHOW)`
+        // 把它显示出来。两边不同步的后果：
+        // - 被外部隐藏后标志仍为 false ⇒ 继续渲染一个不可见的窗口，
+        //   白烧 GPU（正是本循环 `hidden` 分支要避免的）；
+        // - 被外部显示后标志仍为 true ⇒ 窗口可见却停在旧帧不渲染，
+        //   用户看到一扇「卡住」的窗。
+        // 每帧以 Win32 的真实状态为准。
+        let visible_now = unsafe { IsWindowVisible(window.hwnd()) }.as_bool();
+        if hidden && visible_now {
+            // 被外部（热键 / 托盘）显示：恢复正常渲染。
+            // 尺寸可能已变（最大化/还原切换），与托盘唤起同理立刻同步，
+            // 避免用旧 framebuffer present 一帧。
+            hidden = false;
+            rebuild(&mut fr, &mut painter)?;
+            ctx.request_repaint();
+        } else if !hidden && !visible_now {
+            // 被外部隐藏：转入隐藏态（不渲染，只轮询等下一次唤起）。
+            hidden = true;
+        }
+
         // ---- 1. 事件 ----
         //
         // `saw_close` 与 `wm_quit` 必须分开记：`gfx::window` 把
@@ -568,14 +593,25 @@ fn run_mode(
                     // 帧循环对 `Focused` 事件**没有任何分支** ——
                     // 用户开关它、落盘了、重启了，什么都不会发生。
                     //
-                    // ⚠️ 隐藏**必须有托盘兜底**，与 `decide_on_close`
-                    // 的保护一致：没有托盘时隐藏窗口 = 程序彻底消失，
-                    // 用户只能任务管理器强杀。
+                    // ⚠️ 隐藏**必须有唤回路径**兜底，与 `decide_on_close`
+                    // 的保护一致：没有任何入口能把窗口叫回来时，隐藏
+                    // 等于程序消失，用户只能任务管理器强杀。
+                    //
+                    // ⚠️ 判据**不能**只写 `resident.is_some()`：常驻进程
+                    // 模式下界面进程自己不建托盘（托盘归 daemon），那个
+                    // 判断恒为 false——开关在默认的双进程启动下永远失效
+                    // （2026-10-13 用户实测）。托盘在**本进程**（单进程
+                    // 模式）或在**常驻进程**（远端模式）都算有兜底。
                     let gained = *gained;
+                    // 设置窗口开着时不躲：它是本进程的附属顶层窗口，
+                    // 用户点过去同样让主窗口失焦——那种「失焦」不是切到
+                    // 别的程序。躲起来只会剩一扇设置窗漂在桌上，
+                    // 像主程序已经没了。
                     if !gained
                         && app.svc.state.config.ui.hide_on_focus_lost
-                        && resident.is_some()
+                        && (resident.is_some() || remote)
                         && !hidden
+                        && settings_win.is_none()
                     {
                         presence::hide_window(window.hwnd());
                         hidden = true;
@@ -2066,11 +2102,21 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         // 从配置读过一次，不跟着变的话 `solve_scaled`
                         // 会按比例压缩卡片，用户看到的是「卡片被挤扁」。
                         //
+                        // 切到「独立分栏」时额外用**舒适宽度**兜底：
+                        // needed_width 只按 min_width 算（两栏约 340pt），
+                        // 默认窗口 520pt 会被判「够宽」而一动不动——
+                        // 用户要的是「切换后自动放宽以显示更多内容」。
+                        //
                         // 这里只**记下需求**，真正的 resize 留给帧循环：
                         // `apply_ops` 拿不到 `ppp`（DPI 换算要用），
                         // 且窗口对象不在 `self` 里。
-                        self.paint_state.resize_width_to =
-                            Some(crate::solver::needed_width(&self.ws));
+                        let needed = crate::solver::needed_width(&self.ws);
+                        let comfortable = if mode == crate::card::PinnedMode::OwnCard {
+                            crate::solver::comfortable_width(&self.ws)
+                        } else {
+                            needed
+                        };
+                        self.paint_state.resize_width_to = Some(needed.max(comfortable));
                     }
                 }
                 Op::ToggleSettings => {
@@ -2487,6 +2533,68 @@ mod resize_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// 背景层实度必须随「主题 × 背景明暗冲突」双向调整。
+    ///
+    /// 这是磨砂/半透明**可读性**的唯一判据（浅色主题 + 纯黑桌面是最
+    /// 常见的崩坏场景），且它是纯函数——不测就等于把「文字看不看得清」
+    /// 交给运气。
+    #[test]
+    fn backdrop_alpha_adapts_to_theme_background_mismatch() {
+        // 浅色主题 + 纯黑背景：冲突最大，背景层要被推到接近上限。
+        let light_on_black = backdrop_alpha(0.6, Some(0.0), false);
+        // 浅色主题 + 纯白背景：同向，保持用户要的通透。
+        let light_on_white = backdrop_alpha(0.6, Some(1.0), false);
+        assert!(
+            light_on_black > light_on_white + 60,
+            "浅色配黑底({light_on_black}) 应明显比配白底({light_on_white}) 更实"
+        );
+
+        // 暗色主题方向相反：白底才是冲突方。
+        let dark_on_white = backdrop_alpha(0.6, Some(1.0), true);
+        let dark_on_black = backdrop_alpha(0.6, Some(0.0), true);
+        assert!(
+            dark_on_white > dark_on_black + 60,
+            "暗色配白底({dark_on_white}) 应明显比配黑底({dark_on_black}) 更实"
+        );
+    }
+
+    /// 上限 0.88（不是 1.0）：全实就成了纯色底，白改一场。
+    #[test]
+    fn backdrop_alpha_never_reaches_full_opacity() {
+        // 基准已经是 1.0 且明暗完全冲突时，仍必须留一点透出。
+        let worst = backdrop_alpha(1.0, Some(if false { 0.0 } else { 1.0 }), false);
+        assert!(
+            worst <= (0.88_f32 * 255.0).round() as u8,
+            "最坏情况 {worst} 不该超过 0.88 的 alpha"
+        );
+    }
+
+    /// 还没捕获到背景（首帧/最小化）时按用户基准走，别凭空变实。
+    #[test]
+    fn backdrop_alpha_falls_back_to_base_without_capture() {
+        let base = 0.5_f32;
+        let got = backdrop_alpha(base, None, false);
+        assert_eq!(got, (base * 255.0).round() as u8);
+    }
+
+    /// 输出恒被钳在 [0.30, 0.88]：越界输入（用户滑块给 2.0 之类）必须
+    /// 被吃掉，否则调色板变体拿到越界 alpha。
+    #[test]
+    fn backdrop_alpha_clamps_out_of_range_input() {
+        // 无捕获时下限是基准钳位 0.1。
+        let low = backdrop_alpha(2.0, None, false);
+        assert!(
+            low >= (0.1_f32 * 255.0).round() as u8,
+            "base=2.0 无捕获应被钳到基准下限（得到 {low}）"
+        );
+        // 有捕获时下限抬到 0.30（可读性底线）。
+        let with_cap = backdrop_alpha(0.0, Some(0.5), false);
+        assert!(
+            with_cap >= (0.30_f32 * 255.0).round() as u8,
+            "有捕获时下限 0.30（得到 {with_cap}）"
+        );
+    }
 
     /// 最小化窗口的坐标必须在**任何常见缩放**下都被拒绝。
     ///

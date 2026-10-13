@@ -110,6 +110,64 @@ pub fn ui_window_exists() -> bool {
     matches!(unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) }, Ok(h) if !h.is_invalid())
 }
 
+/// 主窗口句柄（`None` = 窗口不存在）。
+///
+/// 常驻进程的「粘贴上一条」用它排除**自己的界面窗口**：前台若是它，
+/// 按键发过去只会激活自己（用户看到「软件窗口被弹到前面」而不是粘贴）。
+pub fn ui_window_hwnd() -> Option<isize> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let wide: Vec<u16> = UI_WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    match unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) } {
+        Ok(h) if !h.is_invalid() => Some(h.0 as isize),
+        _ => None,
+    }
+}
+
+/// 主窗口当前是否**可见**（不只是存在）。///
+/// 界面进程 `SW_HIDE` 后窗口仍存在（`ui_window_exists` 为 true）但
+/// 不可见。常驻进程的热键 toggle 据此决定「显示」还是「隐藏」：
+/// 找不到窗口同样算不可见——那种情况下调用方会去启动它。
+pub fn ui_window_visible() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, IsWindowVisible};
+
+    let wide: Vec<u16> = UI_WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    match unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) } {
+        Ok(h) if !h.is_invalid() => unsafe { IsWindowVisible(h) }.as_bool(),
+        _ => false,
+    }
+}
+
+/// 隐藏主窗口（`SW_HIDE`），返回是否找到了窗口。
+///
+/// 界面进程的帧循环仍在跑（隐藏态只轮询托盘事件、不渲染），
+/// 下一次唤起由 [`request_show_ui`] 完成。它的 `0.5 可见性对账`
+/// 会把本进程的 `hidden` 标志与这里的操作对齐。
+pub fn hide_ui_window() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_HIDE};
+
+    let wide: Vec<u16> = UI_WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    match unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) } {
+        Ok(h) if !h.is_invalid() => {
+            let _ = unsafe { ShowWindow(h, SW_HIDE) };
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
