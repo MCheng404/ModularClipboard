@@ -2672,6 +2672,10 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                         f.state.push(Op::SetHotkeyText { slot: *slot, text });
                         changed = true;
                     }
+                    // 输入框与按钮之间留 8pt：设置卡片把
+                    // `item_spacing.x` 归了 0（行与行才够呼吸），
+                    // 同行控件零间距会挤成一团（用户实测反馈）。
+                    ui.add_space(8.0);
                     if ui.small_button("录制").clicked() {
                         f.state.push(Op::StartRecording(*slot));
                     }

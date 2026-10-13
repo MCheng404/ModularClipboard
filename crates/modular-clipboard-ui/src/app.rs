@@ -1734,16 +1734,38 @@ impl App {
         // 退出收尾统一由帧循环退出后的 `App::shutdown()` 负责。
     }
 
-    /// 录制模式下捕获按键，生成新的快捷键绑定。
-    ///
-    /// # 为什么要在 UI 线程里做
-    ///
-    /// 全局热键的注册在托盘/常驻进程，但**录制**必须在界面这边：
-    /// 键是从 egui 的输入事件里读的，而输入只属于窗口所在的进程。
-    /// 录完写进配置，常驻进程收到配置保存后会自己重注册
-    /// （见 `app::daemon::rebind_hotkeys`）。
-    fn capture_recording(&mut self, ctx: &egui::Context) {
-        let Some(slot) = self.paint_state.hotkey_recording else {
+/// 修饰键的**物理键**变体。
+///
+/// egui 0.36 的 `Key` 枚举含这些（eframe 从 winit 的物理键映射而来），
+/// 而修饰键的逻辑状态在 `Event::Key::modifiers` 里——两者都会来。
+/// 录制时按到修饰键本身必须忽略：不过滤就会把它当成「主键」，
+/// `name()` 返回 `ControlLeft` 这类多字符文本，于是弹
+/// 「不支持把 ControlLeft 设为快捷键」并**退出录制态**，
+/// 用户接下来的组合再也录不进去（2026-10-13 用户实测）。
+fn is_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
+}
+
+/// 录制模式下捕获按键，生成新的快捷键绑定。
+///
+/// # 为什么要在 UI 线程里做
+///
+/// 全局热键的注册在托盘/常驻进程，但**录制**必须在界面这边：
+/// 键是从 egui 的输入事件里读的，而输入只属于窗口所在的进程。
+/// 录完写进配置，常驻进程收到配置保存后会自己重注册
+/// （见 `app::daemon::rebind_hotkeys`）。
+fn capture_recording(&mut self, ctx: &egui::Context) {
+    let Some(slot) = self.paint_state.hotkey_recording else {
             return;
         };
 
@@ -1762,16 +1784,15 @@ impl App {
                     modifiers,
                     pressed: true,
                     ..
-                } => Some((*key, *modifiers)),
+                } if !Self::is_modifier_key(*key) => Some((*key, *modifiers)),
                 _ => None,
             })
         });
         let Some((key, mods)) = captured else {
             return;
         };
-        // egui 0.36 的 `Key` 枚举**不含**修饰键（只有 Modifiers 里有），
-        // 所以拿到的一定是主键；但仍要挡掉方向键这类非字符键——
-        // 它们能触发事件，却不适合当快捷键。
+        // 仍要挡掉方向键这类非字符键——它们能触发事件，却不适合当快捷键。
+        // （修饰键已在上面过滤掉，见 `is_modifier_key`。）
         let name = key.name();
         let mut chars = name.chars();
         let _first = chars.next();
@@ -2693,6 +2714,90 @@ mod tests {
         assert_eq!(hotkey.key, "K", "主键应按名原样记录");
         assert!(hotkey.ctrl && hotkey.shift, "按住的修饰键应捕获：{hotkey:?}");
         assert!(!hotkey.alt && !hotkey.win, "没按的修饰键不该被带上：{hotkey:?}");
+
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 录制中按到**修饰键本身**必须被忽略——它不是「主键」。
+    ///
+    /// egui 0.36 的 `Key` 枚举含 ControlLeft / ShiftLeft / SuperLeft 等
+    /// **物理键**变体（eframe 从 winit 映射而来），修饰键的逻辑状态则在
+    /// `Event::Key::modifiers` 里，两者都会产生事件。不过滤的后果：
+    /// 用户按字母 → 按 Ctrl → 录到的是「ControlLeft」→ 弹
+    /// 「不支持把 ControlLeft 设为快捷键」并**退出录制态**，
+    /// 后面的组合再也录不进去（2026-10-13 用户实测反馈）。
+    #[test]
+    fn recording_ignores_modifier_key_presses() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-hk-mods-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        app.paint_state.hotkey_recording = Some(crate::paint::HotkeySlot::Toggle);
+
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        // 跑一帧并注入一个按键事件；返回本帧收集到的 Op。
+        let frame = |app: &mut App, ev: egui::Event| {
+            let input = egui::RawInput {
+                screen_rect: Some(rect),
+                time: Some(1.0),
+                events: vec![ev],
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                app.capture_recording(ui.ctx());
+            });
+            out.textures_delta.clear();
+            std::mem::take(&mut app.paint_state.ops)
+        };
+        let key = |key: egui::Key, ctrl: bool, shift: bool| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl,
+                shift,
+                ..Default::default()
+            },
+        };
+
+        // 帧 1：Ctrl 物理键（modifiers.ctrl 为真）→ 必须被忽略。
+        let ops = frame(&mut app, key(egui::Key::ControlLeft, true, false));
+        assert!(
+            ops.is_empty(),
+            "按修饰键本身不该产出任何 Op，实得 {ops:?}"
+        );
+        assert_eq!(
+            app.paint_state.hotkey_recording,
+            Some(crate::paint::HotkeySlot::Toggle),
+            "修饰键必须被忽略，录制态不能被打断"
+        );
+
+        // 帧 2：Shift 物理键 → 同样忽略。
+        let ops = frame(&mut app, key(egui::Key::ShiftRight, true, true));
+        assert!(ops.is_empty(), "Shift 物理键同样该被忽略，实得 {ops:?}");
+        assert_eq!(
+            app.paint_state.hotkey_recording,
+            Some(crate::paint::HotkeySlot::Toggle),
+        );
+
+        // 帧 3：主键 K（带着 ctrl+shift）→ 正常录到 Ctrl+Shift+K。
+        let ops = frame(&mut app, key(egui::Key::K, true, true));
+        let Some(crate::paint::Op::SetHotkey { hotkey, .. }) = ops
+            .iter()
+            .find(|o| matches!(o, crate::paint::Op::SetHotkey { .. }))
+        else {
+            panic!("修饰键之后的主键应被录到，实得 {ops:?}");
+        };
+        assert_eq!(hotkey.key, "K");
+        assert!(hotkey.ctrl && hotkey.shift, "修饰键应来自 modifiers：{hotkey:?}");
+        assert_eq!(
+            app.paint_state.hotkey_recording, None,
+            "录完应退出录制态"
+        );
 
         app.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
