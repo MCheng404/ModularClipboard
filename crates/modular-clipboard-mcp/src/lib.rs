@@ -1,7 +1,7 @@
 //! modular-clipboard MCP 服务。
 //!
-//! 提供 Model Context Protocol（JSON-RPC 2.0）服务，暴露 8 个界面
-//! 自动化工具。两种传输：
+//! 提供 Model Context Protocol（JSON-RPC 2.0）服务，暴露 10 个界面
+//! 自动化工具（每个工具可在设置中单独开关）。两种传输：
 //! - **stdio**：`--mcp-server`，每行一个 JSON，由 MCP 客户端 spawn
 //! - **Streamable HTTP**：`--mcp-http`，监听 host:port，Bearer token 鉴权
 //!

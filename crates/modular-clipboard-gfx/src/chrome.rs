@@ -21,24 +21,29 @@
 //! 所以 [`handle_non_client`] 从 `wnd_proc` 调用，
 //! `poll()` 对 `WM_NCHITTEST` **不做任何事**（照常 `DispatchMessageW`）。
 //!
-//! # 拖动方案：交给系统（方案 A）
+//! # 拖动方案：命中测试仍借系统，移动由我们自己驱动（非模态）
 //!
 //! 命中测试在拖动区返回 `HTCAPTION`，系统随即把下一次按下转成
-//! `WM_NCLBUTTONDOWN(wParam = HTCAPTION)`，而 `DefWindowProcW`
-//! 对它会自动进入**系统原生的移动循环**。
+//! `WM_NCLBUTTONDOWN(wParam = HTCAPTION)`。
 //!
-//! 因此**不需要** `ReleaseCapture()` + `SendMessageW(WM_NCLBUTTONDOWN,
-//! HTCAPTION, 0)` 那套手工模拟。手工模拟反而有两个坑：
+//! **但不能让 `DefWindowProcW` 处理这条消息**——它会进入一个
+//! **系统原生的模态移动循环**，该循环在松开鼠标前独占消息分发。
+//! 本项目的 Vulkan 帧循环跑在普通消息循环里，模态移动期间完全不执行，
+//! 于是窗口在动、**背景磨砂却停在拖动开始前那一帧**：自研磨砂每帧都要
+//! 重新抓取窗口身后的桌面，帧循环一停，捕获内容就过期。
 //!
-//! 1. `SendMessageW` 会**重入** `wnd_proc`，若不加标志位守卫就是无限递归；
-//! 2. 手写 `SetWindowPos` 循环要自己实现跨显示器边界、边缘吸附、
-//!    拖到顶部最大化、多显示器断开后的坐标重映射。
+//! 因此 [`handle_non_client`] 拦截 `WM_NCLBUTTONDOWN(HTCAPTION)`：
+//! 不转发 `DefWindowProcW`（杜绝模态循环），改用 `SetCapture` 接管指针；
+//! 随后的 `WM_NCMOUSEMOVE` / `WM_MOUSEMOVE` 走**普通消息队列**，
+//! 我们在其中按光标位移 `SetWindowPos` 移动窗口。这样主帧循环每轮照常
+//! 抓取、模糊、present，拖动时背景实时跟随。
 //!
-//! 「不使用系统窗口」指的是不画系统标题栏的**外观**，不是不用系统的
-//! **移动机制**。原生手感（吸附、跨屏、拖顶最大化）是白拿的，不要重新发明。
+//! 边缘 resize 仍交给系统：`WM_NCLBUTTONDOWN` 的 wParam 是 `HTLEFT`
+//! 等时**不拦截**，由 `DefWindowProcW` 进入系统缩放循环。
+//! 双击标题栏最大化 / 还原由我们自己调 `ShowWindow` 保留。
 //!
-//! resize 同理：边缘返回 `HTLEFT`/`HTTOPLEFT` 等，`DefWindowProcW`
-//! 自动进入系统原生缩放循环。
+//! 代价：失去 Aero Snap「拖到屏幕边缘自动分屏」（系统模态循环独有，
+//! 非模态自移无法白拿）。跨显示器的负坐标移动天然可用。
 //!
 //! # 状态是 **per-HWND** 的
 //!
@@ -73,10 +78,24 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
+    GetClientRect, GetCursorPos, GetWindowRect, IsZoomed, SetWindowPos, ShowWindow,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_RESTORE,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
     HTTOP, HTTOPLEFT, HTTOPRIGHT, WM_NCHITTEST,
 };
+
+// 非客户区指针消息（裸常量，避免 crate 枚举类型差异）。
+// 用裸常量与 window.rs 里 SC_CLOSE 的处理风格一致。
+const WM_NCMOUSEMOVE: u32 = 0x00A0;
+const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+const WM_NCLBUTTONUP: u32 = 0x00A2;
+const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
+// 这几条客户区消息在 SetCapture 后也可能落到拖动窗口上。
+const WM_MOUSEMOVE_C: u32 = 0x0200;
+const WM_LBUTTONUP_C: u32 = 0x0202;
+const WM_CAPTURECHANGED_C: u32 = 0x0215;
 
 /// 边缘 resize 区的默认宽度，**逻辑点**。
 ///
@@ -288,6 +307,8 @@ pub fn forget(hwnd: HWND) {
         && let Ok(mut g) = lock.lock() {
             g.retain(|(h, _)| *h != key);
         }
+    // 同步清掉可能残留的拖动状态，避免 HWND 复用时新窗口被误判为拖动中。
+    clear_moving(hwnd);
 }
 
 /// 设置自绘标题栏（拖动区）的位置，单位逻辑点、客户区坐标系。
@@ -371,6 +392,122 @@ pub fn set_resize_border(hwnd: HWND, points: f32) {
     set_chrome_of(hwnd, |c| c.border = points.max(0.0));
 }
 
+// ---------------------------------------------------------------------------
+// 自定义窗口移动（非模态，让拖动期间 Vulkan 帧循环继续跑）
+// ---------------------------------------------------------------------------
+
+/// 进行中的拖动：起始光标位置与起始窗口原点（物理像素，屏幕坐标）。
+///
+/// 新窗口原点 = 起始窗口原点 + (当前光标 − 起始光标)。用「起始点 + 位移」
+/// 而非「逐帧累加 delta」，可避免中途丢一两条移动消息后窗口位置与光标
+/// 产生累积偏差。
+#[derive(Clone, Copy)]
+struct MoveState {
+    start_cursor: POINT,
+    start_origin: POINT,
+}
+
+/// 按 HWND 索引的拖动状态。与 [`CHROME`] 同理，仅在窗口线程访问。
+static MOVING: std::sync::OnceLock<std::sync::Mutex<Vec<(isize, MoveState)>>> =
+    std::sync::OnceLock::new();
+
+fn moving_table() -> &'static std::sync::Mutex<Vec<(isize, MoveState)>> {
+    MOVING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn moving_state(hwnd: HWND) -> Option<MoveState> {
+    let key = hwnd.0 as isize;
+    let g = moving_table().lock().ok()?;
+    g.iter().find(|(h, _)| *h == key).map(|(_, s)| *s)
+}
+
+fn set_moving(hwnd: HWND, state: MoveState) {
+    let key = hwnd.0 as isize;
+    let Ok(mut g) = moving_table().lock() else {
+        return;
+    };
+    match g.iter_mut().find(|(h, _)| *h == key) {
+        Some(slot) => slot.1 = state,
+        None => g.push((key, state)),
+    }
+}
+
+fn clear_moving(hwnd: HWND) {
+    let key = hwnd.0 as isize;
+    if let Ok(mut g) = moving_table().lock() {
+        g.retain(|(h, _)| *h != key);
+    }
+}
+
+/// 拖动区按下：接管指针、记录起点，**不进系统模态移动循环**。
+unsafe fn begin_custom_move(hwnd: HWND) {
+    unsafe {
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rc);
+        // SetCapture 后，按住左键期间的指针消息都发给本窗口，即使移出窗口。
+        let _ = SetCapture(hwnd);
+        tracing::debug!("自定义拖动：开始 SetCapture");
+        set_moving(
+            hwnd,
+            MoveState {
+                start_cursor: cursor,
+                start_origin: POINT {
+                    x: rc.left,
+                    y: rc.top,
+                },
+            },
+        );
+    }
+}
+
+/// 指针移动：按位移把窗口挪到新位置（不改大小、不改 Z 序、不激活）。
+unsafe fn apply_custom_move(hwnd: HWND) {
+    unsafe {
+        let Some(st) = moving_state(hwnd) else {
+            return;
+        };
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let x = st.start_origin.x + (cursor.x - st.start_cursor.x);
+        let y = st.start_origin.y + (cursor.y - st.start_cursor.y);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// 松开：释放指针捕获并清状态。
+unsafe fn end_custom_move(hwnd: HWND) {
+    unsafe {
+        let _ = ReleaseCapture();
+        tracing::debug!("自定义拖动：结束");
+        clear_moving(hwnd);
+    }
+}
+
+/// 双击标题栏：最大化 / 还原（保留原生手感）。
+unsafe fn toggle_maximize(hwnd: HWND) {
+    unsafe {
+        let restore = IsZoomed(hwnd).as_bool();
+        let _ = ShowWindow(
+            hwnd,
+            if restore {
+                SW_RESTORE
+            } else {
+                SW_MAXIMIZE
+            },
+        );
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Win32 层
@@ -401,9 +538,51 @@ fn y_lparam(lp: isize) -> i32 {
 pub(crate) unsafe fn handle_non_client(
     hwnd: HWND,
     msg: u32,
-    _wparam: WPARAM,
+    wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
+    // ---- 自定义窗口移动（非模态），见模块文档「拖动方案」----
+    match msg {
+        WM_NCLBUTTONDOWN => {
+            if wparam.0 as u32 == HTCAPTION {
+                // 拖动区按下：自己接管指针，阻止 DefWindowProc 进入模态
+                // 移动循环（那会冻结帧循环，磨砂背景停在旧帧）。
+                unsafe { begin_custom_move(hwnd) };
+                return Some(LRESULT(0));
+            }
+            // 边缘 resize（HTLEFT/HTTOP/...）：交给系统原生缩放循环。
+            return None;
+        }
+        WM_NCLBUTTONDBLCLK => {
+            if wparam.0 as u32 == HTCAPTION {
+                unsafe { toggle_maximize(hwnd) };
+                return Some(LRESULT(0));
+            }
+            return None;
+        }
+        WM_NCMOUSEMOVE | WM_MOUSEMOVE_C => {
+            if moving_state(hwnd).is_some() {
+                unsafe { apply_custom_move(hwnd) };
+                return Some(LRESULT(0));
+            }
+            return None;
+        }
+        WM_NCLBUTTONUP | WM_LBUTTONUP_C => {
+            if moving_state(hwnd).is_some() {
+                unsafe { end_custom_move(hwnd) };
+                return Some(LRESULT(0));
+            }
+            return None;
+        }
+        WM_CAPTURECHANGED_C => {
+            // 指针捕获被系统/其他窗口抢走：清状态即可，不要再 ReleaseCapture
+            //（捕获已经不是我们的了）。返回 None 让默认处理走完。
+            clear_moving(hwnd);
+            return None;
+        }
+        _ => {}
+    }
+
     if msg != WM_NCHITTEST {
         return None;
     }

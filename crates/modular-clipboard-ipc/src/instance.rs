@@ -18,6 +18,18 @@ const UI_MUTEX_NAME: &str = r"Local\ModularClipboard.UiInstance";
 /// 「托盘点了没反应」这种 bug 会非常难查。
 pub const UI_WINDOW_TITLE: &str = "ModularClipboard";
 
+/// 跨进程消息：请求主窗口显示并置前。
+///
+/// 消息号是常驻进程与界面进程之间约定的整数（`WM_APP + 1`）。
+/// 接收方在 `modular-clipboard-gfx::window` 的窗口过程里，那边写死
+/// 同一个值（`WM_SHOW_MAIN`）。两边不共享 crate，改号必须两处同步。
+pub const WM_SHOW_MAIN: u32 = 0x8000 + 1;
+
+/// 跨进程消息：请求主窗口隐藏（热键 toggle 的收起方向）。
+///
+/// 对应接收方的 `WM_HIDE_MAIN`（`WM_APP + 2`），同样两处写死。
+pub const WM_HIDE_MAIN: u32 = 0x8000 + 2;
+
 /// 界面进程是否已经运行。
 ///
 /// 用「尝试创建同名互斥体」判断：已存在即界面在跑。
@@ -71,31 +83,42 @@ impl UiInstanceGuard {
     }
 }
 
-/// 请求已运行的界面显示并置前。
+/// 找到主窗口，向它投递一条自定义消息（`PostMessageW`，只入队、不阻塞）。
 ///
-/// 返回 `false` 表示没找到窗口（界面可能正在启动、还没建窗）。
-pub fn request_show_ui() -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, SW_SHOW, ShowWindow};
+/// 这是常驻进程跨进程控制界面窗口的**唯一**姿势：`PostMessageW`
+/// 立即返回，绝不等界面线程泵消息。早年这里直接 `ShowWindow` /
+/// `SetForegroundWindow`，那是同步跨进程调用——常驻进程同时是 IPC
+/// 服务端，界面线程那一刻又正阻塞在命名管道 `ReadFile` 上等回响应，
+/// 于是「常驻等界面泵消息、界面等常驻回响应」双向死锁
+/// （2026-10-13 dump 实锤）。改窗口状态的动作交给界面进程在自己的
+/// 消息循环里做（同线程调用立即返回）。
+fn post_to_main(msg: u32) -> bool {
     use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
 
     let wide: Vec<u16> = UI_WINDOW_TITLE
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let hwnd = unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) };
-    match hwnd {
+    match unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) } {
         Ok(h) if !h.is_invalid() => {
-            unsafe {
-                let _ = ShowWindow(h, SW_SHOW);
-                // 前台窗口受限时这里可能失败，但窗口至少已显示出来，
-                // 用户能自己点一下。不因此返回 false。
-                let _ = SetForegroundWindow(h);
-            }
-            true
+            // SAFETY: `h` 由上面取得且已判非空；PostMessageW 只入队。
+            unsafe { PostMessageW(Some(h), msg, WPARAM(0), LPARAM(0)) }.is_ok()
         }
-        Ok(_) => false,
-        Err(_) => false,
+        _ => false,
     }
+}
+
+/// 请求已运行的界面显示并置前。
+///
+/// 返回 `false` 表示没找到窗口（界面可能正在启动、还没建窗）。
+///
+/// 实现是投递 [`WM_SHOW_MAIN`]：界面进程在自己的消息循环里
+/// `ShowWindow` + 抢前台（见 `gfx::window` 的 `ShowRequested`）。
+/// 不在这里跨进程直接改窗口状态，原因见 [`post_to_main`]。
+pub fn request_show_ui() -> bool {
+    post_to_main(WM_SHOW_MAIN)
 }
 
 /// 与 [`request_show_ui`] 同源、但只回答「窗口在不在」。
@@ -146,26 +169,15 @@ pub fn ui_window_visible() -> bool {
     }
 }
 
-/// 隐藏主窗口（`SW_HIDE`），返回是否找到了窗口。
+/// 请求隐藏主窗口，返回是否成功投递（找到窗口并入队）。
 ///
-/// 界面进程的帧循环仍在跑（隐藏态只轮询托盘事件、不渲染），
-/// 下一次唤起由 [`request_show_ui`] 完成。它的 `0.5 可见性对账`
-/// 会把本进程的 `hidden` 标志与这里的操作对齐。
+/// 实现是投递 [`WM_HIDE_MAIN`]：界面进程在自己的消息循环里
+/// `ShowWindow(SW_HIDE)`（同线程，立即返回）。界面进程的帧循环仍在
+/// 跑（隐藏态只轮询消息、不渲染），下一次唤起由 [`request_show_ui`]
+/// 完成。不能在常驻进程跨进程直接 `ShowWindow`，原因见
+/// [`post_to_main`]（会与 IPC 同步等待构成死锁）。
 pub fn hide_ui_window() -> bool {
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, ShowWindow, SW_HIDE};
-
-    let wide: Vec<u16> = UI_WINDOW_TITLE
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    match unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) } {
-        Ok(h) if !h.is_invalid() => {
-            let _ = unsafe { ShowWindow(h, SW_HIDE) };
-            true
-        }
-        _ => false,
-    }
+    post_to_main(WM_HIDE_MAIN)
 }
 
 #[cfg(test)]

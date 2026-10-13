@@ -1146,6 +1146,14 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         )?;
         // 描述符集引用链与捕获图的视图，两者就绪后写一次。
+        //
+        // IMPORTANT: 必须先 `configure` 再 `bind_source`。`configure` 写链内
+        // 的 0..4 组（降采样 scene、横向、纵向、**合成 SET_COMPOSITE**、
+        // 场景拷贝），`bind_source` 只写第 5 组（捕获图的降采样源）。
+        // 早期版本漏了 `configure`，合成阶段采样的 SET_COMPOSITE 是从未
+        // 写入的描述符，驱动返回空纹理（0,0,0,0）——自研磨砂于是只剩透明、
+        // 没有模糊。覆盖层路径（`ensure_post`）两处都调了，故仅主窗口受影响。
+        pipeline.configure(self.gpu, &chain)?;
         pipeline.bind_source(self.gpu, capture_img.view)?;
         tracing::debug!(
             ?render_extent,

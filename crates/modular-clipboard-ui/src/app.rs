@@ -580,6 +580,20 @@ fn run_mode(
                     saw_show = true;
                     tracing::info!("收到唤起请求（重复启动）");
                 }
+                WindowEvent::HideRequested => {
+                    // 热键 toggle 的收起方向：常驻进程不直接改窗口状态
+                    //（那会跨进程同步等待、与 IPC 同步读构成死锁），而是
+                    // 投递 WM_HIDE_MAIN，由本进程在自己的消息循环里隐藏。
+                    // 同线程 ShowWindow 立即返回，不跨进程。
+                    presence::hide_window(window.hwnd());
+                    hidden = true;
+                    // 主窗口隐藏时连带收起设置窗，避免它孤立留在屏幕上
+                    //（设置窗是本进程的附属顶层窗口，主窗没了它还漂着）。
+                    // 只改状态：本帧 hidden 分支仍会 drive_attach_windows，
+                    // 那里检测到 show_settings=false 即销毁设置窗。
+                    app.paint_state.show_settings = false;
+                    tracing::info!("收到隐藏请求（热键 toggle），已隐藏主窗口并收起设置窗");
+                }
                 WindowEvent::Resized { .. } => {
                     // 客户区尺寸变了 → 交换链必须重建。`rebuild_swapchain`
                     // 内部会 `device_wait_idle` 并重查表面能力。
@@ -717,8 +731,20 @@ fn run_mode(
         //
         // 这里**不能**无条件 break——`WM_CLOSE` 不销毁窗口，
         // 隐藏后循环要继续跑，否则托盘事件再也没人收。
+        //
+        // ⚠️ 「托盘可用」的判据**不能**只写 `resident.is_some()`：
+        // 常驻进程模式下界面进程自己不建托盘（托盘归 daemon），那个
+        // 判断恒为 false ⇒ 远端模式点 ✕ 会走 Quit 分支，而 Quit 的
+        // 上半段还会 `request_quit()` 把常驻进程一起退掉——**点一下
+        // 关闭整个程序消失，托盘白建**（2026-10-13 探针实测：
+        // WM_CLOSE 后窗口销毁 + daemon 退出）。与 `should_quit` 注释里
+        // 「远端模式下只退出界面进程，常驻进程继续干活」的既定语义矛盾。
+        //
+        // 正确判据 = 「程序有唤回入口」：托盘在本进程（单进程模式）
+        // **或** 在常驻进程里（远端模式）。
         if saw_close {
-            match presence::decide_on_close(resident.is_some(), events.quit_requested()) {
+            let tray_backed = resident.is_some() || remote;
+            match presence::decide_on_close(tray_backed, events.quit_requested()) {
                 CloseDecision::HideToTray => {
                     presence::hide_window(window.hwnd());
                     hidden = true;
@@ -882,7 +908,11 @@ fn run_mode(
         // 这里刻意**不**改 `decide_on_close`——四条关闭路径已由
         // `scripts/verify_close_paths.ps1` 验证过，不该为接UI 按钮重开。
         if app.take_close_requested() {
-            match presence::decide_on_close(resident.is_some(), false) {
+            // 判据必须与 WM_CLOSE 路径一致为 `resident.is_some() || remote`：
+            // 远端（双进程）模式下本进程不建托盘（resident 恒 None），
+            // 只写 resident.is_some() 会误判「无托盘兜底」→ 直接退出整个
+            // 界面进程（2026-10-13 日志曾出现「无托盘兜底，直接退出」）。
+            match presence::decide_on_close(resident.is_some() || remote, false) {
                 CloseDecision::HideToTray => {
                     presence::hide_window(window.hwnd());
                     hidden = true;
@@ -2135,6 +2165,12 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 托盘 `shutdown`），配置里的改动会丢。
                     tracing::info!("设置界面请求退出程序");
                     self.should_quit = true;
+                }
+                Op::OpenLink(url) => {
+                    // 关于页的项目 / 作者主页：用系统默认浏览器打开。
+                    if let Err(e) = modular_clipboard_platform::open_url(url) {
+                        tracing::warn!("打开链接失败 {url}: {e}");
+                    }
                 }
                 // 窗口级按钮只**置标志**，由帧循环消费。
                 //

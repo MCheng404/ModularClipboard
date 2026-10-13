@@ -103,7 +103,7 @@ use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WAIT_TIMEOUT, WPARAM
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, GetClassNameW, GetWindowThreadProcessId, HWND_MESSAGE, IsWindow,
-    IsWindowVisible, PostMessageW, WM_CLOSE, WM_COMMAND,
+    IsWindowVisible, PostMessageW, WM_CLOSE, WM_COMMAND, WM_HOTKEY,
 };
 use windows::core::{BOOL, HSTRING, PCWSTR};
 
@@ -132,7 +132,10 @@ const EXE_NAME: &str = "modular-clipboard.exe";
 /// 属于「注释承诺了实现没有的事」，已删。
 ///
 /// 等待主窗口出现的上限。Vulkan 初始化 + 字体加载在慢机器上要几秒。
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(12);
+// debug 构建（本探针用的就是 debug bin）启动明显慢于 release：
+// 40MB exe + pdb 加载 + Vulkan 初始化实测可达 15s+，12s 会把
+// 「慢」误判成「没起来」。放宽松到 25s。
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// 等待托盘窗口出现的上限。托盘在 Vulkan 初始化之后才启动，可能偏晚。
 const TRAY_WAIT: Duration = Duration::from_secs(3);
@@ -344,7 +347,6 @@ impl Drop for ConfigBackup {
 /// `EnumWindows` 回调收集的窗口信息。
 struct WinInfo {
     hwnd: HWND,
-    pid: u32,
 }
 
 /// `EnumWindows` 回调。把结果追加到 `lparam` 指向的 `Vec`。
@@ -355,9 +357,7 @@ struct WinInfo {
 /// 回调期间该 `Vec` 存活（`EnumWindows` 不跨线程），满足 `&mut` 的唯一性。
 unsafe extern "system" fn collect_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let out = unsafe { &mut *(lparam.0 as *mut Vec<WinInfo>) };
-    let mut pid: u32 = 0;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    out.push(WinInfo { hwnd, pid });
+    out.push(WinInfo { hwnd });
     BOOL(1)
 }
 
@@ -371,25 +371,17 @@ fn class_of(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 
-/// 在所有顶层窗口中找出属于 `pid` 且类名匹配 `want_class` 的窗口。
-///
-/// 按 pid 过滤是必需的：用户可能已经手工开着主程序，
-/// 那样会有两个同名窗口，不按 pid 过滤会认错对象。
-fn find_window_by_pid(want_pid: u32, want_class: &str) -> Option<HWND> {
-    let mut found: Vec<WinInfo> = Vec::new();
-    let lparam = LPARAM(&mut found as *mut Vec<WinInfo> as isize);
-    let _ = unsafe { EnumWindows(Some(collect_cb), lparam) };
-    found
-        .into_iter()
-        .find(|w| w.pid == want_pid && class_of(w.hwnd) == want_class)
-        .map(|w| w.hwnd)
-}
-
 /// 等待主窗口出现，返回其句柄。
-fn wait_for_main_window(pid: u32, budget: Duration) -> Option<HWND> {
+///
+/// CAUTION: **不能按 pid 找**。双进程架构下 pid 参数是常驻进程的，
+/// 而主窗口属于它拉起的界面子进程（另一个 pid）——按 pid 找永远
+/// 找不到，表现为「12s 内主窗口未出现」，而程序其实好着
+/// （2026-10-13 实测：这是探针自身的缺陷，不是程序的）。
+/// 改用全局类名查找：本机同时只有一个 ModularClipboardWindow。
+fn wait_for_main_window(_pid: u32, budget: Duration) -> Option<HWND> {
     let deadline = Instant::now() + budget;
     loop {
-        if let Some(h) = find_window_by_pid(pid, MAIN_CLASS) {
+        if let Some(h) = find_window_by_class(MAIN_CLASS) {
             return Some(h);
         }
         if Instant::now() >= deadline {
@@ -397,6 +389,17 @@ fn wait_for_main_window(pid: u32, budget: Duration) -> Option<HWND> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// 全局按类名找窗口（不限定 pid）。
+fn find_window_by_class(want_class: &str) -> Option<HWND> {
+    let mut found: Vec<WinInfo> = Vec::new();
+    let lparam = LPARAM(&mut found as *mut Vec<WinInfo> as isize);
+    let _ = unsafe { EnumWindows(Some(collect_cb), lparam) };
+    found
+        .into_iter()
+        .find(|w| class_of(w.hwnd) == want_class)
+        .map(|w| w.hwnd)
 }
 
 /// 找出属于 `pid` 的托盘 message-only 窗口。
@@ -665,6 +668,83 @@ fn main() {
         }
         None => {
             checks.record("链路 2：托盘左键唤起", None, "托盘窗口未找到，无法验证".to_string());
+        }
+    }
+
+    // ---- 链路 2.5：热键 toggle（WM_HOTKEY）--------------------------------
+    //
+    // 用户实测：「热键隐藏主窗口后无法再次显示」。注入点选 WM_HOTKEY 而非
+    // 真实键盘：RegisterHotKey 的组合在真实按键与注入按键下都派发同一条
+    // WM_HOTKEY，注入排除了「键盘事件被别的软件吃掉」的干扰，直测我们的
+    // 处理逻辑。两次注入 = 隐藏 + 恢复，与用户的两次按键同构。
+    println!("\n--- 链路 2.5：注入 WM_HOTKEY（toggle 槽位）---");
+    match tray_hwnd {
+        Some(tray) => {
+            // 当前状态：链路 2b 刚把窗口唤起，应当可见。
+            let before_hide = unsafe { IsWindowVisible(main_hwnd) }.as_bool();
+            let posted = unsafe {
+                PostMessageW(
+                    Some(tray),
+                    WM_HOTKEY,
+                    WPARAM(modular_clipboard_platform::hotkey::Slot::Toggle.id() as usize),
+                    LPARAM(0),
+                )
+            };
+            let posted = posted.is_ok();
+            checks.record(
+                "链路 2.5a：WM_HOTKEY(toggle) 投递成功（跨进程）",
+                Some(posted),
+                format!("PostMessageW(WM_HOTKEY, 0x0BEE) → {posted}；注入前可见={before_hide}"),
+            );
+
+            if posted {
+                // 第一次：期望隐藏。
+                let hid = wait_until(WAKE_TIMEOUT, || !unsafe { IsWindowVisible(main_hwnd) }.as_bool());
+                let logs_hide = wait_for_log(&log, LOG_POLL_LIMIT, &["热键 toggle"]);
+                checks.record(
+                    "链路 2.5b：热键隐藏主窗口（toggle 第一次）",
+                    Some(hid),
+                    format!(
+                        "IsWindowVisible 在 {WAKE_TIMEOUT:?} 内变 false → {hid}；\
+                         日志出现「热键 toggle」={}",
+                        logs_hide.contains("热键 toggle")
+                    ),
+                );
+
+                // 第二次：期望恢复——用户报的失败点。
+                let posted2 = unsafe {
+                    PostMessageW(
+                        Some(tray),
+                        WM_HOTKEY,
+                        WPARAM(modular_clipboard_platform::hotkey::Slot::Toggle.id() as usize),
+                        LPARAM(0),
+                    )
+                };
+                let woke = wait_until(WAKE_TIMEOUT, || unsafe { IsWindowVisible(main_hwnd) }.as_bool());
+                let alive = process_alive(pid);
+                let logs2 = wait_for_log(&log, LOG_POLL_LIMIT, &["热键 toggle：唤起主窗口"]);
+                checks.record(
+                    "链路 2.5c：热键再次唤出主窗口（toggle 第二次）",
+                    Some(woke),
+                    format!(
+                        "第二次注入 posted={posted2:?}，IsWindowVisible 变 true → {woke}；\
+                         进程存活={alive}；日志出现「唤起主窗口」={}",
+                        logs2.contains("唤起主窗口")
+                    ),
+                );
+                checks.record(
+                    "链路 2.5d：toggle 后进程仍存活",
+                    Some(alive),
+                    format!("进程存活={alive}（toggle 不应终止进程）"),
+                );
+            }
+        }
+        None => {
+            checks.record(
+                "链路 2.5：热键 toggle",
+                None,
+                "托盘窗口未找到，无法验证".to_string(),
+            );
         }
     }
 

@@ -239,13 +239,18 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
                         // Toggle 语义：窗口可见就隐藏、不可见就显示。
                         // 系统 Win+V 就是 toggle，用户预期「再按一次收起
                         // 来」——只唤不藏会让热键变成单向的「显示」。
-                        if modular_clipboard_ipc::ui_window_visible() {
+                        let visible = modular_clipboard_ipc::ui_window_visible();
+                        if visible {
                             if !modular_clipboard_ipc::hide_ui_window() {
                                 // 隐藏失败（窗口刚好在销毁）就别较劲，
                                 // 退回「确保显示」。
+                                tracing::warn!("热键 toggle：隐藏主窗口失败，退回显示");
                                 core.show_ui();
+                            } else {
+                                tracing::info!("热键 toggle：主窗口已隐藏");
                             }
                         } else {
+                            tracing::info!("热键 toggle：唤起主窗口");
                             core.show_ui();
                         }
                     }
@@ -287,6 +292,14 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
         if service.pump() {
             core.bump();
             sync_mini_items(&service, &mini_items);
+        }
+        // 心跳：主循环卡死（托盘菜单能弹但点项没反应 = 这个循环不再转）
+        // 时，这条日志的停顿就是唯一证据。约每 2 秒一条。
+        {
+            static HB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if HB.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+                tracing::debug!("常驻主循环心跳");
+            }
         }
     }
 

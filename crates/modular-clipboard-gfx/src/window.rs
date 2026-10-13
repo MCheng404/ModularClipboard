@@ -163,6 +163,24 @@ static CLASS_REGISTERED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock:
 /// 之上才是应用自定义，不会与任何系统消息撞号。
 pub const WM_SHOW_MAIN: u32 = 0x8000 + 1;
 
+/// 自定义消息：请求把主窗口隐藏（热键 toggle 的「收起」方向）。
+///
+/// # 跨进程消息协议（改号必须两处同步）
+///
+/// 发送方是常驻进程（`modular-clipboard-ipc::instance`），接收方是本
+/// 窗口过程。两边不共享 crate（gfx 不依赖 ipc），消息号是双方约定的
+/// 整数，ipc 那边写死同一个值 `0x8000 + 2`。
+///
+/// # 必须走 PostMessage 而不是跨进程 ShowWindow
+///
+/// 常驻进程同时是 IPC 服务端；它若在主循环里**同步**跨进程
+/// `ShowWindow(SW_HIDE)`，会阻塞等待界面线程泵消息，而界面线程那
+/// 一刻正同步阻塞在命名管道 `ReadFile` 上等常驻进程回响应——
+/// 双向等待死锁（2026-10-13 dump 实锤：常驻线程卡在
+/// `NtUserShowWindow`、界面线程卡在 `NtReadFile`）。投递消息只入队、
+/// 立即返回，由界面进程在自己的消息循环里隐藏自己，彻底断开死锁。
+pub const WM_HIDE_MAIN: u32 = 0x8000 + 2;
+
 /// 找到标题为 `title` 的已有窗口，请求它显示并置前。
 ///
 /// 返回 `true` 表示消息已投递成功（不保证对端一定响应——那是另一个
@@ -224,6 +242,14 @@ pub enum WindowEvent {
     /// 只把窗口 `ShowWindow` 是不够的——应用内部还有一个 `hidden` 标志，
     /// 不同步它的话窗口会显示出来但**不渲染**（一片空白）。
     ShowRequested,
+
+    /// 另一个进程请求把本窗口隐藏（热键 toggle 的收起方向，见
+    /// [`WM_HIDE_MAIN`]）。
+    ///
+    /// 由应用在自己的消息循环里隐藏自己（同线程 `ShowWindow(SW_HIDE)`
+    /// 立即返回，不跨进程），并同步内部 `hidden` 标志；不要让常驻进程
+    /// 跨进程直接改窗口状态。
+    HideRequested,
 
     /// 键盘焦点获得 / 丢失。
     Focused(bool),
@@ -893,6 +919,12 @@ impl EventLoop {
                 continue;
             }
 
+            // 另一个进程请求隐藏本窗口（热键 toggle 的收起方向）。
+            if msg.message == WM_HIDE_MAIN {
+                events.push(WindowEvent::HideRequested);
+                continue;
+            }
+
             // TranslateMessage 把 WM_KEYDOWN 变成 WM_CHAR 投递到队列尾部，
             // 同一轮循环的下一次 PeekMessageW 就能读到。必须在本条消息
             // 处理前调用，否则 WM_CHAR 会晚一帧，文本输入会滞后。
@@ -1359,13 +1391,14 @@ impl EventLoop {
                 // 尺寸与缩放通过 screen_rect 表达；关闭是应用层语义；
                 // 最小化同理——客户区已是 0×0，`screen_rect` 会自动塌成空。
                 //
-                // `ShowRequested` 也是应用层语义（由主循环处理成
-                // 「像点了托盘那样显示并置前」），不进 egui。
+                // `ShowRequested` / `HideRequested` 也是应用层语义
+                //（由主循环处理成显示/隐藏），不进 egui。
                 WindowEvent::Resized { .. }
                 | WindowEvent::ScaleFactorChanged(_)
                 | WindowEvent::Minimized(_)
                 | WindowEvent::CloseRequested
-                | WindowEvent::ShowRequested => {}
+                | WindowEvent::ShowRequested
+                | WindowEvent::HideRequested => {}
             }
         }
 

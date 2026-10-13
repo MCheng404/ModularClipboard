@@ -829,6 +829,7 @@ mod imp {
             }
             WM_HOTKEY => {
                 // 按 id 区分槽位：两个热键注册在同一个窗口上。
+                tracing::debug!(id = wparam.0 as i32, "托盘窗口过程收到 WM_HOTKEY");
                 match wparam.0 as i32 {
                     id if id == hotkey::Slot::PastePrevious.id() => emit(TrayEvent::HotkeyPaste),
                     _ => emit(TrayEvent::Hotkey),
@@ -1321,6 +1322,12 @@ fn run(
             if let Ok(mut guard) = hotkey_ids().lock() {
                 *guard = hotkeys.clone();
             }
+            tracing::info!(
+                hwnd = hwnd.0 as isize,
+                thread_id = tid,
+                failed_hotkeys = failed.len(),
+                "托盘窗口已创建（message-only）"
+            );
             Ok(Ctx {
                 res: Resources {
                     hwnd,
@@ -1445,6 +1452,7 @@ fn run(
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+            tracing::info!("托盘消息循环退出（收到 WM_QUIT），正在回收资源");
             ctx.res.release();
         }
     }

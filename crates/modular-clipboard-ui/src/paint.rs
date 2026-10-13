@@ -162,6 +162,11 @@ pub enum Op {
     /// 置成 true**。于是设置窗口里没有「退出程序」按钮，而标题栏 ✕
     /// 在有托盘时只隐藏到托盘 —— 用户从界面里根本无法退出程序。
     Quit,
+    /// 打开外部链接（关于页的项目 / 作者主页）。
+    ///
+    /// 由 `App::apply_ops` 走平台层 `ShellExecuteW` 用默认浏览器打开，
+    /// 绘制层不直接碰 shell。
+    OpenLink(&'static str),
     /// 关闭按钮 ⇒ 隐藏到托盘。
     ///
     /// NOTE: 语义是「隐藏」不是「退出」：剪贴板类工具直接退出会让
@@ -1956,6 +1961,8 @@ enum ItemKind {
     McpPort,
     /// 只读信息行（关于页）。
     Info(&'static str),
+    /// 可点击的外部链接（关于页）：显示文本即 URL，点击用默认浏览器打开。
+    Link(&'static str),
     /// 退出程序按钮（关于页）。
     Quit,
 }
@@ -2072,7 +2079,7 @@ impl SettingsItem {
             ItemKind::McpPort => {
                 get_number(cfg, ConfigGroup::Mcp, "port") != get_number(&d, ConfigGroup::Mcp, "port")
             }
-            ItemKind::Info(_) | ItemKind::Quit => false,
+            ItemKind::Info(_) | ItemKind::Link(_) | ItemKind::Quit => false,
         }
     }
 
@@ -2119,7 +2126,7 @@ impl SettingsItem {
                 field: "port",
                 value: get_number(&d, ConfigGroup::Mcp, "port"),
             }),
-            ItemKind::Info(_) | ItemKind::Quit => None,
+            ItemKind::Info(_) | ItemKind::Link(_) | ItemKind::Quit => None,
         }
     }
 }
@@ -2330,9 +2337,19 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::Info(concat!("v", env!("CARGO_PKG_VERSION"))),
             },
             SettingsItem {
-                label: "数据目录",
+                label: "项目主页",
+                desc: "源代码、问题反馈与发布版本，点击在浏览器打开",
+                kind: ItemKind::Link("https://github.com/MCheng404/ModularClipboard"),
+            },
+            SettingsItem {
+                label: "作者主页",
+                desc: "GitHub 主页，点击在浏览器打开",
+                kind: ItemKind::Link("https://github.com/MCheng404"),
+            },
+            SettingsItem {
+                label: "开源协议",
                 desc: "",
-                kind: ItemKind::Info("系统应用数据目录（%APPDATA%\\modular-clipboard）"),
+                kind: ItemKind::Info("MIT License"),
             },
             SettingsItem {
                 label: "技术栈",
@@ -2340,14 +2357,9 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::Info("Rust · egui · Vulkan (Win32)"),
             },
             SettingsItem {
-                label: "项目主页",
+                label: "数据目录",
                 desc: "",
-                kind: ItemKind::Info("待补充 GitHub 地址"),
-            },
-            SettingsItem {
-                label: "作者主页",
-                desc: "",
-                kind: ItemKind::Info("待补充"),
+                kind: ItemKind::Info("系统应用数据目录（%APPDATA%\\modular-clipboard）"),
             },
             SettingsItem {
                 label: "退出程序",
@@ -2784,6 +2796,31 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
         ItemKind::Info(text) => {
             setting_row(ui, it.label, "", |ui| {
                 ui.label(egui::RichText::new(*text).color(pal.text_dim));
+                false
+            });
+        }
+        ItemKind::Link(url) => {
+            setting_row(ui, it.label, it.desc, |ui| {
+                // 强调色 URL，hover 手型 + 下划线；点击用默认浏览器打开。
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(*url).size(pal.font_sm).color(pal.accent),
+                    )
+                    .sense(egui::Sense::click()),
+                );
+                // 登记热区（key 即 URL），供自动化与测试定位。
+                f.hit_insert(url, resp.rect);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    let r = resp.rect;
+                    ui.painter_at(r).line_segment(
+                        [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
+                        egui::Stroke::new(1.0, pal.accent),
+                    );
+                }
+                if resp.clicked() {
+                    f.state.push(Op::OpenLink(url));
+                }
                 false
             });
         }
@@ -5821,6 +5858,33 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             ops.iter().any(|o| matches!(o, Op::Quit)),
             "点「退出程序」应产生 Op::Quit，实际={ops:?}"
+        );
+    }
+
+    /// 关于页的「项目主页 / 作者主页」是可点击链接，点击产生 `Op::OpenLink`，
+    /// 且 URL 指向真实仓库与作者主页（不再是「待补充」占位）。
+    #[test]
+    fn about_links_emit_open_link_op() {
+        let mut h = Harness::new("about-links", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.settings_frame();
+        // 切到「关于」分类。
+        let nav = settings_hit(&h, "settings_cat_about").center();
+        h.settings_click_at(nav);
+
+        let project = "https://github.com/MCheng404/ModularClipboard";
+        let author = "https://github.com/MCheng404";
+
+        let ops = h.settings_click_at(settings_hit(&h, project).center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::OpenLink(u) if *u == project)),
+            "点项目主页应产生 OpenLink({project})，实际={ops:?}"
+        );
+
+        let ops = h.settings_click_at(settings_hit(&h, author).center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::OpenLink(u) if *u == author)),
+            "点作者主页应产生 OpenLink({author})，实际={ops:?}"
         );
     }
 
