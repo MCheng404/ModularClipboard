@@ -298,7 +298,9 @@ impl<'a> SettingsWindow<'a> {
         // 覆盖层打开时走**自研 GPU 模糊**路径：设置窗口自身的内容先
         // 卷积成模糊底图，覆盖层面板再清晰叠加。其余情况与普通绘制
         // 完全一致——`paint_blurred` 在没有分割标记时会自动退回普通路径。
-        let use_blur = app.mcp_overlay_open();
+        // 录制快捷键时也走模糊：录制覆盖层要保持清晰，背后是糊掉的
+        // 设置内容（与 MCP 覆盖层同一套路）。
+        let use_blur = app.mcp_overlay_open() || app.hotkey_recording_open();
         let dpi_scale = self.window.scale_factor();
         let painted = if use_blur {
             self.gfx.painter.paint_blurred(

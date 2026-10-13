@@ -1765,18 +1765,24 @@ fn is_modifier_key(key: egui::Key) -> bool {
 /// 录完写进配置，常驻进程收到配置保存后会自己重注册
 /// （见 `app::daemon::rebind_hotkeys`）。
 fn capture_recording(&mut self, ctx: &egui::Context) {
-    let Some(slot) = self.paint_state.hotkey_recording else {
+    // 只关心「是否在录制」：候选组合记在 paint_state 里，
+    // 槽位在确认（Op::FinishRecording）时才用到。
+    let Some(_slot) = self.paint_state.hotkey_recording else {
             return;
         };
 
         // Esc 取消：录到一半想反悔是常态，没有退路会很烦。
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.paint_state.hotkey_recording = None;
-            // 与「取消」按钮同一条恢复路径：反悔之后老键必须能用。
+            self.paint_state.recording_combo = None;
+            // 反悔之后老键必须立刻能用。
             self.set_hotkeys_suspended(false);
             return;
         }
 
+        // 候选组合**只记录不应用**：录制覆盖层实时显示它，用户点击
+        // 任意位置确认后才落地（`Op::FinishRecording`）。按一下就改的
+        // 设计会让手抖直接换掉热键。
         let captured = ctx.input(|i| {
             i.events.iter().find_map(|ev| match ev {
                 egui::Event::Key {
@@ -1791,14 +1797,14 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         let Some((key, mods)) = captured else {
             return;
         };
-        // 仍要挡掉方向键这类非字符键——它们能触发事件，却不适合当快捷键。
-        // （修饰键已在上面过滤掉，见 `is_modifier_key`。）
+        // 挡掉方向键这类非字符键：提示但**不退出录制态**——用户可能
+        // 只是按错键，退出录制反而要重新点一次「录制」（旧实现在这里
+        // 直接退出，被用户评为「离谱的逻辑」）。
         let name = key.name();
         let mut chars = name.chars();
         let _first = chars.next();
         if chars.next().is_some() && !name.starts_with('F') {
             self.svc.notify(format!("不支持把 {name} 设为快捷键"));
-            self.paint_state.hotkey_recording = None;
             return;
         }
         let hotkey = modular_clipboard_core::config::Hotkey {
@@ -1814,10 +1820,44 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
             self.svc.notify("至少按住一个修饰键（Ctrl/Shift/Alt/Win）".into());
             return;
         }
-        self.paint_state.hotkey_recording = None;
-        self.paint_state
-            .ops
-            .push(crate::paint::Op::SetHotkey { slot, hotkey });
+        // 后按的覆盖先按的：用户改主意就再按一次新的。
+        self.paint_state.recording_combo = Some(hotkey);
+    }
+
+    /// 把一个槽位的绑定落地：写配置、清草稿、恢复注册、落盘。
+    ///
+    /// 文本输入（`Op::SetHotkeyText` 解析后）、设置卡片「重置」与
+    /// 录制确认三条路共用它——分开写过三遍，必漂。
+    fn apply_hotkey(
+        &mut self,
+        slot: crate::paint::HotkeySlot,
+        hotkey: modular_clipboard_core::config::Hotkey,
+    ) {
+        match slot {
+            crate::paint::HotkeySlot::Toggle => {
+                self.svc.state.config.hotkey_toggle = hotkey;
+            }
+            crate::paint::HotkeySlot::PastePrevious => {
+                self.svc.state.config.hotkey_paste_previous = hotkey;
+            }
+        }
+        // 草稿一并清掉：留着旧文本，下次回车会把上次手打的
+        // 内容再应用一遍（「录成了框里却还有字」）。
+        slot.draft_mut(&mut self.paint_state).clear();
+        // 录制期间热键是注销状态。常驻进程模式下
+        // `after_config_change` 的 SaveConfig 会让它重注册；
+        // 单进程模式只会写盘，得在这儿立即恢复——
+        // 用户录完很可能马上按键测试，不能让他吃空窗。
+        if !self.svc.is_remote() {
+            let failed = modular_clipboard_app::daemon::rebind_hotkeys(&self.svc.state.config);
+            self.svc.state.hotkey_error = (!failed.is_empty()).then(|| failed.join("；"));
+        }
+        self.after_config_change();
+    }
+
+    /// 是否正在录制快捷键（设置窗口据此走 GPU 模糊路径）。
+    pub fn hotkey_recording_open(&self) -> bool {
+        self.paint_state.hotkey_recording.is_some()
     }
 
     /// 录制快捷键期间暂停 / 恢复全局热键。
@@ -1932,19 +1972,28 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 }
                 Op::StartRecording(slot) => {
                     self.paint_state.hotkey_recording = Some(slot);
-                    // 清这一槽位的草稿：录制态不画输入框，留着旧文本
-                    // 会在录制结束后突然出现在框里，像是「没录成」。
+                    // 清这一槽位的草稿与上一次的候选组合：录制覆盖层
+                    // 不画输入框，旧文本/旧候选会以「幽灵状态」冒出来。
                     slot.draft_mut(&mut self.paint_state).clear();
+                    self.paint_state.recording_combo = None;
                     // 先把已注册的组合从 OS 手里收回来，否则用户按到
                     // 「当前正绑着」的组合时按键被送走，录不到。
                     self.set_hotkeys_suspended(true);
                     tracing::info!(?slot, "开始录制快捷键");
                 }
-                Op::CancelRecording => {
-                    self.paint_state.hotkey_recording = None;
-                    // 取消也要恢复：用户可能录到一半反悔，反悔之后
-                    // 老快捷键必须立刻能用。
-                    self.set_hotkeys_suspended(false);
+                Op::FinishRecording => {
+                    // 录制覆盖层上点击任意位置 = 确认。有候选组合才落地，
+                    // 没有（用户什么都没按就点了）等同取消。
+                    let Some(slot) = self.paint_state.hotkey_recording.take() else {
+                        return;
+                    };
+                    let Some(hotkey) = self.paint_state.recording_combo.take() else {
+                        tracing::debug!(?slot, "录制未捕获到组合，视为取消");
+                        self.set_hotkeys_suspended(false);
+                        return;
+                    };
+                    tracing::info!(?slot, keys = %hotkey.display(), "录制确认");
+                    self.apply_hotkey(slot, hotkey);
                 }
                 Op::SetHotkeyText { slot, text } => {
                     match modular_clipboard_core::config::Hotkey::parse(&text) {
@@ -1990,31 +2039,8 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     }
                 }
                 Op::SetHotkey { slot, hotkey } => {
-                    // 写入配置并落盘。真正的注册由持有托盘的一侧执行：
-                    // 常驻进程模式随 `SaveConfig` 走 `daemon::rebind_hotkeys`，
-                    // 单进程模式由帧循环的幂等比对重注册（4.4c）。
-                    match slot {
-                        crate::paint::HotkeySlot::Toggle => {
-                            self.svc.state.config.hotkey_toggle = hotkey;
-                        }
-                        crate::paint::HotkeySlot::PastePrevious => {
-                            self.svc.state.config.hotkey_paste_previous = hotkey;
-                        }
-                    }
-                    // 草稿一并清掉：留着旧文本，下次回车会把上次手打的
-                    // 内容再应用一遍（「录成了框里却还有字」）。
-                    slot.draft_mut(&mut self.paint_state).clear();
-                    // 录制期间热键是注销状态。常驻进程模式下
-                    // `after_config_change` 的 SaveConfig 会让它重注册；
-                    // 单进程模式只会写盘，得在这儿立即恢复——
-                    // 用户录完很可能马上按键测试，不能让他吃空窗。
-                    if !self.svc.is_remote() {
-                        let failed =
-                            modular_clipboard_app::daemon::rebind_hotkeys(&self.svc.state.config);
-                        self.svc.state.hotkey_error =
-                            (!failed.is_empty()).then(|| failed.join("；"));
-                    }
-                    self.after_config_change();
+                    // 写入配置并落盘；录制确认也走同一条落地路径。
+                    self.apply_hotkey(slot, hotkey);
                 }
                 Op::Select(id) => {
                     self.svc.state.selected = Some(id);
@@ -2657,7 +2683,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 录制：按下的组合键必须变成一条 `Op::SetHotkey`，并退出录制态。
+    /// 录制：按下的组合键只**记录候选**，不立即应用、也不退出录制态。
     ///
     /// # 为什么用独立 ctx 跑一帧
     ///
@@ -2665,8 +2691,13 @@ mod tests {
     /// `egui::Context` 上。主窗口的上下文里什么都看不到——
     /// 这正是用户报「录制没反应」的根因形态。这里用独立 ctx
     /// 复刻「设置窗口收到按键」的那一帧。
+    ///
+    /// # 为什么按一下不算完
+    ///
+    /// 组合先显示在录制覆盖层上给用户看，点击任意位置确认后才落地
+    /// （用户定稿交互）。按一下就改会让手抖直接换掉热键。
     #[test]
-    fn recording_turns_keypress_into_hotkey_op() {
+    fn recording_records_combo_without_applying() {
         let dir = std::env::temp_dir().join(format!("mc-ui-hk-record-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let mut cfg = modular_clipboard_core::Config::default();
@@ -2700,20 +2731,91 @@ mod tests {
         });
         out.textures_delta.clear();
 
+        // 只记录：录制态保持（覆盖层还开着），配置纹丝不动。
         assert_eq!(
-            app.paint_state.hotkey_recording, None,
-            "录完一次必须退出录制态，否则后续每个按键都会被当成新绑定"
+            app.paint_state.hotkey_recording,
+            Some(crate::paint::HotkeySlot::Toggle),
+            "按一下不算完：录制态要保持到用户点击确认"
         );
-        let ops = std::mem::take(&mut app.paint_state.ops);
-        let Some(crate::paint::Op::SetHotkey { hotkey, .. }) = ops
-            .iter()
-            .find(|o| matches!(o, crate::paint::Op::SetHotkey { .. }))
-        else {
-            panic!("录制按键应产出 Op::SetHotkey，实得 {ops:?}");
-        };
-        assert_eq!(hotkey.key, "K", "主键应按名原样记录");
-        assert!(hotkey.ctrl && hotkey.shift, "按住的修饰键应捕获：{hotkey:?}");
-        assert!(!hotkey.alt && !hotkey.win, "没按的修饰键不该被带上：{hotkey:?}");
+        assert!(
+            app.paint_state.ops.is_empty(),
+            "只记录候选，不该产出任何 Op，实得 {:?}",
+            app.paint_state.ops
+        );
+        let combo = app
+            .paint_state
+            .recording_combo
+            .clone()
+            .expect("应按住组合并记录候选");
+        assert_eq!(combo.key, "K", "主键应按名原样记录");
+        assert!(combo.ctrl && combo.shift, "按住的修饰键应捕获：{combo:?}");
+        assert!(!combo.alt && !combo.win, "没按的修饰键不该被带上：{combo:?}");
+        // 配置没被碰——应用发生在确认那一刻。
+        assert_eq!(
+            app.svc.state.config.hotkey_toggle.key, "V",
+            "未确认前配置不应被改写"
+        );
+
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 确认录制：`Op::FinishRecording` 把候选组合落进配置并退出录制态。
+    #[test]
+    fn finish_recording_applies_the_recorded_combo() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-hk-finish-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        app.paint_state.hotkey_recording = Some(crate::paint::HotkeySlot::Toggle);
+        app.paint_state.recording_combo = Some(modular_clipboard_core::config::Hotkey {
+            key: "K".into(),
+            ctrl: true,
+            shift: true,
+            alt: false,
+            win: false,
+        });
+
+        app.paint_state
+            .ops
+            .push(crate::paint::Op::FinishRecording);
+        app.apply_ops();
+
+        assert_eq!(app.paint_state.hotkey_recording, None, "确认后应退出录制态");
+        assert!(app.paint_state.recording_combo.is_none(), "候选应被取走");
+        let hk = &app.svc.state.config.hotkey_toggle;
+        assert_eq!(hk.key, "K");
+        assert!(hk.ctrl && hk.shift, "候选组合应落进配置：{hk:?}");
+
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 什么都没按就点击确认：等同取消——退出录制态但配置不动。
+    ///
+    /// 覆盖层上「点击任意位置停止录制」，用户点进来发现不想改了，
+    /// 直接点一下就该干净退出，不能留下半开的状态。
+    #[test]
+    fn finish_recording_without_combo_cancels() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-hk-nocomb-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        let before = app.svc.state.config.hotkey_toggle.clone();
+        app.paint_state.hotkey_recording = Some(crate::paint::HotkeySlot::Toggle);
+
+        app.paint_state
+            .ops
+            .push(crate::paint::Op::FinishRecording);
+        app.apply_ops();
+
+        assert_eq!(app.paint_state.hotkey_recording, None, "应退出录制态");
+        assert_eq!(
+            app.svc.state.config.hotkey_toggle, before,
+            "没录到组合时配置不应被改写"
+        );
 
         app.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
@@ -2784,19 +2886,20 @@ mod tests {
             Some(crate::paint::HotkeySlot::Toggle),
         );
 
-        // 帧 3：主键 K（带着 ctrl+shift）→ 正常录到 Ctrl+Shift+K。
+        // 帧 3：主键 K（带着 ctrl+shift）→ 记为候选组合（仍不应用）。
         let ops = frame(&mut app, key(egui::Key::K, true, true));
-        let Some(crate::paint::Op::SetHotkey { hotkey, .. }) = ops
-            .iter()
-            .find(|o| matches!(o, crate::paint::Op::SetHotkey { .. }))
-        else {
-            panic!("修饰键之后的主键应被录到，实得 {ops:?}");
-        };
-        assert_eq!(hotkey.key, "K");
-        assert!(hotkey.ctrl && hotkey.shift, "修饰键应来自 modifiers：{hotkey:?}");
+        assert!(ops.is_empty(), "只记录候选，不该产出 Op，实得 {ops:?}");
+        let combo = app
+            .paint_state
+            .recording_combo
+            .clone()
+            .expect("修饰键之后的主键应被记下");
+        assert_eq!(combo.key, "K");
+        assert!(combo.ctrl && combo.shift, "修饰键应来自 modifiers：{combo:?}");
         assert_eq!(
-            app.paint_state.hotkey_recording, None,
-            "录完应退出录制态"
+            app.paint_state.hotkey_recording,
+            Some(crate::paint::HotkeySlot::Toggle),
+            "只记录候选：录制态保持到用户点击确认"
         );
 
         app.shutdown();

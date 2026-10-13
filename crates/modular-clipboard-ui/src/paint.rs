@@ -121,9 +121,13 @@ pub enum Op {
     /// 进入「录制快捷键」状态：下一步按下的组合会被记为该槽位的绑定。
     ///
     /// 录制在 `App::draw_frame` 里消费（那里才拿得到 egui 的按键事件）。
+    /// 录到的组合**只显示不应用**，直到 [`Op::FinishRecording`]。
     StartRecording(HotkeySlot),
-    /// 取消录制（用户点了「取消」，或按了 Esc）。
-    CancelRecording,
+    /// 确认并结束录制：把已按下的候选组合落为该槽位的绑定。
+    ///
+    /// 在录制覆盖层上**点击任意位置**即触发（用户要求「点击任意位置
+    /// 停止录制」）。若还没按过主键，等同取消。
+    FinishRecording,
     /// 把输入框里的文本解析成绑定（`Ctrl+Shift+V` 形式）。
     ///
     /// 解析失败不 panic、也不静默丢弃：由 `App` 侧把错误显示成一条提示。
@@ -378,6 +382,12 @@ pub struct UiState {
     /// 录制状态属于界面本地瞬时状态：它不进配置、也不需要跨进程同步
     /// （界面进程独占键盘焦点）。
     pub hotkey_recording: Option<HotkeySlot>,
+    /// 录制中已按下的候选组合（`None` = 还没按主键）。
+    ///
+    /// **只记录不应用**：组合先显示在录制覆盖层上给用户看，
+    /// 点击任意位置确认后才落地。按一下就改的设计会让手抖
+    /// 直接换掉热键，改回来还得再录一次。
+    pub recording_combo: Option<modular_clipboard_core::config::Hotkey>,
     /// 快捷键输入框草稿，**按槽位分开存**（经 [`HotkeySlot::draft_mut`] 访问）。
     ///
     /// 不能共用一个 `String`：用户在 Toggle 行打了字没回车，转到
@@ -1637,6 +1647,17 @@ pub fn draw_settings(f: &mut Frame<'_>) {
             settings_content(f, ui);
         });
 
+    // 热键录制覆盖层（限制在本窗口客户区内，不遮桌面）。
+    //
+    // 与 MCP 覆盖层同一套路：设置内容照常画（它是 GPU 模糊的底），
+    // 分割标记之后的本面板保持清晰。**整窗只认它**——录制中再弹
+    // MCP 覆盖层只会叠罗汉，故录制态直接跳过 MCP。
+    if f.state.hotkey_recording.is_some() {
+        push_blur_split_marker(f, area);
+        draw_recording_overlay(f, area);
+        return;
+    }
+
     // MCP 调用设置覆盖层（限制在本窗口客户区内，不遮桌面）。
     //
     // 画在内容区**之后**：视觉上盖住卡片，交互区也后注册 → 命中优先。
@@ -2643,50 +2664,39 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             // - **文本输入**：能精确表达 Win+V 这类组合，也能复制粘贴；
             // - **录制**：用户不用记键名，按一下就好。
             // 只做其中一个都会有人卡住（记不住键名 / 不知道 Win 怎么写）。
+            //
+            // 录制态下本行不画特殊 UI：录制覆盖层（`draw_recording_overlay`）
+            // 会盖住整窗，这里保持朴素即可。
             let cur = slot.current(&f.svc.state.config);
-            let recording = f.state.hotkey_recording == Some(*slot);
             let mut changed = false;
             let _ = setting_row(ui, it.label, it.desc, |ui| {
-                if recording {
-                    ui.label(
-                        egui::RichText::new("请按下组合键…")
-                            .color(pal.accent)
-                            .size(12.0),
-                    );
-                    if ui.small_button("取消").clicked() {
-                        f.state.push(Op::CancelRecording);
-                    }
-                    false
-                } else {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(slot.draft_mut(f.state))
-                            .desired_width(112.0)
-                            .hint_text(cur.display())
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    // 回车即应用：设置项里再放一个「确定」按钮太重了。
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        // 先取文本再 push：两个字段同属 `f.state`，
-                        // 一起借会撞借用检查。
-                        let text = slot.draft_mut(f.state).trim().to_string();
-                        f.state.push(Op::SetHotkeyText { slot: *slot, text });
-                        changed = true;
-                    }
-                    // 输入框与按钮之间留 8pt：设置卡片把
-                    // `item_spacing.x` 归了 0（行与行才够呼吸），
-                    // 同行控件零间距会挤成一团（用户实测反馈）。
-                    ui.add_space(8.0);
-                    if ui.small_button("录制").clicked() {
-                        f.state.push(Op::StartRecording(*slot));
-                    }
-                    changed
+                let resp = ui.add(
+                    egui::TextEdit::singleline(slot.draft_mut(f.state))
+                        .desired_width(112.0)
+                        .hint_text(cur.display())
+                        .font(egui::TextStyle::Monospace),
+                );
+                // 回车即应用：设置项里再放一个「确定」按钮太重了。
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    // 先取文本再 push：两个字段同属 `f.state`，
+                    // 一起借会撞借用检查。
+                    let text = slot.draft_mut(f.state).trim().to_string();
+                    f.state.push(Op::SetHotkeyText { slot: *slot, text });
+                    changed = true;
                 }
+                // 输入框与按钮之间留 8pt：设置卡片把
+                // `item_spacing.x` 归了 0（行与行才够呼吸），
+                // 同行控件零间距会挤成一团（用户实测反馈）。
+                ui.add_space(8.0);
+                if ui.small_button("录制").clicked() {
+                    f.state.push(Op::StartRecording(*slot));
+                }
+                changed
             });
             // 注册失败要在**配置它的地方**可见：状态栏提示只闪 3 秒，
             // 用户回到设置页时早就没了。失败信息里含该行当前的组合文本
             // （格式由 `hotkey::failed_message` 固定），据此匹配行列。
-            if !recording
-                && let Some(err) = f.svc.state.hotkey_error.as_ref()
+            if let Some(err) = f.svc.state.hotkey_error.as_ref()
                 && err.contains(cur.display().as_str())
             {
                 ui.horizontal(|ui| {
@@ -3246,6 +3256,151 @@ fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Response {
     );
     f.hit_insert("settings_mcp_info", r);
     resp
+}
+
+/// 热键录制覆盖层。
+///
+/// 结构（用户定稿，2026-10-13）：**整窗只画它**——设置内容作为 GPU
+/// 模糊的底（`draw_settings` 在调用前放分割标记），本面板保持清晰。
+/// 用户看不到设置界面，只看到居中的大圆角正方形：
+///
+/// ```text
+/// ┌──────── 圆角正方形（第一个，外层面板）────────┐
+/// │              正在录制快捷键                  │
+/// │   ┌Ctrl┐ ┌Shift┐ ┌Alt┐ ┌Win┐   ← 修饰键键帽 │
+/// │        ┌──────────┐                    │
+/// │        │    K     │                    │  ← 主键键帽（第二个）
+/// │        └──────────┘                    │
+/// │     录制完成后，点击任意位置停止录制        │
+/// └──────────────────────────────────────────┘
+/// ```
+///
+/// 绘制顺序即「先圆角正方形 + 圆角正方形」：先遮罩 + 外层面板，
+/// 再内层键帽（修饰键四个 + 主键一个），全部 `painter` 直绘——
+/// 不注册任何子交互区，点击一律由全屏 `interact` 收走。
+///
+/// # 交互模型
+///
+/// 按下的组合**只显示不应用**；点击任意位置 = 确认并停止
+/// （用户要求「点击任意位置停止录制」）。没按过主键就点击 = 取消。
+/// Esc 也可取消（在 `App::capture_recording` 里处理）。
+fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
+    let pal = f.pal;
+
+    // 遮罩：与 MCP 覆盖层同色同 alpha（96）——压暗但不糊死，
+    // 模糊本身才是「失焦」的主体。
+    let dark = pal.surface.r() < 128;
+    let shade = if dark {
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 96)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 96)
+    };
+    f.ui.painter_at(area).rect_filled(area, 0.0, shade);
+
+    // ---- 第一个圆角正方形：外层面板（居中）----
+    //
+    // 用**正方形**而非横幅：录制是「看一眼、按一下、点一下」的
+    // 短动作，正方形把内容聚在视觉中心，横幅会让键帽散成一行、
+    // 提示文字离得老远。
+    let side = 340.0_f32
+        .min(area.width() * 0.92)
+        .min(area.height() * 0.92);
+    let panel = Rect::from_center_size(area.center(), vec2(side, side));
+
+    // 全屏交互：录制态下**任意位置**（含面板内）的点击都算确认。
+    // 子内容全部 painter 直绘、不注册交互区，点击自然落到这层。
+    let bg = f.ui.interact(area, egui::Id::new("recording_overlay"), egui::Sense::click());
+    if bg.clicked() {
+        f.state.push(Op::FinishRecording);
+    }
+
+    let p = f.ui.painter_at(panel);
+    p.rect_filled(panel, pal.radius_lg, pal.surface);
+
+    let pad = 22.0;
+    let mut y = panel.min.y + pad;
+
+    // 标题。
+    p.text(
+        pos2(panel.center().x, y + 10.0),
+        egui::Align2::CENTER_TOP,
+        "正在录制快捷键",
+        egui::FontId::proportional(pal.font_md),
+        pal.text_bright,
+    );
+    y += 34.0;
+
+    // ---- 第二个圆角正方形们：键帽 ----
+    //
+    // 修饰键 4 个一排（按下的高亮），主键一个大键帽居中。
+    // 「按下」的判据取**当前帧**的输入状态而非事件流：事件只在
+    // 按下的那一帧出现，而用户按住不动时键帽必须保持亮着。
+    let mods = f.ui.input(|i| i.modifiers);
+    let win = modular_clipboard_platform::win_key_down();
+    let caps: [(&str, bool); 4] = [
+        ("Ctrl", mods.ctrl),
+        ("Shift", mods.shift),
+        ("Alt", mods.alt),
+        ("Win", win),
+    ];
+    let cap_w = 62.0_f32;
+    let cap_h = 46.0_f32;
+    let gap = 10.0_f32;
+    let row_w = cap_w * 4.0 + gap * 3.0;
+    let row_x0 = panel.center().x - row_w / 2.0;
+    for (i, (name, down)) in caps.iter().copied().enumerate() {
+        let r = Rect::from_min_size(pos2(row_x0 + i as f32 * (cap_w + gap), y), vec2(cap_w, cap_h));
+        // 修饰键键帽：小圆角方块。按下 = accent 填充；未按 = 暗面。
+        let (fill, fg) = if down {
+            (pal.accent, pal.text_on_accent)
+        } else {
+            (pal.surface_variant, pal.text_dim)
+        };
+        p.rect_filled(r, pal.radius_md, fill);
+        p.text(
+            r.center(),
+            egui::Align2::CENTER_CENTER,
+            name,
+            egui::FontId::proportional(pal.font_sm),
+            fg,
+        );
+    }
+    y += cap_h + 16.0;
+
+    // 主键键帽：大一号。没按主键时显示「？」占位。
+    let main_w = 104.0_f32;
+    let main_h = 72.0_f32;
+    let main = Rect::from_center_size(pos2(panel.center().x, y + main_h / 2.0), vec2(main_w, main_h));
+    let has_key = f.state.recording_combo.is_some();
+    let (fill, fg) = if has_key {
+        (pal.accent, pal.text_on_accent)
+    } else {
+        (pal.surface_variant, pal.text_dim)
+    };
+    p.rect_filled(main, pal.radius_md, fill);
+    let main_label = f
+        .state
+        .recording_combo
+        .as_ref()
+        .map(|hk| hk.key.to_uppercase())
+        .unwrap_or_else(|| "？".into());
+    p.text(
+        main.center(),
+        egui::Align2::CENTER_CENTER,
+        main_label,
+        egui::FontId::proportional(24.0),
+        fg,
+    );
+    y += main_h + 18.0;
+
+    // 底部提示。
+    p.text(
+        pos2(panel.center().x, y),
+        egui::Align2::CENTER_TOP,
+        "录制完成后，点击任意位置停止录制",
+        egui::FontId::proportional(pal.font_sm),
+        pal.text_dim,
+    );
 }
 
 /// MCP 调用设置覆盖层。
@@ -5666,6 +5821,60 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             ops.iter().any(|o| matches!(o, Op::Quit)),
             "点「退出程序」应产生 Op::Quit，实际={ops:?}"
+        );
+    }
+
+    /// 录制覆盖层：录制态下整窗只认它，**任意位置**点击即确认。
+    ///
+    /// 用户定稿交互（2026-10-13）：「录制完成后，点击任意位置停止
+    /// 录制」。这里连点三处——面板中心、面板外、左上角——都必须
+    /// 产出同一条 `FinishRecording`。
+    #[test]
+    fn recording_overlay_click_anywhere_finishes() {
+        let mut h = Harness::new("settings-rec-overlay", vec2(900.0, 700.0));
+        h.state.hotkey_recording = Some(HotkeySlot::Toggle);
+        h.state.recording_combo = Some(modular_clipboard_core::config::Hotkey {
+            key: "K".into(),
+            ctrl: true,
+            shift: false,
+            alt: false,
+            win: false,
+        });
+        // 先跑一帧让覆盖层画出来（热区在 `recording_overlay` 上）。
+        let ops = h.settings_frame();
+        assert!(
+            ops.is_empty(),
+            "单纯绘制不该产出 Op（没有点击），实得 {ops:?}"
+        );
+
+        for p in [
+            egui::pos2(450.0, 350.0), // 面板中心
+            egui::pos2(30.0, 30.0),   // 左上角（面板外）
+            egui::pos2(870.0, 670.0), // 右下角（面板外）
+        ] {
+            let ops = h.settings_click_at(p);
+            assert!(
+                ops.iter().any(|o| matches!(o, Op::FinishRecording)),
+                "点 {p:?} 应确认录制，实得 {ops:?}"
+            );
+        }
+    }
+
+    /// 录制态下**不画** MCP 覆盖层：两个全屏覆盖层叠一起只会
+    /// 让用户点到不该点的东西。录制优先，MCP 让位。
+    #[test]
+    fn recording_overlay_takes_priority_over_mcp() {
+        let mut h = Harness::new("settings-rec-prio", vec2(900.0, 700.0));
+        h.state.hotkey_recording = Some(HotkeySlot::Toggle);
+        // 故意把 MCP 覆盖层也开着：录制态必须把它挤掉。
+        h.state.mcp_overlay_open = true;
+        h.settings_frame();
+        // MCP 覆盖层的背景交互 id 是 `mcp_overlay_bg`；录制态下点击
+        // 不该触发它（点了也不会关 MCP——那条路径根本不该注册）。
+        let ops = h.settings_click_at(egui::pos2(450.0, 350.0));
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::FinishRecording)),
+            "录制态点击应确认录制，实得 {ops:?}"
         );
     }
 
