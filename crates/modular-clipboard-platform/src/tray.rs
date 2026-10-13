@@ -122,6 +122,26 @@ const WM_TRAY_MENU: u32 = 0x8000 + 3;
 /// 不能置前台，而 `TrackPopupMenu` 要求所属窗口已是前台。
 static MENU_HOST: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// 右键菜单是否正在显示（防重入）。
+///
+/// shell 对一次右键可能发**两条**回调（`WM_RBUTTONUP` 与
+/// `WM_CONTEXTMENU` 都被 `is_context_menu_event` 认作右键），
+/// 于是消息循环会收到两条 `WM_TRAY_MENU`。若照单全收，第二条会在
+/// 第一条的 `TrackPopupMenu` **模态循环里**被派发 → 嵌套再弹一个菜单
+/// → 用户看到「菜单出现一帧就被顶掉」（2026-10-13 用户实测）。
+static MENU_SHOWING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 重入标志的 RAII 复位：函数内任何 return 路径都保证归位
+/// （早退路径漏复位会让菜单**永远**弹不出来）。
+struct MenuShowingGuard;
+
+impl Drop for MenuShowingGuard {
+    fn drop(&mut self) {
+        MENU_SHOWING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// 主窗口句柄（由 UI 层在窗口创建后写入）。
 ///
 /// # 为什么需要它
@@ -467,7 +487,7 @@ mod imp {
         DeleteObject,
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
     };
@@ -477,12 +497,13 @@ mod imp {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-        ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW, LoadIconW, MF_SEPARATOR, MF_STRING, MSG,
-        PostMessageW, RegisterClassExW, SendMessageW, SetForegroundWindow, ShowWindow, SW_HIDE,
-        SW_SHOWNOACTIVATE, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-        TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_HOTKEY,
-        WM_NULL, WM_QUIT, WNDCLASSEXW, HWND_MESSAGE, WS_EX_TOOLWINDOW, WS_POPUP,
+        DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow,
+        GetMessageW, GetWindowThreadProcessId, ICONINFO, IDC_ARROW, IDI_APPLICATION, LoadCursorW,
+        LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, RegisterClassExW, SendMessageW,
+        SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WM_COMMAND, WM_HOTKEY, WM_NULL, WM_QUIT, WNDCLASSEXW, HWND_MESSAGE, WS_EX_TOOLWINDOW,
+        WS_POPUP,
     };
     use windows::core::{HSTRING, PCWSTR};
 
@@ -874,6 +895,13 @@ mod imp {
     /// 弹出右键菜单并派发用户选择。
     unsafe fn show_context_menu(hwnd: HWND) {
         unsafe {
+            // 重入保护：菜单已在显示中就忽略这条重复回调。
+            if MENU_SHOWING.swap(true, std::sync::atomic::Ordering::Acquire) {
+                tracing::debug!("右键菜单已在显示中，忽略重复回调（防嵌套模态）");
+                return;
+            }
+            let _guard = MenuShowingGuard;
+
             let Ok(menu) = CreatePopupMenu() else {
                 tracing::warn!("CreatePopupMenu 失败，跳过托盘菜单");
                 return;
@@ -932,7 +960,32 @@ mod imp {
                 hwnd
             };
             let _ = ShowWindow(host, SW_SHOWNOACTIVATE);
-            let _ = SetForegroundWindow(host);
+            // 宿主必须**真正成为前台窗口**，否则菜单显示一帧就被系统撤掉
+            // （`TrackPopupMenu` 所属窗口非前台时的标准症状）。
+            //
+            // 直接 `SetForegroundWindow` 会踩**前台锁**：用户右键点的是
+            // 任务栏，输入归 explorer，本进程不算「刚收到输入」，置前台
+            // 大概率失败——这就是「有概率闪退」的根因。辅助手段与本项目
+            // `presence::focus_window` 同源：把本线程的输入队列临时接到
+            // 前台线程上，让系统认为这次置前台「来自前台」。
+            let mut ok = SetForegroundWindow(host).as_bool();
+            if !ok {
+                let fg = GetForegroundWindow();
+                if !fg.0.is_null() && fg != host {
+                    let fg_thread = GetWindowThreadProcessId(fg, None);
+                    let cur_thread = GetCurrentThreadId();
+                    if fg_thread != 0 && fg_thread != cur_thread {
+                        let _ = AttachThreadInput(cur_thread, fg_thread, true);
+                        ok = SetForegroundWindow(host).as_bool();
+                        let _ = AttachThreadInput(cur_thread, fg_thread, false);
+                    }
+                }
+            }
+            if !ok && GetForegroundWindow() != host {
+                // 菜单会闪退。除了这个症状没有任何线索，必须留日志——
+                // 否则下次还是只能靠用户复述「有概率」。
+                tracing::debug!("菜单宿主未能置前台（前台锁），右键菜单可能闪退");
+            }
 
             let cmd = TrackPopupMenu(
                 menu,
@@ -1445,6 +1498,31 @@ fn run(
             }
         }
     }
+
+    /// 重入保护：菜单已在显示中时，`show_context_menu` 必须立即返回。
+    ///
+    /// shell 对一次右键可能发两条回调（WM_RBUTTONUP + WM_CONTEXTMENU），
+    /// 第二条 `WM_TRAY_MENU` 若照常处理，会在前一个 `TrackPopupMenu` 的
+    /// **模态循环里**再弹一个——嵌套模态菜单，用户看到「菜单出现一帧
+    /// 就被顶掉」。占住标志后来袭的调用应立即原路返回。
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn context_menu_ignores_reentrant_call() {
+            // 注意：这个测试**不能**放行到 TrackPopupMenu——那会真的弹
+            // 一个模态菜单，把测试进程挂死。能返回即证明重入保护生效。
+            let was = MENU_SHOWING.swap(true, std::sync::atomic::Ordering::Acquire);
+            unsafe { show_context_menu(HWND(std::ptr::null_mut())) };
+            assert!(
+                MENU_SHOWING.load(std::sync::atomic::Ordering::Acquire),
+                "重入路径不应复位标志（复位意味着真的走到弹菜单逻辑）"
+            );
+            MENU_SHOWING.store(was, std::sync::atomic::Ordering::Release);
+        }
+    }
+
 }
 
 #[cfg(test)]
