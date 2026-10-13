@@ -1,11 +1,12 @@
 # ModularClipboard
 
 纯 Rust 实现的模块化剪贴板管理器：原生 Vulkan 图形后端（`ash` 直驱）、
-**常驻进程与界面进程分离**、全局热键、开机自启、迷你快捷复制面板。
+**常驻进程与界面进程分离**、全局热键、开机自启、迷你快捷复制面板、
+**自研磨砂背景**，并内置 **MCP 服务**，让 AI 客户端能看屏幕、点界面、读写剪贴板。
 
 > **项目状态：Pre-Release。** 核心功能（捕获、存储、搜索、联动、托盘常驻、
-> 自定义热键、自启动）已完成并通过 657 项测试；首批 Pre-Release 已发布，
-> 欢迎实测反馈。
+> 自定义热键、自启动、自研磨砂、MCP 服务）已完成并通过 671 项测试；
+> 首批 Pre-Release 已发布，欢迎实测反馈。
 
 ## 功能特性
 
@@ -22,7 +23,14 @@
 **界面**
 - 自写 Vulkan 渲染器（ash 直驱，不经 wgpu）
 - 虚拟化列表，万级条目不卡顿；搜索（`Ctrl+F` 聚焦）、分组筛选
-- 明暗主题、字体缩放、**自研磨砂 / 半透明背景**（GPU 卷积实时模糊）
+- 明暗主题、字体缩放、**自研磨砂 / 半透明背景**（GPU 卷积实时高斯模糊）
+- 自研磨砂每帧抓取窗口身后的桌面再模糊：**拖动窗口时磨砂实时跟随**（标题栏命中
+  后改走非模态自定义拖动，不进入系统模态移动循环，帧循环不停）；并通过
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` 把自身排除在录屏/截图外，
+  磨砂不会糊到自己。可在设置里调不透明度
+- 设置界面：固定窗口、左右导航 + 独立圆角卡片，即改即生效（无「应用」按钮、无底栏），
+  每项偏离默认值时在卡片右上角出现「重置」
+- 记忆窗口位置；卡片间缝隙、列表边距等空白区域均可拖动窗口
 - 多格式详情预览
 
 **常驻与热键**
@@ -45,6 +53,18 @@
 - 内置动作：浏览器搜索、DeepL 翻译
 - 用户可配置 `ActionRule`（关键词 + 类型 → 动作），优先级高于内置推断
 - 一键粘贴到前台窗口（写回剪贴板 + SendInput Ctrl+V）
+
+**MCP 服务（AI 调用）**
+- 内置 Model Context Protocol（JSON-RPC 2.0）服务，让 AI 客户端（Claude Desktop、
+  Cursor 等）能够操作本机界面
+- 两种传输：
+  - **stdio**（本地推荐）：`--mcp-server`，由 MCP 客户端 spawn，每行一个 JSON
+  - **Streamable HTTP**（远程 / 自定义）：`--mcp-http`，监听 `http://{host}:{port}/mcp`，
+    支持 Bearer token 鉴权
+- 10 个可单独开关的界面自动化工具：屏幕截图、读取元素布局、鼠标点击 / 滚动 / 拖拽、
+  文本键入、组合键、调整窗口大小、切换窗口焦点、剪贴板读写
+- 设置 →「通信」：总开关 + 「ⓘ」覆盖层逐项授权，服务地址 / 端口 / 密钥可自定义；
+  「一键 AI 配对提示词」按当前配置生成可直接粘贴的接入 JSON
 
 ## 快速开始
 
@@ -75,6 +95,8 @@ modular-clipboard --daemon     # 只启动常驻进程（开机自启用的就�
 modular-clipboard --ui         # 只启动界面（连接已运行的常驻进程）
 modular-clipboard --single     # 单进程模式（排障用）
 modular-clipboard --no-capture # 不监听剪贴板（调试）
+modular-clipboard --mcp-server # 以 stdio 方式运行 MCP 服务（供 MCP 客户端 spawn）
+modular-clipboard --mcp-http   # 以 Streamable HTTP 方式运行 MCP 服务
 modular-clipboard --data-dir <路径>
 ```
 
@@ -115,7 +137,9 @@ modular-clipboard --data-dir <路径>
 `Sync{known}`，版本未变回 `{"Unchanged"}`（几十字节），不传全量列表。
 
 ```
-modular-clipboard → modular-clipboard-ui → modular-clipboard-app → {capture, platform, gfx} → store → core
+modular-clipboard (bin)
+ ├─ modular-clipboard-ui → modular-clipboard-app → {capture, platform, gfx} → store → core
+ └─ modular-clipboard-mcp → core        # MCP 服务：JSON-RPC + UI 自动化（stdio / HTTP）
 ```
 
 详见 [ARCHITECTURE.md](ARCHITECTURE.md)；构建与图标资源见 [BUILD.md](BUILD.md)。
@@ -136,7 +160,7 @@ modular-clipboard → modular-clipboard-ui → modular-clipboard-app → {captur
 ## 测试
 
 ```bash
-cargo test --workspace      # 657 项
+cargo test --workspace      # 671 项
 cargo clippy --workspace --all-targets   # 零警告
 ```
 
@@ -145,6 +169,7 @@ cargo clippy --workspace --all-targets   # 零警告
 ```bash
 cargo run --example tray_probe          # 托盘图标 + 事件链路 + 热键注册/重注册/录制暂停
 cargo run --example tray_interact_probe # 真实子进程：关窗口≠退出 的四条链路
+cargo run --example backdrop_probe      # 自研磨砂合成路径回归（漏 configure 即全透明）
 ```
 
 ## 路线图
@@ -152,3 +177,9 @@ cargo run --example tray_interact_probe # 真实子进程：关窗口≠退出 �
 - 跨平台验证（目前仅 Windows）
 - 载荷加密、图片缩略图预览、分页加载
 - 动作规则编辑界面化
+
+## 链接
+
+- 项目主页：<https://github.com/MCheng404/ModularClipboard>
+- 作者主页：<https://github.com/MCheng404>
+- 协议：[MIT License](LICENSE)
