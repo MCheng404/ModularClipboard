@@ -19,3 +19,14 @@
 *.py        text eol=lf
 *.yml       text eol=lf
 *.yaml      text eol=lf
+
+# ---- GitHub Linguist：语言统计只保留 Rust（项目主体编写语言）----
+#
+# 仓库里另有大量验证 / 构建脚本（PowerShell、Python、Shell）、HTML 原型、
+# WGSL 着色器、文档与二进制资源（图片/字体/图标），它们都不是产品的
+# 编写语言，纳入语言条会稀释 Rust 的占比。
+#
+# 遵循本文件开头「最后一条匹配生效」的规则：先对所有文件关闭语言检测，
+# 再单独对 *.rs 打开。
+*    linguist-detectable=false
+*.rs linguist-detectable=true
