@@ -18,7 +18,7 @@ use modular_clipboard_gfx::Gpu;
 use modular_clipboard_gfx::backdrop::{
     capture_due, capture_size, DesktopCapture, CAPTURE_INTERVAL,
 };
-use modular_clipboard_gfx::blur::{BlurChain, BlurPipeline, DEFAULT_DIVISOR};
+use modular_clipboard_gfx::blur::{BlurChain, BlurPipeline, DEFAULT_DIVISOR, DEFAULT_RADIUS};
 use modular_clipboard_gfx::buffer::{Buffer, UniformBuffer, Vertex};
 use modular_clipboard_gfx::frame::{DrawInput, FrameRenderer};
 use modular_clipboard_gfx::pipeline::Uniforms;
@@ -466,13 +466,27 @@ struct BackdropFx {
 }
 
 /// 磨砂背景的运行状态：GPU 资源 + GDI 捕获器 + 节流时间戳 + 背景亮度。
-#[derive(Default)]
 struct BackdropState {
     fx: Option<BackdropFx>,
     capture: Option<DesktopCapture>,
     last_capture: Option<Instant>,
     /// 上一次成功捕获的背景平均亮度（0~1），供上层决定背景层实度。
     luminance: Option<f32>,
+    /// 上一次卷积所用的高斯半径；与本帧设置不同则强制重捕获，
+    /// 让用户拖「磨砂强度」滑块时立即见效（不等 30fps 捕获节流）。
+    blur_radius: u32,
+}
+
+impl Default for BackdropState {
+    fn default() -> Self {
+        Self {
+            fx: None,
+            capture: None,
+            last_capture: None,
+            luminance: None,
+            blur_radius: DEFAULT_RADIUS,
+        }
+    }
 }
 
 impl BackdropState {
@@ -580,6 +594,7 @@ impl<'a> Painter<'a> {
             textures_delta,
             PaintMode::Plain,
             None,
+            DEFAULT_RADIUS,
         )
     }
 
@@ -607,6 +622,7 @@ impl<'a> Painter<'a> {
             textures_delta,
             PaintMode::OverlayBlur,
             None,
+            DEFAULT_RADIUS,
         )
     }
 
@@ -633,6 +649,7 @@ impl<'a> Painter<'a> {
         &mut self,
         fr: &mut FrameRenderer<'a>,
         hwnd: isize,
+        blur_radius: u32,
         primitives: &[egui::epaint::ClippedPrimitive],
         pixels_per_point: f32,
         dpi_scale: f32,
@@ -646,6 +663,7 @@ impl<'a> Painter<'a> {
             textures_delta,
             PaintMode::BackdropBlur,
             Some(hwnd),
+            blur_radius,
         )
     }
 
@@ -682,6 +700,7 @@ impl<'a> Painter<'a> {
         textures_delta: &mut egui::TexturesDelta,
         mode: PaintMode,
         backdrop_hwnd: Option<isize>,
+        blur_radius: u32,
     ) -> anyhow::Result<()> {
         let blur_split = tessellate_into(
             primitives,
@@ -810,6 +829,7 @@ impl<'a> Painter<'a> {
             self.record_backdrop_blur(
                 fr,
                 backdrop_hwnd.unwrap_or_default(),
+                blur_radius,
                 render_extent,
                 divisor,
             )?;
@@ -1009,6 +1029,7 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
         &mut self,
         fr: &mut FrameRenderer<'a>,
         hwnd: isize,
+        blur_radius: u32,
         render_extent: vk::Extent2D,
         divisor: u32,
     ) -> anyhow::Result<()> {
@@ -1019,9 +1040,15 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
         }
         self.ensure_backdrop(fr, render_extent, swap_extent, divisor, format)?;
 
-        // 节流：未到间隔直接复用上一帧的模糊结果。
+        // 强度档位变了：强制本帧重新捕获 + 卷积，不等 30fps 节流——
+        // 拖滑块时若还按 33ms 节流，强度要隔一两帧才跳，手感发黏。
+        let radius_changed = self.backdrop.blur_radius != blur_radius;
+        if radius_changed {
+            self.backdrop.blur_radius = blur_radius;
+        }
+        // 节流：未到间隔且强度未变时直接复用上一帧的模糊结果。
         let now = Instant::now();
-        if !capture_due(self.backdrop.last_capture, now, CAPTURE_INTERVAL) {
+        if !radius_changed && !capture_due(self.backdrop.last_capture, now, CAPTURE_INTERVAL) {
             return Ok(());
         }
 
@@ -1032,6 +1059,8 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
             capture,
             last_capture,
             luminance,
+            // blur_radius 已在节流判断前整体读写，这里无需再解构。
+            ..
         } = &mut self.backdrop;
         let fx = fx.as_mut().expect("ensure_backdrop 刚确保存在");
 
@@ -1078,6 +1107,12 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
         let gpu = self.gpu;
         if let Err(e) = fr.record_texture_upload(&mut fx.capture_img, bits, None, (w, h)) {
             self.warn_backdrop(&format!("桌面位图上传失败: {e:#}"));
+            return Ok(());
+        }
+        // 写入本帧的卷积半径（磨砂强度）。描述符集指向的是同一块 uniform
+        // 缓冲，改完紧接着的 record_from 即按新半径卷积——无需重建管线。
+        if let Err(e) = fx.pipeline.set_radius(gpu, &fx.chain, blur_radius) {
+            self.warn_backdrop(&format!("磨砂强度更新失败: {e:#}"));
             return Ok(());
         }
         if let Err(e) = fx.pipeline.record_from(

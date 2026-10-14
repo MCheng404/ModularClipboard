@@ -102,6 +102,8 @@ pub enum Op {
     SetBackdrop(modular_clipboard_core::config::WindowBackdrop),
     /// 调背景不透明度（0.3 ~ 1.0）。
     SetOpacity(f32),
+    /// 调磨砂强度档位（1 ~ 10）。
+    SetBlurStrength(u8),
     /// 切换主题（跟随系统 / 深色 / 浅色）。
     ///
     /// 由 `App::apply_ops` 落地：更新 `App.pal` 并重灌主窗口 `Visuals`；
@@ -776,7 +778,7 @@ pub fn draw(f: &mut Frame<'_>) {
     draw_notice_toast(f);
 }
 
-/// 通知 toast：右上角短暂显示 `Service::notify` 的消息（F-16 / UI-P0-2）。
+/// 通知 toast：窗口上方居中短暂显示 `Service::notify` 的消息（F-16 / UI-P0-2）。
 ///
 /// # 为什么必须有它
 ///
@@ -785,7 +787,8 @@ pub fn draw(f: &mut Frame<'_>) {
 /// 写进去即蒸发，用户点了「复制」却没反应时得不到任何解释。
 /// 原状态栏（`STATUSBAR_HEIGHT`）已移除，toast 是它的替代通道。
 ///
-/// 行为：贴顶栏右下角显示，[`NOTICE_TTL`] 后自动消失；过期的那一帧
+/// 行为：在窗口**上方居中**显示（宽度按内容自适应并钳在窗口内，
+/// 窄窗口也不会渲染到窗外），[`NOTICE_TTL`] 后自动消失；过期的那一帧
 /// 顺带把 `notice` 清掉（读取即消费，不需要额外的定时器）。
 fn draw_notice_toast(f: &mut Frame<'_>) {
     /// toast 存活时间。3 秒是桌面端通知的惯例时长：足够读完一句话，
@@ -815,9 +818,23 @@ fn draw_notice_toast(f: &mut Frame<'_>) {
         .painter()
         .layout(msg.clone(), font.clone(), pal.text, MAX_W - 16.0);
     let w = (galley.rect.width() + 16.0).clamp(MIN_W, MAX_W);
-    // 贴在顶栏下缘、右缘留白处。顶栏按钮在更右侧的上方，不重叠。
+    // 上方居中 + 边界钳制：
+    // 1) 可用宽度 = 窗口宽 - 左右各一个 MARGIN；
+    // 2) toast 宽度压到可用宽度以内（哪怕因此比 MIN_W 还窄）；
+    // 3) 水平中心对齐窗口中线，再把 x 钳进 [min+MARGIN, max-MARGIN-w]。
+    //    只要 w <= 可用宽度，这个区间恒非空（下界 <= 上界）。
+    let area = f.area;
+    let avail_w = area.width() - 2.0 * MARGIN;
+    if avail_w <= 0.0 {
+        // 退化情况：窗口窄到连左右边距都放不下，画了必溢出——干脆不画。
+        return;
+    }
+    let w = w.min(avail_w);
+    let cx = (area.min.x + area.max.x) * 0.5;
+    let x = (cx - w * 0.5).clamp(area.min.x + MARGIN, area.max.x - MARGIN - w);
+    // 垂直仍贴顶栏下缘。
     let r = Rect::from_min_size(
-        pos2(f.area.max.x - w - MARGIN, crate::solver::TOPBAR_HEIGHT + MARGIN * 0.5),
+        pos2(x, crate::solver::TOPBAR_HEIGHT + MARGIN * 0.5),
         vec2(w, H),
     );
     // 自报热区：与其它命名区域同一套路，测试与自动化读坐标而不重算公式。
@@ -1941,6 +1958,8 @@ enum ItemKind {
     Backdrop,
     /// 背景不透明度滑块。
     Opacity,
+    /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
+    BlurStrength,
     /// 快捷键绑定（只读展示）。
     Hotkey(HotkeySlot),
     /// 开机自启动开关（要写注册表，故单独一个变体）。
@@ -2068,6 +2087,7 @@ impl SettingsItem {
             ItemKind::Theme => cfg.ui.dark_mode.is_some(),
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
+            ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
             ItemKind::Hotkey(slot) => slot.current(cfg) != slot.default(),
             ItemKind::Autostart => cfg.ui.autostart != d.ui.autostart,
             ItemKind::McpToggle => {
@@ -2106,6 +2126,7 @@ impl SettingsItem {
             ItemKind::Theme => Some(Op::SetThemeMode(crate::theme::ThemeMode::FollowSystem)),
             ItemKind::Backdrop => Some(Op::SetBackdrop(WindowBackdrop::None)),
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
+            ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
             ItemKind::Autostart => Some(Op::SetAutostart(d.ui.autostart)),
             ItemKind::Hotkey(slot) => Some(Op::SetHotkey {
                 slot: *slot,
@@ -2194,6 +2215,11 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: "背景效果",
                 desc: "无 / 磨砂（实时模糊） / 半透明",
                 kind: ItemKind::Backdrop,
+            },
+            SettingsItem {
+                label: "磨砂强度",
+                desc: "磨砂模式下的模糊程度（1~10 档）",
+                kind: ItemKind::BlurStrength,
             },
             SettingsItem {
                 label: "背景不透明度",
@@ -2667,6 +2693,31 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             });
             if changed && enabled {
                 f.state.push(Op::SetOpacity(op));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::BlurStrength => {
+            // 只有磨砂模式需要模糊强度；半透明 / 无背景时禁用并压暗。
+            let mut level = f.svc.state.config.ui.window_blur_strength;
+            let enabled =
+                f.svc.state.config.ui.window_backdrop == WindowBackdrop::Acrylic;
+            let pal = f.pal;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                // right_to_left：先加的靠右 ⇒ 档位数字在滑条右侧。
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("{level}/10")).color(pal.text_dim),
+                ));
+                draw_step_slider(
+                    f,
+                    ui,
+                    "window_blur_strength",
+                    &mut level,
+                    1..=10,
+                    enabled,
+                )
+            });
+            if changed && enabled {
+                f.state.push(Op::SetBlurStrength(level));
                 record_recent(f, it.label);
             }
         }
@@ -3151,6 +3202,87 @@ fn draw_slider(
     // 热区登记：自动化按字段名定位（同开关的约定）。
     f.hit_insert(id_suffix, rect);
     (*v - orig).abs() > f32::EPSILON
+}
+
+/// 离散档位滑块：外观与 [`draw_slider`] 一致，但值**吸附到整数档位**
+/// （磨砂强度 1~10）——knob 与填充都按吸附后的档位走，一格一格清晰，
+/// 不会停在两档之间。返回本帧档位是否被改变。
+fn draw_step_slider(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    id_suffix: &'static str,
+    v: &mut u8,
+    range: std::ops::RangeInclusive<u8>,
+    enabled: bool,
+) -> bool {
+    let pal = f.pal;
+    let track_w = 150.0;
+    let track_h = 6.0;
+    let knob_d: f32 = 16.0;
+    let cell_h = knob_d.max(track_h);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
+    let resp = ui.interact(
+        rect,
+        egui::Id::new(("step_slider", id_suffix)),
+        if enabled {
+            Sense::click_and_drag()
+        } else {
+            Sense::hover()
+        },
+    );
+
+    let (lo, hi) = (*range.start() as f32, *range.end() as f32);
+    let orig = *v;
+    if enabled
+        && (resp.dragged() || resp.is_pointer_button_down_on())
+        && let Some(pp) = resp.interact_pointer_pos()
+    {
+        let t = ((pp.x - rect.min.x) / track_w).clamp(0.0, 1.0);
+        // 指针位置 → 最近的整数档位（t=0 落 lo，t=1 落 hi）。
+        let mapped = lo + (hi - lo) * t;
+        *v = mapped.round().clamp(lo, hi) as u8;
+    }
+    // 关键：归一化用吸附后的整数档位，knob 才会一格一格跳。
+    let t = ((*v as f32 - lo) / (hi - lo)).clamp(0.0, 1.0);
+
+    let p = ui.painter_at(rect);
+    let track = Rect::from_min_size(
+        pos2(rect.min.x, rect.center().y - track_h * 0.5),
+        vec2(track_w, track_h),
+    );
+    let fill_w = track_w * t;
+    let track_bg = if enabled { pal.surface_variant } else { pal.border_subtle };
+    let fill = if !enabled {
+        pal.text_dim
+    } else if resp.hovered() || resp.dragged() {
+        pal.accent_hover
+    } else {
+        pal.accent
+    };
+    p.rect_filled(track, track_h * 0.5, track_bg);
+    if fill_w > 0.5 {
+        p.rect_filled(
+            Rect::from_min_size(track.min, vec2(fill_w, track_h)),
+            track_h * 0.5,
+            fill,
+        );
+    }
+    let knob_x = (track.min.x + fill_w).clamp(track.min.x + knob_d * 0.5, track.max.x - knob_d * 0.5);
+    let knob_c = pos2(knob_x, track.center().y);
+    let knob_r = knob_d * 0.5;
+    p.circle_filled(
+        knob_c + vec2(0.0, 0.8),
+        knob_r,
+        egui::Color32::from_black_alpha(45),
+    );
+    p.circle_filled(
+        knob_c,
+        knob_r,
+        if enabled { egui::Color32::WHITE } else { pal.text_dim },
+    );
+
+    f.hit_insert(id_suffix, rect);
+    *v != orig
 }
 
 /// MCP 总开关左侧的 ⓘ 详细按钮（打开 MCP 调用设置覆盖层）。
@@ -6054,6 +6186,61 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             h.state.hit_get_from(HitNs::Main, "notice_toast").is_none(),
             "过期通知不应再占热区"
+        );
+    }
+
+    /// toast 必须在窗口上方居中；窗口极窄时也要被钳在窗内、不渲染到窗外。
+    #[test]
+    fn notice_toast_is_top_centered_and_kept_inside_window() {
+        const MARGIN: f32 = 12.0;
+
+        // 正常宽度：水平中心对齐窗口中线。
+        let mut h = Harness::new("notice-center", vec2(700.0, 600.0)).with_items(1);
+        h.svc.notify("已复制到剪贴板".into());
+        h.frame();
+        let r = h
+            .state
+            .hit_get_from(HitNs::Main, "notice_toast")
+            .expect("有通知时应有 toast 热区");
+        let toast_cx = r.center().x;
+        assert!(
+            (toast_cx - 350.0).abs() < 1.0,
+            "toast 应水平居中：中心 {toast_cx}，窗口中心 350"
+        );
+
+        // 极窄窗口：toast 仍必须完全落在左右边距之间，宽度被动态压缩。
+        for narrow in [160.0_f32, 120.0, 90.0, 60.0, 40.0] {
+            let mut n = Harness::new("notice-clamp", vec2(narrow, 300.0)).with_items(1);
+            n.svc.notify("已复制".into());
+            n.frame();
+            let rr = n
+                .state
+                .hit_get_from(HitNs::Main, "notice_toast")
+                .unwrap_or_else(|| panic!("宽 {narrow} 时也应有 toast"));
+            assert!(
+                rr.min.x >= MARGIN - 0.5,
+                "宽 {narrow}：toast 左缘 {:.1} 越过左边距 {MARGIN}",
+                rr.min.x
+            );
+            assert!(
+                rr.max.x <= narrow - MARGIN + 0.5,
+                "宽 {narrow}：toast 右缘 {:.1} 越过右边距（窗口宽 {narrow}）",
+                rr.max.x
+            );
+        }
+
+        // 退化情况：窗口窄到连左右边距都放不下（<24px）时直接不画——
+        // 既不越界也不 panic（旧实现 f32::clamp 区间反转会在此崩溃）。
+        let mut degenerate =
+            Harness::new("notice-degenerate", vec2(20.0, 200.0)).with_items(1);
+        degenerate.svc.notify("提示".into());
+        degenerate.frame();
+        assert!(
+            degenerate
+                .state
+                .hit_get_from(HitNs::Main, "notice_toast")
+                .is_none(),
+            "窗口窄到放不下边距时不应画 toast"
         );
     }
 

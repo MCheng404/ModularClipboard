@@ -1062,6 +1062,9 @@ fn run_mode(
             painter.paint_backdrop(
                 &mut fr,
                 window.hwnd().0 as isize,
+                modular_clipboard_gfx::blur::radius_for_strength(
+                    app.svc.state.config.ui.window_blur_strength,
+                ),
                 &primitives,
                 ppp,
                 window.scale_factor(),
@@ -2018,6 +2021,13 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 }
                 Op::SetOpacity(opacity) => {
                     self.svc.state.config.ui.window_opacity = opacity.clamp(0.3, 1.0);
+                    self.after_config_change();
+                }
+                Op::SetBlurStrength(level) => {
+                    // 磨砂强度只改卷积半径，运行时下一帧卷积即生效（渲染层
+                    // 检测到半径变化会强制重捕获，无需重建资源）。
+                    self.svc.state.config.ui.window_blur_strength =
+                        level.clamp(1, modular_clipboard_gfx::blur::BLUR_LEVELS);
                     self.after_config_change();
                 }
                 Op::SetThemeMode(mode) => {

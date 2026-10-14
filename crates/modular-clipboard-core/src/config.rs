@@ -330,6 +330,14 @@ pub struct UiConfig {
     /// - `Translucent`（半透明）：映射区间更实，直接透出未模糊桌面。
     #[serde(default = "default_window_opacity")]
     pub window_opacity: f32,
+    /// 磨砂强度档位（1 ~ 10，默认 7）。仅在 `window_backdrop == Acrylic`
+    /// 时生效。
+    ///
+    /// 映射到渲染层高斯卷积半径（见 `gfx::blur::radius_for_strength`）：
+    /// 1 档最轻（半径 1）、10 档最重（半径 12），第 7 档对应历史固定
+    /// 半径 8，因此旧用户升级后观感不变。
+    #[serde(default = "default_window_blur_strength")]
+    pub window_blur_strength: u8,
 }
 
 /// 窗口背景效果。
@@ -357,6 +365,11 @@ pub enum WindowBackdrop {
 /// `window_opacity` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
 fn default_window_opacity() -> f32 {
     1.0
+}
+
+/// `window_blur_strength` 的 serde 缺省值：第 7 档对应历史固定半径 8。
+fn default_window_blur_strength() -> u8 {
+    7
 }
 
 /// 一个窗口的位置（屏幕逻辑点，左上角为原点）。
@@ -394,6 +407,7 @@ impl Default for UiConfig {
             pinned_window_pos: None,
             window_backdrop: WindowBackdrop::None,
             window_opacity: 1.0,
+            window_blur_strength: default_window_blur_strength(),
         }
     }
 }
@@ -1008,6 +1022,18 @@ mod tests {
     #[test]
     fn default_ui_config_has_no_layout_override() {
         assert_eq!(UiConfig::default().layout, None);
+    }
+
+    /// 默认磨砂强度档位必须是 7——它经 `gfx::blur::radius_for_strength`
+    /// 映射回历史固定半径 8，老用户升级后磨砂观感保持一致（不突然变轻
+    /// 或变糊）。
+    #[test]
+    fn default_blur_strength_is_seven_for_legacy_match() {
+        assert_eq!(
+            UiConfig::default().window_blur_strength,
+            7,
+            "缺省档位不是 7，会改变升级用户的磨砂观感"
+        );
     }
 
     /// 版本号必须稳定：它是将来做格式迁移的唯一依据。

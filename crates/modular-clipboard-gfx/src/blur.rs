@@ -52,6 +52,9 @@ pub const DEFAULT_DIVISOR: u32 = 4;
 /// 默认高斯半径（降采样后的纹素单位）。
 pub const DEFAULT_RADIUS: u32 = 8;
 
+/// 磨砂强度档位数（设置里暴露给用户的离散档位，1..=10）。
+pub const BLUR_LEVELS: u8 = 10;
+
 /// 描述符集角色。各组各自绑定一张固定的源纹理：
 /// 描述符集的内容是**执行期**读取的，同一份集在两趟之间改写会让
 /// 两趟都读到最后一次写入的值——所以必须一组一集。
@@ -129,6 +132,17 @@ pub fn clamp_radius(radius: u32) -> u32 {
 /// 下限 0.5 避免半径很小时 σ→0 让着色器里的 `exp(-k²/2σ²)` 除零。
 pub fn sigma_for_radius(radius: u32) -> f32 {
     (clamp_radius(radius) as f32 / 3.0).max(0.5)
+}
+
+/// 把设置里的 1..=[`BLUR_LEVELS`] 强度档位映射到高斯半径（1..=[`MAX_BLUR_RADIUS`]）。
+///
+/// 线性铺满整个半径区间：第 1 档几乎不糊（r=1），第 10 档最糊（r=12）。
+/// 历史默认观感（[`DEFAULT_RADIUS`]=8）落在第 7 档——故配置的缺省档位
+/// 取 7，让升级前后磨砂强度一致。
+pub fn radius_for_strength(level: u8) -> u32 {
+    let l = level.clamp(1, BLUR_LEVELS) as f32;
+    let r = 1.0 + (l - 1.0) / (BLUR_LEVELS as f32 - 1.0) * (MAX_BLUR_RADIUS as f32 - 1.0);
+    clamp_radius(r.round() as u32)
 }
 
 /// 一维高斯权重（未归一化），长度 `2r+1`，索引 0 对应 `k = -r`。
@@ -472,6 +486,41 @@ impl BlurPipeline {
         Ok(())
     }
 
+    /// 更新高斯半径（磨砂强度）并立即重写横向 / 纵向 uniform。
+    ///
+    /// 描述符集绑定的是**同一块** uniform buffer：这里写完，下一趟
+    /// [`Self::record_from`] 即按新半径卷积。半径在着色器里是运行时
+    /// uniform、循环上限固定为 [`MAX_BLUR_RADIUS`]，因此**无需重建管线或
+    /// 离屏链**，只改两个 host-visible 的 32 字节缓冲，开销可忽略。
+    ///
+    /// 每次重新卷积前调用即可；半径不变时重复调用结果相同（幂等）。
+    pub fn set_radius(
+        &mut self,
+        gpu: &Gpu,
+        chain: &BlurChain,
+        radius: u32,
+    ) -> anyhow::Result<()> {
+        let device = &gpu.device;
+        let low = chain.blur_a.extent;
+        let texel = [
+            1.0 / low.width.max(1) as f32,
+            1.0 / low.height.max(1) as f32,
+        ];
+        let r = clamp_radius(radius);
+        let sigma = sigma_for_radius(r);
+        self.uniform_h.write(
+            device,
+            0,
+            bytemuck::bytes_of(&BlurUniforms::horizontal(texel, r, sigma)),
+        )?;
+        self.uniform_v.write(
+            device,
+            0,
+            bytemuck::bytes_of(&BlurUniforms::vertical(texel, r, sigma)),
+        )?;
+        Ok(())
+    }
+
     /// 把 `SET_DOWNSAMPLE_BACKDROP` 指向**任意**源图视图。
     ///
     /// 主窗口自研磨砂的降采样源是捕获的桌面纹理，而不是链内的
@@ -801,6 +850,27 @@ mod tests {
             assert!(s >= 0.5, "半径 {r} 的 σ={s} 太小");
             assert!(s.is_finite());
         }
+    }
+
+    #[test]
+    fn strength_levels_span_full_range_monotonically() {
+        // 两端：第 1 档最轻（r=1），第 10 档最重（r=MAX）。
+        assert_eq!(radius_for_strength(1), 1, "第 1 档应几乎不糊");
+        assert_eq!(
+            radius_for_strength(BLUR_LEVELS),
+            MAX_BLUR_RADIUS,
+            "最高档应铺满半径上限"
+        );
+        // 历史默认观感（r=8）落在第 7 档——缺省档位取 7 才不改观。
+        assert_eq!(radius_for_strength(7), DEFAULT_RADIUS);
+        // 档位越高半径不得减小（单调不减）。
+        let radii: Vec<u32> = (1..=BLUR_LEVELS).map(radius_for_strength).collect();
+        for w in radii.windows(2) {
+            assert!(w[1] >= w[0], "强度档位提高模糊半径却减小: {radii:?}");
+        }
+        // 越界档位被钳进区间，不 panic。
+        assert_eq!(radius_for_strength(0), 1);
+        assert_eq!(radius_for_strength(200), MAX_BLUR_RADIUS);
     }
 
     #[test]
