@@ -96,7 +96,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DPICHANGED, WM_IME_CHAR, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_POPUP,
     WS_SYSMENU,
     // IME 会话：搜索框要能输入中文，候选窗依赖这三个消息。
     //
@@ -437,7 +437,16 @@ impl Window {
         no_activate: bool,
         owner: Option<HWND>,
     ) -> anyhow::Result<Self> {
-        let mut ex = WS_EX_TOOLWINDOW;
+        // CAUTION: **不要**用 `WS_EX_TOOLWINDOW`。
+        //
+        // 它有两个副作用：① DWM 的圆角偏好（`DWMWA_WINDOW_CORNER_
+        // PREFERENCE`）对工具窗口常常不生效 ⇒ 窗口是方角的，而磨砂底图
+        // 铺满整个方形窗口、面板却是圆角的，四个角就露出三角形磨砂
+        // （细条的两端各两个）；② 工具窗口在某些系统/远程会话下行为不一。
+        //
+        // 不进任务栏 / 不进 Alt+Tab 靠的是**设了属主**（owner）：被拥有的
+        // 顶层窗口本来就不出现在任务栏，与 TOOLWINDOW 无关。
+        let mut ex = WINDOW_EX_STYLE(0);
         if no_activate {
             ex |= WS_EX_NOACTIVATE;
         }

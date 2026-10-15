@@ -915,7 +915,7 @@ const SEARCH_PANEL_H: f32 = 30.0;
 /// 一个图标宽）。若内容自己的圆角比 DWM 的小，DWM 那一刀会切进内容
 /// 本体：细条的两个短端被削掉两块，实机看就是「两端渲染成三角形」。
 /// 让内容的圆角不小于 DWM 的，裁剪就落在内容自己的圆角之内。
-const POPUP_CORNER: f32 = 10.0;
+const POPUP_CORNER: f32 = 8.0;
 
 /// 类型过滤栏的按钮顺序（与设置界面、捕获层同一份）。
 const RAIL_KIND_ORDER: [modular_clipboard_core::ClipKind; 5] = {
