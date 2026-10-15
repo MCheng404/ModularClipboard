@@ -907,6 +907,16 @@ const RAIL_GAP: f32 = 12.0;
 /// 悬浮搜索面板高度（逻辑点）。
 const SEARCH_PANEL_H: f32 = 30.0;
 
+/// 弹窗内容的圆角半径下限（逻辑点）。
+///
+/// CAUTION: 必须 **≥ DWM 系统圆角的半径**（Win11 约 8pt）。
+///
+/// 弹窗窗口的圆角由 DWM 裁出，而弹窗是**细条**（搜索条 30pt 高、类型栏
+/// 一个图标宽）。若内容自己的圆角比 DWM 的小，DWM 那一刀会切进内容
+/// 本体：细条的两个短端被削掉两块，实机看就是「两端渲染成三角形」。
+/// 让内容的圆角不小于 DWM 的，裁剪就落在内容自己的圆角之内。
+const POPUP_CORNER: f32 = 10.0;
+
 /// 类型过滤栏的按钮顺序（与设置界面、捕获层同一份）。
 const RAIL_KIND_ORDER: [modular_clipboard_core::ClipKind; 5] = {
     use modular_clipboard_core::ClipKind;
@@ -1327,10 +1337,12 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     let painter = f.ui.painter_at(r);
     // 纯平毛玻璃禁令同样适用于悬浮层：纯色底 + 1px 描边，禁渐变光泽。
-    painter.rect_filled(r, pal.radius_md, pal.surface);
+    // 圆角取「主题中圆角」与 DWM 圆角下限的较大者（见 `POPUP_CORNER`）。
+    let radius = pal.radius_md.max(POPUP_CORNER);
+    painter.rect_filled(r, radius, pal.surface);
     painter.rect_stroke(
         r,
-        pal.radius_md,
+        radius,
         Stroke::new(1.0, pal.border),
         egui::StrokeKind::Inside,
     );
@@ -1407,7 +1419,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         // 聚焦时描边加强，给出明确的视觉反馈。
         f.ui.painter_at(r).rect_stroke(
             r,
-            pal.radius_md,
+            radius,
             Stroke::new(1.5, pal.border_strong),
             egui::StrokeKind::Inside,
         );
@@ -1515,14 +1527,15 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         if frost_k < 1.0 && !active {
             base = base.gamma_multiply(frost_k);
         }
-        f.ui.painter_at(slot).rect_filled(slot, size * 0.25, base);
+        let sq_radius = (size * 0.25).max(POPUP_CORNER);
+        f.ui.painter_at(slot).rect_filled(slot, sq_radius, base);
         if resp.hovered() && !active {
-            f.ui.painter_at(slot).rect_filled(slot, size * 0.25, pal.row_hover);
+            f.ui.painter_at(slot).rect_filled(slot, sq_radius, pal.row_hover);
         }
         if !active {
             f.ui.painter_at(slot).rect_stroke(
                 slot,
-                size * 0.25,
+                sq_radius,
                 Stroke::new(1.0, pal.border_subtle),
                 egui::StrokeKind::Inside,
             );
