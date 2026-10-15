@@ -96,8 +96,6 @@ pub struct Popup<'a> {
     topmost: bool,
     /// 上次定位到的屏幕位置（避免每帧重复 `SetWindowPos`）。
     last_pos: Option<(i32, i32)>,
-    /// 已应用的捕获自排除状态（`None` = 未设过）。
-    affinity_set: Option<modular_clipboard_core::config::WindowBackdrop>,
 }
 
 impl<'a> Popup<'a> {
@@ -157,7 +155,6 @@ impl<'a> Popup<'a> {
             was_open: false,
             topmost: false,
             last_pos: None,
-            affinity_set: None,
         })
     }
 
@@ -222,15 +219,8 @@ impl<'a> Popup<'a> {
         let x_px = ((panel_pos_screen.x - margin) * s) as i32;
         let y_px = ((panel_pos_screen.y - margin) * s) as i32;
         self.move_to_screen(x_px, y_px);
-        // 磨砂需要**捕获自排除**：GPU 磨砂通道会抓本窗口身后的桌面，
-        // 不排除就会抓到自己的上一帧（反馈回路，表现为拖影/自叠加）。
-        // 状态变化才调（`affinity_set` 去重）。
-        use modular_clipboard_core::config::WindowBackdrop;
-        let want = if acrylic { WindowBackdrop::Acrylic } else { WindowBackdrop::None };
-        if self.affinity_set.is_none_or(|m| m != want) {
-            crate::presence::apply_backdrop(self.window.hwnd(), want);
-            self.affinity_set = Some(want);
-        }
+        // 不再抓桌面 ⇒ 不需要捕获自排除（弹窗会正常出现在截图/录屏里）。
+        let _ = acrylic;
         // 首次显示：抬到 Z 序顶部，避免被主窗口盖住；搜索面板还要
         // 抢焦点（用户要立刻打字），类型栏保持不抢（no_activate）。
         if just_opened {
@@ -290,25 +280,24 @@ impl<'a> Popup<'a> {
         // CAUTION: 不能自己抓桌面当 egui 纹理用——`Painter` 只有**一个
         // 用户纹理槽**（`user_tex`），缩略图也占这个槽，两者同时出现会
         // 互相顶替：采样到的是另一张纹理，实机表现为「磨砂是白的」。
-        let painted = if acrylic {
-            self.gfx.painter.paint_backdrop(
-                &mut self.gfx.fr,
-                self.window.hwnd().0 as isize,
-                modular_clipboard_gfx::blur::radius_for_strength(blur_strength),
-                &primitives,
-                ppp,
-                dpi_scale,
-                &mut textures_delta,
-            )
-        } else {
-            self.gfx.painter.paint(
-                &mut self.gfx.fr,
-                &primitives,
-                ppp,
-                dpi_scale,
-                &mut textures_delta,
-            )
-        };
+        // CAUTION: 弹窗**不走** GPU 磨砂通道（`paint_backdrop`）。
+        //
+        // 那条链路是按主窗口调的，套在弹窗上有三处不对：
+        // ① 底图是**铺满窗口矩形**的全屏 blit，没有形状参数 ⇒ 无法与
+        //    面板的圆角轮廓对齐（方底图 + 圆角面板 = 四角露三角形）；
+        // ② UV 位移（`backdrop_uv_offset`）用**屏幕点**算 dx 却除以
+        //    **物理像素**的窗口尺寸，单位错配；
+        // ③ 弹窗创建于 (0,0) 再移到目标位置，运动预测会给出很大的位移，
+        //    底图因此整体偏出去（实机「偏移还挺大的」）。
+        // 弹窗是几十像素的小面板，磨砂收益远小于这些代价 ⇒ 不透明面板。
+        let _ = (acrylic, blur_strength);
+        let painted = self.gfx.painter.paint(
+            &mut self.gfx.fr,
+            &primitives,
+            ppp,
+            dpi_scale,
+            &mut textures_delta,
+        );
         if let Err(e) = painted {
             // 出错必须放弃本帧，否则该窗口永久死掉（见设置窗口同款注释）。
             self.gfx.fr.abandon_frame();

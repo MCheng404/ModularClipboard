@@ -2480,31 +2480,12 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
     // 必须**裁剪到面板矩形**：底图铺满整个客户区的话，那圈本该透明的
     // 投影区就变成不透明的模糊矩形，浮不起来的同时还会显出一个大方块。
     //
-    // CAUTION: 图像矩形必须是**整个客户区**而不是 `panel`。
-    // 捕获区间就是窗口客户区，把它塞进面板矩形会同时引入
-    // 12pt 偏移与一次缩放 ⇒ 磨砂内容与身后的真实桌面错位，
-    // 看上去就是一块贴歪的模糊方块。按客户区原样绘制，
-    // 每个像素都对应窗口那个像素身后的桌面，再裁到面板形状。
-    // 磨砂时背景层**降 alpha**（与主窗口同一算式）：底图透出来才有磨砂
-    // 感；描边用主题色（用户要求「开启磨砂时圆角渲染主题描边」）。
-    let backdrop_pal;
-    let is_acrylic = self.svc.state.config.ui.window_backdrop
-        == modular_clipboard_core::config::WindowBackdrop::Acrylic;
-    let pal_ref: &crate::theme::Palette = if is_acrylic {
-        let base = self.svc.state.config.ui.window_opacity.clamp(0.3, 1.0) * 0.6;
-        let alpha = backdrop_alpha(base, self.backdrop_lum, self.pal.is_dark);
-        // CAUTION: 弹窗的背景层 **alpha 有下限**（约 70% 不透明）。
-        //
-        // 主窗口那份算式在大面积背景上是舒服的（最低可到 42%），但弹窗
-        // 只有几十像素高：背景层太透的话，一旦磨砂底图没画出来（首帧、
-        // 捕获失败、或 GDI 不可用），面板就只剩一圈描边、内部全透明——
-        // 实机正是这个现象。小面板上**可读性优先于通透**。
-        let alpha = alpha.max(178);
-        backdrop_pal = self.pal.with_backdrop_alpha(alpha);
-        &backdrop_pal
-    } else {
-        &self.pal
-    };
+    // 底图已整体移除（弹窗不做磨砂，见 `crate::popup`），此处不再有
+    // 磨砂底图的绘制与背景层降 alpha。
+    // 弹窗一律用**不透明**调色板：磨砂已不在弹窗上启用（见
+    // `crate::popup::Popup::sync_and_render`），背景层再降 alpha 就只剩
+    // 一圈描边、内部透明了。
+    let pal_ref: &crate::theme::Palette = &self.pal;
     // NOTE: **不画自研投影**。`SHADOW_MARGIN = 0`（窗口即内容），投影
     // 只能画在窗口矩形之外——画不到；画在里面的那部分会压在面板边缘上、
     // 又被窗口边界裁掉，实机表现为上下/左右边缘的三角形暗块。
