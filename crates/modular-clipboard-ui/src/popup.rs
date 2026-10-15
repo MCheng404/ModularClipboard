@@ -44,17 +44,10 @@ use crate::multiwindow::{SharedGfx, WindowGfx};
 
 /// 弹窗窗口相对内容的边距（逻辑点）。
 ///
-/// 用来容纳**自研**高斯投影（圆角与投影都自己画，不靠 DWM）。
-/// 这圈区域铺的是捕获到的身后桌面——不能留空：本项目不靠 DWM 的
-/// 逐像素 alpha 合成，留空就是黑的。
-pub const SHADOW_MARGIN: f32 = 12.0;
-
-/// 磨砂底图的降采样倍率。
-///
-/// 捕获按 1/4 分辨率、绘制时再放大回原尺寸——双线性插值本身就是一次
-/// 柔化，观感接近磨砂，省掉一整条 GPU 高斯卷积链（弹窗只有几十×几百
-/// 像素，也不值得为它建一套模糊资源）。
-const FROST_DOWNSCALE: u32 = 4;
+/// **恒为 0**：窗口矩形就等于内容矩形，圆角由 **DWM 系统圆角**裁出，
+/// 磨砂底图由渲染器的 GPU 通道铺满整个窗口——两者都以「窗口即面板」
+/// 为前提。留边距的话那圈既没有内容也没有底图，只会是黑的。
+pub const SHADOW_MARGIN: f32 = 0.0;
 
 /// 弹窗身份。既是内容分派的键，也是热区命名空间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,12 +96,6 @@ pub struct Popup<'a> {
     topmost: bool,
     /// 上次定位到的屏幕位置（避免每帧重复 `SetWindowPos`）。
     last_pos: Option<(i32, i32)>,
-    /// 磨砂底图用：桌面捕获器（懒创建）。
-    capture: Option<modular_clipboard_gfx::backdrop::DesktopCapture>,
-    /// 磨砂底图纹理（捕获成功即更新）。
-    frost_tex: Option<egui::TextureHandle>,
-    /// 上次捕获时刻（节流，30fps）。
-    last_capture: Option<std::time::Instant>,
     /// 已应用的捕获自排除状态（`None` = 未设过）。
     affinity_set: Option<modular_clipboard_core::config::WindowBackdrop>,
 }
@@ -132,7 +119,9 @@ impl<'a> Popup<'a> {
             owner,
         )?;
         window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
-        // 面板形状 = 窗口中央的内容矩形；之外那圈（投影区）点击穿透
+        // 圆角交给 DWM（与主窗口同一套）：窗口本身就是那块面板。
+        modular_clipboard_gfx::chrome::apply_rounded_corners(window.hwnd());
+        // 面板形状 = 整个客户区（窗口即面板）。
         // ——命中判定看窗口矩形而非像素，不登记就会吃掉底下窗口的点击。
         // 用**整数像素**登记：Win32 命中按整数像素，亚像素矩形会漏边。
         // （egui 0.36 的 `Rect` 没有 `round()`，自己取整。）
@@ -168,9 +157,6 @@ impl<'a> Popup<'a> {
             was_open: false,
             topmost: false,
             last_pos: None,
-            capture: None,
-            frost_tex: None,
-            last_capture: None,
             affinity_set: None,
         })
     }
@@ -205,66 +191,6 @@ impl<'a> Popup<'a> {
         }
     }
 
-    /// 刷新磨砂底图（`acrylic` 为真时才抓）。
-    ///
-    /// 捕获用 **1/4 分辨率再放大**：放大时的双线性插值本身就是一次柔化，
-    /// 对几十像素高的面板足够像磨砂，且省掉一整条 GPU 卷积链。
-    /// 非磨砂时清掉纹理与自排除（弹窗该出现在截图里）。
-    fn update_frost(&mut self, acrylic: bool) {
-        use modular_clipboard_core::config::WindowBackdrop;
-        use modular_clipboard_gfx::backdrop::{capture_due, DesktopCapture, CAPTURE_INTERVAL};
-        // 自排除只在磨砂时需要（抓身后桌面），状态变化才调。
-        if self.affinity_set
-            .is_none_or(|m| (m == WindowBackdrop::Acrylic) != acrylic)
-        {
-            crate::presence::apply_backdrop(
-                self.window.hwnd(),
-                if acrylic {
-                    WindowBackdrop::Acrylic
-                } else {
-                    WindowBackdrop::None
-                },
-            );
-            self.affinity_set = Some(if acrylic {
-                WindowBackdrop::Acrylic
-            } else {
-                WindowBackdrop::None
-            });
-        }
-        if !acrylic {
-            self.frost_tex = None;
-            return;
-        }
-        let now = std::time::Instant::now();
-        if !capture_due(self.last_capture, now, CAPTURE_INTERVAL) {
-            return;
-        }
-        // CAUTION: `swap_rb` 传 true：DIB 恒 BGRA，egui 的 ColorImage 要 RGBA。
-        let cap = match self.capture.as_mut() {
-            Some(c) => c,
-            None => match DesktopCapture::new(true) {
-                Ok(c) => self.capture.insert(c),
-                Err(e) => {
-                    tracing::warn!(%e, "弹窗桌面捕获器初始化失败，磨砂底图停更");
-                    return;
-                }
-            },
-        };
-        match cap.capture_behind_scaled(self.window.hwnd().0 as isize, FROST_DOWNSCALE) {
-            Ok(Some((bits, w, h))) => {
-                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], bits);
-                self.frost_tex = Some(self.ctx.load_texture(
-                    "popup_frost",
-                    img,
-                    egui::TextureOptions::LINEAR,
-                ));
-                self.last_capture = Some(now);
-            }
-            Ok(None) => {}
-            Err(e) => tracing::debug!(%e, "弹窗磨砂捕获失败，沿用上一张"),
-        }
-    }
-
     /// 同步显隐并在需要时绘制一帧。
     ///
     /// - 隐藏态：泵消息并**排空**事件，不渲染（同设置窗口的纪律：
@@ -278,6 +204,7 @@ impl<'a> Popup<'a> {
         want_open: bool,
         panel_pos_screen: egui::Vec2,
         acrylic: bool,
+        blur_strength: u8,
     ) -> anyhow::Result<()> {
         let just_opened = !self.was_open && want_open;
         self.was_open = want_open;
@@ -295,10 +222,15 @@ impl<'a> Popup<'a> {
         let x_px = ((panel_pos_screen.x - margin) * s) as i32;
         let y_px = ((panel_pos_screen.y - margin) * s) as i32;
         self.move_to_screen(x_px, y_px);
-        // 磨砂：抓身后桌面（自排除，否则抓到自己的上一帧）→ 降采样再
-        // 放大即柔化，用作面板的底图。非磨砂时不抓、不排除。
-        self.update_frost(acrylic);
-        let frost = self.frost_tex.as_ref().map(|t| t.id());
+        // 磨砂需要**捕获自排除**：GPU 磨砂通道会抓本窗口身后的桌面，
+        // 不排除就会抓到自己的上一帧（反馈回路，表现为拖影/自叠加）。
+        // 状态变化才调（`affinity_set` 去重）。
+        use modular_clipboard_core::config::WindowBackdrop;
+        let want = if acrylic { WindowBackdrop::Acrylic } else { WindowBackdrop::None };
+        if self.affinity_set.is_none_or(|m| m != want) {
+            crate::presence::apply_backdrop(self.window.hwnd(), want);
+            self.affinity_set = Some(want);
+        }
         // 首次显示：抬到 Z 序顶部，避免被主窗口盖住；搜索面板还要
         // 抢焦点（用户要立刻打字），类型栏保持不抢（no_activate）。
         if just_opened {
@@ -340,7 +272,7 @@ impl<'a> Popup<'a> {
         let raw_input = self.events.egui_input(&self.ctx, &frame_events);
         // 调色板与主窗口同步（各自 Context，`Visuals` 不共享）。
         crate::theme::apply(&self.ctx, app.palette());
-        let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_popup(ui, kind, frost));
+        let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_popup(ui, kind));
         let ppp = out.pixels_per_point;
         let mut textures_delta = std::mem::take(&mut out.textures_delta);
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
@@ -352,13 +284,31 @@ impl<'a> Popup<'a> {
             return Ok(());
         };
         let dpi_scale = self.window.scale_factor();
-        let painted = self.gfx.painter.paint(
-            &mut self.gfx.fr,
-            &primitives,
-            ppp,
-            dpi_scale,
-            &mut textures_delta,
-        );
+        // 磨砂走渲染器自带的 **GPU 磨砂通道**（与主窗口同一套：实时捕获
+        // 身后桌面 + 三趟高斯卷积，画成底图后再叠界面）。
+        //
+        // CAUTION: 不能自己抓桌面当 egui 纹理用——`Painter` 只有**一个
+        // 用户纹理槽**（`user_tex`），缩略图也占这个槽，两者同时出现会
+        // 互相顶替：采样到的是另一张纹理，实机表现为「磨砂是白的」。
+        let painted = if acrylic {
+            self.gfx.painter.paint_backdrop(
+                &mut self.gfx.fr,
+                self.window.hwnd().0 as isize,
+                modular_clipboard_gfx::blur::radius_for_strength(blur_strength),
+                &primitives,
+                ppp,
+                dpi_scale,
+                &mut textures_delta,
+            )
+        } else {
+            self.gfx.painter.paint(
+                &mut self.gfx.fr,
+                &primitives,
+                ppp,
+                dpi_scale,
+                &mut textures_delta,
+            )
+        };
         if let Err(e) = painted {
             // 出错必须放弃本帧，否则该窗口永久死掉（见设置窗口同款注释）。
             self.gfx.fr.abandon_frame();
@@ -420,6 +370,7 @@ impl<'a> Popups<'a> {
         shared: &SharedGfx<'a>,
         topmost: bool,
         acrylic: bool,
+        blur_strength: u8,
         owner: Option<windows::Win32::Foundation::HWND>,
     ) {
         let want_open = want_open && panel_rect.is_some();
@@ -442,7 +393,9 @@ impl<'a> Popups<'a> {
         p.apply_topmost(topmost);
         let rect = panel_rect.unwrap_or(egui::Rect::ZERO);
         let pos = anchor_screen + rect.min.to_vec2();
-        if let Err(e) = p.sync_and_render(app, PopupKind::Search, want_open, pos, acrylic) {
+        if let Err(e) =
+            p.sync_and_render(app, PopupKind::Search, want_open, pos, acrylic, blur_strength)
+        {
             tracing::warn!(%e, "搜索弹窗渲染失败");
         }
     }
@@ -460,6 +413,7 @@ impl<'a> Popups<'a> {
         shared: &SharedGfx<'a>,
         topmost: bool,
         acrylic: bool,
+        blur_strength: u8,
         owner: Option<windows::Win32::Foundation::HWND>,
     ) {
         let want_open = want_open && panel_rect.is_some();
@@ -482,7 +436,9 @@ impl<'a> Popups<'a> {
         p.apply_topmost(topmost);
         let rect = panel_rect.unwrap_or(egui::Rect::ZERO);
         let pos = anchor_screen + rect.min.to_vec2();
-        if let Err(e) = p.sync_and_render(app, PopupKind::Rail, want_open, pos, acrylic) {
+        if let Err(e) =
+            p.sync_and_render(app, PopupKind::Rail, want_open, pos, acrylic, blur_strength)
+        {
             tracing::warn!(%e, "类型栏弹窗渲染失败");
         }
     }

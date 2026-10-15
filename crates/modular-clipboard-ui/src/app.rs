@@ -1392,6 +1392,7 @@ fn drive_attach_windows<'a>(
         // 收起、主窗被激活时一起到前台（不设属主的话它们是三块互不相干
         // 的顶层窗口，Z 序各自为政）。
         let owner = Some(window.hwnd());
+        let blur_strength = app.svc.state.config.ui.window_blur_strength;
         popups.sync_search(
             app,
             want_search,
@@ -1401,6 +1402,7 @@ fn drive_attach_windows<'a>(
             shared,
             topmost,
             acrylic,
+            blur_strength,
             owner,
         );
         // 隐藏时**必须清**弹窗回报的两项：否则上一次「正在打字」
@@ -1419,6 +1421,7 @@ fn drive_attach_windows<'a>(
             shared,
             topmost,
             acrylic,
+            blur_strength,
             owner,
         );
     }
@@ -2463,12 +2466,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
 ///
 /// 弹窗客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
 /// 面板矩形取中央那块；投影由 `paint` 画在边距里（alpha=0 处即桌面）。
-pub fn draw_popup(
-        &mut self,
-        ui: &mut egui::Ui,
-        kind: crate::popup::PopupKind,
-        frost: Option<egui::TextureId>,
-    ) {
+pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
     let ppp = ui.ctx().pixels_per_point();
     let margin = crate::popup::SHADOW_MARGIN;
     let client = ui.max_rect();
@@ -2487,13 +2485,12 @@ pub fn draw_popup(
     // 12pt 偏移与一次缩放 ⇒ 磨砂内容与身后的真实桌面错位，
     // 看上去就是一块贴歪的模糊方块。按客户区原样绘制，
     // 每个像素都对应窗口那个像素身后的桌面，再裁到面板形状。
-    // 类型栏要**逐方块**裁底图（缝隙保持透桌面），所以把纹理交给
-    // 绘制层：整条铺满会让 8pt 缝隙也变成磨砂，凑出一个大方块。
-    self.paint_state.popup_frost = frost;
     // 磨砂时背景层**降 alpha**（与主窗口同一算式）：底图透出来才有磨砂
     // 感；描边用主题色（用户要求「开启磨砂时圆角渲染主题描边」）。
     let backdrop_pal;
-    let pal_ref: &crate::theme::Palette = if frost.is_some() {
+    let is_acrylic = self.svc.state.config.ui.window_backdrop
+        == modular_clipboard_core::config::WindowBackdrop::Acrylic;
+    let pal_ref: &crate::theme::Palette = if is_acrylic {
         let base = self.svc.state.config.ui.window_opacity.clamp(0.3, 1.0) * 0.6;
         let alpha = backdrop_alpha(base, self.backdrop_lum, self.pal.is_dark);
         backdrop_pal = self.pal.with_backdrop_alpha(alpha);
@@ -2508,11 +2505,6 @@ pub fn draw_popup(
     // 完成）。用 `painter_at(panel)` 会把投影裁掉一圈，面板就贴着桌面、
     // 浮不起来 —— 所以这里必须用 `ui.painter()`。
     crate::paint::draw_popup_shadow(ui.painter(), panel, pal_ref);
-    // 磨砂底图（画在投影**之后**：否则投影会把磨砂压暗一层）。
-    if let Some(tex) = frost {
-        // 搜索面板：整块圆角矩形承载磨砂（圆角与面板描边一致）。
-        crate::paint::draw_popup_frost(ui.painter(), panel, self.pal.radius_md, tex, client);
-    }
     // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
     // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
     let rail_kinds = crate::paint::FloatLayout::kinds(

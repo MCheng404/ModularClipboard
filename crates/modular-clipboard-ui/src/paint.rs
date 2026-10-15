@@ -444,11 +444,6 @@ pub struct UiState {
     /// 变成弹窗后指针在主窗口客户区之外，只能由弹窗问
     /// `WindowFromPoint`（gfx::chrome::pointer_is_over）。
     pub search_popup_hover: bool,
-    /// 弹窗的磨砂底图纹理（`draw_popup` 每帧写入，绘制层读）。
-    ///
-    /// 类型栏要用它**逐方块**裁：缝隙得透出真实桌面，若整条铺满磨砂，
-    /// 8pt 的缝隙也会被填上，凑出一个显眼的方块。
-    pub popup_frost: Option<egui::TextureId>,
     /// 悬停展开是否被抑制（点图标收起后，直到光标离开图标为止）。
     ///
     /// 没有这个位的话，点一下收起、光标却还停在图标上 ⇒ 0.18s 后又被
@@ -1459,75 +1454,6 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
-/// 画一块**圆角**的磨砂底图（自己用 Mesh 三角化）。
-///
-/// # 为什么不用「裁剪 + image」
-///
-/// `Painter::with_clip_rect` 只能按**轴对齐矩形**裁，egui 0.36 的
-/// `Shape::image` 与 `RectShape` 也都不支持贴图 + 圆角。按方形裁/贴图
-/// 的结果：圆角外面四个小角露出方形磨砂块——实机看就是「直角」。
-///
-/// 圆角矩形是**凸**多边形，可以从中心做扇形三角化，顶点自带 uv，
-/// 于是形状与贴图边界完全一致。
-///
-/// # uv 必须按 `client` 线性换算
-///
-/// 捕获区间是整个**窗口客户区**（含投影边距），所以 uv 取顶点在
-/// `client` 里的相对位置——否则整张客户区的图会被压进形状里，
-/// 内容与身后桌面错位（上一轮踩过的坑）。
-pub fn draw_popup_frost(
-    painter: &egui::Painter,
-    shape: Rect,
-    radius: f32,
-    tex: egui::TextureId,
-    client: Rect,
-) {
-    use egui::epaint::{Mesh, Vertex};
-    if shape.width() <= 0.0 || shape.height() <= 0.0 {
-        return;
-    }
-    let rad = radius
-        .min(shape.width() * 0.5)
-        .min(shape.height() * 0.5)
-        .max(0.0);
-    let segs = 5usize;
-    // 四个角的圆心与起止角（顺时针：左上 → 右上 → 右下 → 左下）。
-    let corners = [
-        (pos2(shape.min.x + rad, shape.min.y + rad), std::f32::consts::PI, 1.5 * std::f32::consts::PI),
-        (pos2(shape.max.x - rad, shape.min.y + rad), 1.5 * std::f32::consts::PI, 2.0 * std::f32::consts::PI),
-        (pos2(shape.max.x - rad, shape.max.y - rad), 0.0, 0.5 * std::f32::consts::PI),
-        (pos2(shape.min.x + rad, shape.max.y - rad), 0.5 * std::f32::consts::PI, std::f32::consts::PI),
-    ];
-    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(4 * (segs + 1) + 1);
-    for (c, a0, a1) in corners {
-        for i in 0..=segs {
-            let a = a0 + (a1 - a0) * (i as f32 / segs as f32);
-            pts.push(pos2(c.x + rad * a.cos(), c.y + rad * a.sin()));
-        }
-    }
-    let cw = client.width().max(1.0);
-    let ch = client.height().max(1.0);
-    let uv_of = |p: egui::Pos2| egui::pos2(
-        ((p.x - client.min.x) / cw).clamp(0.0, 1.0),
-        ((p.y - client.min.y) / ch).clamp(0.0, 1.0),
-    );
-    let mut mesh = Mesh::with_texture(tex);
-    let center = shape.center();
-    let center_v = Vertex { pos: center, uv: uv_of(center), color: egui::Color32::WHITE };
-    let ci = mesh.vertices.len() as u32;
-    mesh.vertices.push(center_v);
-    for p in &pts {
-        mesh.vertices.push(Vertex { pos: *p, uv: uv_of(*p), color: egui::Color32::WHITE });
-    }
-    // 扇形三角化（凸多边形 ⇒ 从中心连到每条边都合法）。
-    for i in 0..pts.len() {
-        let a = 1 + i as u32;
-        let b = 1 + ((i + 1) % pts.len()) as u32;
-        mesh.indices.extend_from_slice(&[ci, a, b]);
-    }
-    painter.add(egui::Shape::mesh(mesh));
-}
-
 /// 画悬浮弹窗的投影（面板外围那一圈 alpha）。
 ///
 /// 必须用**弹窗客户区级** painter（`ui.painter()`），不能用
@@ -1596,14 +1522,6 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // （清屏 alpha=0），直接拿它当填充会把按钮画成半透明——透出背后
         // 的深色桌面，实机就是「鼠标一放上去图标变黑」。
         // 所以半透明态一律**先铺不透明底、再叠色调**。
-        // 磨砂：底图**逐方块**裁（缝隙留空 ⇒ 透出真实桌面）。
-        //
-        // 图像矩形取整个客户区（与 `draw_popup` 同一条纪律）：捕获就是按
-        // 客户区抓的，按原尺寸画才能保证与身后的桌面严丝合缝。
-        if let Some(tex) = f.state.popup_frost {
-            // 圆角与方块自身的一致（`size * 0.25`），形状即贴图边界。
-            draw_popup_frost(f.ui.painter(), slot, size * 0.25, tex, f.ui.max_rect());
-        }
         let mut base = if active { pal.accent } else { pal.surface_raised };
         // 磨砂模式：面板底图要透出来，方块底色就得跟着降 alpha。
         //
