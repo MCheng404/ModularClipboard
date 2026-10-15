@@ -2493,6 +2493,13 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
     let pal_ref: &crate::theme::Palette = if is_acrylic {
         let base = self.svc.state.config.ui.window_opacity.clamp(0.3, 1.0) * 0.6;
         let alpha = backdrop_alpha(base, self.backdrop_lum, self.pal.is_dark);
+        // CAUTION: 弹窗的背景层 **alpha 有下限**（约 70% 不透明）。
+        //
+        // 主窗口那份算式在大面积背景上是舒服的（最低可到 42%），但弹窗
+        // 只有几十像素高：背景层太透的话，一旦磨砂底图没画出来（首帧、
+        // 捕获失败、或 GDI 不可用），面板就只剩一圈描边、内部全透明——
+        // 实机正是这个现象。小面板上**可读性优先于通透**。
+        let alpha = alpha.max(178);
         backdrop_pal = self.pal.with_backdrop_alpha(alpha);
         &backdrop_pal
     } else {
