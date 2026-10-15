@@ -308,8 +308,27 @@ impl PipelineLayout {
     pub fn new(device: &Device, set_layouts: &[vk::DescriptorSetLayout]) -> anyhow::Result<Self> {
         // 本项目暂不使用 push constant（uniform 走描述符集），
         // 因此不声明任何 range。
+        Self::with_push_constants(device, set_layouts, &[])
+    }
+
+    /// 带 push constant 范围的管线布局。
+    ///
+    /// 模糊链的拷贝管线用它传「合成底图的 UV 位移」（自研磨砂移动
+    /// 预测，见 `blur.rs` 的 [`crate::blur::Blit::uv_offset`]）：
+    /// 该参数**每次绘制**都变，push constant 是 Vulkan 为此设计的
+    /// 通道——比 uniform 少一块缓冲与一次描述符写入。
+    ///
+    /// 约束（规范硬性）：同一 layout 下各 range 的 stage/offset/size
+    /// 不得重叠；着色器侧声明的 push constant 接口必须落在某个 range
+    /// 内，否则 `create_graphics_pipelines` 直接失败。
+    pub fn with_push_constants(
+        device: &Device,
+        set_layouts: &[vk::DescriptorSetLayout],
+        push_ranges: &[vk::PushConstantRange],
+    ) -> anyhow::Result<Self> {
         let info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(set_layouts);
+            .set_layouts(set_layouts)
+            .push_constant_ranges(push_ranges);
 
         let handle = unsafe { device.create_pipeline_layout(&info, None) }
             .map_err(|e| anyhow::anyhow!("创建管线布局失败: {e:?}"))?;

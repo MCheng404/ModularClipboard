@@ -254,6 +254,17 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
                             core.show_ui();
                         }
                     }
+                    TrayEvent::HotkeyShown => {
+                        // 托盘线程已在 WM_HOTKEY 前台授权窗口内直接完成
+                        // 跨进程 ShowWindow + SetForegroundWindow，
+                        // 这里绝不能再按 toggle 把它藏回去。
+                        // 再投递一次 WM_SHOW_MAIN（幂等）：让 UI 主线程的
+                        // focus_window 兜底置前、立刻重建交换链并恢复
+                        // 渲染，不必等 200ms 可见性对账轮询。
+                        if !request_show_ui() {
+                            tracing::debug!("HotkeyShown 兜底投递 WM_SHOW_MAIN 失败");
+                        }
+                    }
                     // 「粘贴上一条」不经过界面：直接把最新一条写回剪贴板
                     // 并发 Ctrl+V 给前台窗口——走界面就太慢了。
                     TrayEvent::HotkeyPaste => {
@@ -297,7 +308,10 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
         // 时，这条日志的停顿就是唯一证据。约每 2 秒一条。
         {
             static HB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            if HB.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100 == 0 {
+            if HB
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(100)
+            {
                 tracing::debug!("常驻主循环心跳");
             }
         }

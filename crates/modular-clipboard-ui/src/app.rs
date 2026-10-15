@@ -621,11 +621,15 @@ fn run_mode(
                     // 用户点过去同样让主窗口失焦——那种「失焦」不是切到
                     // 别的程序。躲起来只会剩一扇设置窗漂在桌上，
                     // 像主程序已经没了。
+                    //
+                    // 再加一道进程级确认：新前台窗口仍是本进程的
+                    //（设置窗之外的托盘右键菜单、迷你面板等），同样不躲。
                     if !gained
                         && app.svc.state.config.ui.hide_on_focus_lost
                         && (resident.is_some() || remote)
                         && !hidden
                         && settings_win.is_none()
+                        && !presence::foreground_is_own_process()
                     {
                         presence::hide_window(window.hwnd());
                         hidden = true;
@@ -934,11 +938,12 @@ fn run_mode(
         // ---- 2.4 布局变化后自适应窗口宽度 ----
         //
         // 置顶模式在设置里切换时栏数会变（共用单栏 ↔ 独立分栏），
-        // 而窗口尺寸只在启动时从配置读过一次。这里在**放不下**时
-        // 放宽窗口，否则卡片会被 `solve_scaled` 按比例压缩。
-        //
-        // 只放大不收缩：`take_resize_width_to` 内部已判断「够宽就不动」，
-        // 所以用户把窗口开大后切模式不会被改回来。
+        // 而窗口尺寸只在启动时从配置读过一次。两种请求语义：
+        // - 切到独立分栏：放不下就放宽，否则卡片被 `solve_scaled`
+        //   按比例压缩；**只放大不收缩**（够宽就不动，用户手动拉宽过
+        //   的窗口不会被改小）；
+        // - 切回共用单栏：精确恢复默认宽度（切出去时窗口被自动撑宽
+        //   并写回了配置，不恢复的话回不到默认）。
         {
             let (cw, ch) = window.inner_size_physical();
             let scale = window.scale_factor().max(0.01);
@@ -947,7 +952,7 @@ fn run_mode(
                 // 同步回配置，否则下次启动又回到旧尺寸 ——
                 // 用户看到「切了模式窗口变宽、重启又变回去」。
                 app.svc.state.config.ui.window_width = w_px as f32;
-                tracing::info!(width_px = w_px, "布局需要更宽，已调整主窗口宽度");
+                tracing::info!(width_px = w_px, "置顶模式切换，已调整主窗口宽度");
             }
         }
 
@@ -1204,15 +1209,28 @@ fn run_mode(
             Some(p) => (p.x - pos.x).abs() > 1.0 || (p.y - pos.y).abs() > 1.0,
             None => true,
         };
-        if moved {
+        // 边缘拖拽也改变客户区尺寸；同时记住宽高，否则重启后恢复旧尺寸。
+        // 最小化期间 GetClientRect 可返回 0，绝不能写进配置。
+        let (size_w, size_h) = window.inner_size_physical();
+        let size_changed = !minimized && size_w > 0 && size_h > 0
+            && ((app.svc.state.config.ui.window_width - size_w as f32).abs() > 1.0
+                || (app.svc.state.config.ui.window_height - size_h as f32).abs() > 1.0);
+        if moved || size_changed {
             let now = std::time::Instant::now();
             let due = last_pos_save
                 .is_none_or(|t| now.duration_since(t) >= std::time::Duration::from_millis(500));
-            if due && app.persist_window_pos(pos) {
-                if let Err(e) = app.svc.save_config() {
-                    tracing::warn!(%e, "实时保存窗口位置失败");
-                } else {
-                    last_pos_save = Some(now);
+            if due {
+                let pos_changed = moved && app.persist_window_pos(pos);
+                if pos_changed || size_changed {
+                    if size_changed {
+                        app.svc.state.config.ui.window_width = size_w as f32;
+                        app.svc.state.config.ui.window_height = size_h as f32;
+                    }
+                    if let Err(e) = app.svc.save_config() {
+                        tracing::warn!(%e, "实时保存窗口位置和尺寸失败");
+                    } else {
+                        last_pos_save = Some(now);
+                    }
                 }
             }
         }
@@ -1284,6 +1302,11 @@ fn run_mode(
     // 这里确保位置仍落盘）。返回值 `false` 说明窗口处于最小化等
     // 无效状态，跳过即可。
     let _ = app.persist_window_pos(main_pos);
+    let (final_w, final_h) = window.inner_size_physical();
+    if !minimized && final_w > 0 && final_h > 0 {
+        app.svc.state.config.ui.window_width = final_w as f32;
+        app.svc.state.config.ui.window_height = final_h as f32;
+    }
     app.shutdown();
     // `painter` 与 `fr` 借用 `gpu`，必须在 `gpu` 之前 drop。
     drop(painter);
@@ -1514,6 +1537,15 @@ pub struct App {
     pal_from: theme::Palette,
     /// 主题补间的目标调色板（切换后那一份）。
     pal_to: theme::Palette,
+    /// **基础**调色板：主题原色，字号令牌为 1.0×（未叠加 `font_scale`）。
+    ///
+    /// # 为什么必须与显示用的 `pal` 分开存
+    ///
+    /// 字体缩放是 `Palette::with_font_scale` 的**乘性**派生：
+    /// 在已缩放的调色板上再乘一次会叠乘（1.15 × 1.15 = 1.3225），
+    /// 字号每改一次就翻一档。因此每次重算都必须从这份「1.0× 原色」
+    /// 派生，而不是从当前显示值派生。
+    pal_base: theme::Palette,
     /// 新卡片架构的工作区（卡片的唯一权威来源）。
     ///
     /// `pub` 是因为帧循环要用它同步子窗口：
@@ -1618,12 +1650,21 @@ impl App {
         // 解析与灌入一次做完，返回的 `Palette` 存进 `App.pal` 给每帧自绘用——
         // 两处必须同源，早前`view::draw` 每帧自己算一遍，既浪费
         // （55 个字段逐个构造）又可能与灌进 Visuals 的那次解析分叉。
-        let pal = theme::set_theme(
+        //
+        // 字体缩放（`UiConfig::font_scale`）叠加在主题原色之上：
+        // `set_theme` 返回的是 1.0× 原色，这里派生显示用的缩放版并
+        // **再灌一次** egui——否则控件层（输入框/按钮内文字）拿到的
+        // 还是 `set_theme` 灌进去的未缩放字号，与自绘层不一致。
+        let font_scale = theme::clamp_font_scale(svc.state.config.ui.font_scale);
+        let pal_base = theme::set_theme(
             &ctx,
             theme::ThemeMode::from_dark_mode(svc.state.config.ui.dark_mode),
         );
+        let pal = pal_base.with_font_scale(font_scale);
+        theme::apply(&ctx, &pal);
         tracing::info!(
             dark = pal.is_dark,
+            font_scale,
             configured = ?svc.state.config.ui.dark_mode,
             "主题已解析"
         );
@@ -1652,6 +1693,7 @@ impl App {
             pal: pal.clone(),
             pal_from: pal.clone(),
             pal_to: pal,
+            pal_base,
             ws,
             paint_state: crate::paint::UiState::default(),
             diag_frames: 0,
@@ -1689,15 +1731,27 @@ impl App {
         // egui 控件层（Visuals）也每帧重灌：只补间自绘层的话，
         // ScrollArea/tooltip 会瞬跳而卡片在渐变，两层不同步更难看。
         // 补值来自 `Palette::lerp`——只有颜色参与，几何令牌取目标值。
+        //
+        // IMPORTANT: 这里的目标恒为 1.0 ⇒ 本调用是**惰性**的（到 1.0 后
+        // 什么都不做）。真正让补间「重播」的是 `Op::SetThemeMode` 里的
+        // `anim::restart`（见那里的 CAUTION）。时长必须与重启处一致，
+        // 因此共用 `theme::PALETTE_TWEEN`。
         let pal_mix = crate::anim::tween_f32(
             &self.ctx,
             egui::Id::new("pal_mix"),
             1.0,
-            std::time::Duration::from_millis(220),
+            crate::theme::PALETTE_TWEEN,
             crate::anim::Ease::InOutCubic,
         );
         if pal_mix < 1.0 {
             self.pal = self.pal_from.lerp(&self.pal_to, pal_mix);
+            crate::theme::apply(&self.ctx, &self.pal);
+        } else if self.pal != self.pal_to {
+            // 补间刚走完的那一帧：`tween_f32` 到点后直接返回目标值，
+            // 上面的分支不再执行，显示值会停在**最后一帧的近似值**上
+            // （差几个色阶）。这里把它精确落到目标，之后逐字段比较
+            // 恒等、不再重复灌入。
+            self.pal = self.pal_to.clone();
             crate::theme::apply(&self.ctx, &self.pal);
         }
 
@@ -1990,6 +2044,13 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 }
                 Op::SetNumber { group, field, value } => {
                     set_number_field(&mut self.svc.state.config, group, field, value);
+                    // 字体缩放必须在运行时立即生效：配置写进去只是记账，
+                    // 真正让界面变大变小的是「基础调色板 × 缩放」这一派生
+                    // （早前 `font_scale` **只有写入方、没有读取方**，
+                    // 改它完全没反应——用户反馈「字体缩放修改失效」）。
+                    if matches!(group, crate::paint::ConfigGroup::Ui) && field == "font_scale" {
+                        self.apply_font_scale();
+                    }
                     self.after_config_change();
                 }
                 Op::SetText { group, field, value } => {
@@ -2030,6 +2091,19 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         level.clamp(1, modular_clipboard_gfx::blur::BLUR_LEVELS);
                     self.after_config_change();
                 }
+                Op::SetCardShadow(s) => {
+                    // 卡片阴影只需改配置：行卡片每帧读配置画投影，下一帧
+                    // 即生效。值域钳制在绘制侧做（见 `draw_card_shadow`），
+                    // 这里不重复——配置被手工改超界时绘制侧兜底。
+                    self.svc.state.config.ui.card_shadow = s;
+                    self.after_config_change();
+                }
+                Op::SetRowMeta(m) => {
+                    // 右下角信息组合：顺序/显隐只影响绘制，下一帧读配置
+                    // 即生效；after_config_change 负责落盘。
+                    self.svc.state.config.ui.row_meta = m;
+                    self.after_config_change();
+                }
                 Op::SetThemeMode(mode) => {
                     // 主题必须**运行时立即生效**：记录选择 + 重灌调色板。
                     //
@@ -2039,11 +2113,34 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 从 `App.pal` 同步，这里不用管。
                     self.svc.state.config.ui.dark_mode = mode.to_dark_mode();
                     // 补间切换（F-34 / UI-P1-3）：从**当前显示中**的调色板
-                    // 渐变到新主题，220ms。整窗瞬跳在纯平毛玻璃审美下刺眼
+                    // 渐变到新主题。整窗瞬跳在纯平毛玻璃审美下刺眼
                     // （背景模糊内容不变、全部前景色瞬换）。`pal_from` 取
                     // 当前显示值而非上一次的目标——连续切换时从当下续接。
+                    //
+                    // CAUTION（「主题切换失效」的根因，2026-10-14）：
+                    // `pal_mix` 这个补间的目标恒为 1.0，而 `anim::tween_f32`
+                    // 在目标不变时是**惰性**的——首帧插入即 from == to == 1.0，
+                    // 之后永远返回 1.0，`draw_frame` 里 `if pal_mix < 1.0`
+                    // 的分支再也不会执行 ⇒ `self.pal` 从不更新。
+                    // 于是：主窗口的 egui `Visuals` 变了（`set_theme` 立即
+                    // 灌入），而**自绘层与设置/子窗口全部停在旧主题**——
+                    // 用户看到的就是「切主题没反应」。
+                    // 修法：切换时显式 `anim::restart` 把进度重置为 0→1。
+                    let scale = self.font_scale();
+                    let base = crate::theme::set_theme(&self.ctx, mode);
+                    self.pal_base = base.clone();
                     self.pal_from = self.pal.clone();
-                    self.pal_to = crate::theme::set_theme(&self.ctx, mode);
+                    // 目标带上当前字体缩放：否则切主题会把用户设的字号
+                    // 打回 1.0×（`set_theme` 返回的是未缩放的 1.0× 原色）。
+                    self.pal_to = base.with_font_scale(scale);
+                    crate::anim::restart(
+                        &self.ctx,
+                        egui::Id::new("pal_mix"),
+                        0.0,
+                        1.0,
+                        crate::theme::PALETTE_TWEEN,
+                        crate::anim::Ease::InOutCubic,
+                    );
                     self.after_config_change();
                 }
                 Op::StartRecording(slot) => {
@@ -2137,7 +2234,11 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     }
                 }
                 Op::SetPinnedMode(mode) => {
-                    if self.ws.set_pinned_mode(mode) {
+                    // 重复点当前已选项不触发任何调整（`draw_segmented`
+                    // 对已选项也会上报 clicked）。不判这一下的话，
+                    // 「共用单栏」状态下点一下已选项就会把用户手动
+                    // 拉宽的窗口打回默认宽。
+                    if self.ws.pinned_mode() != mode && self.ws.set_pinned_mode(mode) {
                         // 栏数变了 ⇒ 宽度需求变了。窗口尺寸只在启动时
                         // 从配置读过一次，不跟着变的话 `solve_scaled`
                         // 会按比例压缩卡片，用户看到的是「卡片被挤扁」。
@@ -2146,17 +2247,26 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         // needed_width 只按 min_width 算（两栏约 340pt），
                         // 默认窗口 520pt 会被判「够宽」而一动不动——
                         // 用户要的是「切换后自动放宽以显示更多内容」。
+                        // 这条请求**只放大不收缩**（手动拉宽过的窗口
+                        // 不会被改小）。
+                        //
+                        // 切回「共用单栏」则**恢复默认宽度**：切出去时
+                        // 窗口被自动撑宽（并写回了配置），只按 needed
+                        // 判断的话「够宽就不动」，回来时窗口停在撑宽的
+                        // 宽度上——用户看到的是「切了个模式窗口变宽了
+                        // 且回不去」。
                         //
                         // 这里只**记下需求**，真正的 resize 留给帧循环：
                         // `apply_ops` 拿不到 `ppp`（DPI 换算要用），
                         // 且窗口对象不在 `self` 里。
-                        let needed = crate::solver::needed_width(&self.ws);
-                        let comfortable = if mode == crate::card::PinnedMode::OwnCard {
-                            crate::solver::comfortable_width(&self.ws)
+                        let request = if mode == crate::card::PinnedMode::OwnCard {
+                            let needed = crate::solver::needed_width(&self.ws);
+                            let comfortable = crate::solver::comfortable_width(&self.ws);
+                            WidthRequest::AtLeast(needed.max(comfortable))
                         } else {
-                            needed
+                            WidthRequest::RestoreDefault
                         };
-                        self.paint_state.resize_width_to = Some(needed.max(comfortable));
+                        self.paint_state.resize_width_to = Some(request);
                     }
                 }
                 Op::ToggleSettings => {
@@ -2308,14 +2418,46 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         self.should_quit
     }
 
-    /// 取出「布局变化后需要的客户区宽度」（逻辑点）。
+    /// 当前生效的字体缩放倍率（已钳制到合法区间）。
     ///
-    /// 返回 `Some(w)` 表示帧循环应当把窗口**放宽**到 `w`。
-    /// `None` 表示不需要动 —— 包括「当前已经够宽」的情况：
-    /// 用户可能故意把窗口开得很大，不该因为一次模式切换被改小。
+    /// `UiConfig::font_scale` 是**唯一**数据源；钳制走
+    /// [`theme::clamp_font_scale`]，与写入侧同一份实现——两处各写一份
+    /// 的话，配置被手工改成 5.0 时读取侧会照单全收，字号直接爆掉。
+    fn font_scale(&self) -> f32 {
+        theme::clamp_font_scale(self.svc.state.config.ui.font_scale)
+    }
+
+    /// 让字体缩放**立即**生效（重算显示调色板 + 灌入 egui）。
     ///
-    /// CAUTION: 必须**在放大前**判断够不够，不能无脑设成 `needed`。
-    /// 无脑设的话每次切换模式窗口都会跳一下，来回切两次就晃。
+    /// # 为什么不像主题那样走补间
+    ///
+    /// 字号变化会让每段文字重新排版：走 220ms 渐变意味着这 13 帧里
+    /// 文字逐帧换字号，观感是「抖」而不是「淡入」。所以这里直接跳到
+    /// 目标值。
+    ///
+    /// # 为什么要清掉主题补间
+    ///
+    /// 若此刻正有一段主题补间在飞，它每帧会把 `self.pal` 覆盖成
+    /// `pal_from.lerp(pal_to, mix)`——其中不含新的字号，刚设的字号
+    /// 下一帧就被抹掉。清掉状态后帧循环的 `tween_f32` 会以
+    /// from == to == 1.0 重新插入（惰性），不再覆盖。
+    fn apply_font_scale(&mut self) {
+        self.pal = self.pal_base.with_font_scale(self.font_scale());
+        self.pal_from = self.pal.clone();
+        self.pal_to = self.pal.clone();
+        crate::anim::clear(&self.ctx, egui::Id::new("pal_mix"));
+        crate::theme::apply(&self.ctx, &self.pal);
+        tracing::info!(font_scale = self.font_scale(), "字体缩放已应用");
+    }
+
+    /// 取出「布局变化后需要的客户区宽度」请求。
+    ///
+    /// 返回 `Some(w)` 表示帧循环应当把窗口设为 `w`（物理像素）。
+    /// `None` 表示不需要动。
+    ///
+    /// CAUTION: 必须**按请求语义**判断，不能无脑设成目标宽度——
+    /// `AtLeast` 无脑设的话每次切换模式窗口都会跳一下，来回切两次
+    /// 就晃（见 [`resize_width_target`]）。
     pub fn take_resize_width_to(&mut self, current_px: (u32, u32), scale: f32) -> Option<u32> {
         resize_width_target(self.paint_state.resize_width_to.take(), current_px, scale)
     }
@@ -2500,35 +2642,76 @@ fn set_opt_number_field(
 // 测试
 // ---------------------------------------------------------------------------
 
+/// 窗口宽度调整请求（`Op::SetPinnedMode` 写入，帧循环消费）。
+///
+/// 两种语义分开是因为「切出去」和「切回来」要的行为**相反**：
+/// 无脑一个「目标宽度」会把这两种情况都变成「总是设成它」。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WidthRequest {
+    /// 至少放宽到这么多**逻辑点**。当前够宽时不动（只放大不收缩）。
+    ///
+    /// 用于切到「独立分栏」：多出一栏要宽度，而用户手动拉宽过的
+    /// 窗口不该被改小。
+    AtLeast(f32),
+    /// 精确恢复**默认宽度**（物理像素）。
+    ///
+    /// 用于切回「共用单栏」：独立分栏会自动把窗口撑宽（并写回配置），
+    /// 切回来若沿用「够宽就不动」，窗口就永远停在撑宽的宽度上。
+    /// 默认宽度取自 [`modular_clipboard_core::config::UiConfig::default`]，
+    /// 不写死数字——配置默认值变化时「恢复默认」跟着变。
+    RestoreDefault,
+}
+
+/// 主窗口默认宽度（物理像素）。
+///
+/// 单一数据源是 `UiConfig::default().ui.window_width`。
+pub fn default_window_width_px() -> u32 {
+    modular_clipboard_core::config::UiConfig::default().window_width as u32
+}
+
 /// 算出「该把窗口宽度设成多少物理像素」，不该动就返回 `None`。
 ///
 /// 抽成纯函数是为了能直接测：`take_resize_width_to` 需要 `&mut App`，
 /// 而构造 App 要 config + 临时数据目录，放进单元测试太重。
 ///
-/// `needed` 是**逻辑点**（`solver::needed_width` 的输出）。
+/// 语义见 [`WidthRequest`]。`scale` 只对 `AtLeast` 有用（逻辑点 →
+/// 物理像素）；`RestoreDefault` 的目标本身就是物理像素。
 fn resize_width_target(
-    needed: Option<f32>,
+    request: Option<WidthRequest>,
     current_px: (u32, u32),
     scale: f32,
 ) -> Option<u32> {
-    let needed = needed?;
-    if needed <= 0.0 || scale <= 0.0 {
-        return None;
+    let request = request?;
+    match request {
+        WidthRequest::AtLeast(needed) => {
+            if needed <= 0.0 || scale <= 0.0 {
+                return None;
+            }
+            let current_points = current_px.0 as f32 / scale;
+            // 已经够宽就不动。
+            //
+            // 留 1pt 容差：浮点误差会让「刚好等于」时在两个分支间反复跳，
+            // 表现为每次切模式窗口都抖一下。
+            if current_points >= needed - 1.0 {
+                return None;
+            }
+            Some(((needed * scale).round() as u32).max(1))
+        }
+        WidthRequest::RestoreDefault => {
+            let target = default_window_width_px().max(1);
+            // 已经就是默认宽度（1px 容差）则不动：省掉一次
+            // `set_size_physical` + 交换链重建。
+            if current_px.0.abs_diff(target) <= 1 {
+                return None;
+            }
+            Some(target)
+        }
     }
-    let current_points = current_px.0 as f32 / scale;
-    // 已经够宽就不动。
-    //
-    // 留 1pt 容差：浮点误差会让「刚好等于」时在两个分支间反复跳，
-    // 表现为每次切模式窗口都抖一下。
-    if current_points >= needed - 1.0 {
-        return None;
-    }
-    Some(((needed * scale).round() as u32).max(1))
 }
 
 #[cfg(test)]
 mod resize_tests {
-    use super::resize_width_target;
+    use super::{resize_width_target, WidthRequest};
 
     /// 放不下时必须给出目标物理宽度。
     ///
@@ -2538,7 +2721,7 @@ mod resize_tests {
     #[test]
     fn widens_when_current_is_too_narrow() {
         // 需求 600 逻辑点，当前只有 400 逻辑点（= 600 物理像素 @1.5）
-        let target = resize_width_target(Some(600.0), (600, 800), 1.5);
+        let target = resize_width_target(Some(WidthRequest::AtLeast(600.0)), (600, 800), 1.5);
         assert_eq!(target, Some(900), "应放宽到 600×1.5 = 900 物理像素");
     }
 
@@ -2549,19 +2732,77 @@ mod resize_tests {
     /// 来回切两次模式窗口就会来回跳。
     #[test]
     fn leaves_window_alone_when_already_wide_enough() {
-        assert_eq!(resize_width_target(Some(400.0), (900, 800), 1.5), None);
+        assert_eq!(
+            resize_width_target(Some(WidthRequest::AtLeast(400.0)), (900, 800), 1.5),
+            None
+        );
         // 刚好等于也要算「够宽」（1pt 容差内），否则浮点误差会抖。
-        assert_eq!(resize_width_target(Some(400.0), (600, 800), 1.5), None);
+        assert_eq!(
+            resize_width_target(Some(WidthRequest::AtLeast(400.0)), (600, 800), 1.5),
+            None
+        );
+    }
+
+    /// 切回共用单栏：宽度**恢复默认**（物理像素），不管当前多宽。
+    ///
+    /// 用户反馈：「置顶模式切换回共用单栏时，宽度恢复为默认」。
+    /// 独立分栏会自动撑宽窗口（并写回配置），切回来若按「够宽就不动」
+    /// 判断，窗口就停在撑宽的宽度上回不去。
+    #[test]
+    fn restores_default_width_when_back_to_shared_column() {
+        // 当前被独立分栏撑宽到 1180 物理像素（如 1.5x 下的舒适宽度）。
+        let target = resize_width_target(Some(WidthRequest::RestoreDefault), (1180, 800), 1.5);
+        assert_eq!(
+            target,
+            Some(super::default_window_width_px()),
+            "切回共用单栏必须恢复默认宽度"
+        );
+        // 比默认窄时同样恢复到默认（篱它不负责「只放大」）。
+        let narrow = resize_width_target(Some(WidthRequest::RestoreDefault), (400, 800), 1.0);
+        assert_eq!(narrow, Some(super::default_window_width_px()));
+    }
+
+    /// 已经是默认宽度时不动（省一次 resize + 交换链重建）。
+    #[test]
+    fn restore_default_is_noop_at_default_width() {
+        let d = super::default_window_width_px();
+        assert_eq!(
+            resize_width_target(Some(WidthRequest::RestoreDefault), (d, 800), 1.0),
+            None
+        );
+        // 1px 容差内也算「已经是默认」。
+        assert_eq!(
+            resize_width_target(Some(WidthRequest::RestoreDefault), (d + 1, 800), 1.0),
+            None
+        );
     }
 
     /// 没有请求、或参数非法时不动。
     #[test]
     fn no_request_means_no_resize() {
         assert_eq!(resize_width_target(None, (300, 800), 1.5), None);
-        assert_eq!(resize_width_target(Some(0.0), (300, 800), 1.5), None);
-        assert_eq!(resize_width_target(Some(-50.0), (300, 800), 1.5), None);
+        assert_eq!(
+            resize_width_target(Some(WidthRequest::AtLeast(0.0)), (300, 800), 1.5),
+            None
+        );
+        assert_eq!(
+            resize_width_target(Some(WidthRequest::AtLeast(-50.0)), (300, 800), 1.5),
+            None
+        );
         // scale = 0 会除出 inf / 除零，必须挡住。
-        assert_eq!(resize_width_target(Some(600.0), (300, 800), 0.0), None);
+        assert_eq!(
+            resize_width_target(Some(WidthRequest::AtLeast(600.0)), (300, 800), 0.0),
+            None
+        );
+    }
+
+    /// `RestoreDefault` 不依赖 `scale`（目标本就是物理像素）——
+    /// 防的是「将来有人给它也乘了 scale」这种静默错误。
+    #[test]
+    fn restore_default_ignores_scale() {
+        let a = resize_width_target(Some(WidthRequest::RestoreDefault), (1180, 800), 1.0);
+        let b = resize_width_target(Some(WidthRequest::RestoreDefault), (1180, 800), 1.5);
+        assert_eq!(a, b, "恢复默认与 DPI 缩放无关");
     }
 
     /// 结果必须是**正**整数：0 会让客户区塌成 0×0，
@@ -2572,7 +2813,8 @@ mod resize_tests {
     /// `3.0 × 0.1 = 0.3` 四舍五入就是 0，靠 `.max(1)` 兜住。
     #[test]
     fn target_is_never_zero() {
-        let t = resize_width_target(Some(3.0), (0, 10), 0.1).expect("应给出目标宽度");
+        let t = resize_width_target(Some(WidthRequest::AtLeast(3.0)), (0, 10), 0.1)
+            .expect("应给出目标宽度");
         assert!(t >= 1, "目标宽度必须至少 1 像素，实际 {t}");
     }
 }
@@ -2796,6 +3038,144 @@ mod tests {
     /// `start_capture`/`stop_capture`——于是运行中打开开关后
     /// 捕获线程仍然不存在，用户复制什么都记录不到（重启才生效），
     /// 表现为「复制监听获取不到、开关改了没反应」。
+    #[test]
+    fn theme_switch_actually_changes_palette_and_restarts_tween() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-theme-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        // 固定起点：跟随系统会让断言依赖跑测试的机器。
+        cfg.ui.dark_mode = Some(true);
+        let mut app = App::new(cfg, false, Some(&dir));
+        assert!(app.palette().is_dark, "初始应为深色");
+
+        // 切到浅色。
+        app.paint_state.ops.push(crate::paint::Op::SetThemeMode(
+            crate::theme::ThemeMode::Light,
+        ));
+        app.apply_ops();
+        assert!(!app.pal_to.is_dark, "目标调色板必须是浅色");
+        // 「主题切换失效」的根因是补间从不重启（目标恒为 1.0 ⇒ 惰性）。
+        // 重启后它必须在飞——否则下面推进时间也到不了目标。
+        assert!(
+            crate::anim::busy(&app.ctx),
+            "切主题必须重启 pal_mix 补间（否则永远停在旧主题）"
+        );
+
+        // 推进超过补间时长：显示中的调色板必须**精确**落到浅色。
+        let ctx = app.ctx.clone();
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                time: Some(10.0),
+                ..Default::default()
+            },
+            |ui| app.draw_frame(ui),
+        );
+        out.textures_delta.clear();
+        assert!(
+            !app.palette().is_dark,
+            "补间走完后显示调色板必须变成浅色"
+        );
+        assert_eq!(
+            app.palette().surface,
+            crate::theme::Palette::light().surface,
+            "走完后必须精确落在目标色（不是最后一帧的近似值）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 字体缩放必须**运行时**生效（配置 → 调色板 → egui 三层同源）。
+    ///
+    /// 守着实机缺陷：`UiConfig::font_scale` 早前**只有写入方、没有读取方**，
+    /// 改它完全没反应（用户反馈「字体缩放修改失效」）。
+    #[test]
+    fn font_scale_takes_effect_at_runtime() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-fontscale-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.ui.dark_mode = Some(true);
+        cfg.ui.font_scale = 1.0;
+        let mut app = App::new(cfg, false, Some(&dir));
+        let base_md = crate::theme::Palette::dark().font_md;
+        assert!((app.palette().font_md - base_md).abs() < 1e-3, "默认 1.0× 不缩放");
+
+        // 设成 1.5×（预设「超大」）→ 立即生效。
+        app.paint_state.ops.push(crate::paint::Op::SetNumber {
+            group: crate::paint::ConfigGroup::Ui,
+            field: "font_scale",
+            value: 1.5,
+        });
+        app.apply_ops();
+        assert!(
+            (app.palette().font_md - base_md * 1.5).abs() < 1e-3,
+            "字号应放大到 1.5×，实际 {}",
+            app.palette().font_md
+        );
+        // 承载文字的几何**必须**跟着放大：固定 28pt 高的输入框装不下
+        // 25.5pt 的字（文字被裁 = 用户反馈的「布局错乱」）。
+        assert!(
+            (app.palette().control_height
+                - crate::theme::Palette::dark().control_height * 1.5)
+                .abs()
+                < 1e-3,
+            "控件高度应随字号放大"
+        );
+        // 圆角不放大（1.5× 的圆角会让卡片变胶囊）。
+        assert!(
+            (app.palette().radius_md - crate::theme::Palette::dark().radius_md).abs() < 1e-3
+        );
+
+        // 再改一次不能叠乘（1.5 × 1.2 必须是 1.2×，不是 1.8×）——
+        // 这正是 `pal_base` 必须单独存一份的理由。
+        app.paint_state.ops.push(crate::paint::Op::SetNumber {
+            group: crate::paint::ConfigGroup::Ui,
+            field: "font_scale",
+            value: 1.2,
+        });
+        app.apply_ops();
+        assert!(
+            (app.palette().font_md - base_md * 1.2).abs() < 1e-3,
+            "第二次缩放必须从基础调色板派生，实际 {}",
+            app.palette().font_md
+        );
+
+        // 越界值被钳制（不是照单全收）。
+        app.paint_state.ops.push(crate::paint::Op::SetNumber {
+            group: crate::paint::ConfigGroup::Ui,
+            field: "font_scale",
+            value: 99.0,
+        });
+        app.apply_ops();
+        assert!(
+            (app.palette().font_md - base_md * crate::theme::FONT_SCALE_MAX).abs() < 1e-3,
+            "越界应钳到上限"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 切主题不能把用户设的字体缩放打回 1.0×。
+    #[test]
+    fn theme_switch_preserves_font_scale() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-theme-scale-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.ui.dark_mode = Some(true);
+        cfg.ui.font_scale = 1.3;
+        let mut app = App::new(cfg, false, Some(&dir));
+        let base_md = crate::theme::Palette::dark().font_md;
+        assert!((app.palette().font_md - base_md * 1.3).abs() < 1e-3);
+
+        app.paint_state.ops.push(crate::paint::Op::SetThemeMode(
+            crate::theme::ThemeMode::Light,
+        ));
+        app.apply_ops();
+        assert!(
+            (app.pal_to.font_md - base_md * 1.3).abs() < 1e-3,
+            "切主题后目标调色板的字号必须仍带 1.3× 缩放，实际 {}",
+            app.pal_to.font_md
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn capture_enabled_switch_restarts_thread_at_runtime() {
         let dir = std::env::temp_dir().join(format!("mc-ui-capture-switch-{}", std::process::id()));

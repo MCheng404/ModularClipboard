@@ -16,7 +16,7 @@
 use ash::vk;
 use modular_clipboard_gfx::Gpu;
 use modular_clipboard_gfx::backdrop::{
-    capture_due, capture_size, DesktopCapture, CAPTURE_INTERVAL,
+    capture_due, capture_size, client_origin, DesktopCapture, MotionPredictor, CAPTURE_INTERVAL,
 };
 use modular_clipboard_gfx::blur::{BlurChain, BlurPipeline, DEFAULT_DIVISOR, DEFAULT_RADIUS};
 use modular_clipboard_gfx::buffer::{Buffer, UniformBuffer, Vertex};
@@ -475,6 +475,17 @@ struct BackdropState {
     /// 上一次卷积所用的高斯半径；与本帧设置不同则强制重捕获，
     /// 让用户拖「磨砂强度」滑块时立即见效（不等 30fps 捕获节流）。
     blur_radius: u32,
+    /// 窗口客户区原点的运动轨迹（移动预测，见 `gfx::backdrop::MotionPredictor`）。
+    ///
+    /// 每帧观测一次（`record_backdrop_blur` 入口，**先于节流判断**）——
+    /// 节流帧不观测的话拖动中的速度采样会稀疏成 30fps，预测失真。
+    predictor: MotionPredictor,
+    /// 最新一次观测到的客户区原点（屏幕物理像素）。
+    origin: Option<(f32, f32)>,
+    /// **上一次成功捕获时**的客户区原点。合成底图时按
+    /// `(预测位置 − 本原点) / 交换链尺寸` 平移采样坐标，把过期快照
+    /// 贴回窗口当前位置（消除拖动磨砂的轻微拖影）。
+    capture_origin: Option<(f32, f32)>,
 }
 
 impl Default for BackdropState {
@@ -485,6 +496,9 @@ impl Default for BackdropState {
             last_capture: None,
             luminance: None,
             blur_radius: DEFAULT_RADIUS,
+            predictor: MotionPredictor::new(),
+            origin: None,
+            capture_origin: None,
         }
     }
 }
@@ -500,6 +514,10 @@ impl BackdropState {
         self.capture = None;
         self.last_capture = None;
         self.luminance = None;
+        // 捕获原点作废：下一帧重新捕获前没有可对齐的快照。
+        // 预测器保留无妨（窗口还在动的话轨迹仍有效），但原点必须清，
+        // 否则新快照会按旧原点的位移平移——凭空错位一帧。
+        self.capture_origin = None;
     }
 }
 
@@ -645,6 +663,9 @@ impl<'a> Painter<'a> {
     /// 不等于没有底图。
     ///
     /// `hwnd` 以 `isize` 传入（UI 层从 `HWND` 转换），仅本方法使用。
+    // 参数与 `paint_inner` 三个薄入口共享同一份签名（拆出去只是把参数
+    // 列表换个地方排）；8 个参数触到 clippy 的 7 个上限，显式豁免。
+    #[allow(clippy::too_many_arguments)]
     pub fn paint_backdrop(
         &mut self,
         fr: &mut FrameRenderer<'a>,
@@ -684,6 +705,10 @@ impl<'a> Painter<'a> {
         }
         self.backdrop.capture = None;
         self.backdrop.last_capture = None;
+        // 捕获原点与轨迹作废：再开启时首帧重新捕获，避免用过期原点
+        // 算出错误位移（表现为「重新开启磨砂那一下底图错位」）。
+        self.backdrop.capture_origin = None;
+        self.backdrop.predictor.reset();
     }
 
     /// 一帧的实际绘制逻辑。`mode` 决定走哪条合成路径；
@@ -837,10 +862,22 @@ impl<'a> Painter<'a> {
         // 合成底图用的句柄（`Blit` 是 Copy 的小结构，先取出避免借用冲突）。
         // 首帧尚未上传过捕获图时不能铺底图（采样未初始化图像是 UB），
         // 退化为透明清屏 + 半透明背景层——下一帧自动恢复。
+        //
+        // `uv_offset`：磨砂移动预测补偿。拖动窗口时底图是过期快照，
+        // 这里按「已走位移 + 一帧预测」平移采样坐标，让磨砂实时跟住
+        // 窗口；静止时位移为 0，与旧行为逐字节一致。
         let backdrop_blit = if use_backdrop
             && self.backdrop.fx.as_ref().is_some_and(|fx| fx.uploaded)
         {
-            Some(self.backdrop.fx.as_ref().expect("上面刚检查过").pipeline.composite())
+            let offset = self.backdrop_uv_offset(swap_extent);
+            Some(
+                self.backdrop
+                    .fx
+                    .as_ref()
+                    .expect("上面刚检查过")
+                    .pipeline
+                    .composite(offset),
+            )
         } else {
             None
         };
@@ -909,7 +946,9 @@ impl<'a> Painter<'a> {
                 vertex_buffer,
                 index_buffer,
                 batches: &self.draw_batches[blur_split..],
-                prelude: Some(res.pipeline.composite()),
+                // 覆盖层模糊的合成无位移可言（场景图就是本帧刚画的），
+                // 恒推零。
+                prelude: Some(res.pipeline.composite([0.0, 0.0])),
                 ..Default::default()
             };
             fr.record_to(
@@ -1008,6 +1047,50 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
     self.backdrop.luminance
 }
 
+/// 磨砂底图合成时的 UV 位移（push constant，目标 UV 单位）。
+///
+/// # 算的是什么
+///
+/// 底图是 `capture_origin` 时刻抓的快照，而窗口现在（帧呈现时更晚）
+/// 在 `预测位置`。把采样坐标平移 `(预测 − 捕获) / 交换链尺寸` 后，
+/// 快照内容正好落在窗口当前所占的屏幕区域上——**静止时该值为 0**
+/// （两个位置相同），行为与加此机制前完全一致；拖动时它逐帧把
+/// 过期快照「拉」回窗口，消除磨砂背景跟不上窗口的轻微拖影。
+///
+/// # 为什么除以交换链尺寸而不是模糊链尺寸
+///
+/// 合成用的全屏三角形把 `[0,1]²` 的 UV 映射到**整个绘制目标**；
+/// 无论目标是交换链（`ssaa ≤ 1` 路径）还是超采样场景图
+/// （内容先画场景、再统一降采样），一像素的物理位移都等于
+/// `d / swap_extent` 个 UV 单位——两条路径口径一致。
+///
+/// # 为什么还要一帧预测
+///
+/// 补偿只算到「本帧观测时刻」，而帧提交后还要过约一个帧间隔才
+/// 真正呈现，那时窗口已又走过 `v × 帧间隔`。 `MotionPredictor`
+/// 用速度外推补上这段，观感上底图与窗口「正好跟住」而不是总慢
+/// 半拍。预测失误的代价是有界的：`CLAMP_TO_EDGE` 采样器只会把
+/// 越界的一小条边缘拉伸，而模糊半径（等效全分辨率 ~32px）远大于
+/// 单帧位移，看不出来。
+///
+/// 无捕获原点（首帧前 / 刚重建）时返回零——那时本就不铺底图
+/// （`fx.uploaded == false`），零值只是不改变任何行为。
+fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
+    let (Some(cap), Some(_cur)) = (self.backdrop.capture_origin, self.backdrop.origin) else {
+        return [0.0, 0.0];
+    };
+    let pred = self
+        .backdrop
+        .predictor
+        .predict_next_frame()
+        .unwrap_or((cap.0, cap.1));
+    let dx = pred.0 - cap.0;
+    let dy = pred.1 - cap.1;
+    let w = swap_extent.width.max(1) as f32;
+    let h = swap_extent.height.max(1) as f32;
+    [dx / w, dy / h]
+}
+
 /// 交换链为 RGBA 字节序时需要 R/B 交换（GDI DIB 恒为 BGRA）。
     ///
     /// `pick_format` 只会给出 `B8G8R8A8_UNORM` / `R8G8B8A8_UNORM` 两种；
@@ -1025,6 +1108,17 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
     /// 在 `paint_inner` 的所有渲染通道之前调用（上传不能进渲染通道，
     /// 卷积要在交换链那趟通道前完成）。任何一步失败都只记日志并跳过
     /// ——磨砂是观感增强，绝不能把渲染主流程带崩。
+    ///
+    /// # 移动预测（本函数与 `paint_inner` 的合成配合）
+    ///
+    /// 1. 入口处**无论是否节流**都观测一次客户区原点（`client_origin`），
+    ///    喂给 `MotionPredictor`；
+    /// 2. 窗口在动（速度超阈值）时**强制本帧捕获**——否则 33ms 节流
+    ///    会让快照比窗口落后最多两帧的位移，补偿量超出图像边界、
+    ///    边缘出现拉伸条；
+    /// 3. 捕获成功时记下 `capture_origin`；合成阶段
+    ///    （[`Self::backdrop_uv_offset`]）按 `预测位置 − capture_origin`
+    ///    平移采样坐标，过期快照重新贴住窗口。
     fn record_backdrop_blur(
         &mut self,
         fr: &mut FrameRenderer<'a>,
@@ -1040,17 +1134,30 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
         }
         self.ensure_backdrop(fr, render_extent, swap_extent, divisor, format)?;
 
+        // ---- ① 运动观测（先于节流：节流帧也要喂预测器）----
+        let now = Instant::now();
+        if let Some(o) = client_origin(hwnd) {
+            self.backdrop.predictor.observe(now, o);
+            self.backdrop.origin = Some(o);
+        }
+
         // 强度档位变了：强制本帧重新捕获 + 卷积，不等 30fps 节流——
         // 拖滑块时若还按 33ms 节流，强度要隔一两帧才跳，手感发黏。
         let radius_changed = self.backdrop.blur_radius != blur_radius;
         if radius_changed {
             self.backdrop.blur_radius = blur_radius;
         }
-        // 节流：未到间隔且强度未变时直接复用上一帧的模糊结果。
-        let now = Instant::now();
-        if !radius_changed && !capture_due(self.backdrop.last_capture, now, CAPTURE_INTERVAL) {
+        // 节流：未到间隔、强度未变、且窗口没在动时直接复用上一帧的
+        // 模糊结果。窗口移动时放行——见方法文档第 2 条。
+        let moving = self.backdrop.predictor.is_moving();
+        if !radius_changed && !moving && !capture_due(self.backdrop.last_capture, now, CAPTURE_INTERVAL) {
             return Ok(());
         }
+
+        // 本帧观测到的原点先拷贝出来：下面按字段拆借 `&mut self.backdrop`
+        // 期间不能再整体访问它。捕获与观测同帧发生，拷贝值即「快照
+        // 对应的窗口位置」。
+        let observed_origin = self.backdrop.origin;
 
         // 拆字段借用：`fx` 与 `capture` 是 `BackdropState` 的两个互不相交
         // 字段，逐字段借比整体 `&mut self.backdrop` 少一层间接冲突。
@@ -1059,7 +1166,8 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
             capture,
             last_capture,
             luminance,
-            // blur_radius 已在节流判断前整体读写，这里无需再解构。
+            // blur_radius / predictor / origin / capture_origin 已在
+            // 节流判断前整体读写，这里无需再解构。
             ..
         } = &mut self.backdrop;
         let fx = fx.as_mut().expect("ensure_backdrop 刚确保存在");
@@ -1084,6 +1192,13 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
             // 等下一轮 swapchain 重建后尺寸自然对齐。
             return Ok(());
         }
+        // 捕获成功 ⇒ 记下快照对应的窗口位置。合成阶段用它算位移
+        // （磨砂移动预测，见 [`Self::backdrop_uv_offset`]）。
+        // 观测与捕获在同一帧内先后发生，原点即捕获时刻的位置。
+        // 注意：拆借期间不能写 `self.backdrop.*`，改为拆借前取出、
+        // 到这里再借道 `BackdropState` 的剩余字段——直接放回拆借模式
+        // 会与 `last_capture` 的写冲突，所以用局部变量延迟到函数尾。
+        let capture_succeeded = observed_origin;
 
         // 上传 + 三趟卷积（降采样、横向、纵向）。
         //
@@ -1127,6 +1242,9 @@ pub fn backdrop_luminance(&self) -> Option<f32> {
         }
         fx.uploaded = true;
         *last_capture = Some(now);
+        // 到这里拆借已全部用完，可以安全写回捕获原点（引用在 NLL
+        // 下于最后一次使用后结束；`fx.uploaded` 这行是最后一次）。
+        self.backdrop.capture_origin = capture_succeeded;
         Ok(())
     }
 

@@ -7,6 +7,7 @@
 
 # 本地 Agent 工作数据，不应进入仓库
 /.workbuddy/
+/.workbuddy-ai/
 
 # 各类隔离构建目录与 Agent 临时目录（动态产生，统一忽略）
 # 覆盖 target-lead-verify/、target-split-*/、target-*/ 等全部变体。
@@ -34,3 +35,4 @@ modular_clipboard.lnk
 shot-*.png
 *.log
 *.err
+

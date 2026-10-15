@@ -1,0 +1,337 @@
+{
+  "src": "D:\\modular-clipboard\\shadow-preview\\卡片阴影效果预览.html",
+  "url": "file:///D:/modular-clipboard/shadow-preview/%E5%8D%A1%E7%89%87%E9%98%B4%E5%BD%B1%E6%95%88%E6%9E%9C%E9%A2%84%E8%A7%88.html",
+  "outdir": "D:\\modular-clipboard\\shadow-preview\\_shots",
+  "include": [
+    "lint",
+    "screenshots",
+    "structure"
+  ],
+  "shots": {
+    "desktop": {
+      "screenshot": "D:\\modular-clipboard\\shadow-preview\\_shots\\卡片阴影效果预览_desktop.jpg",
+      "screenshotBytes": 80148,
+      "truncated": false,
+      "structure": {
+        "title": "卡片阴影效果预览",
+        "firstH1": "卡片阴影效果预览",
+        "viewport": {
+          "w": 1418,
+          "h": 746
+        },
+        "fullpage": {
+          "w": 1418,
+          "h": 963
+        },
+        "counts": {
+          "section": 2,
+          "h1": 1,
+          "h2": 0,
+          "img": 0,
+          "canvas": 0,
+          "svg": 12,
+          "links": 0,
+          "buttons": 6
+        }
+      },
+      "consoleErrors": [],
+      "consoleWarnings": [],
+      "horizontalOverflow": [],
+      "resourceErrors": [],
+      "deadButtons": [
+        {
+          "tag": "button",
+          "text": "图标",
+          "reason": "button-no-onclick",
+          "rect": [
+            319,
+            173,
+            50,
+            28
+          ],
+          "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+        },
+        {
+          "tag": "button",
+          "text": "类型",
+          "reason": "button-no-onclick",
+          "rect": [
+            375,
+            173,
+            50,
+            28
+          ],
+          "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+        },
+        {
+          "tag": "button",
+          "text": "大小",
+          "reason": "button-no-onclick",
+          "rect": [
+            431,
+            173,
+            50,
+            28
+          ],
+          "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+        }
+      ],
+      "deadButtonsHint": "含义：视觉上可点、但点了不发生任何事的元素。覆盖 6 种模式，reason 字段指明是哪种： | button-no-onclick：<button> 既无 onclick 也没被 addEventListener('click') 绑过。 | onclick-noop：onclick 属性是占位/无副作用字符串（`return false` / `void(0)` / 空串 / 分号 / 纯注释等），extra 字段 onclickAttr 展示原始值。这类写法在生产代码里几乎没有正当用途，视同没写。 | a-no-href / a-href-empty / a-href-hash-no-handler：<a> 无 href / href=\"\" / href=\"#\" 且无 handler。 | a-href-javascript-noop-no-handler：<a href=\"javascript:void(0)\" / \"javascript:;\">，作者显式关掉 native 导航，但 JS 侧也没人接手。收紧路径：祖先有 click listener 时，还要验证 listener 源码是否引用了本元素的 class/id/data-* 才放行；listener 源码不可读（native/bound/被 minify）时保守放行，避免误伤。extra 字段 hrefAttr 展示原始 href。 | a-broken-anchor：<a href=\"#foo\"> 但页面里没有 id=\"foo\" 也没有 name=\"foo\" 的元素。已排除 SPA hash 路由（href 含 / 或 ? 的形式，如 #/dashboard）。 | cursor-pointer-no-handler：<div>/<span> 等非交互标签加了 cursor:pointer 却没绑任何 click。 | input-no-handler：<input type=button|submit|reset|image> 无 onclick 也无 listener。form 里的 submit/reset 已豁免。 | label-for-not-found：<label for=\"xxx\"> 但页面里没有 id=\"xxx\"。用户点 label 期望 focus 到 input，实际什么都不发生。extra 字段 forAttr 展示 for 值。 | 已排除：form submit/reset、popover 触发器、role=button/link/tab/menuitem/option/switch/checkbox/radio、<label> 包裹、body/html 上继承 cursor:pointer；cursor-pointer-no-handler 只报尺寸 ≥ 24×16 且有可见文字的元素。 | 修法：给 <button>/<input> 加 onclick 或 addEventListener；给 <a> 补真实 href 或改成 <button>；把 <div class=\"nav-item\">…</div> 之类假按钮换成真 <button> 或 <a>，或给它加 role=button+tabindex+键盘 handler；onclick=\"return false\" 之类占位符要么删掉（配合真 handler），要么替换为 toast 提示「演示中」这类可感知反馈；断链锚点核对目标 id 拼写；label 断链核对 for 与 input id 是否一致。 | 豁免：(1) 带 note=ancestor-has-data-attr 的项可能是**祖先事件委托**目标（document/window 上的全局委托本规则查不到），对着代码核对，如果确实有 document.addEventListener('click', e => e.target.closest(...)) 之类的委托捕获就忽略；(2) 纯装饰按钮（无 hover/focus 反馈的 mock 页面）——但这本身也算 slop，建议改成非 <button>；(3) cursor-pointer-no-handler：如果元素只是 hover 变鼠标做微交互提示（如 tooltip trigger）而非真按钮，去掉 cursor:pointer 更合适；(4) a-href-javascript-noop-no-handler：如果确实有全局委托捕获（如 window.addEventListener 或 minify 后的框架 handler），本规则的 listener 源码启发式可能读不到明文标识 → 结合 note 字段和实际代码核对；(5) a-broken-anchor：如果目标 id 是运行时由 JS 动态注入的（比如懒加载章节），核对确认后可忽略。",
+      "reportSource": "cdp"
+    },
+    "mobile": {
+      "screenshot": "D:\\modular-clipboard\\shadow-preview\\_shots\\卡片阴影效果预览_mobile.jpg",
+      "screenshotBytes": 127806,
+      "truncated": false,
+      "structure": {
+        "title": "卡片阴影效果预览",
+        "firstH1": "卡片阴影效果预览",
+        "viewport": {
+          "w": 500,
+          "h": 690
+        },
+        "fullpage": {
+          "w": 500,
+          "h": 1787
+        },
+        "counts": {
+          "section": 2,
+          "h1": 1,
+          "h2": 0,
+          "img": 0,
+          "canvas": 0,
+          "svg": 12,
+          "links": 0,
+          "buttons": 6
+        }
+      },
+      "consoleErrors": [],
+      "consoleWarnings": [],
+      "horizontalOverflow": [],
+      "resourceErrors": [],
+      "deadButtons": [
+        {
+          "tag": "button",
+          "text": "图标",
+          "reason": "button-no-onclick",
+          "rect": [
+            106,
+            305,
+            50,
+            28
+          ],
+          "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+        },
+        {
+          "tag": "button",
+          "text": "类型",
+          "reason": "button-no-onclick",
+          "rect": [
+            162,
+            305,
+            50,
+            28
+          ],
+          "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+        },
+        {
+          "tag": "button",
+          "text": "大小",
+          "reason": "button-no-onclick",
+          "rect": [
+            218,
+            305,
+            50,
+            28
+          ],
+          "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+        }
+      ],
+      "deadButtonsHint": "含义：视觉上可点、但点了不发生任何事的元素。覆盖 6 种模式，reason 字段指明是哪种： | button-no-onclick：<button> 既无 onclick 也没被 addEventListener('click') 绑过。 | onclick-noop：onclick 属性是占位/无副作用字符串（`return false` / `void(0)` / 空串 / 分号 / 纯注释等），extra 字段 onclickAttr 展示原始值。这类写法在生产代码里几乎没有正当用途，视同没写。 | a-no-href / a-href-empty / a-href-hash-no-handler：<a> 无 href / href=\"\" / href=\"#\" 且无 handler。 | a-href-javascript-noop-no-handler：<a href=\"javascript:void(0)\" / \"javascript:;\">，作者显式关掉 native 导航，但 JS 侧也没人接手。收紧路径：祖先有 click listener 时，还要验证 listener 源码是否引用了本元素的 class/id/data-* 才放行；listener 源码不可读（native/bound/被 minify）时保守放行，避免误伤。extra 字段 hrefAttr 展示原始 href。 | a-broken-anchor：<a href=\"#foo\"> 但页面里没有 id=\"foo\" 也没有 name=\"foo\" 的元素。已排除 SPA hash 路由（href 含 / 或 ? 的形式，如 #/dashboard）。 | cursor-pointer-no-handler：<div>/<span> 等非交互标签加了 cursor:pointer 却没绑任何 click。 | input-no-handler：<input type=button|submit|reset|image> 无 onclick 也无 listener。form 里的 submit/reset 已豁免。 | label-for-not-found：<label for=\"xxx\"> 但页面里没有 id=\"xxx\"。用户点 label 期望 focus 到 input，实际什么都不发生。extra 字段 forAttr 展示 for 值。 | 已排除：form submit/reset、popover 触发器、role=button/link/tab/menuitem/option/switch/checkbox/radio、<label> 包裹、body/html 上继承 cursor:pointer；cursor-pointer-no-handler 只报尺寸 ≥ 24×16 且有可见文字的元素。 | 修法：给 <button>/<input> 加 onclick 或 addEventListener；给 <a> 补真实 href 或改成 <button>；把 <div class=\"nav-item\">…</div> 之类假按钮换成真 <button> 或 <a>，或给它加 role=button+tabindex+键盘 handler；onclick=\"return false\" 之类占位符要么删掉（配合真 handler），要么替换为 toast 提示「演示中」这类可感知反馈；断链锚点核对目标 id 拼写；label 断链核对 for 与 input id 是否一致。 | 豁免：(1) 带 note=ancestor-has-data-attr 的项可能是**祖先事件委托**目标（document/window 上的全局委托本规则查不到），对着代码核对，如果确实有 document.addEventListener('click', e => e.target.closest(...)) 之类的委托捕获就忽略；(2) 纯装饰按钮（无 hover/focus 反馈的 mock 页面）——但这本身也算 slop，建议改成非 <button>；(3) cursor-pointer-no-handler：如果元素只是 hover 变鼠标做微交互提示（如 tooltip trigger）而非真按钮，去掉 cursor:pointer 更合适；(4) a-href-javascript-noop-no-handler：如果确实有全局委托捕获（如 window.addEventListener 或 minify 后的框架 handler），本规则的 listener 源码启发式可能读不到明文标识 → 结合 note 字段和实际代码核对；(5) a-broken-anchor：如果目标 id 是运行时由 JS 动态注入的（比如懒加载章节），核对确认后可忽略。",
+      "reportSource": "cdp"
+    }
+  },
+  "engine": "chrome_cli",
+  "chromiumExec": "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "engineDegraded": true,
+  "engineDegradedReason": "playwright 未装",
+  "elapsedSec": 5.57,
+  "schemaVersion": 2,
+  "status": "fail",
+  "engineInfo": {
+    "name": "chrome_cli",
+    "degraded": true,
+    "degradedReasons": [
+      "playwright 未装"
+    ]
+  },
+  "input": {
+    "original": "D:\\modular-clipboard\\shadow-preview\\卡片阴影效果预览.html",
+    "resolvedPath": "D:\\modular-clipboard\\shadow-preview\\卡片阴影效果预览.html",
+    "baseUrl": "file:///D:/modular-clipboard/shadow-preview/%E5%8D%A1%E7%89%87%E9%98%B4%E5%BD%B1%E6%95%88%E6%9E%9C%E9%A2%84%E8%A7%88.html",
+    "protocol": "file",
+    "cwd": "D:\\modular-clipboard",
+    "mediaMode": {
+      "reducedMotion": true
+    }
+  },
+  "artifacts": {
+    "screenshots": [
+      {
+        "viewport": "desktop",
+        "path": "D:\\modular-clipboard\\shadow-preview\\_shots\\卡片阴影效果预览_desktop.jpg",
+        "size": 80148,
+        "visualCoverage": {
+          "complete": true,
+          "reason": null
+        }
+      },
+      {
+        "viewport": "mobile",
+        "path": "D:\\modular-clipboard\\shadow-preview\\_shots\\卡片阴影效果预览_mobile.jpg",
+        "size": 127806,
+        "visualCoverage": {
+          "complete": true,
+          "reason": null
+        }
+      }
+    ]
+  },
+  "summary": {
+    "blocker": 0,
+    "error": 6,
+    "warning": 0,
+    "info": 0
+  },
+  "findings": [
+    {
+      "ruleId": "deadButtons",
+      "severity": "error",
+      "kind": "interaction",
+      "viewport": "desktop",
+      "selector": "button",
+      "evidence": {
+        "tag": "button",
+        "text": "图标",
+        "reason": "button-no-onclick",
+        "rect": [
+          319,
+          173,
+          50,
+          28
+        ],
+        "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+      },
+      "dedupeKey": "deadButtons|desktop|button|0"
+    },
+    {
+      "ruleId": "deadButtons",
+      "severity": "error",
+      "kind": "interaction",
+      "viewport": "desktop",
+      "selector": "button",
+      "evidence": {
+        "tag": "button",
+        "text": "类型",
+        "reason": "button-no-onclick",
+        "rect": [
+          375,
+          173,
+          50,
+          28
+        ],
+        "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+      },
+      "dedupeKey": "deadButtons|desktop|button|1"
+    },
+    {
+      "ruleId": "deadButtons",
+      "severity": "error",
+      "kind": "interaction",
+      "viewport": "desktop",
+      "selector": "button",
+      "evidence": {
+        "tag": "button",
+        "text": "大小",
+        "reason": "button-no-onclick",
+        "rect": [
+          431,
+          173,
+          50,
+          28
+        ],
+        "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+      },
+      "dedupeKey": "deadButtons|desktop|button|2"
+    },
+    {
+      "ruleId": "deadButtons",
+      "severity": "error",
+      "kind": "interaction",
+      "viewport": "mobile",
+      "selector": "button",
+      "evidence": {
+        "tag": "button",
+        "text": "图标",
+        "reason": "button-no-onclick",
+        "rect": [
+          106,
+          305,
+          50,
+          28
+        ],
+        "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+      },
+      "dedupeKey": "deadButtons|mobile|button|0"
+    },
+    {
+      "ruleId": "deadButtons",
+      "severity": "error",
+      "kind": "interaction",
+      "viewport": "mobile",
+      "selector": "button",
+      "evidence": {
+        "tag": "button",
+        "text": "类型",
+        "reason": "button-no-onclick",
+        "rect": [
+          162,
+          305,
+          50,
+          28
+        ],
+        "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+      },
+      "dedupeKey": "deadButtons|mobile|button|1"
+    },
+    {
+      "ruleId": "deadButtons",
+      "severity": "error",
+      "kind": "interaction",
+      "viewport": "mobile",
+      "selector": "button",
+      "evidence": {
+        "tag": "button",
+        "text": "大小",
+        "reason": "button-no-onclick",
+        "rect": [
+          218,
+          305,
+          50,
+          28
+        ],
+        "note": "ancestor-has-data-attr: 可能被 addEventListener 委托捕获，请核对"
+      },
+      "dedupeKey": "deadButtons|mobile|button|2"
+    }
+  ],
+  "prioritizedActions": [
+    {
+      "ruleId": "deadButtons",
+      "severity": "error",
+      "viewport": "desktop",
+      "selector": "button"
+    }
+  ],
+  "reportPath": "D:\\modular-clipboard\\shadow-preview\\_shots\\report.json"
+}

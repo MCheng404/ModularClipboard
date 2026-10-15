@@ -55,6 +55,19 @@ pub const DEFAULT_RADIUS: u32 = 8;
 /// 磨砂强度档位数（设置里暴露给用户的离散档位，1..=10）。
 pub const BLUR_LEVELS: u8 = 10;
 
+/// 合成拷贝 push constant 的阶段掩码。
+///
+/// 与 WGSL 的 `fs_copy`（片元入口）对应：顶点阶段 `vs_fullscreen`
+/// 不读该常量，声明成 VERTEX 只是徒增验证面。
+const COPY_OFFSET_STAGE: vk::ShaderStageFlags = vk::ShaderStageFlags::FRAGMENT;
+
+/// 合成拷贝 push constant 的字节数：一个 `vec2<f32>`。
+///
+/// 必须与 `blur.wgsl` 的 `CopyOffset` 结构体逐字节一致；规范要求
+/// size > 0 且为 4 的倍数。`pipeline.rs` 的测试把布局声明钉在这里，
+/// 两侧漂移会在 `create_graphics_pipelines` 炸出来。
+const COPY_OFFSET_SIZE: u32 = 8;
+
 /// 描述符集角色。各组各自绑定一张固定的源纹理：
 /// 描述符集的内容是**执行期**读取的，同一份集在两趟之间改写会让
 /// 两趟都读到最后一次写入的值——所以必须一组一集。
@@ -318,7 +331,16 @@ impl BlurPipeline {
         // 模糊描述符集在创建后**只在 resize 时整体重建**，不存在
         // 「多帧在途时改写」的场景，因此不需要 `UPDATE_AFTER_BIND`。
         let desc_layout = DescriptorLayout::blur(device, false)?;
-        let pipe_layout = PipelineLayout::new(device, std::slice::from_ref(&desc_layout.handle))?;
+        // 拷贝管线的合成需要 push constant（UV 位移，自研磨砂移动
+        // 预测）。模糊卷积管线与之**共用**同一个 layout：多声明一个
+        // 没人读的 range 无代价，省得为两条管线维护两套布局。
+        let pc = vk::PushConstantRange {
+            stage_flags: COPY_OFFSET_STAGE,
+            offset: 0,
+            size: COPY_OFFSET_SIZE,
+        };
+        let pipe_layout =
+            PipelineLayout::with_push_constants(device, std::slice::from_ref(&desc_layout.handle), &[pc])?;
         let shader = ShaderModule::new_blur(device)?;
 
         let blur_pipeline = GraphicsPipeline::fullscreen(
@@ -571,11 +593,16 @@ impl BlurPipeline {
     /// 合成阶段要用的描述符集与管线（把 `blur_a` 画到交换链）。
     ///
     /// 供 `FrameRenderer` 在交换链渲染通道里先画一张全屏模糊底图。
-    pub fn composite(&self) -> Blit {
+    ///
+    /// `uv_offset`：自研磨砂的**移动预测补偿**（目标 UV 单位）——
+    /// 底图是过期快照，把采样坐标按「窗口已走过的位移 + 一帧预测」
+    /// 平移，磨砂即与窗口当前位置对齐。非磨砂路径传 `[0.0, 0.0]`。
+    pub fn composite(&self, uv_offset: [f32; 2]) -> Blit {
         Blit {
             pipeline: self.copy_pipeline.handle,
             layout: self.pipe_layout.handle,
             descriptor_set: self.sets[SET_COMPOSITE],
+            uv_offset,
         }
     }
 
@@ -589,11 +616,13 @@ impl BlurPipeline {
     /// - `downsample` 读 `scene`（全分辨率，只是缩小）。
     ///
     /// 两者的管线是同一个（`fs_copy` + 线性采样器），只是描述符集不同。
+    /// 这条路径不涉及磨砂补偿，UV 位移恒为零。
     pub fn downsample(&self) -> Blit {
         Blit {
             pipeline: self.copy_pipeline.handle,
             layout: self.pipe_layout.handle,
             descriptor_set: self.sets[SET_SCENE_COPY],
+            uv_offset: [0.0, 0.0],
         }
     }
 
@@ -750,6 +779,12 @@ impl BlurPipeline {
             extent: target.extent,
         };
         let sets = [set];
+        // push constant：**每趟 blit 都必须显式推值**。`fs_copy` 声明了
+        // 这块 push constant（合成移位用），不推就是未定义内容——
+        // 降采样那几趟会随机平移图像，而偏移在窗口拖动前全是 0，
+        // 表现为「偶尔画面莫名偏一下」。模糊卷积（`fs_blur`）不读它，
+        // 推零同样无害。
+        let zero_offset = [0.0f32, 0.0];
         unsafe {
             device.cmd_begin_render_pass(cmd, &begin, vk::SubpassContents::INLINE);
             device.cmd_set_viewport(cmd, 0, std::slice::from_ref(&viewport));
@@ -762,6 +797,13 @@ impl BlurPipeline {
                 0,
                 &sets,
                 &[],
+            );
+            device.cmd_push_constants(
+                cmd,
+                self.pipe_layout.handle,
+                COPY_OFFSET_STAGE,
+                0,
+                bytemuck::bytes_of(&zero_offset),
             );
             // 全屏三角形：3 个顶点、无顶点缓冲。
             device.cmd_draw(cmd, 3, 1, 0, 0);
@@ -791,11 +833,17 @@ impl BlurPipeline {
 ///
 /// `FrameRenderer` 在交换链渲染通道开头画它（模糊结果作底），
 /// 之后再叠加清晰的界面图元。
+///
+/// `uv_offset` 随每次 `cmd_draw` 以 **push constant** 推入：
+/// `fs_copy` 在 `in.uv + uv_offset` 处采样。它使「过期快照 + 窗口
+/// 已移动」的磨砂底图重新与窗口对齐（自研磨砂移动预测），
+/// 其它用途（覆盖层模糊、超采样降采样）恒为零位移。
 #[derive(Debug, Clone, Copy)]
 pub struct Blit {
     pub pipeline: vk::Pipeline,
     pub layout: vk::PipelineLayout,
     pub descriptor_set: vk::DescriptorSet,
+    pub uv_offset: [f32; 2],
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +864,23 @@ mod tests {
         );
         // 16 的倍数是 std140 对 uniform 缓冲的硬要求。
         assert_eq!(std::mem::size_of::<BlurUniforms>() % 16, 0);
+    }
+
+    #[test]
+    fn copy_offset_push_constant_matches_wgsl() {
+        // WGSL：struct CopyOffset { offset: vec2<f32> } = 8 字节。
+        // 与 Rust 侧 COPY_OFFSET_SIZE / Blit::uv_offset 必须一致，
+        // 否则着色器读到半个常量或布局校验直接失败。
+        assert_eq!(COPY_OFFSET_SIZE as usize, std::mem::size_of::<[f32; 2]>());
+        assert_eq!(COPY_OFFSET_SIZE, 8);
+        assert_eq!(COPY_OFFSET_STAGE, vk::ShaderStageFlags::FRAGMENT);
+        // 编译期常量不变量走 const 块：`assert!` 对常量表达式求值会被
+        // `assertions_on_constants` 警告（该写法对运行期输入无意义）。
+        const {
+            assert!(COPY_OFFSET_SIZE > 0);
+            // Vulkan 硬性要求：push constant 的 offset/size 4 字节对齐。
+            assert!(COPY_OFFSET_SIZE.is_multiple_of(4));
+        }
     }
 
     #[test]

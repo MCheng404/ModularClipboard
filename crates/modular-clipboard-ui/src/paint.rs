@@ -27,7 +27,7 @@
 use egui::{Align2, CornerRadius, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
 use modular_clipboard_app::Service;
 use modular_clipboard_core::ClipItem;
-use modular_clipboard_core::config::WindowBackdrop;
+use modular_clipboard_core::config::{RowMetaPart, WindowBackdrop};
 
 use crate::card::{Card, CardHost, CardKind, PinnedMode};
 use crate::icons::Icon;
@@ -104,6 +104,16 @@ pub enum Op {
     SetOpacity(f32),
     /// 调磨砂强度档位（1 ~ 10）。
     SetBlurStrength(u8),
+    /// 设置列表卡片阴影（开关 + 模糊 / 浓度 / 垂直偏移）。
+    ///
+    /// 整包替换而不是逐字段 Op：三个滑块 + 开关可能在一帧内连续改动，
+    /// 逐字段 push 会让 `apply_ops` 跑四次、写四次盘。
+    SetCardShadow(modular_clipboard_core::config::CardShadowConfig),
+    /// 设置右下角信息组合（图标 / 类型 / 大小的显隐与顺序）。
+    ///
+    /// 同 `SetCardShadow`：编辑器内单击、拖拽可能在一帧内连续改，
+    /// 整包替换，避免逐字段写盘。
+    SetRowMeta(modular_clipboard_core::config::RowMetaConfig),
     /// 切换主题（跟随系统 / 深色 / 浅色）。
     ///
     /// 由 `App::apply_ops` 落地：更新 `App.pal` 并重灌主窗口 `Visuals`；
@@ -492,7 +502,7 @@ pub struct UiState {
     pub hit: HitTable,
     /// 关闭 / 最小化请求。
     pub close_requested: bool,
-    /// 布局变化后**需要的客户区宽度**（逻辑点），由帧循环消费。
+    /// 布局变化后**需要的客户区宽度**，由帧循环消费。
     ///
     /// 为什么会需要它：窗口尺寸原先只在**启动时**从
     /// `UiConfig::window_width` 读一次。用户在设置里把「置顶模式」
@@ -500,9 +510,13 @@ pub struct UiState {
     /// 而没人去改窗口尺寸 —— 表现是卡片被按比例挤扁
     /// （`solve_scaled` 在需求 > 可用时按比例缩）。
     ///
-    /// `None` 表示不需要调整。**只放大不收缩**：用户可能故意把窗口
-    /// 开得很大，不该因为一次模式切换被改小。
-    pub resize_width_to: Option<f32>,
+    /// 两种请求语义（见 `app::WidthRequest`）：
+    /// - `AtLeast`：至少放宽到这么多逻辑点，**只放大不收缩**
+    ///   （用户可能故意把窗口开得很大，切模式不该被改小）；
+    /// - `RestoreDefault`：精确恢复**默认宽度**（物理像素）。
+    ///   切回「共用单栏」时用——独立分栏会自动放宽，切回来若只按
+    ///   min_width 判「够宽就不动」，窗口就留在被撑宽的宽度上。
+    pub resize_width_to: Option<crate::app::WidthRequest>,
 
     /// 行高缓存（PF-1），按列表分槽：`[0]` 主栏、`[1]` 置顶栏。
     ///
@@ -649,7 +663,23 @@ impl<'a> Frame<'a> {
     }
 
     /// 登记一个热区到本窗口。
+    ///
+    /// # 只登记**部分可见**的控件
+    ///
+    /// 完全滚出视口的控件（设置卡片在大字号 / 小窗口下很常见）不登记：
+    /// 它的坐标落在窗口之外，自动化（MCP 的 `click_element`）拿着它去点，
+    /// 点的是空气、甚至点到别的窗口上。部分可见的仍登记——用户能点到
+    /// 露出来的那一部分。
     pub fn hit_insert(&mut self, key: &'static str, r: Rect) {
+        let sane = r.min.x.is_finite()
+            && r.min.y.is_finite()
+            && r.max.x.is_finite()
+            && r.max.y.is_finite()
+            && r.width() > 0.0
+            && r.height() > 0.0;
+        if !sane || !self.area.intersects(r) {
+            return;
+        }
         let ns = self.hit_ns;
         self.state.hit_insert_to(ns, key, r);
     }
@@ -1619,7 +1649,8 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     // ---- 左列：搜索框 + 导航块 ----
     let left_x0 = area.min.x + m;
     let left_x1 = left_x0 + left_w;
-    let search_h = 34.0;
+    // 高度随字号缩放（`control_height` 已含字体缩放）。
+    let search_h = pal.control_height * 1.21;
     let search_rect = Rect::from_min_size(pos2(left_x0, area.min.y + m), vec2(left_w, search_h));
     draw_settings_search(f, search_rect);
 
@@ -1815,7 +1846,8 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
 
     let pad = 6.0;
     let gap = 2.0;
-    let item_h = 40.0;
+    // 项高随字号缩放，否则大字号下导航文字会顶到相邻项。
+    let item_h = pal.control_height * 1.43;
     for (i, cat) in SettingsCat::ALL.iter().enumerate() {
         let y0 = nav_rect.min.y + pad + i as f32 * (item_h + gap);
         let r = Rect::from_min_max(
@@ -1905,14 +1937,6 @@ const fn mb_to_bytes(v: f64) -> f64 {
     v * 1048576.0
 }
 
-const NUMBER_FONT_SCALE: NumberSpec = NumberSpec {
-    min: 0.8,
-    max: 1.4,
-    step: 0.05,
-    unit: "×",
-    display: identity_num,
-    store: identity_num,
-};
 const NUMBER_POLL_MS: NumberSpec = NumberSpec {
     min: 50.0,
     max: 2000.0,
@@ -1960,6 +1984,27 @@ enum ItemKind {
     Opacity,
     /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
     BlurStrength,
+    /// 卡片阴影：开关行 + （开启时）模糊 / 浓度 / 垂直偏移三个滑条。
+    ///
+    /// 与 [`ItemKind::Opacity`] 同理独立成变体——参数不止一个，
+    /// 走 `Bool`/`Number` 的通用渲染会得到三个分散的开关/输入框，
+    /// 无法表达「关掉开关后参数一起失效」的依赖关系。
+    CardShadow,
+    /// 右下角信息组合：图标 / 类型 / 大小三个可点击、可拖拽的元素。
+    ///
+    /// 单击切换显隐（亮 = 显示，灰 = 隐藏），按住拖动重排前后顺序。
+    /// 独立成变体：需要同时编辑「顺序 + 三个显隐位」，通用的
+    /// `Bool`/`Number` 渲染表达不了拖拽排序。
+    RowMeta,
+    /// 字体缩放：**预设档位**分段控件（小 / 标准 / 大 / 特大 / 超大）。
+    ///
+    /// # 为什么不用滑条 / 数字输入
+    ///
+    /// 字号没有「连续可调」的真实需求——用户要的是「字小一点 / 大一点」，
+    /// 而 0.05 一档的滑条既看不出差别，又让每拖动一格都触发全量重排。
+    /// 预设档位一次到位、可预期、可回归测试（点第 N 段必得第 N 个倍率）。
+    /// 值不在预设上时（手工改过配置文件）显示为「自定义」，不假装选中。
+    FontScale,
     /// 快捷键绑定（只读展示）。
     Hotkey(HotkeySlot),
     /// 开机自启动开关（要写注册表，故单独一个变体）。
@@ -1984,6 +2029,48 @@ enum ItemKind {
     Link(&'static str),
     /// 退出程序按钮（关于页）。
     Quit,
+}
+
+/// 字体缩放预设（百分比 → 档位名）。
+///
+/// 用**整数百分比**而不是 f32 当值：`draw_segmented` 靠 `PartialEq`
+/// 判断哪一段高亮，而 f32 的相等比较会被浮点误差击穿（1.1500001 与
+/// 1.15 不相等 ⇒ 没有任何一段被选中，界面看着像「没生效」）。
+/// 存进配置时再除以 100 还原成倍率。
+///
+/// 档位覆盖 [`crate::theme::FONT_SCALE_MIN`]~[`crate::theme::FONT_SCALE_MAX`]
+/// 区间内的常用档：标准 100% 是默认值，两侧各两档。
+pub const FONT_SCALE_PRESETS: &[(u8, &str)] = &[
+    (85, "小"),
+    (100, "标准"),
+    (115, "大"),
+    (130, "特大"),
+    (150, "超大"),
+];
+
+/// 配置里的 `font_scale` 倍率 → 预设百分比（取最接近的一档）。
+///
+/// 不在预设上（手工改过配置文件）时也返回最近档位，但
+/// [`font_scale_is_preset`] 会是 `false`——调用方据此显示「自定义」，
+/// 而不是把最近的档位当成「当前选中」误导用户。
+fn font_scale_percent(scale: f32) -> u8 {
+    let pct = (crate::theme::clamp_font_scale(scale) * 100.0).round() as i32;
+    let mut best = FONT_SCALE_PRESETS[0].0;
+    let mut best_d = i32::MAX;
+    for (p, _) in FONT_SCALE_PRESETS {
+        let d = (i32::from(*p) - pct).abs();
+        if d < best_d {
+            best_d = d;
+            best = *p;
+        }
+    }
+    best
+}
+
+/// 当前倍率是否**正好**落在某个预设档位上（±0.5% 容差）。
+fn font_scale_is_preset(scale: f32) -> bool {
+    let pct = (crate::theme::clamp_font_scale(scale) * 100.0).round() as i32;
+    FONT_SCALE_PRESETS.iter().any(|(p, _)| (i32::from(*p) - pct).abs() <= 0)
 }
 
 /// MCP 可调用能力清单（叠加层内展示，顺序即显示顺序）。
@@ -2088,6 +2175,9 @@ impl SettingsItem {
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
+            ItemKind::CardShadow => cfg.ui.card_shadow != d.ui.card_shadow,
+            ItemKind::RowMeta => cfg.ui.row_meta != d.ui.row_meta,
+            ItemKind::FontScale => (cfg.ui.font_scale - d.ui.font_scale).abs() > 1e-6,
             ItemKind::Hotkey(slot) => slot.current(cfg) != slot.default(),
             ItemKind::Autostart => cfg.ui.autostart != d.ui.autostart,
             ItemKind::McpToggle => {
@@ -2127,6 +2217,15 @@ impl SettingsItem {
             ItemKind::Backdrop => Some(Op::SetBackdrop(WindowBackdrop::None)),
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
+            ItemKind::CardShadow => Some(Op::SetCardShadow(d.ui.card_shadow)),
+            ItemKind::RowMeta => Some(Op::SetRowMeta(d.ui.row_meta)),
+            // 字体缩放：恢复默认倍率（1.0×）。走 SetNumber 而非专用 Op——
+            // 应用侧的即时生效钩子正是按 (Ui, "font_scale") 匹配的。
+            ItemKind::FontScale => Some(Op::SetNumber {
+                group: ConfigGroup::Ui,
+                field: "font_scale",
+                value: f64::from(d.ui.font_scale),
+            }),
             ItemKind::Autostart => Some(Op::SetAutostart(d.ui.autostart)),
             ItemKind::Hotkey(slot) => Some(Op::SetHotkey {
                 slot: *slot,
@@ -2208,8 +2307,8 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
             },
             SettingsItem {
                 label: "字体缩放",
-                desc: "界面文字大小",
-                kind: ItemKind::Number(ConfigGroup::Ui, "font_scale", &NUMBER_FONT_SCALE),
+                desc: "界面文字大小（预设档位，即改即生效）",
+                kind: ItemKind::FontScale,
             },
             SettingsItem {
                 label: "背景效果",
@@ -2225,6 +2324,16 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: "背景不透明度",
                 desc: "背景层强度，文字始终不透明",
                 kind: ItemKind::Opacity,
+            },
+            SettingsItem {
+                label: "卡片阴影",
+                desc: "条目卡片的高斯投影；浓度 20% 为默认（16% = 1.0× 主题强度），深色主题自动加浓；开启后行间距自动适配，投影不被下一张卡片遮挡",
+                kind: ItemKind::CardShadow,
+            },
+            SettingsItem {
+                label: "右下角信息",
+                desc: "列表卡片右下角的图标 / 类型 / 大小：单击元素切换显示（灰色 = 隐藏），按住拖动可调整前后顺序",
+                kind: ItemKind::RowMeta,
             },
         ],
     },
@@ -2573,6 +2682,151 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
         });
 }
 
+/// 卡片阴影的参数行（滑条 + 右侧读数），标签是运行时文本。
+///
+/// 布局与 [`setting_row`] 一致（标签左、控件右），但 `setting_row` 的
+/// 标签/描述是 `&'static str`，这里「模糊」「浓度」这类小标签不值得
+/// 进静态表，就单独写一个接受 `&str` 的变体。
+///
+/// `id_suffix` 必须稳定唯一（`draw_slider` 的 id 依赖它）。
+fn shadow_param_row(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    id_suffix: &'static str,
+    label: &str,
+    readout: String,
+    v: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // 读数：与 `ItemKind::Opacity` 同一习惯，数字显示在滑条右侧。
+            ui.add(
+                egui::Label::new(egui::RichText::new(readout).color(f.pal.text_dim)),
+            );
+            changed = draw_slider(f, ui, id_suffix, v, range, true);
+            // 剩余宽度给标签列（与 `setting_row` 同款布局，见其注释）。
+            let rest = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
+            ui.allocate_ui_with_layout(
+                vec2(rest, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.add(egui::Label::new(label).truncate());
+                },
+            );
+        });
+    });
+    changed
+}
+
+/// 右下角信息组合编辑器：三个 chip（图标 / 类型 / 大小）。
+///
+/// - **单击** chip：切换该元素显隐（亮 = 显示，灰 = 隐藏）；
+/// - **按住拖动**：按鼠标落点重排前后顺序（每帧直接按鼠标位置算出
+///   目标索引，结果只依赖鼠标位置、天然幂等，不会在相邻位置抖动）。
+///
+/// 返回 true 表示配置有变化（调用方 push `Op::SetRowMeta`）。
+fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
+    let mut changed = false;
+    let pal = f.pal;
+    let cfg = f.svc.state.config.ui.row_meta;
+    let font = egui::FontId::proportional(pal.font_sm);
+    let chip_h = pal.font_sm + 9.0;
+    let chip_pad_x = 11.0;
+    let chip_radius = 7.0;
+    let chip_gap = 6.0;
+
+    // 拖拽态跨帧记忆：当前正被拖动的元素。
+    let drag_id = ui.id().with("row_meta_drag");
+    let dragged: Option<RowMetaPart> = ui.data(|d| d.get_temp(drag_id));
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = chip_gap;
+        // 先布局所有 chip 并登记交互、收集 rect（拖拽时需要彼此的位置）。
+        let mut cells: Vec<(RowMetaPart, Rect, egui::Response)> = Vec::with_capacity(3);
+        for &part in cfg.order.iter() {
+            let w = crate::text::measure_text(ui, part.label(), &font) + chip_pad_x * 2.0;
+            let (rect, _) = ui.allocate_exact_size(vec2(w, chip_h), egui::Sense::hover());
+            let id = ui.id().with(("rowmeta_chip", part.label()));
+            let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
+            cells.push((part, rect, resp));
+        }
+        let painter = ui.painter();
+        let mut next = cfg;
+        for (part, rect, resp) in &cells {
+            let part = *part;
+            // 登记热区（测试用 hit 名定位；与编辑器交互 id 区分）。
+            let hit_key = match part {
+                RowMetaPart::Icon => "rowmeta_chip_icon",
+                RowMetaPart::Type => "rowmeta_chip_type",
+                RowMetaPart::Size => "rowmeta_chip_size",
+            };
+            f.hit_insert(hit_key, *rect);
+            let on = cfg.visible(part);
+            let is_dragged = dragged == Some(part);
+            // 隐藏态：底色与文字整体降对比（灰）。
+            let bg = if on {
+                pal.surface_variant
+            } else {
+                pal.surface_variant.gamma_multiply(0.4)
+            };
+            let fg = if on {
+                pal.text_dim
+            } else {
+                pal.text_dim.gamma_multiply(0.38)
+            };
+            painter.rect_filled(*rect, chip_radius, bg);
+            if is_dragged {
+                // 拖动中给一个 accent 描边，明确「正在拿的是哪个」。
+                painter.rect_stroke(
+                    *rect,
+                    chip_radius,
+                    egui::Stroke::new(1.5, pal.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                part.label(),
+                font.clone(),
+                fg,
+            );
+
+            // 单击切换显隐（发生过拖动时 clicked() 不会触发）。
+            if resp.clicked() {
+                next.toggle(part);
+                changed = true;
+            }
+            if resp.drag_started() {
+                ui.data_mut(|d| d.insert_temp(drag_id, part));
+            }
+            // 拖动重排：鼠标左侧有几个「其他」chip，就插到第几。
+            if is_dragged {
+                if let Some(ptr) = resp.interact_pointer_pos() {
+                    let n_left = cells
+                        .iter()
+                        .filter(|(p, r, _)| *p != part && r.center().x < ptr.x)
+                        .count();
+                    let cur = next.order.iter().position(|p| *p == part).unwrap_or(0);
+                    if cur != n_left {
+                        next.move_to_index(part, n_left);
+                        changed = true;
+                    }
+                }
+            }
+            if resp.drag_stopped() {
+                ui.data_mut(|d| d.remove::<RowMetaPart>(drag_id));
+            }
+        }
+        if changed {
+            f.state.push(Op::SetRowMeta(next));
+        }
+    });
+    changed
+}
+
 /// 一行设置项：按类型分派到开关 / 数值 / 单选 / 只读。
 fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
     let pal = f.pal;
@@ -2636,6 +2890,33 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 );
                 if let Some(m) = picked {
                     f.state.push(Op::SetPinnedMode(m));
+                    record_recent(f, it.label);
+                }
+                picked.is_some()
+            });
+        }
+        ItemKind::FontScale => {
+            let cur = f.svc.state.config.ui.font_scale;
+            setting_row(ui, it.label, it.desc, |ui| {
+                // 百分比读数（right_to_left：先加的靠右 ⇒ 显示在分段控件右侧）。
+                // 不在预设上时标「自定义」——比假装选中最近档位诚实。
+                let pct = (crate::theme::clamp_font_scale(cur) * 100.0).round() as i32;
+                let readout = if font_scale_is_preset(cur) {
+                    format!("{pct}%")
+                } else {
+                    format!("{pct}%（自定义）")
+                };
+                ui.add(egui::Label::new(
+                    egui::RichText::new(readout).color(pal.text_dim),
+                ));
+                // 分段控件：值与配置同源，点哪段设哪个倍率。
+                let picked = draw_segmented(f, ui, FONT_SCALE_PRESETS, font_scale_percent(cur));
+                if let Some(p) = picked {
+                    f.state.push(Op::SetNumber {
+                        group: ConfigGroup::Ui,
+                        field: "font_scale",
+                        value: f64::from(p) / 100.0,
+                    });
                     record_recent(f, it.label);
                 }
                 picked.is_some()
@@ -2721,6 +3002,61 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 record_recent(f, it.label);
             }
         }
+        ItemKind::CardShadow => {
+            let mut cfg = f.svc.state.config.ui.card_shadow;
+            let mut changed = false;
+
+            // 开关行：整项的总闸。
+            changed |= setting_row(ui, it.label, it.desc, |ui| {
+                draw_switch(f, ui, "card_shadow_enabled", &mut cfg.enabled)
+            });
+
+            // 参数子块：仅在开启时显示——「关着还能调」的控件只会
+            // 让用户以为参数没保存。
+            if cfg.enabled {
+                ui.add_space(2.0);
+                changed |= shadow_param_row(
+                    f,
+                    ui,
+                    "card_shadow_blur",
+                    "模糊",
+                    format!("{}", cfg.blur.round() as i32),
+                    &mut cfg.blur,
+                    0.0..=24.0,
+                );
+                changed |= shadow_param_row(
+                    f,
+                    ui,
+                    "card_shadow_opacity",
+                    "浓度",
+                    format!("{}%", (cfg.opacity * 100.0).round() as i32),
+                    &mut cfg.opacity,
+                    0.0..=0.6,
+                );
+                changed |= shadow_param_row(
+                    f,
+                    ui,
+                    "card_shadow_offset_y",
+                    "偏移",
+                    format!("{}", cfg.offset_y.round() as i32),
+                    &mut cfg.offset_y,
+                    -8.0..=16.0,
+                );
+            }
+
+            if changed {
+                // 整包替换：三个滑块 + 开关可能在同一帧连续改，一个 Op
+                // 就够（见 `Op::SetCardShadow` 的说明）。
+                f.state.push(Op::SetCardShadow(cfg));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::RowMeta => {
+            // 编辑器内部自己 push Op（单击 / 拖拽可能一帧内多次改）。
+            if draw_row_meta_editor(f, ui) {
+                record_recent(f, it.label);
+            }
+        }
         ItemKind::Hotkey(slot) => {
             //
             // 两条输入路径都要有：
@@ -2735,7 +3071,8 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             let _ = setting_row(ui, it.label, it.desc, |ui| {
                 let resp = ui.add(
                     egui::TextEdit::singleline(slot.draft_mut(f.state))
-                        .desired_width(112.0)
+                        // 宽度随字号缩放（基准 112 @ font_sm 15）。
+                        .desired_width(pal.font_sm * 7.5)
                         .hint_text(cur.display())
                         .font(egui::TextStyle::Monospace),
                 );
@@ -2789,6 +3126,11 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // 先画开关（最右），再画 ⓘ 详细按钮（紧贴开关**左边**，
                 // 即「MCP 详细在总开关按钮的左边」）。
                 let sw = draw_switch(f, ui, "mcp_enabled", &mut v);
+                // 与 ⓘ 按钮之间留 8pt：设置卡片把 `item_spacing.x`
+                // 归了 0（行与行才够呼吸），同行控件零间距会**直接
+                // 贴在一起**——用户实测反馈「MCP 设置和开关挨得
+                // 太挤」。热键行的输入框与「录制」按钮同款修法。
+                ui.add_space(8.0);
                 let info = draw_mcp_info_btn(f, ui);
                 if info.clicked() {
                     f.state.mcp_overlay_open = !f.state.mcp_overlay_open;
@@ -2813,7 +3155,10 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             let cur = get_text(&f.svc.state.config, *group, field);
             let mut buf = cur;
             let changed = setting_row(ui, it.label, it.desc, |ui| {
-                draw_text_field(f, ui, &mut buf, ph, *secret, if *secret { 170.0 } else { 230.0 })
+                // 宽度随字号缩放（基准 170 / 230 @ font_sm 15），
+                // 否则 2× 字号下框里只显示得下 4~5 个字。
+                let w = pal.font_sm * if *secret { 11.3 } else { 15.3 };
+                draw_text_field(f, ui, &mut buf, ph, *secret, w)
             });
             if changed {
                 f.state.push(Op::SetText {
@@ -2832,7 +3177,8 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 port.to_string()
             };
             let changed = setting_row(ui, it.label, it.desc, |ui| {
-                draw_text_field(f, ui, &mut buf, "9123", false, 110.0)
+                // 宽度随字号缩放（基准 110 @ font_sm 15）。
+                draw_text_field(f, ui, &mut buf, "9123", false, pal.font_sm * 7.3)
             });
             if changed {
                 let v: u16 = buf.trim().parse().unwrap_or(0);
@@ -2846,7 +3192,13 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
         }
         ItemKind::Info(text) => {
             setting_row(ui, it.label, "", |ui| {
-                ui.label(egui::RichText::new(*text).color(pal.text_dim));
+                // CAUTION: 必须 `truncate()`。右对齐布局里宽度不够的控件
+                // 会**向左**无限生长（`Extend` 模式），长文本（如数据目录
+                // 那行）会压到左侧导航列上——实测 2× 字号下越出 130pt。
+                let r = ui.add(
+                    egui::Label::new(egui::RichText::new(*text).color(pal.text_dim)).truncate(),
+                );
+                r.on_hover_text(*text);
                 false
             });
         }
@@ -2857,6 +3209,8 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     egui::Label::new(
                         egui::RichText::new(*url).size(pal.font_sm).color(pal.accent),
                     )
+                    // 同 `ItemKind::Info`：不截断会向左溢出到导航列上。
+                    .truncate()
                     .sense(egui::Sense::click()),
                 );
                 // 登记热区（key 即 URL），供自动化与测试定位。
@@ -3008,17 +3362,109 @@ fn section(ui: &mut Ui, title: &str) {
 /// 宽度分配交给 `ui.horizontal` + `with_layout(right_to_left)`，
 /// 不再手算 `ctrl_w`（旧实现那处 `min(r.width() * 0.4)` 的钳制
 /// 会在极窄面板里把标签挤没）。
-fn setting_row(ui: &mut Ui, label: &str, desc: &str, control: impl FnOnce(&mut Ui) -> bool) -> bool {
+///
+/// # 顺序：**先放控件，再放标签列**
+///
+/// 这是「两者永不重叠」的关键。早前是「先标签列、后控件」，而控件在
+/// `right_to_left` 里是**右对齐**的：一旦控件比剩下的空间宽（字体放大
+/// 后必然发生），它就向左溢出、压到标签列身上——实测 1.5× 时字体缩放
+/// 分段控件左缘 436.5，而标签列右缘 456.8，重叠 20pt。
+///
+/// 反过来先放控件：控件先占住自己需要的宽度，标签列随后拿到的
+/// `available_width` 已是**净宽**，截断按净宽发生，两者不可能重叠。
+/// 字体缩放到这个倍率以上时，设置行改为**上下堆叠**（标签在上、控件在下）。
+///
+/// # 为什么需要堆叠（用户反馈「字体调整太大导致布局错乱」）
+///
+/// 并排时标签列与控件列争同一条行宽（544pt）。5 段的分段控件在 1.3×
+/// 时已占 300pt+，加上读数与间距后留给标签列的不足 160pt——描述只能
+/// 显示 6 个字（虽然可悬停看全文，但一眼看不到重点）。堆叠后控件独占
+/// 整行宽度，描述也不再被截断，代价只是卡片变高（内容区本来就可滚动）。
+///
+/// 阈值 1.25：1.15× 及以下并排仍然宽松（实测标签列 ≥ 240pt），
+/// 从 1.3× 开始明显拥挤。
+const ROW_STACK_SCALE: f32 = 1.25;
+
+/// 从 egui 样式反推当前字体缩放倍率。
+///
+/// `theme::apply` 把 `pal.font_md` 写进 `TextStyle::Body`，因此
+/// 「Body 字号 / 基准字号」就是缩放倍率。取不到样式时按 1.0 处理
+/// （退回并排布局，最坏只是大字号下拥挤一点，不会崩）。
+fn row_font_scale(ui: &Ui) -> f32 {
+    let base = crate::theme::Palette::light().font_md;
+    let cur = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .map_or(base, |f| f.size);
+    if base > 0.0 && cur.is_finite() { (cur / base).max(0.1) } else { 1.0 }
+}
+
+fn setting_row(
+    ui: &mut Ui,
+    label: &'static str,
+    desc: &'static str,
+    control: impl FnOnce(&mut Ui) -> bool,
+) -> bool {
     let mut changed = false;
-    ui.horizontal(|ui| {
+    if row_font_scale(ui) > ROW_STACK_SCALE {
+        // ---- 大字号：上下堆叠 ----
         ui.vertical(|ui| {
-            ui.label(label);
+            ui.add(egui::Label::new(label));
             if !desc.is_empty() {
-                ui.label(egui::RichText::new(desc).small().color(ui.visuals().weak_text_color()));
+                let r = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(desc)
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    )
+                    .truncate(),
+                );
+                r.on_hover_text(desc);
             }
+            // CAUTION: 必须用 `ui.horizontal` 包一层。直接在纵向布局里
+            // `with_layout(right_to_left)` 会让子 ui 拿到**剩余全部高度**
+            // （滚动区里是上千点），`Align::Center` 随即把控件垂直居中到
+            // 几百点之外——实测第一行控件被推到 y=632（行首在 y=54）。
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    changed = control(ui);
+                });
+            });
         });
+        return changed;
+    }
+    ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             changed = control(ui);
+            // 扣掉与控件之间的行内间距：不减的话标签列会多占一个间距的
+            // 宽度、与控件左缘重叠几个点（实测 7pt）。
+            let rest = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
+            // NOTE: 标签列**不登记热区**——`setting_row` 只拿到 `Ui`，
+            // 而命中表挂在 `UiState` 上（`Frame` 才有）。布局回归测试
+            // 因此改用两条可测判据：控件不越出卡片 + 控件之间不重叠。
+            ui.allocate_ui_with_layout(
+                vec2(rest, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    // 用 `truncate()` 而不是默认的换行：换行会让长描述在窄列里
+                    // 折成多行，把行高撑得极不均匀（同一张卡片里 30pt 与 120pt
+                    // 的行交替出现，观感就是「错乱」）。
+                    ui.add(egui::Label::new(label).truncate());
+                    if !desc.is_empty() {
+                        let r = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(desc)
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate(),
+                        );
+                        // 截断后看不到全文，悬停给出完整描述——否则等于丢信息。
+                        r.on_hover_text(desc);
+                    }
+                },
+            );
         });
     });
     changed
@@ -3039,9 +3485,10 @@ fn setting_row(ui: &mut Ui, label: &str, desc: &str, control: impl FnOnce(&mut U
 /// 交互状态（hover/active）被反复丢弃。所以传配置**字段名**。
 fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut bool) -> bool {
     let pal = f.pal;
-    // 尺寸：高 20、宽 38（约 1.9 倍），比旧版 18×32 更饱满，
-    // 与放大后的正文字号（15）协调。
-    let h = 20.0_f32;
+    // 尺寸：基准高 20、宽 38（约 1.9 倍），比旧版 18×32 更饱满。
+    // 按 `font_sm` 缩放——开关不承载文字，但必须与旁边放大的
+    // 标签视觉配重（1.5× 字号配 20pt 开关会显得开关「缩水」）。
+    let h = pal.font_sm * 1.33;
     let w = h * 1.9;
     // NOTE: 同一个矩形只准注册**一次**交互。
     //
@@ -3130,10 +3577,10 @@ fn draw_slider(
 ) -> bool {
     let pal = f.pal;
     // 轨道 150x6，knob 直径 16——比开关轨道（20）细，但 knob 同为白圆，
-    // 两个控件摆在一页里粗细有致又不散。
-    let track_w = 150.0;
-    let track_h = 6.0;
-    let knob_d: f32 = 16.0;
+    // 两个控件摆在一页里粗细有致又不散。尺寸随字号缩放。
+    let track_w = pal.font_sm * 10.0;
+    let track_h = (pal.font_sm * 0.4).max(4.0);
+    let knob_d: f32 = pal.font_sm * 1.07;
     let cell_h = knob_d.max(track_h);
     // 分工同 draw_switch：allocate 只占位，交互走显式 interact（Id 绑字段名）。
     let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
@@ -3216,9 +3663,10 @@ fn draw_step_slider(
     enabled: bool,
 ) -> bool {
     let pal = f.pal;
-    let track_w = 150.0;
-    let track_h = 6.0;
-    let knob_d: f32 = 16.0;
+    // 尺寸与 `draw_slider` 同源（随字号缩放）。
+    let track_w = pal.font_sm * 10.0;
+    let track_h = (pal.font_sm * 0.4).max(4.0);
+    let knob_d: f32 = pal.font_sm * 1.07;
     let cell_h = knob_d.max(track_h);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
     let resp = ui.interact(
@@ -3298,12 +3746,17 @@ fn draw_step_slider(
 fn draw_segmented<T: Copy + PartialEq>(
     f: &mut Frame<'_>,
     ui: &mut Ui,
-    options: &[(T, &str)],
+    // 选项文字必须是 `'static`：它同时作为热区 key（`hit` 表的键是
+    // `&'static str`）。全部调用点传的都是字面量，无额外负担。
+    options: &[(T, &'static str)],
     cur: T,
 ) -> Option<T> {
     let pal = f.pal;
-    let h = 30.0;
-    // 每项宽度按文字测量 + 20 padding，统一取最长项（项宽一致更整齐）。
+    // 高度随字号缩放（`control_height` 已含字体缩放）：固定 30pt 时
+    // 字号放大到 1.5× 会顶出控件上下边缘。
+    let h = pal.control_height + 2.0;
+    // 每项宽度按文字测量 + 内边距，统一取最长项（项宽一致更整齐）。
+    let pad = 20.0;
     let font = egui::FontId::proportional(pal.font_sm);
     let mut seg_w = 0.0_f32;
     for (_, label) in options {
@@ -3312,7 +3765,17 @@ fn draw_segmented<T: Copy + PartialEq>(
             .layout_no_wrap(label.to_string(), font.clone(), pal.text)
             .rect
             .width();
-        seg_w = seg_w.max(w + 20.0);
+        seg_w = seg_w.max(w + pad);
+    }
+    // 自适应可用宽度：字体放大后自然宽度会超过卡片，必须等比压缩，
+    // 否则控件被画到卡片之外（用户反馈「字体调整太大导致布局错乱」）。
+    // 压到每段不足 1 个汉字宽时就不再压——宁可溢出，也不能把选项挤成
+    // 不可辨认的窄条。
+    let avail = ui.available_width().max(0.0);
+    let min_seg = pal.font_sm + pad * 0.5;
+    if avail > 0.0 {
+        let max_seg = avail / options.len() as f32;
+        seg_w = seg_w.min(max_seg).max(min_seg.min(seg_w));
     }
     let total_w = seg_w * options.len() as f32;
     let (r, _) = ui.allocate_exact_size(vec2(total_w, h), egui::Sense::empty());
@@ -3325,12 +3788,15 @@ fn draw_segmented<T: Copy + PartialEq>(
             pos2(r.min.x + seg_w * (i + 1) as f32, r.max.y),
         );
         let resp = ui.interact(seg, egui::Id::new(("seg", i, label)), egui::Sense::click());
+        // 文字放不下时按**段宽**省略：`draw_text` 不裁剪，直接画会
+        // 越到相邻段上（视觉上两段文字叠在一起）。
+        let text = elide_to_width(ui, label, &font, seg.width() - 8.0);
         if cur == *value {
             painter.rect_filled(seg.shrink2(vec2(2.0, 2.0)), pal.radius_sm, pal.surface);
             painter.text(
                 seg.center(),
                 egui::Align2::CENTER_CENTER,
-                label,
+                text,
                 font.clone(),
                 pal.accent,
             );
@@ -3339,7 +3805,7 @@ fn draw_segmented<T: Copy + PartialEq>(
             painter.text(
                 seg.center(),
                 egui::Align2::CENTER_CENTER,
-                label,
+                text,
                 font.clone(),
                 color,
             );
@@ -3347,8 +3813,49 @@ fn draw_segmented<T: Copy + PartialEq>(
         if resp.clicked() {
             picked = Some(*value);
         }
+        // 登记热区：key 用**选项文字**。同一帧只画当前分类的卡片，
+        // 各分类的选项名互不重复（字体缩放的「小/标准/大/特大/超大」、
+        // 主题的「跟随系统/深色/浅色」…），因此不会互相覆盖。
+        // 自动化（MCP 的 click_element）与回归测试都靠它定位分段控件。
+        f.hit_insert(label, seg);
     }
     picked
+}
+
+/// 把 `text` 省略到不超过 `max_w`（超出部分用 `…` 收尾）。
+///
+/// 与 `egui::Label::truncate()` 的分工：那个作用于**控件**，本函数作用于
+/// **自绘文字**（`painter.text` 不做任何裁剪，直接画会越到相邻分段上）。
+/// 逐字二分前缀 + `layout_no_wrap` 测量，成本与文字长度成对数关系。
+fn elide_to_width(ui: &Ui, text: &str, font: &egui::FontId, max_w: f32) -> String {
+    if max_w <= 0.0 {
+        return String::new();
+    }
+    let measure = |s: &str| {
+        ui.painter()
+            .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+            .rect
+            .width()
+    };
+    if measure(text) <= max_w {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // 二分找最长可容纳前缀（含省略号）。
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        if measure(&candidate) <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 {
+        return String::new();
+    }
+    chars[..lo].iter().collect::<String>() + "…"
 }
 
 /// 文本输入框：清晰圆角背景（surface_variant 实底 + 边框），在右侧区域里靠右。
@@ -3365,7 +3872,8 @@ fn draw_text_field(
     w: f32,
 ) -> bool {
     let pal = f.pal;
-    let h = 30.0;
+    // 高度随字号缩放：固定 30pt 时 1.5× 字号（行高 ~33）会被裁掉。
+    let h = pal.control_height + 2.0;
     let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::empty());
     let painter = ui.painter_at(r);
     painter.rect_filled(r, pal.radius_md, pal.surface_variant);
@@ -3402,7 +3910,9 @@ fn draw_text_field(
 
 fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Response {
     let pal = f.pal;
-    let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+    // 直径随字号缩放（与开关同量级）。
+    let d = pal.font_sm * 1.47;
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::click());
     let p = ui.painter_at(r);
     // 未 hover：surface_variant 实底（与卡片 surface 拉开一层）；
     // hover：accent 实底。避免用半透明 row_selected 叠在卡片上显脏。
@@ -3659,6 +4169,13 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     // 这一行是「徽标为什么显示未连接」的答案来源：未连接有四种成因
     // （总开关关 / 未配置端口 / 服务没起 / 已连上），只给一个徽标
     // 用户完全不知道该去改哪里。
+    //
+    // CAUTION: 必须拆成**两行**。`McpConn::detail()` 最长约 25 个
+    // 全角字，与「MCP 服务：xx」挤在同一行会超出面板右缘——egui 的
+    // Label 在**横向**布局（`ui.horizontal`）里默认 `TextWrapMode::
+    // Extend`：不换行也不截断，直接溢出容器（用户反馈「文字渲染出
+    // 界面」）。放到纵向布局下才默认 Wrap。第一行只放短状态，
+    // 第二行放长说明。
     {
         let conn = f.state.mcp_conn;
         let color = if conn.is_connected() {
@@ -3672,11 +4189,16 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
             let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter_at(dot).circle_filled(dot.center(), 3.5, color);
             ui.label(
-                egui::RichText::new(format!("MCP 服务：{} · {}", conn.label(), conn.detail()))
+                egui::RichText::new(format!("MCP 服务：{}", conn.label()))
                     .size(pal.font_xs)
                     .color(color),
             );
         });
+        ui.label(
+            egui::RichText::new(conn.detail())
+                .size(pal.font_xs)
+                .color(pal.text_dim),
+        );
     }
 
     // 分隔线。
@@ -3734,7 +4256,11 @@ fn draw_mcp_overlay_btn(
     primary: bool,
 ) {
     let pal = f.pal;
-    let (r, resp) = ui.allocate_exact_size(vec2(84.0, 32.0), egui::Sense::click());
+    // 尺寸随字号缩放（基准 84x32 @ font_sm 15）。
+    let (r, resp) = ui.allocate_exact_size(
+        vec2(pal.font_sm * 5.0 + 9.0, pal.control_height + 4.0),
+        egui::Sense::click(),
+    );
     let p = ui.painter_at(r);
     let hovered = resp.hovered();
     let fill = if primary {
@@ -3809,8 +4335,11 @@ fn draw_mcp_badge(f: &mut Frame<'_>, ui: &mut Ui, ready: bool) {
     } else {
         ("未连接", pal.text_dim)
     };
-    let w = 44.0_f32;
-    let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), egui::Sense::hover());
+    // 宽度 = 三个全角字 + 8pt 内边距，随字号缩放：固定 50pt 时
+    // 1.5× 字号（三字约 63pt）会把文字顶出徽标。
+    let w = pal.font_xs * 3.0 + 8.0;
+    let h = pal.font_xs * 1.43;
+    let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
     let p = ui.painter_at(r);
     p.rect_filled(r, 10.0, pal.surface_variant);
     p.text(
@@ -3825,8 +4354,10 @@ fn draw_mcp_badge(f: &mut Frame<'_>, ui: &mut Ui, ready: bool) {
 /// 总开关关闭时的灰色徽标。
 fn draw_mcp_badge_disabled(f: &mut Frame<'_>, ui: &mut Ui) {
     let pal = f.pal;
-    let w = 44.0_f32;
-    let (r, _) = ui.allocate_exact_size(vec2(w, 20.0), egui::Sense::hover());
+    // 同 `draw_mcp_badge`：宽度 = 三个全角字 + 8pt 内边距，随字号缩放。
+    let w = pal.font_xs * 3.0 + 8.0;
+    let h = pal.font_xs * 1.43;
+    let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::hover());
     let p = ui.painter_at(r);
     p.rect_filled(r, 10.0, pal.surface_variant);
     p.text(
@@ -4235,15 +4766,16 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             }
         }
     };
-    // 前缀和：用来 O(log n) 由滚动偏移定位到行。
-    //
-    // 卡片样式需要行间留缝（`ROW_GAP`）：首项顶部留半条，每项之后
-    // 再留整条。**最后一项之后不留**——否则滚到底时最后一行会悬在
+    // 行间缝隙：阴影开启时按「偏移 + 弥散半径」动态加宽（见
+    // `history_row_gap`），保证投影不被下一张卡片盖住；关闭时回落
+    // 到基础 `ROW_GAP`。首项顶部留半条，每项之后再留整条。
+    // **最后一项之后不留**——否则滚到底时最后一行会悬在
     // 列表底部之上一条缝（gap），贴底点击/视觉都对不上。
+    let row_gap = history_row_gap(&f.svc.state.config.ui.card_shadow);
     let mut offsets: Vec<f32> = Vec::with_capacity(heights.len() + 1);
-    offsets.push(ROW_GAP * 0.5);
+    offsets.push(row_gap * 0.5);
     for (i, h) in heights.iter().enumerate() {
-        let inc = if i + 1 == heights.len() { *h } else { h + ROW_GAP };
+        let inc = if i + 1 == heights.len() { *h } else { h + row_gap };
         offsets.push(offsets.last().copied().unwrap_or(0.0) + inc);
     }
     let content_h = offsets.last().copied().unwrap_or(0.0);
@@ -4381,6 +4913,10 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             } else {
                 content.width()
             };
+
+            // 先收集真正可见行的几何（过滤条件与下面的内容绘制循环
+            // 完全一致），供阴影/内容两遍渲染共用。
+            let mut frames: Vec<(usize, usize, Rect)> = Vec::new();
             for (k, i) in (first..last).enumerate() {
                 let y = content.min.y + offsets[i] - scroll;
                 if y > content.max.y {
@@ -4393,6 +4929,26 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 if r.max.y < content.min.y {
                     continue; // 整行都在可视区上方
                 }
+                frames.push((k, i, r));
+            }
+
+            // ---- 第一遍：所有行的卡片阴影（统一在内容之前） ----
+            //
+            // 必须用视口级 painter（不能用 `painter_at(r)`，否则外扩
+            // 晕带被行矩形裁掉）；必须先于所有行内容画：落在卡片矩形
+            // 内的阴影随后会被该行的不透明填充盖住，于是投影只在行间
+            // 缝隙与列表边缘可见，后一行的阴影也不会压暗前一行的文字。
+            // 几何细节与反混合公式见 `draw_card_shadow`。
+            {
+                let shadow_painter = ui.painter();
+                let shadow_cfg = &f.svc.state.config.ui.card_shadow;
+                for (_, _, r) in &frames {
+                    draw_card_shadow(&shadow_painter, *r, ROW_RADIUS, shadow_cfg, f.pal);
+                }
+            }
+
+            // ---- 第二遍：缝隙拖动区 + 行内容 ----
+            for (k, i, r) in frames {
                 // ---- 卡片缝隙 = 拖动区 ------------------------------------
                 // 卡片与卡片之间的空白横带（含首行顶部的半条缝）同样上报
                 // 为拖动区：WM_NCHITTEST 返回 HTCAPTION，用户按住行间
@@ -4401,7 +4957,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 // NOTE: 右缘让出垂直滚动条占位（`content.max.x - RESERVE`），
                 // 否则「拖滚动条」会被系统判成 HTCAPTION 变成拖窗口——
                 // 与左右留白拖动区避开滚动条是同一个原因。
-                let gap_top = if i == 0 { content.min.y } else { r.min.y - ROW_GAP };
+                let gap_top = if i == 0 { content.min.y } else { r.min.y - row_gap };
                 let gap_bottom = r.min.y.min(content.max.y);
                 if gap_bottom > gap_top {
                     f.state.drag_regions.push(Rect::from_min_max(
@@ -4521,6 +5077,23 @@ const LIST_PAD_X: f32 = 8.0;
 /// 卡片样式 = 每条历史是一张圆角小卡，卡与卡之间留这条缝；
 /// 首项顶部再留半条，让整体上下边缘也有留白。
 const ROW_GAP: f32 = 6.0;
+/// 阴影开启时行间缝隙的最大值：参数拉满（offset 16 + blur 24）理论
+/// 需要 40pt，列表会过度松散，视觉上也不成立——设上限截断。
+const ROW_GAP_MAX: f32 = 30.0;
+
+/// 行间缝隙：阴影开启时按「偏移 + 弥散半径」动态加宽，保证投影主体
+/// 不被下一张卡片盖住；关闭时回落到基础 [`ROW_GAP`]。
+///
+/// 弥散系数取 1.0（≈ 2σ：该距离内高斯 alpha ≥ ~2.3%，肉眼可见；
+/// 更远的残余淡影 <1%，被下一张卡片盖住无感知）。`offset_y` 取绝对值：
+/// 偏移向下时投影需要下方缝隙、向上时需要上方缝隙，统一按绝对值给。
+fn history_row_gap(cfg: &modular_clipboard_core::config::CardShadowConfig) -> f32 {
+    if !cfg.enabled {
+        return ROW_GAP;
+    }
+    let need = cfg.offset_y.abs() + cfg.blur.clamp(0.0, 24.0);
+    need.max(ROW_GAP).min(ROW_GAP_MAX)
+}
 
 /// 顶栏搜索框的**期望**宽度（逻辑点）。
 ///
@@ -4774,6 +5347,155 @@ fn fill_rounded_border(
     content(painter, inner, inner_r);
 }
 
+/// 高斯核对半平面卷积的外轮廓（归一化）：`1 - Φ(d/σ) = 0.5·erfc(d/(σ√2))`。
+///
+/// `d` 为卡片边缘**向外**的距离（逻辑点）：边缘处为 0.5，向外单调
+/// 衰减到 0——真实 box-shadow 在缝隙里的强度分布就是这条曲线，
+/// 比线性羽化自然得多（边缘不生硬、外缘无截断）。
+///
+/// 用 Abramowitz & Stegun 7.1.26 的 Φ(x) 有理近似（|误差| < 7.5e-8），
+/// 不引第三方数学库。
+fn gaussian_outer(d: f32, sigma: f32) -> f32 {
+    if sigma <= 0.0 {
+        return 0.0;
+    }
+    let x = (d / sigma).max(0.0);
+    let t = 1.0 / (1.0 + 0.2316419 * x);
+    let phi = 0.39894228 * (-0.5 * x * x).exp(); // 1/√(2π)·e^(-x²/2)
+    let poly = t
+        * (0.319381530
+            + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    phi * poly
+}
+
+/// 列表卡片阴影：多层同心圆角矩形合成的**高斯投影**。
+///
+/// # 为什么不用 `epaint::Shadow`（旧实现被否决的原因）
+///
+/// 1. **被裁剪 + 被覆盖，等于没画**：旧实现用行内 `painter_at(r)`，
+///    其 clip 与行矩形取交集，阴影外扩晕带全被裁掉；r 内部分又被
+///    不透明的卡片填充完整盖住。
+/// 2. **圆角暗斑**：`Shadow` 走 epaint feathering（沿轮廓的单条
+///    抗锯齿渐变带），在圆角凸角「直线→弧线」接点两侧填充带重叠，
+///    alpha 累加 2~4 次（本仓常态描边因此被迫移除，见
+///    [`draw_item_row`] 里的排查记录），四个角变成深色斑点。
+/// 3. **深色主题不可见**：黑色 16% 投影叠在近黑的 `list_bg`
+///    （`#101215`）上几乎没有明度差。
+///
+/// # 做法：N 层实心圆角矩形 + 反解 alpha 混合
+///
+/// 把扩散区切成 1pt 宽的环带，第 k 层是一个「按 offset 平移后再
+/// 外扩 k 点」的**实心**圆角矩形（无 feathering ⇒ 无凸角重叠），
+/// 圆角半径同步外扩 k（同心圆角）。从最大的一层向卡片画：
+///
+/// - 环带 k（距卡片边缘 k-1~k 点）被第 k..n 层覆盖；
+/// - 设其目标强度为 `T_k = C · gaussian_outer(k-0.5, σ)`；
+/// - 画第 k 层时它已经与更外层混成强度 `outer`，按「源 over」
+///   公式 `T = a + outer·(1-a)` 反解 `a = (T - outer)/(1 - outer)`；
+/// - 画完后更新 `outer`。跳过的层（量化后不可见）不更新，
+///   后续层自动补偿，误差不累积。
+///
+/// 不可加的 alpha 混合于是被精确反解，最终环带强度就是高斯
+/// 轮廓，量化误差仅 ±1/255。
+///
+/// # 裁剪与顺序（由调用方 `draw_history_body` 保证）
+///
+/// 传入的 `painter` 必须是**视口级** painter（clip = ScrollArea
+/// 视口），且所有行的阴影必须在**所有行内容之前**统一画一遍：
+/// 外扩晕带才不会被行 clip 裁掉，后一行的阴影也不会压暗前一行
+/// 卡片上的文字（落在卡片矩形内的阴影随后被该行填充覆盖）。
+/// 计算高斯阴影每一层的 `(外扩距离, 填充 alpha)`，按**从外到内**的
+/// 绘制顺序返回（即喂给 `Painter::rect_filled` 的顺序）。
+///
+/// 纯函数：便于单测模拟「源 over」合成后逐环带核对高斯轮廓。
+/// `c` 是卷积黑矩形的强度（边缘处可见强度为其一半）。
+fn card_shadow_layers(blur: f32, c: f32) -> Vec<(f32, f32)> {
+    let blur = blur.clamp(0.0, 24.0);
+    if blur <= 0.0 {
+        return Vec::new();
+    }
+    let sigma = blur * 0.5;
+    let layers = (blur * 1.5).round().max(1.0) as i32;
+    let c = c.clamp(0.0, 0.95);
+    let mut out = Vec::new();
+    // 实际混合强度（不是目标值）：跳过量化后不可见的层时不更新，
+    // 后续层的反解会自动补偿，误差不累积。
+    let mut outer = 0.0f32;
+    for k in (1..=layers).rev() {
+        let target = c * gaussian_outer(k as f32 - 0.5, sigma);
+        let a = (target - outer) / (1.0 - outer);
+        if a >= 0.003 {
+            out.push((k as f32, a));
+            outer += a * (1.0 - outer);
+        }
+    }
+    out
+}
+
+fn draw_card_shadow(
+    painter: &egui::Painter,
+    r: Rect,
+    radius: f32,
+    cfg: &modular_clipboard_core::config::CardShadowConfig,
+    pal: &Palette,
+) {
+    if !cfg.enabled || cfg.opacity <= 0.0 {
+        return;
+    }
+    let blur = cfg.blur.clamp(0.0, 24.0);
+    if blur <= 0.0 {
+        return;
+    }
+    // 主题推荐强度（`Palette::shadow` 的 alpha）为基准，用户浓度
+    // 滑块是倍率：默认 0.16 → 1.0×；拖到 0 → 无阴影。
+    let strength = (cfg.opacity / 0.16).clamp(0.0, 1.0 / 0.16);
+    let c = pal.shadow.a() as f32 / 255.0 * strength;
+    let offset_y = cfg.offset_y.clamp(-8.0, 16.0);
+    let base = r.translate(vec2(0.0, offset_y));
+    let [sr, sg, sb, _] = pal.shadow.to_array();
+
+    // 主投影：用户调节的模糊/偏移。
+    for (grow, a) in card_shadow_layers(blur, c) {
+        let rr = base.expand(grow);
+        // 半径随外扩同步增大：矩形与圆角始终同心，
+        // 且 radius+k ≤ (h+2k)/2 恒成立（由 radius ≤ h/2 保证）。
+        painter.rect_filled(
+            rr,
+            radius + grow,
+            egui::Color32::from_rgba_unmultiplied(
+                sr,
+                sg,
+                sb,
+                (a * 255.0).round().clamp(0.0, 255.0) as u8,
+            ),
+        );
+    }
+
+    // 近投影（接触阴影）：紧贴卡片的第二组高斯层——更小模糊、更小
+    // 偏移、浓度更高，让卡片边缘有「贴地」的锐利过渡。这是立体感的
+    // 主要来源（深色背景下黑投影对比有限，靠近投影拉出边缘层次）。
+    //
+    // 参数与预览页一致：blur×0.35（至少 0.5）、浓度×1.15、偏移×0.25
+    // （至少 0.5 下移，即使主偏移为 0 也保留一条贴边接触影）。
+    let near_blur = (blur * 0.35).max(0.5);
+    let near_offset = (offset_y * 0.25).max(0.5);
+    let near_c = (c * 1.15).clamp(0.0, 0.95);
+    let near_base = r.translate(vec2(0.0, near_offset));
+    for (grow, a) in card_shadow_layers(near_blur, near_c) {
+        let rr = near_base.expand(grow);
+        painter.rect_filled(
+            rr,
+            radius + grow,
+            egui::Color32::from_rgba_unmultiplied(
+                sr,
+                sg,
+                sb,
+                (a * 255.0).round().clamp(0.0, 255.0) as u8,
+            ),
+        );
+    }
+}
+
 fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let pal = f.pal;
     let scale = f.scale;
@@ -4801,9 +5523,16 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // NOTE: 描边在所有状态都画：悬停若只换底色，边框会「消失一瞬」
     // （从有到无再到有），视觉上跳变。
     let radius = ROW_RADIUS;
+
+    // 卡片阴影**不在本函数画**：它在行内容之外（行间缝隙、列表边缘），
+    // 而这里的 `painter` 被裁剪到行矩形 `r`，外扩晕带会被裁掉。
+    // 阴影由 `draw_history_body` 在所有行内容之前统一画一遍
+    // （见 `draw_card_shadow` 的裁剪/顺序说明）。
+
     // 常态描边已取消，原因见下面 `selected` 分支处的说明（feathering 在
     // 凸角处重叠会把它变成一圈深色短线）。
     // 选中态描边加粗到 2pt。向内生长、不占布局 —— 内容位置与常态完全一致。
+
     //
     // # CAUTION: 非选中态**不画描边**（这里曾有一圈极弱描边）
     //
@@ -4865,22 +5594,54 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         }
     }
 
+    // ---- 顶部受光高光（在卡片填充之上）----
+    //
+    // 深色主题下卡片顶部 3pt 白色渐变亮边（alpha 0.20 → 0），模拟
+    // 上方光源——深色卡片在近黑列表底上靠它「浮」起来（立体阴影的
+    // 另一半；近投影在 `draw_card_shadow` 里画）。浅色主题高光透明。
+    let hl_top = pal.card_highlight;
+    let [hl_r, hl_g, hl_b, _] = hl_top.to_array();
+    if hl_top.a() > 0 {
+        // 高光只覆盖直边段（左右各让开 ROW_RADIUS），避免在卡片圆角外
+        // 露出直角亮角；gradient_rect 是直角渐变，圆角处自然留空。
+        //
+        // CAUTION: egui 的 Color32 是 **premultiplied** 存储，`to_array()`
+        // 返回的就是预乘分量——渐变端点必须直接用预乘值（透明端保持
+        // 同 RGB、alpha=0），再用 `from_rgba_unmultiplied` 包一遍会
+        // 二次预乘，把高光压暗成灰。
+        let hl = Rect::from_min_max(
+            pos2(r.min.x + radius, r.min.y),
+            pos2(r.max.x - radius, r.min.y + 3.0),
+        );
+        if hl.width() > 1.0 {
+            painter.add(egui::Shape::gradient_rect(
+                hl,
+                egui::Direction::TopDown,
+                [
+                    hl_top,
+                    egui::Color32::from_rgba_premultiplied(hl_r, hl_g, hl_b, 0),
+                ],
+            ));
+        }
+    }
+
     // ---- 三段布局 ----------------------------------------------------
     //
     // 左上：来源程序 · 时间（小字弱化）
     // 中间：预览（主字号，可折行）
-    // 右下：类型标签 · 大小（小字弱化，右对齐，大小自适应单位）
+    // 右下：类型徽标 + 类型 · 大小（圆角小方块图标 + 文字，右对齐）
     // 右上：置顶 / 复制 / 删除 三个小图标按钮
     //
-    // NOTE: 左侧的类型图标已移除 —— 类型信息在右下角「类型 · 大小」
-    // 那行已经表达，左侧再挂一枚是重复；而且它占的 24pt（`icon_w`）
-    // 会白白吃掉文本宽度。
+    // NOTE: 类型徽标放在**右下角**与「类型 · 大小」文字组合成一组
+    // （2026-10-15 用户定稿）：不再占用左侧文本宽度，预览/测量两侧
+    // 都不需要为它让位。
     //
     // NOTE: 目标是「**完整显示内容**」：预览**不再截断**，而是按宽度
     // 折行。折行数由 `wrap` 直接给出，不用手工估算——
     // 早前版本按 `preview.chars().take(30)` 硬砍，中文一个字算一个
     // char、英文一个词算一个 char，两者的实际显示宽度差了好几倍，
     // 于是「看起来还有空间」但已经被砍掉了。
+    let pad_v = 5.0;
     let acts_w = acts_width(pal);
     let text_x0 = r.min.x + ROW_PAD_H;
     // 顶部 meta 行右侧要让开按钮列；预览与底部 meta 位于按钮行**下方**，
@@ -4906,7 +5667,6 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         return;
     }
 
-    let pad_v = 5.0;
     let meta_font = sized(pal.font_xs, scale);
     let meta_h = meta_font.size.max(10.0);
     // 左上角：来源 · 时间（小字，左对齐）。右侧要给按钮让位。
@@ -4988,24 +5748,90 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         );
     }
 
-    // 右下：类型标签 · 大小（小字，右对齐）。
+    // 右下：可配置的信息组合（类型徽标 / 类型文字 / 大小文字）。
+    //
+    // 三个元素的**显隐与前后顺序**由 [`RowMetaConfig`] 决定（设置中
+    // 可单击切换、按住拖拽重排）。元素之间只留固定间距，不再用「·」
+    // 分隔。整组右对齐 bot_band 右缘。
     //
     // 大小来自 `PayloadRef::len`（字节数），`format_size` 自适应
-    // B/KB/MB/GB；载荷被淘汰（`payload = None`）时只显示类型。
-    let size_str = item.payload.as_ref().map(|p| format_size(p.len));
-    let bot_meta = match size_str {
-        Some(s) => format!("{} · {}", kind_label(item.kind), s),
-        None => kind_label(item.kind).to_string(),
-    };
-    let bot_shown = crate::text::elide_text(f.ui, &bot_meta, &meta_font, bot_band.width());
-    if !bot_shown.is_empty() {
-        ui.painter_at(bot_band).text(
-            bot_band.right_center(),
-            Align2::RIGHT_CENTER,
-            bot_shown,
-            meta_font.clone(),
-            pal.text_dim,
-        );
+    // B/KB/MB/GB；载荷被淘汰（`payload = None`）时大小元素自动缺席。
+    // 宽度不足时优先保住短的「大小」，「类型」elide 截断。
+    let meta_cfg = &f.svc.state.config.ui.row_meta;
+    let type_text = kind_label(item.kind).to_string();
+    let size_text = item.payload.as_ref().map(|p| format_size(p.len));
+    let badge_side = pal.icon_size; // 16pt
+    let badge_radius = 4.0;
+    let meta_gap = 6.0;
+
+    let icon_on = meta_cfg.visible(RowMetaPart::Icon);
+    let type_on = meta_cfg.visible(RowMetaPart::Type) && !type_text.is_empty();
+    let size_on = meta_cfg.visible(RowMetaPart::Size) && size_text.is_some();
+    let n = icon_on as u32 + type_on as u32 + size_on as u32;
+    if n > 0 {
+        // 固定占位（徽标宽 + 元素间 gap）；余下全部给文字。
+        let fixed = if icon_on { badge_side } else { 0.0 }
+            + if n > 1 { meta_gap * (n - 1) as f32 } else { 0.0 };
+        let text_budget = (bot_band.width() - fixed).max(0.0);
+        let size_full = size_text.unwrap_or_default();
+        let size_w = if size_on {
+            crate::text::measure_text(f.ui, &size_full, &meta_font)
+        } else {
+            0.0
+        };
+        // 类型与大小同处一行时，gap 已计入 fixed，这里只扣 size_w。
+        let type_budget = if type_on && size_on {
+            (text_budget - size_w).max(0.0)
+        } else {
+            text_budget
+        };
+        let type_shown = if type_on {
+            crate::text::elide_text(f.ui, &type_text, &meta_font, type_budget)
+        } else {
+            String::new()
+        };
+        let type_w = crate::text::measure_text(f.ui, &type_shown, &meta_font);
+
+        let cy = bot_band.center().y;
+        let mut rx = bot_band.right_center().x;
+        // 文字用 bot_band 的 painter（受文字带裁剪）；徽标比文字带
+        // 高（16pt vs ~12pt），画在行 painter 上不被裁掉。
+        let bot_painter = ui.painter_at(bot_band);
+        for part in meta_cfg.order.iter().rev() {
+            match part {
+                RowMetaPart::Icon if icon_on => {
+                    let br = Rect::from_min_max(
+                        pos2(rx - badge_side, cy - badge_side * 0.5),
+                        pos2(rx, cy + badge_side * 0.5),
+                    );
+                    painter.rect_filled(br, badge_radius, pal.surface_variant);
+                    crate::icons::Icon::for_kind(item.kind)
+                        .paint(&painter, br, pal.text_dim);
+                    rx -= badge_side + meta_gap;
+                }
+                RowMetaPart::Size if size_on => {
+                    bot_painter.text(
+                        pos2(rx, cy),
+                        Align2::RIGHT_CENTER,
+                        size_full.clone(),
+                        meta_font.clone(),
+                        pal.text_dim,
+                    );
+                    rx -= size_w + meta_gap;
+                }
+                RowMetaPart::Type if type_on && !type_shown.is_empty() => {
+                    bot_painter.text(
+                        pos2(rx, cy),
+                        Align2::RIGHT_CENTER,
+                        type_shown.clone(),
+                        meta_font.clone(),
+                        pal.text_dim,
+                    );
+                    rx -= type_w + meta_gap;
+                }
+                _ => {}
+            }
+        }
     }
 
     // 右侧三个操作：置顶 / 复制 / 删除。
@@ -5844,7 +6670,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
-    /// 卡片行间缝隙（`ROW_GAP` 横带）与首行顶部半条缝必须是拖动区：
+    /// 卡片行间缝隙（`history_row_gap` 横带）与首行顶部半条缝必须是拖动区：
     /// 按住行间空白即可拖动窗口，不必精确瞄准左右留白。
     ///
     /// CAUTION: 缝隙横条右缘让出滚动条占位（`SCROLLBAR_RESERVE`），否则
@@ -5858,13 +6684,16 @@ fn with_pinned(mut self, n: usize) -> Self {
             pos2(body.min.x + LIST_PAD_X, body.min.y),
             pos2(body.max.x - LIST_PAD_X, body.max.y),
         );
+        // 阴影默认开启（enabled=true, blur=8, offset_y=0）⇒ 行距 8pt
+        // （|0| + 8 = 8，与旧默认 2+6=8 恰好相同）。
+        let gap = history_row_gap(&modular_clipboard_core::Config::default().ui.card_shadow);
         let near = |a: f32, b: f32| (a - b).abs() < 0.6;
         // ① 首行顶部的半条缝：从列表顶到第一行顶，右缘让出滚动条位。
         let top_gap = Rect::from_min_max(
             content.min,
             pos2(
                 content.max.x - SCROLLBAR_RESERVE,
-                content.min.y + ROW_GAP * 0.5,
+                content.min.y + gap * 0.5,
             ),
         );
         assert!(
@@ -5877,14 +6706,14 @@ fn with_pinned(mut self, n: usize) -> Self {
             "首行顶部半条缝应是拖动区；drag_regions={:?}",
             h.state.drag_regions
         );
-        // ② 行间整条缝：3 条记录之间至少一条 `ROW_GAP` 高的横条。
+        // ② 行间整条缝：3 条记录之间至少一条 `gap` 高的横条。
         assert!(
             h.state.drag_regions.iter().any(|r| {
-                r.height() >= ROW_GAP - 0.5
-                    && r.height() <= ROW_GAP + 0.5
+                r.height() >= gap - 0.5
+                    && r.height() <= gap + 0.5
                     && r.width() > 200.0
             }),
-            "行间缝隙（{ROW_GAP}pt 横条）应是拖动区"
+            "行间缝隙（{gap}pt 横条）应是拖动区"
         );
         // ③ 内容不满一屏 → 列表底部空白也应是拖动区，横向延伸到最右缘。
         assert!(
@@ -5896,6 +6725,47 @@ fn with_pinned(mut self, n: usize) -> Self {
             "列表底部空白（内容不满一屏）应是拖动区；drag_regions={:?}",
             h.state.drag_regions
         );
+    }
+
+    /// 动态行距：阴影关闭回落基础 6pt；开启时按「偏移 + 弥散」加宽；
+    /// 大参数截断到 `ROW_GAP_MAX`；向上偏移同样计入（取绝对值）。
+    #[test]
+    fn history_row_gap_follows_shadow_config() {
+        let d = modular_clipboard_core::config::CardShadowConfig::default();
+        // 新默认（blur=8, offset=0）→ |0| + 8 = 8（与旧默认 2+6=8 相同）。
+        assert_eq!(history_row_gap(&d), 8.0);
+        let cfg_on = |enabled, blur, offset_y| modular_clipboard_core::config::CardShadowConfig {
+            enabled,
+            blur,
+            opacity: d.opacity,
+            offset_y,
+        };
+        assert_eq!(history_row_gap(&cfg_on(false, 6.0, 2.0)), ROW_GAP);
+        assert_eq!(history_row_gap(&cfg_on(true, 6.0, 2.0)), 8.0);
+        // blur 0 / offset 0：阴影无弥散，回落到基础间距
+        assert_eq!(history_row_gap(&cfg_on(true, 0.0, 0.0)), ROW_GAP);
+        // 向上偏移同样需要上方缝隙
+        assert_eq!(history_row_gap(&cfg_on(true, 4.0, -3.0)), 7.0);
+        // 大参数截断到上限
+        assert_eq!(history_row_gap(&cfg_on(true, 24.0, 16.0)), ROW_GAP_MAX);
+        // blur 超界（手改配置）钳到 24
+        assert_eq!(history_row_gap(&cfg_on(true, 99.0, 0.0)), 24.0);
+    }
+
+    /// 类型徽标（2026-10-15 定稿）位于卡片**右下角**，与「类型 · 大小」
+    /// 文字组合成一组、整组右对齐——不再占左侧文本宽度，因此
+    /// `preview_width` / `preview_full_width` 不需要为徽标让位：
+    /// 徽标缩进是「右下角文字右侧让出一个徽标位」，而不是减可用宽度。
+    #[test]
+    fn bottom_badge_keeps_preview_width_unchanged() {
+        let body_w = 700.0;
+        // 徽标不挤占预览/文本宽度（左侧无徽标列）。
+        assert_eq!(
+            preview_full_width(body_w),
+            (body_w - 2.0 * ROW_PAD_H).max(20.0)
+        );
+        // 极窄内容区仍保底 20pt。
+        assert_eq!(preview_full_width(10.0), 20.0);
     }
 
     // ------------------------------------------------------------------
@@ -7532,6 +8402,13 @@ fn with_pinned(mut self, n: usize) -> Self {
             info.max.x,
             sw.min.x
         );
+        // 两者之间必须留出呼吸间距（用户反馈「挨得太挤」）。
+        // 设置卡片把 item_spacing.x 归了 0，不显式 add_space 就会贴上。
+        assert!(
+            sw.min.x - info.max.x >= 7.5,
+            "ⓘ 与开关间距过近：{:.1}pt",
+            sw.min.x - info.max.x
+        );
     }
 
     /// 点 ⓘ ⇒ 打开 MCP 调用设置覆盖层；点遮罩（面板外）⇒ 关闭。
@@ -7605,6 +8482,313 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
+    /// 字体缩放预设：覆盖默认档、升序、落在合法区间内。
+    #[test]
+    fn font_scale_presets_are_sane() {
+        assert!(!FONT_SCALE_PRESETS.is_empty());
+        // 必须包含 100%（默认值），否则用户没有「回到标准」的入口。
+        assert!(
+            FONT_SCALE_PRESETS.iter().any(|(p, _)| *p == 100),
+            "预设必须包含标准档 100%"
+        );
+        let mut prev = 0u8;
+        for (pct, name) in FONT_SCALE_PRESETS {
+            assert!(!name.is_empty(), "预设 {pct}% 缺少档位名");
+            assert!(*pct > prev, "预设必须严格升序：{prev} → {pct}");
+            prev = *pct;
+            let scale = f64::from(*pct) / 100.0;
+            assert!(
+                (crate::theme::FONT_SCALE_MIN as f64..=crate::theme::FONT_SCALE_MAX as f64)
+                    .contains(&scale),
+                "预设 {pct}% 超出允许区间"
+            );
+        }
+    }
+
+    /// 倍率 → 预设百分比：精确命中取自身，非预设取最近档。
+    #[test]
+    fn font_scale_percent_picks_exact_or_nearest() {
+        assert_eq!(font_scale_percent(1.0), 100);
+        assert_eq!(font_scale_percent(1.15), 115);
+        assert_eq!(font_scale_percent(1.5), 150);
+        // 非预设值取最近档：1.12 → 115（距 100 有 12、距 115 只有 3）。
+        assert_eq!(font_scale_percent(1.12), 115);
+        // 越界值先钳制：5.0 → 上限 2.0 → 距 150 最近。
+        assert_eq!(font_scale_percent(5.0), 150);
+        assert_eq!(font_scale_percent(f32::NAN), 100, "NaN 回落 1.0×");
+    }
+
+    /// 只有**正好**落在预设上才算「预设」，否则界面要标「自定义」。
+    #[test]
+    fn font_scale_preset_detection_is_exact() {
+        assert!(font_scale_is_preset(1.0));
+        assert!(font_scale_is_preset(0.85));
+        assert!(font_scale_is_preset(1.5));
+        assert!(!font_scale_is_preset(1.12), "1.12× 不是预设档");
+        assert!(!font_scale_is_preset(0.9), "0.9× 不是预设档");
+    }
+
+    /// 外观卡片点「大」分段 ⇒ 推出 `SetNumber(Ui, font_scale, 1.15)`。
+    ///
+    /// 这条守的是「字体缩放修改失效」：配置写进去了，但**没有任何读取方**
+    /// （`Palette` 从不按 `font_scale` 缩放），界面毫无变化。
+    /// 现在配置项走的是 `FontScale` 分段控件，点击必须产出带倍率的 Op。
+    #[test]
+    fn font_scale_segment_emits_scaled_number_op() {
+        let mut h = Harness::new("font-scale-seg", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.settings_frame();
+
+        // 五个预设段都应登记热区（key = 选项文字）。
+        for (_, name) in FONT_SCALE_PRESETS {
+            let seg = settings_hit(&h, name);
+            assert!(seg.width() > 0.0, "预设「{name}」应有热区");
+        }
+        // 点「大」（115%）。
+        let big = settings_hit(&h, "大");
+        let ops = h.settings_click_at(big.center());
+        let hit = ops.iter().any(|o| matches!(
+            o,
+            Op::SetNumber { group: ConfigGroup::Ui, field: "font_scale", value }
+                if (value - 1.15).abs() < 1e-6
+        ));
+        assert!(hit, "点「大」应推出 font_scale=1.15，实际={ops:?}");
+    }
+
+    /// 字体缩放偏离默认值时，外观卡片的「重置」必须把它恢复成 1.0×。
+    #[test]
+    fn font_scale_reset_restores_default() {
+        let mut h = Harness::new("font-scale-reset", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.svc.state.config.ui.font_scale = 1.5;
+        h.settings_frame();
+        let reset = settings_hit(&h, "settings_reset_appearance");
+        let ops = h.settings_click_at(reset.center());
+        assert!(
+            ops.iter().any(|o| matches!(
+                o,
+                Op::SetNumber { group: ConfigGroup::Ui, field: "font_scale", value }
+                    if (value - 1.0).abs() < 1e-6
+            )),
+            "重置应把字体缩放恢复为 1.0×，实际={ops:?}"
+        );
+    }
+
+    /// 外观卡片点「卡片阴影」开关 ⇒ 推出 `SetCardShadow`，enabled 取反。
+    ///
+    /// 这条守的是「设置项必须真的产出 Op」——新增设置项若漏接
+    /// `settings_item_row` 的推送，界面点了毫无反应还静默通过。
+    #[test]
+    fn card_shadow_switch_emits_set_card_shadow() {
+        let mut h = Harness::new("card-shadow-sw", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.settings_frame();
+        let sw = settings_hit(&h, "card_shadow_enabled");
+        let ops = h.settings_click_at(sw.center());
+        let c = ops
+            .iter()
+            .find_map(|o| match o {
+                Op::SetCardShadow(c) => Some(c),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("点开关应推出 SetCardShadow，实际={ops:?}"));
+        // 开关行只动 enabled；其余参数保持默认。
+        assert_eq!(
+            *c,
+            modular_clipboard_core::config::CardShadowConfig {
+                enabled: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// 卡片阴影偏离默认（关掉）时，外观卡片「重置」把它恢复默认（开启）。
+    #[test]
+    fn card_shadow_reset_restores_default() {
+        let mut h = Harness::new("card-shadow-reset", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.svc.state.config.ui.card_shadow = modular_clipboard_core::config::CardShadowConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        h.settings_frame();
+        let reset = settings_hit(&h, "settings_reset_appearance");
+        let ops = h.settings_click_at(reset.center());
+        assert!(
+            ops.iter().any(|o| matches!(
+                o,
+                Op::SetCardShadow(c)
+                    if *c == modular_clipboard_core::config::CardShadowConfig::default()
+            )),
+            "重置应把卡片阴影恢复默认（开启），实际={ops:?}"
+        );
+    }
+
+    /// 卡片阴影三个滑条都必须登记热区（可被自动化点击）。
+    ///
+    /// 顺带验证「开关关闭时参数子块不渲染」：滑条热区缺失是预期，
+    /// 不该把「找不到热区」当成失败。
+    #[test]
+    fn card_shadow_sliders_have_hit_regions_when_enabled() {
+        let mut h = Harness::new("card-shadow-sl", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.settings_frame();
+        for key in ["card_shadow_blur", "card_shadow_opacity", "card_shadow_offset_y"] {
+            let r = h.state.hit.get(HitNs::Settings, key);
+            assert!(
+                r.is_some_and(|r| r.width() > 0.0 && r.height() > 0.0),
+                "开启状态下滑条 {key} 应有热区"
+            );
+        }
+    }
+
+    /// 右下角信息编辑器：三个 chip（图标 / 类型 / 大小）都必须登记热区。
+    #[test]
+    fn row_meta_chips_have_hit_regions() {
+        let mut h = Harness::new("rowmeta-hits", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.settings_frame();
+        for key in ["rowmeta_chip_icon", "rowmeta_chip_type", "rowmeta_chip_size"] {
+            let r = h.state.hit.get(HitNs::Settings, key);
+            assert!(
+                r.is_some_and(|r| r.width() > 0.0 && r.height() > 0.0),
+                "右下角信息 chip {key} 应有热区"
+            );
+        }
+    }
+
+    /// 单击「类型」chip ⇒ 推出 `SetRowMeta`，只翻转 type_ 显隐位，
+    /// 顺序与其他两个显隐位保持不变。
+    #[test]
+    fn row_meta_chip_click_toggles_visibility() {
+        let mut h = Harness::new("rowmeta-click", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.settings_frame();
+        let chip = settings_hit(&h, "rowmeta_chip_type");
+        let ops = h.settings_click_at(chip.center());
+        let m = ops
+            .iter()
+            .find_map(|o| match o {
+                Op::SetRowMeta(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("点「类型」chip 应推出 SetRowMeta，实际={ops:?}"));
+        assert!(!m.type_, "单击后类型应隐藏（灰）");
+        assert!(m.icon && m.size, "图标/大小显隐不受影响");
+        assert_eq!(
+            m.order,
+            [
+                modular_clipboard_core::config::RowMetaPart::Icon,
+                modular_clipboard_core::config::RowMetaPart::Type,
+                modular_clipboard_core::config::RowMetaPart::Size,
+            ],
+            "单击不改变顺序"
+        );
+    }
+
+    /// 按住「图标」chip 拖到「大小」右侧 ⇒ 顺序变为 类型 → 大小 → 图标。
+    ///
+    /// 拖拽跨帧：按下（帧 1）→ 移动越过其他 chip（帧 2）→ 抬起（帧 3）。
+    #[test]
+    fn row_meta_chip_drag_reorders() {
+        let mut h = Harness::new("rowmeta-drag", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.settings_frame();
+        let icon = settings_hit(&h, "rowmeta_chip_icon");
+        let size = settings_hit(&h, "rowmeta_chip_size");
+        let start = icon.center();
+        // 落到「大小」chip 右侧足够远，确保越过其中心。
+        let target = egui::pos2(size.max.x + 20.0, start.y);
+        let press = |p: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: p,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        h.settings_frame_with(vec![egui::Event::PointerMoved(start), press(start, true)]);
+        h.settings_frame_with(vec![egui::Event::PointerMoved(target)]);
+        let ops = h.settings_frame_with(vec![press(target, false)]);
+        let m = ops
+            .iter()
+            .find_map(|o| match o {
+                Op::SetRowMeta(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("拖拽应推出 SetRowMeta，实际={ops:?}"));
+        use modular_clipboard_core::config::RowMetaPart::*;
+        assert_eq!(m.order, [Type, Size, Icon], "图标拖到最右后的顺序");
+        // 显隐位不受拖拽影响。
+        assert!(m.icon && m.type_ && m.size);
+    }
+
+    /// 高斯外轮廓：边缘处半值、向外单调衰减、3σ 外几乎消失。
+    #[test]
+    fn gaussian_outer_profile_is_half_at_edge_and_fades() {
+        let sigma = 3.0;
+        assert!((gaussian_outer(0.0, sigma) - 0.5).abs() < 1e-3, "边缘处应为 0.5");
+        assert!(gaussian_outer(1.0, sigma) < 0.5);
+        assert!(gaussian_outer(3.0, sigma) < gaussian_outer(1.0, sigma));
+        // 3σ 处标准正态尾概率 = 0.00135；再外（阴影截断处）不可见。
+        assert!(gaussian_outer(3.0 * sigma, sigma) < 0.002);
+        // σ 非正时安全返回（不能 panic/NaN）；d<0 钳到边缘值 0.5。
+        assert_eq!(gaussian_outer(0.0, 0.0), 0.0);
+        assert!((gaussian_outer(-5.0, sigma) - 0.5).abs() < 1e-3);
+    }
+
+    /// 多层反混合的核心验收：按「源 over」逐环带模拟合成后，
+    /// 最终强度必须精确等于高斯轮廓（容差只来自 8-bit 量化与
+    /// <0.3% 层的跳过）。
+    ///
+    /// 这条守的是「层数翻倍但阴影形状不对」：alpha 若直接线性相加，
+    /// 边缘会黑成实心圈、环带之间有分层硬边。
+    #[test]
+    fn card_shadow_layers_reproduce_gaussian_profile() {
+        let blur = 6.0;
+        let c = 0.40;
+        let layers = card_shadow_layers(blur, c);
+        let sigma = blur * 0.5;
+        let n = (blur * 1.5).round() as i32;
+        assert!(layers.len() <= n as usize, "层数不应超过 1.5·blur");
+        assert!(!layers.is_empty(), "blur=6 应有可见层");
+        // 每层 alpha 合法、外扩距离为正且按从外到内排列。
+        let mut prev_grow = f32::INFINITY;
+        for (grow, a) in &layers {
+            assert!(*a > 0.0 && *a <= 1.0, "层 alpha 越界: {a}");
+            assert!(*grow < prev_grow, "层必须按从外到内排列");
+            prev_grow = *grow;
+        }
+        // 逐环带模拟合成：环带 k 被所有 grow >= k 的层覆盖。
+        for k in 1..=n {
+            let mut acc = 0.0f32;
+            for (grow, a) in &layers {
+                if *grow >= k as f32 {
+                    acc = a + acc * (1.0 - a);
+                }
+            }
+            let target = c * gaussian_outer(k as f32 - 0.5, sigma);
+            assert!(
+                (acc - target).abs() < 0.004,
+                "环带 {k} 合成强度 {acc:.4} 偏离高斯目标 {target:.4}"
+            );
+        }
+        // 最大模糊（24）：36 层封顶（性能保护：30 行 × 36 ≈ 1080 形状），
+        // 高斯尾巴上量化后不可见的层会被跳过，实际略少。
+        let max_layers = card_shadow_layers(24.0, 0.8);
+        assert!(max_layers.len() <= 36, "层数上限 36，实际 {}", max_layers.len());
+        assert!(max_layers.len() >= 28, "最大模糊下应有足量衰减层");
+        // 退化输入：无层、不 panic。
+        assert!(card_shadow_layers(0.0, 0.4).is_empty());
+        assert!(card_shadow_layers(6.0, 0.0).is_empty());
+    }
+
     /// 一键配对提示词：包含 10 项能力与接入参数，随配置动态拼接。
     #[test]
     fn mcp_pair_prompt_is_complete() {
@@ -7620,5 +8804,175 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(p.contains("9123"), "提示词应含自定义端口");
         assert!(p.contains("Bearer Token"), "提示词应反映已配置密钥");
         assert!(p.contains("--mcp-server"), "提示词应含启动命令");
+    }
+
+    /// 字体放大后设置界面**不得横向溢出、控件不得互相重叠**。
+    ///
+    /// # 为什么用「热区几何」当判据
+    ///
+    /// 设置卡片的控件宽度大多是**按文字测量**算出来的（分段控件的段宽 =
+    /// 最长文字 + 内边距），字体放大后总宽会超过卡片可用宽度，于是控件
+    /// 被画到卡片之外（用户反馈的「布局错乱」）；并排布局里标签列与控件
+    /// 还会互相侵占。热区由绘制层自报，是唯一可信的坐标来源。
+    #[test]
+    fn settings_layout_survives_large_font_scale() {
+        for (width, scale) in [(780.0, 1.0f32), (780.0, 1.15), (780.0, 1.3),
+            (780.0, 1.5), (780.0, 2.0), (720.0, 1.5), (720.0, 2.0)] {
+            let mut h = Harness::new("font-layout", vec2(width, 560.0));
+            h.pal = crate::theme::Palette::light().with_font_scale(scale);
+            // 生产路径每帧都会 `theme::apply`（见 `settingswin::sync_and_render`），
+            // 夹具必须复刻：egui 控件（标签 / 输入框）的字号来自样式，
+            // 不灌的话量出来的行高与实机不符。
+            crate::theme::apply(&h.ctx, &h.pal);
+            h.state.show_settings = true;
+            for cat in SettingsCat::ALL {
+                h.state.settings_cat = cat;
+                h.settings_frame();
+                let keys = h.state.hit.keys(HitNs::Settings);
+                let rects: Vec<(&'static str, Rect)> = keys
+                    .iter()
+                    .filter_map(|k| h.state.hit.get(HitNs::Settings, k).map(|r| (*k, r)))
+                    .collect();
+                for (key, r) in &rects {
+                    assert!(
+                        r.max.x <= h.area.max.x + 0.5,
+                        "字体 {scale}× 下 {cat:?} 的热区「{key}」越出窗口右缘：\
+                         {:.1} > {:.1}",
+                        r.max.x,
+                        h.area.max.x
+                    );
+                    assert!(
+                        r.min.x >= h.area.min.x - 0.5 && r.min.y >= h.area.min.y - 0.5,
+                        "字体 {scale}× 下 {cat:?} 的热区「{key}」越出窗口左上缘"
+                    );
+                }
+                // 同一分类内的热区互不重叠（相邻分段共边不算重叠）。
+                for (i, (ka, ra)) in rects.iter().enumerate() {
+                    for (kb, rb) in rects.iter().skip(i + 1) {
+                        let ox = (ra.max.x.min(rb.max.x) - ra.min.x.max(rb.min.x)).max(0.0);
+                        let oy = (ra.max.y.min(rb.max.y) - ra.min.y.max(rb.min.y)).max(0.0);
+                        assert!(
+                            ox <= 1.0 || oy <= 1.0,
+                            "字体 {scale}× 下 {cat:?} 的热区「{ka}」与「{kb}」重叠了 \
+                             {:.1}x{:.1}（布局互相侵占）",
+                            ox,
+                            oy
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 大字号下设置行改为**上下堆叠**：标签不再与控件争宽度。
+    ///
+    /// 守的是「并排时描述只剩 6 个字」这种可读性崩坏——堆叠后描述能拿到
+    /// 整行宽度，控件也独占一行。
+    #[test]
+    fn large_font_stacks_setting_rows() {
+        // 用高窗口：1.5× 下外观卡片总高超过 560（需要滚动），
+        // 而热区只登记可见控件——不高一点就测不到两行的相对位置。
+        let mut h = Harness::new("font-stack", vec2(780.0, 1200.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+
+        // 1.0×：并排 —— 主题分段与字体缩放分段**同一行**（y 区间一致）。
+        h.pal = crate::theme::Palette::light();
+        crate::theme::apply(&h.ctx, &h.pal);
+        h.settings_frame();
+        let theme_y = settings_hit(&h, "浅色").min.y;
+        let font_y = settings_hit(&h, "超大").min.y;
+        assert!(
+            (theme_y - font_y).abs() > 20.0,
+            "1.0× 下主题行与字体缩放行本就在不同行（间距应 > 20）：{theme_y} vs {font_y}"
+        );
+
+        // 1.5×：堆叠 —— 每行的控件独占一行，行距显著变大。
+        h.pal = crate::theme::Palette::light().with_font_scale(1.5);
+        crate::theme::apply(&h.ctx, &h.pal);
+        h.settings_frame();
+        let theme_y15 = settings_hit(&h, "浅色").min.y;
+        let font_y15 = settings_hit(&h, "超大").min.y;
+        let pitch_10 = font_y - theme_y;
+        let pitch_15 = font_y15 - theme_y15;
+        assert!(
+            pitch_15 > pitch_10 * 1.5,
+            "1.5× 下应改为上下堆叠（行距 {pitch_15:.1} 应远大于 1.0× 的 {pitch_10:.1}）"
+        );
+    }
+
+    /// 量一段文字的像素宽（不换行口径）。
+    fn measure_w(ctx: &egui::Context, s: &str, size: f32) -> f32 {
+        let mut w = 0.0f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            w = ui
+                .painter()
+                .layout_no_wrap(
+                    s.to_owned(),
+                    egui::FontId::proportional(size),
+                    egui::Color32::PLACEHOLDER,
+                )
+                .rect
+                .width();
+        });
+        // run_ui 会产出字体纹理 delta；不清掉Drop 时直接 panic
+        // （epaint 的「Dropped TexturesDelta with N unapplied deltas」）。
+        out.textures_delta.clear();
+        w
+    }
+
+    /// MCP 覆盖层状态行：拆分两行后每行都必须在面板内缘放得下，
+    /// 同时锁死「旧单行拼接放不下」——证明拆分不是空做。
+    ///
+    /// 背景（用户反馈「文字渲染出界面」）：egui 的 Label 在**横向**
+    /// 布局里默认 `TextWrapMode::Extend`——不换行也不截断，直接溢出
+    /// 容器。最长的 detail（`Unconfigured`，约 25 个全角字）与标题挤
+    /// 在同一行时实测 475pt > 面板内缘 448pt，文字画出面板。
+    /// 修法：第一行只放「圆点 + MCP 服务：xx」，detail 单独一行
+    /// （纵向布局默认 Wrap）。
+    #[test]
+    fn mcp_overlay_status_lines_fit_panel() {
+        use crate::mcp_status::McpConn;
+        let h = Harness::new("mcp-status", vec2(780.0, 560.0));
+        // 与 `settings_mcp_overlay` 一致的面板几何：480pt 面板，内缩 16/14。
+        let pw = 480.0_f32.min(h.area.width() * 0.92);
+        let inner = pw - 32.0;
+        let size = h.pal.font_xs;
+        // 第一行行首：状态圆点 10pt + 行内间距 6pt。
+        let dot_w = 16.0_f32;
+
+        for conn in [
+            McpConn::Disabled,
+            McpConn::Unconfigured,
+            McpConn::Connected,
+            McpConn::Disconnected,
+        ] {
+            // 第一行：圆点 + 「MCP 服务：xx」。横向布局 ⇒ 必须放得下。
+            let line1 = format!("MCP 服务：{}", conn.label());
+            let w1 = dot_w + measure_w(&h.ctx, &line1, size);
+            assert!(
+                w1 <= inner,
+                "{conn:?} 状态行宽 {w1} 超过面板内缘 {inner}"
+            );
+            // 第二行：detail。纵向布局会换行，但正常字体下也不该超宽。
+            let w2 = measure_w(&h.ctx, conn.detail(), size);
+            assert!(
+                w2 <= inner,
+                "{conn:?} 说明文字宽 {w2} 超过面板内缘 {inner}"
+            );
+        }
+
+        // 锁死修法：旧的单行拼接在最长 detail 下必须**放不下**——
+        // 否则这个测试锁不住「拆两行」这个回归。
+        let old = format!(
+            "MCP 服务：{} · {}",
+            McpConn::Unconfigured.label(),
+            McpConn::Unconfigured.detail()
+        );
+        let old_w = dot_w + measure_w(&h.ctx, &old, size);
+        assert!(
+            old_w > inner,
+            "旧单行拼接宽 {old_w} 应放不进 {inner}（放得进说明回归锁失效）"
+        );
     }
 }

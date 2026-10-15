@@ -41,8 +41,8 @@
 //! resize 与窗口移动能力**，所以两者在 [`chrome`] 里补回来：
 //!
 //! - `WM_NCHITTEST` 里手动判定边缘与拖动区，返回 `HTLEFT`/`HTCAPTION` 等；
-//! - 系统随即把按下转成 `WM_NCLBUTTONDOWN`，由 `DefWindowProcW`
-//!   进入**原生**的缩放 / 移动循环。
+//! - 系统随即把按下转成 `WM_NCLBUTTONDOWN`，`chrome` 以非模态指针捕获
+//!   驱动 `SetWindowPos`，拖动期间帧循环仍能绘制磨砂背景。
 //!
 //! 命中测试必须在窗口过程里做，不能在 [`EventLoop::poll`] 里做——
 //! 详见 [`chrome`] 模块文档。
@@ -397,8 +397,8 @@ impl Window {
         // 的唤起逻辑依赖 `SW_RESTORE`）。
         //
         // **刻意不加 `WS_THICKFRAME`**：加了系统会自己画 resize 边框，
-        // 与自绘外观冲突；不加则必须自己在 `WM_NCHITTEST` 里补回
-        // resize 能力，见 [`chrome`]。
+        // 与自绘外观冲突；不加则通过 `WM_NCHITTEST` + 指针捕获实现
+        // 非模态 resize，见 [`chrome`]。
         let style = WS_POPUP | WS_SYSMENU;
 
         let hwnd = unsafe {
@@ -591,6 +591,11 @@ impl Window {
     /// 见 [`chrome::set_resize_border`]。
     pub fn set_resize_border(&self, points: f32) {
         chrome::set_resize_border(self.hwnd(), points);
+    }
+
+    /// 设置鼠标拖拽缩放允许的最小逻辑尺寸。
+    pub fn set_min_size(&self, width: f32, height: f32) {
+        chrome::set_min_size(self.hwnd(), width, height);
     }
 
     /// 主动销毁窗口。

@@ -338,6 +338,162 @@ pub struct UiConfig {
     /// 半径 8，因此旧用户升级后观感不变。
     #[serde(default = "default_window_blur_strength")]
     pub window_blur_strength: u8,
+    /// 列表卡片阴影（历史列表里每条条目卡片的投影）。
+    ///
+    /// 颜色由主题令牌 `Palette::shadow` 提供（深色主题自动加浓，
+    /// 否则黑色投影在近黑的列表背景上看不见），效果通过
+    /// [`CardShadowConfig`] 的模糊 / 浓度 / 垂直偏移自定义。
+    #[serde(default)]
+    pub card_shadow: CardShadowConfig,
+    /// 列表行右下角信息组合（类型徽标 + 类型 + 大小）。
+    ///
+    /// 三个元素的显隐与前后顺序都可在设置中调整，见 [`RowMetaConfig`]。
+    #[serde(default)]
+    pub row_meta: RowMetaConfig,
+}
+
+/// 列表卡片阴影配置。
+///
+/// 渲染分两遍：先为所有可见行画投影，再画卡片本体——投影只在
+/// 行间缝隙（`ROW_GAP`）与列表边缘可见，不会压暗相邻卡片的文字。
+/// 投影本身是多层同心圆角矩形叠加出的**高斯衰减**（不是单条
+/// 抗锯齿边），圆角处没有 alpha 重叠暗斑。
+///
+/// # 为什么颜色不开放
+///
+/// 投影色几乎总是黑色（深色主题下也是黑的，只是基准浓度更高），
+/// 开放颜色只会多出一个没人用的旋钮；「自定义」集中在
+/// 模糊（笔触软硬）、浓度（深浅）、垂直偏移（高低）三个
+/// 真正影响观感的维度上。
+///
+/// 取值范围（绘制侧会再钳制一遍，防手改配置文件超界）：
+/// - `blur`：0 ~ 24（高斯扩散半径，0 = 无投影）
+/// - `opacity`：0.0 ~ 0.6（浓度倍率；0.16 = 1.0× 主题强度，默认 0.20 ≈ 1.25×，
+///   实际像素 alpha 再按主题令牌 `Palette::shadow` 缩放，
+///   深色主题会自动比浅色更浓）
+/// - `offset_y`：-8 ~ 16（逻辑点，正值向下）
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CardShadowConfig {
+    /// 是否启用列表卡片阴影。
+    pub enabled: bool,
+    /// 模糊半径（逻辑点，高斯扩散半径）。
+    pub blur: f32,
+    /// 浓度倍率：0.16 为 1.0× 主题强度，0 为无投影，上限 0.6。
+    pub opacity: f32,
+    /// 垂直偏移（逻辑点，正值向下）。
+    pub offset_y: f32,
+}
+
+impl Default for CardShadowConfig {
+    fn default() -> Self {
+        // 2026-10-15 定稿：预览页验收后的推荐参数。
+        Self {
+            enabled: true,
+            blur: 8.0,
+            opacity: 0.20,
+            offset_y: 0.0,
+        }
+    }
+}
+
+/// 列表行右下角信息组合的一个元素。
+///
+/// 三个元素可在设置中：
+/// - 单击切换显隐（灰 = 不显示）；
+/// - 按住拖动重排前后顺序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RowMetaPart {
+    /// 圆角小方块类型徽标（内嵌类型图标）。
+    Icon,
+    /// 类型文字标签（文本 / HTML / 图片 / 文件）。
+    #[serde(rename = "type")]
+    Type,
+    /// 大小文字（B / KB / MB / GB，自适应单位）。
+    Size,
+}
+
+impl RowMetaPart {
+    /// 全部三个元素（自然顺序），供设置编辑器与渲染侧遍历。
+    pub const ALL: [RowMetaPart; 3] = [RowMetaPart::Icon, RowMetaPart::Type, RowMetaPart::Size];
+
+    /// 元素在设置编辑器中的中文名称。
+    pub fn label(self) -> &'static str {
+        match self {
+            RowMetaPart::Icon => "图标",
+            RowMetaPart::Type => "类型",
+            RowMetaPart::Size => "大小",
+        }
+    }
+}
+
+/// 列表行右下角「类型徽标 + 类型 + 大小」组合的配置。
+///
+/// - `order`：三个元素从左到右的排列顺序；
+/// - `icon` / `type` / `size`：各元素是否显示，默认全部显示。
+///
+/// 元素之间只留固定间距，不再用「·」分隔。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RowMetaConfig {
+    /// 组合顺序（从左到右）。默认 图标 → 类型 → 大小。
+    pub order: [RowMetaPart; 3],
+    /// 是否显示类型徽标。
+    pub icon: bool,
+    /// 是否显示类型文字标签。
+    #[serde(rename = "type")]
+    pub type_: bool,
+    /// 是否显示大小文字。
+    pub size: bool,
+}
+
+impl Default for RowMetaConfig {
+    fn default() -> Self {
+        Self {
+            order: RowMetaPart::ALL,
+            icon: true,
+            type_: true,
+            size: true,
+        }
+    }
+}
+
+impl RowMetaConfig {
+    /// 该元素当前是否显示。
+    pub fn visible(&self, part: RowMetaPart) -> bool {
+        match part {
+            RowMetaPart::Icon => self.icon,
+            RowMetaPart::Type => self.type_,
+            RowMetaPart::Size => self.size,
+        }
+    }
+
+    /// 切换某个元素的显隐（设置编辑器中单击）。
+    pub fn toggle(&mut self, part: RowMetaPart) {
+        match part {
+            RowMetaPart::Icon => self.icon = !self.icon,
+            RowMetaPart::Type => self.type_ = !self.type_,
+            RowMetaPart::Size => self.size = !self.size,
+        }
+    }
+
+    /// 把 `part` 移动到目标索引 `idx`（拖动重排）：先从原位置取出，
+    /// 再插入到 `idx`，其余元素保持相对顺序不变。`idx` 越界会被钳制
+    /// 到合法区间；元素不存在时不改动。
+    ///
+    /// 拖拽 UI 按鼠标位置直接算出目标索引（鼠标左侧有几个元素就插到
+    /// 第几），因此每帧结果只取决于鼠标位置、天然幂等，不会在两个
+    /// 相邻位置间来回抖动。
+    pub fn move_to_index(&mut self, part: RowMetaPart, idx: usize) {
+        let Some(cur) = self.order.iter().position(|p| *p == part) else {
+            return;
+        };
+        let mut v: Vec<RowMetaPart> = self.order.to_vec();
+        let moved = v.remove(cur);
+        let idx = idx.min(v.len());
+        v.insert(idx, moved);
+        self.order = [v[0], v[1], v[2]];
+    }
 }
 
 /// 窗口背景效果。
@@ -408,6 +564,8 @@ impl Default for UiConfig {
             window_backdrop: WindowBackdrop::None,
             window_opacity: 1.0,
             window_blur_strength: default_window_blur_strength(),
+            card_shadow: CardShadowConfig::default(),
+            row_meta: RowMetaConfig::default(),
         }
     }
 }
@@ -1034,6 +1192,110 @@ mod tests {
             7,
             "缺省档位不是 7，会改变升级用户的磨砂观感"
         );
+    }
+
+    /// 卡片阴影配置必须能无损序列化往返，且旧版配置文件缺该字段时
+    /// 回退到默认（开启）。
+    #[test]
+    fn card_shadow_survives_json_roundtrip_and_defaults() {
+        // 自定义一组非默认值，走裸 serde 往返。
+        let custom = CardShadowConfig {
+            enabled: true,
+            blur: 12.0,
+            opacity: 0.3,
+            offset_y: 6.0,
+        };
+        let text = serde_json::to_string(&custom).unwrap();
+        let back: CardShadowConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(custom, back);
+
+        // 字段缺失（旧配置）→ 容器级 serde(default) 补成默认值。
+        let legacy = r#"{"always_on_top": true}"#;
+        let cfg: UiConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.card_shadow, CardShadowConfig::default());
+        assert!(cfg.card_shadow.enabled, "阴影默认应开启");
+    }
+
+    /// 默认值必须落在绘制侧承诺的取值区间内（防默认值本身越界）。
+    #[test]
+    fn card_shadow_defaults_are_within_range() {
+        let d = CardShadowConfig::default();
+        assert!((0.0..=24.0).contains(&d.blur));
+        assert!((0.0..=0.6).contains(&d.opacity));
+        assert!((-8.0..=16.0).contains(&d.offset_y));
+    }
+
+    /// 2026-10-15 预览页验收后用户定稿的默认参数：blur 8 / 浓度 20% /
+    /// 偏移 0 / 阴影默认开启。锁死这批数值，防止后续改动悄悄改掉观感。
+    #[test]
+    fn card_shadow_defaults_match_2026_10_15_final() {
+        let d = CardShadowConfig::default();
+        assert!(d.enabled, "阴影默认开启");
+        assert_eq!(d.blur, 8.0, "默认模糊半径 8.0");
+        assert_eq!(d.opacity, 0.20, "默认浓度倍率 20%");
+        assert_eq!(d.offset_y, 0.0, "默认纵向偏移 0");
+    }
+
+    /// 右下角信息组合默认三个元素全亮、顺序 图标 → 类型 → 大小。
+    #[test]
+    fn row_meta_defaults_all_visible_in_natural_order() {
+        let d = RowMetaConfig::default();
+        assert!(d.icon && d.type_ && d.size, "默认全部显示");
+        assert_eq!(
+            d.order,
+            [RowMetaPart::Icon, RowMetaPart::Type, RowMetaPart::Size]
+        );
+        for p in RowMetaPart::ALL {
+            assert!(d.visible(p));
+        }
+    }
+
+    /// 单击切换显隐：toggle 必须翻转对应元素、不影响其他元素。
+    #[test]
+    fn row_meta_toggle_flips_only_target() {
+        let mut d = RowMetaConfig::default();
+        d.toggle(RowMetaPart::Type);
+        assert!(!d.type_);
+        assert!(d.icon && d.size, "其他元素不受影响");
+        d.toggle(RowMetaPart::Type);
+        assert!(d.type_, "再次点击恢复显示");
+    }
+
+    /// 拖动重排：move_to_index 把元素移到目标位置，其余相对顺序不变。
+    #[test]
+    fn row_meta_move_to_index_reorders_without_losing_elements() {
+        use RowMetaPart::*;
+        // 图标移到最右：idx=2。
+        let mut d = RowMetaConfig::default();
+        d.move_to_index(Icon, 2);
+        assert_eq!(d.order, [Type, Size, Icon]);
+        // 大小移到最左：idx=0。
+        d.move_to_index(Size, 0);
+        assert_eq!(d.order, [Size, Type, Icon]);
+        // 越界 idx 钳制到末尾。
+        d.move_to_index(Size, 99);
+        assert_eq!(d.order, [Type, Icon, Size]);
+        // 移到原位置（idx=1）：不变。
+        d.move_to_index(Icon, 1);
+        assert_eq!(d.order, [Type, Icon, Size]);
+        // 三种元素始终各出现一次，没有丢失或重复。
+        for p in RowMetaPart::ALL {
+            assert_eq!(d.order.iter().filter(|x| **x == p).count(), 1);
+        }
+        // 幂等：同一位置反复调用结果相同（拖拽每帧重算不能抖动）。
+        d.move_to_index(Type, 0);
+        let once = d.order;
+        d.move_to_index(Type, 0);
+        assert_eq!(d.order, once);
+    }
+
+    /// 旧 config.json 缺 row_meta 字段时必须反序列化为默认组合，
+    /// 不能让整份配置解析失败。
+    #[test]
+    fn row_meta_missing_in_config_falls_back_to_default() {
+        let json = r#"{"window_width":720.0}"#;
+        let ui: UiConfig = serde_json::from_str(json).expect("旧配置应能解析");
+        assert_eq!(ui.row_meta, RowMetaConfig::default());
     }
 
     /// 版本号必须稳定：它是将来做格式迁移的唯一依据。

@@ -27,6 +27,20 @@
 // 视觉差异不可辨（暗部过渡略有偏差），却省掉两趟 sRGB 编解码。
 // 若将来离屏目标改用 `*_SRGB`，采样器会自动解码、写入自动编码，
 // 这段着色器无需改动。
+//
+// # 合成时的 UV 位移（push constant）
+//
+// 自研磨砂的底图是**上一次捕获**的桌面快照：窗口拖动时，捕获发生在
+// 位置 P_cap，而帧呈现时窗口已经到 P_now——底图内容相对窗口「过期」
+// 了一段位移 d = P_now - P_cap，表现为磨砂背景跟不上窗口（拖影）。
+// 合成阶段用 push constant 把采样坐标平移 d/尺寸（目标 UV 单位），
+// 快照即与窗口当前所在位置对齐；再叠加一帧**预测**位移（速度×帧
+// 间隔），补偿「提交 → 呈现」之间窗口又走过的距离。位移为零时与
+// 旧行为完全一致（其它拷贝用途恒推零）。
+//
+// 为什么用 push constant 而不是 uniform：这是**每次绘制**变的参数，
+// push constant 正是 Vulkan 为此设计的通道；写 uniform 要多一块缓冲
+// 和一次描述符写入，还会与模糊共用的描述符布局纠缠不清。
 
 struct BlurUniforms {
     // 采样方向与步长（**纹素**单位）：横向为 (1/w, 0)，纵向为 (0, 1/h)。
@@ -40,6 +54,15 @@ struct BlurUniforms {
     texel: vec2<f32>,
     _pad: vec2<f32>,
 };
+
+// 合成拷贝的 UV 位移（目标 UV 单位，见模块头「合成时的 UV 位移」）。
+// 高斯卷积不读它，只有 `fs_copy` 用；离屏拷贝（降采样等）每次绘制前
+// 由 CPU 端推零。
+struct CopyOffset {
+    offset: vec2<f32>,
+};
+
+var<push_constant> copy_pc: CopyOffset;
 
 @group(0) @binding(0) var<uniform> u: BlurUniforms;
 @group(0) @binding(1) var blur_sampler: sampler;
@@ -106,5 +129,11 @@ fn fs_copy(in: VertexOutput) -> @location(0) vec4<f32> {
     // 降采样与最终合成都走这里。降采样时源是全分辨率场景、
     // 目标是 1/N 分辨率，线性采样器自动做一次双线性平均，
     // 等价于一次 2x2 的盒式滤波（N=2 时精确，N=4 时近似）。
-    return textureSampleLevel(src, blur_sampler, in.uv, 0.0);
+    //
+    // `copy_pc.offset`：只有自研磨砂的**合成**用非零值——把过期
+    // 快照按窗口位移平移回当前位置（见模块头「合成时的 UV 位移」）。
+    // 离屏拷贝恒为零，采样点退回 in.uv，与加 push constant 前一致。
+    // CLAMP_TO_EDGE 采样器会把越界坐标钳到边缘：快速拖动时 trailing
+    // 边缘的一小条会被拉伸，而模糊半径远大于该宽度，观感无差别。
+    return textureSampleLevel(src, blur_sampler, in.uv + copy_pc.offset, 0.0);
 }

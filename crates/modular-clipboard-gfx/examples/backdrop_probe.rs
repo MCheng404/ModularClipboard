@@ -139,7 +139,7 @@ fn main() -> anyhow::Result<()> {
             extent: full,
         })
         .clear_values(std::slice::from_ref(&clear));
-    let blit = pipeline.composite();
+    let blit = pipeline.composite([0.0, 0.0]);
     let viewport = vk::Viewport {
         x: 0.0,
         y: 0.0,
@@ -165,6 +165,16 @@ fn main() -> anyhow::Result<()> {
             0,
             &sets,
             &[],
+        );
+        // 合成拷贝的 UV 位移 push constant：探针不走磨砂路径，恒推零。
+        // 着色器声明了这块常量，不推 = 未定义内容 = 底图随机平移。
+        let zero_offset = [0.0f32, 0.0];
+        gpu.device.cmd_push_constants(
+            cmd,
+            blit.layout,
+            vk::ShaderStageFlags::FRAGMENT,
+            0,
+            bytemuck::bytes_of(&zero_offset),
         );
         gpu.device.cmd_draw(cmd, 3, 1, 0, 0);
         gpu.device.cmd_end_render_pass(cmd);
@@ -303,11 +313,11 @@ fn region_stats(bytes: &[u8], w: u32, h: u32) -> Stats {
             a_sum += bytes[i + 3] as f64;
             if x < w / 2 {
                 lr += bytes[i + 2] as f64;
-                lb += bytes[i + 0] as f64;
+                lb += bytes[i] as f64;
                 ln += 1;
             } else {
                 rr += bytes[i + 2] as f64;
-                rb += bytes[i + 0] as f64;
+                rb += bytes[i] as f64;
                 rn += 1;
             }
         }

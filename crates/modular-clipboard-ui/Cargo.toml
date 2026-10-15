@@ -32,6 +32,8 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     # presence.rs：SetWindowDisplayAffinity（磨砂的捕获自排除）。
     "Win32_UI_WindowsAndMessaging",
+    # presence.rs：focus_window 的 Alt 键前台切换技巧（keybd_event）。
+    "Win32_UI_Input_KeyboardAndMouse",
     # presence.rs：AttachThreadInput / GetCurrentThreadId
     "Win32_System_Threading",
     # theme.rs：读 AppsUseLightTheme 以跟随系统主题。

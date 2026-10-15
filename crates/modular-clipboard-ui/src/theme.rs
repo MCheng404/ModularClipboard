@@ -88,6 +88,34 @@ macro_rules! backdrop_layer_value {
     (dur, $name:ident, $v:expr, $_alpha:expr) => { $v };
 }
 
+/// 字体令牌的缩放变体：`font_*` 与**承载文字的几何令牌**乘以 `scale`。
+///
+/// 供 [`Palette::with_font_scale`] 逐字段展开使用。判据用字段名前缀
+/// 而不是另维护一张名单：新增字号令牌时忘记登记会**静默不缩放**
+/// （用户看到「只有一部分文字跟着放大」），前缀判据没有这个缺口。
+///
+/// # 为什么 `control_height` / `icon_size` 也要跟着缩放
+///
+/// 控件高度是**为了容纳文字**而存在的：字号放大 1.5× 而输入框仍是
+/// 28pt 高，文字会被裁掉半截（用户反馈「字体调整太大导致布局错乱」）。
+/// 图标与图标按钮同理——图标尺寸固定而周围文字放大，视觉比例会崩。
+///
+/// 圆角、描边、间距**不缩放**：它们与字号不是线性关系（1.5× 的圆角
+/// 会让卡片变成胶囊），且留白不缩放正好让大字号下更紧凑。
+macro_rules! font_scaled_value {
+    (num, $name:ident, $v:expr, $scale:expr) => {{
+        if stringify!($name).starts_with("font_")
+            || matches!(stringify!($name), "control_height" | "icon_size")
+        {
+            $v * $scale
+        } else {
+            $v
+        }
+    }};
+    (color, $name:ident, $v:expr, $_scale:expr) => { $v };
+    (dur, $name:ident, $v:expr, $_scale:expr) => { $v };
+}
+
 /// 定义 [`Palette`] 的字段与两套取值。
 ///
 /// 用宏而不是手写两个 `struct` 字面量，是为了让「深浅两套字段对称」
@@ -105,7 +133,12 @@ macro_rules! palette {
         ///
         /// `Clone`：主题补间（[`Palette::lerp`]）每帧都要从源/目标两份
         /// 派生显示中的调色板，没有 Clone 就得逐字段手抄。
-        #[derive(Clone)]
+        ///
+        /// `PartialEq`：主题补间走完后帧循环要判断「显示值是否已等于
+        /// 目标值」——`tween_f32` 到点后直接返回目标值，`mix < 1.0` 的
+        /// 分支不再执行，显示值会停在最后一帧的**近似**值上。
+        /// 逐字段比较（55 个令牌）只在补间结束后的那一帧发生一次。
+        #[derive(Clone, PartialEq)]
         pub struct Palette {
             $(
                 $(#[$meta])*
@@ -190,6 +223,26 @@ macro_rules! palette {
                     is_dark: self.is_dark,
                 }
             }
+
+            /// 字体缩放变体：`font_*` 令牌乘以 `scale`，其余令牌原样。
+            ///
+            /// # 为什么必须从**基础调色板**派生，而不是在显示值上再乘一次
+            ///
+            /// 这是幂等的纯函数：`base.with_font_scale(1.15)` 永远等于
+            /// 「基础字号 × 1.15」。调用方（`App`）因此可以放心地每次
+            /// 从 `pal_base` 重新派生；若在**已缩放**的调色板上再调一次，
+            /// 会变成叠乘（1.15 × 1.15 = 1.3225），字号越调越大。
+            ///
+            /// `scale` 由 `UiConfig::font_scale` 提供，取值 0.75~2.0
+            /// （写入时已钳制）。非有限值按 1.0 处理——NaN 会让所有
+            /// 字号变 NaN，egui 的排版会静默产出空 galley（文字消失）。
+            pub fn with_font_scale(&self, scale: f32) -> Palette {
+                let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+                Self {
+                    $( $name: font_scaled_value!($kind, $name, self.$name, s), )*
+                    is_dark: self.is_dark,
+                }
+            }
         }
     };
 }
@@ -231,6 +284,31 @@ palette! {
     /// 强求高对比会让面板之间全是硬边，视觉噪声大于收益。
     border_subtle: color = egui::Color32::from_rgb(0x2A, 0x2F, 0x36)
                      => egui::Color32::from_rgb(0xDD, 0xE2, 0xE8),
+    /// 卡片投影基色（列表卡片阴影，见 `draw_card_shadow`）。
+    ///
+    /// RGB 都是黑色（投影的物理色），**alpha 是主题推荐的「卷积黑
+    /// 矩形」强度**：用户配置 `card_shadow.opacity = 0.16`（1.0×）
+    /// 时按此 alpha 出图，滑块再线性缩放（默认 0.20 ≈ 1.25×）。
+    ///
+    /// 深色模式（1.00）比浅色（0.50）浓一倍：列表底 `list_bg`
+    /// 深色为 `#101215`、近黑，黑投影叠上去几乎没有明度差，
+    /// 这是物理必然，不是参数问题——Material 的深色 elevation
+    /// 阴影同样靠提高 alpha 解决。2026-10-15 预览页验收后从
+    /// 204/102 提到 255/128，深色主题阴影从此清晰可见。
+    ///
+    /// 注意：投影实际可见的边缘强度约为该 alpha 的一半
+    /// （高斯卷积在半平面边缘处为 0.5），衰减到 1.5 倍模糊半径
+    /// 处已 < 0.2%，不会留下硬边。
+    shadow: color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 255)
+                    => egui::Color32::from_rgba_unmultiplied(0, 0, 0, 128),
+    /// 卡片顶部受光高光（「立体阴影」的一部分，见 `draw_item_row`）。
+    ///
+    /// 深色主题下是卡片顶部 3pt 的白色渐变亮边（alpha 0.20 → 0），
+    /// 模拟光源从上方照下，让深色卡片在近黑背景上「浮」起来——
+    /// 深色投影本身在深背景上对比有限，高光才是立体感的主要来源。
+    /// 浅色主题卡片自身最亮（#FFFFFF），高光为透明（不绘制）。
+    card_highlight: color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 51)
+                      => egui::Color32::TRANSPARENT,
 
     // ---- 文本层 ----
     /// 主要文字。
@@ -372,6 +450,31 @@ palette! {
     anim_fast: dur = Duration::from_millis(90) => Duration::from_millis(90),
     /// 常规动效：展开、淡入。
     anim_normal: dur = Duration::from_millis(160) => Duration::from_millis(160),
+}
+
+/// 主题切换的补间时长（F-34 / UI-P1-3）。
+///
+/// 单一数据源：`App::apply_ops` 的重启（`anim::restart`）与帧循环的
+/// 推进（`anim::tween_f32`）**必须用同一个时长**——两处各写一份的话，
+/// 推进侧的时长若更短，动画会在重启的时长走完前先吸附到 1.0，
+/// 表现为「切换只动了开头一小段」。
+pub const PALETTE_TWEEN: std::time::Duration = std::time::Duration::from_millis(220);
+
+/// 字体缩放倍率的合法区间（写入侧与读取侧共用）。
+///
+/// 下限 0.75：再小则 font_xs(14) 只有 10.5pt，中文笔画糊成一团；
+/// 上限 2.0：再大则设置页的卡片要横向滚动，且 CJK 图集膨胀明显。
+pub const FONT_SCALE_MIN: f32 = 0.75;
+/// 见 [`FONT_SCALE_MIN`]。
+pub const FONT_SCALE_MAX: f32 = 2.0;
+
+/// 把任意来源的缩放值收敛到合法区间（非有限值回落 1.0）。
+pub fn clamp_font_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(FONT_SCALE_MIN, FONT_SCALE_MAX)
+    } else {
+        1.0
+    }
 }
 
 /// 主题模式。
@@ -932,6 +1035,90 @@ mod tests {
     use super::*;
 
     // ------------------------------------------------------------------
+    // 字体缩放（`UiConfig::font_scale` 的落地）
+    // ------------------------------------------------------------------
+
+    /// 缩放作用于「字号 + 承载文字的几何」，圆角/描边/间距/颜色原样。
+    ///
+    /// 这条守的是「字体缩放改了个寂寞」的反面：早前 `font_scale`
+    /// 只有写入方、没有读取方，改它完全没反应。现在它是调色板的一个
+    /// 派生维度，派生范围**恰好**是「字号 + 必须容纳字号的几何」
+    /// （控件高度、图标尺寸）——多派生一点（圆角、间距）就会让设置页
+    /// 在大字号下膨胀得离谱。
+    #[test]
+    fn font_scale_scales_fonts_and_text_bearing_geometry() {
+        let base = Palette::dark();
+        let scaled = base.with_font_scale(1.5);
+        // 字号按倍率放大。
+        assert!((scaled.font_xs - base.font_xs * 1.5).abs() < 1e-3);
+        assert!((scaled.font_md - base.font_md * 1.5).abs() < 1e-3);
+        assert!((scaled.font_title - base.font_title * 1.5).abs() < 1e-3);
+        // 承载文字的几何同步放大：不放大则文字被裁（用户反馈的「布局错乱」）。
+        assert!((scaled.control_height - base.control_height * 1.5).abs() < 1e-3);
+        assert!((scaled.icon_size - base.icon_size * 1.5).abs() < 1e-3);
+        // 圆角 / 间距 / 描边 / 动效令牌原样。
+        assert_eq!(scaled.radius_md, base.radius_md);
+        assert_eq!(scaled.space_md, base.space_md);
+        assert_eq!(scaled.stroke_normal, base.stroke_normal);
+        assert_eq!(scaled.anim_fast, base.anim_fast);
+        // 颜色令牌原样（含透明度）。
+        assert_eq!(scaled.bg, base.bg);
+        assert_eq!(scaled.text, base.text);
+        assert_eq!(scaled.accent, base.accent);
+        assert_eq!(scaled.is_dark, base.is_dark);
+    }
+
+    /// 1.0× 是恒等变换：逐字段等于基础调色板。
+    #[test]
+    fn font_scale_one_is_identity() {
+        for base in [Palette::dark(), Palette::light()] {
+            let same = base.with_font_scale(1.0);
+            assert_eq!(same.font_md, base.font_md);
+            assert_eq!(same.font_xs, base.font_xs);
+            assert_eq!(same.font_title, base.font_title);
+        }
+    }
+
+    /// 非有限 / 非正缩放必须回落到 1.0。
+    ///
+    /// NaN 会让每个字号都变 NaN，egui 排版静默产出空 galley——
+    /// 表现为「文字全部消失」，且不报任何错。这是必须挡住的输入。
+    #[test]
+    fn font_scale_rejects_nonsense_input() {
+        let base = Palette::dark();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -1.5] {
+            let p = base.with_font_scale(bad);
+            assert_eq!(p.font_md, base.font_md, "非法缩放 {bad} 应回落 1.0");
+            assert!(p.font_md.is_finite());
+        }
+    }
+
+    /// 缩放从**基础**调色板派生才幂等；在已缩放的结果上再乘会叠乘。
+    ///
+    /// 这条把「必须从 `pal_base` 派生」写成可执行文档：`App` 每次
+    /// 都从基础调色板重算，就是为了避开下面这个叠乘。
+    #[test]
+    fn font_scale_compounds_if_applied_twice() {
+        let base = Palette::dark();
+        let once = base.with_font_scale(1.15);
+        let twice = once.with_font_scale(1.15);
+        assert!(
+            (twice.font_md - base.font_md * 1.15 * 1.15).abs() < 1e-3,
+            "在已缩放的调色板上再乘会叠乘——调用方必须从 base 派生"
+        );
+        assert!(twice.font_md > once.font_md);
+    }
+
+    /// 钳制区间：越界收敛、NaN 回落 1.0。
+    #[test]
+    fn clamp_font_scale_bounds() {
+        assert_eq!(clamp_font_scale(1.0), 1.0);
+        assert_eq!(clamp_font_scale(0.1), FONT_SCALE_MIN);
+        assert_eq!(clamp_font_scale(9.0), FONT_SCALE_MAX);
+        assert_eq!(clamp_font_scale(f32::NAN), 1.0);
+    }
+
+    // ------------------------------------------------------------------
     // 对比度工具（WCAG 2.1）
     // ------------------------------------------------------------------
 
@@ -1144,6 +1331,43 @@ mod tests {
         }
     }
 
+    /// 深色主题的投影必须比浅色更浓：列表底 `list_bg` 深色近黑
+    /// （`#101215`），低 alpha 黑投影叠上去没有明度差。
+    #[test]
+    fn dark_shadow_is_stronger_than_light() {
+        let d = Palette::dark();
+        let l = Palette::light();
+        assert!(
+            d.shadow.a() > l.shadow.a(),
+            "深色阴影 {} 应浓于浅色 {}（否则深色主题下看不见投影）",
+            d.shadow.a(),
+            l.shadow.a()
+        );
+        // 两个主题的投影基色都必须是黑色（物理投影色）。
+        for p in [&d, &l] {
+            let [r, g, b, _] = p.shadow.to_array();
+            assert_eq!((r, g, b), (0, 0, 0), "投影基色应为黑色");
+        }
+        // 2026-10-15 预览页验收后：深色 255 / 浅色 128（此前 204/102）。
+        assert_eq!(d.shadow.a(), 255, "深色阴影 alpha 应提到满值");
+        assert_eq!(l.shadow.a(), 128, "浅色阴影 alpha 应提到 0.5");
+    }
+
+    /// 卡片顶部受光高光：深色主题有（alpha 0.20 的白色渐变），浅色
+    /// 主题透明（卡片自身最亮，不再叠加）。
+    #[test]
+    fn card_highlight_only_in_dark_theme() {
+        let d = Palette::dark();
+        let l = Palette::light();
+        assert!(d.card_highlight.a() > 0, "深色主题应绘制顶部高光");
+        assert_eq!(l.card_highlight.a(), 0, "浅色主题高光应透明");
+        // 高光必须是白色系（受光模拟）。Color32 是 premultiplied 存储，
+        // 白色 α 分量下 RGB 应等于 A（(51,51,51,51) = 白 × 20%）。
+        let [r, g, b, a] = d.card_highlight.to_array();
+        assert_eq!((r, g, b), (a, a, a), "高光应为白色（premultiplied 下 RGB==A）");
+        assert_eq!(a, 51, "高光 alpha 应为 20%（255×0.2=51）");
+    }
+
     // ------------------------------------------------------------------
     // 深浅两套完整性
     // ------------------------------------------------------------------
@@ -1155,6 +1379,8 @@ mod tests {
         "bg", "surface", "surface_variant", "surface_raised", "list_bg", "overlay_scrim",
         // 描边层
         "border", "border_strong", "border_subtle",
+        // 投影
+        "shadow", "card_highlight",
         // 文本层
         "text", "text_dim", "text_bright", "text_on_accent",
         // 状态色五组三态

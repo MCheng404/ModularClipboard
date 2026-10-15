@@ -38,12 +38,24 @@
 //! 我们在其中按光标位移 `SetWindowPos` 移动窗口。这样主帧循环每轮照常
 //! 抓取、模糊、present，拖动时背景实时跟随。
 //!
-//! 边缘 resize 仍交给系统：`WM_NCLBUTTONDOWN` 的 wParam 是 `HTLEFT`
-//! 等时**不拦截**，由 `DefWindowProcW` 进入系统缩放循环。
+//! 边缘与角落的 resize 也走同一套非模态指针捕获：系统缩放循环
+//! 同样会暂停 Vulkan 帧循环；而无 `WS_THICKFRAME` 的 `WS_POPUP`
+//! 窗口也不能依赖系统一定启动缩放。尺寸变化通过 `SetWindowPos`
+//! 触发 `WM_SIZE`，由普通消息循环重建交换链。
 //! 双击标题栏最大化 / 还原由我们自己调 `ShowWindow` 保留。
 //!
 //! 代价：失去 Aero Snap「拖到屏幕边缘自动分屏」（系统模态循环独有，
 //! 非模态自移无法白拿）。跨显示器的负坐标移动天然可用。
+//!
+//! ## 光标指示：WM_SETCURSOR + 帧循环防覆盖
+//!
+//! resize 边/角的光标由本模块在 [`handle_non_client`] 里显式接管
+//! （`WM_SETCURSOR` 分支按命中码设 `IDC_SIZEWE` / `IDC_SIZENS` 等）。
+//! 两层原因：无 `WS_THICKFRAME` 的 `WS_POPUP` 窗口上，系统默认
+//! 处理不保证显示 resize 光标；且主窗口帧循环每帧都会用 egui 的
+//! 光标覆盖（边缘处是 Default → 箭头）。UI 侧每帧调
+//! [`shell_cursor_id`] 先问外壳、[`pointer_is_over`] 判断指针归属，
+//! 避免把别的窗口（子卡片、设置窗）的外壳光标覆盖回箭头。
 //!
 //! # 状态是 **per-HWND** 的
 //!
@@ -71,6 +83,7 @@
 use std::ffi::c_void;
 
 use egui::emath::{Pos2, Rect, Vec2};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
@@ -80,10 +93,12 @@ use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetCursorPos, GetWindowRect, IsZoomed, SetWindowPos, ShowWindow,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_RESTORE,
+    GetClientRect, GetCursorPos, GetWindowRect, IsZoomed, LoadCursorW, SetCursor,
+    SetWindowPos, ShowWindow, WindowFromPoint,
+    SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_RESTORE,
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
     HTTOP, HTTOPLEFT, HTTOPRIGHT, WM_NCHITTEST,
+    IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
 };
 
 // 非客户区指针消息（裸常量，避免 crate 枚举类型差异）。
@@ -96,6 +111,9 @@ const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
 const WM_MOUSEMOVE_C: u32 = 0x0200;
 const WM_LBUTTONUP_C: u32 = 0x0202;
 const WM_CAPTURECHANGED_C: u32 = 0x0215;
+// WM_SETCURSOR（0x0020）不在 WM_NC* 段里，但同样是窗口过程
+// 决定光标形状的消息，这里一并接管（见 handle_non_client）。
+const WM_SETCURSOR: u32 = 0x0020;
 
 /// 边缘 resize 区的默认宽度，**逻辑点**。
 ///
@@ -114,7 +132,7 @@ pub enum HitZone {
     Client,
     /// 拖动区（自绘标题栏），系统接管窗口移动。
     Caption,
-    /// 上 / 下 / 左 / 右边缘，系统接管缩放。
+    /// 上 / 下 / 左 / 右边缘，非模态指针捕获驱动缩放。
     Top,
     Bottom,
     Left,
@@ -141,6 +159,24 @@ impl HitZone {
             HitZone::BottomLeft => HTBOTTOMLEFT,
             HitZone::BottomRight => HTBOTTOMRIGHT,
         }
+    }
+
+    /// 该区域应显示的系统光标资源 ID。
+    ///
+    /// - 边/角：对应的 resize 光标（`IDC_SIZEWE` 等）；
+    /// - 拖动区：箭头（与原生窗口的标题栏光标一致，移动窗口
+    ///   本来就是箭头）；
+    /// - 客户区：返回 `None`——那里由 egui 的光标决定
+    ///   （手型 / I-beam 等）。
+    pub fn cursor_id(self) -> Option<u16> {
+        Some(match self {
+            HitZone::Left | HitZone::Right => IDC_SIZEWE.0 as u16,
+            HitZone::Top | HitZone::Bottom => IDC_SIZENS.0 as u16,
+            HitZone::TopLeft | HitZone::BottomRight => IDC_SIZENWSE.0 as u16,
+            HitZone::TopRight | HitZone::BottomLeft => IDC_SIZENESW.0 as u16,
+            HitZone::Caption => IDC_ARROW.0 as u16,
+            HitZone::Client => return None,
+        })
     }
 }
 
@@ -257,6 +293,8 @@ struct WindowChrome {
     drag: Vec<Rect>,
     /// resize 边缘宽度（逻辑点）。0 = 不能 resize。
     border: f32,
+    /// 窗口特定的最小尺寸（逻辑点）；未设置时沿用通用下限。
+    min_size: Option<Vec2>,
 }
 
 /// 按 HWND 索引的窗口外壳状态。
@@ -392,19 +430,71 @@ pub fn set_resize_border(hwnd: HWND, points: f32) {
     set_chrome_of(hwnd, |c| c.border = points.max(0.0));
 }
 
+/// 设置窗口缩放时的最小逻辑尺寸；设置页需要足够宽容纳导航与控件。
+pub fn set_min_size(hwnd: HWND, width: f32, height: f32) {
+    if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
+        set_chrome_of(hwnd, |c| c.min_size = Some(Vec2::new(width, height)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 自定义窗口移动（非模态，让拖动期间 Vulkan 帧循环继续跑）
 // ---------------------------------------------------------------------------
 
-/// 进行中的拖动：起始光标位置与起始窗口原点（物理像素，屏幕坐标）。
-///
-/// 新窗口原点 = 起始窗口原点 + (当前光标 − 起始光标)。用「起始点 + 位移」
-/// 而非「逐帧累加 delta」，可避免中途丢一两条移动消息后窗口位置与光标
-/// 产生累积偏差。
+/// 正在拖动窗口的位置或尺寸。所有坐标均为物理像素、屏幕坐标。
+/// 始终从起始矩形与光标总位移计算，避免丢失移动事件时累积漂移。
 #[derive(Clone, Copy)]
 struct MoveState {
     start_cursor: POINT,
-    start_origin: POINT,
+    start_rect: RECT,
+    zone: HitZone,
+    min_width: i32,
+    min_height: i32,
+}
+
+/// 把起始窗口矩形沿选中的边/角拖动，并保证不会缩成不可交互的 0×0。
+fn dragged_rect(mut rect: RECT, delta: POINT, zone: HitZone, min_w: i32, min_h: i32) -> RECT {
+    let min_w = min_w.max(1);
+    let min_h = min_h.max(1);
+    match zone {
+        HitZone::Caption => {
+            rect.left = rect.left.saturating_add(delta.x);
+            rect.right = rect.right.saturating_add(delta.x);
+            rect.top = rect.top.saturating_add(delta.y);
+            rect.bottom = rect.bottom.saturating_add(delta.y);
+        }
+        _ => {
+            if matches!(zone, HitZone::Left | HitZone::TopLeft | HitZone::BottomLeft) {
+                rect.left = rect.left.saturating_add(delta.x).min(rect.right - min_w);
+            }
+            if matches!(zone, HitZone::Right | HitZone::TopRight | HitZone::BottomRight) {
+                rect.right = rect.right.saturating_add(delta.x).max(rect.left + min_w);
+            }
+            if matches!(zone, HitZone::Top | HitZone::TopLeft | HitZone::TopRight) {
+                rect.top = rect.top.saturating_add(delta.y).min(rect.bottom - min_h);
+            }
+            if matches!(zone, HitZone::Bottom | HitZone::BottomLeft | HitZone::BottomRight) {
+                rect.bottom = rect.bottom.saturating_add(delta.y).max(rect.top + min_h);
+            }
+        }
+    }
+    rect
+}
+
+/// Win32 非客户区按下的 HT 值映射为可拖拽区域；其他命中保留系统默认处理。
+fn draggable_zone(hit: u32) -> Option<HitZone> {
+    Some(match hit {
+        HTCAPTION => HitZone::Caption,
+        HTLEFT => HitZone::Left,
+        HTRIGHT => HitZone::Right,
+        HTTOP => HitZone::Top,
+        HTBOTTOM => HitZone::Bottom,
+        HTTOPLEFT => HitZone::TopLeft,
+        HTTOPRIGHT => HitZone::TopRight,
+        HTBOTTOMLEFT => HitZone::BottomLeft,
+        HTBOTTOMRIGHT => HitZone::BottomRight,
+        _ => return None,
+    })
 }
 
 /// 按 HWND 索引的拖动状态。与 [`CHROME`] 同理，仅在窗口线程访问。
@@ -439,58 +529,73 @@ fn clear_moving(hwnd: HWND) {
     }
 }
 
-/// 拖动区按下：接管指针、记录起点，**不进系统模态移动循环**。
-unsafe fn begin_custom_move(hwnd: HWND) {
+/// 按下标题栏/边/角：接管指针，避免系统模态移动/缩放循环冻结画面。
+unsafe fn begin_custom_move(hwnd: HWND, zone: HitZone) {
     unsafe {
         let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
         let mut rc = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut rc);
-        // SetCapture 后，按住左键期间的指针消息都发给本窗口，即使移出窗口。
+        if GetCursorPos(&mut cursor).is_err() || GetWindowRect(hwnd, &mut rc).is_err() {
+            return;
+        }
+        let dpi = GetDpiForWindow(hwnd);
+        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+        // 客户区保持可操作；起始尺寸若更小，不要在开始拖动时突然放大。
+        let min_size = chrome_of(hwnd).min_size.unwrap_or(Vec2::new(320.0, 240.0));
+        let min_width = ((min_size.x * scale).round() as i32).min(rc.right - rc.left).max(1);
+        let min_height = ((min_size.y * scale).round() as i32).min(rc.bottom - rc.top).max(1);
+        set_moving(hwnd, MoveState {
+            start_cursor: cursor,
+            start_rect: rc,
+            zone,
+            min_width,
+            min_height,
+        });
+        // 捕获后移出窗口仍收到鼠标移动和松开消息。
         let _ = SetCapture(hwnd);
-        tracing::debug!("自定义拖动：开始 SetCapture");
-        set_moving(
-            hwnd,
-            MoveState {
-                start_cursor: cursor,
-                start_origin: POINT {
-                    x: rc.left,
-                    y: rc.top,
-                },
-            },
-        );
     }
 }
 
-/// 指针移动：按位移把窗口挪到新位置（不改大小、不改 Z 序、不激活）。
+/// 指针移动：以起始矩形计算位置/尺寸，让常规事件循环继续渲染。
 unsafe fn apply_custom_move(hwnd: HWND) {
     unsafe {
-        let Some(st) = moving_state(hwnd) else {
-            return;
-        };
+        let Some(st) = moving_state(hwnd) else { return };
         let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
-        let x = st.start_origin.x + (cursor.x - st.start_cursor.x);
-        let y = st.start_origin.y + (cursor.y - st.start_cursor.y);
+        if GetCursorPos(&mut cursor).is_err() { return; }
+        let rc = dragged_rect(
+            st.start_rect,
+            POINT {
+                x: cursor.x.saturating_sub(st.start_cursor.x),
+                y: cursor.y.saturating_sub(st.start_cursor.y),
+            },
+            st.zone,
+            st.min_width,
+            st.min_height,
+        );
+        // Win32 会合并鼠标消息；连续两条落在相同像素时不要反复发
+        // WM_WINDOWPOSCHANGED/WM_SIZE，否则每帧可能白白重建交换链。
+        let mut current = RECT::default();
+        if GetWindowRect(hwnd, &mut current).is_ok()
+            && current.left == rc.left && current.top == rc.top
+            && current.right == rc.right && current.bottom == rc.bottom
+        {
+            return;
+        }
         let _ = SetWindowPos(
             hwnd,
             None,
-            x,
-            y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
 }
 
-/// 松开：释放指针捕获并清状态。
+/// 松开：清状态再释放捕获（ReleaseCapture 会同步触发 CAPTURECHANGED）。
 unsafe fn end_custom_move(hwnd: HWND) {
-    unsafe {
-        let _ = ReleaseCapture();
-        tracing::debug!("自定义拖动：结束");
-        clear_moving(hwnd);
-    }
+    clear_moving(hwnd);
+    unsafe { let _ = ReleaseCapture(); }
 }
 
 /// 双击标题栏：最大化 / 还原（保留原生手感）。
@@ -526,6 +631,88 @@ fn y_lparam(lp: isize) -> i32 {
     ((lp as u32 >> 16) as u16 as i16) as i32
 }
 
+/// 把**屏幕坐标**换算成客户区坐标并跑一次完整命中测试。
+///
+/// 与 `WM_NCHITTEST` 分支用**同一套**判定（客户区尺寸、DPI 换算、
+/// `ScreenToClient`、`hit_test`），避免两处逻辑分叉——
+/// 一处改了另一处没改，光标指示就会和实际可 resize 的区域对不上。
+///
+/// 取不到客户区尺寸时返回 `Client`（与 `WM_NCHITTEST` 分支一致：
+/// 最坏结果是那一次判定退化为客户区，比误判成边缘安全）。
+fn hit_zone_at_screen(hwnd: HWND, pt_screen: POINT) -> HitZone {
+    let mut cr = RECT::default();
+    if unsafe { GetClientRect(hwnd, &mut cr) }.is_err() {
+        return HitZone::Client;
+    }
+    let scale = {
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+    };
+    let size = Vec2::new(
+        (cr.right - cr.left).max(0) as f32 / scale,
+        (cr.bottom - cr.top).max(0) as f32 / scale,
+    );
+    let mut pt = pt_screen;
+    // BOOL 是 must_use；失败时 pt 保持屏幕坐标，判定结果无意义但无害。
+    let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+    let pos = Pos2::new(pt.x as f32 / scale, pt.y as f32 / scale);
+    hit_test(pos, size, resize_border(hwnd), &drag_regions(hwnd))
+}
+
+/// 指针当前是否落在这个窗口上。
+///
+/// 用 `WindowFromPoint` 判定：多窗口（主窗口 + 拖出的卡片子窗口 +
+/// 设置窗口）重叠时，只有**最上层**窗口命中。
+///
+/// 用途：每帧设置光标前先问一句——指针不在本窗口上时，本窗口的
+/// 光标逻辑**不得**碰全局光标。否则主窗口的帧循环会在指针悬停在
+/// 子窗口 resize 边缘时把它覆盖回箭头（「resize 无光标指示」的
+/// 成因之一）。
+pub fn pointer_is_over(hwnd: HWND) -> bool {
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return false;
+    }
+    unsafe { WindowFromPoint(pt) == hwnd }
+}
+
+/// 设置一个系统预定义光标（`LoadCursorW` + `SetCursor`）。
+///
+/// # Safety
+///
+/// `res_id` 必须是系统预定义光标资源 ID（`IDC_*`）。
+unsafe fn set_system_cursor(res_id: u16) {
+    unsafe {
+        // SAFETY: IDC_* 是系统预定义资源 ID；返回的句柄由系统持有、
+        // 不需要销毁（与 presence.rs 的 set_cursor_icon 同一模式）。
+        if let Ok(h) = LoadCursorW(None, PCWSTR(res_id as *const u16)) {
+            let _ = SetCursor(Some(h));
+        }
+    }
+}
+
+/// 本窗口此刻应该显示的系统光标资源 ID（供 UI 帧循环每帧查询）。
+///
+/// 返回 `Some`：指针落在窗口外壳（resize 边/角、拖动区）上，或正在
+/// 拖动本窗口——此时光标由外壳决定，UI 层不应再用 egui 的光标覆盖。
+/// 返回 `None`：指针在客户区或不在本窗口上，交给 egui/系统。
+pub fn shell_cursor_id(hwnd: HWND) -> Option<u16> {
+    // 拖动中：指针可能已移出窗口，`WindowFromPoint` 与当前位置判定
+    // 都会失效；按拖动开始时命中的区域保持光标，直到松手。
+    if let Some(st) = moving_state(hwnd) {
+        return st.zone.cursor_id();
+    }
+    let mut pt = POINT::default();
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return None;
+    }
+    // 指针不在本窗口上：不越权设置（可能是别的窗口的外壳/客户区）。
+    if unsafe { WindowFromPoint(pt) } != hwnd {
+        return None;
+    }
+    hit_zone_at_screen(hwnd, pt).cursor_id()
+}
+
 /// 窗口过程里的 non-client 分支。
 ///
 /// 返回 `Some(lresult)` 表示已处理，`None` 表示原样转发
@@ -541,16 +728,16 @@ pub(crate) unsafe fn handle_non_client(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
-    // ---- 自定义窗口移动（非模态），见模块文档「拖动方案」----
+    // ---- 非模态移动与缩放，不进入会阻塞帧循环的系统模态循环 ----
     match msg {
         WM_NCLBUTTONDOWN => {
-            if wparam.0 as u32 == HTCAPTION {
-                // 拖动区按下：自己接管指针，阻止 DefWindowProc 进入模态
-                // 移动循环（那会冻结帧循环，磨砂背景停在旧帧）。
-                unsafe { begin_custom_move(hwnd) };
+            if let Some(zone) = draggable_zone(wparam.0 as u32) {
+                if unsafe { IsZoomed(hwnd) }.as_bool() {
+                    return None;
+                }
+                unsafe { begin_custom_move(hwnd, zone) };
                 return Some(LRESULT(0));
             }
-            // 边缘 resize（HTLEFT/HTTOP/...）：交给系统原生缩放循环。
             return None;
         }
         WM_NCLBUTTONDBLCLK => {
@@ -580,6 +767,31 @@ pub(crate) unsafe fn handle_non_client(
             clear_moving(hwnd);
             return None;
         }
+        WM_SETCURSOR => {
+            // 无边框窗口（WS_POPUP、无 WS_THICKFRAME）上，系统默认
+            // 不保证按命中码显示 resize 光标；而且主窗口的帧循环每帧
+            // 都会用 egui 的光标（边缘处是 Default）覆盖一次——
+            // 两件事叠加就是「resize 时没有任何光标指示」。
+            // 这里显式接管：命中 resize 边/角或拖动区时按区域设光标。
+            //
+            // 拖动中：lParam 里的命中码按当前指针位置算，指针移出
+            // 窗口后不可靠；改用拖动开始时记录的区域。
+            if let Some(st) = moving_state(hwnd)
+                && let Some(code) = st.zone.cursor_id()
+            {
+                unsafe { set_system_cursor(code) };
+                return Some(LRESULT(1)); // TRUE：不再走默认处理
+            }
+            // WM_SETCURSOR 的 lParam 低 16 位是命中测试码。
+            let hit = (lparam.0 as u32 & 0xFFFF) as u32;
+            if let Some(code) = draggable_zone(hit).and_then(HitZone::cursor_id) {
+                unsafe { set_system_cursor(code) };
+                return Some(LRESULT(1));
+            }
+            // HTCLIENT 等客户区命中：交给 DefWindowProc / egui 每帧
+            // 的光标设置（手型、I-beam 走那条路）。
+            return None;
+        }
         _ => {}
     }
 
@@ -587,31 +799,13 @@ pub(crate) unsafe fn handle_non_client(
         return None;
     }
 
-    // 取不到客户区尺寸就不能判定边缘，返回 HTCLIENT 让事件落回 egui。
-    // 比返回错误的 HT* 安全：最坏结果是那一次拖动不生效。
-    let mut cr = RECT::default();
-    if unsafe { GetClientRect(hwnd, &mut cr) }.is_err() {
-        return Some(LRESULT(HTCLIENT as isize));
-    }
-    let scale = {
-        let dpi = unsafe { GetDpiForWindow(hwnd) };
-        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
-    };
-    let size = Vec2::new(
-        (cr.right - cr.left).max(0) as f32 / scale,
-        (cr.bottom - cr.top).max(0) as f32 / scale,
-    );
-
-    // `WM_NCHITTEST` 的 lParam 是**屏幕**坐标，要换算成客户区坐标。
-    let mut pt = POINT {
+    // `WM_NCHITTEST` 的 lParam 是**屏幕**坐标；与
+    // [`shell_cursor_id`] 共用同一套命中判定。
+    let pt = POINT {
         x: x_lparam(lparam.0),
         y: y_lparam(lparam.0),
     };
-    // BOOL 是 must_use；失败时 pt 保持屏幕坐标，判定结果无意义但无害。
-    let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
-    let pos = Pos2::new(pt.x as f32 / scale, pt.y as f32 / scale);
-
-    let zone = hit_test(pos, size, resize_border(hwnd), &drag_regions(hwnd));
+    let zone = hit_zone_at_screen(hwnd, pt);
     Some(LRESULT(zone.hit_code() as isize))
 }
 
@@ -799,6 +993,49 @@ mod tests {
     }
 
     #[test]
+    fn drag_zone_round_trip_and_unhandled_hit() {
+        for zone in [HitZone::Caption, HitZone::Top, HitZone::Bottom, HitZone::Left,
+            HitZone::Right, HitZone::TopLeft, HitZone::TopRight,
+            HitZone::BottomLeft, HitZone::BottomRight] {
+            assert_eq!(draggable_zone(zone.hit_code()), Some(zone));
+        }
+        assert_eq!(draggable_zone(HTCLIENT), None);
+    }
+
+    #[test]
+    fn resize_all_edges_and_corners() {
+        let start = RECT { left: 100, top: 200, right: 500, bottom: 600 };
+        let delta = POINT { x: 30, y: -40 };
+        for (zone, expected) in [
+            (HitZone::Left, (130, 200, 500, 600)),
+            (HitZone::Right, (100, 200, 530, 600)),
+            (HitZone::Top, (100, 160, 500, 600)),
+            (HitZone::Bottom, (100, 200, 500, 560)),
+            (HitZone::TopLeft, (130, 160, 500, 600)),
+            (HitZone::TopRight, (100, 160, 530, 600)),
+            (HitZone::BottomLeft, (130, 200, 500, 560)),
+            (HitZone::BottomRight, (100, 200, 530, 560)),
+            (HitZone::Caption, (130, 160, 530, 560)),
+        ] {
+            let r = dragged_rect(start, delta, zone, 320, 240);
+            assert_eq!((r.left, r.top, r.right, r.bottom), expected, "{zone:?}");
+        }
+    }
+
+    #[test]
+    fn resizing_clamps_minimum_and_preserves_opposite_edge() {
+        let start = RECT { left: -200, top: 50, right: 200, bottom: 450 };
+        let r = dragged_rect(start, POINT { x: 900, y: 900 }, HitZone::TopLeft, 320, 240);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (-120, 210, 200, 450));
+        let r = dragged_rect(start, POINT { x: -900, y: -900 }, HitZone::BottomRight, 320, 240);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (-200, 50, 120, 290));
+        // 当窗口原本就比最小尺寸小，不应在按下时瞬间跳到阈值。
+        let small = RECT { left: 0, top: 0, right: 200, bottom: 120 };
+        let r = dragged_rect(small, POINT { x: 50, y: 50 }, HitZone::Caption, 320, 240);
+        assert_eq!((r.left, r.top, r.right, r.bottom), (50, 50, 250, 170));
+    }
+
+    #[test]
     fn hit_codes_match_win32_constants() {
         // 硬编码期望值，而不是引用 windows crate 的常量——
         // 否则常量写错时测试会跟着一起错（MEMORY.md 坑 84）。
@@ -812,6 +1049,52 @@ mod tests {
         assert_eq!(HitZone::TopRight.hit_code(), 14);
         assert_eq!(HitZone::BottomLeft.hit_code(), 16);
         assert_eq!(HitZone::BottomRight.hit_code(), 17);
+    }
+
+    /// resize 边/角必须映射到对应的系统光标资源 ID，客户区返回 None。
+    ///
+    /// 期望值硬编码（与 `hit_codes_match_win32_constants` 同一策略）：
+    /// IDC_SIZENWSE=32642, IDC_SIZENESW=32643, IDC_SIZEWE=32644,
+    /// IDC_SIZENS=32645, IDC_ARROW=32512。
+    #[test]
+    fn zones_map_to_cursor_ids() {
+        assert_eq!(HitZone::Left.cursor_id(), Some(32644));
+        assert_eq!(HitZone::Right.cursor_id(), Some(32644));
+        assert_eq!(HitZone::Top.cursor_id(), Some(32645));
+        assert_eq!(HitZone::Bottom.cursor_id(), Some(32645));
+        assert_eq!(HitZone::TopLeft.cursor_id(), Some(32642));
+        assert_eq!(HitZone::BottomRight.cursor_id(), Some(32642));
+        assert_eq!(HitZone::TopRight.cursor_id(), Some(32643));
+        assert_eq!(HitZone::BottomLeft.cursor_id(), Some(32643));
+        // 拖动区与原生标题栏一致：箭头。
+        assert_eq!(HitZone::Caption.cursor_id(), Some(32512));
+        // 客户区由 egui 决定，外壳不接管。
+        assert_eq!(HitZone::Client.cursor_id(), None);
+    }
+
+    /// `draggable_zone` 与 `cursor_id` 组合后，每条非客户区命中码
+    /// 都能给出光标；HTCLIENT 不行（客户区不归外壳管）。
+    #[test]
+    fn every_draggable_hit_code_has_a_cursor() {
+        for zone in [
+            HitZone::Caption,
+            HitZone::Top,
+            HitZone::Bottom,
+            HitZone::Left,
+            HitZone::Right,
+            HitZone::TopLeft,
+            HitZone::TopRight,
+            HitZone::BottomLeft,
+            HitZone::BottomRight,
+        ] {
+            assert!(
+                draggable_zone(zone.hit_code())
+                    .and_then(HitZone::cursor_id)
+                    .is_some(),
+                "{zone:?} 的命中码必须能给出光标"
+            );
+        }
+        assert_eq!(draggable_zone(HTCLIENT), None);
     }
 
     // ---- lParam拆包 ----
@@ -947,6 +1230,19 @@ mod tests {
             HitZone::Client,
             "两段之间的控件区必须判 Client，否则实机点不动"
         );
+    }
+
+    #[test]
+    fn min_size_is_per_window_and_rejects_invalid_values() {
+        const A: HWND = HWND(0x1234 as *mut std::ffi::c_void);
+        const B: HWND = HWND(0x5678 as *mut std::ffi::c_void);
+        set_min_size(A, 720.0, 400.0);
+        assert_eq!(chrome_of(A).min_size, Some(Vec2::new(720.0, 400.0)));
+        assert_eq!(chrome_of(B).min_size, None);
+        set_min_size(A, f32::NAN, -1.0);
+        assert_eq!(chrome_of(A).min_size, Some(Vec2::new(720.0, 400.0)));
+        forget(A);
+        assert_eq!(chrome_of(A).min_size, None);
     }
 
     #[test]

@@ -81,7 +81,11 @@ fn compile(source: &str, origin: &str) -> Vec<u32> {
 
     let info = match naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        // PUSH_CONSTANT：`blur.wgsl` 的合成阶段用 push constant 传
+        // 「磨砂底图的 UV 位移」（自研磨砂移动预测，见 blur.rs）。
+        // 不用该 capability 时 naga 会以 UnsupportedCapability 拒绝
+        // 整个模块——错误发生在编译期，正好逼着后来者看见这里。
+        naga::valid::Capabilities::PUSH_CONSTANT,
     )
     .validate(&module)
     {

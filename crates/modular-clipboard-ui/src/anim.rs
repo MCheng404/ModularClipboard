@@ -145,6 +145,36 @@ pub fn tween_f32(ctx: &Context, id: Id, target: f32, dur: Duration, ease: Ease) 
     })
 }
 
+/// 以显式的 `from → to` **重新开始**一段补间（覆盖既有状态），返回当前值。
+///
+/// # 与 [`tween_f32`] 的分工（这条是「主题切换失效」的根因）
+///
+/// `tween_f32` 是**惰性**的：目标值没变时它只是取当前值，已经到目标就
+/// 什么都不做。对「值跟着某个状态走」的场景（悬停、开关）这是对的。
+/// 但「每次触发都重播一遍固定动画」的场景（主题切换的 0→1 进度）不能
+/// 这么用——目标恒为 `1.0`，第一次调用就把状态插成 `from == to == 1.0`，
+/// 之后无论切多少次主题，`tween_f32` 都返回 1.0，动画**永远不会重播**。
+///
+/// 所以重播必须有一个显式入口：`restart(.., 0.0, 1.0, ..)` 把状态重置成
+/// 「从 0 开始、目标 1」，随后每帧的 `tween_f32(ctx, id, 1.0, ..)`
+/// 就能正常推进它（目标一致 ⇒ 不 retarget，只按时间前进）。
+pub fn restart(ctx: &Context, id: Id, from: f32, to: f32, dur: Duration, ease: Ease) -> f32 {
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| {
+        let store = d.get_temp_mut_or_default::<AnimStore>(store_id());
+        let t = Tween {
+            from,
+            to,
+            t0: now,
+            dur: dur.as_secs_f32(),
+            ease,
+        };
+        let v = t.value_at(now);
+        store.map.insert(id, t);
+        v
+    })
+}
+
 /// 颜色补间：四通道各自补间后组装。
 ///
 /// 透明度参与补间（淡入淡出的常用轴）。`target` 为 `None` 表示该通道
@@ -288,5 +318,71 @@ mod tests {
         // 清掉后下一次调用以新目标为起点重新开始（而不是从旧状态续接）。
         let v = tween_f32(&ctx, id, 0.0, Duration::from_millis(100), Ease::Linear);
         assert_eq!(v, 0.0, "清除后应视为全新补间");
+    }
+
+    /// 主题切换补间的重播：目标恒为 1.0 时 `tween_f32` 是惰性的，
+    /// 必须靠 `restart` 才能重播——这正是「切主题没反应」的根因。
+    #[test]
+    fn restart_replays_a_fixed_animation() {
+        let (ctx, mut input) = ctx_with_time(0.0);
+        let id = Id::new("pal_mix_like");
+        // 首次调用（惰性）：直接落在目标 1.0 上。
+        assert_eq!(
+            tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear),
+            1.0
+        );
+        // 再次调用（目标没变）：仍然是 1.0 —— 动画不会自己重播。
+        input.time = Some(5.0);
+        let mut out = ctx.run_ui(input.clone(), |_| {});
+        out.textures_delta.clear();
+        assert_eq!(
+            tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear),
+            1.0,
+            "目标不变时 tween_f32 必须惰性（这就是需要 restart 的理由）"
+        );
+
+        // restart：从 0 重播，当帧取到起点 0。
+        let v = restart(&ctx, id, 0.0, 1.0, Duration::from_millis(100), Ease::Linear);
+        assert_eq!(v, 0.0, "重启当帧应停在起点");
+        // 之后每帧的 tween_f32（目标 1.0）按时间推进它。
+        input.time = Some(5.05);
+        let mut out = ctx.run_ui(input.clone(), |_| {});
+        out.textures_delta.clear();
+        let mid = tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear);
+        assert!((mid - 0.5).abs() < 1e-5, "重启后应正常推进，实际 {mid}");
+        input.time = Some(5.2);
+        let mut out = ctx.run_ui(input, |_| {});
+        out.textures_delta.clear();
+        assert_eq!(
+            tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear),
+            1.0,
+            "时长用尽后吸附到 1.0"
+        );
+    }
+
+    /// `restart` 会覆盖既有状态（不是叠加、不是续接）。
+    #[test]
+    fn restart_overrides_previous_state() {
+        let (ctx, mut input) = ctx_with_time(0.0);
+        let id = Id::new("override");
+        tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear);
+        input.time = Some(0.05);
+        let mut out = ctx.run_ui(input, |_| {});
+        out.textures_delta.clear();
+        // 中途重启到另一段动画：起点立刻生效。
+        let v = restart(&ctx, id, 0.3, 0.9, Duration::from_millis(100), Ease::Linear);
+        assert!((v - 0.3).abs() < 1e-6, "重启当帧应等于 from，实际 {v}");
+    }
+
+    /// `restart` 之后 `busy()` 必须为真——否则空闲闸门会跳过帧，
+    /// 动画只在事件帧推进（主题切换会卡在半路）。
+    #[test]
+    fn restart_marks_animation_busy() {
+        let (ctx, _input) = ctx_with_time(0.0);
+        let id = Id::new("busy-restart");
+        tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear);
+        assert!(!busy(&ctx), "已完成（惰性 1.0）时不该算在飞");
+        restart(&ctx, id, 0.0, 1.0, Duration::from_millis(100), Ease::Linear);
+        assert!(busy(&ctx), "重启后必须算在飞");
     }
 }

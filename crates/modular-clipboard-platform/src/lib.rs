@@ -9,6 +9,13 @@ pub mod autostart;
 pub mod hotkey;
 pub mod tray;
 
+/// 主界面窗口标题（`CreateWindowExW` 用的就是它）。
+///
+/// 必须与 `modular-clipboard-ipc::instance::UI_WINDOW_TITLE` 保持一致；
+/// 这里不依赖 ipc crate（platform 是更底层的 crate），重复定义一份。
+/// 托盘线程按标题 `FindWindowW` 找到主窗口。
+pub const UI_WINDOW_TITLE: &str = "ModularClipboard";
+
 /// 复用捕获层的窗口探测能力，避免重复实现 Win32 调用。
 use modular_clipboard_capture::{foreground_class_name, source_process_name};
 
@@ -52,6 +59,72 @@ pub fn foreground_window() -> isize {
 #[cfg(not(windows))]
 pub fn foreground_window() -> isize {
     0
+}
+
+/// 按窗口标题找到主窗口，并在**当前线程正持有前台授权时**把它恢复并
+/// 激活到最前；返回「显示方向是否已由本函数处理」。
+///
+/// # 返回值语义
+///
+/// - `true`：窗口原本处于隐藏/最小化状态，本函数已完成 `SW_RESTORE`
+///   （置前可能仍失败，但上层不得再 toggle 隐藏）。
+/// - `false`：找不到窗口（尚未创建，上层应拉起新进程），或窗口已在
+///   正常显示（交由上层按 toggle 隐藏 / 幂等置前）。
+///
+/// # 为什么必须在 WM_HOTKEY 处理线程里直接调
+///
+/// 系统派发 `WM_HOTKEY` 时会临时把「允许设置前台窗口」的权限授予
+/// **接收该消息的线程**（即托盘线程）。若托盘线程只把事件转发给 UI
+/// 主线程（`PostMessage` 是异步的），等主线程帧循环处理时授权上下文
+/// 早已失效——这正是「快捷键呼出时窗口被其他应用盖在下面、只在
+/// 任务栏闪烁」的根因。
+///
+/// 在热键处理线程里直接 `FindWindowW` + 激活，单进程（同进程跨线程）
+/// 与双进程（daemon 托盘线程 → UI 进程窗口）都成立：热键授权允许
+/// 跨进程 `SetForegroundWindow`。UI 主线程的「可见性对账」会发现
+/// 窗口已可见并恢复渲染；`WM_SHOW_MAIN` 若随后到达，`focus_window`
+/// 再做一次幂等置前兜底。
+pub fn activate_window_by_title(title: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, FindWindowW, IsIconic, IsWindowVisible, SetForegroundWindow,
+        ShowWindow, SW_RESTORE,
+    };
+
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let hwnd = match unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) } {
+        Ok(h) if !h.is_invalid() => h,
+        _ => {
+            tracing::debug!("按标题未找到窗口：{title}（可能尚未创建）");
+            return false;
+        }
+    };
+    unsafe {
+        // 窗口已处于正常显示状态（非隐藏、非最小化）时不干预：
+        // 双进程模式下热键是 toggle——可见时上层紧接着会把它隐藏，
+        // 这里若先前置会「闪一下又消失」。
+        // 可见但被其他窗口盖住的情况，由 UI 主线程的
+        // `focus_window`（加强版）负责置前。
+        if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+            return false;
+        }
+        // 最小化（IsIconic）或被 SW_HIDE 隐藏（IsWindowVisible=false）
+        // 都先还原：SW_RESTORE 同时覆盖这两种状态。
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let fg_ok = SetForegroundWindow(hwnd).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        if !fg_ok {
+            tracing::debug!("热键线程 SetForegroundWindow 未成功（前台锁），主线程将再兜底");
+        }
+        // 只要执行了显示方向就返回 true：置前失败由主线程兜底，
+        // 但上层绝不能再把窗口 toggle 回隐藏。
+        true
+    }
+}
+
+#[cfg(not(windows))]
+pub fn activate_window_by_title(_title: &str) -> bool {
+    false
 }
 
 /// 自动粘贴：把剪贴板内容以 Ctrl+V 发给当前前台窗口。

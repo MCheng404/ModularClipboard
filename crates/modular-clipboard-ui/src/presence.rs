@@ -67,13 +67,15 @@ pub enum Action {
 
 /// 单个 [`TrayEvent`] 对应的动作。
 ///
-/// `Show` 与 `Hotkey` **必须**映射到同一个 [`Action::Show`]：
-/// 两条入口走同一条唤起路径，才能保证「左键能唤起，快捷键也一定
-/// 能唤起」——分成两个动作就会各自演化出不同的前置条件，
-/// 最终表现为「有时按快捷键没反应」。
+/// `Show`、`Hotkey` 与 `HotkeyShown` **必须**映射到同一个
+/// [`Action::Show`]：三条入口走同一条唤起路径，才能保证「左键能唤起，
+/// 快捷键也一定能唤起」——分成两个动作就会各自演化出不同的前置条件，
+/// 最终表现为「有时按快捷键没反应」。`HotkeyShown` 在托盘线程已直接
+/// 完成显示与置前，这里再做一次 `focus_window` 是幂等的双保险
+/// （单进程模式下还能在首次置前失败时兜底）。
 pub const fn action_of(ev: TrayEvent) -> Action {
     match ev {
-        TrayEvent::Show | TrayEvent::Hotkey => Action::Show,
+        TrayEvent::Show | TrayEvent::Hotkey | TrayEvent::HotkeyShown => Action::Show,
         // 「粘贴上一条」不经过界面：直接写剪贴板 + 发 Ctrl+V 给前台窗口。
         // 唤起界面再让用户选一条，就失去这个快捷键的意义了。
         TrayEvent::HotkeyPaste => Action::PastePrevious,
@@ -244,51 +246,136 @@ impl Drop for Resident {
 
 /// 唤起主窗口：从最小化/隐藏恢复并置于前台。
 ///
+/// 托盘左键、「显示」菜单项、重复双击 exe、`WM_SHOW_MAIN` 都走这里；
+/// 失焦隐藏后的唤回也走这里。
+///
 /// `IsWindow` 检查是防御性的：正常流程下窗口永不销毁
-/// （关闭按钮走 [`CloseDecision::HideToTray`），但若将来有人改成
+/// （关闭按钮走 [`CloseDecision::HideToTray`]），但若将来有人改成
 /// 真的销毁窗口，这里拿失效句柄调 Win32 会静默失败并留下
 /// 「点了没反应」的现象，不如明确记一条日志。
+///
+/// `SetForegroundWindow` 受 Windows 前台锁限制：后台进程通常无权直接
+/// 抢前台，只会闪一下任务栏。对全局快捷键场景，托盘线程已在 WM_HOTKEY
+/// 授权窗口内直接激活过一次（见 `platform::activate_window_by_title`）；
+/// 本函数是其余唤起路径的兜底，必须把**整个显示+激活序列**包在
+/// `AttachThreadInput` 里，任何一步缺失都会在某些 Windows 版本上
+/// 「弹出来了但压在当前应用下面」：
+///
+/// 1. 附加输入队列（必须在 `ShowWindow` **之前**）；
+/// 2. `ShowWindow(SW_RESTORE)` 恢复最小化/隐藏；
+/// 3. `SetWindowPos` 按置顶身份插回正确的 Z 序层；
+/// 4. `SetForegroundWindow` + `BringWindowToTop` + `SetFocus`；
+/// 5. 断开输入队列；
+/// 6. 仍失败则模拟一次 Alt 键（系统据此认为用户主动发起了前台切换）
+///    再重试，最后用 `FlashWindowEx` 让任务栏图标闪烁。
 pub fn focus_window(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, SetFocus, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, FlashWindowEx, FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, HWND_TOP,
+        SWP_SHOWWINDOW, WS_EX_TOPMOST,
+    };
+
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         tracing::warn!("唤起失败：主窗口句柄已失效");
         return;
     }
     unsafe {
+        let cur_thread = GetCurrentThreadId();
+        let fg = GetForegroundWindow();
+        // fg 为空（当前没有任何前台窗口）或已是本窗口时，无需附加。
+        let fg_thread = if fg.0.is_null() || fg == hwnd {
+            0
+        } else {
+            GetWindowThreadProcessId(fg, None)
+        };
+        let attached = fg_thread != 0
+            && fg_thread != cur_thread
+            && AttachThreadInput(cur_thread, fg_thread, true).as_bool();
+
         // 一次 SW_RESTORE 覆盖「最小化」与「隐藏」两种状态：
         // 对未最小化的隐藏窗口，它等价于 SW_SHOW。
         let _ = ShowWindow(hwnd, SW_RESTORE);
-        if SetForegroundWindow(hwnd).as_bool() {
-            return;
-        }
-        // 前台窗口限制：后台进程不能直接抢前台。
-        //
-        // 不用 `AllowSetForegroundWindow`——它只能由**当前前台窗口**
-        // 所属线程调用去授权*其它*进程，对自己不生效（会失败）。
-        // 它的适用场景是「A 窗口刚被点过，想让 B 进程弹窗」，
-        // 与本场景相反。
-        //
-        // 正确做法是把本线程的输入队列临时接到前台线程上，
-        // 让 `SetForegroundWindow` 认为自己来自前台。
-        let fg = GetForegroundWindow();
-        if fg.0.is_null() || fg == hwnd {
-            return;
-        }
-        let fg_thread = GetWindowThreadProcessId(fg, None);
-        let cur_thread = GetCurrentThreadId();
-        if fg_thread == 0 || fg_thread == cur_thread {
-            return;
-        }
-        let _ = AttachThreadInput(cur_thread, fg_thread, true);
-        let _ = SetForegroundWindow(hwnd);
+
+        // 按当前置顶身份插回 Z 序：置顶窗口必须进 HWND_TOPMOST 层，
+        // 否则即便 ShowWindow 了，仍会被失焦期间升起的其他窗口压住；
+        // SWP_SHOWWINDOW 保证隐藏态也被显示，SWP_NOACTIVATE 让真正的
+        // 激活交给下面的 SetForegroundWindow。
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let z_after = if ex_style & WS_EX_TOPMOST.0 != 0 {
+            HWND_TOPMOST
+        } else {
+            HWND_TOP
+        };
+        let _ = SetWindowPos(
+            hwnd,
+            Some(z_after),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW | SWP_NOACTIVATE,
+        );
+
+        let mut ok = SetForegroundWindow(hwnd).as_bool();
+        let _ = BringWindowToTop(hwnd);
+        // SetFocus 对其他线程的窗口通常失败，附加输入队列后才生效；
+        // 失败可忽略（SetForegroundWindow 已承担键盘焦点转移）。
+        let _ = SetFocus(Some(hwnd));
+
         // 必须解除：连接期间本线程的消息会被送进前台线程的队列，
         // 忘记解除会造成键盘输入落到别人的窗口上。
-        let _ = AttachThreadInput(cur_thread, fg_thread, false);
+        if attached {
+            let _ = AttachThreadInput(cur_thread, fg_thread, false);
+        }
+
+        if !ok {
+            // Alt 键技巧：系统把「按住 Alt」视为用户正在亲自切换窗口，
+            // 此后的 SetForegroundWindow 不再受前台锁限制。
+            keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            ok = SetForegroundWindow(hwnd).as_bool();
+            let _ = BringWindowToTop(hwnd);
+        }
+
+        if !ok {
+            // 最终兜底：任务栏图标闪烁到窗口变为前台为止，
+            // 至少让用户明确知道有窗口在请求注意。
+            let fi = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                uCount: 3,
+                dwTimeout: 0,
+            };
+            let _ = FlashWindowEx(&fi);
+        }
     }
 }
 
+/// 当前前台窗口是否属于**本进程**。
+///
+/// 失焦隐藏的二次确认：主窗口失去焦点时，新前台若仍是本进程窗口
+/// （设置窗、托盘线程弹出的系统右键菜单/迷你面板等），这次「失焦」
+/// 并不是切到别的程序，不应把主窗口藏起来。
+///
+/// 取不到前台窗口（焦点在桌面/无窗口）时按「非本进程」处理——
+/// 那种情况隐藏到托盘符合「失焦即收起」的预期。
+pub fn foreground_is_own_process() -> bool {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    let fg = unsafe { GetForegroundWindow() };
+    if fg.0.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    pid != 0 && pid == unsafe { GetCurrentProcessId() }
+}
+
 /// 隐藏主窗口（不销毁），托盘继续常驻。
-pub fn hide_window(hwnd: HWND) {
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+pub fn hide_window(hwnd: HWND) {    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         tracing::warn!("隐藏失败：主窗口句柄已失效");
         return;
     }
@@ -313,6 +400,19 @@ pub fn hide_window(hwnd: HWND) {
 /// 于是**光标永远是默认箭头**——在搜索框上、在可点条目上、在文本上
 /// 全都一模一样，「这里能点」没有任何视觉提示。
 ///
+/// # 两个必须守住的边界
+///
+/// 1. **指针不在本窗口上时不动光标**。`SetCursor` 是 Win32 全局状态，
+///    本窗口的帧循环若在指针悬停于其它窗口（拖出的卡片子窗口、
+///    设置窗口）时也去设箭头，就会把那些窗口外壳的 resize 光标
+///    覆盖掉——「resize 无光标指示」的成因之一。
+/// 2. **指针落在窗口外壳（resize 边/角、拖动区）上时，听外壳的**。
+///    egui 0.36 没有 `Resize*` 系列变体，指针悬停在边缘时它报
+///    `Default`；直接套用下面的映射会把它覆盖回箭头——
+///    这正是「调整窗口大小时无任何光标指示」的根因。
+///    缩放光标由 `chrome` 模块（`WM_SETCURSOR` + [`shell_cursor_id`]）
+///    决定，这里只负责把外壳没接管的客户区光标映射成 Win32 资源。
+///
 /// 只在**形状变化时**才调 `SetCursor`：它是 Win32 全局状态，
 /// 每帧设一次既无必要也会和别的窗口抢光标。
 pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
@@ -320,26 +420,33 @@ pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
     // 上一次设置的光标。0 = 从未设过。
     static LAST: AtomicU32 = AtomicU32::new(0);
 
-    // egui 0.36 的变体名与旧版不同：手型是 `PointingHand`（不是 `Pointer`），
-    // 且**没有** `Resize*` 系列 —— 缩放光标由 `WM_NCHITTEST` + 系统
-    // 默认处理，不走这里。
-    let code: u16 = match icon {
+    // 指针不在本窗口上：光标归别的窗口 / 系统管，这里绝不能碰。
+    if !modular_clipboard_gfx::chrome::pointer_is_over(hwnd) {
+        return;
+    }
+
+    // 指针在窗口外壳（resize 边/角、拖动区）或拖动中：由外壳决定。
+    let code: u16 = if let Some(shell) = modular_clipboard_gfx::chrome::shell_cursor_id(hwnd) {
+        shell
+    } else {
         // IDC_* 在 windows crate 里是 PCWSTR 常量，这里要裸的u16 资源 ID。
-        egui::CursorIcon::Default => IDC_ARROW.0 as u16,
-        egui::CursorIcon::Text | egui::CursorIcon::VerticalText => IDC_IBEAM.0 as u16,
-        egui::CursorIcon::PointingHand => IDC_HAND.0 as u16,
-        egui::CursorIcon::Help
-        | egui::CursorIcon::ContextMenu
-        | egui::CursorIcon::Alias
-        | egui::CursorIcon::Copy
-        | egui::CursorIcon::Move
-        | egui::CursorIcon::Cell
-        | egui::CursorIcon::Crosshair
-        | egui::CursorIcon::Grab
-        | egui::CursorIcon::Grabbing => IDC_ARROW.0 as u16,
-        // 其余（None / Progress / Wait / NoDrop / NotAllowed）本项目
-        // 不会产生，一律退回默认箭头。
-        _ => IDC_ARROW.0 as u16,
+        match icon {
+            egui::CursorIcon::Default => IDC_ARROW.0 as u16,
+            egui::CursorIcon::Text | egui::CursorIcon::VerticalText => IDC_IBEAM.0 as u16,
+            egui::CursorIcon::PointingHand => IDC_HAND.0 as u16,
+            egui::CursorIcon::Help
+            | egui::CursorIcon::ContextMenu
+            | egui::CursorIcon::Alias
+            | egui::CursorIcon::Copy
+            | egui::CursorIcon::Move
+            | egui::CursorIcon::Cell
+            | egui::CursorIcon::Crosshair
+            | egui::CursorIcon::Grab
+            | egui::CursorIcon::Grabbing => IDC_ARROW.0 as u16,
+            // 其余（None / Progress / Wait / NoDrop / NotAllowed）本项目
+            // 不会产生，一律退回默认箭头。
+            _ => IDC_ARROW.0 as u16,
+        }
     };
     let key = code as u32;
     if LAST.swap(key, Ordering::Relaxed) == key {
@@ -533,6 +640,9 @@ mod tests {
         // 两条入口必须归一：分开展会导致「有时能唤起有时不能」。
         assert_eq!(action_of(TrayEvent::Show), Action::Show);
         assert_eq!(action_of(TrayEvent::Hotkey), Action::Show);
+        // 托盘线程已在热键授权窗口内直接激活过主窗口：
+        // 映射到 Show 是幂等置前兜底，不能变成「无动作」或隐藏。
+        assert_eq!(action_of(TrayEvent::HotkeyShown), Action::Show);
     }
 
     #[test]

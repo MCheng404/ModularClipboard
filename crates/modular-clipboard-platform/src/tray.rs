@@ -43,6 +43,15 @@ pub enum TrayEvent {
     Quit,
     /// 「显示主窗口」快捷键被按下。
     Hotkey,
+    /// 快捷键呼出的**显示方向**已由托盘线程在 WM_HOTKEY 授权窗口内
+    /// 直接完成（窗口已 `ShowWindow` + `SetForegroundWindow`）。
+    ///
+    /// 与 [`Self::Hotkey`] 的区别：普通 `Hotkey` 交给上层按 toggle
+    /// 语义处理（双进程 daemon 会按窗口可见性决定隐藏/显示）；
+    /// `HotkeyShown` 表示窗口已经被显示并置前，上层**不得再 toggle
+    /// 一次**（否则会把刚呼出的窗口立刻藏回去）。UI 进程自身的
+    /// 「可见性对账」会发现窗口已可见并恢复渲染。
+    HotkeyShown,
     /// 迷你面板里选中了某个条目（携带条目 id）。
     ///
     /// 面板本身在托盘线程里弹出（系统菜单），但**复制动作必须由
@@ -832,7 +841,22 @@ mod imp {
                 tracing::debug!(id = wparam.0 as i32, "托盘窗口过程收到 WM_HOTKEY");
                 match wparam.0 as i32 {
                     id if id == hotkey::Slot::PastePrevious.id() => emit(TrayEvent::HotkeyPaste),
-                    _ => emit(TrayEvent::Hotkey),
+                    _ => {
+                        // 趁本线程还持有系统派发 WM_HOTKEY 时授予的
+                        // 「前台窗口」权限，直接把主窗口激活到最前。
+                        // 转发到 UI 主线程再 SetForegroundWindow 会因
+                        // 授权失效而被其他应用盖住（见 lib.rs
+                        // activate_window_by_title 的说明）。
+                        if crate::activate_window_by_title(crate::UI_WINDOW_TITLE) {
+                            // 显示方向已在授权窗口内完成（含双进程
+                            // 跨进程激活），上层不得再 toggle 一次。
+                            emit(TrayEvent::HotkeyShown);
+                        } else {
+                            // 窗口已可见（toggle 隐藏方向 / 幂等置前）
+                            // 或尚未创建（需要上层拉起新进程）。
+                            emit(TrayEvent::Hotkey);
+                        }
+                    }
                 }
                 LRESULT(0)
             }

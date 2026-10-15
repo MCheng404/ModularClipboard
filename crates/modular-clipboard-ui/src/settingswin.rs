@@ -30,8 +30,9 @@ const TITLE: &str = "剪贴板设置";
 ///
 /// 定稿布局：左侧导航（搜索框 + 圆角导航块）+ 右侧卡片内容。
 /// 宽度 780 容纳「常规/外观/捕获/存储/快捷键/关于」六分类导航
-/// 与右侧完整卡片；固定大小（无 resize 逻辑）。
+/// 与右侧完整卡片；允许拖拽缩放，维持导航和控件的最小宽度。
 const DEFAULT_SIZE: (f32, f32) = (780.0, 560.0);
+const MIN_SIZE: (f32, f32) = (720.0, 400.0);
 
 /// 设置窗口。
 ///
@@ -71,6 +72,9 @@ impl<'a> SettingsWindow<'a> {
             (DEFAULT_SIZE.0 * s) as u32,
             (DEFAULT_SIZE.1 * s) as u32,
         )?;
+        // 左侧导航固定占宽，右侧大字号分段控件也需要空间；
+        // 限制设置窗口下限，避免拖窄后在两列之间重叠。
+        window.set_min_size(MIN_SIZE.0, MIN_SIZE.1);
         // 与主窗口一致：告知设备纹理上限，否则超采样下字体图集会溢出。
         window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
         // `Window::new` 收物理像素，`anchor` 是逻辑点，要乘 `s`。

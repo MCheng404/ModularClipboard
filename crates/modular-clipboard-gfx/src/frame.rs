@@ -1309,6 +1309,11 @@ impl<'a> FrameRenderer<'a> {
         //
         // 底图必须用**独立的管线与描述符集**：它采样的是低分辨率模糊图，
         // 与 egui 图元管线（采样字体图集/缩略图）不是同一套布局。
+        //
+        // push constant：底图绘制**每次都要推** `pre.uv_offset`。
+        // 着色器 `fs_copy` 声明了这块常量（自研磨砂移动预测的采样
+        // 位移），不推 = 未定义内容 = 底图随机平移。零位移路径
+        // （覆盖层模糊 / 超采样降采样）推的也是零，行为与加常量前一致。
         if let Some(pre) = input.prelude {
             let pre_sets = [pre.descriptor_set];
             unsafe {
@@ -1322,6 +1327,13 @@ impl<'a> FrameRenderer<'a> {
                     &[],
                 );
                 // 全屏三角形：3 顶点、无顶点缓冲。
+                device.cmd_push_constants(
+                    cmd,
+                    pre.layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&pre.uv_offset),
+                );
                 device.cmd_draw(cmd, 3, 1, 0, 0);
             }
         }
