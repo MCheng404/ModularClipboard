@@ -25,18 +25,18 @@
 //! 窗口实际是**不透明**的，见 `presence::apply_backdrop` 的说明）。
 //! 交换链 alpha 在这条管线上不参与合成，alpha=0 的像素就落成黑色。
 //!
-//! 于是弹窗照同一套做：== 假透明 ==
+//! 于是弹窗改用另一条路：== 窗口就是面板 ==
 //!
-//! 1. 节流捕获**自己身后**的桌面（`DesktopCapture::capture_behind`，
-//!    配合 `WDA_EXCLUDEFROMCAPTURE` 自排除，否则会抓到自己的上一帧，
-//!    形成反馈回路）；
-//! 2. 上传成 egui 纹理，**铺满整个客户区**（不透明）；
-//! 3. 投影画在底图之上（alpha 混合在渲染层完成），面板再画在最上层，
-//!    面板圆角处露出的就是底图 ⇒ 视觉上就是圆角 + 浮在桌面上。
+//! 1. **窗口矩形 = 内容矩形**（不再多留一圈投影边距）——没有「面板之外」
+//!    的区域，就不存在「那块画什么」的问题；
+//! 2. 圆角与投影交给 **DWM 系统圆角**（`apply_rounded_corners`）与
+//!    DWM 的窗口投影：窗口本身就是那块圆角面板，边角自然透出桌面；
+//! 3. 内容铺满窗口（不透明），底衬仍是捕获到的身后桌面（有则更贴合，
+//!    没有也不露黑——因为内容已经盖满了）。
 //!
-//! 窗口矩形仍比面板大一圈 [`SHADOW_MARGIN`]，而**命中判定不看像素**，
-//! 所以还要登记「面板形状」让 `WM_NCHITTEST` 对外圈返回
-//! `HTTRANSPARENT`（见 `set_panel_shape`），否则点投影会点不动底下的窗口。
+//! 用户反馈的正是这一点：「应该只渲染搜索框内和图标的那个正方形」——
+//! 即**不要让底图铺成一个比面板更大的矩形**，那圈多出来的部分在
+//! alpha 不参与合成的前提下只会是黑的。
 //!
 //! # 焦点
 //!
@@ -53,11 +53,11 @@ use modular_clipboard_gfx::window::{Window, WindowEvent};
 
 use crate::multiwindow::{SharedGfx, WindowGfx};
 
-/// 面板投影的安全边距（逻辑点）。
+/// 弹窗窗口相对内容的边距（逻辑点）。
 ///
-/// 弹窗客户区 = 面板 + 四周各一圈本值，用来容纳高斯投影（模糊半径
-/// 8pt ≈ 12px，浓度 20%）。**窗口矩形比面板大**这一圈，是上面
-/// 「点击穿透」那条存在的原因。
+/// 用来容纳**自研**高斯投影（圆角与投影都自己画，不靠 DWM）。
+/// 这圈区域铺的是捕获到的身后桌面——不能留空：本项目不靠 DWM 的
+/// 逐像素 alpha 合成，留空就是黑的。
 pub const SHADOW_MARGIN: f32 = 12.0;
 
 /// 弹窗身份。既是内容分派的键，也是热区命名空间。
@@ -113,6 +113,8 @@ pub struct Popup<'a> {
     bg_tex: Option<egui::TextureHandle>,
     /// 上次定位到的屏幕位置。窗口一动身后内容就变了，必须强制重抓。
     last_pos: Option<(i32, i32)>,
+    /// 首张底图是否已记过日志（避免每帧刷屏）。
+    capture_logged: bool,
 }
 
 impl<'a> Popup<'a> {
@@ -124,10 +126,7 @@ impl<'a> Popup<'a> {
         shared: &SharedGfx<'a>,
     ) -> anyhow::Result<Self> {
         let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
-        let client = egui::vec2(
-            panel_size.x + SHADOW_MARGIN * 2.0,
-            panel_size.y + SHADOW_MARGIN * 2.0,
-        );
+        let client = egui::vec2(panel_size.x + SHADOW_MARGIN * 2.0, panel_size.y + SHADOW_MARGIN * 2.0);
         let mut window = Window::new_popup(
             kind.title(),
             (client.x * s) as u32,
@@ -135,16 +134,19 @@ impl<'a> Popup<'a> {
             !kind.activatable(),
         )?;
         window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
-        // 面板形状 = 客户区中央的面板矩形；之外（投影区）点击穿透。
-        // 用**整数像素**登记：Win32 命中判定按整数像素，亚像素矩形会漏边。
+        // 面板形状 = 窗口中央的内容矩形；之外那圈（投影区）点击穿透
+        // ——命中判定看窗口矩形而非像素，不登记就会吃掉底下窗口的点击。
+        // 用**整数像素**登记：Win32 命中按整数像素，亚像素矩形会漏边。
         // （egui 0.36 的 `Rect` 没有 `round()`，自己取整。）
         let panel = egui::Rect::from_min_max(
-            egui::pos2(SHADOW_MARGIN, SHADOW_MARGIN),
-            egui::pos2(SHADOW_MARGIN + panel_size.x, SHADOW_MARGIN + panel_size.y),
-        );
-        let panel = egui::Rect::from_min_max(
-            egui::pos2(panel.min.x.round(), panel.min.y.round()),
-            egui::pos2(panel.max.x.round(), panel.max.y.round()),
+            egui::pos2(
+                (SHADOW_MARGIN).round(),
+                (SHADOW_MARGIN).round(),
+            ),
+            egui::pos2(
+                (SHADOW_MARGIN + panel_size.x).round(),
+                (SHADOW_MARGIN + panel_size.y).round(),
+            ),
         );
         modular_clipboard_gfx::chrome::set_panel_shape(window.hwnd(), Some(panel));
         // 捕获自排除：桌面捕获要看到弹窗**身后**而不是弹窗自己
@@ -172,6 +174,7 @@ impl<'a> Popup<'a> {
             last_capture: None,
             bg_tex: None,
             last_pos: None,
+            capture_logged: false,
         })
     }
 
@@ -234,16 +237,21 @@ impl<'a> Popup<'a> {
                 }
             },
         };
-        match cap.capture_behind(self.window.hwnd().0 as isize) {
+        match cap.capture_behind_scaled(self.window.hwnd().0 as isize, 1) {
             Ok(Some((bits, w, h))) => {
-                // 捕获是客户区的 1/2 分辨率（`CAPTURE_DOWNSCALE`）：
-                // 底图只需要「身后大概是什么」，省一半上传量。
+                // 全分辨率（`downscale = 1`）：底图直接露在投影边距与
+                // 按钮缝隙里，1/2 分辨率拉伸回去会发虚、与真实桌面接缝。
+                // 弹窗只有几十×几百像素，上传量可忽略。
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], bits);
                 self.bg_tex = Some(self.ctx.load_texture(
                     "popup_backdrop",
                     img,
                     egui::TextureOptions::LINEAR,
                 ));
+                if !self.capture_logged {
+                    self.capture_logged = true;
+                    tracing::info!(w, h, "弹窗底图已就绪（身后桌面捕获成功）");
+                }
                 self.last_capture = Some(now);
             }
             // 最小化 ⇒ 跳过，保留上一帧底图。
@@ -276,7 +284,6 @@ impl<'a> Popup<'a> {
         }
 
         // 定位：面板左上角的屏幕坐标（逻辑点）→ 物理像素。
-        // 客户区比面板大一圈投影边距，弹窗左上角要减掉它。
         let s = self.window.scale_factor();
         let margin = SHADOW_MARGIN;
         let x_px = ((panel_pos_screen.x - margin) * s) as i32;

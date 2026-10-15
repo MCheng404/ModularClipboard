@@ -340,7 +340,15 @@ pub enum WindowIme {
 /// **一组的**（ex 样式 / 初始显隐 / 圆角 / resize 边 / 位置），
 /// 逐个 bool 参数会出现 `new(t, w, h, false, true, false, 0.0, None)`
 /// 这种不可读的调用点。
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// # CAUTION: `Default` 必须手写，不能用 derive
+///
+/// derive 出来全是零值（`show=false` / `rounded=false` / `border=0`），
+/// 而**主窗口要的就是「显示 + 系统圆角 + 默认 resize 边」**——早前图省事
+/// 用了 derive，结果主窗口与设置窗口**再也不调 `apply_rounded_corners`**，
+/// 圆角整体消失（用户实机一眼看出来）。默认值必须照 `Window::new`
+/// 的老行为写死。
+#[derive(Debug, Clone, Copy)]
 pub struct WindowOpts {
     /// 扩展样式（主窗口传 0；弹窗见 [`Window::new_popup`]）。
     pub ex_style: WINDOW_EX_STYLE,
@@ -354,6 +362,21 @@ pub struct WindowOpts {
     pub resize_border: f32,
     /// 初始位置（物理像素）。`None` = 系统默认 (120, 120)。
     pub pos: Option<(i32, i32)>,
+}
+
+impl Default for WindowOpts {
+    /// **主窗口**的那一份：可见 + 系统圆角 + 默认 resize 边。
+    ///
+    /// 弹窗走 [`Window::new_popup`] 显式构造，不受这里影响。
+    fn default() -> Self {
+        Self {
+            ex_style: WINDOW_EX_STYLE(0),
+            show: true,
+            rounded: true,
+            resize_border: chrome::DEFAULT_RESIZE_BORDER,
+            pos: None,
+        }
+    }
 }
 
 /// Win32 窗口。

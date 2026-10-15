@@ -62,7 +62,12 @@ pub const CAPTURE_DOWNSCALE: u32 = 2;
 
 /// 捕获尺寸：客户区尺寸除以 [`CAPTURE_DOWNSCALE`]，向上取整且至少为 1。
 pub fn capture_size(width: u32, height: u32) -> (u32, u32) {
-    let d = CAPTURE_DOWNSCALE.max(1);
+    capture_scaled(width, height, CAPTURE_DOWNSCALE)
+}
+
+/// 按指定倍率算捕获尺寸（`1` = 原分辨率）。
+pub fn capture_scaled(width: u32, height: u32, downscale: u32) -> (u32, u32) {
+    let d = downscale.max(1);
     ((width.div_ceil(d)).max(1), (height.div_ceil(d)).max(1))
 }
 
@@ -361,6 +366,23 @@ impl DesktopCapture {
     ///
     /// 客户区尺寸与 DIB 不符时自动重建 DIB（窗口 resize 后的首帧）。
     pub fn capture_behind(&mut self, hwnd: isize) -> anyhow::Result<Option<(&[u8], u32, u32)>> {
+        self.capture_behind_scaled(hwnd, CAPTURE_DOWNSCALE)
+    }
+
+    /// 指定降采样倍率的捕获（1 = 原分辨率）。
+    ///
+    /// # 为什么需要倍率参数
+    ///
+    /// 主窗口那套按 1/2 分辨率抓（`CAPTURE_DOWNSCALE`）是为了压上传量
+    /// （720×800 全分辨率约 1.66MB/帧，会撑满 staging arena）。但**弹窗
+    /// 是要拿它当「透明」用的**：那圈十几像素的边距与按钮缝隙直接露出
+    /// 底图，1/2 分辨率再拉伸回去会明显发虚、与周围真实桌面接缝，
+    /// 一眼看出是假的。弹窗只有几十×几百像素，全分辨率上传量可忽略。
+    pub fn capture_behind_scaled(
+        &mut self,
+        hwnd: isize,
+        downscale: u32,
+    ) -> anyhow::Result<Option<(&[u8], u32, u32)>> {
         // SAFETY: hwnd 由调用方从活的窗口句柄转换而来；
         // 本结构持有的 DC 与位图均由 GDI 合法分配。
         unsafe {
@@ -371,7 +393,7 @@ impl DesktopCapture {
             let mut rc = RECT::default();
             GetClientRect(hwnd, &mut rc)?;
             let (cw, ch) = capture_extent(rc.right - rc.left, rc.bottom - rc.top);
-            let (w, h) = capture_size(cw, ch);
+            let (w, h) = capture_scaled(cw, ch, downscale);
             self.ensure_size(w, h)?;
 
             // 客户区原点转屏幕坐标：桌面 DC 以虚拟屏幕为坐标系。

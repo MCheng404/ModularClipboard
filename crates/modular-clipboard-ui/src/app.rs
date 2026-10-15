@@ -834,6 +834,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
+                !hidden,
             );
             frame_no += 1;
             continue;
@@ -987,6 +988,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
+                !hidden,
             );
             continue;
         }
@@ -1030,6 +1032,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
+                !hidden,
             );
             continue;
         }
@@ -1061,6 +1064,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
+                !hidden,
             );
             continue;
         };
@@ -1176,6 +1180,7 @@ fn run_mode(
             &window,
             frame_no,
             topmost,
+            !hidden,
         );
 
         frame_no += 1;
@@ -1358,6 +1363,7 @@ fn drive_attach_windows<'a>(
     window: &Window,
     frame_no: u64,
     topmost: bool,
+    main_visible: bool,
 ) {
     // 悬浮弹窗（搜索面板 / 类型过滤栏）--------------------------------------
     //
@@ -1376,15 +1382,11 @@ fn drive_attach_windows<'a>(
         );
         let anchor = window.screen_position_points();
         let s = window.scale_factor();
-        popups.sync_search(
-            app,
-            app.paint_state.search_expanded,
-            floats.search,
-            anchor,
-            s,
-            shared,
-            topmost,
-        );
+        // 主窗口隐藏（失焦隐藏 / 收托盘 / 关闭按钮）时弹窗必须一起收：
+        // 它们是**贴着主窗口**的浮动面板，主窗口不在了却留着两块面板
+        // 浮在桌面上，是最刺眼的一种「渲染 bug」。
+        let want_search = main_visible && app.paint_state.search_expanded;
+        popups.sync_search(app, want_search, floats.search, anchor, s, shared, topmost);
         // 隐藏时**必须清**弹窗回报的两项：否则上一次「正在打字」
         // 的 true 会一直留在状态里，主窗口的搜索状态机认为有人持有
         // 焦点，面板再也收不回去。
@@ -1392,7 +1394,15 @@ fn drive_attach_windows<'a>(
             app.paint_state.search_popup_hover = false;
             app.paint_state.search_popup_focus = false;
         }
-        popups.sync_rail(app, floats.rail.is_some(), floats.rail, anchor, s, shared, topmost);
+        popups.sync_rail(
+            app,
+            main_visible && floats.rail.is_some(),
+            floats.rail,
+            anchor,
+            s,
+            shared,
+            topmost,
+        );
     }
 
     // 卡片子窗口
@@ -2468,8 +2478,12 @@ pub fn draw_popup(
             ui.painter().rect_filled(client, 0.0, self.pal.bg);
         }
     }
-    // 投影先画：用**客户区级** painter（`painter_at(panel)` 会把投影裁掉
-    // 一圈，面板就贴着桌面、浮不起来）。
+    // ---- 自研投影：画在**客户区级** painter 上 ----
+    //
+    // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，这圈铺的是捕获到的桌面；
+    // 投影就用项目自己的高斯投影画在内容矩形外围（alpha 混合在渲染层
+    // 完成）。用 `painter_at(panel)` 会把投影裁掉一圈，面板就贴着桌面、
+    // 浮不起来 —— 所以这里必须用 `ui.painter()`。
     crate::paint::draw_popup_shadow(ui.painter(), panel, &self.pal);
     // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
     // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
