@@ -20,6 +20,12 @@ pub enum ClipKind {
     Image,
     /// 文件路径列表
     Files,
+    /// Markdown 文档
+    ///
+    /// 载荷与 [`ClipKind::Text`] 同为 UTF-8 文本，单独分类是为了让
+    /// 界面按 Markdown 渲染（标题 / 列表 / 代码块等）而非等宽纯文本。
+    /// 由捕获层的格式探测判定（见 `capture` 的 `looks_like_markdown`）。
+    Markdown,
 }
 
 impl ClipKind {
@@ -29,6 +35,18 @@ impl ClipKind {
             ClipKind::Html => "html",
             ClipKind::Image => "image",
             ClipKind::Files => "files",
+            ClipKind::Markdown => "markdown",
+        }
+    }
+
+    /// 界面展示名（列表行右下角标签 / 类型过滤栏 tooltip）。
+    pub fn label(self) -> &'static str {
+        match self {
+            ClipKind::Text => "文本",
+            ClipKind::Html => "HTML",
+            ClipKind::Image => "图片",
+            ClipKind::Files => "文件",
+            ClipKind::Markdown => "Markdown",
         }
     }
 }
@@ -167,9 +185,22 @@ mod tests {
 
     #[test]
     fn kind_roundtrips_through_json() {
-        for kind in [ClipKind::Text, ClipKind::Html, ClipKind::Image, ClipKind::Files] {
+        for kind in [
+            ClipKind::Text,
+            ClipKind::Html,
+            ClipKind::Image,
+            ClipKind::Files,
+            ClipKind::Markdown,
+        ] {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(serde_json::from_str::<ClipKind>(&json).unwrap(), kind);
         }
+    }
+
+    #[test]
+    fn markdown_kind_serializes_as_lowercase() {
+        assert_eq!(serde_json::to_string(&ClipKind::Markdown).unwrap(), "\"markdown\"");
+        assert_eq!(ClipKind::Markdown.as_str(), "markdown");
+        assert_eq!(ClipKind::Markdown.label(), "Markdown");
     }
 }

@@ -136,7 +136,41 @@ pub fn layout_demand(ws: &Workspace) -> Vec<f32> {
 /// 右缘可能超出 `body.max.x` 约 1e-5pt 或留一条亚像素缝。
 /// 详见落位循环处的说明。
 pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
-    let body = card_area(area);
+    solve_scaled_inset(ws, area, scale, [0.0; 4])
+}
+
+/// 求解 + **悬浮装饰让出的附加内缩**（2026-10-15 第三轮：类型过滤栏）。
+///
+/// `insets` = `[左, 右, 上, 下]`，在 [`card_area`] 基础之上**再**缩。
+/// 类型过滤栏停靠某侧时，该侧要让出 `图标边长 + 间距`——否则浮动按钮
+/// 会压在列表内容上（右缘更会盖住滚动条与行内删除按钮，那是历史上
+/// 极难自查的一类 bug）。顶/底方向同理。
+///
+/// 附加内缩为 0 时与 [`solve_scaled`] 完全等价（旧调用点不受影响）。
+pub fn solve_scaled_inset(
+    ws: &Workspace,
+    area: Rect,
+    scale: f32,
+    insets: [f32; 4],
+) -> Solution {
+    let base = card_area(area);
+    let body = Rect::from_min_max(
+        pos2(base.min.x + insets[0].max(0.0), base.min.y + insets[2].max(0.0)),
+        pos2(base.max.x - insets[1].max(0.0), base.max.y - insets[3].max(0.0)),
+    );
+    if body.width() <= 0.0 || body.height() <= 0.0 {
+        return Solution {
+            rects: vec![Rect::ZERO; ws.cards.len()],
+        };
+    }
+    solve_body(ws, body, scale)
+}
+
+/// [`solve_scaled`] 的主体：在**已算好的** `body` 内分配卡片宽度。
+///
+/// 从 [`solve_scaled_inset`] 抽出来是为了让「body 怎么来」与「卡片怎么分」
+/// 两个关注点分开：附加内缩（类型栏占位）只影响前者。
+fn solve_body(ws: &Workspace, body: Rect, scale: f32) -> Solution {
     if body.width() <= 0.0 || body.height() <= 0.0 {
         return Solution {
             rects: vec![Rect::ZERO; ws.cards.len()],
@@ -250,7 +284,10 @@ pub fn solve(ws: &Workspace, area: Rect) -> Solution {
 /// DWM：Win10 上 `DWMWA_WINDOW_CORNER_PREFERENCE` 返回 `E_INVALIDARG`
 /// （`apply_rounded_corners` 已优雅降级），窗口仍是直角，
 /// 卡片圆角照常成立。
-const CARD_AREA_INSET: f32 = 8.0;
+///
+/// NOTE: `pub` 是为了让悬浮装饰（类型栏 / 搜索面板）的测试能核对
+/// 「与顶栏、与窗口缘的间距都是这个值」——几何契约只有一处数据源。
+pub const CARD_AREA_INSET: f32 = 8.0;
 
 /// 卡片可用区：扣掉顶部标题栏与底部状态栏，再四周内缩 [`CARD_AREA_INSET`]。
 pub fn card_area(area: Rect) -> Rect {

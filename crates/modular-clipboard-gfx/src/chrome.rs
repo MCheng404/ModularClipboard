@@ -783,7 +783,7 @@ pub(crate) unsafe fn handle_non_client(
                 return Some(LRESULT(1)); // TRUE：不再走默认处理
             }
             // WM_SETCURSOR 的 lParam 低 16 位是命中测试码。
-            let hit = (lparam.0 as u32 & 0xFFFF) as u32;
+            let hit = lparam.0 as u32 & 0xFFFF;
             if let Some(code) = draggable_zone(hit).and_then(HitZone::cursor_id) {
                 unsafe { set_system_cursor(code) };
                 return Some(LRESULT(1));

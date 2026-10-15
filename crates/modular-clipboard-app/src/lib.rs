@@ -528,6 +528,19 @@ impl Service {
     }
 
 
+    /// 读取条目载荷字节（图片缩略图等 UI 预览用途）。
+    ///
+    /// 分离模式下走 IPC（`Command::LoadPayload` → `Response::Bytes`）；
+    /// 单进程模式直接读库。两条路径都可能失败（条目不存在 / 载荷已被
+    /// 淘汰 / 通道故障），调用方按「没有缩略图」降级即可。
+    pub fn load_payload_bytes(&mut self, id: EntryId) -> Result<Vec<u8>> {
+        match &mut self.backend {
+            Backend::Local(l) => l.load_payload_bytes(id),
+            Backend::Remote(r) => r.load_payload_bytes(id),
+        }
+    }
+
+
     /// 复制并自动粘贴到前台窗口。
     pub fn copy_and_paste(&mut self, id: EntryId) -> Result<()> {
         match &mut self.backend {
@@ -895,6 +908,7 @@ impl LocalBackend {
         let bytes = self.store.load_payload(&item)?;
         let mut reader = ClipboardReader::new()?;
 
+
         // CAUTION: 抑制必须在**写之前**武装，不能等写完再标。
         //
         // 早前 `suppress_self_capture()` 在 `match item.kind` **之后**，
@@ -912,7 +926,9 @@ impl LocalBackend {
             .store(now_ms() as u64, Ordering::Relaxed);
 
         match item.kind {
-            ClipKind::Text | ClipKind::Html => {
+            // Markdown 载荷与 Text 同为 UTF-8 文本：复制的是**源码**
+            // （用户从哪复制的就还回什么，渲染只发生在界面显示侧）。
+            ClipKind::Text | ClipKind::Html | ClipKind::Markdown => {
                 reader.write_text(&String::from_utf8_lossy(&bytes))?;
             }
             ClipKind::Files => {
@@ -932,7 +948,18 @@ impl LocalBackend {
 
         self.store.touch(id).ok();
         Ok(())
-        }
+    }
+
+    /// 读取条目载荷字节（UI 图片缩略图用）。
+    ///
+    /// 与 `copy_item` 的读法相同（`store.get` + `load_payload`），
+    /// 差别只是不写剪贴板、不武装自写回抑制——纯读取。
+    fn load_payload_bytes(&mut self, id: EntryId) -> Result<Vec<u8>> {
+        let Some(item) = self.store.get(id)? else {
+            anyhow::bail!("条目不存在");
+        };
+        self.store.load_payload(&item)
+    }
 
     fn copy_and_paste(&mut self, state: &mut AppState, id: EntryId) -> Result<()> {
         self.copy_item(state, id)?;
@@ -1091,6 +1118,14 @@ impl RemoteBackend {
     /// 发一条**没有返回数据**的命令。
     fn unit(&mut self, cmd: Command) -> anyhow::Result<()> {
         self.client.command(cmd).map(|_| ())
+    }
+
+    /// 取条目载荷字节（图片缩略图）。
+    ///
+    /// 与 `mutate` 不同：`Response::Bytes` 不改变列表状态，
+    /// `apply` 对它本就是空操作，这里直接取字节。
+    fn load_payload_bytes(&mut self, id: EntryId) -> anyhow::Result<Vec<u8>> {
+        self.client.load_payload(id)
     }
 
     fn reload_list(&mut self, state: &mut AppState) -> bool {
@@ -1292,7 +1327,9 @@ pub const PREVIEW_MAX_CHARS: usize = 512;
 /// 生成预览文本。
 fn build_preview(payload: &CapturedPayload) -> String {
     match payload.kind {
-        ClipKind::Text | ClipKind::Html => {
+        // Markdown 的预览即**源码前 512 字符**：界面按 Markdown 渲染
+        // 这一截（与 Text 同样的截断取舍，PF-5 / SEC-018）。
+        ClipKind::Text | ClipKind::Html | ClipKind::Markdown => {
             let raw = payload
                 .text
                 .clone()

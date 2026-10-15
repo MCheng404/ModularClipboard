@@ -87,8 +87,15 @@ impl ClipboardReader {
         let html = self.inner.get().html().ok();
 
         match (text, html) {
+            // 纯文本（无 HTML 风味）且形似 Markdown → Markdown 类。
+            // 带 HTML 风味的一律按 Html：富文本编辑器复制出来的内容
+            // 是渲染结果而非 Markdown 源码，不能按 Markdown 排版。
             (Some(t), h) if !t.is_empty() => Some(CapturedPayload {
-                kind: ClipKind::Text,
+                kind: if h.is_none() && looks_like_markdown(&t) {
+                    ClipKind::Markdown
+                } else {
+                    ClipKind::Text
+                },
                 bytes: t.as_bytes().to_vec(),
                 html: h,
                 text: Some(t),
@@ -174,6 +181,54 @@ impl ClipboardReader {
         self.reset_baseline();
         Ok(())
     }
+}
+
+/// 行首是否为 ATX 标题（`# ` ~ `###### `，后跟一个空格）。
+fn is_md_heading(t: &str) -> bool {
+    let n = t.chars().take_while(|c| *c == '#').count();
+    (1..=6).contains(&n) && t[n..].starts_with(' ')
+}
+
+/// 行首是否为有序列表标记（`1. ` / `12) `，限 1~9 位数字）。
+fn is_md_ordered_list(t: &str) -> bool {
+    let n = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    (1..=9).contains(&n) && (t[n..].starts_with(". ") || t[n..].starts_with(") "))
+}
+
+/// 纯文本是否「看起来像 Markdown」。
+///
+/// # 判据为什么是「至少两处标记」
+///
+/// 误报的代价比漏报大：普通多行文本（日志、邮件、代码片段）被误判成
+/// Markdown 后，界面会按标题/列表/代码块重新排版，用户只觉得
+/// 「显示莫名其妙变了」。因此要求**至少两处**结构标记：
+/// - 行首标记：标题 / 代码栏 / 引用 / 无序·有序列表，每行记一次；
+/// - 行内标记：`**`、`` ` ``、`[..](..)` 任一处再记一次。
+///
+/// 单处标记（比如只有一行 `- item`）视为普通文本——那更可能是
+/// CLI 帮助或破折号开头的一句话。
+///
+/// CAUTION: 只对**无 HTML 风味**的纯文本调用。富文本编辑器复制出的
+/// 内容是渲染结果而非 Markdown 源码，必须留在 [`ClipKind::Html`]。
+pub fn looks_like_markdown(text: &str) -> bool {
+    let mut hits = 0u32;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if is_md_heading(t)
+            || t.starts_with("```")
+            || t.starts_with("> ")
+            || t.starts_with("- ")
+            || t.starts_with("* ")
+            || t.starts_with("+ ")
+            || is_md_ordered_list(t)
+        {
+            hits += 1;
+        }
+    }
+    if text.contains("**") || text.contains('`') || (text.contains('[') && text.contains("](")) {
+        hits += 1;
+    }
+    hits >= 2
 }
 
 /// HTML 标签剥离：把富文本降级为可搜索、可预览的纯文本。
@@ -402,8 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_html_decodes_entities() {
-        let text = strip_html("<p>a &amp; b &lt;c&gt;</p>");
+    fn strip_html_decodes_entities() {        let text = strip_html("<p>a &amp; b &lt;c&gt;</p>");
         assert!(text.contains("a & b"));
         assert!(text.contains("<c>"));
     }
@@ -466,5 +520,58 @@ mod tests {
         let b = current_sequence();
         // 能连续读两次说明 API 可用；序列号本身允许被其它线程/进程推进。
         assert!(a > 0 || b > 0, "序列号应可读取且非负");
+    }
+
+    // ---- Markdown 探测 ----
+
+    #[test]
+    fn markdown_detects_heading_plus_list() {
+        assert!(looks_like_markdown("# 标题\n\n- 一\n- 二\n"));
+    }
+
+    #[test]
+    fn markdown_detects_code_fence_and_bold() {
+        assert!(looks_like_markdown("```rust\nfn main() {}\n```\n\n**加粗** 一句"));
+    }
+
+    #[test]
+    fn markdown_detects_quote_plus_inline_code() {
+        assert!(looks_like_markdown("> 引用一行\n\n行内 `code` 标记"));
+    }
+
+    #[test]
+    fn markdown_detects_ordered_list_plus_link() {
+        assert!(looks_like_markdown("1. 第一项\n2. 第二项\n\n见 [文档](https://example.com)"));
+    }
+
+    #[test]
+    fn markdown_rejects_plain_multiline_text() {
+        // 日志 / 邮件式多行文本：无任何结构标记
+        assert!(!looks_like_markdown("第一行普通文字\n第二行还是普通文字\n第三行"));
+    }
+
+    #[test]
+    fn markdown_rejects_single_marker() {
+        // 只有一处标记：更可能是破折号开头的一句话或 CLI 帮助
+        assert!(!looks_like_markdown("- 只是一个列表项"));
+        assert!(!looks_like_markdown("这句话里有 **加粗** 而已"));
+    }
+
+    #[test]
+    fn markdown_rejects_heading_without_space() {
+        // `#tag` 是话题标签不是标题；`#` 后必须有空格
+        assert!(!looks_like_markdown("#tag 不是标题\n另一行也没有标记"));
+    }
+
+    #[test]
+    fn markdown_ignores_indented_markers() {
+        // 行首允许缩进（trim_start），引用块里的列表也算
+        assert!(looks_like_markdown("  - 缩进列表一\n  - 缩进列表二"));
+    }
+
+    #[test]
+    fn markdown_empty_and_short_text() {
+        assert!(!looks_like_markdown(""));
+        assert!(!looks_like_markdown("hello"));
     }
 }

@@ -1095,9 +1095,11 @@ typeRail.addEventListener("click", (e) => {
   render();
 });
 
-/* ---- 原型设置条（对应未来的 Rust 设置项） ---- */
-$("#cfgShowImg").addEventListener("change", (e) => { state.showImageInline = e.target.checked; state.selected = null; render(); });
-$("#cfgMdRendered").addEventListener("change", (e) => { state.mdRendered = e.target.checked; state.selected = null; render(); });
+/* ---- 原型设置条（对应未来的 Rust 设置项） ----
+   注意：只有「行操作 + 搜索/过滤」清选中（与 Rust apply_ops 规则一致），
+   设置类变更不清选中。                                                  */
+$("#cfgShowImg").addEventListener("change", (e) => { state.showImageInline = e.target.checked; render(); });
+$("#cfgMdRendered").addEventListener("change", (e) => { state.mdRendered = e.target.checked; render(); });
 $("#cfgTypeRail").addEventListener("change", (e) => { state.showTypeRail = e.target.checked; render(); });
 $("#cfgTypeAlways").addEventListener("change", (e) => { state.typeRailAlways = e.target.checked; render(); });
 $("#cfgRailPos").addEventListener("change", (e) => { state.railPos = e.target.value; renderTypeRail(); });

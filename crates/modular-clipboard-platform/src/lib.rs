@@ -309,6 +309,78 @@ pub fn reveal_in_explorer(path: &str) -> Result<()> {
     }
 }
 
+/// 自定义调用程序的公共校验：路径非空且**真实存在**。
+///
+/// 不存在的程序由 `spawn` 报出来的是 OS error 2（「系统找不到指定的文件」），
+/// 用户看不出说的是哪个程序；这里提前给出带路径的明确消息。
+fn validate_custom_program(what: &str, custom: &str) -> Result<()> {
+    let p = std::path::Path::new(custom);
+    if !p.exists() {
+        anyhow::bail!("{what}路径不存在: {custom}");
+    }
+    Ok(())
+}
+
+/// 用默认或自定义浏览器打开 URL。
+///
+/// `custom` 为空 = 系统默认浏览器（[`open_url`] 的 `ShellExecuteW`）；
+/// 非空 = 以 argv 直传方式启动自定义程序（Chrome / Firefox / Edge 均可）。
+///
+/// CAUTION: 自定义路径同样**不经 shell**：URL 是不可信输入，
+/// `cmd /C start` 会把 `&` 当命令分隔符、`%XX` 当变量展开。
+pub fn open_url_with(url: &str, custom: &str) -> Result<()> {
+    let custom = custom.trim();
+    if custom.is_empty() {
+        return open_url(url);
+    }
+    validate_custom_program("浏览器", custom)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED: u32 = 0x0000_0008 | 0x0000_0020;
+        std::process::Command::new(custom)
+            .arg(url)
+            .creation_flags(DETACHED)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = url;
+        open_url(url)
+    }
+}
+
+/// 用默认或自定义资源管理器定位路径。
+///
+/// `custom` 为空 = 系统 `explorer /select,<path>`（定位并选中）；
+/// 非空 = 启动自定义文件管理器并传路径（Directory Opus / Total Commander
+/// 等），`/select` 语法只有真 explorer 认识，第三方程序直接传路径。
+///
+/// 多文件条目传**首个路径**（调用方负责取第一行）。
+pub fn reveal_with(path: &str, custom: &str) -> Result<()> {
+    let custom = custom.trim();
+    if custom.is_empty() {
+        return reveal_in_explorer(path);
+    }
+    validate_custom_program("资源管理器", custom)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED: u32 = 0x0000_0008 | 0x0000_0020;
+        std::process::Command::new(custom)
+            .arg(path)
+            .creation_flags(DETACHED)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        open_external(path)
+    }
+}
+
 /// 执行外部命令（联动规则入口）。
 ///
 /// `arg` 中的 `{selection}` 会被替换为选中文本。

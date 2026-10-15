@@ -239,6 +239,9 @@ impl Icon {
     ///
     /// 用于列表左侧的条目类型标识。`ClipKind` 属于业务层，
     /// 这里用穷举匹配避免依赖它。
+    ///
+    /// NOTE: [`ClipKind::Markdown`] **没有**对应字形（PUA 码位已占满），
+    /// 调用方应走 [`paint_kind_icon`] 而不是本方法。
     pub fn for_kind(kind: modular_clipboard_core::ClipKind) -> Self {
         use modular_clipboard_core::ClipKind;
         match kind {
@@ -246,6 +249,7 @@ impl Icon {
             ClipKind::Html => Icon::Code,
             ClipKind::Image => Icon::Image,
             ClipKind::Files => Icon::File,
+            ClipKind::Markdown => Icon::Text, // 占位：paint_kind_icon 会拦截
         }
     }
 
@@ -336,6 +340,51 @@ pub fn paint_inline(ui: &mut Ui, icon: Icon, color: Color32, pal: &crate::theme:
 /// 抽出来是为了让测试能验证「实际绘制位置」而不必真的跑一帧。
 pub fn icon_center(rect: Rect) -> egui::Pos2 {
     pos2(rect.center().x, rect.center().y)
+}
+
+/// 按内容类型画徽标图标（行内右下角 / 类型过滤栏共用）。
+///
+/// Markdown 走**几何绘制**：图标字体的 PUA 码位（U+E000..E011）已占满，
+/// 加字形要重新生成 TTF；而「M + 下箭头」用几段线段就能表达清楚，
+/// 与 `paint.rs::draw_topbar_icon` 里那批几何图标同一套路。
+/// 归一化坐标（24  viewBox 同款）：
+///   方框 (0.10,0.08)-(0.90,0.92)；M 三点折线；下箭头 = 竖线 + V。
+pub fn paint_kind_icon(
+    painter: &egui::Painter,
+    kind: modular_clipboard_core::ClipKind,
+    rect: Rect,
+    color: Color32,
+) {
+    use modular_clipboard_core::ClipKind;
+    if kind != ClipKind::Markdown {
+        Icon::for_kind(kind).paint(painter, rect, color);
+        return;
+    }
+    let side = rect.width().min(rect.height());
+    if side <= 0.0 || color == Color32::TRANSPARENT {
+        return;
+    }
+    let w = (side * 0.10).max(1.1);
+    let stroke = egui::Stroke::new(w, color);
+    let pad = side * 0.06;
+    let inner = side - pad * 2.0;
+    let u = |x: f32, y: f32| pos2(rect.min.x + pad + x * inner, rect.min.y + pad + y * inner);
+    painter.rect_stroke(
+        Rect::from_min_max(u(0.10, 0.08), u(0.90, 0.92)),
+        w,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    // M：左竖 → 谷底 → 右竖
+    painter.add(egui::Shape::line(
+        vec![u(0.26, 0.70), u(0.26, 0.32), u(0.40, 0.52), u(0.54, 0.32), u(0.54, 0.70)],
+        stroke,
+    ));
+    // 下箭头：竖线 + V（「渲染/导出」的隐喻）
+    painter.add(egui::Shape::line(
+        vec![u(0.70, 0.32), u(0.70, 0.62), u(0.63, 0.55), u(0.70, 0.62), u(0.77, 0.55)],
+        stroke,
+    ));
 }
 
 #[cfg(test)]

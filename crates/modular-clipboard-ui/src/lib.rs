@@ -36,6 +36,7 @@ pub mod app;
 pub mod card;
 pub mod childwin;
 pub mod mcp_status;
+pub mod md;
 pub mod multiwindow;
 pub mod paint;
 pub mod solver;

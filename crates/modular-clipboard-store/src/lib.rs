@@ -309,7 +309,9 @@ impl Store {
         };
 
         let text_for_fts = match item.kind {
-            ClipKind::Text | ClipKind::Html => Some(item.preview.clone()),
+            // Markdown 载荷同为 UTF-8 文本，预览即原文摘要，纳入全文索引，
+            // 否则搜索「剪贴板」找不到 Markdown 条目里的同一句话。
+            ClipKind::Text | ClipKind::Html | ClipKind::Markdown => Some(item.preview.clone()),
             _ => None,
         };
 
@@ -919,6 +921,7 @@ fn parse_kind(s: &str) -> ClipKind {
         "html" => ClipKind::Html,
         "image" => ClipKind::Image,
         "files" => ClipKind::Files,
+        "markdown" => ClipKind::Markdown,
         _ => ClipKind::Text,
     }
 }

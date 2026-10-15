@@ -350,6 +350,144 @@ pub struct UiConfig {
     /// 三个元素的显隐与前后顺序都可在设置中调整，见 [`RowMetaConfig`]。
     #[serde(default)]
     pub row_meta: RowMetaConfig,
+    /// 图片条目在列表行里直接显示缩略图（默认开）。
+    ///
+    /// 关闭后回落为「尺寸描述」文本（`PayloadRef::dims`），
+    /// 与早期版本行为一致。
+    #[serde(default = "default_true")]
+    pub image_inline: bool,
+    /// Markdown 条目按 Markdown 渲染（标题 / 列表 / 代码块等，默认开）。
+    ///
+    /// 关闭后按等宽纯文本显示源码。
+    #[serde(default = "default_true")]
+    pub md_rendered: bool,
+    /// 主窗口悬浮类型过滤栏（默认开、停靠右侧、32pt、仅显示已有类型）。
+    ///
+    /// 四个参数收拢成一个结构体而不是四个平铺字段：它们在设置界面
+    /// 是**一张互相牵连的卡**（关掉「显示」后其余三个一起失效），
+    /// 与 [`CardShadowConfig`] / [`RowMetaConfig`] 同一惯例。
+    #[serde(default)]
+    pub type_rail: TypeRailConfig,
+    /// 双击链接型条目时调用的浏览器路径。
+    ///
+    /// 空 = 系统默认浏览器（`ShellExecuteW` 的 `open` 动词）。
+    /// 自定义时可指向第三方浏览器（Chrome / Firefox / Edge 均可）。
+    #[serde(default)]
+    pub browser_path: String,
+    /// 双击文件型条目时调用的资源管理器路径。
+    ///
+    /// 空 = 系统 `explorer.exe`。自定义时可指向第三方文件管理器
+    /// （Directory Opus / Total Commander / Everything 等）。
+    #[serde(default)]
+    pub explorer_path: String,
+}
+
+/// 类型过滤栏配置（第三轮原型移植项）。
+///
+/// 停靠某侧时该侧让出 `size + RAIL_GAP` 的条带（见 ui 侧
+/// `paint::FloatLayout`），浮动按钮不压列表内容。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TypeRailConfig {
+    /// 是否显示类型过滤栏。
+    #[serde(default = "default_true")]
+    pub visible: bool,
+    /// 是否始终显示全部类型（默认关 = 仅有该类型记录时才出现）。
+    #[serde(default)]
+    pub always: bool,
+    /// 停靠的主窗口边缘（默认右）。
+    #[serde(default)]
+    pub pos: TypeRailPos,
+    /// 图标边长（逻辑点，钳制 [`TYPE_RAIL_SIZE_MIN`]~[`TYPE_RAIL_SIZE_MAX`]）。
+    #[serde(default = "default_type_rail_size")]
+    pub size: f32,
+}
+
+impl Default for TypeRailConfig {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            always: false,
+            pos: TypeRailPos::Right,
+            size: default_type_rail_size(),
+        }
+    }
+}
+
+/// `image_inline` / `md_rendered` / [`TypeRailConfig::visible`] 的 serde 缺省值。
+fn default_true() -> bool {
+    true
+}
+
+/// `type_rail_size` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
+fn default_type_rail_size() -> f32 {
+    32.0
+}
+
+/// `type_rail_size` 的合法区间（逻辑点）。与设置侧滑块范围一致。
+pub const TYPE_RAIL_SIZE_MIN: f32 = 24.0;
+/// 见 [`TYPE_RAIL_SIZE_MIN`]。
+pub const TYPE_RAIL_SIZE_MAX: f32 = 48.0;
+
+/// 把任意来源的尺寸值收敛到合法区间（非有限值回落 32.0）。
+///
+/// 与 [`clamp_font_scale`] 同构：手改 config.json 是常态，
+/// 不能让一个越界值把图标画成 0 或 480。
+pub fn clamp_type_rail_size(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(TYPE_RAIL_SIZE_MIN, TYPE_RAIL_SIZE_MAX)
+    } else {
+        default_type_rail_size()
+    }
+}
+
+/// 类型过滤栏停靠的主窗口边缘。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TypeRailPos {
+    /// 右侧（默认），垂直居中。
+    #[default]
+    Right,
+    /// 左侧，垂直居中。
+    Left,
+    /// 顶部，横向居中。
+    Top,
+    /// 底部，横向居中。
+    Bottom,
+}
+
+impl TypeRailPos {
+    /// 设置界面下拉框展示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            TypeRailPos::Right => "右侧",
+            TypeRailPos::Left => "左侧",
+            TypeRailPos::Top => "顶部",
+            TypeRailPos::Bottom => "底部",
+        }
+    }
+
+    /// 配置里的稳定字符串（与 serde 编码一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TypeRailPos::Right => "right",
+            TypeRailPos::Left => "left",
+            TypeRailPos::Top => "top",
+            TypeRailPos::Bottom => "bottom",
+        }
+    }
+
+    /// 从字符串解析，无法识别时回落 [`TypeRailPos::Right`]。
+    ///
+    /// 容错而不是报错：这个值来自用户手装的 config.json，
+    /// 为一个 cosmetic 设置让整个配置加载失败不值得。
+    pub fn from_str_opt(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "left" => TypeRailPos::Left,
+            "top" => TypeRailPos::Top,
+            "bottom" => TypeRailPos::Bottom,
+            _ => TypeRailPos::Right,
+        }
+    }
 }
 
 /// 列表卡片阴影配置。
@@ -566,6 +704,11 @@ impl Default for UiConfig {
             window_blur_strength: default_window_blur_strength(),
             card_shadow: CardShadowConfig::default(),
             row_meta: RowMetaConfig::default(),
+            image_inline: true,
+            md_rendered: true,
+            type_rail: TypeRailConfig::default(),
+            browser_path: String::new(),
+            explorer_path: String::new(),
         }
     }
 }
@@ -1247,6 +1390,95 @@ mod tests {
         );
         for p in RowMetaPart::ALL {
             assert!(d.visible(p));
+        }
+    }
+
+    /// 2026-10-15 第三轮原型的默认值：图片直显 / Markdown 渲染 /
+    /// 类型栏可见但仅显示已有类型 / 停靠右侧 / 32pt / 调用路径留空。
+    #[test]
+    fn proto_round3_defaults() {
+        let d = UiConfig::default();
+        assert!(d.image_inline, "图片直显默认开");
+        assert!(d.md_rendered, "Markdown 渲染默认开");
+        assert!(d.type_rail.visible, "类型栏默认显示");
+        assert!(!d.type_rail.always, "默认仅显示已有类型");
+        assert_eq!(d.type_rail.pos, TypeRailPos::Right);
+        assert_eq!(d.type_rail.size, 32.0);
+        assert!(d.browser_path.is_empty(), "浏览器默认走系统");
+        assert!(d.explorer_path.is_empty(), "资源管理器默认走系统");
+    }
+
+    /// 旧版 config.json 缺第三轮字段时必须补默认值，不能让整个配置
+    /// 解析失败（那会静默抹掉用户的全部设置，见 UiConfig 注释）。
+    ///
+    /// NOTE: 只测「键缺失」——显式 `null` 不在 `#[serde(default)]` 语义内，
+    /// 与 `card_shadow` 等既有结构体字段行为一致（手写 null 会让整份配置
+    /// 解析失败并回退默认，那是 serde 的既定语义，不为谁开特例）。
+    #[test]
+    fn proto_round3_fields_fall_back_for_legacy_config() {
+        let legacy = r#"{"always_on_top": true, "window_width": 720.0}"#;
+        let cfg: UiConfig = serde_json::from_str(legacy).unwrap();
+        assert!(cfg.image_inline);
+        assert!(cfg.md_rendered);
+        assert!(cfg.type_rail.visible);
+        assert!(!cfg.type_rail.always);
+        assert_eq!(cfg.type_rail.pos, TypeRailPos::Right);
+        assert_eq!(cfg.type_rail.size, 32.0);
+        assert!(cfg.browser_path.is_empty());
+        assert!(cfg.explorer_path.is_empty());
+        // type_rail 整体键缺失也要补默认（结构体级 serde(default)）。
+        let legacy2 = r#"{"image_inline": false}"#;
+        let cfg2: UiConfig = serde_json::from_str(legacy2).unwrap();
+        assert!(!cfg2.image_inline, "同键存在时应尊重用户值");
+        assert_eq!(cfg2.type_rail, TypeRailConfig::default());
+    }
+
+    /// 自定义值无损往返（含枚举的小写编码）。
+    #[test]
+    fn proto_round3_survives_json_roundtrip() {
+        let custom = UiConfig {
+            image_inline: false,
+            md_rendered: false,
+            type_rail: TypeRailConfig {
+                visible: false,
+                always: true,
+                pos: TypeRailPos::Top,
+                size: 44.0,
+            },
+            browser_path: "C:\\app\\chrome.exe".into(),
+            explorer_path: "D:\\Tools\\dopus.exe".into(),
+            ..UiConfig::default()
+        };
+        let text = serde_json::to_string(&custom).unwrap();
+        let back: UiConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(custom, back);
+        assert!(text.contains("\"pos\":\"top\""));
+    }
+
+    /// 尺寸钳制：越界收边界、非有限值（NaN / ±inf）统一回落默认。
+    #[test]
+    fn type_rail_size_clamps() {
+        assert_eq!(clamp_type_rail_size(32.0), 32.0);
+        assert_eq!(clamp_type_rail_size(8.0), TYPE_RAIL_SIZE_MIN);
+        assert_eq!(clamp_type_rail_size(999.0), TYPE_RAIL_SIZE_MAX);
+        assert_eq!(clamp_type_rail_size(f32::NAN), 32.0);
+        assert_eq!(clamp_type_rail_size(f32::INFINITY), 32.0);
+        assert_eq!(clamp_type_rail_size(f32::NEG_INFINITY), 32.0);
+    }
+
+    /// 位置解析：合法值逐一命中，无法识别回落右侧（cosmetic 设置
+    /// 不值得让配置加载失败）。
+    #[test]
+    fn type_rail_pos_from_str_falls_back_to_right() {
+        assert_eq!(TypeRailPos::from_str_opt("left"), TypeRailPos::Left);
+        assert_eq!(TypeRailPos::from_str_opt("TOP"), TypeRailPos::Top);
+        assert_eq!(TypeRailPos::from_str_opt(" bottom "), TypeRailPos::Bottom);
+        assert_eq!(TypeRailPos::from_str_opt("right"), TypeRailPos::Right);
+        assert_eq!(TypeRailPos::from_str_opt(""), TypeRailPos::Right);
+        assert_eq!(TypeRailPos::from_str_opt("diagonal"), TypeRailPos::Right);
+        for p in [TypeRailPos::Right, TypeRailPos::Left, TypeRailPos::Top, TypeRailPos::Bottom] {
+            assert_eq!(TypeRailPos::from_str_opt(p.as_str()), p);
+            assert!(!p.label().is_empty());
         }
     }
 

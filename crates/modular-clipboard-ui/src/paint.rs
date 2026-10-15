@@ -114,6 +114,11 @@ pub enum Op {
     /// 同 `SetCardShadow`：编辑器内单击、拖拽可能在一帧内连续改，
     /// 整包替换，避免逐字段写盘。
     SetRowMeta(modular_clipboard_core::config::RowMetaConfig),
+    /// 设置悬浮类型过滤栏（开关 + 始终显示 + 停靠位置 + 图标大小）。
+    ///
+    /// 同 `SetCardShadow`：四个参数在设置界面是一张互相牵连的卡，
+    /// 整包替换，避免一次拖动写四次盘。
+    SetTypeRail(modular_clipboard_core::config::TypeRailConfig),
     /// 切换主题（跟随系统 / 深色 / 浅色）。
     ///
     /// 由 `App::apply_ops` 落地：更新 `App.pal` 并重灌主窗口 `Visuals`；
@@ -179,6 +184,21 @@ pub enum Op {
     /// 由 `App::apply_ops` 走平台层 `ShellExecuteW` 用默认浏览器打开，
     /// 绘制层不直接碰 shell。
     OpenLink(&'static str),
+    /// 双击链接型条目：用浏览器打开 URL。
+    ///
+    /// 与 [`Op::OpenLink`] 的区别是**内容来自剪贴板**（动态字符串），
+    /// 且尊重设置里的自定义浏览器路径（`ui.browser_path`）。
+    OpenUrl(String),
+    /// 双击文件型条目：在资源管理器中定位路径。
+    ///
+    /// 路径来自剪贴板内容（多文件取首行），尊重设置里的自定义
+    /// 资源管理器路径（`ui.explorer_path`）。
+    RevealPath(String),
+    /// 设置类型过滤（`None` = 取消过滤）。
+    ///
+    /// 过滤在**界面侧**做（与 `query` 同为 UI 本地状态，不进快照）：
+    /// 绘制时按 `paint_state.type_filter` 筛行，不触碰 store 查询与 IPC。
+    SetTypeFilter(Option<modular_clipboard_core::ClipKind>),
     /// 关闭按钮 ⇒ 隐藏到托盘。
     ///
     /// NOTE: 语义是「隐藏」不是「退出」：剪贴板类工具直接退出会让
@@ -360,6 +380,33 @@ pub struct UiState {
     pub ops: Vec<Op>,
     /// 搜索框文本。
     pub query: String,
+    /// 类型过滤（`None` = 不过滤）。
+    ///
+    /// 与 `query` 同为**界面本地状态**：不进配置、不进 IPC 快照，
+    /// 由绘制层按它筛行（store 查询与常驻进程无感知）。
+    /// 2026-10-15 第三轮新增（悬浮类型过滤栏）。
+    pub type_filter: Option<modular_clipboard_core::ClipKind>,
+    /// 图片缩略图的**像素**缓存（第三轮：图片条目内嵌显示）。
+    ///
+    /// LRU + 字节预算，见 [`crate::thumbnail::ThumbnailCache`]。
+    /// 与 `thumb_tex` 分工：这里存解码后的像素（可反复上传），
+    /// 那里存 GPU 纹理句柄（随可见集淘汰）。
+    pub thumb_cache: crate::thumbnail::ThumbnailCache,
+    /// 已上传的缩略图纹理（条目 id → 纹理句柄）。
+    ///
+    /// **有界**：每帧按可见图片条目淘汰（见 `draw` 收尾的 `retain`）。
+    /// 没有这一条的话，滚动浏览过的每张图都会留下一份纹理，
+    /// GPU 内存只涨不消。
+    pub thumb_tex:
+        std::collections::HashMap<modular_clipboard_core::EntryId, egui::TextureId>,
+    /// 本帧**出现过**的图片条目 id（纹理淘汰的判据）。
+    ///
+    /// 为什么不能在每个列表各自淘汰：主栏与内嵌置顶区是两个列表
+    /// （`draw_history_body` 被调两次），各留一份可见集会互相淘汰——
+    /// 置顶区刚上传的纹理被主栏的 retain 丢掉，下一帧再上传，
+    /// 每帧重复传 GPU。收拢到帧级：两个列表都往这里报，`draw`
+    /// 在画完全部卡片后统一 retain 一次。
+    pub thumb_seen: std::collections::HashSet<modular_clipboard_core::EntryId>,
     /// 搜索框是否展开（顶栏右侧图标折叠式搜索）。
     ///
     /// 折叠时顶栏只显示一枚放大镜图标（贴近窗口按钮），左侧整片
@@ -778,9 +825,18 @@ pub fn draw_child(f: &mut Frame<'_>) {
 
 /// 画一帧。
 ///
-/// 流程：顶栏 → 设置界面（覆盖层）→ 卡片（Z 序）。
-/// 与旧实现最大的差别是**卡片一定会被画**——折叠的画把手，
-/// 展开的画内容，不存在「跳过」。
+/// 流程：背景 → 悬浮装饰布局 → 顶栏（搜索图标）→ 搜索状态机 →
+/// 卡片（Z 序）→ 类型过滤栏 → 悬浮搜索面板 → 通知 toast。
+///
+/// 2026-10-15 第三轮起，搜索输入框与类型过滤栏都是**悬浮层**：
+/// - 搜索面板贴在卡片区顶部（与顶栏/左右缘的间距即 `card_area` 的 12px
+///   内缩），折叠时只占顶栏一枚放大镜；
+/// - 类型栏停靠卡片区某一侧，该侧通过 `FloatLayout::insets` 让列表收缩，
+///   浮动按钮不压内容（右缘更不会盖住滚动条与行内删除按钮）。
+///
+/// NOTE: 原型里这两个悬浮层画在**窗口外**（HTML 窗口可以探出边框）；
+/// 真实窗口画不出自身边界，落为窗口内悬浮——视觉语义（间距、投影、
+/// 不挡内容）一致，位置偏差已在各组件的文档里说明。
 pub fn draw(f: &mut Frame<'_>) {
     let area = f.area;
     // 背景必须铺满整个客户区，否则窗口边缘会露出 clear color。
@@ -796,8 +852,49 @@ pub fn draw(f: &mut Frame<'_>) {
     // 「上一帧存在、这一帧已消失」的位置，症状是改了布局后
     // 测试仍通过但测的是空气。
     f.hit_clear();
-    draw_topbar(f, top);
+
+    // ---- 悬浮装饰布局（纯函数：配置 + 条目 + 过滤态 → 矩形与占位） ----
+    let mut floats = FloatLayout::compute(
+        &f.svc.state.config.ui,
+        &f.svc.state.items,
+        f.state.type_filter,
+        f.state.search_expanded,
+        body,
+    );
+
+    // 顶栏（含搜索开关图标）。返回图标响应供下面的状态机使用。
+    let icon_resp = draw_topbar(f, top);
+
+    // 搜索状态机：悬停 0.18s / 点击展开，离开宽限 0.35s 折叠，
+    // 焦点或查询词钉住。它可能翻转 `search_expanded`——翻转后重算一次
+    // 布局，让本帧的面板矩形与新状态一致（避免「状态翻了、矩形没翻」）。
+    run_search_state_machine(f, &icon_resp, floats.search);
+    if f.state.search_expanded != floats.search.is_some() {
+        floats = FloatLayout::compute(
+            &f.svc.state.config.ui,
+            &f.svc.state.items,
+            f.state.type_filter,
+            f.state.search_expanded,
+            body,
+        );
+    }
+
+    // 卡片（矩形由 solver 按同一套 insets 算好，绘制层只读不判断）。
     draw_cards(f, body);
+
+    // 缩略图纹理按**本帧全部可见图片条目**淘汰（帧级，跨列表）：
+    // 滚出屏的条目释放 GPU 纹理；像素仍在 `thumb_cache`（LRU）里，
+    // 滚回来只需重新上传，不必重新解码。
+    f.state.thumb_tex.retain(|id, _| f.state.thumb_seen.contains(id));
+    f.state.thumb_seen.clear();
+
+    // 悬浮层画在列表之上：类型栏 → 搜索面板 → toast。
+    if let Some(rail) = floats.rail {
+        draw_type_rail(f, rail, &floats.rail_kinds);
+    }
+    if let Some(panel) = floats.search {
+        draw_search_panel(f, panel);
+    }
 
     // NOTE: 设置界面**不在这里画**——它已移到独立窗口
     // （见 `crate::settingswin`）。主窗口只负责响应齿轮点击，
@@ -806,6 +903,129 @@ pub fn draw(f: &mut Frame<'_>) {
     // 若在这里再画一次，用户会看到「主窗口里浮着一块面板」，
     // 而真正的设置窗口在旁边——同一份内容画两遍。
     draw_notice_toast(f);
+}
+
+/// 类型过滤栏与主窗口内容的间距（逻辑点）。
+const RAIL_GAP: f32 = 12.0;
+
+/// 悬浮搜索面板高度（逻辑点）。
+const SEARCH_PANEL_H: f32 = 30.0;
+
+/// 类型过滤栏的按钮顺序（与设置界面、捕获层同一份）。
+const RAIL_KIND_ORDER: [modular_clipboard_core::ClipKind; 5] = {
+    use modular_clipboard_core::ClipKind;
+    [
+        ClipKind::Text,
+        ClipKind::Html,
+        ClipKind::Image,
+        ClipKind::Files,
+        ClipKind::Markdown,
+    ]
+};
+
+/// 悬浮装饰（类型过滤栏 + 搜索面板）的布局结果。
+///
+/// **纯函数** `compute` 的产物：同一份输入（配置 + 条目 + 过滤态 +
+/// 展开态 + 卡片区）必然得到同一份矩形——帧循环（solver 占位）与绘制层
+/// （画按钮/面板）各自调它，不存在「两处各算一套」的漂移空间。
+pub struct FloatLayout {
+    /// 类型栏占满的条带矩形（`None` = 不显示）。按钮槽位由
+    /// [`draw_type_rail`] 按停靠方向在带内均布。
+    pub rail: Option<Rect>,
+    /// 类型栏要显示的按钮（顺序固定；含「始终显示」时补全的类型）。
+    pub rail_kinds: Vec<modular_clipboard_core::ClipKind>,
+    /// 搜索面板矩形（`None` = 折叠）。
+    pub search: Option<Rect>,
+    /// 卡片区附加内缩 `[左, 右, 上, 下]`（逻辑点）：类型栏停靠侧让出
+    /// `图标边长 + RAIL_GAP`，喂给 `solver::solve_scaled_inset`。
+    pub insets: [f32; 4],
+}
+
+impl FloatLayout {
+    /// 计算悬浮装饰布局。
+    ///
+    /// - `body`：卡片区（`solver::card_area` 的输出，已扣顶栏与四周内缩）；
+    /// - `type_filter`：当前激活的类型（仅影响 tooltip 文案，不影响几何）；
+    /// - `search_expanded`：搜索面板是否展开。
+    pub fn compute(
+        cfg: &modular_clipboard_core::config::UiConfig,
+        items: &[modular_clipboard_core::item::ClipItem],
+        _type_filter: Option<modular_clipboard_core::ClipKind>,
+        search_expanded: bool,
+        body: Rect,
+    ) -> Self {
+        use modular_clipboard_core::config::TypeRailPos;
+
+        let rail_cfg = &cfg.type_rail;
+        let size = modular_clipboard_core::config::clamp_type_rail_size(rail_cfg.size);
+        let mut insets = [0.0f32; 4];
+        let mut rail = None;
+        let mut rail_kinds = Vec::new();
+
+        if rail_cfg.visible {
+            // 默认只显示「已有记录」的类型；`always` 时五类齐全。
+            rail_kinds = RAIL_KIND_ORDER
+                .iter()
+                .copied()
+                .filter(|k| rail_cfg.always || items.iter().any(|it| it.kind == *k))
+                .collect();
+            if !rail_kinds.is_empty() {
+                let strip = size + RAIL_GAP;
+                rail = Some(match rail_cfg.pos {
+                    TypeRailPos::Right => {
+                        insets[1] = strip;
+                        Rect::from_min_max(pos2(body.max.x - size, body.min.y), pos2(body.max.x, body.max.y))
+                    }
+                    TypeRailPos::Left => {
+                        insets[0] = strip;
+                        Rect::from_min_max(pos2(body.min.x, body.min.y), pos2(body.min.x + size, body.max.y))
+                    }
+                    TypeRailPos::Top => {
+                        insets[2] = strip;
+                        Rect::from_min_max(pos2(body.min.x, body.min.y), pos2(body.max.x, body.min.y + size))
+                    }
+                    TypeRailPos::Bottom => {
+                        insets[3] = strip;
+                        Rect::from_min_max(pos2(body.min.x, body.max.y - size), pos2(body.max.x, body.max.y))
+                    }
+                });
+            }
+        }
+
+        // 搜索面板：卡片区通栏、与顶栏留 [`RAIL_GAP`] 的间距（原型里
+        // 面板「悬浮且与主窗口有间距」的窗口内等价物）。
+        //
+        // CAUTION: 左右停靠了类型栏时，面板**右缘（或左缘）要让出栏条带**。
+        // 不让的后果：矮窗口下垂直居中的类型栏上沿会被面板压住，而那几枚
+        // 按钮正在面板下面——点不动，且没有任何提示。这与「行矩形让出
+        // 滚动条」是同一条纪律：浮动层不能盖住另一个浮动层的交互区。
+        // 顶部停靠时面板下移到栏下方（间距同为 RAIL_GAP）。
+        let search = if search_expanded {
+            let rail_top = rail.is_some_and(|_| matches!(rail_cfg.pos, TypeRailPos::Top));
+            let (x0, x1) = match (rail.is_some(), rail_cfg.pos) {
+                (true, TypeRailPos::Left) => (body.min.x + size + RAIL_GAP, body.max.x),
+                (true, TypeRailPos::Right) => (body.min.x, body.max.x - size - RAIL_GAP),
+                _ => (body.min.x, body.max.x),
+            };
+            let y0 = body.min.y + if rail_top { size + RAIL_GAP } else { RAIL_GAP };
+            Some(Rect::from_min_max(
+                pos2(x0, y0),
+                pos2(x1, y0 + SEARCH_PANEL_H),
+            ))
+        } else {
+            None
+        };
+
+        Self { rail, rail_kinds, search, insets }
+    }
+
+    /// 把附加内缩应用到卡片区（solver 与绘制侧共用同一算式）。
+    pub fn inset_body(&self, body: Rect) -> Rect {
+        Rect::from_min_max(
+            pos2(body.min.x + self.insets[0], body.min.y + self.insets[2]),
+            pos2(body.max.x - self.insets[1], body.max.y - self.insets[3]),
+        )
+    }
 }
 
 /// 通知 toast：窗口上方居中短暂显示 `Service::notify` 的消息（F-16 / UI-P0-2）。
@@ -888,7 +1108,12 @@ fn draw_notice_toast(f: &mut Frame<'_>) {
 
 // ---------------------------------------------------------------- 顶栏
 
-fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
+/// 画顶栏：背景 + 分隔线 + 右侧四枚窗口按钮 + 搜索开关图标。
+///
+/// 返回搜索图标的 [`egui::Response`]——调用方（`draw`）要拿它喂
+/// [`run_search_state_machine`]（悬停展开 / 点击展开的判据）。
+/// 输入框本身**不在这里画**：第三轮起它是悬浮面板（`draw_search_panel`）。
+fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     let pal = f.pal;
     let scale = f.scale;
     let painter = f.ui.painter_at(bar);
@@ -932,19 +1157,15 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     );
     draw_topbar_icons(f, btn_area, bar.center().y);
 
-    // ---- 搜索：折叠图标 + 点击展开输入框 --------------------------------
+    // ---- 搜索：折叠图标（输入框是悬浮面板，见 draw_search_panel） -------
     //
     // 布局（自左向右）：
-    //   [ 大片拖动区 ][ 搜索输入框（仅展开时） ][ 🔍 ][ ✕ ][ 🗑 ][ ⚙ ]
+    //   [ 大片拖动区 ][ 🔍 ][ ✕ ][ 🗑 ][ ⚙ ]
     //
     // 搜索框默认**折叠成一枚放大镜图标**、贴在窗口按钮左侧：顶栏左侧
-    // 整片（除按钮与图标）都是拖动区，用户落手即拖——这是顶栏拖动区
-    // 曾经「只剩 8pt、拖不动」问题的最优解：不是给拖动区留宽，
-    // 而是把占位的搜索框整个压缩到右侧一角。
-    //
-    // 点击图标展开输入框（向左弹出固定宽度），再点一次折叠。
-    // 展开时拖动区收缩到输入框左缘，但 140pt 输入框 + 右端控件之后
-    // 仍剩 ~46pt 可拖，不会退化成「窗口拖不动」。
+    // 整片（除按钮与图标）都是拖动区，用户落手即拖。第三轮起输入框
+    // 移出顶栏成为悬浮面板（贴卡片区顶部），顶栏结构因此简化——
+    // 左侧拖动区不再需要随展开收缩。
     let sq = btn * 0.62;
     let search_icon_r = Rect::from_center_size(
         pos2(btn_area.min.x - pal.space_md - sq * 0.5, bar.center().y),
@@ -952,126 +1173,6 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     );
     f.hit_insert("search_icon", search_icon_r);
     let icon_resp = search_toggle_button(f, search_icon_r);
-    let hover_icon = icon_resp.hovered();
-
-    // ---- 悬停展开 / 延迟折叠 -------------------------------------------
-    //
-    // 交互契约：
-    // - 光标**停在**图标上 ≥ [`SEARCH_HOVER_DELAY`] ⇒ 展开；
-    // - 离开图标与输入框 ⇒ **宽限** [`SEARCH_COLLAPSE_DELAY`] 后才折叠；
-    // - 输入框持有焦点、或里面有查询词 ⇒ 永不折叠。
-    //
-    // 为什么必须「停留一会儿」而不是一碰就展开：图标紧挨着设置按钮，
-    // 鼠标从顶栏左侧移到设置**必然划过它**。一碰就展开的话，弹出的
-    // 输入框会把设置按钮往左顶走，用户永远点不到设置——这正是
-    // 「划过」与「停住」必须分开的原因。
-    //
-    // 为什么必须有宽限期（用户反馈「根本不给输入的机会」）：输入框弹在
-    // 图标**左侧**、两者之间是 `space_md` 的间隙。指针从图标移向输入框
-    // 必然穿过那段既不属于图标也不属于输入框的空隙，若「离开即折叠」，
-    // 输入框会在指针抵达前消失——鼠标永远追不上。
-    let now = f.ui.ctx().input(|i| i.time);
-    if hover_icon {
-        f.state.search_hover_since.get_or_insert(now);
-    } else {
-        // 离开图标即重新计时：再次移入要重新停够时间。
-        f.state.search_hover_since = None;
-    }
-    if f
-        .state
-        .search_hover_since
-        .is_some_and(|t| now - t >= SEARCH_HOVER_DELAY)
-    {
-        f.state.search_expanded = true;
-        f.state.search_leave_since = None;
-    }
-
-    // ---- 输入框几何：按可用宽度动态收缩 --------------------------------
-    //
-    // 固定 140pt 在窄窗口下会溢出：输入框从 `search_icon_r.left()` 向
-    // 左伸展，窗口宽度不够时它会伸到顶栏左缘之外，`painter_at(r)` 按
-    // 可见区裁剪 ⇒ 左半边被切掉（实机「搜索框渲染不完整」）。
-    //
-    // 可用宽度 = 图标左缘 − 间隙 − 顶栏左缘 − 拖动区保留宽度。
-    // 取它与期望宽度的**较小者**；不够最小可用宽度就不展开。
-    let avail_w = search_icon_r.min.x - pal.space_md * 2.0 - bar.min.x - SEARCH_DRAG_RESERVE;
-    let input_w = avail_w.min(SEARCH_EXPAND_W);
-    let input = Rect::from_min_max(
-        pos2(search_icon_r.min.x - pal.space_md - input_w, bar.min.y + pal.space_sm),
-        pos2(search_icon_r.min.x - pal.space_md, bar.max.y - pal.space_sm),
-    );
-    let input_ok = input_w >= SEARCH_MIN_W && input.height() > 8.0;
-    // 「离开搜索框区域」的判据用**指针是否落在输入框矩形内**，而不是
-    // 逐个控件响应的 `hovered()`：框内还有文本光标、清除按钮等子交互，
-    // 逐个子响应去 or 一定会漏掉某一处。
-    let hover_input = input_ok && f.ui.rect_contains_pointer(input);
-    // 输入框持有焦点 / 有查询词：无条件保持展开。
-    //
-    // 焦点这条最关键：用户要点进输入框打字。而点击图标到 `TextEdit`
-    // 拿到焦点之间隔着一帧、鼠标移动到输入框又要几帧，这段时间里
-    // 既不悬停图标也不悬停输入框——没有这条判定，输入框会在焦点
-    // 建立之前自己收回去，然后焦点被丢弃，字永远打不进去。
-    //
-    // CAUTION: 焦点 id 必须用输入框**自报的真实 id**
-    // （`UiState::search_edit_id`，见 `draw_search`），不能用上层猜的
-    // `Id::new("search_edit")`：`TextEdit` 的最终 id 由 egui 在容器 id
-    // 上派生，两者并不相等——猜的那个永远匹配不上，这条判定会恒假。
-    let focused = f
-        .state
-        .search_edit_id
-        .is_some_and(|id| f.ui.memory(|m| m.focused()) == Some(id));
-    let hold_open = focused || !f.state.query.is_empty();
-
-    // 点击图标 = 展开 + 把焦点交给输入框。
-    //
-    // NOTE: 展开/折叠**不再由点击切换**。早前是点击 toggle，与悬停展开
-    // 叠加会互相打架：点一下折叠，可光标还停在图标上，下一帧又被悬停
-    // 展开——表现为「点不动」。
-    // ……但**现在**还不能写焦点：输入框本帧可能一次都没画过，
-    // `search_edit_id` 还是 `None`（首次展开就是这种情况）。真正的
-    // 请求挂在 [`UiState::search_focus_pending`] 上，等 `draw_search`
-    // 自报出真实 id 之后再发。
-    if icon_resp.clicked() {
-        f.state.search_expanded = true;
-        f.state.search_leave_since = None;
-        f.state.search_focus_pending = true;
-    }
-
-    // CAUTION: 顺序是「先算矩形 → 判折叠 → 再画」。反过来（先画再判）
-    // 会让**折叠的那一帧**仍然把输入框画出来并登记热区，外部（测试、
-    // 自动化脚本）读到的热区表与实际状态差一帧——表现是「已经收起了，
-    // 但热区还在」。
-    if f.state.search_expanded && !hover_icon && !hover_input && !hold_open {
-        match f.state.search_leave_since {
-            None => f.state.search_leave_since = Some(now),
-            Some(t) if now - t >= SEARCH_COLLAPSE_DELAY => {
-                f.state.search_expanded = false;
-                f.state.search_hover_since = None;
-                f.state.search_leave_since = None;
-            }
-            _ => {}
-        }
-    } else {
-        // 仍在区域内（或被焦点/查询词钉住）：取消在途的折叠倒计时。
-        f.state.search_leave_since = None;
-    }
-
-    let mut search_left = search_icon_r.min.x;
-    if f.state.search_expanded && input_ok {
-        draw_search(f, input);
-        search_left = input.min.x;
-        if f.state.search_focus_pending
-            && let Some(id) = f.state.search_edit_id
-        {
-            // CAUTION: 必须是 `draw_search` 自报的**真实 id**。拿上层猜的
-            // `Id::new("search_edit")` 请求焦点会打水漂——那个 id 与
-            // TextEdit 实际用的 id 不相等（`UiBuilder::id` 只是容器 id）。
-            f.ui.memory_mut(|m| m.request_focus(id));
-            f.state.search_focus_pending = false;
-        }
-    }
-
-    let _ = scale;
 
     // 顶栏拖动区 = 顶栏**减去交互控件**。
     //
@@ -1082,19 +1183,17 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
     // 症状：整个顶栏（含齿轮、垃圾桶、搜索框）全都点不动，
     // 表现为「设置打不开 / 搜索框不能点」。
     let mut drag = Vec::new();
-    // 左段：窗口左缘 → 搜索输入框/图标的左缘。
-    //
-    // 折叠时 `search_left` 是图标左缘，顶栏左侧几乎整条都是拖动区；
-    // 展开时收缩到输入框左缘。**必须用左缘 - 2pt 收尾**：多出来的
-    // 2pt 与控件之间留缝，避免亚像素重叠把控件边缘判成 Caption。
-    let left_end = search_left;
+    // 左段：窗口左缘 → 搜索图标左缘。
+    // **必须用左缘 - 2pt 收尾**：多出来的 2pt 与控件之间留缝，
+    // 避免亚像素重叠把控件边缘判成 Caption。
+    let left_end = search_icon_r.min.x;
     if left_end - bar.min.x > 8.0 {
         drag.push(Rect::from_min_max(bar.min, pos2(left_end - 2.0, bar.max.y)));
     }
     // NOTE: 这里**不设**「两按钮之间」那一段。
     //
     // `btn_area` 宽 `btn*2 + space_sm`、两按钮各占一半——它们是
-    // **紧邻**的（`space_sm` 落在 `btn_area` 内部，两侧各一半）。
+    // **紧邻**的（`space_sm` 落在 `btn_area` 的内部，两侧各一半）。
     // 早前按「中点 ± 3」加一段，实测该段与垃圾桶重叠
     // （`[[645.7,0]-[651.7,44]]` vs 按钮 `[[617.4,8.4]-[648.7,35.6]]`），
     // 于是那段又变成「点垃圾桶 = 拖窗口」。
@@ -1119,6 +1218,328 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) {
         ));
     }
     f.state.drag_regions = drag;
+
+    let _ = scale;
+    icon_resp
+}
+
+/// 搜索状态机：悬停展开 / 宽限折叠 / 焦点钉住。
+///
+/// 从 `draw_topbar` 抽出来的原因：第三轮起输入框是**悬浮面板**，
+/// 其矩形要等 `FloatLayout` 算完才知道，而状态机又必须先于绘制
+/// 跑（它决定本帧画不画面板）。三者顺序因此变为：
+/// 布局 → 画顶栏拿图标响应 → 状态机 → （可能）重算布局 → 画面板。
+///
+/// 交互契约（与原型逐条一致）：
+/// - 光标**停在**图标上 ≥ [`SEARCH_HOVER_DELAY`] ⇒ 展开；
+/// - 离开图标与面板 ⇒ **宽限** [`SEARCH_COLLAPSE_DELAY`] 后才折叠；
+/// - 输入框持有焦点、或里面有查询词 ⇒ 永不折叠。
+///
+/// `panel`：本帧搜索面板的矩形（折叠时为 `None`）。悬停判据用
+/// `rect_contains_pointer` 而不是逐个控件的 `hovered()`：框内还有
+/// 文本光标、清除按钮等子交互，逐个子响应去 or 一定会漏掉某一处。
+fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response, panel: Option<Rect>) {
+    let hover_icon = icon_resp.hovered();
+    let hover_panel = panel.is_some_and(|r| f.ui.rect_contains_pointer(r));
+    let now = f.ui.ctx().input(|i| i.time);
+
+    if hover_icon {
+        f.state.search_hover_since.get_or_insert(now);
+    } else {
+        // 离开图标即重新计时：再次移入要重新停够时间。
+        f.state.search_hover_since = None;
+    }
+    if f
+        .state
+        .search_hover_since
+        .is_some_and(|t| now - t >= SEARCH_HOVER_DELAY)
+    {
+        f.state.search_expanded = true;
+        f.state.search_leave_since = None;
+    }
+
+    // 输入框持有焦点 / 有查询词：无条件保持展开。
+    //
+    // 焦点这条最关键：用户要点进输入框打字。而点击图标到 `TextEdit`
+    // 拿到焦点之间隔着一帧、鼠标移动到面板又要几帧，这段时间里
+    // 既不悬停图标也不悬停面板——没有这条判定，面板会在焦点
+    // 建立之前自己收回去，然后焦点被丢弃，字永远打不进去。
+    //
+    // CAUTION: 焦点 id 必须用输入框**自报的真实 id**
+    // （`UiState::search_edit_id`，见 `draw_search_panel`），不能用上层猜的
+    // `Id::new("search_edit")`：`TextEdit` 的最终 id 由 egui 在容器 id
+    // 上派生，两者并不相等——猜的那个永远匹配不上，这条判定会恒假。
+    let focused = f
+        .state
+        .search_edit_id
+        .is_some_and(|id| f.ui.memory(|m| m.focused()) == Some(id));
+    let hold_open = focused || !f.state.query.is_empty();
+
+    // 点击图标 = 展开 + 把焦点交给输入框。
+    //
+    // NOTE: 展开/折叠**不再由点击切换**。早前是点击 toggle，与悬停展开
+    // 叠加会互相打架：点一下折叠，可光标还停在图标上，下一帧又被悬停
+    // 展开——表现为「点不动」。
+    // ……但**现在**还不能写焦点：输入框本帧可能一次都没画过，
+    // `search_edit_id` 还是 `None`（首次展开就是这种情况）。真正的
+    // 请求挂在 [`UiState::search_focus_pending`] 上，等 `draw_search_panel`
+    // 自报出真实 id 之后再发。
+    if icon_resp.clicked() {
+        f.state.search_expanded = true;
+        f.state.search_leave_since = None;
+        f.state.search_focus_pending = true;
+    }
+
+    // CAUTION: 顺序是「先算矩形 → 判折叠 → 再画」。反过来（先画再判）
+    // 会让**折叠的那一帧**仍然把输入框画出来并登记热区，外部（测试、
+    // 自动化脚本）读到的热区表与实际状态差一帧——表现是「已经收起了，
+    // 但热区还在」。
+    if f.state.search_expanded && !hover_icon && !hover_panel && !hold_open {
+        match f.state.search_leave_since {
+            None => f.state.search_leave_since = Some(now),
+            Some(t) if now - t >= SEARCH_COLLAPSE_DELAY => {
+                f.state.search_expanded = false;
+                f.state.search_hover_since = None;
+                f.state.search_leave_since = None;
+            }
+            _ => {}
+        }
+    } else {
+        // 仍在区域内（或被焦点/查询词钉住）：取消在途的折叠倒计时。
+        f.state.search_leave_since = None;
+    }
+}
+
+/// 画悬浮搜索面板（第三轮起输入框的新形态）。
+///
+/// 与旧「顶栏内弹出输入框」的差别只在**位置与容器**：矩形由
+/// [`FloatLayout`] 给（卡片区通栏、贴顶部），控件结构与交互
+/// （hint / 字体 / 边距 / 无外框 / 聚焦加强 / 清除按钮 / 焦点自报）
+/// 与旧 `draw_search` 完全一致，行为可无缝对拍。
+fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
+    let pal = f.pal;
+    let painter = f.ui.painter_at(r);
+    // 纯平毛玻璃禁令同样适用于悬浮层：纯色底 + 1px 描边，禁渐变光泽。
+    painter.rect_filled(r, pal.radius_md, pal.surface);
+    painter.rect_stroke(
+        r,
+        pal.radius_md,
+        Stroke::new(1.0, pal.border),
+        egui::StrokeKind::Inside,
+    );
+
+    // 文字直接从左边距起排（放大镜在顶栏，不重复画）。
+    let pad = pal.space_sm;
+    let edit_rect = Rect::from_min_max(
+        pos2(r.min.x + pad, r.min.y + 1.0),
+        pos2(r.max.x - pad, r.max.y - 1.0),
+    );
+    if edit_rect.width() <= 4.0 || edit_rect.height() <= 4.0 {
+        return;
+    }
+    // 自报热区给测试用（见 `UiState::hit` 的说明）。
+    //
+    // NOTE: 登记**两个**：`search_box` 是外框，`search` 是输入区。
+    f.hit_insert("search_box", r);
+    f.hit_insert("search", edit_rect);
+    // 面板**整块**可点：点到左右 padding（输入区之外）也应当聚焦输入框。
+    //
+    // CAUTION: 不注册这一条的后果不是「点不动」而是更糟的「变成拖窗口」——
+    // 顶栏的拖动区上报给系统后变成 HTCAPTION，面板 padding 处没有 egui
+    // 交互，点击穿透到 WM_NCHITTEST，用户点输入框左侧空白就把窗口拖走了。
+    // 后注册的 interact 在重叠区胜出，面板整体盖过拖动区。
+    let panel_resp = f
+        .ui
+        .interact(r, egui::Id::new("card_search_box"), Sense::click());
+    let resp = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            // IMPORTANT: **必须给显式 id**。不给的话 egui 按调用位置自动生成，
+            // 于是：焦点断言没法稳定地指向它（只能退化成
+            // 「有没有任何控件获得焦点」这种恒真判断），且任何调整
+            // 布局的改动都可能悄悄换掉 id。
+            .id(egui::Id::new("search_edit"))
+            .max_rect(edit_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut f.state.query)
+                    .hint_text("搜索历史…")
+                    .desired_width(f32::INFINITY)
+                    // IMPORTANT: 字号必须给**不带scale 的逻辑字号**。
+                    //
+                    // 早前传的是 `sized(pal.font_md, scale)`——它已经把
+                    // DPI 系数乘进去了，而 egui 在计算可用高度时会
+                    // **再乘一次** `pixels_per_point`。结果是行高被放大到
+                    // 远超框高，文字被裁掉上半/下半截，表现为
+                    //「能输入但看不见、字很小」。
+                    //
+                    // 正确做法：`FontId` 用逻辑字号，由 egui 负责缩放。
+                    .font(egui::FontId::proportional(pal.font_md))
+                    // 内边距收窄：egui 默认的 `symmetric(4,2)` 在此会让
+                    // 单行控件偏高而裁切。
+                    .margin(egui::Margin::symmetric(2, 0))
+                    .text_color(pal.text)
+                    // 去掉 TextEdit 自带的外框：外框已由上面的
+                    // `rect_stroke` 画好，两层框叠在一起会显得脏。
+                    //
+                    // IMPORTANT: 这里必须给 `egui::Frame` 枚举而不是 `false`：
+                    // 0.36 的 `frame()` 收的是容器框类型，不是 bool。
+                    .frame(egui::Frame::NONE),
+            )
+        },
+    );
+    // `scope_builder` 返回 `InnerResponse<Response>`：内层是 TextEdit
+    // 自己的响应，外层是这次作用域分配整体的响应。
+    // 焦点与 id 都要用**内层**的——外层 id 属于作用域，不是输入框。
+    let edit_resp = resp.inner;
+
+    // 自报真实 Id，供测试精确判断焦点落在哪个控件上（见字段说明）。
+    f.state.search_edit_id = Some(edit_resp.id);
+
+    if edit_resp.has_focus() {
+        // 聚焦时描边加强，给出明确的视觉反馈。
+        f.ui.painter_at(r).rect_stroke(
+            r,
+            pal.radius_md,
+            Stroke::new(1.5, pal.border_strong),
+            egui::StrokeKind::Inside,
+        );
+    }
+
+    // 有文本时给一个清除按钮。
+    if !f.state.query.is_empty() {
+        let btn = r.height() * 0.6;
+        let clear = Rect::from_center_size(
+            pos2(r.max.x - pad - btn * 0.5, r.center().y),
+            vec2(btn, btn),
+        );
+        let cr = f
+            .ui
+            .interact(clear, egui::Id::new("card_search_clear"), Sense::click());
+        crate::icons::Icon::Close.paint(
+            &f.ui.painter_at(clear),
+            Rect::from_center_size(clear.center(), vec2(btn, btn) * 0.7),
+            if cr.hovered() { pal.text_bright } else { pal.text_dim },
+        );
+        if cr.clicked() {
+            f.state.query.clear();
+            // 清空后主动交还焦点：否则用户还得再点一次才能继续打字。
+            f.ui.memory_mut(|m| m.request_focus(edit_resp.id));
+        }
+        cr.on_hover_text("清空搜索");
+    }
+
+    // 焦点请求在**画完之后**发：id 刚自报出来，此刻才有效。
+    if f.state.search_focus_pending
+        && let Some(id) = f.state.search_edit_id
+    {
+        // CAUTION: 必须是自报的**真实 id**。拿上层猜的
+        // `Id::new("search_edit")` 请求焦点会打水漂——那个 id 与
+        // TextEdit 实际用的 id 不相等（`UiBuilder::id` 只是容器 id）。
+        f.ui.memory_mut(|m| m.request_focus(id));
+        f.state.search_focus_pending = false;
+    }
+    // 点面板空白处（输入区左右的 padding）也聚焦输入框。
+    if panel_resp.clicked()
+        && let Some(id) = f.state.search_edit_id
+    {
+        f.ui.memory_mut(|m| m.request_focus(id));
+    }
+}
+
+/// 画悬浮类型过滤栏（2026-10-15 第三轮新增，待移植设置联动）。
+///
+/// 按钮在 `rail` 条带内按停靠方向均布（左右 = 垂直居中分组，
+/// 上下 = 水平居中分组），每枚是圆角方块：`surface_raised` 底 +
+/// 1px 弱描边；激活 = `accent` 底 + `text_on_accent` 图标。
+/// 点击过滤、再点一次取消（`Op::SetTypeFilter`）。
+fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_core::ClipKind]) {
+    use modular_clipboard_core::config::TypeRailPos;
+    let pal = f.pal;
+    let rail_cfg = &f.svc.state.config.ui.type_rail;
+    let size = modular_clipboard_core::config::clamp_type_rail_size(rail_cfg.size);
+    let gap = RAIL_GAP.min(8.0); // 按钮间距比条带间距紧一档
+    let n = kinds.len();
+    if n == 0 || rail.width() <= 0.0 || rail.height() <= 0.0 {
+        return;
+    }
+    let vertical = matches!(rail_cfg.pos, TypeRailPos::Left | TypeRailPos::Right);
+    let total = n as f32 * size + (n as f32 - 1.0) * gap;
+    // 组内居中：左右停靠按竖向均布起点，上下停靠按横向。
+    let (mut x, mut y) = if vertical {
+        (rail.min.x, rail.center().y - total * 0.5)
+    } else {
+        (rail.center().x - total * 0.5, rail.min.y)
+    };
+
+    for &kind in kinds {
+        let slot = Rect::from_min_size(pos2(x, y), vec2(size, size));
+        let active = f.state.type_filter == Some(kind);
+        // 热区按类型分key：测试要逐类断言「某类型的按钮在不在」。
+        // CAUTION: key 必须是 `&'static str`（热区表的键类型），
+        // 不能 `format!`——临时 String 活不过这条语句。
+        let hit_key = match kind {
+            modular_clipboard_core::ClipKind::Text => "rail_text",
+            modular_clipboard_core::ClipKind::Html => "rail_html",
+            modular_clipboard_core::ClipKind::Image => "rail_image",
+            modular_clipboard_core::ClipKind::Files => "rail_files",
+            modular_clipboard_core::ClipKind::Markdown => "rail_markdown",
+        };
+        f.hit_insert(hit_key, slot);
+        let resp = f.ui.scope_builder(
+            egui::UiBuilder::new()
+                .id(egui::Id::new(("rail", kind)))
+                .max_rect(slot)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| ui.add_sized(slot.size(), egui::Button::new("").frame(false)),
+        );
+        let resp = resp.inner;
+        // 底色：激活 accent / 悬停 row_hover / 常态 surface_raised。
+        let bg = if active {
+            pal.accent
+        } else if resp.hovered() {
+            pal.row_hover
+        } else {
+            pal.surface_raised
+        };
+        f.ui.painter_at(slot).rect_filled(slot, size * 0.25, bg);
+        if !active {
+            f.ui.painter_at(slot).rect_stroke(
+                slot,
+                size * 0.25,
+                Stroke::new(1.0, pal.border_subtle),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let icon_color = if active {
+            pal.text_on_accent
+        } else if resp.hovered() {
+            pal.text_bright
+        } else {
+            pal.text_dim
+        };
+        let icon_px = size * 0.5625; // 32pt → 18pt（同行内按钮比例）
+        crate::icons::paint_kind_icon(
+            &f.ui.painter_at(slot),
+            kind,
+            Rect::from_center_size(slot.center(), vec2(icon_px, icon_px)),
+            icon_color,
+        );
+        // 提示带计数：用户能看出点下去会过滤出多少条。
+        let count = f.svc.state.items.iter().filter(|it| it.kind == kind).count();
+        // NOTE: `clicked()` 必须在 `on_hover_text` 之前取——后者按值消耗
+        // `Response`（`icon_button` 里踩过同一个坑，E0382）。
+        let clicked = resp.clicked();
+        resp.on_hover_text(format!("{} · {} 条", kind.label(), count));
+        if clicked {
+            f.state.push(Op::SetTypeFilter(if active { None } else { Some(kind) }));
+        }
+        if vertical {
+            y += size + gap;
+        } else {
+            x += size + gap;
+        }
+    }
 }
 
 /// 顶栏右侧的四枚图标按钮：关闭 / 最小化 / 清空 / 设置。
@@ -1323,121 +1744,6 @@ fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response {
     resp.on_hover_text(if f.state.search_expanded { "收起搜索" } else { "搜索" })
 }
 
-
-fn draw_search(f: &mut Frame<'_>, r: Rect) {
-    let pal = f.pal;
-    let painter = f.ui.painter_at(r);
-    painter.rect_filled(r, pal.radius_md, pal.surface);
-    painter.rect_stroke(
-        r,
-        pal.radius_md,
-        Stroke::new(1.0, pal.border),
-        egui::StrokeKind::Inside,
-    );
-
-    // 放大镜图标由右侧的折叠式搜索图标按钮承担（见 `draw_topbar`），
-    // 输入框内不再重复画 —— 否则框内左侧又冒出一个放大镜，与右侧
-    // 图标成双，视觉重复。文字直接从左边距起排。
-    let pad = pal.space_sm;
-    let edit_rect = Rect::from_min_max(
-        pos2(r.min.x + pad, r.min.y + 1.0),
-        pos2(r.max.x - pad, r.max.y - 1.0),
-    );
-    if edit_rect.width() <= 4.0 || edit_rect.height() <= 4.0 {
-        return;
-    }
-    // 自报热区给测试用（见 `UiState::hit` 的说明）。
-    //
-    // NOTE: 登记**两个**：`search_box` 是外框，`search` 是输入区。
-    //
-    // 只登记输入区不够——外框左侧那条约 22pt 宽的图标带**也是可点的**
-    //（点它会聚焦搜索框），而它恰好是最容易被拖动区吃掉的地方。
-    // 没有 `search_box` 这条热区，`topbar_controls_are_not_in_drag_region`
-    // 就探测不到那个 bug：输入区左缘与拖动区终点只差 2pt，四角全落在
-    // 拖动区**之外**，测试照样绿。
-    f.hit_insert("search_box", r);
-    f.hit_insert("search", edit_rect);
-    let resp = f.ui.scope_builder(
-        egui::UiBuilder::new()
-            // IMPORTANT: **必须给显式 id**。不给的话 egui 按调用位置自动生成，
-            // 于是：焦点断言没法稳定地指向它（只能退化成
-            // 「有没有任何控件获得焦点」这种恒真判断），且任何调整
-            // 布局的改动都可能悄悄换掉 id。
-            //
-            // 上面 `icon_button` 同样用 `scope_builder`，它就给了
-            // `.id(Id::new(id))` —— 两处写法必须一致。
-            .id(egui::Id::new("search_edit"))
-            .max_rect(edit_rect)
-            .layout(egui::Layout::top_down(egui::Align::Min)),
-        |ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut f.state.query)
-                    .hint_text("搜索历史…")
-                    .desired_width(f32::INFINITY)
-                    // IMPORTANT: 字号必须给**不带scale 的逻辑字号**。
-                    //
-                    // 早前传的是 `sized(pal.font_md, scale)`——它已经把
-                    // DPI 系数乘进去了，而 egui 在计算可用高度时会
-                    // **再乘一次** `pixels_per_point`。结果是行高被放大到
-                    // 远超框高，文字被裁掉上半/下半截，表现为
-                    //「能输入但看不见、字很小」。
-                    //
-                    // 正确做法：`FontId` 用逻辑字号，由 egui 负责缩放。
-                    .font(egui::FontId::proportional(pal.font_md))
-                    // 内边距收窄：顶栏只有 44pt，egui 默认的
-                    // `symmetric(4,2)` 在此会让单行控件偏高而裁切。
-                    .margin(egui::Margin::symmetric(2, 0))
-                    .text_color(pal.text)
-                    // 去掉 TextEdit 自带的外框：外框已由上面的
-                    // `rect_stroke` 画好，两层框叠在一起会显得脏。
-                    //
-                    // IMPORTANT: 这里必须给 `egui::Frame` 枚举而不是 `false`：
-                    // 0.36 的 `frame()` 收的是容器框类型，不是 bool。
-                    .frame(egui::Frame::NONE),
-            )
-        },
-    );
-    // `scope_builder` 返回 `InnerResponse<Response>`：内层是 TextEdit
-    // 自己的响应，外层是这次作用域分配整体的响应。
-    // 焦点与 id 都要用**内层**的——外层 id 属于作用域，不是输入框。
-    let edit_resp = resp.inner;
-
-    // 自报真实 Id，供测试精确判断焦点落在哪个控件上（见字段说明）。
-    f.state.search_edit_id = Some(edit_resp.id);
-
-    if edit_resp.has_focus() {
-        // 聚焦时描边加强，给出明确的视觉反馈。
-        f.ui.painter_at(r).rect_stroke(
-            r,
-            pal.radius_md,
-            Stroke::new(1.5, pal.border_strong),
-            egui::StrokeKind::Inside,
-        );
-    }
-
-    // 有文本时给一个清除按钮。
-    if !f.state.query.is_empty() {
-        let btn = r.height() * 0.6;
-        let clear = Rect::from_center_size(
-            pos2(r.max.x - pad - btn * 0.5, r.center().y),
-            vec2(btn, btn),
-        );
-        let cr = f
-            .ui
-            .interact(clear, egui::Id::new("card_search_clear"), Sense::click());
-        crate::icons::Icon::Close.paint(
-            &f.ui.painter_at(clear),
-            Rect::from_center_size(clear.center(), vec2(btn, btn) * 0.7),
-            if cr.hovered() { pal.text_bright } else { pal.text_dim },
-        );
-        if cr.clicked() {
-            f.state.query.clear();
-            // 清空后主动交还焦点：否则用户还得再点一次才能继续打字。
-            f.ui.memory_mut(|m| m.request_focus(edit_resp.id));
-        }
-        cr.on_hover_text("清空搜索");
-    }
-}
 
 /// 画放大镜图标（圆环 + 手柄），几何绘制而非字体字形。
 ///
@@ -1996,6 +2302,12 @@ enum ItemKind {
     /// 独立成变体：需要同时编辑「顺序 + 三个显隐位」，通用的
     /// `Bool`/`Number` 渲染表达不了拖拽排序。
     RowMeta,
+    /// 悬浮类型过滤栏：总开关 + 始终显示 + 停靠位置 + 图标大小。
+    ///
+    /// 独立成变体（同 [`ItemKind::CardShadow`]）：四个参数一张互相
+    /// 牵连的卡，关掉总开关后其余三个一起失效，走通用渲染会得到
+    /// 四个互不相干的开关/滑块。
+    TypeRail,
     /// 字体缩放：**预设档位**分段控件（小 / 标准 / 大 / 特大 / 超大）。
     ///
     /// # 为什么不用滑条 / 数字输入
@@ -2177,6 +2489,7 @@ impl SettingsItem {
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
             ItemKind::CardShadow => cfg.ui.card_shadow != d.ui.card_shadow,
             ItemKind::RowMeta => cfg.ui.row_meta != d.ui.row_meta,
+            ItemKind::TypeRail => cfg.ui.type_rail != d.ui.type_rail,
             ItemKind::FontScale => (cfg.ui.font_scale - d.ui.font_scale).abs() > 1e-6,
             ItemKind::Hotkey(slot) => slot.current(cfg) != slot.default(),
             ItemKind::Autostart => cfg.ui.autostart != d.ui.autostart,
@@ -2219,6 +2532,7 @@ impl SettingsItem {
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
             ItemKind::CardShadow => Some(Op::SetCardShadow(d.ui.card_shadow)),
             ItemKind::RowMeta => Some(Op::SetRowMeta(d.ui.row_meta)),
+            ItemKind::TypeRail => Some(Op::SetTypeRail(d.ui.type_rail)),
             // 字体缩放：恢复默认倍率（1.0×）。走 SetNumber 而非专用 Op——
             // 应用侧的即时生效钩子正是按 (Ui, "font_scale") 匹配的。
             ItemKind::FontScale => Some(Op::SetNumber {
@@ -2294,6 +2608,26 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 desc: "开机后只启动后台记录，界面从托盘唤起",
                 kind: ItemKind::Autostart,
             },
+            SettingsItem {
+                label: "浏览器路径",
+                desc: "双击链接型条目时调用的程序；留空用系统默认浏览器",
+                kind: ItemKind::Text {
+                    group: ConfigGroup::Ui,
+                    field: "browser_path",
+                    ph: "默认（系统默认浏览器）",
+                    secret: false,
+                },
+            },
+            SettingsItem {
+                label: "资源管理器路径",
+                desc: "双击文件型条目时调用的程序；留空用系统资源管理器",
+                kind: ItemKind::Text {
+                    group: ConfigGroup::Ui,
+                    field: "explorer_path",
+                    ph: "默认（explorer.exe）",
+                    secret: false,
+                },
+            },
         ],
     },
     SettingsCard {
@@ -2334,6 +2668,21 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: "右下角信息",
                 desc: "列表卡片右下角的图标 / 类型 / 大小：单击元素切换显示（灰色 = 隐藏），按住拖动可调整前后顺序",
                 kind: ItemKind::RowMeta,
+            },
+            SettingsItem {
+                label: "图片内容直接显示",
+                desc: "图片类型的条目在列表里直接显示缩略图；关闭后只显示尺寸描述",
+                kind: ItemKind::Bool(ConfigGroup::Ui, "image_inline"),
+            },
+            SettingsItem {
+                label: "Markdown 渲染显示",
+                desc: "Markdown 类型按标题 / 列表 / 代码块排版；关闭后显示等宽源码",
+                kind: ItemKind::Bool(ConfigGroup::Ui, "md_rendered"),
+            },
+            SettingsItem {
+                label: "类型过滤栏",
+                desc: "主窗口边缘的悬浮类型按钮：单击按类型过滤、再点取消；默认只显示已有记录的类型，位置与大小可调",
+                kind: ItemKind::TypeRail,
             },
         ],
     },
@@ -2517,6 +2866,11 @@ fn get_bool(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, field:
         (G::Ui, "show_tray") => cfg.ui.show_tray,
         (G::Ui, "start_minimized") => cfg.ui.start_minimized,
         (G::Ui, "autostart") => cfg.ui.autostart,
+        // ---- 第三轮新增 ----
+        (G::Ui, "image_inline") => cfg.ui.image_inline,
+        (G::Ui, "md_rendered") => cfg.ui.md_rendered,
+        // NOTE: type_rail 的四个参数走 `Op::SetTypeRail` 整包替换
+        // （ItemKind::TypeRail），这里不再按字段名分发。
         (G::MiniPanel, "enabled") => cfg.mini_panel.enabled,
         (G::MiniPanel, "ctrl") => cfg.mini_panel.ctrl,
         (G::MiniPanel, "shift") => cfg.mini_panel.shift,
@@ -2548,6 +2902,9 @@ fn get_text(cfg: &modular_clipboard_core::config::Config, g: ConfigGroup, field:
     match (g, field) {
         (G::Mcp, "host") => cfg.mcp.host.clone(),
         (G::Mcp, "token") => cfg.mcp.token.clone(),
+        // 第三轮：双击跳转调用路径（空 = 系统默认）。
+        (G::Ui, "browser_path") => cfg.ui.browser_path.clone(),
+        (G::Ui, "explorer_path") => cfg.ui.explorer_path.clone(),
         _ => String::new(),
     }
 }
@@ -2803,17 +3160,17 @@ fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
                 ui.data_mut(|d| d.insert_temp(drag_id, part));
             }
             // 拖动重排：鼠标左侧有几个「其他」chip，就插到第几。
-            if is_dragged {
-                if let Some(ptr) = resp.interact_pointer_pos() {
-                    let n_left = cells
-                        .iter()
-                        .filter(|(p, r, _)| *p != part && r.center().x < ptr.x)
-                        .count();
-                    let cur = next.order.iter().position(|p| *p == part).unwrap_or(0);
-                    if cur != n_left {
-                        next.move_to_index(part, n_left);
-                        changed = true;
-                    }
+            if is_dragged
+                && let Some(ptr) = resp.interact_pointer_pos()
+            {
+                let n_left = cells
+                    .iter()
+                    .filter(|(p, r, _)| *p != part && r.center().x < ptr.x)
+                    .count();
+                let cur = next.order.iter().position(|p| *p == part).unwrap_or(0);
+                if cur != n_left {
+                    next.move_to_index(part, n_left);
+                    changed = true;
                 }
             }
             if resp.drag_stopped() {
@@ -3054,6 +3411,64 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
         ItemKind::RowMeta => {
             // 编辑器内部自己 push Op（单击 / 拖拽可能一帧内多次改）。
             if draw_row_meta_editor(f, ui) {
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::TypeRail => {
+            // 类型过滤栏：总开关 + （开启时）始终显示 / 位置 / 大小。
+            // 整包替换（四个参数可能同帧连改，见 Op::SetTypeRail）。
+            let mut cfg = f.svc.state.config.ui.type_rail;
+            let mut changed = false;
+            changed |= setting_row(ui, it.label, it.desc, |ui| {
+                draw_switch(f, ui, "type_rail_visible", &mut cfg.visible)
+            });
+            if cfg.visible {
+                ui.add_space(2.0);
+                changed |= setting_row(ui, "始终显示全部类型", "关闭时仅显示已有记录的类型", |ui| {
+                    draw_switch(f, ui, "type_rail_always", &mut cfg.always)
+                });
+                ui.add_space(2.0);
+                // 位置：四向分段控件（与「背景效果」同一控件）。
+                changed |= setting_row(ui, "停靠位置", "类型栏贴在主窗口的哪一侧", |ui| {
+                    use modular_clipboard_core::config::TypeRailPos;
+                    let picked = draw_segmented(
+                        f,
+                        ui,
+                        &[
+                            (TypeRailPos::Right, "右"),
+                            (TypeRailPos::Left, "左"),
+                            (TypeRailPos::Top, "上"),
+                            (TypeRailPos::Bottom, "下"),
+                        ],
+                        cfg.pos,
+                    );
+                    if let Some(p) = picked {
+                        cfg.pos = p;
+                    }
+                    picked.is_some()
+                });
+                ui.add_space(2.0);
+                // 大小：24~48pt 滑块（步进由滑块天然连续，绘制侧钳制）。
+                let mut size = modular_clipboard_core::config::clamp_type_rail_size(cfg.size);
+                let pal = f.pal;
+                changed |= setting_row(ui, "图标大小", "类型按钮的边长（24~48pt）", |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(format!("{}", size.round() as i32)).color(pal.text_dim),
+                    ));
+                    draw_slider(
+                        f,
+                        ui,
+                        "type_rail_size",
+                        &mut size,
+                        modular_clipboard_core::config::TYPE_RAIL_SIZE_MIN
+                            ..=modular_clipboard_core::config::TYPE_RAIL_SIZE_MAX,
+                        true,
+                    )
+                });
+                cfg.size = modular_clipboard_core::config::clamp_type_rail_size(size);
+            }
+            if changed {
+                f.state.push(Op::SetTypeRail(cfg));
                 record_recent(f, it.label);
             }
         }
@@ -4688,6 +5103,10 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // `docked()` 内部已经处理了「置顶内嵌时不参与 dock」这个规则，
     // 它才是「这张卡片会不会真的被画出来」的准确来源。
     let pinned_drawn_separately = f.ws.docked().any(|c| c.kind == CardKind::Pinned);
+    // 类型过滤（2026-10-15 第三轮：悬浮类型栏）。与 `query` 一样是
+    // **界面本地**过滤——不进 store 查询、不进 IPC 快照，绘制时筛行。
+    // 置顶条目同样参与类型过滤：置顶只是一个排序权重，不是豁免。
+    let type_filter = f.state.type_filter;
     // 只收**索引**，不克隆条目（PF-1）：整表 `.cloned()` 每帧拷贝全部
     // preview / hash / source_app 三个 String（2000 条时是数 MB/帧），
     // 而绘制只碰可见行。索引 8 字节/行，测量与绘制都按需取原表。
@@ -4697,9 +5116,12 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
         .items
         .iter()
         .enumerate()
-        .filter(|(_, it)| match only_pinned {
-            Some(p) => it.pinned == p,
-            None => !(pinned_drawn_separately && it.pinned),
+        .filter(|(_, it)| {
+            type_filter.is_none_or(|k| it.kind == k)
+                && match only_pinned {
+                    Some(p) => it.pinned == p,
+                    None => !(pinned_drawn_separately && it.pinned),
+                }
         })
         .map(|(i, _)| i)
         .collect();
@@ -4713,8 +5135,10 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     if rows.is_empty() {
         let msg = match only_pinned {
             Some(true) => "还没有置顶条目",
-            _ if f.state.query.is_empty() => "还没有剪贴板记录",
-            _ => "没有匹配的结果",
+            // 有查询词**或类型过滤**生效 ⇒ 「没有匹配的结果」；
+            // 两者都空才是「还没有剪贴板记录」（从没复制过东西）。
+            _ if !f.state.query.is_empty() || type_filter.is_some() => "没有匹配的结果",
+            _ => "还没有剪贴板记录",
         };
         draw_empty(f, body, msg);
         return;
@@ -4754,7 +5178,16 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             None => {
                 let h: Vec<f32> = rows
                     .iter()
-                    .map(|&i| row_height_for(f.ui, &f.svc.state.items[i], pal, scale, text_w))
+                    .map(|&i| {
+                        row_height_for(
+                            f.ui,
+                            &f.svc.state.items[i],
+                            pal,
+                            scale,
+                            text_w,
+                            &f.svc.state.config.ui,
+                        )
+                    })
                     .collect();
                 f.state.row_height_cache[pinned_slot as usize] = Some(RowHeightCache {
                     version,
@@ -4932,6 +5365,15 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 frames.push((k, i, r));
             }
 
+            // 本帧本列表可见的图片条目报到帧级集合（`thumb_seen`）——
+            // 淘汰在 `draw` 收尾统一做，见该字段的说明。
+            for (_, i, _) in &frames {
+                let it = &f.svc.state.items[rows[*i]];
+                if it.kind == modular_clipboard_core::ClipKind::Image {
+                    f.state.thumb_seen.insert(it.id);
+                }
+            }
+
             // ---- 第一遍：所有行的卡片阴影（统一在内容之前） ----
             //
             // 必须用视口级 painter（不能用 `painter_at(r)`，否则外扩
@@ -4942,10 +5384,12 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             {
                 let shadow_painter = ui.painter();
                 let shadow_cfg = &f.svc.state.config.ui.card_shadow;
-                for (_, _, r) in &frames {
-                    draw_card_shadow(&shadow_painter, *r, ROW_RADIUS, shadow_cfg, f.pal);
-                }
-            }
+                for &(_, _, r) in &frames {
+                    // CAUTION: `ui.painter()` 返回的就是 `&Painter`，不要再
+                    // 套一层 `&`——clippy 的 needless_borrow 会报，且
+                    // `&&Painter` 靠自动解引用勉强能编译，属于暗坑。
+                    draw_card_shadow(shadow_painter, r, ROW_RADIUS, shadow_cfg, f.pal);
+                }            }
 
             // ---- 第二遍：缝隙拖动区 + 行内容 ----
             for (k, i, r) in frames {
@@ -4967,6 +5411,9 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 }
                 draw_item_row(f, ui, r, &visible[k]);
             }
+            // NOTE: 纹理淘汰**不在这里做**——主栏与内嵌置顶区各调一次
+            // 本函数，各自 retain 会互相淘汰（见 UiState::thumb_seen）。
+            // 统一收到帧级，由 `draw` 收尾处理。
             // 最后可视行之后的空白（内容不满一屏时的列表底部）也作为拖动
             // 区——它不覆盖任何卡片，按住中部空白即可拖动窗口。
             //
@@ -5092,36 +5539,8 @@ fn history_row_gap(cfg: &modular_clipboard_core::config::CardShadowConfig) -> f3
         return ROW_GAP;
     }
     let need = cfg.offset_y.abs() + cfg.blur.clamp(0.0, 24.0);
-    need.max(ROW_GAP).min(ROW_GAP_MAX)
+    need.clamp(ROW_GAP, ROW_GAP_MAX)
 }
-
-/// 顶栏搜索框的**期望**宽度（逻辑点）。
-///
-/// 搜索框默认折叠成一枚放大镜图标（贴在窗口按钮左侧），顶栏左侧
-/// 整片让给拖动区；展开后输入框向左弹出。
-///
-/// CAUTION: 这是**期望**值不是最终宽度。主窗口窄时要按可用空间
-/// 收窄（见 [`draw_topbar`]），写死就会溢出到顶栏之外、被 `painter`
-/// 裁掉——实机表现「渲染不完整」。
-///
-/// 取值平衡：太窄（<120）输入体验差；太宽（>180）展开时把拖动区
-/// 挤到 <30pt，用户搜索完要拖窗口又拖不动。140pt ≈ 物理 210px，
-/// 足够输入，且展开后拖动区仍剩约 46pt。
-const SEARCH_EXPAND_W: f32 = 140.0;
-
-/// 输入框的**最小可用宽度**（逻辑点）。
-///
-/// 低于这个宽度连「搜索历史…」的提示文字都放不下，展开也失去意义；
-/// 此时宁可不展开（`draw_topbar` 判 `input_ok=false`），也不要挤出一
-/// 条被裁切的输入框（这正是「主窗口小时渲染不完整」的来源）。
-const SEARCH_MIN_W: f32 = 88.0;
-
-/// 展开输入框后，顶栏左侧**至少**要留给拖动区的宽度。
-///
-/// 窗口窄时若不设下限，输入框会一路向左扩张把拖动区吃光，
-/// 窗口就拖不动了。剩下的宽度不够就把输入框缩窄——它是被限制的
-/// 一方，拖动区优先。24pt 约等于一个图标按钮的宽度，仍然按得住。
-const SEARCH_DRAG_RESERVE: f32 = 24.0;
 
 /// 离开搜索区域后延迟多久折叠（秒）。
 ///
@@ -5153,7 +5572,13 @@ const SCROLLBAR_RESERVE: f32 = crate::theme::SCROLLBAR_WIDTH;
 /// 每行文字的高度倍率。
 const LINE_H: f32 = 1.35;
 
-/// 单条列表项的**实际**行高：按预览文本折行后的行数计算。
+/// 图片条目内嵌缩略图的限高（逻辑点）≈ 3 行正文。
+///
+/// 与原型一致：再高会让一条记录占据半屏，列表的信息密度崩塌；
+/// 更宽的图按比例缩窄，长宽比不变。
+const IMG_MAX_H: f32 = 108.0;
+
+/// 单条列表项的**实际**行高：按内容排版结果计算。
 ///
 /// # 为什么必须逐条算
 ///
@@ -5165,7 +5590,19 @@ const LINE_H: f32 = 1.35;
 /// 折行数由 egui 自己算（[`egui::TextWrapping::max_rows`]），
 /// 这里只取「实际用了几行」——比按字符数估算准得多，
 /// 中英文混排、全角半角混排都能正确处理。
-fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, text_w: f32) -> f32 {
+///
+/// 2026-10-15 第三轮起有三种内容形态，行高各按各的算：
+/// - 图片（`image_inline` 开）= 缩略图显示高（限高 [`IMG_MAX_H`]）；
+/// - Markdown（`md_rendered` 开）= 排版实测高；
+/// - 其余 = 折行文本高。
+fn row_height_for(
+    ui: &egui::Ui,
+    item: &ClipItem,
+    pal: &Palette,
+    scale: f32,
+    text_w: f32,
+    cfg: &modular_clipboard_core::config::UiConfig,
+) -> f32 {
     let preview_font = sized(pal.font_md, scale);
     let meta_font = sized(pal.font_xs, scale);
     // IMPORTANT: 行高也必须用**逻辑点**、不乘 ppp：字号已经改成逻辑点，
@@ -5173,40 +5610,55 @@ fn row_height_for(ui: &egui::Ui, item: &ClipItem, pal: &Palette, scale: f32, tex
     let line_h = pal.font_md * LINE_H;
     let meta_h = meta_font.size.max(10.0);
 
-    // 折行一次，拿到实际行数。
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        &item.preview,
-        0.0,
-        egui::TextFormat {
-            font_id: preview_font,
-            color: pal.text,
-            ..Default::default()
-        },
-    );
-    job.wrap.max_width = text_w;
-    // 不限行数，先量出「到底需要几行」。
-    //
-    // IMPORTANT: 必须用 `usize::MAX` 而不是 `0`：`TextWrapping::max_rows` 的
-    // 默认值是 `usize::MAX`（不限），而它的文档明确写着
-    // 「If set to `0`, no text will be outputted」——
-    // **0 表示一行都不输出**，不是「不限」。
-    //
-    // 误设成 0 的后果：galley.rows 恒为空 → `n_lines` 恒为 1 →
-    // 行高恒等于最小值 52pt → 预览带只有 24pt 高 → 长内容被省略号
-    // 截断。实测诊断数据完全对上：
-    //   row_h=52.8  band_h=24.3  galley_rows=1  elided=true
-    job.wrap.max_rows = usize::MAX;
-    job.wrap.break_anywhere = true;
-    let galley = ui.painter().layout_job(job);
-    // `rows` 是字段不是方法（`Arc<Galley>` 直接解引用）。
-    let n_lines = galley.rows.len().max(1);
-    let text_h = n_lines as f32 * line_h;
-
     // 三段布局：顶部一行（meta / 按钮取较高者）+ 预览 + 底部 meta。
     // 与 `draw_item_row` 的 `preview_band` 严格对应。
     let top_h = row_top_height(pal);
-    (text_h + meta_h + top_h + 5.0 * 2.0 + 4.0).max(ROW_HEIGHT_MIN)
+
+    // ---- 内容高：图片 / Markdown / 文本三分支 ----
+    let content_h = if item.kind == modular_clipboard_core::ClipKind::Image
+        && cfg.image_inline
+        && let Some(dims) = item.payload.as_ref().and_then(|p| p.dims)
+        && dims.0 > 0
+        && dims.1 > 0
+    {
+        // 缩略图显示高：限高 IMG_MAX_H，宽不超预览带（保持长宽比）。
+        // dims 来自 store 插入时读的图片头，**不需要解码**——
+        // 行高是每帧都要算的（滚动数学），为它解码全图太贵。
+        IMG_MAX_H.min(text_w * dims.1 as f32 / dims.0 as f32)
+    } else if item.kind == modular_clipboard_core::ClipKind::Markdown && cfg.md_rendered {
+        crate::md::MdDoc::parse(&item.preview).height(ui, pal, scale, text_w)
+    } else {
+        // 折行一次，拿到实际行数。
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &item.preview,
+            0.0,
+            egui::TextFormat {
+                font_id: preview_font,
+                color: pal.text,
+                ..Default::default()
+            },
+        );
+        job.wrap.max_width = text_w;
+        // 不限行数，先量出「到底需要几行」。
+        //
+        // IMPORTANT: 必须用 `usize::MAX` 而不是 `0`：`TextWrapping::max_rows` 的
+        // 默认值是 `usize::MAX`（不限），而它的文档明确写着
+        // 「If set to `0`, no text will be outputted」——
+        // **0 表示一行都不输出**，不是「不限」。
+        //
+        // 误设成 0 的后果：galley.rows 恒为空 → `n_lines` 恒为 1 →
+        // 行高恒等于最小值 52pt → 预览带只有 24pt 高 → 长内容被省略号
+        // 截断。实测诊断数据完全对上：
+        //   row_h=52.8  band_h=24.3  galley_rows=1  elided=true
+        job.wrap.max_rows = usize::MAX;
+        job.wrap.break_anywhere = true;
+        let galley = ui.painter().layout_job(job);
+        // `rows` 是字段不是方法（`Arc<Galley>` 直接解引用）。
+        galley.rows.len().max(1) as f32 * line_h
+    };
+
+    (content_h + meta_h + top_h + 5.0 * 2.0 + 4.0).max(ROW_HEIGHT_MIN)
 }
 
 fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
@@ -5355,6 +5807,11 @@ fn fill_rounded_border(
 ///
 /// 用 Abramowitz & Stegun 7.1.26 的 Φ(x) 有理近似（|误差| < 7.5e-8），
 /// 不引第三方数学库。
+///
+/// NOTE: 系数**刻意保留出版常数**（而非削到 f32 精度）：这组数字要与
+/// 论文表格逐位对得上才敢声称「误差 < 7.5e-8」，削位反而让可追溯性
+/// 断掉。`excessive_precision` 在这里是特性不是缺陷。
+#[allow(clippy::excessive_precision)]
 fn gaussian_outer(d: f32, sigma: f32) -> f32 {
     if sigma <= 0.0 {
         return 0.0;
@@ -5662,7 +6119,10 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
             f.state.push(Op::Select(item.id));
         }
         if resp.double_clicked() {
-            f.state.push(Op::Copy(item.id));
+            // CAUTION: 必须先算后 push——`f.state.push(double_click_op(f, …))`
+            // 让 `f.state` 与实参 `&mut f` 同时活着一帧，借用检查直接拦。
+            let op = double_click_op(f, item);
+            f.state.push(op);
         }
         return;
     }
@@ -5690,47 +6150,24 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         pos2(full_x1, bot_band.min.y - 2.0),
     );
 
+    // 内容形态三分支（第三轮）：图片内嵌 / Markdown 渲染（或源码）/ 文本。
+    // CAUTION: 判据用的开关要从 config 现取，且**不能**持有 `&cfg` 跨越
+    // 下面的 `&mut f` 调用——先拷成两个 bool。
+    let image_inline = f.svc.state.config.ui.image_inline;
+    let md_rendered = f.svc.state.config.ui.md_rendered;
+    let is_image = item.kind == modular_clipboard_core::ClipKind::Image;
+    let is_markdown = item.kind == modular_clipboard_core::ClipKind::Markdown;
+
     if preview_band.height() > 4.0 {
-        // 用 `Painter::layout_job` 按宽度折行，返回**完整** Galley——
-        // 这才是「完整显示」：不丢任何字符，只是折行。
-        //
-        // CAUTION: 不能用 `Ui::layout`/`Context::layout`：那是给「让出矩形」
-        // 的控件做换行用的，会受子 `Ui` 的布局约束影响，而我们只要
-        // 一个纯文本排版结果。`Painter::layout_job` 才是纯排版入口。
-        let mut job = egui::text::LayoutJob::default();
-        job.append(
-            &item.preview,
-            0.0,
-            egui::TextFormat {
-                font_id: sized(pal.font_md, scale),
-                color: if selected {
-                    pal.text_bright
-                } else {
-                    pal.text
-                },
-                ..Default::default()
-            },
-        );
-        job.wrap.max_width = preview_band.width();
-        // 高度用 `max_rows` 表达（0.36 的 `TextWrapping` **没有**
-        // `max_height` 字段，只有 `max_width` / `max_rows` /
-        // `break_anywhere` / `overflow_character`）。
-        //
-        // 行数按可用高度与字号算出，至少 1 行。超出部分由 egui 省略并
-        // 在末行加省略号——**完整内容在详情子窗口里能看到**。
-        // 行数上限：`row_height_for` 已按同一份预览文本算出行数并据此
-        // 定好行高，这里给同样的上限只是兜底（防止两次排版结果不一致）。
-        //
-        // CAUTION: **不能设 0**：egui 文档写明「If set to 0, no text will be
-        // outputted」——0 表示一行都不输出。默认值 `usize::MAX` 才是「不限」。
-        job.wrap.max_rows = ((preview_band.height() / (pal.font_md * LINE_H))
-            .floor()
-            .max(1.0)) as usize;
-        // 长路径/无空格的长串要在任意字符间断行，否则会横向溢出。
-        job.wrap.break_anywhere = true;
-        let galley = f.ui.painter().layout_job(job);
-        ui.painter_at(preview_band)
-            .galley(pos2(preview_band.min.x, preview_band.min.y), galley, pal.text);
+        if is_image && image_inline {
+            draw_image_preview(f, ui, preview_band, item);
+        } else if is_markdown && md_rendered {
+            draw_markdown_preview(f, ui, preview_band, item);
+        } else if is_markdown {
+            draw_source_preview(f, ui, preview_band, item);
+        } else {
+            draw_text_preview(f, ui, preview_band, item, selected);
+        }
     }
 
     // 左上：来源 · 时间（小字）。
@@ -5805,8 +6242,8 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
                         pos2(rx, cy + badge_side * 0.5),
                     );
                     painter.rect_filled(br, badge_radius, pal.surface_variant);
-                    crate::icons::Icon::for_kind(item.kind)
-                        .paint(&painter, br, pal.text_dim);
+                    // Markdown 无字体字形，走几何绘制（见 paint_kind_icon）。
+                    crate::icons::paint_kind_icon(&painter, item.kind, br, pal.text_dim);
                     rx -= badge_side + meta_gap;
                 }
                 RowMetaPart::Size if size_on => {
@@ -5937,8 +6374,237 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         f.state.push(Op::Select(item.id));
     }
     if resp.double_clicked() {
-        f.state.push(Op::Copy(item.id));
+        // 同窄行分支：先算后 push（避免 `f.state` 与 `&mut f` 同帧共存）。
+        let op = double_click_op(f, item);
+        f.state.push(op);
     }
+}
+
+// ---------------------------------------------------------------- 预览带
+
+/// 文本预览（默认形态）：按预览带宽度折行，**完整显示**。
+///
+/// 选中态把文字提亮一档（与 `sel_fx` 的描边/底色叠加表达选中）。
+fn draw_text_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem, selected: bool) {
+    let pal = f.pal;
+    // 用 `Painter::layout_job` 按宽度折行，返回**完整** Galley——
+    // 这才是「完整显示」：不丢任何字符，只是折行。
+    //
+    // CAUTION: 不能用 `Ui::layout`/`Context::layout`：那是给「让出矩形」
+    // 的控件做换行用的，会受子 `Ui` 的布局约束影响，而我们只要
+    // 一个纯文本排版结果。`Painter::layout_job` 才是纯排版入口。
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &item.preview,
+        0.0,
+        egui::TextFormat {
+            font_id: sized(pal.font_md, f.scale),
+            color: if selected {
+                pal.text_bright
+            } else {
+                pal.text
+            },
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = band.width();
+    // 高度用 `max_rows` 表达（0.36 的 `TextWrapping` **没有**
+    // `max_height` 字段，只有 `max_width` / `max_rows` /
+    // `break_anywhere` / `overflow_character`）。
+    //
+    // 行数按可用高度与字号算出，至少 1 行。超出部分由 egui 省略并
+    // 在末行加省略号——**完整内容在详情子窗口里能看到**。
+    // 行数上限：`row_height_for` 已按同一份预览文本算出行数并据此
+    // 定好行高，这里给同样的上限只是兜底（防止两次排版结果不一致）。
+    //
+    // CAUTION: **不能设 0**：egui 文档写明「If set to 0, no text will be
+    // outputted」——0 表示一行都不输出。默认值 `usize::MAX` 才是「不限」。
+    job.wrap.max_rows = ((band.height() / (pal.font_md * LINE_H)).floor().max(1.0)) as usize;
+    // 长路径/无空格的长串要在任意字符间断行，否则会横向溢出。
+    job.wrap.break_anywhere = true;
+    let galley = f.ui.painter().layout_job(job);
+    ui.painter_at(band)
+        .galley(pos2(band.min.x, band.min.y), galley, pal.text);
+}
+
+/// Markdown 源码预览（`md_rendered` 关闭时）：等宽 + 弱化色。
+///
+/// 与渲染态明确区分——用户能一眼看出「现在看到的是原始 Markdown」。
+fn draw_source_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
+    let pal = f.pal;
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &item.preview,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::monospace(pal.font_sm * f.scale),
+            color: pal.text_dim,
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = band.width();
+    job.wrap.max_rows = ((band.height() / (pal.font_sm * 1.45)).floor().max(1.0)) as usize;
+    job.wrap.break_anywhere = true;
+    let galley = f.ui.painter().layout_job(job);
+    ui.painter_at(band)
+        .galley(pos2(band.min.x, band.min.y), galley, pal.text_dim);
+}
+
+/// Markdown 渲染预览（第三轮新增）。
+///
+/// 行高由 `row_height_for` 调**同一个** `md::MdDoc` 的 `height()` 算出，
+/// 绘制调 `draw()`——同一函数、同一宽度，测量与绘制不可能漂移。
+/// 选中态不提亮文字（`sel_fx` 覆盖层已足够表达），与原型一致。
+fn draw_markdown_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
+    let doc = crate::md::MdDoc::parse(&item.preview);
+    if doc.is_empty() {
+        return;
+    }
+    let pal = f.pal;
+    doc.draw(ui, pal, f.scale, band.min, band.width());
+}
+
+/// 图片预览（第三轮新增）：内容区直接显示缩略图。
+///
+/// 管线：`thumb_tex` 命中 → 直接用；未命中 → `thumb_cache`
+/// （LRU 像素缓存，失败有短时抑制）解码 + `load_texture` 上传。
+/// 解码在**缓存未命中**时才发生：载荷读取与解码都不进每帧热路径
+/// （PF-1 的同款理由——列表每帧重排，不能每帧读盘）。
+///
+/// 任何一步失败（载荷被淘汰 / 不是图片 / 解码失败）都**回落文本预览**：
+/// 剪贴板工具的列表不能因为一张坏图就少画一行。
+fn draw_image_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
+    use modular_clipboard_core::ClipKind;
+    let _ = ClipKind::Image;
+    // 显示矩形：限高 IMG_MAX_H、限宽预览带，保持长宽比，左上对齐。
+    let Some(dims) = item
+        .payload
+        .as_ref()
+        .and_then(|p| p.dims)
+        .filter(|(w, h)| *w > 0 && *h > 0)
+    else {
+        // 没有尺寸信息（载荷已被淘汰）：按普通文本显示（「图片 WxH」）。
+        draw_text_preview(f, ui, band, item, false);
+        return;
+    };
+    let ratio = dims.0 as f32 / dims.1 as f32;
+    // 显示矩形：限高 IMG_MAX_H、限宽预览带，**两步都保持长宽比**。
+    //
+    // CAUTION: 不能「高先定死、宽超了再截」——那会把图拉扁
+    // （painter.image 按 uv 0..1 把整张图填进矩形）。宽超限时必须
+    // 回头按比例缩高，否则极窄窗口下截图变成压扁的条。
+    let mut disp_h = IMG_MAX_H.min(band.height());
+    let mut disp_w = disp_h * ratio;
+    if disp_w > band.width() {
+        disp_w = band.width();
+        disp_h = disp_w / ratio;
+    }
+    let rect = Rect::from_min_size(band.min, vec2(disp_w, disp_h));
+
+    // 纹理句柄：命中直接用，未命中走缓存 + 上传。
+    //
+    // CAUTION: `state.thumb_cache` 与 `svc` 是 Frame 的不同字段，
+    // 先分别借开才能在同一条表达式里用（闭包要读载荷、缓存要可写）。
+    let tex = match f.state.thumb_tex.get(&item.id).copied() {
+        Some(t) => Some(t),
+        None => {
+            let cache = &mut f.state.thumb_cache;
+            let svc = &mut f.svc;
+            let id = item.id;
+            let key = crate::thumbnail::CacheKey::new(id, item.hash.clone());
+            match cache.get_or_load(key, || svc.load_payload_bytes(id).map_err(|e| e.to_string())) {
+                Ok(thumb) => {
+                    let img = thumb.to_color_image();
+                    // 纹理名带条目 id：同一条目重复上传会**替换**而不是
+                    // 累积，egui 侧不会因此长出新纹理。
+                    // 只存 `TextureId`：纹理由 Context 持有（注册即托管），
+                    // 句柄（TextureHandle）只是引用，没必要长留。
+                    let t = ui
+                        .ctx()
+                        .load_texture(
+                            format!("mc_thumb_{id}"),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        )
+                        .id();
+                    f.state.thumb_tex.insert(id, t);
+                    Some(t)
+                }
+                Err(e) => {
+                    tracing::debug!(id, ?e, "缩略图获取失败，回落文本预览");
+                    None
+                }
+            }
+        }
+    };
+    let Some(tex) = tex else {
+        draw_text_preview(f, ui, band, item, false);
+        return;
+    };
+    let painter = ui.painter_at(rect);
+    // uv 给整张图（0..1），tint 白色（不染色——缩略图颜色即原图）。
+    painter.image(
+        tex,
+        rect,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    // 1px 弱描边：浅色图片（白底截图）与深色列表背景之间需要一道边界。
+    painter.rect_stroke(
+        rect,
+        6.0,
+        Stroke::new(1.0, f.pal.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// 双击列表行的目标操作（2026-10-15 第三轮定稿）：
+///
+/// - 链接型文本（`https?://…`）⇒ 浏览器打开（尊重 `ui.browser_path`）；
+/// - 文件型条目 / 形似路径的文本 ⇒ 资源管理器定位（尊重 `ui.explorer_path`）；
+/// - 其余 ⇒ 复制。
+///
+/// CAUTION: 判据放在绘制层（而不是让 `App` 再认一遍内容）：
+/// 双击时条目就在手上，kind + preview 都是现成的；`App` 侧只负责
+/// 「用哪个程序打开」，不重复判断「该不该打开」。
+///
+/// CAUTION 2: **文件型条目必须读载荷取路径，不能用 preview**。
+/// `build_preview` 给 Files 存的是**文件名摘要**（`paint.rs 等 12 个文件`），
+/// 完整路径只存在于载荷字节（换行拼接）里。拿 preview 去定位，
+/// explorer 收到的是一个文件名——打不开用户想要的位置。
+/// 文本型路径没有这个问题（preview 即原文）。
+fn double_click_op(f: &mut Frame<'_>, item: &modular_clipboard_core::item::ClipItem) -> Op {
+    use modular_clipboard_core::ClipKind;
+    use modular_clipboard_platform::{looks_like_path, looks_like_url};
+    let text = item.preview.trim();
+    if item.kind == ClipKind::Text && looks_like_url(text) {
+        return Op::OpenUrl(text.to_string());
+    }
+    let is_pathish =
+        item.kind == ClipKind::Files || (item.kind == ClipKind::Text && looks_like_path(text));
+    if is_pathish {
+        let first = if item.kind == ClipKind::Files {
+            // 载荷是换行拼接的路径列表，取第一行。读失败（载荷已被淘汰 /
+            // 通道故障）就放弃跳转——回落成复制好过打开一个错误的位置。
+            match f.svc.load_payload_bytes(item.id) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(str::trim)
+                    .find(|s| !s.is_empty())
+                    .map(str::to_string),
+                Err(e) => {
+                    tracing::debug!(id = item.id, %e, "读取文件条目载荷失败，双击跳转降级为复制");
+                    None
+                }
+            }
+        } else {
+            text.lines().next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+        };
+        if let Some(path) = first {
+            return Op::RevealPath(path);
+        }
+    }
+    Op::Copy(item.id)
 }
 
 // ---------------------------------------------------------------- 状态栏
@@ -5948,13 +6614,11 @@ fn format_meta(ts_ms: i64) -> String {
 }
 
 /// 内容类型的展示名（右下角标签）。
+///
+/// 单一数据源在 [`modular_clipboard_core::ClipKind::label`]：
+/// 类型过滤栏的 tooltip、设置界面、捕获层提示都读同一份。
 fn kind_label(kind: modular_clipboard_core::ClipKind) -> &'static str {
-    match kind {
-        modular_clipboard_core::ClipKind::Text => "文本",
-        modular_clipboard_core::ClipKind::Html => "HTML",
-        modular_clipboard_core::ClipKind::Image => "图片",
-        modular_clipboard_core::ClipKind::Files => "文件",
-    }
+    kind.label()
 }
 
 /// 字节数 → 自适应单位（B / KB / MB / GB）。
@@ -6190,8 +6854,20 @@ fn with_pinned(mut self, n: usize) -> Self {
             // 会让它在后面无法可变借用。
             // 与 `App::draw_frame` 用同一个 scale（生产路径传真实 ppp；
             // 测试夹具的 ppp 恰好是 1.0，`solve` 与 `solve_scaled` 等价）。
+            //
+            // 2026-10-15 第三轮：悬浮类型栏的占位也必须在这里算——
+            // 否则夹具解出的卡片矩形与生产不一致（生产让位、夹具不让），
+            // 「列表被浮动按钮压住」这类问题在测试里永远看不见。
             let ppp = self.ctx.pixels_per_point();
-            let sol = crate::solver::solve_scaled(&self.ws, self.area, ppp);
+            let body = crate::solver::card_area(self.area);
+            let floats = crate::paint::FloatLayout::compute(
+                &self.svc.state.config.ui,
+                &self.svc.state.items,
+                self.state.type_filter,
+                false, // 搜索面板是浮动覆盖层，不参与占位
+                body,
+            );
+            let sol = crate::solver::solve_scaled_inset(&self.ws, self.area, ppp, floats.insets);
             crate::solver::apply(&mut self.ws, &sol);
             let (svc, ws, state, pal, area) =
                 (&mut self.svc, &self.ws, &mut self.state, &self.pal, self.area);
@@ -6362,6 +7038,14 @@ fn with_pinned(mut self, n: usize) -> Self {
             .hit
             .get(ns, name)
             .unwrap_or_else(|| panic!("热区 {name:?} 未在 {ns:?} 里登记（首帧后才有）"))
+    }
+
+    /// `hit` 的可选版本：热区**没登记**返回 `None` 而不是 panic。
+    ///
+    /// 类型过滤栏按「已有类型」决定画哪些按钮，「某类型的按钮不在」
+    /// 本身就是要断言的事实（默认行为：没有该类型记录就不出现）。
+    fn hit_opt(h: &Harness, name: &str) -> Option<Rect> {
+        h.state.hit.get(HitNs::Main, name)
     }
 
     /// 设置（齿轮）按钮矩形。
@@ -7873,31 +8557,42 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
 
         // 折叠态：三按钮 + 搜索图标。
-        assert_outside_drag(
-            &drag,
-            &h,
-            &["topbar_close", "topbar_clear", "topbar_settings", "search_icon"],
-        );
+        //
+        // CAUTION: 只校验**顶栏段**（y 范围落在顶栏内的 drag_regions）。
+        // 侧栏折叠卡片的把手也是拖动区（整列高），而第三轮起的悬浮
+        // 搜索面板通栏、故意盖住把手的顶部一小段——后注册的 interact
+        // 在重叠区胜出，面板优先。这是悬浮层的设计语义（面板压一切），
+        // 不是缺陷；把手在面板下方仍可拖动。本测试守护的洞是
+        // 「顶栏控件被判成 HTCAPTION」，与侧栏把手无关。
+        let topbar_drag = |regions: &[Rect]| -> Vec<Rect> {
+            regions
+                .iter()
+                .copied()
+                .filter(|d| d.max.y <= crate::solver::TOPBAR_HEIGHT + 0.5)
+                .collect()
+        };
+        assert_outside_drag(&topbar_drag(&drag), &h, &[
+            "topbar_close",
+            "topbar_clear",
+            "topbar_settings",
+            "search_icon",
+        ]);
 
-        // 展开态：悬停图标展开搜索框，再验证输入区与外框。
+        // 展开态：悬停图标展开搜索面板，再验证输入区与外框。
         h.hover_search_icon();
         let drag_expanded = h.state.drag_regions.clone();
         assert!(
             h.state.search_expanded,
             "点搜索图标应展开搜索框"
         );
-        assert_outside_drag(
-            &drag_expanded,
-            &h,
-            &[
-                "topbar_close",
-                "topbar_clear",
-                "topbar_settings",
-                "search_icon",
-                "search",
-                "search_box",
-            ],
-        );
+        assert_outside_drag(&topbar_drag(&drag_expanded), &h, &[
+            "topbar_close",
+            "topbar_clear",
+            "topbar_settings",
+            "search_icon",
+            "search",
+            "search_box",
+        ]);
     }
 
     /// 点关闭按钮必须产生 `Op::CloseWindow`。
@@ -7947,31 +8642,25 @@ fn with_pinned(mut self, n: usize) -> Self {
             );
         }
 
-        // 展开后：搜索框也必须完全排在按钮（与图标）左侧。
+        // 展开后：搜索面板是**通栏悬浮层**（卡片区全宽、顶栏下方），
+        // 与顶栏按钮不在同一行——不应当与任何按钮重叠。
+        // （旧实现里输入框向左弹、贴着图标，那时才需要「右缘不越过
+        // 图标左缘」这组断言；第三轮起该几何已不存在。）
         h.hover_search_icon();
         let search = hit(&h, "search_box");
-        let rightmost = rects
-            .iter()
-            .map(|(_, r)| r.max.x)
-            .fold(f32::MIN, f32::max);
-        assert!(
-            search.max.x <= icon_r.min.x + 0.5,
-            "展开后搜索框右缘 {} 越过搜索图标左缘 {}",
-            search.max.x,
-            icon_r.min.x
-        );
-        assert!(
-            search.max.x <= rightmost + 0.5,
-            "搜索框右缘 {} 越过最右按钮 {}，按钮会被盖住",
-            search.max.x,
-            rightmost
-        );
         for (name, r) in &rects {
             assert!(
                 !search.intersects(*r),
-                "展开后搜索框 {search:?} 与按钮 {name} {r:?} 重叠"
+                "展开后面板 {search:?} 与按钮 {name} {r:?} 重叠"
             );
         }
+        // 面板必须整块落在顶栏**下方**（不侵入顶栏，否则顶栏控件被盖）。
+        assert!(
+            search.min.y >= crate::solver::TOPBAR_HEIGHT - 0.5,
+            "面板 top={:.1} 侵入了顶栏（高 {}）",
+            search.min.y,
+            crate::solver::TOPBAR_HEIGHT
+        );
     }
 
     /// 拖动区本身必须真的能拖：空白处要判成 Caption。
@@ -8011,14 +8700,16 @@ fn with_pinned(mut self, n: usize) -> Self {
             );
         }
 
-        // 展开态：左段收缩到输入框左缘，但仍必须存在且能拖。
+        // 展开态：输入框是顶栏**下方**的悬浮面板，不再占顶栏宽度，
+        // 左段拖动区因此不收窄（旧实现「展开时收缩到输入框左缘」
+        // 的几何已不存在）。仍必须存在且能拖。
         h.hover_search_icon();
         let drag2 = h.state.drag_regions.clone();
         let seg2 = drag2[0];
         assert!(
-            seg2.width() >= 40.0,
-            "展开态顶栏左段拖动区只剩 {}pt（应 ≥ 40pt）—— \
-             搜索框展开时窗口会拖不动；drag_regions={drag2:?}",
+            seg2.width() >= 100.0,
+            "展开态顶栏左段拖动区只剩 {}pt（应 ≥ 100pt）—— \
+             搜索区又占回顶栏左侧了？drag_regions={drag2:?}",
             seg2.width()
         );
         let c2 = seg2.center();
@@ -8155,13 +8846,14 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 输入框宽度必须随窗口收窄，且**永远不越出客户区左缘**。
+    /// 悬浮搜索面板必须**完整落在客户区内**，且窄窗口下依然是通栏。
     ///
-    /// 守着实机缺陷（用户反馈「主窗口小时渲染不完整」）：宽度写死
-    /// 140pt 时，窄窗口下输入框从图标位置向左伸展，越过顶栏左缘之后
-    /// 被 `painter_at` 裁掉 —— 左半个框连同提示文字一起没了。
+    /// 守着实机缺陷（用户反馈「主窗口小时渲染不完整」）：旧实现在顶栏里
+    /// 向左弹出固定 140pt，窄窗口下越出左缘被 `painter_at` 裁掉。第三轮起
+    /// 面板是卡片区通栏（左右缘间距即 `CARD_AREA_INSET`），任何宽度下
+    /// 都不可能越界——这条测试把该不变式钉死。
     #[test]
-    fn search_box_shrinks_instead_of_overflowing() {
+    fn search_panel_spans_card_area_and_stays_inside() {
         // 360pt：solver 断点里偏窄的一档，也是「主窗口拉小」时的常态。
         let mut h = Harness::new("search-narrow", vec2(360.0, 500.0));
         h.frame();
@@ -8170,34 +8862,30 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         let r = hit(&h, "search_box");
         assert!(
-            r.min.x >= h.area.min.x,
-            "输入框左缘 {:.1} 越出了客户区左缘 {:.1} —— 左上角被裁，\
-             实机表现「搜索框渲染不完整」",
-            r.min.x,
-            h.area.min.x
-        );
-        assert!(
             h.area.contains_rect(r),
-            "输入框 {r:?} 未完整落在客户区 {:?} 内",
+            "面板 {r:?} 未完整落在客户区 {:?} 内",
             h.area
         );
+        // 通栏：左右缘与窗口边缘的间距 = 卡片区内缩（8pt）。
+        let inset = crate::solver::CARD_AREA_INSET;
         assert!(
-            r.width() >= SEARCH_MIN_W - 0.5,
-            "即使收窄也应保住最小可用宽度 {}（实际 {:.1}）",
-            SEARCH_MIN_W,
+            (r.min.x - h.area.min.x - inset).abs() < 0.6
+                && (h.area.max.x - r.max.x - inset).abs() < 0.6,
+            "面板应通栏（左右各让出 CARD_AREA_INSET={inset}）：{r:?}"
+        );
+        assert!(
+            // 88 = 旧顶栏输入框的最小可用宽度；悬浮面板通栏只会更宽，
+            // 这里守住「没被挤成一条线」。
+            r.width() >= 88.0,
+            "即使收窄也应保住最小可用宽度 88（实际 {:.1}）",
             r.width()
         );
-        // 必须严格窄于宽窗口下的宽度——证明它真的按可用空间算了。
-        let wide_h = {
-            let mut w = Harness::new("search-wide", vec2(700.0, 500.0));
-            w.frame();
-            w.hover_search_icon();
-            hit(&w, "search_box").width()
-        };
+        // 贴在顶栏之下：与顶栏底缘的间距 = RAIL_GAP（12pt，原型的
+        // 「面板与主窗口有间距」在窗口内的等价物）。
         assert!(
-            r.width() < wide_h,
-            "窄窗宽度 {:.1} 应与宽窗 {wide_h:.1} 不同 —— 没走动态计算",
-            r.width()
+            (r.min.y - crate::solver::TOPBAR_HEIGHT - RAIL_GAP).abs() < 0.6,
+            "面板应悬浮在顶栏下方（间距 RAIL_GAP）：top={:.1}",
+            r.min.y
         );
         // 拖动区不能被吃光：左侧仍要留得下一截可拖的顶栏。
         let drag = h.state.drag_regions.clone();
@@ -8207,21 +8895,283 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 窄到连[`SEARCH_MIN_W`]都放不下时：**不画**，而不是画一条残缺的框。
+    /// 右侧停靠类型栏时，搜索面板右缘让出栏条带。
     ///
-    /// 另一半保证：旧实现在这里画的是**固定 140pt**的框，左半截越出
-    /// 客户区被 `painter_at` 裁掉（「搜索框渲染不完整」）。现在的取舍是
-    /// 「宁可不展开，也不画被裁的框」。
+    /// 守一个只在**矮窗口**现形的故障：类型栏垂直居中，窗口一矮，
+    /// 最上面几枚按钮的上沿就伸到面板的高度里——面板通栏画过去
+    /// 会盖住它们（后画者胜），那几枚按钮点不动且毫无提示。
+    /// 判据用「面板右缘 = 卡片区右缘 − 栏宽 − 间距」的精确等式，
+    /// 比「两者不相交」更狠（不相交在按钮少/窗口高时恒成立，抓不到）。
     #[test]
-    fn search_box_is_not_drawn_when_there_is_no_room() {
+    fn search_panel_yields_to_side_rail() {
+        // 220pt 高 + 始终显示五类：栏总高 192pt > 可视 body，按钮必然
+        // 上探到面板所在的顶部区域——正是故障现形的几何。
+        let mut h = Harness::new("search-rail-right", vec2(700.0, 220.0)).with_items(4);
+        h.frame();
+        h.svc.state.config.ui.type_rail.always = true;
+        h.frame();
+        h.hover_search_icon();
+        assert!(h.state.search_expanded, "悬停应展开");
+        let panel = hit(&h, "search_box");
+        let rail = hit(&h, "rail_text");
+        let size = modular_clipboard_core::config::clamp_type_rail_size(
+            h.svc.state.config.ui.type_rail.size,
+        );
+        let expect_right = h.area.max.x - crate::solver::CARD_AREA_INSET - size - RAIL_GAP;
+        assert!(
+            (panel.max.x - expect_right).abs() < 0.6,
+            "面板右缘 {:.1} 应让出类型栏条带（期望 {:.1}）：{panel:?}",
+            panel.max.x,
+            expect_right
+        );
+        assert!(
+            !panel.intersects(rail),
+            "面板 {panel:?} 压住了类型栏按钮 {rail:?}——矮窗口下会点不动"
+        );
+        // 左缘不受右侧栏影响（仍贴卡片区左缘）。
+        assert!(
+            (panel.min.x - (h.area.min.x + crate::solver::CARD_AREA_INSET)).abs() < 0.6,
+            "左缘应仍贴卡片区：{panel:?}"
+        );
+    }
+
+    /// 文件型条目双击 ⇒ `RevealPath(**载荷里的完整路径**)`。
+    ///
+    /// 守一个已修掉的真 bug：`build_preview` 给 Files 存的是**文件名
+    /// 摘要**（「paint.rs 等 2 个文件」），而双击定位要的是完整路径。
+    /// 早前版本直接拿 preview 第一行去定位，explorer 收到一个文件名，
+    /// 打不开用户想要的位置——而单看界面毫无异常。
+    #[test]
+    fn double_click_files_reveals_full_payload_path() {
+        let mut h = Harness::new("dbl-files", vec2(700.0, 500.0));
+        let p1 = "D:\\modular-clipboard\\crates\\paint.rs";
+        let p2 = "D:\\other\\b.rs";
+        assert!(
+            h.svc.ingest(modular_clipboard_core::CapturedPayload {
+                kind: modular_clipboard_core::ClipKind::Files,
+                bytes: format!("{p1}\n{p2}").into_bytes(),
+                html: None,
+                text: None,
+                source_app: "explorer.exe".into(),
+                files: vec![p1.into(), p2.into()],
+            }),
+            "塞入 Files 记录"
+        );
+        h.svc.reload_list();
+        h.frame();
+        // preview 必须是文件名摘要（否则本测试的场景不成立）。
+        let item = h.svc.state.items[0].clone();
+        assert!(
+            item.preview.contains("paint.rs") && !item.preview.contains("crates"),
+            "Files 的 preview 应为文件名摘要，实际 {:?}",
+            item.preview
+        );
+        let mut ops: Vec<Op> = Vec::new();
+        let mut out = h.ctx.run_ui(h.input(Vec::new()), |ui| {
+            // 直接构造 Frame 调被测函数：双击判定归 egui，这里只验
+            // 「哪种内容分发成哪种 Op」。
+            let mut f = Frame {
+                ui,
+                state: &mut h.state,
+                svc: &mut h.svc,
+                ws: &h.ws,
+                pal: &h.pal,
+                scale: 1.0,
+                area: h.area,
+                card_id: None,
+                hit_ns: HitNs::Main,
+            };
+            ops.push(double_click_op(&mut f, &item));
+        });
+        out.textures_delta.clear();
+        assert!(
+            matches!(&ops[0], Op::RevealPath(p) if p == p1),
+            "应定位载荷首行 {p1:?}，实际 {:?}",
+            ops[0]
+        );
+    }
+
+    /// 链接文本双击 ⇒ `OpenUrl`；普通文本 ⇒ `Copy`。
+    #[test]
+    fn double_click_text_dispatches_by_shape() {
+        let mut h = Harness::new("dbl-text", vec2(700.0, 500.0));
+        h.frame();
+        let mk = |preview: &str| {
+            modular_clipboard_core::ClipItem::new(
+                modular_clipboard_core::ClipKind::Text,
+                "h".into(),
+                preview.into(),
+                "app".into(),
+            )
+        };
+        let mut ops: Vec<Op> = Vec::new();
+        let items = vec![
+            mk("https://github.com/MCheng404/ModularClipboard"),
+            mk("D:\\modular-clipboard\\README.md"),
+            mk("just some words"),
+        ];
+        let mut out = h.ctx.run_ui(h.input(Vec::new()), |ui| {
+            for it in &items {
+                let mut f = Frame {
+                    ui,
+                    state: &mut h.state,
+                    svc: &mut h.svc,
+                    ws: &h.ws,
+                    pal: &h.pal,
+                    scale: 1.0,
+                    area: h.area,
+                    card_id: None,
+                    hit_ns: HitNs::Main,
+                };
+                ops.push(double_click_op(&mut f, it));
+            }
+        });
+        out.textures_delta.clear();
+        assert!(matches!(&ops[0], Op::OpenUrl(u) if u == "https://github.com/MCheng404/ModularClipboard"));
+        assert!(matches!(&ops[1], Op::RevealPath(p) if p == "D:\\modular-clipboard\\README.md"));
+        assert!(matches!(&ops[2], Op::Copy(_)), "普通文本应回落复制");
+    }
+
+    /// 顶部停靠类型栏时，搜索面板让位到栏下方（两者不重叠）。
+    ///
+    /// 对应原型「顶部 + 搜索展开 ⇒ 搜索框让到栏上方」：窗口内版本是
+    /// 「面板下移到栏下方」，间距均为 `RAIL_GAP`。
+    #[test]
+    fn search_panel_yields_to_top_rail() {
+        // 必须有记录：类型栏默认只显示「已有记录」的类型，空列表时
+        // 整个栏不画，`rail_btn` 热区无从登记。
+        let mut h = Harness::new("search-rail-top", vec2(700.0, 500.0)).with_items(4);
+        h.frame();
+        // 顶部停靠 + 始终显示（种子数据四类俱全，默认已满足）。
+        h.svc.state.config.ui.type_rail.pos = modular_clipboard_core::config::TypeRailPos::Top;
+        h.frame();
+        h.hover_search_icon();
+        assert!(h.state.search_expanded, "悬停应展开");
+        let panel = hit(&h, "search_box");
+        let rail = hit(&h, "rail_text");
+        assert!(
+            panel.min.y > rail.max.y,
+            "面板 top={:.1} 应低于类型栏底缘 {:.1}（让位）",
+            panel.min.y,
+            rail.max.y
+        );
+        // 让位间距 = RAIL_GAP（12pt）。
+        assert!(
+            (panel.min.y - rail.max.y - RAIL_GAP).abs() < 0.6,
+            "让位间距应为 RAIL_GAP：{:.1}",
+            panel.min.y - rail.max.y
+        );
+    }
+
+    /// 点类型栏按钮 ⇒ `SetTypeFilter(Some(kind))`；再点一次 ⇒ `None`。
+    #[test]
+    fn type_rail_click_toggles_type_filter() {
+        let mut h = Harness::new("rail-click", vec2(700.0, 500.0)).with_items(4);
+        h.frame();
+        // 夹具不跑 `App::apply_ops`，过滤态要手动落地——生产里正是
+        // apply_ops 消费 `Op::SetTypeFilter` 写回 `paint_state.type_filter`，
+        // 下一帧的「激活态 / 再点取消」才读得到。
+        let apply = |h: &mut Harness, ops: Vec<Op>| {
+            for op in ops {
+                if let Op::SetTypeFilter(k) = op {
+                    h.state.type_filter = k;
+                }
+            }
+        };
+        let r = hit(&h, "rail_text");
+        let ops = h.click_at(r.center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::SetTypeFilter(Some(k)) if *k == modular_clipboard_core::ClipKind::Text)),
+            "点文本按钮应过滤出 Text，实际 {ops:?}"
+        );
+        apply(&mut h, ops);
+        // 再点一次取消（过滤态会让列表只剩 Text 行，按钮仍在）。
+        let ops2 = h.click_at(r.center());
+        assert!(
+            ops2.iter().any(|o| matches!(o, Op::SetTypeFilter(None))),
+            "再点一次应取消过滤，实际 {ops2:?}"
+        );
+    }
+
+    /// 默认只显示**已有记录**的类型；`type_rail_always` 时五类齐全。
+    #[test]
+    fn type_rail_shows_only_present_kinds_unless_always() {
+        // 四条全是 Text：默认只有一枚文本按钮。
+        let mut h = Harness::new("rail-kinds", vec2(700.0, 500.0)).with_items(4);
+        h.frame();
+        assert!(hit_opt(&h, "rail_text").is_some(), "Text 有记录，按钮应在");
+        for k in ["html", "image", "files", "markdown"] {
+            assert!(
+                hit_opt(&h, &format!("rail_{k}")).is_none(),
+                "库里没有 {k} 记录，默认不该出现该按钮"
+            );
+        }
+        // 始终显示：五类齐全。
+        h.svc.state.config.ui.type_rail.always = true;
+        h.frame();
+        for k in ["text", "html", "image", "files", "markdown"] {
+            assert!(
+                hit_opt(&h, &format!("rail_{k}")).is_some(),
+                "type_rail_always 开 => {k} 按钮应出现"
+            );
+        }
+    }
+
+    /// 类型栏停靠右侧时，历史卡片必须让出 `图标 + 间距` 的条带——
+    /// 否则浮动按钮会压在列表内容（乃至滚动条 / 删除按钮）上。
+    #[test]
+    fn type_rail_reserves_strip_in_card_layout() {
+        let mut h = Harness::new("rail-inset", vec2(700.0, 500.0)).with_items(4);
+        h.frame();
+        let size = modular_clipboard_core::config::clamp_type_rail_size(
+            h.svc.state.config.ui.type_rail.size,
+        );
+        let hist = h
+            .ws
+            .cards
+            .iter()
+            .find(|c| c.kind == crate::card::CardKind::History)
+            .expect("默认工作区应有历史卡片");
+        let expect_right = h.area.max.x - crate::solver::CARD_AREA_INSET - size - RAIL_GAP;
+        assert!(
+            (hist.rect.max.x - expect_right).abs() < 0.6,
+            "历史卡片右缘 {:.1} 应让出类型栏条带（期望 {:.1}）",
+            hist.rect.max.x,
+            expect_right
+        );
+        // 关掉类型栏：条带让位消失，右缘回到卡片区边缘。
+        h.svc.state.config.ui.type_rail.visible = false;
+        h.frame();
+        let hist2 = h
+            .ws
+            .cards
+            .iter()
+            .find(|c| c.kind == crate::card::CardKind::History)
+            .expect("默认工作区应有历史卡片");
+        assert!(
+            (hist2.rect.max.x - (h.area.max.x - crate::solver::CARD_AREA_INSET)).abs() < 0.6,
+            "关闭后右缘 {:.1} 应回到卡片区边缘",
+            hist2.rect.max.x
+        );
+    }
+
+    /// 极窄窗口下面板**照样画**（通栏永远装得下），不再有「不画」分支。
+    ///
+    /// 旧实现在这里判 `input_ok=false` 直接不画（顶栏里向左弹出的框
+    /// 放不下）；第三轮起面板是卡片区通栏，260pt 窗口的卡片区也有
+    /// ~236pt，远超 [`SEARCH_MIN_W`]，没有「放不下」这一说。
+    #[test]
+    fn search_panel_is_drawn_even_in_a_very_narrow_window() {
         let mut h = Harness::new("search-too-narrow", vec2(260.0, 500.0));
         h.frame();
         h.hover_search_icon();
-        // 展开标记可能是 true（悬停判据仍成立），但绝不许出现输入框热区。
+        assert!(h.state.search_expanded, "极窄窗口悬停也应展开");
+        let r = hit(&h, "search_box");
         assert!(
-            !h.state.hit.contains_key(HitNs::Main, "search_box"),
-            "空间不足时不该画输入框——画出来必然被裁切"
+            h.area.contains_rect(r),
+            "极窄窗口下面板 {r:?} 仍应完整落在客户区内"
         );
+        assert!(r.width() >= 88.0, "面板宽度 {:.1} 过窄", r.width());
     }
 
     /// 搜索图标的**绘制矩形**必须完整落在按钮热区内。
@@ -8304,6 +9254,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn row_height_grows_with_content_length() {
         let ctx = settled_ctx();
         let pal = crate::theme::Palette::dark();
+        let cfg = modular_clipboard_core::config::UiConfig::default();
         // NOTE: `run_ui` 返回 `FullOutput`（不是闭包的返回值），
         // 所以要通过外部变量把结果取出来。
         let mut h = 0.0_f32;
@@ -8315,7 +9266,7 @@ fn with_pinned(mut self, n: usize) -> Self {
                 "test".into(),
             );
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                *h = row_height_for(ui, &item, &pal, 1.0, 200.0);
+                *h = row_height_for(ui, &item, &pal, 1.0, 200.0, &cfg);
             });
             // IMPORTANT: 必须 `clear()`：排版会往纹理图集里加新字形，
             // `FullOutput` 被 drop 时若还带着未应用的 deltas，egui 会 panic
@@ -8336,6 +9287,83 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             short >= ROW_HEIGHT_MIN - 0.01,
             "行高不应低于下限 {ROW_HEIGHT_MIN}，实际 {short}"
+        );
+    }
+
+    /// 图片条目的行高 = 缩略图显示高（限高 [`IMG_MAX_H`]）+ 固定段，
+    /// 与同尺寸文本行**不同**——证明走的是图片分支而不是文本分支。
+    #[test]
+    fn row_height_uses_thumbnail_height_for_images() {
+        let ctx = settled_ctx();
+        let pal = crate::theme::Palette::dark();
+        let cfg = modular_clipboard_core::config::UiConfig::default();
+        assert!(cfg.image_inline, "图片内嵌默认开");
+        let mut h = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut item = modular_clipboard_core::ClipItem::new(
+                modular_clipboard_core::ClipKind::Image,
+                "h".into(),
+                "图片 1920×1080".into(),
+                "test".into(),
+            );
+            // payload.dims 是 store 插入时读的图片头，行高只认它。
+            item.payload = Some(modular_clipboard_core::PayloadRef {
+                file: "h.bin".into(),
+                len: 1024,
+                dims: Some((1920, 1080)),
+            });
+            h = row_height_for(ui, &item, &pal, 1.0, 600.0, &cfg);
+        });
+        out.textures_delta.clear();
+        // 600pt 宽的带、16:9 的图：显示高 = min(108, 600*1080/1920=337.5) = 108。
+        let expect = 108.0 + pal.font_xs.max(10.0) + row_top_height(&pal) + 5.0 * 2.0 + 4.0;
+        assert!(
+            (h - expect).abs() < 0.6,
+            "图片行高应等于 图高108 + 固定段（{expect}），实际 {h}"
+        );
+    }
+
+    /// Markdown 行高 = `md::MdDoc::height()` 实测 + 固定段。
+    ///
+    /// 精确等式而不是「渲染态比源码态高」——后者对短文档不成立
+    /// （源码折行行数可能更多），曾据此写断言结果反被数据打脸。
+    #[test]
+    fn row_height_uses_markdown_layout_when_rendered() {
+        let ctx = settled_ctx();
+        let pal = crate::theme::Palette::dark();
+        let src = "# 标题\n\n- 第一项\n- 第二项\n\n> 引用一段\n\n正文一段";
+        let item = modular_clipboard_core::ClipItem::new(
+            modular_clipboard_core::ClipKind::Markdown,
+            "h".into(),
+            src.into(),
+            "test".into(),
+        );
+        let mut cfg = modular_clipboard_core::config::UiConfig {
+            md_rendered: true,
+            ..Default::default()
+        };
+        let mut rendered = 0.0_f32;
+        let mut md_h = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            md_h = crate::md::MdDoc::parse(src).height(ui, &pal, 1.0, 400.0);
+            rendered = row_height_for(ui, &item, &pal, 1.0, 400.0, &cfg);
+        });
+        out.textures_delta.clear();
+        let fixed = pal.font_xs.max(10.0) + row_top_height(&pal) + 5.0 * 2.0 + 4.0;
+        assert!(
+            (rendered - (md_h + fixed)).abs() < 0.6,
+            "渲染行高（{rendered}）应等于 md 实测（{md_h}）+ 固定段（{fixed}）"
+        );
+        // 关闭渲染 ⇒ 走等宽源码分支，行高必然不同（证明开关真的接了线）。
+        cfg.md_rendered = false;
+        let mut source = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            source = row_height_for(ui, &item, &pal, 1.0, 400.0, &cfg);
+        });
+        out.textures_delta.clear();
+        assert!(
+            (source - rendered).abs() > 0.6,
+            "关闭渲染后行高应变化（源码分支）：渲染={rendered} 源码={source}"
         );
     }
 

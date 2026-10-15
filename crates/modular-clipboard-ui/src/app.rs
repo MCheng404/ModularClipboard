@@ -1765,7 +1765,21 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         // IMPORTANT: 必须传真实的 `ppp`：落位要对齐**设备**像素栅格，
         // 否则高DPI 下卡片边界落在半像素上，描边发虚。
-        let sol = crate::solver::solve_scaled(&self.ws, area, ppp);
+        //
+        // 2026-10-15 第三轮：悬浮类型过滤栏停靠某侧时，该侧要让出
+        // `图标边长 + 间距`（FloatLayout::insets）——浮动按钮不能压在
+        // 列表内容上（右缘更会盖住滚动条与行内删除按钮）。
+        // 布局是**纯函数**：这里与绘制层各自调 `FloatLayout::compute`，
+        // 同一份输入必然同一份结果，不存在两处各算一套的漂移。
+        let body = crate::solver::card_area(area);
+        let floats = crate::paint::FloatLayout::compute(
+            &self.svc.state.config.ui,
+            &self.svc.state.items,
+            self.paint_state.type_filter,
+            false, // 搜索面板是浮动覆盖层，不参与占位
+            body,
+        );
+        let sol = crate::solver::solve_scaled_inset(&self.ws, area, ppp, floats.insets);
         crate::solver::apply(&mut self.ws, &sol);
 
         if env_flag("MC_DIAG") {
@@ -2024,7 +2038,26 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
     /// 于是「点了折叠按钮」这件事不会散落在几十个绘制函数里。
     fn apply_ops(&mut self) {
         use crate::paint::Op;
-        for op in self.paint_state.take_ops() {
+        let ops = self.paint_state.take_ops();
+        // 「任意操作取消选中」（2026-10-15 第三轮原型定稿）：
+        // 选中是临时状态，任何**行操作**（置顶 / 删除 / 复制 / 打开 /
+        // 清空）之后都不该继续高亮——否则用户会以为选中项还有后续
+        // 作用（实际下一帧它就只是背景高亮）。
+        //
+        // CAUTION: 配置类 Op（SetBool / SetThemeMode…）**不**清选中：
+        // 那些来自设置窗口，与主窗口的选中态无关。
+        let row_op = ops.iter().any(|o| {
+            matches!(
+                o,
+                Op::TogglePin(_)
+                    | Op::Delete(_)
+                    | Op::Copy(_)
+                    | Op::OpenUrl(_)
+                    | Op::RevealPath(_)
+                    | Op::ClearAll
+            )
+        });
+        for op in ops {
             match op {
                 Op::SetBool { group, field, value } => {
                     let is_capture_enabled =
@@ -2102,6 +2135,12 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 右下角信息组合：顺序/显隐只影响绘制，下一帧读配置
                     // 即生效；after_config_change 负责落盘。
                     self.svc.state.config.ui.row_meta = m;
+                    self.after_config_change();
+                }
+                Op::SetTypeRail(m) => {
+                    // 类型过滤栏：只影响绘制（FloatLayout 每帧读配置），
+                    // 下一帧即生效；尺寸在绘制侧钳制，这里原样存。
+                    self.svc.state.config.ui.type_rail = m;
                     self.after_config_change();
                 }
                 Op::SetThemeMode(mode) => {
@@ -2292,6 +2331,31 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         tracing::warn!("打开链接失败 {url}: {e}");
                     }
                 }
+                Op::OpenUrl(url) => {
+                    // 双击链接型条目：尊重设置里的自定义浏览器路径
+                    // （留空 = 系统默认浏览器）。失败必须告知用户——
+                    // 双击没反应是最难自查的一类故障。
+                    let custom = self.svc.state.config.ui.browser_path.trim();
+                    if let Err(e) = modular_clipboard_platform::open_url_with(&url, custom) {
+                        self.svc.notify(format!("打开链接失败: {e}"));
+                    }
+                }
+                Op::RevealPath(path) => {
+                    // 双击文件型条目：尊重设置里的自定义资源管理器路径
+                    // （留空 = 系统 explorer /select 定位）。
+                    let custom = self.svc.state.config.ui.explorer_path.trim();
+                    if let Err(e) = modular_clipboard_platform::reveal_with(&path, custom) {
+                        self.svc.notify(format!("打开资源管理器失败: {e}"));
+                    }
+                }
+                Op::SetTypeFilter(kind) => {
+                    // 类型过滤是界面本地状态：只改 paint_state，列表由
+                    // 绘制层按它筛行。变化时清选中（见 loop 后的统一规则）。
+                    if self.paint_state.type_filter != kind {
+                        self.paint_state.type_filter = kind;
+                        self.svc.state.selected = None;
+                    }
+                }
                 // 窗口级按钮只**置标志**，由帧循环消费。
                 //
                 // CAUTION: 不能在这里直接关窗口：`apply_ops`  borrows `self`，
@@ -2315,7 +2379,13 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         // 重新查库，每帧调一次是无谓的 IO。
         if self.paint_state.query != self.svc.state.query {
             let q = self.paint_state.query.clone();
+            // 搜索词变化同样清选中（与「任意操作取消选中」同一语义：
+            // 过滤让「哪一行被选中」失去意义）。
+            self.svc.state.selected = None;
             self.svc.search(q);
+        }
+        if row_op {
+            self.svc.state.selected = None;
         }
     }
 
@@ -2572,6 +2642,11 @@ fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate::paint::Con
         (G::Ui, "hide_on_focus_lost") => cfg.ui.hide_on_focus_lost = v,
         (G::Ui, "show_tray") => cfg.ui.show_tray = v,
         (G::Ui, "start_minimized") => cfg.ui.start_minimized = v,
+        // ---- 第三轮新增（图片直显 / Markdown 渲染） ----
+        (G::Ui, "image_inline") => cfg.ui.image_inline = v,
+        (G::Ui, "md_rendered") => cfg.ui.md_rendered = v,
+        // NOTE: type_rail 的参数走 `Op::SetTypeRail` 整包落地，
+        // 没有按字段名的写入方。
     (G::Ui, "autostart") => cfg.ui.autostart = v,
     (G::MiniPanel, "enabled") => cfg.mini_panel.enabled = v,
     (G::MiniPanel, "ctrl") => cfg.mini_panel.ctrl = v,
@@ -2618,6 +2693,10 @@ fn set_text_field(cfg: &mut modular_clipboard_core::Config, g: crate::paint::Con
     match (g, field) {
         (G::Mcp, "host") => cfg.mcp.host = v.trim().to_string(),
         (G::Mcp, "token") => cfg.mcp.token = v.trim().to_string(),
+        // 第三轮：双击跳转的调用路径。**不 trim 掉内部空格**——Windows
+        // 路径合法地包含空格（`C:\Program Files\...`），只去首尾。
+        (G::Ui, "browser_path") => cfg.ui.browser_path = v.trim().to_string(),
+        (G::Ui, "explorer_path") => cfg.ui.explorer_path = v.trim().to_string(),
         _ => tracing::warn!(?g, field, "未知的文本配置字段，已忽略"),
     }
 }
