@@ -88,7 +88,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
     SetWindowPos, GetWindowRect, FindWindowW, PostMessageW,
     SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_NOMOVE,
-    GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW,
+    GetForegroundWindow, IsIconic, IsWindow, MSG, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+    RegisterClassExW,
     SIZE_MINIMIZED, SIZE_RESTORED, SW_HIDE, SW_SHOW, SW_SHOWNA, ShowWindow, TranslateMessage,
     WINDOW_EX_STYLE,
     WM_SYSCOMMAND,
@@ -362,6 +363,14 @@ pub struct WindowOpts {
     pub resize_border: f32,
     /// 初始位置（物理像素）。`None` = 系统默认 (120, 120)。
     pub pos: Option<(i32, i32)>,
+    /// 属主窗口（owner）。
+    ///
+    /// 弹窗必须把主窗口设为属主：
+    /// - 始终叠在属主之上，不会掉到别的窗口后面；
+    /// - 属主最小化时系统自动把它们一起收起（否则主窗最小化后两块浮动
+    ///   面板还留在桌面上）；
+    /// - 属主被激活时一起被带到前台。
+    pub owner: Option<HWND>,
 }
 
 impl Default for WindowOpts {
@@ -375,6 +384,7 @@ impl Default for WindowOpts {
             rounded: true,
             resize_border: chrome::DEFAULT_RESIZE_BORDER,
             pos: None,
+            owner: None,
         }
     }
 }
@@ -425,6 +435,7 @@ impl Window {
         width: u32,
         height: u32,
         no_activate: bool,
+        owner: Option<HWND>,
     ) -> anyhow::Result<Self> {
         let mut ex = WS_EX_TOOLWINDOW;
         if no_activate {
@@ -440,6 +451,7 @@ impl Window {
                 rounded: false,
                 resize_border: 0.0,
                 pos: None,
+                owner,
             },
         )
     }
@@ -511,7 +523,7 @@ impl Window {
                 y,
                 clamp_i32(width),
                 clamp_i32(height),
-                None,
+                opts.owner,
                 None,
                 Some(hinstance),
                 None,
@@ -538,6 +550,14 @@ impl Window {
             hinstance,
             max_texture_side: 2048,
         })
+    }
+
+    /// 窗口是否已最小化到任务栏。
+    ///
+    /// 供「附属窗口是否该显示」判断：`IsWindowVisible` 对最小化窗口
+    /// **仍然返回 true**，只靠可见性会让主窗最小化后弹窗还留在桌面上。
+    pub fn is_minimized(&self) -> bool {
+        unsafe { IsIconic(self.hwnd) }.as_bool()
     }
 
     /// 告知 egui 纹理尺寸上限（拿到 `Gpu` 之后调用）。

@@ -120,6 +120,7 @@ impl<'a> Popup<'a> {
         panel_size: egui::Vec2,
         scale_factor: f32,
         shared: &SharedGfx<'a>,
+        owner: Option<windows::Win32::Foundation::HWND>,
     ) -> anyhow::Result<Self> {
         let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
         let client = egui::vec2(panel_size.x + SHADOW_MARGIN * 2.0, panel_size.y + SHADOW_MARGIN * 2.0);
@@ -128,6 +129,7 @@ impl<'a> Popup<'a> {
             (client.x * s) as u32,
             (client.y * s) as u32,
             !kind.activatable(),
+            owner,
         )?;
         window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
         // 面板形状 = 窗口中央的内容矩形；之外那圈（投影区）点击穿透
@@ -418,13 +420,14 @@ impl<'a> Popups<'a> {
         shared: &SharedGfx<'a>,
         topmost: bool,
         acrylic: bool,
+        owner: Option<windows::Win32::Foundation::HWND>,
     ) {
         let want_open = want_open && panel_rect.is_some();
         if want_open && self.search.is_none() {
             let size = panel_rect
                 .map(|r| r.size())
                 .unwrap_or_else(|| egui::vec2(720.0, 45.0));
-            match Popup::create(PopupKind::Search, size, scale_factor, shared) {
+            match Popup::create(PopupKind::Search, size, scale_factor, shared, owner) {
                 Ok(p) => {
                     tracing::info!("悬浮弹窗已创建：搜索面板");
                     self.search = Some(p);
@@ -457,13 +460,14 @@ impl<'a> Popups<'a> {
         shared: &SharedGfx<'a>,
         topmost: bool,
         acrylic: bool,
+        owner: Option<windows::Win32::Foundation::HWND>,
     ) {
         let want_open = want_open && panel_rect.is_some();
         if want_open && self.rail.is_none() {
             let size = panel_rect
                 .map(|r| r.size())
                 .unwrap_or_else(|| egui::vec2(32.0, 200.0));
-            match Popup::create(PopupKind::Rail, size, scale_factor, shared) {
+            match Popup::create(PopupKind::Rail, size, scale_factor, shared, owner) {
                 Ok(p) => {
                     tracing::info!("悬浮弹窗已创建：类型栏");
                     self.rail = Some(p);

@@ -834,7 +834,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
-                !hidden,
+                !hidden && !window.is_minimized(),
             );
             frame_no += 1;
             continue;
@@ -988,7 +988,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
-                !hidden,
+                !hidden && !window.is_minimized(),
             );
             continue;
         }
@@ -1032,7 +1032,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
-                !hidden,
+                !hidden && !window.is_minimized(),
             );
             continue;
         }
@@ -1064,7 +1064,7 @@ fn run_mode(
                 &window,
                 frame_no,
                 topmost,
-                !hidden,
+                !hidden && !window.is_minimized(),
             );
             continue;
         };
@@ -1180,7 +1180,7 @@ fn run_mode(
             &window,
             frame_no,
             topmost,
-            !hidden,
+            !hidden && !window.is_minimized(),
         );
 
         frame_no += 1;
@@ -1388,7 +1388,21 @@ fn drive_attach_windows<'a>(
         let want_search = main_visible && app.paint_state.search_expanded;
         let acrylic = app.svc.state.config.ui.window_backdrop
             == modular_clipboard_core::config::WindowBackdrop::Acrylic;
-        popups.sync_search(app, want_search, floats.search, anchor, s, shared, topmost, acrylic);
+        // 弹窗把主窗口设为**属主**：始终叠在主窗之上、随主窗最小化一起
+        // 收起、主窗被激活时一起到前台（不设属主的话它们是三块互不相干
+        // 的顶层窗口，Z 序各自为政）。
+        let owner = Some(window.hwnd());
+        popups.sync_search(
+            app,
+            want_search,
+            floats.search,
+            anchor,
+            s,
+            shared,
+            topmost,
+            acrylic,
+            owner,
+        );
         // 隐藏时**必须清**弹窗回报的两项：否则上一次「正在打字」
         // 的 true 会一直留在状态里，主窗口的搜索状态机认为有人持有
         // 焦点，面板再也收不回去。
@@ -1405,6 +1419,7 @@ fn drive_attach_windows<'a>(
             shared,
             topmost,
             acrylic,
+            owner,
         );
     }
 
