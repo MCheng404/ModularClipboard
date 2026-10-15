@@ -2472,14 +2472,6 @@ pub fn draw_popup(
     // 12pt 偏移与一次缩放 ⇒ 磨砂内容与身后的真实桌面错位，
     // 看上去就是一块贴歪的模糊方块。按客户区原样绘制，
     // 每个像素都对应窗口那个像素身后的桌面，再裁到面板形状。
-    if let Some(tex) = frost {
-        ui.painter().with_clip_rect(panel).image(
-            tex,
-            client,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
-    }
     // 类型栏要**逐方块**裁底图（缝隙保持透桌面），所以把纹理交给
     // 绘制层：整条铺满会让 8pt 缝隙也变成磨砂，凑出一个大方块。
     self.paint_state.popup_frost = frost;
@@ -2494,13 +2486,18 @@ pub fn draw_popup(
     } else {
         &self.pal
     };
-    // ---- 自研投影：画在**客户区级** painter 上 ----
+    // ---- 自研投影（先画：它属于「面板之外」，不能压在磨砂之上）----
     //
     // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，这圈铺的是捕获到的桌面；
     // 投影就用项目自己的高斯投影画在内容矩形外围（alpha 混合在渲染层
     // 完成）。用 `painter_at(panel)` 会把投影裁掉一圈，面板就贴着桌面、
     // 浮不起来 —— 所以这里必须用 `ui.painter()`。
     crate::paint::draw_popup_shadow(ui.painter(), panel, pal_ref);
+    // 磨砂底图（画在投影**之后**：否则投影会把磨砂压暗一层）。
+    if let Some(tex) = frost {
+        // 搜索面板：整块圆角矩形承载磨砂（圆角与面板描边一致）。
+        crate::paint::draw_popup_frost(ui.painter(), panel, self.pal.radius_md, tex, client);
+    }
     // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
     // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
     let rail_kinds = crate::paint::FloatLayout::kinds(
