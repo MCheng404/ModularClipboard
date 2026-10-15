@@ -2466,14 +2466,23 @@ pub fn draw_popup(
     // 只在「磨砂」模式下有（见 `crate::popup::Popup::update_frost`）。
     // 必须**裁剪到面板矩形**：底图铺满整个客户区的话，那圈本该透明的
     // 投影区就变成不透明的模糊矩形，浮不起来的同时还会显出一个大方块。
+    //
+    // CAUTION: 图像矩形必须是**整个客户区**而不是 `panel`。
+    // 捕获区间就是窗口客户区，把它塞进面板矩形会同时引入
+    // 12pt 偏移与一次缩放 ⇒ 磨砂内容与身后的真实桌面错位，
+    // 看上去就是一块贴歪的模糊方块。按客户区原样绘制，
+    // 每个像素都对应窗口那个像素身后的桌面，再裁到面板形状。
     if let Some(tex) = frost {
         ui.painter().with_clip_rect(panel).image(
             tex,
-            panel,
+            client,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             egui::Color32::WHITE,
         );
     }
+    // 类型栏要**逐方块**裁底图（缝隙保持透桌面），所以把纹理交给
+    // 绘制层：整条铺满会让 8pt 缝隙也变成磨砂，凑出一个大方块。
+    self.paint_state.popup_frost = frost;
     // 磨砂时背景层**降 alpha**（与主窗口同一算式）：底图透出来才有磨砂
     // 感；描边用主题色（用户要求「开启磨砂时圆角渲染主题描边」）。
     let backdrop_pal;

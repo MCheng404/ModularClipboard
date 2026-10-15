@@ -444,6 +444,11 @@ pub struct UiState {
     /// 变成弹窗后指针在主窗口客户区之外，只能由弹窗问
     /// `WindowFromPoint`（gfx::chrome::pointer_is_over）。
     pub search_popup_hover: bool,
+    /// 弹窗的磨砂底图纹理（`draw_popup` 每帧写入，绘制层读）。
+    ///
+    /// 类型栏要用它**逐方块**裁：缝隙得透出真实桌面，若整条铺满磨砂，
+    /// 8pt 的缝隙也会被填上，凑出一个显眼的方块。
+    pub popup_frost: Option<egui::TextureId>,
     /// 悬停展开是否被抑制（点图标收起后，直到光标离开图标为止）。
     ///
     /// 没有这个位的话，点一下收起、光标却还停在图标上 ⇒ 0.18s 后又被
@@ -1522,6 +1527,18 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // （清屏 alpha=0），直接拿它当填充会把按钮画成半透明——透出背后
         // 的深色桌面，实机就是「鼠标一放上去图标变黑」。
         // 所以半透明态一律**先铺不透明底、再叠色调**。
+        // 磨砂：底图**逐方块**裁（缝隙留空 ⇒ 透出真实桌面）。
+        //
+        // 图像矩形取整个客户区（与 `draw_popup` 同一条纪律）：捕获就是按
+        // 客户区抓的，按原尺寸画才能保证与身后的桌面严丝合缝。
+        if let Some(tex) = f.state.popup_frost {
+            f.ui.painter().with_clip_rect(slot).image(
+                tex,
+                f.ui.max_rect(),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
         let mut base = if active { pal.accent } else { pal.surface_raised };
         // 磨砂模式：面板底图要透出来，方块底色就得跟着降 alpha。
         //
