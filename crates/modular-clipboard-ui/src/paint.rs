@@ -1515,15 +1515,28 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         let resp = f
             .ui
             .interact(slot, egui::Id::new(("rail", kind)), Sense::click());
-        // 底色：激活 accent / 悬停 row_hover / 常态 surface_raised。
-        let bg = if active {
-            pal.accent
-        } else if resp.hovered() {
-            pal.row_hover
-        } else {
-            pal.surface_raised
-        };
-        f.ui.painter_at(slot).rect_filled(slot, size * 0.25, bg);
+        // 底色：激活 accent / 悬停（row_hover 叠在不透明底上）/ 常态 surface_raised。
+        //
+        // CAUTION: `row_hover` 是**半透明**令牌（`from_white_alpha(30)`），
+        // 在主窗口里它下面有整块不透明背景托着；而弹窗的画布是**透明**的
+        // （清屏 alpha=0），直接拿它当填充会把按钮画成半透明——透出背后
+        // 的深色桌面，实机就是「鼠标一放上去图标变黑」。
+        // 所以半透明态一律**先铺不透明底、再叠色调**。
+        let mut base = if active { pal.accent } else { pal.surface_raised };
+        // 磨砂模式：面板底图要透出来，方块底色就得跟着降 alpha。
+        //
+        // 判据取「`surface` 令牌是否被降过透明度」——`with_backdrop_alpha`
+        // 只处理背景层（bg/surface/surface_variant/list_bg），
+        // `surface_raised` 不在名单里（它是卡片色，主窗口里必须保持不透明）。
+        // 弹窗的方块是**面板本身**，所以按同一比例手降一次。
+        let frost_k = pal.surface.a() as f32 / 255.0;
+        if frost_k < 1.0 && !active {
+            base = base.gamma_multiply(frost_k);
+        }
+        f.ui.painter_at(slot).rect_filled(slot, size * 0.25, base);
+        if resp.hovered() && !active {
+            f.ui.painter_at(slot).rect_filled(slot, size * 0.25, pal.row_hover);
+        }
         if !active {
             f.ui.painter_at(slot).rect_stroke(
                 slot,

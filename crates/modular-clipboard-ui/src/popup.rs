@@ -49,6 +49,13 @@ use crate::multiwindow::{SharedGfx, WindowGfx};
 /// 逐像素 alpha 合成，留空就是黑的。
 pub const SHADOW_MARGIN: f32 = 12.0;
 
+/// 磨砂底图的降采样倍率。
+///
+/// 捕获按 1/4 分辨率、绘制时再放大回原尺寸——双线性插值本身就是一次
+/// 柔化，观感接近磨砂，省掉一整条 GPU 高斯卷积链（弹窗只有几十×几百
+/// 像素，也不值得为它建一套模糊资源）。
+const FROST_DOWNSCALE: u32 = 4;
+
 /// 弹窗身份。既是内容分派的键，也是热区命名空间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PopupKind {
@@ -96,6 +103,14 @@ pub struct Popup<'a> {
     topmost: bool,
     /// 上次定位到的屏幕位置（避免每帧重复 `SetWindowPos`）。
     last_pos: Option<(i32, i32)>,
+    /// 磨砂底图用：桌面捕获器（懒创建）。
+    capture: Option<modular_clipboard_gfx::backdrop::DesktopCapture>,
+    /// 磨砂底图纹理（捕获成功即更新）。
+    frost_tex: Option<egui::TextureHandle>,
+    /// 上次捕获时刻（节流，30fps）。
+    last_capture: Option<std::time::Instant>,
+    /// 已应用的捕获自排除状态（`None` = 未设过）。
+    affinity_set: Option<modular_clipboard_core::config::WindowBackdrop>,
 }
 
 impl<'a> Popup<'a> {
@@ -151,6 +166,10 @@ impl<'a> Popup<'a> {
             was_open: false,
             topmost: false,
             last_pos: None,
+            capture: None,
+            frost_tex: None,
+            last_capture: None,
+            affinity_set: None,
         })
     }
 
@@ -184,6 +203,66 @@ impl<'a> Popup<'a> {
         }
     }
 
+    /// 刷新磨砂底图（`acrylic` 为真时才抓）。
+    ///
+    /// 捕获用 **1/4 分辨率再放大**：放大时的双线性插值本身就是一次柔化，
+    /// 对几十像素高的面板足够像磨砂，且省掉一整条 GPU 卷积链。
+    /// 非磨砂时清掉纹理与自排除（弹窗该出现在截图里）。
+    fn update_frost(&mut self, acrylic: bool) {
+        use modular_clipboard_core::config::WindowBackdrop;
+        use modular_clipboard_gfx::backdrop::{capture_due, DesktopCapture, CAPTURE_INTERVAL};
+        // 自排除只在磨砂时需要（抓身后桌面），状态变化才调。
+        if self.affinity_set
+            .is_none_or(|m| (m == WindowBackdrop::Acrylic) != acrylic)
+        {
+            crate::presence::apply_backdrop(
+                self.window.hwnd(),
+                if acrylic {
+                    WindowBackdrop::Acrylic
+                } else {
+                    WindowBackdrop::None
+                },
+            );
+            self.affinity_set = Some(if acrylic {
+                WindowBackdrop::Acrylic
+            } else {
+                WindowBackdrop::None
+            });
+        }
+        if !acrylic {
+            self.frost_tex = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !capture_due(self.last_capture, now, CAPTURE_INTERVAL) {
+            return;
+        }
+        // CAUTION: `swap_rb` 传 true：DIB 恒 BGRA，egui 的 ColorImage 要 RGBA。
+        let cap = match self.capture.as_mut() {
+            Some(c) => c,
+            None => match DesktopCapture::new(true) {
+                Ok(c) => self.capture.insert(c),
+                Err(e) => {
+                    tracing::warn!(%e, "弹窗桌面捕获器初始化失败，磨砂底图停更");
+                    return;
+                }
+            },
+        };
+        match cap.capture_behind_scaled(self.window.hwnd().0 as isize, FROST_DOWNSCALE) {
+            Ok(Some((bits, w, h))) => {
+                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], bits);
+                self.frost_tex = Some(self.ctx.load_texture(
+                    "popup_frost",
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ));
+                self.last_capture = Some(now);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!(%e, "弹窗磨砂捕获失败，沿用上一张"),
+        }
+    }
+
     /// 同步显隐并在需要时绘制一帧。
     ///
     /// - 隐藏态：泵消息并**排空**事件，不渲染（同设置窗口的纪律：
@@ -196,6 +275,7 @@ impl<'a> Popup<'a> {
         kind: PopupKind,
         want_open: bool,
         panel_pos_screen: egui::Vec2,
+        acrylic: bool,
     ) -> anyhow::Result<()> {
         let just_opened = !self.was_open && want_open;
         self.was_open = want_open;
@@ -213,6 +293,10 @@ impl<'a> Popup<'a> {
         let x_px = ((panel_pos_screen.x - margin) * s) as i32;
         let y_px = ((panel_pos_screen.y - margin) * s) as i32;
         self.move_to_screen(x_px, y_px);
+        // 磨砂：抓身后桌面（自排除，否则抓到自己的上一帧）→ 降采样再
+        // 放大即柔化，用作面板的底图。非磨砂时不抓、不排除。
+        self.update_frost(acrylic);
+        let frost = self.frost_tex.as_ref().map(|t| t.id());
         // 首次显示：抬到 Z 序顶部，避免被主窗口盖住；搜索面板还要
         // 抢焦点（用户要立刻打字），类型栏保持不抢（no_activate）。
         if just_opened {
@@ -254,7 +338,7 @@ impl<'a> Popup<'a> {
         let raw_input = self.events.egui_input(&self.ctx, &frame_events);
         // 调色板与主窗口同步（各自 Context，`Visuals` 不共享）。
         crate::theme::apply(&self.ctx, app.palette());
-        let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_popup(ui, kind));
+        let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_popup(ui, kind, frost));
         let ppp = out.pixels_per_point;
         let mut textures_delta = std::mem::take(&mut out.textures_delta);
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
@@ -323,6 +407,7 @@ impl<'a> Popups<'a> {
     /// `panel_rect` 是**主窗口客户区坐标系**下的面板矩形（逻辑点，
     /// y 为负 = 在窗口上方），这里加上主窗口屏幕位置得到屏幕坐标。
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn sync_search(
         &mut self,
         app: &mut crate::app::App,
@@ -332,6 +417,7 @@ impl<'a> Popups<'a> {
         scale_factor: f32,
         shared: &SharedGfx<'a>,
         topmost: bool,
+        acrylic: bool,
     ) {
         let want_open = want_open && panel_rect.is_some();
         if want_open && self.search.is_none() {
@@ -353,12 +439,13 @@ impl<'a> Popups<'a> {
         p.apply_topmost(topmost);
         let rect = panel_rect.unwrap_or(egui::Rect::ZERO);
         let pos = anchor_screen + rect.min.to_vec2();
-        if let Err(e) = p.sync_and_render(app, PopupKind::Search, want_open, pos) {
+        if let Err(e) = p.sync_and_render(app, PopupKind::Search, want_open, pos, acrylic) {
             tracing::warn!(%e, "搜索弹窗渲染失败");
         }
     }
 
     /// 同步类型过滤栏弹窗（常驻可见）。
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn sync_rail(
         &mut self,
@@ -369,6 +456,7 @@ impl<'a> Popups<'a> {
         scale_factor: f32,
         shared: &SharedGfx<'a>,
         topmost: bool,
+        acrylic: bool,
     ) {
         let want_open = want_open && panel_rect.is_some();
         if want_open && self.rail.is_none() {
@@ -390,7 +478,7 @@ impl<'a> Popups<'a> {
         p.apply_topmost(topmost);
         let rect = panel_rect.unwrap_or(egui::Rect::ZERO);
         let pos = anchor_screen + rect.min.to_vec2();
-        if let Err(e) = p.sync_and_render(app, PopupKind::Rail, want_open, pos) {
+        if let Err(e) = p.sync_and_render(app, PopupKind::Rail, want_open, pos, acrylic) {
             tracing::warn!(%e, "类型栏弹窗渲染失败");
         }
     }

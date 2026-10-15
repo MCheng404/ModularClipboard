@@ -1386,7 +1386,9 @@ fn drive_attach_windows<'a>(
         // 它们是**贴着主窗口**的浮动面板，主窗口不在了却留着两块面板
         // 浮在桌面上，是最刺眼的一种「渲染 bug」。
         let want_search = main_visible && app.paint_state.search_expanded;
-        popups.sync_search(app, want_search, floats.search, anchor, s, shared, topmost);
+        let acrylic = app.svc.state.config.ui.window_backdrop
+            == modular_clipboard_core::config::WindowBackdrop::Acrylic;
+        popups.sync_search(app, want_search, floats.search, anchor, s, shared, topmost, acrylic);
         // 隐藏时**必须清**弹窗回报的两项：否则上一次「正在打字」
         // 的 true 会一直留在状态里，主窗口的搜索状态机认为有人持有
         // 焦点，面板再也收不回去。
@@ -1402,6 +1404,7 @@ fn drive_attach_windows<'a>(
             s,
             shared,
             topmost,
+            acrylic,
         );
     }
 
@@ -2445,7 +2448,12 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
 ///
 /// 弹窗客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
 /// 面板矩形取中央那块；投影由 `paint` 画在边距里（alpha=0 处即桌面）。
-pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
+pub fn draw_popup(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: crate::popup::PopupKind,
+        frost: Option<egui::TextureId>,
+    ) {
     let ppp = ui.ctx().pixels_per_point();
     let margin = crate::popup::SHADOW_MARGIN;
     let client = ui.max_rect();
@@ -2453,15 +2461,37 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
         egui::pos2(client.min.x + margin, client.min.y + margin),
         egui::pos2(client.max.x - margin, client.max.y - margin),
     );
-    // NOTE: 不铺底图。弹窗的清屏色是透明的（见 `crate::popup`），
-    // 没画到的地方直接透出桌面 —— 圆角与投影都靠这个。
+    // ---- 磨砂底图：裁到面板圆角内 ----
+    //
+    // 只在「磨砂」模式下有（见 `crate::popup::Popup::update_frost`）。
+    // 必须**裁剪到面板矩形**：底图铺满整个客户区的话，那圈本该透明的
+    // 投影区就变成不透明的模糊矩形，浮不起来的同时还会显出一个大方块。
+    if let Some(tex) = frost {
+        ui.painter().with_clip_rect(panel).image(
+            tex,
+            panel,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+    // 磨砂时背景层**降 alpha**（与主窗口同一算式）：底图透出来才有磨砂
+    // 感；描边用主题色（用户要求「开启磨砂时圆角渲染主题描边」）。
+    let backdrop_pal;
+    let pal_ref: &crate::theme::Palette = if frost.is_some() {
+        let base = self.svc.state.config.ui.window_opacity.clamp(0.3, 1.0) * 0.6;
+        let alpha = backdrop_alpha(base, self.backdrop_lum, self.pal.is_dark);
+        backdrop_pal = self.pal.with_backdrop_alpha(alpha);
+        &backdrop_pal
+    } else {
+        &self.pal
+    };
     // ---- 自研投影：画在**客户区级** painter 上 ----
     //
     // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，这圈铺的是捕获到的桌面；
     // 投影就用项目自己的高斯投影画在内容矩形外围（alpha 混合在渲染层
     // 完成）。用 `painter_at(panel)` 会把投影裁掉一圈，面板就贴着桌面、
     // 浮不起来 —— 所以这里必须用 `ui.painter()`。
-    crate::paint::draw_popup_shadow(ui.painter(), panel, &self.pal);
+    crate::paint::draw_popup_shadow(ui.painter(), panel, pal_ref);
     // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
     // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
     let rail_kinds = crate::paint::FloatLayout::kinds(
@@ -2473,7 +2503,7 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
         state: &mut self.paint_state,
         svc: &mut self.svc,
         ws: &self.ws,
-        pal: &self.pal,
+        pal: pal_ref,
         scale: ppp,
         area: panel,
         card_id: None,
