@@ -89,12 +89,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, GetWindowRect, FindWindowW, PostMessageW,
     SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SWP_NOMOVE,
     GetForegroundWindow, IsWindow, MSG, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassExW,
-    SIZE_MINIMIZED, SIZE_RESTORED, SW_SHOW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    SIZE_MINIMIZED, SIZE_RESTORED, SW_HIDE, SW_SHOW, SW_SHOWNA, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE,
     WM_SYSCOMMAND,
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DPICHANGED, WM_IME_CHAR, WM_KEYDOWN, WM_KEYUP,
     WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_POPUP, WS_SYSMENU,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WS_SYSMENU,
     // IME 会话：搜索框要能输入中文，候选窗依赖这三个消息。
     //
     // NOTE: 名字是 `*_COMPOSITION` 而不是直觉上的 `WM_IME_START`/`WM_IME_END`
@@ -332,6 +334,28 @@ pub enum WindowIme {
     End(String),
 }
 
+/// 窗口构造选项（`Window::new` 与 `Window::new_popup` 的差异全在这里）。
+///
+/// 抽成结构体而不是给 `new` 加一堆默认参数：主窗口与弹窗的差异是
+/// **一组的**（ex 样式 / 初始显隐 / 圆角 / resize 边 / 位置），
+/// 逐个 bool 参数会出现 `new(t, w, h, false, true, false, 0.0, None)`
+/// 这种不可读的调用点。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WindowOpts {
+    /// 扩展样式（主窗口传 0；弹窗见 [`Window::new_popup`]）。
+    pub ex_style: WINDOW_EX_STYLE,
+    /// 创建后是否立即显示。弹窗传 false——按需显示，
+    /// 避免「程序一启动就多两个空面板挂在屏幕上」。
+    pub show: bool,
+    /// 是否应用 DWM 圆角 + 去系统描边。弹窗传 false：
+    /// 圆角由内容自己的 alpha 画（投影也要一起画，系统圆角管不了）。
+    pub rounded: bool,
+    /// resize 边缘宽度（逻辑点）。0 = 不可缩放（弹窗）。
+    pub resize_border: f32,
+    /// 初始位置（物理像素）。`None` = 系统默认 (120, 120)。
+    pub pos: Option<(i32, i32)>,
+}
+
 /// Win32 窗口。
 ///
 /// 持有 `HWND` 与模块句柄，`Drop` 时销毁窗口。窗口类**不**注销：
@@ -363,6 +387,58 @@ impl Window {
     /// `width` / `height` 是**客户区**的物理像素。内部先打开 per-monitor
     /// DPI 感知（v2），因此在高 DPI 显示器上窗口是清晰的。
     pub fn new(title: &str, width: u32, height: u32) -> anyhow::Result<Self> {
+        Self::create(title, width, height, WindowOpts::default())
+    }
+
+    /// 创建一个**弹窗**（悬浮面板用）：不出现在任务栏与 Alt+Tab
+    /// （`WS_EX_TOOLWINDOW`），初始**隐藏**（由调用方在需要时 `set_visible`），
+    /// 不要系统圆角与 resize 边——圆角由内容自己的 alpha 画，更可控。
+    ///
+    /// `no_activate` 为 true 时加 `WS_EX_NOACTIVATE`：点击不抢焦点
+    /// （类型过滤栏这类纯按钮面板用；要打字的搜索面板不能加，否则
+    /// 永远拿不到键盘焦点）。
+    pub fn new_popup(
+        title: &str,
+        width: u32,
+        height: u32,
+        no_activate: bool,
+    ) -> anyhow::Result<Self> {
+        let mut ex = WS_EX_TOOLWINDOW;
+        if no_activate {
+            ex |= WS_EX_NOACTIVATE;
+        }
+        Self::create(
+            title,
+            width,
+            height,
+            WindowOpts {
+                ex_style: ex,
+                show: false,
+                rounded: false,
+                resize_border: 0.0,
+                pos: None,
+            },
+        )
+    }
+
+    /// 显示 / 隐藏窗口（同线程调用）。
+    ///
+    /// CAUTION: 只限**同线程**。跨线程必须走 `request_show_main_window`
+    /// 那套 PostMessage——`ShowWindow` 会阻塞等待目标线程泵消息，
+    /// 而界面线程可能正卡在等 IPC（见 `request_show_main_window` 的注释）。
+    /// 弹窗与主窗口同在界面线程，用本函数安全。
+    pub fn set_visible(&self, visible: bool) {
+        // SAFETY: hwnd 由本结构持有且有效。
+        let _ = unsafe { ShowWindow(self.hwnd, if visible { SW_SHOWNA } else { SW_HIDE }) };
+    }
+
+    /// 构造主体：`new` 与 `new_popup` 共用，差异全在 [`WindowOpts`]。
+    fn create(
+        title: &str,
+        width: u32,
+        height: u32,
+        opts: WindowOpts,
+    ) -> anyhow::Result<Self> {
         // 必须在建窗之前调用，之后再设置不生效。
         // 重复调用返回 Err（ERROR_ACCESS_DENIED），说明别处已设过，
         // 不影响正确性，只 debug 记一笔。
@@ -401,14 +477,15 @@ impl Window {
         // 非模态 resize，见 [`chrome`]。
         let style = WS_POPUP | WS_SYSMENU;
 
+        let (x, y) = opts.pos.unwrap_or((120, 120));
         let hwnd = unsafe {
             CreateWindowExW(
-                WINDOW_EX_STYLE(0),
+                opts.ex_style,
                 class_p,
                 title_p,
                 style,
-                120,
-                120,
+                x,
+                y,
                 clamp_i32(width),
                 clamp_i32(height),
                 None,
@@ -419,13 +496,19 @@ impl Window {
         }
         .context("CreateWindowExW 失败")?;
 
-        // BOOL 是 Copy 且非 must_use，显式丢弃以表明「返回值不关心」
-        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+        if opts.show {
+            // BOOL 是 Copy 且非 must_use，显式丢弃以表明「返回值不关心」
+            let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+        }
 
-        // 圆角 + 去系统描边。Win10 上失败只记debug，不影响启动。
-        chrome::apply_rounded_corners(hwnd);
+        if opts.rounded {
+            // 圆角 + 去系统描边。Win10 上失败只记debug，不影响启动。
+            chrome::apply_rounded_corners(hwnd);
+        }
         // 给一个默认的 resize 边缘；上层可用`set_resize_border` 覆盖。
-        chrome::set_resize_border(hwnd, chrome::DEFAULT_RESIZE_BORDER);
+        // 弹窗传 0：面板不可缩放，`hit_test` 的 `border <= 0` 分支
+        // 会跳过全部边缘判定，只剩 Client / Caption。
+        chrome::set_resize_border(hwnd, opts.resize_border);
 
         Ok(Self {
             hwnd,

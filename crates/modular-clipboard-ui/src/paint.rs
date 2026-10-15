@@ -426,13 +426,30 @@ pub struct UiState {
     /// 在指针抵达前就消失——**永远进不去输入框**（用户反馈：
     /// 「根本不给输入的机会」）。
     pub search_leave_since: Option<f64>,
+    /// 搜索面板文本框的自报 id（`draw_search_panel` 写入）。
+    ///
+    /// 面板是独立弹窗、有自己的 `egui::Context`，焦点也在那里面——
+    /// 主窗口的 `memory()` 读不到。弹窗每帧用这个 id 回报焦点状态
+    /// （见 [`UiState::search_popup_focus`]）。
+    pub search_edit_id: Option<egui::Id>,
     /// 点击搜索图标后待办的「把焦点交给输入框」请求。
     ///
-    /// 之所以要跨帧挂起：点击的那一帧输入框可能还没画出来（它要先被
-    /// 悬停/点击判定判为展开），而焦点只能请求给**已经存在**的控件 id。
-    /// 真正发出请求是在本帧的 `draw_search` 之后（那时 id 已自报），
-    /// 拿不到就留到下一帧再说。
+    /// 跨帧挂起的原因：点击的那一帧弹窗可能还没画（要先判展开），
+    /// 而焦点只能请求给**已经存在**的控件 id。真正发出请求是在弹窗
+    /// 那帧 `draw_search_panel` 之后（那时 id 已自报）。
     pub search_focus_pending: bool,
+    /// 指针是否悬在**搜索弹窗**上（弹窗每帧回报）。
+    ///
+    /// 第三轮初版面板画在窗口内，用 `rect_contains_pointer` 就能判；
+    /// 变成弹窗后指针在主窗口客户区之外，只能由弹窗问
+    /// `WindowFromPoint`（gfx::chrome::pointer_is_over）。
+    pub search_popup_hover: bool,
+    /// 搜索弹窗的输入框是否持有焦点（弹窗每帧回报）。
+    ///
+    /// 这条规则是「正在打字时不折叠面板」的依据，而焦点住在弹窗的
+    /// `egui::Context` 里——主窗口的 `memory()` 恒为空，不回报的话
+    /// 用户点进输入框的瞬间面板就会自己收回去，字永远打不进去。
+    pub search_popup_focus: bool,
     /// 上一帧提交给窗口的拖动区（标题栏）。
     ///
     /// IMPORTANT: 必须是**多段**而不是「整个顶栏一块」：拖动区会被系统转成
@@ -472,17 +489,6 @@ pub struct UiState {
     /// [`Self::list_scroll`] / [`Self::set_list_scroll`] 访问。
     list_scroll: [f32; 2],
 
-    /// 搜索框 `TextEdit` 的 egui `Id`（本帧绘制时写入）。
-    ///
-    /// # 为什么需要
-    ///
-    /// egui 0.36 的 `Id` 是**哈希值**，`format!("{id:?}")` 只得到
-    /// `Id::new(3070286450358649230)` 这样的数字，没法按名字匹配。
-    /// 于是「点搜索框后焦点是否落在搜索框上」只能退化成「有没有任何
-    /// 控件获得焦点」——那是**恒真**的，点别处也一样通过。
-    ///
-    /// 绘制层把自己用的 id 记下来，测试才能**精确比对**。
-    pub search_edit_id: Option<egui::Id>,
     /// 设置界面是否打开。
     pub show_settings: bool,
     /// `MC_SETTINGS` 启动开关是否已消费（一次性）。
@@ -596,6 +602,13 @@ pub enum HitNs {
     Child(crate::card::CardId),
     /// 设置窗口。
     Settings,
+    /// 悬浮面板弹窗（搜索面板 / 类型过滤栏）。
+    ///
+    /// 独立命名空间的理由：弹窗与主窗口**共用**同一个 `UiState`（配置、
+    /// 选中项、查询词都共享），若热区也共用 Main 表，同名 key（如
+    /// `search_box`）会互相覆盖——自动化脚本点主窗口的坐标会落到
+    /// 弹窗的矩形上。
+    Popup(crate::popup::PopupKind),
 }
 
 /// 按窗口分隔的热区表（见 [`UiState::hit`]）。
@@ -853,33 +866,19 @@ pub fn draw(f: &mut Frame<'_>) {
     // 测试仍通过但测的是空气。
     f.hit_clear();
 
-    // ---- 悬浮装饰布局（纯函数：配置 + 条目 + 过滤态 → 矩形与占位） ----
-    let mut floats = FloatLayout::compute(
-        &f.svc.state.config.ui,
-        &f.svc.state.items,
-        f.state.type_filter,
-        f.state.search_expanded,
-        body,
-    );
-
-    // 顶栏（含搜索开关图标）。返回图标响应供下面的状态机使用。
+    // 顶栏（含搜索开关图标）。返回图标响应供状态机使用。
     let icon_resp = draw_topbar(f, top);
 
     // 搜索状态机：悬停 0.18s / 点击展开，离开宽限 0.35s 折叠，
-    // 焦点或查询词钉住。它可能翻转 `search_expanded`——翻转后重算一次
-    // 布局，让本帧的面板矩形与新状态一致（避免「状态翻了、矩形没翻」）。
-    run_search_state_machine(f, &icon_resp, floats.search);
-    if f.state.search_expanded != floats.search.is_some() {
-        floats = FloatLayout::compute(
-            &f.svc.state.config.ui,
-            &f.svc.state.items,
-            f.state.type_filter,
-            f.state.search_expanded,
-            body,
-        );
-    }
+    // 焦点或查询词钉住。
+    //
+    // 「焦点」与「悬停」两项都来自**弹窗**：面板住在自己的窗口与
+    // `egui::Context` 里，主窗口既看不到它的指针也读不到它的焦点
+    // （焦点在弹窗的 `Context::memory()`）。`popup` 每帧把两者回报
+    // 到 `UiState`（`search_popup_hover` / `search_popup_focus`）。
+    run_search_state_machine(f, &icon_resp);
 
-    // 卡片（矩形由 solver 按同一套 insets 算好，绘制层只读不判断）。
+    // 卡片（矩形由 solver 算好，绘制层只读不判断）。
     draw_cards(f, body);
 
     // 缩略图纹理按**本帧全部可见图片条目**淘汰（帧级，跨列表）：
@@ -888,24 +887,16 @@ pub fn draw(f: &mut Frame<'_>) {
     f.state.thumb_tex.retain(|id, _| f.state.thumb_seen.contains(id));
     f.state.thumb_seen.clear();
 
-    // 悬浮层画在列表之上：类型栏 → 搜索面板 → toast。
-    if let Some(rail) = floats.rail {
-        draw_type_rail(f, rail, &floats.rail_kinds);
-    }
-    if let Some(panel) = floats.search {
-        draw_search_panel(f, panel);
-    }
-
-    // NOTE: 设置界面**不在这里画**——它已移到独立窗口
-    // （见 `crate::settingswin`）。主窗口只负责响应齿轮点击，
-    // 把 `show_settings` 置 true，由设置窗口的绘制入口接管。
+    // NOTE: 搜索面板与类型过滤栏**不在这里画**——它们是独立弹窗
+    // （`crate::popup`），画在主窗口客户区里就等于「画在窗口内」，
+    // 与原型不符。窗口过程、事件泵、投影、点击穿透都在那边。
     //
-    // 若在这里再画一次，用户会看到「主窗口里浮着一块面板」，
-    // 而真正的设置窗口在旁边——同一份内容画两遍。
+    // NOTE: 设置界面同样不在这里画（独立窗口，见 `settingswin`）。
+
     draw_notice_toast(f);
 }
 
-/// 类型过滤栏与主窗口内容的间距（逻辑点）。
+/// 类型过滤栏与主窗口的间距（逻辑点）。
 const RAIL_GAP: f32 = 12.0;
 
 /// 悬浮搜索面板高度（逻辑点）。
@@ -923,109 +914,130 @@ const RAIL_KIND_ORDER: [modular_clipboard_core::ClipKind; 5] = {
     ]
 };
 
-/// 悬浮装饰（类型过滤栏 + 搜索面板）的布局结果。
+/// 悬浮装饰（搜索面板 / 类型过滤栏）的**弹窗几何**。
 ///
-/// **纯函数** `compute` 的产物：同一份输入（配置 + 条目 + 过滤态 +
-/// 展开态 + 卡片区）必然得到同一份矩形——帧循环（solver 占位）与绘制层
-/// （画按钮/面板）各自调它，不存在「两处各算一套」的漂移空间。
+/// # 坐标系：主窗口客户区左上角为原点，允许负坐标
+///
+/// 搜索面板在窗口**上方** ⇒ `y ∈ [-(RAIL_GAP + SEARCH_PANEL_H), -RAIL_GAP]`；
+/// 类型栏在左 / 上方同理。`crate::popup` 据此换算屏幕坐标（加主窗口
+/// 屏幕位置）。
+///
+/// 这正是原型（`main-proto/index.html`）的布局：两个面板**漂在窗口
+/// 之外**，间距透出桌面。2026-10-15 第三轮初版把它们画在窗口内，
+/// 与原型不符——Win32 窗口画不出客户区之外，只能靠独立弹窗实现。
+///
+/// 因为面板不再压在内容上，**列表也不需要为它们让位**（第三轮初版
+/// 里的 `insets` 已随之删除，卡片区恢复满宽）。
+///
+/// **纯函数** `compute` 的产物：帧循环（弹窗定位）与绘制层（弹窗内容）
+/// 各自调它，同一份输入必然同一份矩形。
 pub struct FloatLayout {
-    /// 类型栏占满的条带矩形（`None` = 不显示）。按钮槽位由
-    /// [`draw_type_rail`] 按停靠方向在带内均布。
+    /// 类型栏按钮组的矩形（`None` = 不显示）。
     pub rail: Option<Rect>,
     /// 类型栏要显示的按钮（顺序固定；含「始终显示」时补全的类型）。
     pub rail_kinds: Vec<modular_clipboard_core::ClipKind>,
     /// 搜索面板矩形（`None` = 折叠）。
     pub search: Option<Rect>,
-    /// 卡片区附加内缩 `[左, 右, 上, 下]`（逻辑点）：类型栏停靠侧让出
-    /// `图标边长 + RAIL_GAP`，喂给 `solver::solve_scaled_inset`。
-    pub insets: [f32; 4],
 }
 
 impl FloatLayout {
-    /// 计算悬浮装饰布局。
+    /// 当前应显示的类型栏按钮（顺序固定）。
     ///
-    /// - `body`：卡片区（`solver::card_area` 的输出，已扣顶栏与四周内缩）；
-    /// - `type_filter`：当前激活的类型（仅影响 tooltip 文案，不影响几何）；
+    /// 抽成函数是为了让**几何**（[`FloatLayout::compute`] 决定弹窗尺寸）
+    /// 与**绘制**（弹窗内容里的按钮）读同一份结果——两处各判一次
+    /// 「该显示哪几类」必然漂移（弹窗按 4 类算尺寸、内容画 3 枚按钮）。
+    pub fn kinds(
+        cfg: &modular_clipboard_core::config::UiConfig,
+        items: &[modular_clipboard_core::item::ClipItem],
+    ) -> Vec<modular_clipboard_core::ClipKind> {
+        if !cfg.type_rail.visible {
+            return Vec::new();
+        }
+        RAIL_KIND_ORDER
+            .iter()
+            .copied()
+            // 默认只显示「已有记录」的类型；`always` 时五类齐全。
+            .filter(|k| cfg.type_rail.always || items.iter().any(|it| it.kind == *k))
+            .collect()
+    }
+
+    /// 计算悬浮弹窗的布局。
+    ///
+    /// - `area`：主窗口客户区（逻辑点，窗口坐标）；
     /// - `search_expanded`：搜索面板是否展开。
     pub fn compute(
         cfg: &modular_clipboard_core::config::UiConfig,
         items: &[modular_clipboard_core::item::ClipItem],
-        _type_filter: Option<modular_clipboard_core::ClipKind>,
         search_expanded: bool,
-        body: Rect,
+        area: Rect,
     ) -> Self {
         use modular_clipboard_core::config::TypeRailPos;
 
         let rail_cfg = &cfg.type_rail;
         let size = modular_clipboard_core::config::clamp_type_rail_size(rail_cfg.size);
-        let mut insets = [0.0f32; 4];
-        let mut rail = None;
-        let mut rail_kinds = Vec::new();
+        let gap = RAIL_GAP.min(8.0); // 按钮间距比面板间距紧一档
 
-        if rail_cfg.visible {
-            // 默认只显示「已有记录」的类型；`always` 时五类齐全。
-            rail_kinds = RAIL_KIND_ORDER
-                .iter()
-                .copied()
-                .filter(|k| rail_cfg.always || items.iter().any(|it| it.kind == *k))
-                .collect();
-            if !rail_kinds.is_empty() {
-                let strip = size + RAIL_GAP;
-                rail = Some(match rail_cfg.pos {
-                    TypeRailPos::Right => {
-                        insets[1] = strip;
-                        Rect::from_min_max(pos2(body.max.x - size, body.min.y), pos2(body.max.x, body.max.y))
-                    }
-                    TypeRailPos::Left => {
-                        insets[0] = strip;
-                        Rect::from_min_max(pos2(body.min.x, body.min.y), pos2(body.min.x + size, body.max.y))
-                    }
-                    TypeRailPos::Top => {
-                        insets[2] = strip;
-                        Rect::from_min_max(pos2(body.min.x, body.min.y), pos2(body.max.x, body.min.y + size))
-                    }
-                    TypeRailPos::Bottom => {
-                        insets[3] = strip;
-                        Rect::from_min_max(pos2(body.min.x, body.max.y - size), pos2(body.max.x, body.max.y))
-                    }
-                });
+        // ---- 类型栏：按钮组矩形（弹窗按它定尺寸，投影边距由弹窗自己加） ----
+        let rail_kinds = Self::kinds(cfg, items);
+        let rail = match rail_kinds.len() {
+            0 => None,
+            n => {
+                // 弹窗客户区只包住按钮组本身（+ 投影边距），不做成
+                // 「整条侧栏那么高」——那圈空白是透明窗口面积，
+                // 既费显存又会挡下面的窗口（要靠点击穿透兜，更容易出岔子）。
+                let total = n as f32 * size + (n as f32 - 1.0) * gap;
+                let card = crate::solver::card_area(area);
+                Some(match rail_cfg.pos {
+                    // 右 / 左：贴在窗口对应侧缘外，垂直对齐卡片区中心。
+                    TypeRailPos::Right => Rect::from_center_size(
+                        pos2(area.max.x + RAIL_GAP + size * 0.5, card.center().y),
+                        vec2(size, total),
+                    ),
+                    TypeRailPos::Left => Rect::from_center_size(
+                        pos2(area.min.x - RAIL_GAP - size * 0.5, card.center().y),
+                        vec2(size, total),
+                    ),
+                    // 上 / 下：横向一行，对齐卡片区中心。
+                    TypeRailPos::Top => Rect::from_center_size(
+                        pos2(card.center().x, area.min.y - RAIL_GAP - size * 0.5),
+                        vec2(total, size),
+                    ),
+                    TypeRailPos::Bottom => Rect::from_center_size(
+                        pos2(card.center().x, area.max.y + RAIL_GAP + size * 0.5),
+                        vec2(total, size),
+                    ),
+                })
             }
-        }
-
-        // 搜索面板：卡片区通栏、与顶栏留 [`RAIL_GAP`] 的间距（原型里
-        // 面板「悬浮且与主窗口有间距」的窗口内等价物）。
-        //
-        // CAUTION: 左右停靠了类型栏时，面板**右缘（或左缘）要让出栏条带**。
-        // 不让的后果：矮窗口下垂直居中的类型栏上沿会被面板压住，而那几枚
-        // 按钮正在面板下面——点不动，且没有任何提示。这与「行矩形让出
-        // 滚动条」是同一条纪律：浮动层不能盖住另一个浮动层的交互区。
-        // 顶部停靠时面板下移到栏下方（间距同为 RAIL_GAP）。
-        let search = if search_expanded {
-            let rail_top = rail.is_some_and(|_| matches!(rail_cfg.pos, TypeRailPos::Top));
-            let (x0, x1) = match (rail.is_some(), rail_cfg.pos) {
-                (true, TypeRailPos::Left) => (body.min.x + size + RAIL_GAP, body.max.x),
-                (true, TypeRailPos::Right) => (body.min.x, body.max.x - size - RAIL_GAP),
-                _ => (body.min.x, body.max.x),
-            };
-            let y0 = body.min.y + if rail_top { size + RAIL_GAP } else { RAIL_GAP };
-            Some(Rect::from_min_max(
-                pos2(x0, y0),
-                pos2(x1, y0 + SEARCH_PANEL_H),
-            ))
-        } else {
-            None
         };
 
-        Self { rail, rail_kinds, search, insets }
-    }
+        // ---- 搜索面板：窗口正上方通栏 ----
+        let search = search_expanded.then(|| {
+            Rect::from_min_max(
+                pos2(area.min.x, area.min.y - RAIL_GAP - SEARCH_PANEL_H),
+                pos2(area.max.x, area.min.y - RAIL_GAP),
+            )
+        });
 
-    /// 把附加内缩应用到卡片区（solver 与绘制侧共用同一算式）。
-    pub fn inset_body(&self, body: Rect) -> Rect {
-        Rect::from_min_max(
-            pos2(body.min.x + self.insets[0], body.min.y + self.insets[2]),
-            pos2(body.max.x - self.insets[1], body.max.y - self.insets[3]),
-        )
+        Self { rail, rail_kinds, search }
     }
+}
+
+/// 画悬浮弹窗的投影（面板外围那一圈 alpha）。
+///
+/// 必须用**弹窗客户区级** painter（`ui.painter()`），不能用
+/// `painter_at(panel)`——后者按面板矩形裁剪，投影会被切掉一圈，
+/// 表现为「面板贴着桌面、没有浮起来」。
+///
+/// 参数比行卡片投影稍重：行卡片在窗口**内部**（投影只从缝隙里透出来），
+/// 弹窗是压在**桌面**上的，需要更强的层次才浮得起来。
+pub fn draw_popup_shadow(painter: &egui::Painter, panel: Rect, pal: &Palette) {
+    let cfg = modular_clipboard_core::config::CardShadowConfig {
+        enabled: true,
+        blur: 16.0,
+        opacity: 0.32,
+        offset_y: 2.0,
+    };
+    draw_card_shadow(painter, panel, 9.0, &cfg, pal);
 }
 
 /// 通知 toast：窗口上方居中短暂显示 `Service::notify` 的消息（F-16 / UI-P0-2）。
@@ -1225,22 +1237,17 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
 
 /// 搜索状态机：悬停展开 / 宽限折叠 / 焦点钉住。
 ///
-/// 从 `draw_topbar` 抽出来的原因：第三轮起输入框是**悬浮面板**，
-/// 其矩形要等 `FloatLayout` 算完才知道，而状态机又必须先于绘制
-/// 跑（它决定本帧画不画面板）。三者顺序因此变为：
-/// 布局 → 画顶栏拿图标响应 → 状态机 → （可能）重算布局 → 画面板。
-///
 /// 交互契约（与原型逐条一致）：
 /// - 光标**停在**图标上 ≥ [`SEARCH_HOVER_DELAY`] ⇒ 展开；
-/// - 离开图标与面板 ⇒ **宽限** [`SEARCH_COLLAPSE_DELAY`] 后才折叠；
+/// - 离开图标与**面板** ⇒ **宽限** [`SEARCH_COLLAPSE_DELAY`] 后才折叠；
 /// - 输入框持有焦点、或里面有查询词 ⇒ 永不折叠。
 ///
-/// `panel`：本帧搜索面板的矩形（折叠时为 `None`）。悬停判据用
-/// `rect_contains_pointer` 而不是逐个控件的 `hovered()`：框内还有
-/// 文本光标、清除按钮等子交互，逐个子响应去 or 一定会漏掉某一处。
-fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response, panel: Option<Rect>) {
+/// 面板是独立弹窗，因此「悬停面板」与「面板持有焦点」两项都由弹窗
+/// 每帧回报到 [`UiState::search_popup_hover`] / [`UiState::search_popup_focus`]——
+/// 指针在主窗口客户区之外、主窗口也读不到弹窗 Context 的焦点。
+fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response) {
     let hover_icon = icon_resp.hovered();
-    let hover_panel = panel.is_some_and(|r| f.ui.rect_contains_pointer(r));
+    let hover_panel = f.state.search_popup_hover;
     let now = f.ui.ctx().input(|i| i.time);
 
     if hover_icon {
@@ -1254,53 +1261,37 @@ fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response, panel
         .search_hover_since
         .is_some_and(|t| now - t >= SEARCH_HOVER_DELAY)
     {
-        f.state.search_expanded = true;
-        f.state.search_leave_since = None;
+        set_search_expanded(f, true);
     }
 
     // 输入框持有焦点 / 有查询词：无条件保持展开。
     //
-    // 焦点这条最关键：用户要点进输入框打字。而点击图标到 `TextEdit`
-    // 拿到焦点之间隔着一帧、鼠标移动到面板又要几帧，这段时间里
-    // 既不悬停图标也不悬停面板——没有这条判定，面板会在焦点
-    // 建立之前自己收回去，然后焦点被丢弃，字永远打不进去。
-    //
-    // CAUTION: 焦点 id 必须用输入框**自报的真实 id**
-    // （`UiState::search_edit_id`，见 `draw_search_panel`），不能用上层猜的
-    // `Id::new("search_edit")`：`TextEdit` 的最终 id 由 egui 在容器 id
-    // 上派生，两者并不相等——猜的那个永远匹配不上，这条判定会恒假。
-    let focused = f
-        .state
-        .search_edit_id
-        .is_some_and(|id| f.ui.memory(|m| m.focused()) == Some(id));
-    let hold_open = focused || !f.state.query.is_empty();
+    // 焦点这条最关键：用户要点进输入框打字。弹窗刚打开、输入框还没
+    // 拿到焦点的那几帧里，既不悬停图标也不悬停面板——没有这条判定，
+    // 面板会在焦点建立之前自己收回去，然后焦点被丢弃，字永远打不进去。
+    let hold_open = f.state.search_popup_focus || !f.state.query.is_empty();
 
     // 点击图标 = 展开 + 把焦点交给输入框。
     //
     // NOTE: 展开/折叠**不再由点击切换**。早前是点击 toggle，与悬停展开
     // 叠加会互相打架：点一下折叠，可光标还停在图标上，下一帧又被悬停
     // 展开——表现为「点不动」。
-    // ……但**现在**还不能写焦点：输入框本帧可能一次都没画过，
-    // `search_edit_id` 还是 `None`（首次展开就是这种情况）。真正的
-    // 请求挂在 [`UiState::search_focus_pending`] 上，等 `draw_search_panel`
-    // 自报出真实 id 之后再发。
+    // ……但**现在**还不能写焦点：弹窗本帧可能一次都没画过（弹窗是
+    // 主窗口之后才渲染的），`search_edit_id` 还是 `None`。真正的请求
+    // 挂在 [`UiState::search_focus_pending`] 上，等弹窗自报出真实 id。
     if icon_resp.clicked() {
-        f.state.search_expanded = true;
-        f.state.search_leave_since = None;
+        set_search_expanded(f, true);
         f.state.search_focus_pending = true;
     }
 
-    // CAUTION: 顺序是「先算矩形 → 判折叠 → 再画」。反过来（先画再判）
-    // 会让**折叠的那一帧**仍然把输入框画出来并登记热区，外部（测试、
-    // 自动化脚本）读到的热区表与实际状态差一帧——表现是「已经收起了，
-    // 但热区还在」。
+    // CAUTION: 顺序是「先判折叠 → 弹窗再画」。反过来（先画再判）
+    // 会让**折叠的那一帧**仍然把面板显示出来，外部（测试、自动化脚本）
+    // 读到的状态与实际差一帧——表现是「已经收起了，但面板还在」。
     if f.state.search_expanded && !hover_icon && !hover_panel && !hold_open {
         match f.state.search_leave_since {
             None => f.state.search_leave_since = Some(now),
             Some(t) if now - t >= SEARCH_COLLAPSE_DELAY => {
-                f.state.search_expanded = false;
-                f.state.search_hover_since = None;
-                f.state.search_leave_since = None;
+                set_search_expanded(f, false);
             }
             _ => {}
         }
@@ -1310,13 +1301,26 @@ fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response, panel
     }
 }
 
+/// 展开 / 收起搜索面板。
+///
+/// 单一入口：图标点击、悬停计时、Esc、弹窗自关都走这里，保证
+/// 「状态翻转」只有一处。弹窗的显隐由帧循环按 `search_expanded` 同步。
+fn set_search_expanded(f: &mut Frame<'_>, v: bool) {
+    if f.state.search_expanded == v {
+        return;
+    }
+    f.state.search_expanded = v;
+    f.state.search_hover_since = None;
+    f.state.search_leave_since = None;
+}
+
 /// 画悬浮搜索面板（第三轮起输入框的新形态）。
 ///
 /// 与旧「顶栏内弹出输入框」的差别只在**位置与容器**：矩形由
 /// [`FloatLayout`] 给（卡片区通栏、贴顶部），控件结构与交互
 /// （hint / 字体 / 边距 / 无外框 / 聚焦加强 / 清除按钮 / 焦点自报）
 /// 与旧 `draw_search` 完全一致，行为可无缝对拍。
-fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
+pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     let painter = f.ui.painter_at(r);
     // 纯平毛玻璃禁令同样适用于悬浮层：纯色底 + 1px 描边，禁渐变光泽。
@@ -1447,30 +1451,27 @@ fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
-/// 画悬浮类型过滤栏（2026-10-15 第三轮新增，待移植设置联动）。
+/// 画悬浮类型过滤栏的内容（2026-10-15 第三轮新增，待移植设置联动）。
 ///
-/// 按钮在 `rail` 条带内按停靠方向均布（左右 = 垂直居中分组，
-/// 上下 = 水平居中分组），每枚是圆角方块：`surface_raised` 底 +
-/// 1px 弱描边；激活 = `accent` 底 + `text_on_accent` 图标。
-/// 点击过滤、再点一次取消（`Op::SetTypeFilter`）。
-fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_core::ClipKind]) {
+/// 由**弹窗**调用（`crate::popup`），`rail` 是弹窗客户区中央的按钮组
+/// 矩形——[`FloatLayout::compute`] 已把按钮组的尺寸算好，这里只负责
+/// 按停靠方向从组矩形左上角依次摆按钮。
+///
+/// 按钮外观：圆角方块，`surface_raised` 底 + 1px 弱描边；激活 =
+/// `accent` 底 + `text_on_accent` 图标。点击过滤、再点一次取消
+/// （`Op::SetTypeFilter`）。
+pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_core::ClipKind]) {
     use modular_clipboard_core::config::TypeRailPos;
     let pal = f.pal;
     let rail_cfg = &f.svc.state.config.ui.type_rail;
     let size = modular_clipboard_core::config::clamp_type_rail_size(rail_cfg.size);
-    let gap = RAIL_GAP.min(8.0); // 按钮间距比条带间距紧一档
+    let gap = RAIL_GAP.min(8.0); // 按钮间距比面板间距紧一档
     let n = kinds.len();
     if n == 0 || rail.width() <= 0.0 || rail.height() <= 0.0 {
         return;
     }
     let vertical = matches!(rail_cfg.pos, TypeRailPos::Left | TypeRailPos::Right);
-    let total = n as f32 * size + (n as f32 - 1.0) * gap;
-    // 组内居中：左右停靠按竖向均布起点，上下停靠按横向。
-    let (mut x, mut y) = if vertical {
-        (rail.min.x, rail.center().y - total * 0.5)
-    } else {
-        (rail.center().x - total * 0.5, rail.min.y)
-    };
+    let (mut x, mut y) = (rail.min.x, rail.min.y);
 
     for &kind in kinds {
         let slot = Rect::from_min_size(pos2(x, y), vec2(size, size));
@@ -1486,14 +1487,13 @@ fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_core
             modular_clipboard_core::ClipKind::Markdown => "rail_markdown",
         };
         f.hit_insert(hit_key, slot);
-        let resp = f.ui.scope_builder(
-            egui::UiBuilder::new()
-                .id(egui::Id::new(("rail", kind)))
-                .max_rect(slot)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-            |ui| ui.add_sized(slot.size(), egui::Button::new("").frame(false)),
-        );
-        let resp = resp.inner;
+        // CAUTION: 用 `ui.interact` 而不是 `scope_builder` + `Button`——
+        // 后者在**弹窗上下文**里拿不到指针（实测 `hovered` 恒假、
+        // 点击不响应；主窗口上下文却正常）。行内按钮（`draw_row_acts`）
+        // 一直是 `ui.interact`，本函数与它保持一致。
+        let resp = f
+            .ui
+            .interact(slot, egui::Id::new(("rail", kind)), Sense::click());
         // 底色：激活 accent / 悬停 row_hover / 常态 surface_raised。
         let bg = if active {
             pal.accent
@@ -6854,20 +6854,8 @@ fn with_pinned(mut self, n: usize) -> Self {
             // 会让它在后面无法可变借用。
             // 与 `App::draw_frame` 用同一个 scale（生产路径传真实 ppp；
             // 测试夹具的 ppp 恰好是 1.0，`solve` 与 `solve_scaled` 等价）。
-            //
-            // 2026-10-15 第三轮：悬浮类型栏的占位也必须在这里算——
-            // 否则夹具解出的卡片矩形与生产不一致（生产让位、夹具不让），
-            // 「列表被浮动按钮压住」这类问题在测试里永远看不见。
             let ppp = self.ctx.pixels_per_point();
-            let body = crate::solver::card_area(self.area);
-            let floats = crate::paint::FloatLayout::compute(
-                &self.svc.state.config.ui,
-                &self.svc.state.items,
-                self.state.type_filter,
-                false, // 搜索面板是浮动覆盖层，不参与占位
-                body,
-            );
-            let sol = crate::solver::solve_scaled_inset(&self.ws, self.area, ppp, floats.insets);
+            let sol = crate::solver::solve_scaled(&self.ws, self.area, ppp);
             crate::solver::apply(&mut self.ws, &sol);
             let (svc, ws, state, pal, area) =
                 (&mut self.svc, &self.ws, &mut self.state, &self.pal, self.area);
@@ -6894,6 +6882,146 @@ fn with_pinned(mut self, n: usize) -> Self {
         /// 空输入跑一帧。
         fn frame(&mut self) -> Vec<Op> {
             self.frame_with(Vec::new())
+        }
+
+        /// 以**搜索弹窗身份**跑一帧（`App::draw_popup` 的等价路径）。
+        ///
+        /// 面板住在独立窗口里，有自己的 `egui::Context` 与热区命名空间；
+        /// 主窗口的 `frame()` 里根本没有它。想测面板的输入 / 焦点行为
+        /// （打字、清除按钮），只能从这里进。
+        ///
+        /// 客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
+        /// 与真实弹窗一致。
+        fn search_popup_frame_with(&mut self, events: Vec<egui::Event>) -> Vec<Op> {
+            let margin = crate::popup::SHADOW_MARGIN;
+            let panel = Rect::from_min_max(
+                pos2(margin, margin),
+                pos2(self.area.width() - margin, self.area.height() - margin),
+            );
+            let input = self.input(events);
+            // 每帧推进时钟：与 `frame_with` 同款。egui 的事件带时间戳，
+            // 时钟不动时它会把「同一时刻」的新事件当成旧事件的重复而丢弃。
+            self.clock += 1.0 / 60.0;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                let mut f = Frame {
+                    ui,
+                    state: &mut self.state,
+                    svc: &mut self.svc,
+                    ws: &self.ws,
+                    pal: &self.pal,
+                    scale: 1.0,
+                    area: panel,
+                    card_id: None,
+                    hit_ns: HitNs::Popup(crate::popup::PopupKind::Search),
+                };
+                draw_search_panel(&mut f, panel);
+            });
+            // 焦点回报：与 `App::draw_popup` 同一动作。
+            //
+            // CAUTION: 必须在 `f` 的作用域**之外**读 `ui.memory()`——
+            // `f` 借走了 `ui` 的可变引用，两者不能同时活着。
+            self.state.search_popup_focus = self
+                .state
+                .search_edit_id
+                .is_some_and(|id| self.ctx.memory(|m| m.focused()) == Some(id));
+            out.textures_delta.clear();
+            std::mem::take(&mut self.state.ops)
+        }
+
+        /// 以**类型栏弹窗身份**跑一帧（客户区 = 面板 + 一圈投影边距）。
+        ///
+        /// 与 `search_popup_frame_with` 同一形状：面板住在独立窗口里，
+        /// 主窗口的 `frame()` 里根本没有它。
+        fn rail_popup_frame(
+            &mut self,
+            events: Vec<egui::Event>,
+            panel: Rect,
+            kinds: &[modular_clipboard_core::ClipKind],
+        ) {
+            let input = self.input(events);
+            self.clock += 1.0 / 60.0;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                let mut f = Frame {
+                    ui,
+                    state: &mut self.state,
+                    svc: &mut self.svc,
+                    ws: &self.ws,
+                    pal: &self.pal,
+                    scale: 1.0,
+                    area: panel,
+                    card_id: None,
+                    hit_ns: HitNs::Popup(crate::popup::PopupKind::Rail),
+                };
+                draw_type_rail(&mut f, panel, kinds);
+            });
+            out.textures_delta.clear();
+        }
+
+        /// 以**类型栏弹窗身份**点第 `idx` 枚按钮，返回该帧收集到的 Op。
+        ///
+        /// 按钮矩形按 `FloatLayout` 的几何算（弹窗客户区中央的按钮组），
+        /// 与生产同一条算式——不自己估坐标。
+        fn rail_popup_click(&mut self, idx: usize) -> Vec<Op> {
+            let margin = crate::popup::SHADOW_MARGIN;
+            let area = Rect::from_min_size(pos2(0.0, 0.0), self.area.size());
+            let cfg = self.svc.state.config.ui.clone();
+            let items = self.svc.state.items.clone();
+            let kinds = FloatLayout::kinds(&cfg, &items);
+            let group = FloatLayout::compute(&cfg, &items, false, area)
+                .rail
+                .expect("测试前置：类型栏应可见");
+            let size = modular_clipboard_core::config::clamp_type_rail_size(cfg.type_rail.size);
+            // 弹窗客户区里的面板矩形（= 类型栏按钮组在弹窗内的位置）。
+            let panel = Rect::from_min_max(
+                pos2(margin, margin),
+                pos2(margin + group.width(), margin + group.height()),
+            );
+            // 按钮槽位从**面板原点**起排——与 `draw_type_rail` 同一算式
+            // （它拿到的 `rail` 就是这个面板矩形）。
+            let slot = Rect::from_min_size(
+                pos2(
+                    panel.min.x,
+                    panel.min.y + idx as f32 * (size + RAIL_GAP.min(8.0)),
+                ),
+                vec2(size, size),
+            );
+            let p = slot.center();
+            // 点击必须**分两帧**：先一帧 `PointerMoved`（让 egui 知道指针
+            // 在哪、按钮进入 hover），下一帧才按下/松开。合成一帧时
+            // egui 收不到点击——实测 `clicked()` 恒假。
+            self.rail_popup_frame(vec![egui::Event::PointerMoved(p)], panel, &kinds);
+            let input = self.input(vec![
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ]);
+            self.clock += 1.0 / 60.0;
+            let mut out = self.ctx.run_ui(input, |ui| {
+                let mut f = Frame {
+                    ui,
+                    state: &mut self.state,
+                    svc: &mut self.svc,
+                    ws: &self.ws,
+                    pal: &self.pal,
+                    scale: 1.0,
+                    area: panel,
+                    card_id: None,
+                    hit_ns: HitNs::Popup(crate::popup::PopupKind::Rail),
+                };
+                draw_type_rail(&mut f, panel, &kinds);
+                // ---- 临时诊断（调试完删除） ----
+            });
+            out.textures_delta.clear();
+            std::mem::take(&mut self.state.ops)
         }
 
         /// 跑一帧**子窗口**内容，返回本帧上报的拖动区。
@@ -7038,14 +7166,6 @@ fn with_pinned(mut self, n: usize) -> Self {
             .hit
             .get(ns, name)
             .unwrap_or_else(|| panic!("热区 {name:?} 未在 {ns:?} 里登记（首帧后才有）"))
-    }
-
-    /// `hit` 的可选版本：热区**没登记**返回 `None` 而不是 panic。
-    ///
-    /// 类型过滤栏按「已有类型」决定画哪些按钮，「某类型的按钮不在」
-    /// 本身就是要断言的事实（默认行为：没有该类型记录就不出现）。
-    fn hit_opt(h: &Harness, name: &str) -> Option<Rect> {
-        h.state.hit.get(HitNs::Main, name)
     }
 
     /// 设置（齿轮）按钮矩形。
@@ -7248,19 +7368,32 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 搜索框能接收输入并写进 `query`。
+    /// 搜索面板能接收输入并写进 `query`。
     ///
     /// 早前顶栏那个「搜索框」是用 `painter.text()` 画上去的静态占位符，
     /// 点击只 `request_repaint()` —— 看着像搜索框，实际**打不了字**。
     /// 这条测试守住它真的能输入。
+    ///
+    /// 2026-10-15：面板改为独立弹窗，输入框住在**弹窗自己的 Context**
+    /// 里，因此这里也走弹窗路径（`search_popup_frame_with`）——
+    /// 主窗口的 `frame()` 里根本没有这个输入框。
     #[test]
     fn search_box_accepts_typed_text() {
         let mut h = Harness::new("search", vec2(600.0, 400.0));
         h.frame();
-        // 搜索框默认折叠成一枚图标：先把光标停在图标上展开，输入区才存在。
+        // 搜索框默认折叠成一枚图标：先把光标停在图标上展开，弹窗才存在。
         h.hover_search_icon();
-        // 坐标从热区表读，不猜。
-        let p = hit(&h, "search").center();
+        assert!(h.state.search_expanded, "悬停后应展开");
+
+        // 第一帧：弹窗画出来，自报输入框 id。
+        let _ = h.search_popup_frame_with(Vec::new());
+        let edit_id = h
+            .state
+            .search_edit_id
+            .expect("绘制层应自报搜索框的 egui Id");
+        // 坐标从面板几何读，不猜（弹窗客户区 = 面板 + 一圈投影边距）。
+        let margin = crate::popup::SHADOW_MARGIN;
+        let p = egui::pos2(300.0, margin + 15.0);
 
         // IMPORTANT: 点击与文字必须**分两帧**。
         //
@@ -7269,7 +7402,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 同帧的 `Event::Text` 会被丢弃。实测 `query` 保持空串。
         //
         // 这与真实输入一致：用户点一下、稍后打字。
-        h.frame_with(vec![
+        let _ = h.search_popup_frame_with(vec![
             egui::Event::PointerMoved(p),
             egui::Event::PointerButton {
                 pos: p,
@@ -7287,37 +7420,24 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 确认真的拿到焦点了——不确认的话下面的打字断言失败时
         // 不知道是「焦点没拿到」还是「输入没写进去」。
         //
-        // NOTE: 本版 egui 的 `Context` **没有** `wants_keyboard_input()`，
-        // 焦点态要从 `memory` 读。
-        //
-        // IMPORTANT: 判据必须指出**是哪个控件**拿到了焦点。
-        //
-        // 原先是 `has_focus(Id::new("search_edit")) || focused().is_some()`
-        // —— 后半句只要「有任何控件获得焦点」就成立，于是这条断言
-        // 在「点空了别处」的情况下**照样通过**，等于没有断言。
-        // 修掉它之后这条测试立刻变红，正好证明了它此前是恒真的。
-        //
-        //
-        // CAUTION: 也不能按 id 的 debug 串匹配：egui 0.36 的 `Id` 是**哈希值**，
-        // `format!("{id:?}")` 只得到 `Id::new(3070286450358649230)`。
-        //
-        // 所以绘制层把**自己用的那个 id** 记进 `UiState::search_edit_id`，
-        // 测试与它精确比对。
-        let edit_id = h
-            .state
-            .search_edit_id
-            .expect("绘制层应自报搜索框的 egui Id");
-        let focused_id = h.ctx.memory(|m| m.focused());
+        // CAUTION: 判据必须指出**是哪个控件**拿到了焦点，也不能按 id
+        // 的 debug 串匹配（egui 0.36 的 `Id` 是哈希值）——所以绘制层把
+        // 自己用的 id 记进 `UiState::search_edit_id`，测试与它精确比对。
         assert_eq!(
-            focused_id,
+            h.ctx.memory(|m| m.focused()),
             Some(edit_id),
-            "点搜索框后焦点应**精确落在搜索框**上（不是「有控件获得焦点」就算）"
+            "点弹窗输入框后焦点应**精确落在输入框**上"
+        );
+        // 焦点回报也该同时被填上（主窗口的状态机靠它钉住展开）。
+        assert!(
+            h.state.search_popup_focus,
+            "弹窗应把「输入框持有焦点」回报给主窗口"
         );
 
-        h.frame_with(vec![egui::Event::Text("abc".to_owned())]);
+        let _ = h.search_popup_frame_with(vec![egui::Event::Text("abc".to_owned())]);
         assert_eq!(
             h.state.query, "abc",
-            "点进搜索框后打字应写入 query"
+            "点进输入框后打字应写入 query"
         );
     }
 
@@ -8585,13 +8705,13 @@ fn with_pinned(mut self, n: usize) -> Self {
             h.state.search_expanded,
             "点搜索图标应展开搜索框"
         );
+        // NOTE: 不再断言 `search` / `search_box`——面板已搬进独立弹窗
+        // （自己的 Context 与热区命名空间），主窗口热区表里根本没有它。
         assert_outside_drag(&topbar_drag(&drag_expanded), &h, &[
             "topbar_close",
             "topbar_clear",
             "topbar_settings",
             "search_icon",
-            "search",
-            "search_box",
         ]);
     }
 
@@ -8647,19 +8767,26 @@ fn with_pinned(mut self, n: usize) -> Self {
         // （旧实现里输入框向左弹、贴着图标，那时才需要「右缘不越过
         // 图标左缘」这组断言；第三轮起该几何已不存在。）
         h.hover_search_icon();
-        let search = hit(&h, "search_box");
+        // 面板在独立弹窗里（漂在窗口上方），与顶栏按钮天然不可能重叠——
+        // 它根本不在主窗口的坐标空间里。
+        let floats = FloatLayout::compute(
+            &h.svc.state.config.ui,
+            &h.svc.state.items,
+            true,
+            Rect::from_min_size(pos2(0.0, 0.0), h.area.size()),
+        );
+        let panel = floats.search.expect("展开时应给出弹窗矩形");
         for (name, r) in &rects {
             assert!(
-                !search.intersects(*r),
-                "展开后面板 {search:?} 与按钮 {name} {r:?} 重叠"
+                !panel.intersects(*r),
+                "弹窗面板 {panel:?} 与顶栏按钮 {name} {r:?} 重叠"
             );
         }
-        // 面板必须整块落在顶栏**下方**（不侵入顶栏，否则顶栏控件被盖）。
+        // 面板整块在**顶栏之上**（弹窗漂在窗口外）⇒ 不可能侵入顶栏。
         assert!(
-            search.min.y >= crate::solver::TOPBAR_HEIGHT - 0.5,
-            "面板 top={:.1} 侵入了顶栏（高 {}）",
-            search.min.y,
-            crate::solver::TOPBAR_HEIGHT
+            panel.max.y <= 0.0,
+            "弹窗面板底缘 {:.1} 应在窗口顶缘之上（不侵入顶栏）",
+            panel.max.y
         );
     }
 
@@ -8717,7 +8844,8 @@ fn with_pinned(mut self, n: usize) -> Self {
             drag2.iter().any(|d| d.contains(c2)),
             "展开态拖动区自己的中心应落在拖动区内，实际 {drag2:?}"
         );
-        for name in ["search_icon", "topbar_clear", "topbar_settings", "search_box", "search"] {
+        // NOTE: `search_box` / `search` 已不在主窗口热区表（面板是弹窗）。
+        for name in ["search_icon", "topbar_clear", "topbar_settings"] {
             let r = hit(&h, name);
             assert!(
                 !r.intersects(seg2),
@@ -8740,24 +8868,16 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("search-toggle", vec2(700.0, 500.0));
         h.frame();
 
-        // 默认折叠：没有输入区热区，只有图标。
+        // 默认折叠：只有图标热区（面板在独立弹窗里，不在主窗口热区表）。
         assert!(!h.state.search_expanded, "搜索框应默认折叠");
         assert!(
             h.state.hit.contains_key(HitNs::Main, "search_icon"),
             "应有搜索图标热区"
         );
-        assert!(
-            !h.state.hit.contains_key(HitNs::Main, "search_box"),
-            "折叠态不应有输入框外框热区"
-        );
 
-        // 悬停图标（停够时间）→ 展开：输入区出现。
+        // 悬停图标（停够时间）→ 展开（弹窗随之显示）。
         h.hover_search_icon();
         assert!(h.state.search_expanded, "悬停图标应展开搜索框");
-        assert!(
-            h.state.hit.contains_key(HitNs::Main, "search_box"),
-            "展开后应有输入框外框热区"
-        );
 
         // 光标移开 —— **当帧还开着**：这是用户能真正进到输入框的前提
         // （详见 `search_stays_open_during_grace_period`）。
@@ -8771,10 +8891,6 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.advance_secs(SEARCH_COLLAPSE_DELAY + 0.05);
         h.frame();
         assert!(!h.state.search_expanded, "宽限期过后应收起搜索框");
-        assert!(
-            !h.state.hit.contains_key(HitNs::Main, "search_box"),
-            "收起后输入框外框热区应消失"
-        );
     }
 
     /// 宽限期必须撑过「鼠标从图标走到输入框」这段行程。
@@ -8793,385 +8909,277 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(h.state.search_expanded, "前置条件：已展开");
 
         let icon = h.state.hit.get(HitNs::Main, "search_icon").unwrap().center();
-        let input = h.state.hit.get(HitNs::Main, "search_box").unwrap();
 
-        // 图标 → 输入框中心，分 8 步走（每步一帧）。真实鼠标在一帧里
-        // 也走不完这段：1/60s 的移动远不到百来像素。
+        // 图标 → 弹窗，分 8 步走（每步一帧）。真实鼠标在一帧里也走不完
+        // 这段：从图标（窗口右上）到弹窗（窗口**上方**）要跨越窗口顶缘。
+        //
+        // NOTE: 指针进入弹窗之后，「是否悬停面板」由弹窗自己回报
+        // （`search_popup_hover`，主窗口的 `rect_contains_pointer` 看不到
+        // 客户区之外的点）。这里模拟那份回报。
+        let area = Rect::from_min_size(pos2(0.0, 0.0), h.area.size());
+        let floats = FloatLayout::compute(
+            &h.svc.state.config.ui,
+            &h.svc.state.items,
+            true,
+            area,
+        );
+        let panel = floats.search.expect("展开时应有面板矩形");
         for i in 1..=8 {
             let t = i as f32 / 8.0;
             let p = egui::pos2(
-                icon.x + (input.center().x - icon.x) * t,
-                icon.y + (input.center().y - icon.y) * t,
+                icon.x + (panel.center().x - icon.x) * t,
+                icon.y + (panel.center().y - icon.y) * t,
             );
+            // 指针越过窗口顶缘的那一刻开始算「在弹窗上」。
+            let over_popup = p.y < area.min.y;
+            h.state.search_popup_hover = over_popup;
             h.frame_with(vec![egui::Event::PointerMoved(p)]);
             assert!(
                 h.state.search_expanded,
-                "走向输入框的第 {i} 步（{p:?}）就把搜索框收了 —— 用户永远点不进输入框"
+                "走向弹窗的第 {i} 步（{p:?}）就把搜索框收了 —— 用户永远点不进输入框"
             );
         }
-        // 落在输入框里：回填 bimahi倒计时，之后怎么动都不折叠。
-        assert!(h.state.search_leave_since.is_none(), "落在框内应取消折叠倒计时");
+        // 落在弹窗里：回填折叠倒计时，之后怎么动都不折叠。
+        assert!(h.state.search_leave_since.is_none(), "落在弹窗内应取消折叠倒计时");
     }
 
-    /// 输入框一旦拿到焦点就**永不折叠**（无论光标在哪、等多久）。
+    /// 弹窗输入框持有焦点时**永不折叠**（无论光标在哪、等多久）。
     ///
     /// 焦点是「用户正在搜索」的唯一可靠判据：他可能已经把手移开去
-    /// 看列表结果了。这一条不做的话，打字打到一半框自己没了。
+    /// 看列表结果了。这一条不做的话，打字打到一半弹窗自己没了。
+    ///
+    /// NOTE: 焦点住在**弹窗自己的 `egui::Context`** 里，主窗口的
+    /// `memory()` 恒为空——所以判据是弹窗每帧回报的
+    /// `search_popup_focus`，不是主窗口自己查焦点。
     #[test]
     fn focused_search_box_never_collapses() {
         let mut h = Harness::new("search-focus", vec2(700.0, 500.0));
         h.frame();
-        // 点图标：展开 + 请求焦点。
+        // 点图标：展开 + 请求焦点（焦点请求由弹窗消费）。
         let icon = h.state.hit.get(HitNs::Main, "search_icon").unwrap().center();
         h.click_at(icon);
         assert!(h.state.search_expanded, "点击图标应展开");
-        // 焦点要到下一帧 `TextEdit` 参与布局后才建立。
-        h.frame();
-        // CAUTION: 判据必须用输入框自报的真实 id（`search_edit_id`），
-        // 用上层猜的 `Id::new("search_edit")` 永远匹配不上。
-        let edit_id = h.state.search_edit_id.expect("绘制层应自报输入框 Id");
-        assert_eq!(
-            h.ctx.memory(|m| m.focused()),
-            Some(edit_id),
-            "点击图标后输入框应拿到焦点"
-        );
 
+        // 弹窗回报「焦点在输入框上」（等价于弹窗跑过一帧并拿到焦点）。
+        h.state.search_popup_focus = true;
         // 光标移到列表中间 + 时间往前拨 5 秒：仍然不能折叠。
         let away = egui::pos2(h.area.center().x, h.area.max.y - 20.0);
         h.advance_secs(5.0);
         h.frame_with(vec![egui::Event::PointerMoved(away)]);
         assert!(
             h.state.search_expanded,
-            "持有焦点时搜索框不能折叠——用户正在打字"
+            "弹窗持有焦点时搜索面板不能折叠——用户正在打字"
+        );
+
+        // 焦点交还（点了别处）→ 宽限后折叠。
+        //
+        // NOTE: 交还的**那一帧**不会立刻开始倒计时——那一帧状态机走的是
+        // 「被焦点钉住」分支，顺手把在途的 `leave_since` 清了。所以要
+        // 先跑一帧让它把计时器重新起上，再等宽限期。
+        h.state.search_popup_focus = false;
+        h.frame();
+        h.advance_secs(SEARCH_COLLAPSE_DELAY + 0.05);
+        h.frame();
+        assert!(
+            !h.state.search_expanded,
+            "焦点交还且宽限期过后应收起弹窗"
         );
     }
 
-    /// 悬浮搜索面板必须**完整落在客户区内**，且窄窗口下依然是通栏。
+/// 搜索面板的弹窗矩形必须**整块在主窗口上方**（原型：漂在窗外）。
     ///
-    /// 守着实机缺陷（用户反馈「主窗口小时渲染不完整」）：旧实现在顶栏里
-    /// 向左弹出固定 140pt，窄窗口下越出左缘被 `painter_at` 裁掉。第三轮起
-    /// 面板是卡片区通栏（左右缘间距即 `CARD_AREA_INSET`），任何宽度下
-    /// 都不可能越界——这条测试把该不变式钉死。
+    /// 这条是 2026-10-15 第三轮「独立弹窗」改造的核心不变式：面板
+    /// 曾经被画在**窗口内**（贴卡片区顶部），与原型不符；现在它由
+    /// `crate::popup` 单独开窗，位置由 `FloatLayout` 给——矩形整体
+    /// 落在 `y <= 0`（窗口客户区坐标系），且与窗口顶边留 `RAIL_GAP`。
     #[test]
-    fn search_panel_spans_card_area_and_stays_inside() {
-        // 360pt：solver 断点里偏窄的一档，也是「主窗口拉小」时的常态。
-        let mut h = Harness::new("search-narrow", vec2(360.0, 500.0));
-        h.frame();
-        h.hover_search_icon();
-        assert!(h.state.search_expanded, "窄窗口下悬停也应展开");
+    fn search_panel_floats_above_window_with_gap() {
+        let cfg = modular_clipboard_core::config::UiConfig::default();
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(720.0, 800.0));
+        let floats = FloatLayout::compute(&cfg, &[], true, area);
+        let r = floats.search.expect("展开时应给出面板矩形");
+        assert!(
+            r.max.y <= area.min.y,
+            "面板底缘 {:.1} 应在窗口顶缘 {:.1} 之上（不得压进窗口内）：{r:?}",
+            r.max.y,
+            area.min.y
+        );
+        assert!(
+            (area.min.y - r.max.y - RAIL_GAP).abs() < 0.01,
+            "面板与窗口的间距应为 RAIL_GAP={RAIL_GAP}：{r:?}"
+        );
+        assert!(
+            (r.min.y - (area.min.y - RAIL_GAP - SEARCH_PANEL_H)).abs() < 0.01,
+            "面板高度应为 SEARCH_PANEL_H={SEARCH_PANEL_H}：{r:?}"
+        );
+        // 通栏：左右缘与窗口客户区对齐。
+        assert!((r.min.x - area.min.x).abs() < 0.01 && (r.max.x - area.max.x).abs() < 0.01);
+        // 折叠：没有矩形。
+        assert!(FloatLayout::compute(&cfg, &[], false, area).search.is_none());
+    }
 
-        let r = hit(&h, "search_box");
+    /// 类型栏的按钮组必须**整块在主窗口外**，四向都如此。
+    ///
+    /// 这是用户明确要求的观感（原型里类型栏漂在窗口某一侧外面）。
+    /// 第三轮初版把它画在卡片区**内侧**并让列表让位——与原型相反。
+    /// 因为弹窗与列表不再共享客户区，「面板盖住列表内容/滚动条/删除
+    /// 按钮」那一整类问题也一并消失。
+    #[test]
+    fn type_rail_floats_outside_window_on_all_four_sides() {
+        use modular_clipboard_core::ClipKind;
+        use modular_clipboard_core::config::{TypeRailConfig, TypeRailPos};
+        let mut cfg = modular_clipboard_core::config::UiConfig {
+            type_rail: TypeRailConfig {
+                visible: true,
+                // 无记录时也让 5 枚按钮都出现，几何才稳定可比
+                always: true,
+                pos: TypeRailPos::Right,
+                size: 32.0,
+            },
+            ..Default::default()
+        };
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(720.0, 800.0));
+        let items: Vec<modular_clipboard_core::item::ClipItem> = Vec::new();
+        let size = 32.0;
+
+        // 右：整块在窗口右缘之外，间距 RAIL_GAP。
+        let r = FloatLayout::compute(&cfg, &items, false, area)
+            .rail
+            .expect("always 开启时应给出类型栏矩形");
         assert!(
-            h.area.contains_rect(r),
-            "面板 {r:?} 未完整落在客户区 {:?} 内",
-            h.area
+            r.min.x >= area.max.x + RAIL_GAP - 0.01,
+            "右停靠时类型栏左缘 {:.1} 应在窗口右缘 {:.1} 之外：{r:?}",
+            r.min.x,
+            area.max.x
         );
-        // 通栏：左右缘与窗口边缘的间距 = 卡片区内缩（8pt）。
-        let inset = crate::solver::CARD_AREA_INSET;
+        assert!((r.width() - size).abs() < 0.01, "右/左停靠宽度 = 图标边长");
+
+        // 左。
+        cfg.type_rail.pos = TypeRailPos::Left;
+        let r = FloatLayout::compute(&cfg, &items, false, area)
+            .rail
+            .expect("应给出矩形");
         assert!(
-            (r.min.x - h.area.min.x - inset).abs() < 0.6
-                && (h.area.max.x - r.max.x - inset).abs() < 0.6,
-            "面板应通栏（左右各让出 CARD_AREA_INSET={inset}）：{r:?}"
+            r.max.x <= area.min.x - RAIL_GAP + 0.01,
+            "左停靠时类型栏右缘 {:.1} 应在窗口左缘 {:.1} 之外：{r:?}",
+            r.max.x,
+            area.min.x
         );
+
+        // 上 / 下：横向一行，整块在窗口外，高度 = 图标边长。
+        cfg.type_rail.pos = TypeRailPos::Top;
+        let r = FloatLayout::compute(&cfg, &items, false, area)
+            .rail
+            .expect("应给出矩形");
         assert!(
-            // 88 = 旧顶栏输入框的最小可用宽度；悬浮面板通栏只会更宽，
-            // 这里守住「没被挤成一条线」。
-            r.width() >= 88.0,
-            "即使收窄也应保住最小可用宽度 88（实际 {:.1}）",
-            r.width()
+            r.max.y <= area.min.y - RAIL_GAP + 0.01,
+            "上停靠时类型栏底缘 {:.1} 应在窗口顶缘之外：{r:?}",
+            r.max.y
         );
-        // 贴在顶栏之下：与顶栏底缘的间距 = RAIL_GAP（12pt，原型的
-        // 「面板与主窗口有间距」在窗口内的等价物）。
+        assert!((r.height() - size).abs() < 0.01, "上/下停靠高度 = 图标边长");
+
+        cfg.type_rail.pos = TypeRailPos::Bottom;
+        let r = FloatLayout::compute(&cfg, &items, false, area)
+            .rail
+            .expect("应给出矩形");
         assert!(
-            (r.min.y - crate::solver::TOPBAR_HEIGHT - RAIL_GAP).abs() < 0.6,
-            "面板应悬浮在顶栏下方（间距 RAIL_GAP）：top={:.1}",
+            r.min.y >= area.max.y + RAIL_GAP - 0.01,
+            "下停靠时类型栏顶缘 {:.1} 应在窗口底缘之外：{r:?}",
             r.min.y
         );
-        // 拖动区不能被吃光：左侧仍要留得下一截可拖的顶栏。
-        let drag = h.state.drag_regions.clone();
+        // 按钮数 × 边长 + 间隙 = 组宽（弹窗据此定尺寸）。
+        let expect_w = 5.0 * size + 4.0 * (RAIL_GAP.min(8.0));
         assert!(
-            drag.iter().any(|d| d.min.x <= h.area.min.x + 1.0 && d.width() > 8.0),
-            "展开后左侧拖动区被吃光，窗口就拖不动了：{drag:?}"
+            (r.width() - expect_w).abs() < 0.01,
+            "横向停靠时组宽应为 5×size + 4×gap = {expect_w}，实际 {:.1}",
+            r.width()
         );
+        // 可见性关闭 ⇒ 没有矩形（弹窗随之不建）。
+        cfg.type_rail.visible = false;
+        assert!(
+            FloatLayout::compute(&cfg, &items, false, area).rail.is_none(),
+            "关闭类型栏后不应给出矩形"
+        );
+        let _ = ClipKind::Text;
     }
 
-    /// 右侧停靠类型栏时，搜索面板右缘让出栏条带。
+    /// 默认只显示**已有记录**的类型；`type_rail_always` 时五类齐全。
     ///
-    /// 守一个只在**矮窗口**现形的故障：类型栏垂直居中，窗口一矮，
-    /// 最上面几枚按钮的上沿就伸到面板的高度里——面板通栏画过去
-    /// 会盖住它们（后画者胜），那几枚按钮点不动且毫无提示。
-    /// 判据用「面板右缘 = 卡片区右缘 − 栏宽 − 间距」的精确等式，
-    /// 比「两者不相交」更狠（不相交在按钮少/窗口高时恒成立，抓不到）。
+    /// 判据用 [`FloatLayout::kinds`]（纯函数）——弹窗尺寸（几何）与按钮
+    /// 内容（绘制）读的是同一份结果，这条测试守住它不被拆成两套。
     #[test]
-    fn search_panel_yields_to_side_rail() {
-        // 220pt 高 + 始终显示五类：栏总高 192pt > 可视 body，按钮必然
-        // 上探到面板所在的顶部区域——正是故障现形的几何。
-        let mut h = Harness::new("search-rail-right", vec2(700.0, 220.0)).with_items(4);
-        h.frame();
-        h.svc.state.config.ui.type_rail.always = true;
-        h.frame();
-        h.hover_search_icon();
-        assert!(h.state.search_expanded, "悬停应展开");
-        let panel = hit(&h, "search_box");
-        let rail = hit(&h, "rail_text");
-        let size = modular_clipboard_core::config::clamp_type_rail_size(
-            h.svc.state.config.ui.type_rail.size,
+    fn type_rail_shows_only_present_kinds_unless_always() {
+        use modular_clipboard_core::CapturedPayload;
+        let mut cfg = modular_clipboard_core::config::UiConfig::default();
+        // 四条全是 Text。
+        let mut h = Harness::new("rail-kinds", vec2(700.0, 500.0)).with_items(4);
+        let ids: Vec<_> = h.svc.state.items.iter().map(|it| it.id).collect();
+        for id in ids {
+            h.svc.toggle_pin(id).ok();
+        }
+        let items = h.svc.state.items.clone();
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().all(|it| it.kind == modular_clipboard_core::ClipKind::Text));
+        let kinds = FloatLayout::kinds(&cfg, &items);
+        assert_eq!(
+            kinds,
+            vec![modular_clipboard_core::ClipKind::Text],
+            "只有 Text 有记录，默认只应出现一枚按钮"
         );
-        let expect_right = h.area.max.x - crate::solver::CARD_AREA_INSET - size - RAIL_GAP;
-        assert!(
-            (panel.max.x - expect_right).abs() < 0.6,
-            "面板右缘 {:.1} 应让出类型栏条带（期望 {:.1}）：{panel:?}",
-            panel.max.x,
-            expect_right
-        );
-        assert!(
-            !panel.intersects(rail),
-            "面板 {panel:?} 压住了类型栏按钮 {rail:?}——矮窗口下会点不动"
-        );
-        // 左缘不受右侧栏影响（仍贴卡片区左缘）。
-        assert!(
-            (panel.min.x - (h.area.min.x + crate::solver::CARD_AREA_INSET)).abs() < 0.6,
-            "左缘应仍贴卡片区：{panel:?}"
-        );
-    }
 
-    /// 文件型条目双击 ⇒ `RevealPath(**载荷里的完整路径**)`。
-    ///
-    /// 守一个已修掉的真 bug：`build_preview` 给 Files 存的是**文件名
-    /// 摘要**（「paint.rs 等 2 个文件」），而双击定位要的是完整路径。
-    /// 早前版本直接拿 preview 第一行去定位，explorer 收到一个文件名，
-    /// 打不开用户想要的位置——而单看界面毫无异常。
-    #[test]
-    fn double_click_files_reveals_full_payload_path() {
-        let mut h = Harness::new("dbl-files", vec2(700.0, 500.0));
-        let p1 = "D:\\modular-clipboard\\crates\\paint.rs";
-        let p2 = "D:\\other\\b.rs";
-        assert!(
-            h.svc.ingest(modular_clipboard_core::CapturedPayload {
-                kind: modular_clipboard_core::ClipKind::Files,
-                bytes: format!("{p1}\n{p2}").into_bytes(),
-                html: None,
-                text: None,
-                source_app: "explorer.exe".into(),
-                files: vec![p1.into(), p2.into()],
-            }),
-            "塞入 Files 记录"
-        );
-        h.svc.reload_list();
-        h.frame();
-        // preview 必须是文件名摘要（否则本测试的场景不成立）。
-        let item = h.svc.state.items[0].clone();
-        assert!(
-            item.preview.contains("paint.rs") && !item.preview.contains("crates"),
-            "Files 的 preview 应为文件名摘要，实际 {:?}",
-            item.preview
-        );
-        let mut ops: Vec<Op> = Vec::new();
-        let mut out = h.ctx.run_ui(h.input(Vec::new()), |ui| {
-            // 直接构造 Frame 调被测函数：双击判定归 egui，这里只验
-            // 「哪种内容分发成哪种 Op」。
-            let mut f = Frame {
-                ui,
-                state: &mut h.state,
-                svc: &mut h.svc,
-                ws: &h.ws,
-                pal: &h.pal,
-                scale: 1.0,
-                area: h.area,
-                card_id: None,
-                hit_ns: HitNs::Main,
-            };
-            ops.push(double_click_op(&mut f, &item));
-        });
-        out.textures_delta.clear();
-        assert!(
-            matches!(&ops[0], Op::RevealPath(p) if p == p1),
-            "应定位载荷首行 {p1:?}，实际 {:?}",
-            ops[0]
-        );
-    }
-
-    /// 链接文本双击 ⇒ `OpenUrl`；普通文本 ⇒ `Copy`。
-    #[test]
-    fn double_click_text_dispatches_by_shape() {
-        let mut h = Harness::new("dbl-text", vec2(700.0, 500.0));
-        h.frame();
-        let mk = |preview: &str| {
-            modular_clipboard_core::ClipItem::new(
+        // 始终显示：五类齐全，顺序固定。
+        cfg.type_rail.always = true;
+        assert_eq!(
+            FloatLayout::kinds(&cfg, &items),
+            vec![
                 modular_clipboard_core::ClipKind::Text,
-                "h".into(),
-                preview.into(),
-                "app".into(),
-            )
+                modular_clipboard_core::ClipKind::Html,
+                modular_clipboard_core::ClipKind::Image,
+                modular_clipboard_core::ClipKind::Files,
+                modular_clipboard_core::ClipKind::Markdown,
+            ]
+        );
+        // 隐藏 ⇒ 空（弹窗不建）。
+        cfg.type_rail.visible = false;
+        assert!(FloatLayout::kinds(&cfg, &items).is_empty());
+        let _ = CapturedPayload {
+            kind: modular_clipboard_core::ClipKind::Text,
+            bytes: Vec::new(),
+            html: None,
+            text: None,
+            source_app: String::new(),
+            files: Vec::new(),
         };
-        let mut ops: Vec<Op> = Vec::new();
-        let items = vec![
-            mk("https://github.com/MCheng404/ModularClipboard"),
-            mk("D:\\modular-clipboard\\README.md"),
-            mk("just some words"),
-        ];
-        let mut out = h.ctx.run_ui(h.input(Vec::new()), |ui| {
-            for it in &items {
-                let mut f = Frame {
-                    ui,
-                    state: &mut h.state,
-                    svc: &mut h.svc,
-                    ws: &h.ws,
-                    pal: &h.pal,
-                    scale: 1.0,
-                    area: h.area,
-                    card_id: None,
-                    hit_ns: HitNs::Main,
-                };
-                ops.push(double_click_op(&mut f, it));
-            }
-        });
-        out.textures_delta.clear();
-        assert!(matches!(&ops[0], Op::OpenUrl(u) if u == "https://github.com/MCheng404/ModularClipboard"));
-        assert!(matches!(&ops[1], Op::RevealPath(p) if p == "D:\\modular-clipboard\\README.md"));
-        assert!(matches!(&ops[2], Op::Copy(_)), "普通文本应回落复制");
-    }
-
-    /// 顶部停靠类型栏时，搜索面板让位到栏下方（两者不重叠）。
-    ///
-    /// 对应原型「顶部 + 搜索展开 ⇒ 搜索框让到栏上方」：窗口内版本是
-    /// 「面板下移到栏下方」，间距均为 `RAIL_GAP`。
-    #[test]
-    fn search_panel_yields_to_top_rail() {
-        // 必须有记录：类型栏默认只显示「已有记录」的类型，空列表时
-        // 整个栏不画，`rail_btn` 热区无从登记。
-        let mut h = Harness::new("search-rail-top", vec2(700.0, 500.0)).with_items(4);
-        h.frame();
-        // 顶部停靠 + 始终显示（种子数据四类俱全，默认已满足）。
-        h.svc.state.config.ui.type_rail.pos = modular_clipboard_core::config::TypeRailPos::Top;
-        h.frame();
-        h.hover_search_icon();
-        assert!(h.state.search_expanded, "悬停应展开");
-        let panel = hit(&h, "search_box");
-        let rail = hit(&h, "rail_text");
-        assert!(
-            panel.min.y > rail.max.y,
-            "面板 top={:.1} 应低于类型栏底缘 {:.1}（让位）",
-            panel.min.y,
-            rail.max.y
-        );
-        // 让位间距 = RAIL_GAP（12pt）。
-        assert!(
-            (panel.min.y - rail.max.y - RAIL_GAP).abs() < 0.6,
-            "让位间距应为 RAIL_GAP：{:.1}",
-            panel.min.y - rail.max.y
-        );
     }
 
     /// 点类型栏按钮 ⇒ `SetTypeFilter(Some(kind))`；再点一次 ⇒ `None`。
+    ///
+    /// 通过**弹窗身份**驱动（`App::draw_popup` 的路径）：弹窗是独立窗口，
+    /// 有自己的 `egui::Context` 与热区命名空间，用主窗口的 `h.frame()`
+    /// 点不到它的按钮。
     #[test]
     fn type_rail_click_toggles_type_filter() {
         let mut h = Harness::new("rail-click", vec2(700.0, 500.0)).with_items(4);
         h.frame();
-        // 夹具不跑 `App::apply_ops`，过滤态要手动落地——生产里正是
-        // apply_ops 消费 `Op::SetTypeFilter` 写回 `paint_state.type_filter`，
-        // 下一帧的「激活态 / 再点取消」才读得到。
-        let apply = |h: &mut Harness, ops: Vec<Op>| {
-            for op in ops {
-                if let Op::SetTypeFilter(k) = op {
-                    h.state.type_filter = k;
-                }
-            }
-        };
-        let r = hit(&h, "rail_text");
-        let ops = h.click_at(r.center());
+        let ops = h.rail_popup_click(0); // 第一枚按钮（Text）
         assert!(
-            ops.iter().any(|o| matches!(o, Op::SetTypeFilter(Some(k)) if *k == modular_clipboard_core::ClipKind::Text)),
+            ops.iter().any(|o| matches!(
+                o,
+                Op::SetTypeFilter(Some(k)) if *k == modular_clipboard_core::ClipKind::Text
+            )),
             "点文本按钮应过滤出 Text，实际 {ops:?}"
         );
-        apply(&mut h, ops);
-        // 再点一次取消（过滤态会让列表只剩 Text 行，按钮仍在）。
-        let ops2 = h.click_at(r.center());
+        // 落地 Op（生产由 App::apply_ops 做），再点一次应取消过滤。
+        for op in ops {
+            if let Op::SetTypeFilter(k) = op {
+                h.state.type_filter = k;
+            }
+        }
+        let ops2 = h.rail_popup_click(0);
         assert!(
             ops2.iter().any(|o| matches!(o, Op::SetTypeFilter(None))),
             "再点一次应取消过滤，实际 {ops2:?}"
         );
-    }
-
-    /// 默认只显示**已有记录**的类型；`type_rail_always` 时五类齐全。
-    #[test]
-    fn type_rail_shows_only_present_kinds_unless_always() {
-        // 四条全是 Text：默认只有一枚文本按钮。
-        let mut h = Harness::new("rail-kinds", vec2(700.0, 500.0)).with_items(4);
-        h.frame();
-        assert!(hit_opt(&h, "rail_text").is_some(), "Text 有记录，按钮应在");
-        for k in ["html", "image", "files", "markdown"] {
-            assert!(
-                hit_opt(&h, &format!("rail_{k}")).is_none(),
-                "库里没有 {k} 记录，默认不该出现该按钮"
-            );
-        }
-        // 始终显示：五类齐全。
-        h.svc.state.config.ui.type_rail.always = true;
-        h.frame();
-        for k in ["text", "html", "image", "files", "markdown"] {
-            assert!(
-                hit_opt(&h, &format!("rail_{k}")).is_some(),
-                "type_rail_always 开 => {k} 按钮应出现"
-            );
-        }
-    }
-
-    /// 类型栏停靠右侧时，历史卡片必须让出 `图标 + 间距` 的条带——
-    /// 否则浮动按钮会压在列表内容（乃至滚动条 / 删除按钮）上。
-    #[test]
-    fn type_rail_reserves_strip_in_card_layout() {
-        let mut h = Harness::new("rail-inset", vec2(700.0, 500.0)).with_items(4);
-        h.frame();
-        let size = modular_clipboard_core::config::clamp_type_rail_size(
-            h.svc.state.config.ui.type_rail.size,
-        );
-        let hist = h
-            .ws
-            .cards
-            .iter()
-            .find(|c| c.kind == crate::card::CardKind::History)
-            .expect("默认工作区应有历史卡片");
-        let expect_right = h.area.max.x - crate::solver::CARD_AREA_INSET - size - RAIL_GAP;
-        assert!(
-            (hist.rect.max.x - expect_right).abs() < 0.6,
-            "历史卡片右缘 {:.1} 应让出类型栏条带（期望 {:.1}）",
-            hist.rect.max.x,
-            expect_right
-        );
-        // 关掉类型栏：条带让位消失，右缘回到卡片区边缘。
-        h.svc.state.config.ui.type_rail.visible = false;
-        h.frame();
-        let hist2 = h
-            .ws
-            .cards
-            .iter()
-            .find(|c| c.kind == crate::card::CardKind::History)
-            .expect("默认工作区应有历史卡片");
-        assert!(
-            (hist2.rect.max.x - (h.area.max.x - crate::solver::CARD_AREA_INSET)).abs() < 0.6,
-            "关闭后右缘 {:.1} 应回到卡片区边缘",
-            hist2.rect.max.x
-        );
-    }
-
-    /// 极窄窗口下面板**照样画**（通栏永远装得下），不再有「不画」分支。
-    ///
-    /// 旧实现在这里判 `input_ok=false` 直接不画（顶栏里向左弹出的框
-    /// 放不下）；第三轮起面板是卡片区通栏，260pt 窗口的卡片区也有
-    /// ~236pt，远超 [`SEARCH_MIN_W`]，没有「放不下」这一说。
-    #[test]
-    fn search_panel_is_drawn_even_in_a_very_narrow_window() {
-        let mut h = Harness::new("search-too-narrow", vec2(260.0, 500.0));
-        h.frame();
-        h.hover_search_icon();
-        assert!(h.state.search_expanded, "极窄窗口悬停也应展开");
-        let r = hit(&h, "search_box");
-        assert!(
-            h.area.contains_rect(r),
-            "极窄窗口下面板 {r:?} 仍应完整落在客户区内"
-        );
-        assert!(r.width() >= 88.0, "面板宽度 {:.1} 过窄", r.width());
     }
 
     /// 搜索图标的**绘制矩形**必须完整落在按钮热区内。

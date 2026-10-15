@@ -97,7 +97,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow, WindowFromPoint,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_RESTORE,
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, WM_NCHITTEST,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, WM_NCHITTEST,
     IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
 };
 
@@ -142,6 +142,15 @@ pub enum HitZone {
     TopRight,
     BottomLeft,
     BottomRight,
+    /// **点击穿透**：指针不在窗口的有效内容上（弹窗的投影 / 透明边距）。
+    ///
+    /// 悬浮面板的窗口矩形要比面板本身大一圈来容纳投影，那圈区域
+    /// 画出来是透明的。命中判定按**窗口矩形**而不是按像素 alpha，
+    /// 于是不处理的话，点在投影上会被这个窗口吃掉——用户想点
+    /// 面板后面的东西却没反应（面板越靠边越明显）。
+    /// 返回 `HTTRANSPARENT` 后点击落到下面的窗口，行为与「那里
+    /// 没有这个窗口」完全一致。
+    Transparent,
 }
 
 impl HitZone {
@@ -158,6 +167,9 @@ impl HitZone {
             HitZone::TopRight => HTTOPRIGHT,
             HitZone::BottomLeft => HTBOTTOMLEFT,
             HitZone::BottomRight => HTBOTTOMRIGHT,
+            // NOTE: windows crate 里 `HTTRANSPARENT` 是 `i32`，
+            // 其余命中码是 `u32`——这里显式转换而不是让整个 match 迁就它。
+            HitZone::Transparent => HTTRANSPARENT as u32,
         }
     }
 
@@ -175,9 +187,47 @@ impl HitZone {
             HitZone::TopLeft | HitZone::BottomRight => IDC_SIZENWSE.0 as u16,
             HitZone::TopRight | HitZone::BottomLeft => IDC_SIZENESW.0 as u16,
             HitZone::Caption => IDC_ARROW.0 as u16,
-            HitZone::Client => return None,
+            // 透明区：光标由下面的窗口负责（它才是命中目标）。
+            HitZone::Client | HitZone::Transparent => return None,
         })
     }
+}
+
+/// 弹窗命中判定：面板之外 = 点击穿透。**纯逻辑**，可直接单测。
+///
+/// `panel = None`（主窗口）⇒ `None`，走常规 [`hit_test`]。
+/// `Some(rect)` 且点在 rect 外 ⇒ [`HitZone::Transparent`]（点击落到
+/// 下面的窗口）；点在 rect 内 ⇒ `None`（照常由 `hit_test` 判）。
+///
+/// 抽成独立函数而不是塞在 `hit_zone_at_screen` 里：那条路径要真实
+/// HWND + `ScreenToClient`，单测里根本执行不到——而「面板外必须穿透」
+/// 恰恰是最该有测试的一条（漏了就是「点投影把底下的窗口吃掉」）。
+pub fn popup_zone(pos: Pos2, panel: Option<Rect>) -> Option<HitZone> {
+    match panel {
+        Some(r) if !r.contains(pos) => Some(HitZone::Transparent),
+        _ => None,
+    }
+}
+
+/// 设置弹窗的有效内容矩形（逻辑点、客户区坐标系）。
+///
+/// 传 `None` 关闭（窗口矩形整体可点，主窗口即此）。
+///
+/// # 为什么需要
+///
+/// 悬浮面板的窗口要画投影，窗口矩形比面板大一圈；那圈区域的像素是
+/// 透明的，但**命中判定不看像素**（那要读回 GPU，慢且不可靠）。
+/// 不登记的话，点在投影上会被这个「看不见的窗口」吃掉——用户想点
+/// 面板后面的东西却毫无反应，面板越靠屏幕边越明显。
+///
+/// 每帧调一次即可：只改内存里一个 `Option<Rect>`，没有系统调用。
+pub fn set_panel_shape(hwnd: HWND, rect: Option<Rect>) {
+    set_chrome_of(hwnd, |c| c.panel = rect);
+}
+
+/// 该窗口登记的有效内容矩形（未登记 = 整块可点）。
+pub fn panel_shape(hwnd: HWND) -> Option<Rect> {
+    chrome_of(hwnd).panel
 }
 
 /// 判定 `pos`（**逻辑点**，客户区坐标系）落在哪个区域。
@@ -295,6 +345,12 @@ struct WindowChrome {
     border: f32,
     /// 窗口特定的最小尺寸（逻辑点）；未设置时沿用通用下限。
     min_size: Option<Vec2>,
+    /// 弹窗的**有效内容矩形**（逻辑点、客户区坐标系）。
+    ///
+    /// `Some(r)` 表示「窗口矩形大于面板本身」——超出的那圈（投影 /
+    /// 安全边距）不是可点区域，命中判定返回 [`HitZone::Transparent`]。
+    /// `None`（主窗口）= 整块客户区都可点，行为与从前一致。
+    panel: Option<Rect>,
 }
 
 /// 按 HWND 索引的窗口外壳状态。
@@ -656,6 +712,12 @@ fn hit_zone_at_screen(hwnd: HWND, pt_screen: POINT) -> HitZone {
     // BOOL 是 must_use；失败时 pt 保持屏幕坐标，判定结果无意义但无害。
     let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
     let pos = Pos2::new(pt.x as f32 / scale, pt.y as f32 / scale);
+    // 弹窗：面板之外的透明边距（投影区）一律穿透。
+    // 必须在 hit_test **之前**判——边缘 resize / 拖动区在弹窗上都不该
+    // 生效（弹窗 resize_border = 0、无拖动区），先判穿透语义才干净。
+    if let Some(zone) = popup_zone(pos, panel_shape(hwnd)) {
+        return zone;
+    }
     hit_test(pos, size, resize_border(hwnd), &drag_regions(hwnd))
 }
 
@@ -1160,6 +1222,44 @@ mod tests {
     /// 早前拖动区是进程级全局：设置窗口会继承主窗口的拖动区，
     /// 于是它左上角一整块被判成 `HTCAPTION`，点击变成拖窗、
     /// 控件点不动。这条守住「A 窗的设置不影响 B 窗」。
+    /// 弹窗：面板**之外**的点必须穿透，面板之内照常走常规判定。
+///
+/// 这条守的是「悬浮面板的投影区吃掉底下窗口的点击」：弹窗客户区比
+/// 面板大一圈投影边距，而命中判定按**窗口矩形**而非像素 alpha。
+#[test]
+fn popup_panel_outside_is_click_through() {
+    let panel = Rect::from_min_size(Pos2::new(12.0, 12.0), Vec2::new(100.0, 40.0));
+    // 面板内 → 交回常规判定（None）。
+    assert_eq!(popup_zone(Pos2::new(60.0, 30.0), Some(panel)), None);
+    // 四条边距（投影区）→ 穿透。
+    assert_eq!(
+        popup_zone(Pos2::new(5.0, 30.0), Some(panel)),
+        Some(HitZone::Transparent),
+        "左侧投影区应穿透"
+    );
+    assert_eq!(
+        popup_zone(Pos2::new(60.0, 5.0), Some(panel)),
+        Some(HitZone::Transparent),
+        "上侧投影区应穿透"
+    );
+    assert_eq!(
+        popup_zone(Pos2::new(118.0, 30.0), Some(panel)),
+        Some(HitZone::Transparent),
+        "右侧投影区应穿透"
+    );
+    assert_eq!(
+        popup_zone(Pos2::new(60.0, 58.0), Some(panel)),
+        Some(HitZone::Transparent),
+        "下侧投影区应穿透"
+    );
+    // 未登记面板形状（主窗口）→ 永远交回常规判定。
+    assert_eq!(popup_zone(Pos2::new(0.0, 0.0), None), None);
+    // 穿透区对应 HTTRANSPARENT（点击落到下面的窗口）。
+    assert_eq!(HitZone::Transparent.hit_code(), HTTRANSPARENT as u32);
+    // 穿透区不设光标：那里的光标归下面的窗口管。
+    assert_eq!(HitZone::Transparent.cursor_id(), None);
+}
+
     #[test]
     fn drag_regions_are_isolated_per_window() {
         let r = Rect::from_min_max(p(0.0, 0.0), p(400.0, 32.0));

@@ -39,6 +39,7 @@ pub mod mcp_status;
 pub mod md;
 pub mod multiwindow;
 pub mod paint;
+pub mod popup;
 pub mod solver;
 pub mod text;
 pub mod workspace;

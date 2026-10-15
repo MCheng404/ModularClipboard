@@ -447,6 +447,9 @@ fn run_mode(
     let mut applied_backdrop = modular_clipboard_core::config::WindowBackdrop::None;
     // 卡片子窗口集合（详情/视图等被拖出主窗的卡片）。
     let mut children = crate::childwin::ChildWindows::new();
+    // 悬浮弹窗（搜索面板 / 类型过滤栏）：懒创建、隐藏时保留
+    // （类型栏常驻可见；搜索面板收起频繁，销毁重建有可感延迟）。
+    let mut popups = crate::popup::Popups::default();
     // 设置窗口（懒创建）。
     //
     // NOTE: **懒创建**而不是建时就创建：设置窗口只在用户点齿轮时才需要，
@@ -826,6 +829,7 @@ fn run_mode(
                 &mut app,
                 &mut children,
                 &mut settings_win,
+                &mut popups,
                 &shared,
                 &window,
                 frame_no,
@@ -978,6 +982,7 @@ fn run_mode(
                 &mut app,
                 &mut children,
                 &mut settings_win,
+                &mut popups,
                 &shared,
                 &window,
                 frame_no,
@@ -1020,6 +1025,7 @@ fn run_mode(
                 &mut app,
                 &mut children,
                 &mut settings_win,
+                &mut popups,
                 &shared,
                 &window,
                 frame_no,
@@ -1050,6 +1056,7 @@ fn run_mode(
                 &mut app,
                 &mut children,
                 &mut settings_win,
+                &mut popups,
                 &shared,
                 &window,
                 frame_no,
@@ -1164,6 +1171,7 @@ fn run_mode(
             &mut app,
             &mut children,
             &mut settings_win,
+            &mut popups,
             &shared,
             &window,
             frame_no,
@@ -1345,11 +1353,48 @@ fn drive_attach_windows<'a>(
     app: &mut App,
     children: &mut crate::childwin::ChildWindows<'a>,
     settings_win: &mut Option<crate::settingswin::SettingsWindow<'a>>,
+    popups: &mut crate::popup::Popups<'a>,
     shared: &crate::multiwindow::SharedGfx<'a>,
     window: &Window,
     frame_no: u64,
     topmost: bool,
 ) {
+    // 悬浮弹窗（搜索面板 / 类型过滤栏）--------------------------------------
+    //
+    // 位置来自 `FloatLayout`（主窗口客户区坐标，允许负值 = 窗外），
+    // 加主窗口屏幕位置得到屏幕坐标。**在卡片之后驱动**：弹窗要读
+    // 本帧刚算出的 `search_expanded` / 类型列表，也要让主窗口下一帧
+    // 的搜索状态机拿到弹窗回报的悬停/焦点。
+    {
+        let (mw, mh) = window.inner_size_points();
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(mw, mh));
+        let floats = crate::paint::FloatLayout::compute(
+            &app.svc.state.config.ui,
+            &app.svc.state.items,
+            app.paint_state.search_expanded,
+            area,
+        );
+        let anchor = window.screen_position_points();
+        let s = window.scale_factor();
+        popups.sync_search(
+            app,
+            app.paint_state.search_expanded,
+            floats.search,
+            anchor,
+            s,
+            shared,
+            topmost,
+        );
+        // 隐藏时**必须清**弹窗回报的两项：否则上一次「正在打字」
+        // 的 true 会一直留在状态里，主窗口的搜索状态机认为有人持有
+        // 焦点，面板再也收不回去。
+        if !app.paint_state.search_expanded {
+            app.paint_state.search_popup_hover = false;
+            app.paint_state.search_popup_focus = false;
+        }
+        popups.sync_rail(app, floats.rail.is_some(), floats.rail, anchor, s, shared, topmost);
+    }
+
     // 卡片子窗口
     //
     // 每个子窗口有**独立的 `egui::Context`、独立的交换链**，
@@ -1553,7 +1598,11 @@ pub struct App {
     /// [`crate::card::CardHost`] 并写回窗口位置。
     pub ws: crate::workspace::Workspace,
     /// 新卡片架构的界面状态。
-    paint_state: crate::paint::UiState,
+    ///
+    /// `pub(crate)`：悬浮弹窗（`crate::popup`）要读写搜索展开态与
+    /// 弹窗回报的悬停/焦点——它们与主窗口共用这一份状态（弹窗有自己的
+    /// `egui::Context`，但**配置 / 查询词 / 选中项**只有一份）。
+    pub(crate) paint_state: crate::paint::UiState,
     /// 诊断用帧计数（仅 `MC_DIAG` 打开时用）。
     diag_frames: u64,
     /// 界面退出请求。
@@ -1766,20 +1815,10 @@ impl App {
         // IMPORTANT: 必须传真实的 `ppp`：落位要对齐**设备**像素栅格，
         // 否则高DPI 下卡片边界落在半像素上，描边发虚。
         //
-        // 2026-10-15 第三轮：悬浮类型过滤栏停靠某侧时，该侧要让出
-        // `图标边长 + 间距`（FloatLayout::insets）——浮动按钮不能压在
-        // 列表内容上（右缘更会盖住滚动条与行内删除按钮）。
-        // 布局是**纯函数**：这里与绘制层各自调 `FloatLayout::compute`，
-        // 同一份输入必然同一份结果，不存在两处各算一套的漂移。
-        let body = crate::solver::card_area(area);
-        let floats = crate::paint::FloatLayout::compute(
-            &self.svc.state.config.ui,
-            &self.svc.state.items,
-            self.paint_state.type_filter,
-            false, // 搜索面板是浮动覆盖层，不参与占位
-            body,
-        );
-        let sol = crate::solver::solve_scaled_inset(&self.ws, area, ppp, floats.insets);
+        // 2026-10-15 第三轮：悬浮搜索面板与类型过滤栏已改为**独立弹窗**
+        // （`crate::popup`），漂在窗口外，卡片区因此**不再需要让位**
+        // ——恢复满宽（`solve_scaled_inset` 已随之删除）。
+        let sol = crate::solver::solve_scaled(&self.ws, area, ppp);
         crate::solver::apply(&mut self.ws, &sol);
 
         if env_flag("MC_DIAG") {
@@ -2389,7 +2428,87 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         }
     }
 
-    /// 画一个卡片子窗口的内容。
+    /// 画一个悬浮弹窗的内容（`crate::popup` 调用）。
+///
+/// 与 [`Self::draw_child_frame`] 同一套路：把 `paint::Frame` 的字段
+/// 组装收敛在 app.rs，`popup` 不需要知道 `App` 的内部结构。
+///
+/// 弹窗客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
+/// 面板矩形取中央那块；投影由 `paint` 画在边距里（alpha=0 处即桌面）。
+pub fn draw_popup(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: crate::popup::PopupKind,
+        backdrop: Option<egui::TextureId>,
+    ) {
+    let ppp = ui.ctx().pixels_per_point();
+    let margin = crate::popup::SHADOW_MARGIN;
+    let client = ui.max_rect();
+    let panel = egui::Rect::from_min_max(
+        egui::pos2(client.min.x + margin, client.min.y + margin),
+        egui::pos2(client.max.x - margin, client.max.y - margin),
+    );
+    // ---- 底图：弹窗窗口是**不透明**的，圆角/投影靠这张「身后桌面」----
+    //
+    // 见 `crate::popup` 模块文档：本项目不靠 DWM 的逐像素 alpha 合成
+    // （那会落成黑屏），而是把捕获到的桌面画成不透明底图，面板的圆角
+    // 缝里露出的即为桌面。
+    match backdrop {
+        Some(tex) => {
+            ui.painter().image(
+                tex,
+                client,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        // 首帧还没抓到（或捕获器不可用）：铺窗口底色兜底——
+        // 有色方块也比黑屏强。
+        None => {
+            ui.painter().rect_filled(client, 0.0, self.pal.bg);
+        }
+    }
+    // 投影先画：用**客户区级** painter（`painter_at(panel)` 会把投影裁掉
+    // 一圈，面板就贴着桌面、浮不起来）。
+    crate::paint::draw_popup_shadow(ui.painter(), panel, &self.pal);
+    // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
+    // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
+    let rail_kinds = crate::paint::FloatLayout::kinds(
+        &self.svc.state.config.ui,
+        &self.svc.state.items,
+    );
+    let mut frame = crate::paint::Frame {
+        ui,
+        state: &mut self.paint_state,
+        svc: &mut self.svc,
+        ws: &self.ws,
+        pal: &self.pal,
+        scale: ppp,
+        area: panel,
+        card_id: None,
+        hit_ns: crate::paint::HitNs::Popup(kind),
+    };
+    match kind {
+        crate::popup::PopupKind::Search => {
+            crate::paint::draw_search_panel(&mut frame, panel);
+            // 搜索面板把「输入框焦点 / 指针是否在面板上」回报给主窗口：
+            // 焦点住在**弹窗自己的** `Context` 里，主窗口的
+            // `memory()` 恒为空——不回报的话状态机认为「没人持有焦点」，
+            // 面板会在用户点进输入框的瞬间自己收回去。
+            self.paint_state.search_popup_focus = frame
+                .state
+                .search_edit_id
+                .is_some_and(|id| ui.memory(|m| m.focused()) == Some(id));
+        }
+        crate::popup::PopupKind::Rail => {
+            crate::paint::draw_type_rail(&mut frame, panel, &rail_kinds);
+        }
+    }
+    // 弹窗里的操作（点类型栏按钮、清搜索、Esc）也要落地。
+    self.apply_ops();
+}
+
+/// 画一个卡片子窗口的内容。
     ///
     /// 与 [`Self::draw_frame`] 分开而不是加参数：`draw_frame` 还要跑
     /// 主窗口专属的逻辑（`svc.pump()`、拖动区上报、操作落地），

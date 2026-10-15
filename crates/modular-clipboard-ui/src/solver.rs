@@ -136,40 +136,14 @@ pub fn layout_demand(ws: &Workspace) -> Vec<f32> {
 /// 右缘可能超出 `body.max.x` 约 1e-5pt 或留一条亚像素缝。
 /// 详见落位循环处的说明。
 pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
-    solve_scaled_inset(ws, area, scale, [0.0; 4])
-}
-
-/// 求解 + **悬浮装饰让出的附加内缩**（2026-10-15 第三轮：类型过滤栏）。
-///
-/// `insets` = `[左, 右, 上, 下]`，在 [`card_area`] 基础之上**再**缩。
-/// 类型过滤栏停靠某侧时，该侧要让出 `图标边长 + 间距`——否则浮动按钮
-/// 会压在列表内容上（右缘更会盖住滚动条与行内删除按钮，那是历史上
-/// 极难自查的一类 bug）。顶/底方向同理。
-///
-/// 附加内缩为 0 时与 [`solve_scaled`] 完全等价（旧调用点不受影响）。
-pub fn solve_scaled_inset(
-    ws: &Workspace,
-    area: Rect,
-    scale: f32,
-    insets: [f32; 4],
-) -> Solution {
-    let base = card_area(area);
-    let body = Rect::from_min_max(
-        pos2(base.min.x + insets[0].max(0.0), base.min.y + insets[2].max(0.0)),
-        pos2(base.max.x - insets[1].max(0.0), base.max.y - insets[3].max(0.0)),
-    );
-    if body.width() <= 0.0 || body.height() <= 0.0 {
-        return Solution {
-            rects: vec![Rect::ZERO; ws.cards.len()],
-        };
-    }
-    solve_body(ws, body, scale)
+    solve_body(ws, card_area(area), scale)
 }
 
 /// [`solve_scaled`] 的主体：在**已算好的** `body` 内分配卡片宽度。
 ///
-/// 从 [`solve_scaled_inset`] 抽出来是为了让「body 怎么来」与「卡片怎么分」
-/// 两个关注点分开：附加内缩（类型栏占位）只影响前者。
+/// 2026-10-15 第三轮曾在这里给「悬浮类型栏让位」加过一个带附加内缩的
+/// 变体（`solve_scaled_inset`），后来类型栏改成漂在窗外的独立弹窗，
+/// 卡片区不再需要让位，那个变体连同内缩一起删除。
 fn solve_body(ws: &Workspace, body: Rect, scale: f32) -> Solution {
     if body.width() <= 0.0 || body.height() <= 0.0 {
         return Solution {
