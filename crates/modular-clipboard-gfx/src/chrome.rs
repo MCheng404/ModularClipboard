@@ -94,8 +94,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetWindowRect, IsZoomed, LoadCursorW, SetCursor,
-    SetWindowPos, ShowWindow, WindowFromPoint,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_RESTORE,
+    SetForegroundWindow, SetWindowPos, WindowFromPoint, SWP_NOACTIVATE, SWP_NOZORDER,
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
     HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, WM_NCHITTEST,
     IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
@@ -606,6 +605,14 @@ unsafe fn begin_custom_move(hwnd: HWND, zone: HitZone) {
             min_width,
             min_height,
         });
+        // CAUTION: 必须抢前台。
+        //
+        // 走的是**自建非模态拖动**（`SetCapture` + `SetWindowPos`），
+        // 系统不会像 `HTCAPTION` 的模态拖动那样顺带激活窗口。于是
+        // 「点了别的程序后，不点主窗口直接拖它」时，主窗口没有焦点、
+        // 被别的窗口盖住——拖着拖着就看不见自己在拖什么。
+        // 这是**用户发起的操作**（真的按下了鼠标），抢前台是被允许的。
+        let _ = SetForegroundWindow(hwnd);
         // 捕获后移出窗口仍收到鼠标移动和松开消息。
         let _ = SetCapture(hwnd);
     }
@@ -653,22 +660,6 @@ unsafe fn end_custom_move(hwnd: HWND) {
     clear_moving(hwnd);
     unsafe { let _ = ReleaseCapture(); }
 }
-
-/// 双击标题栏：最大化 / 还原（保留原生手感）。
-unsafe fn toggle_maximize(hwnd: HWND) {
-    unsafe {
-        let restore = IsZoomed(hwnd).as_bool();
-        let _ = ShowWindow(
-            hwnd,
-            if restore {
-                SW_RESTORE
-            } else {
-                SW_MAXIMIZE
-            },
-        );
-    }
-}
-
 
 // ---------------------------------------------------------------------------
 // Win32 层
@@ -802,9 +793,14 @@ pub(crate) unsafe fn handle_non_client(
             }
             return None;
         }
+        // 双击标题栏：**不**最大化。
+        //
+        // 默认行为（`toggle_maximize`）对剪贴板工具是错的：主窗口是
+        // 常驻小窗、尺寸与位置都是用户精心调过的，双击一下被撑满全屏
+        // 纯粹是干扰。这里**吞掉**这条消息（返回 0 而不转发
+        // `DefWindowProcW`），既不最大化，也不让系统走它自己的那套。
         WM_NCLBUTTONDBLCLK => {
             if wparam.0 as u32 == HTCAPTION {
-                unsafe { toggle_maximize(hwnd) };
                 return Some(LRESULT(0));
             }
             return None;

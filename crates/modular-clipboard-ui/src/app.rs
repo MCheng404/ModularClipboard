@@ -2498,13 +2498,10 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
     } else {
         &self.pal
     };
-    // ---- 自研投影（先画：它属于「面板之外」，不能压在磨砂之上）----
-    //
-    // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，这圈铺的是捕获到的桌面；
-    // 投影就用项目自己的高斯投影画在内容矩形外围（alpha 混合在渲染层
-    // 完成）。用 `painter_at(panel)` 会把投影裁掉一圈，面板就贴着桌面、
-    // 浮不起来 —— 所以这里必须用 `ui.painter()`。
-    crate::paint::draw_popup_shadow(ui.painter(), panel, pal_ref);
+    // NOTE: **不画自研投影**。`SHADOW_MARGIN = 0`（窗口即内容），投影
+    // 只能画在窗口矩形之外——画不到；画在里面的那部分会压在面板边缘上、
+    // 又被窗口边界裁掉，实机表现为上下/左右边缘的三角形暗块。
+    // 层次感由 DWM 的窗口投影 + 面板自身的主题描边提供。
     // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
     // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
     let rail_kinds = crate::paint::FloatLayout::kinds(

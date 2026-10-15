@@ -1454,24 +1454,6 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
-/// 画悬浮弹窗的投影（面板外围那一圈 alpha）。
-///
-/// 必须用**弹窗客户区级** painter（`ui.painter()`），不能用
-/// `painter_at(panel)`——后者按面板矩形裁剪，投影会被切掉一圈，
-/// 表现为「面板贴着桌面、没有浮起来」。
-///
-/// 参数比行卡片投影稍重：行卡片在窗口**内部**（投影只从缝隙里透出来），
-/// 弹窗是压在**桌面**上的，需要更强的层次才浮得起来。
-pub fn draw_popup_shadow(painter: &egui::Painter, panel: Rect, pal: &Palette) {
-    let cfg = modular_clipboard_core::config::CardShadowConfig {
-        enabled: true,
-        blur: 16.0,
-        opacity: 0.32,
-        offset_y: 2.0,
-    };
-    draw_card_shadow(painter, panel, 9.0, &cfg, pal);
-}
-
 /// 画悬浮类型过滤栏的内容（2026-10-15 第三轮新增，待移植设置联动）。
 ///
 /// 由**弹窗**调用（`crate::popup`），`rail` 是弹窗客户区中央的按钮组
