@@ -907,16 +907,6 @@ const RAIL_GAP: f32 = 12.0;
 /// 悬浮搜索面板高度（逻辑点）。
 const SEARCH_PANEL_H: f32 = 30.0;
 
-/// 弹窗内容的圆角半径下限（逻辑点）。
-///
-/// CAUTION: 必须 **≥ DWM 系统圆角的半径**（Win11 约 8pt）。
-///
-/// 弹窗窗口的圆角由 DWM 裁出，而弹窗是**细条**（搜索条 30pt 高、类型栏
-/// 一个图标宽）。若内容自己的圆角比 DWM 的小，DWM 那一刀会切进内容
-/// 本体：细条的两个短端被削掉两块，实机看就是「两端渲染成三角形」。
-/// 让内容的圆角不小于 DWM 的，裁剪就落在内容自己的圆角之内。
-const POPUP_CORNER: f32 = 8.0;
-
 /// 类型过滤栏的按钮顺序（与设置界面、捕获层同一份）。
 const RAIL_KIND_ORDER: [modular_clipboard_core::ClipKind; 5] = {
     use modular_clipboard_core::ClipKind;
@@ -1337,8 +1327,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     let painter = f.ui.painter_at(r);
     // 纯平毛玻璃禁令同样适用于悬浮层：纯色底 + 1px 描边，禁渐变光泽。
-    // 圆角取「主题中圆角」与 DWM 圆角下限的较大者（见 `POPUP_CORNER`）。
-    let radius = pal.radius_md.max(POPUP_CORNER);
+    let radius = pal.radius_md;
     painter.rect_filled(r, radius, pal.surface);
     painter.rect_stroke(
         r,
@@ -1466,6 +1455,24 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
+/// 画悬浮弹窗的投影（面板外围那一圈 alpha）。
+///
+/// 必须用**弹窗客户区级** painter（`ui.painter()`），不能用
+/// `painter_at(panel)`——后者按面板矩形裁剪，投影会被切掉一圈，
+/// 表现为「面板贴着桌面、没有浮起来」。
+///
+/// 参数比行卡片投影稍重：行卡片在窗口**内部**（投影只从缝隙里透出来），
+/// 弹窗是压在**桌面**上的，需要更强的层次才浮得起来。
+pub fn draw_popup_shadow(painter: &egui::Painter, panel: Rect, pal: &Palette) {
+    let cfg = modular_clipboard_core::config::CardShadowConfig {
+        enabled: true,
+        blur: 16.0,
+        opacity: 0.32,
+        offset_y: 2.0,
+    };
+    draw_card_shadow(painter, panel, 9.0, &cfg, pal);
+}
+
 /// 画悬浮类型过滤栏的内容（2026-10-15 第三轮新增，待移植设置联动）。
 ///
 /// 由**弹窗**调用（`crate::popup`），`rail` 是弹窗客户区中央的按钮组
@@ -1527,7 +1534,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         if frost_k < 1.0 && !active {
             base = base.gamma_multiply(frost_k);
         }
-        let sq_radius = (size * 0.25).max(POPUP_CORNER);
+        let sq_radius = size * 0.25;
         f.ui.painter_at(slot).rect_filled(slot, sq_radius, base);
         if resp.hovered() && !active {
             f.ui.painter_at(slot).rect_filled(slot, sq_radius, pal.row_hover);

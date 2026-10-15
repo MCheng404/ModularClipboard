@@ -44,10 +44,12 @@ use crate::multiwindow::{SharedGfx, WindowGfx};
 
 /// 弹窗窗口相对内容的边距（逻辑点）。
 ///
-/// **恒为 0**：窗口矩形就等于内容矩形，圆角由 **DWM 系统圆角**裁出，
-/// 磨砂底图由渲染器的 GPU 通道铺满整个窗口——两者都以「窗口即面板」
-/// 为前提。留边距的话那圈既没有内容也没有底图，只会是黑的。
-pub const SHADOW_MARGIN: f32 = 0.0;
+/// 用来容纳**自研**高斯投影：窗口比内容大一圈，那圈是透明的（清屏
+/// alpha=0），投影画在里面、向外渐隐到全透明。
+///
+/// 不能为 0：投影只能画在面板矩形之外，没有余量就只能压在面板边缘上、
+/// 再被窗口边界裁掉 ⇒ 四边出现三角形暗块（踩过）。
+pub const SHADOW_MARGIN: f32 = 12.0;
 
 /// 弹窗身份。既是内容分派的键，也是热区命名空间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,9 +119,11 @@ impl<'a> Popup<'a> {
             owner,
         )?;
         window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
-        // 圆角交给 DWM（与主窗口同一套）：窗口本身就是那块面板。
-        modular_clipboard_gfx::chrome::apply_rounded_corners(window.hwnd());
-        // 面板形状 = 整个客户区（窗口即面板）。
+        // 圆角**自己画**，所以必须显式关掉 DWM 圆角：微软文档明确写了
+        // 「每像素 alpha 分层的窗口无法被 DWM 圆角化」，而 DWM 若还在尝试
+        // 圆角，我们自绘的投影就会被那一刀切掉（四个角的三角形）。
+        modular_clipboard_gfx::chrome::disable_rounded_corners(window.hwnd());
+        // 面板形状 = 窗口中央的内容矩形；之外那圈（投影区）点击穿透。
         // ——命中判定看窗口矩形而非像素，不登记就会吃掉底下窗口的点击。
         // 用**整数像素**登记：Win32 命中按整数像素，亚像素矩形会漏边。
         // （egui 0.36 的 `Rect` 没有 `round()`，自己取整。）

@@ -87,7 +87,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -871,6 +872,31 @@ pub(crate) unsafe fn handle_non_client(
 ///
 /// **优雅降级**：Win10 或调用失败时只记一条 debug，不 panic、不中断启动。
 /// 圆角是锦上添花，缺了不影响任何功能。
+/// 明确**不要**系统圆角（`DWMWCP_DONOTROUND`）。
+///
+/// # 为什么需要这个
+///
+/// 微软文档写得很清楚：使用**每像素 alpha 分层**（在窗口周围画透明像素
+/// 以实现自定义阴影）的窗口，**无法**被 DWM 圆角化——系统把它当非矩形
+/// 窗口处理。反过来也成立：只要 DWM 还在尝试圆角，我们自绘的投影就会
+/// 被它那一刀切掉（实机表现为四个角的三角形）。
+///
+/// 因此「自研圆角 + 自研投影」的窗口必须**显式关掉**系统圆角，让窗口
+/// 保持矩形，圆角与投影全部由渲染层画。
+pub fn disable_rounded_corners(hwnd: HWND) {
+    let pref = DWMWCP_DONOTROUND;
+    if let Err(e) = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        )
+    } {
+        tracing::debug!("关闭系统圆角失败（Win10 或 DWM 不可用，属预期）: {e:?}");
+    }
+}
+
 pub fn apply_rounded_corners(hwnd: HWND) {
     // Win11 才认DWMWA_WINDOW_CORNER_PREFERENCE（属性号 33）。
     // Win10 上返回 E_INVALIDARG，属预期。
