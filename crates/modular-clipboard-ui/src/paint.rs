@@ -444,6 +444,11 @@ pub struct UiState {
     /// 变成弹窗后指针在主窗口客户区之外，只能由弹窗问
     /// `WindowFromPoint`（gfx::chrome::pointer_is_over）。
     pub search_popup_hover: bool,
+    /// 悬停展开是否被抑制（点图标收起后，直到光标离开图标为止）。
+    ///
+    /// 没有这个位的话，点一下收起、光标却还停在图标上 ⇒ 0.18s 后又被
+    /// 悬停展开，用户觉得「点了关不掉」。
+    pub search_hover_suppressed: bool,
     /// 搜索弹窗的输入框是否持有焦点（弹窗每帧回报）。
     ///
     /// 这条规则是「正在打字时不折叠面板」的依据，而焦点住在弹窗的
@@ -1238,10 +1243,11 @@ fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response) {
         // 离开图标即重新计时：再次移入要重新停够时间。
         f.state.search_hover_since = None;
     }
-    if f
-        .state
-        .search_hover_since
-        .is_some_and(|t| now - t >= SEARCH_HOVER_DELAY)
+    if !f.state.search_hover_suppressed
+        && f
+            .state
+            .search_hover_since
+            .is_some_and(|t| now - t >= SEARCH_HOVER_DELAY)
     {
         set_search_expanded(f, true);
     }
@@ -1261,9 +1267,24 @@ fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response) {
     // ……但**现在**还不能写焦点：弹窗本帧可能一次都没画过（弹窗是
     // 主窗口之后才渲染的），`search_edit_id` 还是 `None`。真正的请求
     // 挂在 [`UiState::search_focus_pending`] 上，等弹窗自报出真实 id。
+    // 点击图标 = **开合切换**：折叠时展开并把焦点交给输入框，
+    // 展开时收起。
+    //
+    // CAUTION: 收起后光标多半还停在图标上，若不管，悬停计时会在
+    // 0.18s 后把它重新展开——表现为「点了关不掉」。所以收起时置
+    // `search_hover_suppressed`，等光标**离开图标**才解除。
     if icon_resp.clicked() {
-        set_search_expanded(f, true);
-        f.state.search_focus_pending = true;
+        if f.state.search_expanded {
+            set_search_expanded(f, false);
+            f.state.search_hover_suppressed = true;
+        } else {
+            set_search_expanded(f, true);
+            f.state.search_focus_pending = true;
+        }
+    }
+    // 光标离开图标 ⇒ 解除抑制（下次移入可以正常悬停展开）。
+    if !hover_icon {
+        f.state.search_hover_suppressed = false;
     }
 
     // CAUTION: 顺序是「先判折叠 → 弹窗再画」。反过来（先画再判）

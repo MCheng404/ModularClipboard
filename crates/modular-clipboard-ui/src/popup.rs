@@ -16,38 +16,27 @@
 //! 可忽略，真正占内存的是字体图集——而弹窗只在需要时创建、隐藏时保留
 //! （见 [`Popups`]），实际同时存在最多两个。
 //!
-//! # 圆角与投影：**为什么不靠 alpha 合成**
+//! # 圆角与投影：**真·逐像素透明**
 //!
-//! 最初的实现把「面板之外的区域」留成 alpha=0，指望 DWM 按交换链的
-//! 逐像素 alpha 合成出圆角与投影。实机是**黑屏 + 黑色直角**：本项目的
-//! 窗口并不是靠 DWM 的 alpha 合成来做半透明的——主窗口的磨砂/半透明
-//! 是**自研方案**（`gfx::backdrop` 抓窗口身后的桌面、GPU 处理后当底图，
-//! 窗口实际是**不透明**的，见 `presence::apply_backdrop` 的说明）。
-//! 交换链 alpha 在这条管线上不参与合成，alpha=0 的像素就落成黑色。
+//! 交换链是 `PRE_MULTIPLIED`、渲染管线的混合也是预乘 alpha
+//! （`src=ONE, dst=ONE_MINUS_SRC_ALPHA`），所以窗口**本来就能**按像素
+//! 透明——前提是**清屏色必须是透明的**。
 //!
-//! 于是弹窗改用另一条路：== 窗口就是面板 ==
+//! `FrameRenderer` 的默认清屏色是 `[0.10, 0.10, 0.12, 1.0]`（不透明深色，
+//! 主窗口需要它兜底）。早前的弹窗沿用这个默认值，于是「面板之外什么
+//! 都不画」的区域被清成不透明深色 ⇒ 实机看到的是黑块与黑色直角。
+//! 这个现象被我误判成「DWM 不支持 alpha」，于是去抓桌面当底图——
+//! 方向错了。
 //!
-//! 1. **窗口矩形 = 内容矩形**（不再多留一圈投影边距）——没有「面板之外」
-//!    的区域，就不存在「那块画什么」的问题；
-//! 2. 圆角与投影交给 **DWM 系统圆角**（`apply_rounded_corners`）与
-//!    DWM 的窗口投影：窗口本身就是那块圆角面板，边角自然透出桌面；
-//! 3. 内容铺满窗口（不透明），底衬仍是捕获到的身后桌面（有则更贴合，
-//!    没有也不露黑——因为内容已经盖满了）。
-//!
-//! 用户反馈的正是这一点：「应该只渲染搜索框内和图标的那个正方形」——
-//! 即**不要让底图铺成一个比面板更大的矩形**，那圈多出来的部分在
-//! alpha 不参与合成的前提下只会是黑的。
-//!
-//! # 焦点
-//!
-//! 每个弹窗有自己的 `egui::Context`：**键盘焦点在弹窗自己的 Context
-//! 里**，主窗口的 `memory()` 看不到它。于是「焦点钉住展开」这条规则
-//! 改由弹窗每帧把 `focused / pointer_over` 回报给主窗口的状态机
-//! （[`crate::paint::UiState::search_popup_focus`] 等）。
-//!
-//! 搜索面板**要能打字**⇒ 建成普通可激活窗口（不加 `WS_EX_NOACTIVATE`）；
-//! 类型过滤栏只有按钮 ⇒ `no_activate`，点它不把焦点从用户正在用的
-//! 程序抢走。
+//! 现在的做法（用户拍板去掉底图）：
+//! 1. 弹窗把清屏色设为 `[0,0,0,0]`（`set_clear_color`），没画到的地方
+//!    **真的透明**；
+//! 2. 窗口 = 内容 + 一圈 [`SHADOW_MARGIN`]，圆角与高斯投影都自己画，
+//!    画在透明画布上、alpha 渐变到 0 ⇒ 天然的圆角与柔和投影；
+//! 3. 不再抓桌面、不再需要 `WDA_EXCLUDEFROMCAPTURE`（弹窗因此能正常
+//!    出现在截图/录屏里）；
+//! 4. 命中判定仍按**窗口矩形**而非像素，所以投影区要登记
+//!    `set_panel_shape` 让 `WM_NCHITTEST` 返回 `HTTRANSPARENT`。
 
 use modular_clipboard_gfx::window::{Window, WindowEvent};
 
@@ -105,16 +94,8 @@ pub struct Popup<'a> {
     was_open: bool,
     /// 已应用的置顶状态（幂等去重）。
     topmost: bool,
-    /// 桌面捕获器（身后背景）。懒创建：GDI 句柄，失败即降级为纯色底。
-    capture: Option<modular_clipboard_gfx::backdrop::DesktopCapture>,
-    /// 上次成功捕获的时刻（节流）。
-    last_capture: Option<std::time::Instant>,
-    /// 底图纹理（捕获成功即更新；首帧还没抓到时为 `None`）。
-    bg_tex: Option<egui::TextureHandle>,
-    /// 上次定位到的屏幕位置。窗口一动身后内容就变了，必须强制重抓。
+    /// 上次定位到的屏幕位置（避免每帧重复 `SetWindowPos`）。
     last_pos: Option<(i32, i32)>,
-    /// 首张底图是否已记过日志（避免每帧刷屏）。
-    capture_logged: bool,
 }
 
 impl<'a> Popup<'a> {
@@ -149,16 +130,15 @@ impl<'a> Popup<'a> {
             ),
         );
         modular_clipboard_gfx::chrome::set_panel_shape(window.hwnd(), Some(panel));
-        // 捕获自排除：桌面捕获要看到弹窗**身后**而不是弹窗自己
-        // （否则抓到的是自己的上一帧，形成反馈回路，表现为拖影/自叠加）。
-        // 副作用与主窗口磨砂模式一致：弹窗不出现在录屏/截图里。
-        crate::presence::apply_backdrop(
-            window.hwnd(),
-            modular_clipboard_core::config::WindowBackdrop::Acrylic,
-        );
+        // NOTE: 不再设 `WDA_EXCLUDEFROMCAPTURE`：那是给「抓身后桌面」用的
+        // （不加会抓到自己的上一帧）。现在靠真透明，没有捕获，也就不该
+        // 让弹窗从截图/录屏里消失。
 
         let surface = shared.gpu.create_surface_for(window.hinstance(), window.hwnd())?;
-        let gfx = WindowGfx::new_for(shared, surface)?;
+        let mut gfx = WindowGfx::new_for(shared, surface)?;
+        // 真透明的关键一步：清屏色 alpha = 0。默认是 `[0.10,0.10,0.12,1.0]`
+        // （主窗口要它兜底），弹窗沿用就会把没画到的地方清成不透明深色。
+        gfx.fr.set_clear_color([0.0, 0.0, 0.0, 0.0]);
         let ctx = shared.new_context();
         // EventLoop 借用 window，必须在 struct 字面量**搬走** window 之前建好。
         let events = modular_clipboard_gfx::window::EventLoop::new(&window);
@@ -170,11 +150,7 @@ impl<'a> Popup<'a> {
             ctx,
             was_open: false,
             topmost: false,
-            capture: None,
-            last_capture: None,
-            bg_tex: None,
             last_pos: None,
-            capture_logged: false,
         })
     }
 
@@ -208,58 +184,6 @@ impl<'a> Popup<'a> {
         }
     }
 
-    /// 刷新身后的桌面底图（节流 30fps；窗口移动时立即刷新）。
-    ///
-    /// # 为什么必须自己抓
-    ///
-    /// 弹窗的「圆角 + 投影」靠的是**不透明窗口 + 画上去的桌面底图**
-    /// （见模块文档）。底图不更新时，窗口移动后圆角缝里露出的还是
-    /// 上一处的桌面——移动时强制重抓就是为了这个。
-    ///
-    /// 捕获失败（GDI 异常 / 最小化）只是**本帧不更新**，`bg_tex`
-    /// 里上一帧的图仍在，不会闪黑。
-    fn update_backdrop(&mut self) {
-        use modular_clipboard_gfx::backdrop::{capture_due, DesktopCapture, CAPTURE_INTERVAL};
-        let now = std::time::Instant::now();
-        if !capture_due(self.last_capture, now, CAPTURE_INTERVAL) {
-            return;
-        }
-        // CAUTION: `swap_rb` 传 **true**：DIB 恒 BGRA，而 egui 的
-        // `ColorImage` 要 RGBA。主窗口那条路径是直接上传给 GPU 图像
-        // （格式与交换链一致，无需交换），这里走 egui 纹理，必须交换。
-        let cap = match self.capture.as_mut() {
-            Some(c) => c,
-            None => match DesktopCapture::new(true) {
-                Ok(c) => self.capture.insert(c),
-                Err(e) => {
-                    tracing::warn!(%e, "弹窗桌面捕获器初始化失败，底图停更");
-                    return;
-                }
-            },
-        };
-        match cap.capture_behind_scaled(self.window.hwnd().0 as isize, 1) {
-            Ok(Some((bits, w, h))) => {
-                // 全分辨率（`downscale = 1`）：底图直接露在投影边距与
-                // 按钮缝隙里，1/2 分辨率拉伸回去会发虚、与真实桌面接缝。
-                // 弹窗只有几十×几百像素，上传量可忽略。
-                let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], bits);
-                self.bg_tex = Some(self.ctx.load_texture(
-                    "popup_backdrop",
-                    img,
-                    egui::TextureOptions::LINEAR,
-                ));
-                if !self.capture_logged {
-                    self.capture_logged = true;
-                    tracing::info!(w, h, "弹窗底图已就绪（身后桌面捕获成功）");
-                }
-                self.last_capture = Some(now);
-            }
-            // 最小化 ⇒ 跳过，保留上一帧底图。
-            Ok(None) => {}
-            Err(e) => tracing::debug!(%e, "弹窗桌面捕获失败，本帧沿用上一张底图"),
-        }
-    }
-
     /// 同步显隐并在需要时绘制一帧。
     ///
     /// - 隐藏态：泵消息并**排空**事件，不渲染（同设置窗口的纪律：
@@ -289,10 +213,6 @@ impl<'a> Popup<'a> {
         let x_px = ((panel_pos_screen.x - margin) * s) as i32;
         let y_px = ((panel_pos_screen.y - margin) * s) as i32;
         self.move_to_screen(x_px, y_px);
-        // 位子定好**之后**再抓身后桌面：捕获区间是本窗口的客户区，
-        // 顺序反了就会抓到移动前那块区域。
-        self.update_backdrop();
-        let bg = self.bg_tex.as_ref().map(|t| t.id());
         // 首次显示：抬到 Z 序顶部，避免被主窗口盖住；搜索面板还要
         // 抢焦点（用户要立刻打字），类型栏保持不抢（no_activate）。
         if just_opened {
@@ -334,7 +254,7 @@ impl<'a> Popup<'a> {
         let raw_input = self.events.egui_input(&self.ctx, &frame_events);
         // 调色板与主窗口同步（各自 Context，`Visuals` 不共享）。
         crate::theme::apply(&self.ctx, app.palette());
-        let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_popup(ui, kind, bg));
+        let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_popup(ui, kind));
         let ppp = out.pixels_per_point;
         let mut textures_delta = std::mem::take(&mut out.textures_delta);
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);

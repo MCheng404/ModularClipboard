@@ -2445,12 +2445,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
 ///
 /// 弹窗客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
 /// 面板矩形取中央那块；投影由 `paint` 画在边距里（alpha=0 处即桌面）。
-pub fn draw_popup(
-        &mut self,
-        ui: &mut egui::Ui,
-        kind: crate::popup::PopupKind,
-        backdrop: Option<egui::TextureId>,
-    ) {
+pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
     let ppp = ui.ctx().pixels_per_point();
     let margin = crate::popup::SHADOW_MARGIN;
     let client = ui.max_rect();
@@ -2458,26 +2453,8 @@ pub fn draw_popup(
         egui::pos2(client.min.x + margin, client.min.y + margin),
         egui::pos2(client.max.x - margin, client.max.y - margin),
     );
-    // ---- 底图：弹窗窗口是**不透明**的，圆角/投影靠这张「身后桌面」----
-    //
-    // 见 `crate::popup` 模块文档：本项目不靠 DWM 的逐像素 alpha 合成
-    // （那会落成黑屏），而是把捕获到的桌面画成不透明底图，面板的圆角
-    // 缝里露出的即为桌面。
-    match backdrop {
-        Some(tex) => {
-            ui.painter().image(
-                tex,
-                client,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        }
-        // 首帧还没抓到（或捕获器不可用）：铺窗口底色兜底——
-        // 有色方块也比黑屏强。
-        None => {
-            ui.painter().rect_filled(client, 0.0, self.pal.bg);
-        }
-    }
+    // NOTE: 不铺底图。弹窗的清屏色是透明的（见 `crate::popup`），
+    // 没画到的地方直接透出桌面 —— 圆角与投影都靠这个。
     // ---- 自研投影：画在**客户区级** painter 上 ----
     //
     // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，这圈铺的是捕获到的桌面；
