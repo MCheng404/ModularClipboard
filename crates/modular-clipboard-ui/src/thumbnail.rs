@@ -1,27 +1,19 @@
 //! 图片缩略图：尺寸计算、解码降采样、CPU 侧缓存。
 //!
-//! # 现状：GPU 侧尚不能显示（不是本模块的问题）
+//! 职责边界：把「载荷字节」变成「一张 ≤256px 的 RGBA8 位图」。
+//! 上传 GPU（`ctx.load_texture`）由绘制层负责，本模块不碰纹理。
 //!
-//! 本模块负责「字节 → 可显示的缩略图」这半段，全部是纯 CPU 逻辑，可单测。
-//! 但把缩略图真正**画到屏幕上**还需要渲染层支持多纹理，而当前渲染器
-//! 只绑定了一张纹理（字体图集）：
+//! # 载荷的两种形态（2026-10-16 起以裸 RGBA8 为规范）
 //!
-//! - `shaders/egui.wgsl` 只声明 `@binding(2) var font_tex`，
-//!   片元着色器写的是 `textureSample(font_tex, ...)`，把纹理当**单通道覆盖率**用；
-//! - `pipeline.rs::DescriptorLayout` 只有 3 个绑定（uniform/sampler/纹理，计数均为 1）；
-//! - `renderer.rs::upload_font_delta` 对非字体纹理 `tracing::warn!` 后 `continue`
-//!   ——用户纹理被**显式丢弃**；
-//! - `frame.rs` 的描述符池 `COMBINED_IMAGE_SAMPLER` 计数 =交换链图像数
-//!   （每槽位恰好 1 个），放不下第二张纹理。
+//! 1. **裸 RGBA8**（现行）：arboard 在 Windows 上把 `CF_DIBV5`/`CF_PNG`
+//!    一律解码成 RGBA 像素后交出，字节无文件头。尺寸由捕获侧透传
+//!    （`CapturedPayload::dims` → `PayloadRef::dims`），解码走
+//!    [`decode_rgba`] / [`decode_auto`] 旁路。
+//! 2. **编码格式**（历史数据）：PNG 等，靠 [`decode`] 的魔数嗅探。
 //!
-//! 因此 `ctx.load_texture()` 产生的 `TexturesDelta` 目前会被渲染器丢掉。
-//! 接线所需改动见 `PROGRESS.md` 待决区「缩略图 GPU 接线」。
-//!
-//! # 为什么不在本模块里做降采样之外的事
-//!
-//! 显存预算、纹理创建、描述符绑定都属于渲染层职责。本模块只产出
-//! 「一张≤256px 的 RGBA8 位图」，恰好是 egui `ColorImage` 需要的形态，
-//! 接通渲染层后无需改动即可使用。
+//! 曾因全链路假设「载荷一定是编码格式」，导致裸 RGBA 载荷在每一环
+//! （store 尺寸列、预览文案、缩略图解码）都失败，界面显示
+//! 「图片 N 字节」且列表行没有任何图片预览。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -170,6 +162,63 @@ impl Thumbnail {
 /// 所有失败路径都返回 [`ThumbError`]。本函数由 UI 线程直接调用，
 /// 一个 panic 会带崩整个帧循环，因此「非图片数据」必须是普通返回值。
 pub fn decode(bytes: &[u8], max_edge: u32) -> Result<Thumbnail, ThumbError> {
+    decode_with(bytes, DecodeMode::Encoded, max_edge)
+}
+
+/// 把**裸 RGBA8 像素**解码成缩略图。
+///
+/// # 为什么需要这个入口
+///
+/// 本项目图片载荷的规范形态是裸 RGBA8：arboard 在 Windows 上把
+/// `CF_DIBV5`/`CF_PNG` 一律 `into_rgba8().into_raw()` 后交出（见
+/// `CapturedPayload::dims` 的文档）。这类字节没有文件头，
+/// [`decode`] 的格式嗅探必然返回 [`ThumbError::NotAnImage`]——
+/// 曾导致「图片显示开启后仍显示 图片 N 字节」。
+///
+/// 尺寸无法从字节反推（`len = w*h*4` 有无穷多分解），必须由调用方
+/// 从存储层的 `PayloadRef::dims` 提供；长度不吻合时拒绝，
+/// 防止把别的格式的字节当像素解释出花屏。
+pub fn decode_rgba(bytes: &[u8], w: u32, h: u32, max_edge: u32) -> Result<Thumbnail, ThumbError> {
+    decode_with(bytes, DecodeMode::Rgba { w, h }, max_edge)
+}
+
+/// 智能解码：尺寸与字节长度互相吻合时按裸 RGBA8 解，否则按编码格式解。
+///
+/// 这是 UI 侧的统一入口——新捕获的图片走 RGBA 路径，历史编码格式
+/// 数据（PNG 等）自动落到 [`decode`]，调用方不需要知道载荷是哪种形态。
+pub fn decode_auto(
+    bytes: &[u8],
+    dims: Option<(u32, u32)>,
+    max_edge: u32,
+) -> Result<Thumbnail, ThumbError> {
+    let mode = match dims.filter(|(w, h)| *w > 0 && *h > 0) {
+        Some((w, h))
+            if (w as u64)
+                .saturating_mul(h as u64)
+                .saturating_mul(4)
+                == bytes.len() as u64 =>
+        {
+            DecodeMode::Rgba { w, h }
+        }
+        _ => DecodeMode::Encoded,
+    };
+    decode_with(bytes, mode, max_edge)
+}
+
+/// 载荷的两种形态（见 [`decode_rgba`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodeMode {
+    /// 编码格式（PNG/JPEG/…）：靠魔数嗅探，尺寸从头解析。
+    Encoded,
+    /// 裸 RGBA8：尺寸由外部给定，字节直接即位图。
+    Rgba { w: u32, h: u32 },
+}
+
+fn decode_with(
+    bytes: &[u8],
+    mode: DecodeMode,
+    max_edge: u32,
+) -> Result<Thumbnail, ThumbError> {
     if bytes.is_empty() || bytes.len() > MAX_INPUT_BYTES {
         return Err(ThumbError::TooLarge);
     }
@@ -177,24 +226,10 @@ pub fn decode(bytes: &[u8], max_edge: u32) -> Result<Thumbnail, ThumbError> {
         return Err(ThumbError::TooLarge);
     }
 
-    // `with_guessed_format` 按魔数嗅探格式——载荷没有可靠的扩展名，
-    // 剪贴板也不携带文件名，格式只能靠内容判断。
-    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|_| ThumbError::NotAnImage)?;
-
-    // 限制解码峰值内存。注意 `max_image_width/height` 保持 `None`：
-    // 它们是**严格**限制，超过就整张拒绝，而不是缩放。
-    // 真正要防的是解压炸弹（`max_alloc`），尺寸超限由 `fit_within` 缩放处理。
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
-
-    let mut reader = reader;
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(|e| match e {
-        image::ImageError::Unsupported(_) => ThumbError::NotAnImage,
-        _ => ThumbError::DecodeFailed,
-    })?;
+    let decoded = match mode {
+        DecodeMode::Encoded => decode_encoded(bytes)?,
+        DecodeMode::Rgba { w, h } => decode_raw_rgba(bytes, w, h)?,
+    };
 
     let (src_w, src_h) = (decoded.width(), decoded.height());
     // 原图已小于上限时 `resize_exact` 会做一次无意义的重采样，
@@ -229,6 +264,47 @@ pub fn decode(bytes: &[u8], max_edge: u32) -> Result<Thumbnail, ThumbError> {
         height: out_h,
         pixels: rgba,
     })
+}
+
+/// 编码格式解码（PNG/JPEG/BMP/…）。
+fn decode_encoded(bytes: &[u8]) -> Result<image::DynamicImage, ThumbError> {
+    // `with_guessed_format` 按魔数嗅探格式——载荷没有可靠的扩展名，
+    // 剪贴板也不携带文件名，格式只能靠内容判断。
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| ThumbError::NotAnImage)?;
+
+    // 限制解码峰值内存。注意 `max_image_width/height` 保持 `None`：
+    // 它们是**严格**限制，超过就整张拒绝，而不是缩放。
+    // 真正要防的是解压炸弹（`max_alloc`），尺寸超限由 `fit_within` 缩放处理。
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+
+    let mut reader = reader;
+    reader.limits(limits);
+    reader.decode().map_err(|e| match e {
+        image::ImageError::Unsupported(_) => ThumbError::NotAnImage,
+        _ => ThumbError::DecodeFailed,
+    })
+}
+
+/// 裸 RGBA8 解码：长度必须与 `w*h*4` 精确吻合。
+///
+/// 不吻合时返回 [`ThumbError::NotAnImage`]——长度对不上说明这份字节
+/// 不是「尺寸为 w×h 的 RGBA 位图」（可能是别的格式，也可能是截断的
+/// 载荷）。绝不能按声明的尺寸硬读：那会把花屏当图片显示。
+fn decode_raw_rgba(bytes: &[u8], w: u32, h: u32) -> Result<image::DynamicImage, ThumbError> {
+    let expect = (w as u64)
+        .saturating_mul(h as u64)
+        .saturating_mul(4);
+    if bytes.len() as u64 != expect {
+        return Err(ThumbError::NotAnImage);
+    }
+    // `from_raw` 会再次校验长度并拷贝；这里的长度刚刚校验过，
+    // 失败只可能是尺寸溢出（fit_within 前的极端值），按解不动处理。
+    image::RgbaImage::from_raw(w, h, bytes.to_vec())
+        .map(image::DynamicImage::ImageRgba8)
+        .ok_or(ThumbError::DecodeFailed)
 }
 
 // ---------------------------------------------------------------------------
@@ -358,13 +434,53 @@ impl ThumbnailCache {
     ///
     /// 预算为 0 时仍会解码并返回，只是不留存——调用方拿到的
     /// [`Arc`] 在本次调用内有效，适合「只要这一帧」的用法。
-    pub fn get_or_load<F>(
+    pub fn get_or_load<F>(&mut self, key: CacheKey, load: F) -> Result<Arc<Thumbnail>, ThumbError>
+    where
+        F: FnOnce() -> Result<Vec<u8>, String>,
+    {
+        self.get_or_load_with(key, load, |_| DecodeMode::Encoded)
+    }
+
+    /// 同 [`Self::get_or_load`]，但按「裸 RGBA8 优先」选择解码模式。
+    ///
+    /// `dims` 来自存储层的 `PayloadRef::dims`：长度与 `w*h*4` 吻合时
+    /// 走 RGBA 旁路（现行图片载荷的规范形态），否则回落编码格式嗅探
+    /// （历史数据）。UI 的图片预览应统一走这个入口。
+    pub fn get_or_load_auto<F>(
         &mut self,
         key: CacheKey,
+        dims: Option<(u32, u32)>,
         load: F,
     ) -> Result<Arc<Thumbnail>, ThumbError>
     where
         F: FnOnce() -> Result<Vec<u8>, String>,
+    {
+        self.get_or_load_with(key, load, move |bytes| {
+            match dims.filter(|(w, h)| *w > 0 && *h > 0) {
+                Some((w, h))
+                    if (w as u64).saturating_mul(h as u64).saturating_mul(4)
+                        == bytes.len() as u64 =>
+                {
+                    DecodeMode::Rgba { w, h }
+                }
+                _ => DecodeMode::Encoded,
+            }
+        })
+    }
+
+    /// [`Self::get_or_load`] 与 [`Self::get_or_load_auto`] 的共同实现。
+    ///
+    /// `mode` 在字节到手后才能求值（RGBA 判据依赖字节长度），
+    /// 因此它是个闭包而不是构造参数。
+    fn get_or_load_with<F, M>(
+        &mut self,
+        key: CacheKey,
+        load: F,
+        mode: M,
+    ) -> Result<Arc<Thumbnail>, ThumbError>
+    where
+        F: FnOnce() -> Result<Vec<u8>, String>,
+        M: FnOnce(&[u8]) -> DecodeMode,
     {
         if let Some(hit) = self.get(&key) {
             return Ok(hit);
@@ -378,7 +494,10 @@ impl ThumbnailCache {
 
         let result = load()
             .map_err(|_| ThumbError::DecodeFailed)
-            .and_then(|bytes| decode(&bytes, THUMB_MAX_EDGE));
+            .and_then(|bytes| {
+                let mode = mode(&bytes);
+                decode_with(&bytes, mode, THUMB_MAX_EDGE)
+            });
 
         match result {
             Ok(thumb) => {
@@ -602,6 +721,96 @@ mod tests {
         let mut png = encode_png(64, 64);
         png.truncate(10);
         assert_eq!(decode(&png, 256), Err(ThumbError::DecodeFailed));
+    }
+
+    // ---- 裸 RGBA8 载荷（arboard 在 Windows 上解 CF_DIBV5 的产物） ----
+
+    /// 构造 `w*h*4` 长度的纯色 RGBA 字节。
+    fn raw_rgba(w: u32, h: u32, px: [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for _ in 0..(w * h) {
+            v.extend_from_slice(&px);
+        }
+        v
+    }
+
+    #[test]
+    fn decode_rgba_reads_headerless_pixels() {
+        // 回归测试：无文件头的裸像素曾让 `decode` 必然 NotAnImage，
+        // 界面只能显示「图片 N 字节」。尺寸由外部给定。
+        let t = decode_rgba(&raw_rgba(8, 4, [1, 2, 3, 255]), 8, 4, 256).unwrap();
+        assert_eq!((t.width, t.height), (8, 4), "小图不缩放");
+        assert_eq!(&t.pixels[0..4], &[1, 2, 3, 255], "像素内容应原样透出");
+    }
+
+    #[test]
+    fn decode_rgba_downscales_like_encoded_path() {
+        let t = decode_rgba(&raw_rgba(1920, 1080, [9, 9, 9, 255]), 1920, 1080, 256).unwrap();
+        assert_eq!((t.width, t.height), (256, 144));
+        assert_eq!(t.pixels.len(), 256 * 144 * 4);
+    }
+
+    #[test]
+    fn decode_rgba_rejects_length_mismatch() {
+        // 长度对不上就不是「该尺寸的 RGBA 位图」。硬按声明尺寸读会花屏。
+        let short = raw_rgba(8, 4, [0, 0, 0, 255]);
+        assert_eq!(
+            decode_rgba(&short[..short.len() - 4], 8, 4, 256),
+            Err(ThumbError::NotAnImage)
+        );
+        // 尺寸也错（长了两像素）同样拒绝。
+        assert_eq!(
+            decode_rgba(&raw_rgba(8, 4, [0, 0, 0, 255]), 8, 5, 256),
+            Err(ThumbError::NotAnImage)
+        );
+    }
+
+    #[test]
+    fn decode_rgba_rejects_degenerate_dims() {
+        assert_eq!(decode_rgba(&[], 0, 4, 256), Err(ThumbError::TooLarge));
+        assert_eq!(
+            decode_rgba(&raw_rgba(4, 4, [0; 4]), 0, 0, 256),
+            Err(ThumbError::NotAnImage)
+        );
+    }
+
+    #[test]
+    fn decode_auto_prefers_rgba_when_length_matches() {
+        let bytes = raw_rgba(32, 32, [7, 8, 9, 255]);
+        let t = decode_auto(&bytes, Some((32, 32)), 256).unwrap();
+        assert_eq!((t.width, t.height), (32, 32));
+        assert_eq!(&t.pixels[0..4], &[7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn decode_auto_falls_back_to_encoded_for_png() {
+        // 历史数据是 PNG：长度与 dims 不吻合（压缩过），必须回落嗅探。
+        let png = encode_png(48, 24);
+        let t = decode_auto(&png, Some((48, 24)), 256).unwrap();
+        assert_eq!((t.width, t.height), (48, 24));
+    }
+
+    #[test]
+    fn decode_auto_without_dims_uses_encoding_sniffing() {
+        let t = decode_auto(&encode_png(16, 16), None, 256).unwrap();
+        assert_eq!((t.width, t.height), (16, 16));
+    }
+
+    #[test]
+    fn cache_auto_loads_raw_rgba_payload() {
+        // 端到端：缓存 + RGBA 旁路。同一 key 只 load 一次。
+        let mut c = ThumbnailCache::default();
+        let k = CacheKey::new(42, "h");
+        let calls = AtomicU32::new(0);
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(raw_rgba(300, 200, [5, 6, 7, 255]))
+        };
+        let t = c.get_or_load_auto(k.clone(), Some((300, 200)), load).unwrap();
+        assert_eq!((t.width, t.height), (256, 171));
+        let t2 = c.get_or_load_auto(k, Some((300, 200)), load).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "命中缓存不应再次 load");
+        assert_eq!(t, t2);
     }
 
     // ---- 缓存 ----

@@ -660,6 +660,7 @@ mod tests {
             text: Some(text.to_string()),
             source_app: "test".into(),
             files: Vec::new(),
+            dims: None,
         }
     }
 

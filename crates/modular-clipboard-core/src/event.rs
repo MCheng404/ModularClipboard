@@ -13,6 +13,18 @@ pub struct CapturedPayload {
     pub kind: crate::item::ClipKind,
     /// 载荷字节（文本为 UTF-8，图片为原始编码）。
     pub bytes: Vec<u8>,
+    /// 图片像素尺寸（宽, 高），仅 [`crate::item::ClipKind::Image`] 有值。
+    ///
+    /// # 为什么必须透传
+    ///
+    /// Windows 上 arboard 的 `image()` 把 `CF_DIBV5`/`CF_PNG` 一律解码成
+    /// **裸 RGBA8 像素**（`into_rgba8().into_raw()`）后交出——字节里没有
+    /// 文件头，`image` crate 的格式嗅探与头解析对它全部无效。存储层
+    /// （`compute_dims`）与预览层（`image_dimensions`）都曾因此拿到
+    /// `None`，界面只能显示「图片 N 字节」且不渲染缩略图。
+    /// 尺寸在捕获侧由 arboard 白给（`ImageData::width/height`），
+    /// 零成本，绕这一层就没有第二个人知道图有多大。
+    pub dims: Option<(u32, u32)>,
     /// HTML 原文，若剪贴板同时提供。
     pub html: Option<String>,
     /// 解析后的文本，若有。

@@ -5929,21 +5929,25 @@ fn draw_detail_image_zoom(f: &mut Frame<'_>, body: Rect, item: &ClipItem) {
         .unwrap_or(true);
     if needs_upload {
         match f.svc.load_payload_bytes(item.id) {
-            Ok(bytes) => match crate::thumbnail::decode(&bytes, u32::MAX) {
-                Ok(thumb) => {
-                    let img = thumb.to_color_image();
-                    let handle = f.ui.ctx().load_texture(
-                        format!("mc_orig_{}", item.id),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    f.state.detail_image_orig = Some((item.id, handle));
+            Ok(bytes) => {
+                // 与缩略图同一套 auto 入口：裸 RGBA8（现行规范）走旁路，
+                // 历史编码格式回落嗅探。`u32::MAX` = 不降采样（原图）。
+                match crate::thumbnail::decode_auto(&bytes, dims, u32::MAX) {
+                    Ok(thumb) => {
+                        let img = thumb.to_color_image();
+                        let handle = f.ui.ctx().load_texture(
+                            format!("mc_orig_{}", item.id),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        f.state.detail_image_orig = Some((item.id, handle));
+                    }
+                    Err(e) => {
+                        tracing::debug!(id = item.id, ?e, "原图解码失败");
+                        f.state.detail_image_orig = None;
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(id = item.id, ?e, "原图解码失败");
-                    f.state.detail_image_orig = None;
-                }
-            },
+            }
             Err(e) => {
                 tracing::debug!(id = item.id, ?e, "原图读取失败");
                 f.state.detail_image_orig = None;
@@ -6786,16 +6790,23 @@ fn draw_markdown_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
 /// 单条记录撑爆，详情面板传 `[body.width(), body.height()]` 让图按
 /// 长宽比尽量放大。
 fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32) {
-    use modular_clipboard_core::ClipKind;
-    let _ = ClipKind::Image;
     // 显示矩形：限高 max_h、限宽预览带，保持长宽比，左上对齐。
+    //
+    // dims 只认 store 入库时存的（`PayloadRef::dims`）。2026-10-16 起
+    // 图片载荷的规范形态是裸 RGBA8（arboard 解 CF_DIBV5 的产物），
+    // 尺寸由捕获侧透传，新条目必有；缺失只可能是「载荷已被淘汰」或
+    // 极老的编码格式数据——两者都无法从字节反推尺寸（RGBA 的
+    // `len = w*h*4` 有无穷多分解），按文本降级显示，不做每帧读盘
+    // 嗅探（那正是 PF-1 明令禁止的）。
     let Some(dims) = item
         .payload
         .as_ref()
         .and_then(|p| p.dims)
         .filter(|(w, h)| *w > 0 && *h > 0)
     else {
-        // 没有尺寸信息（载荷已被淘汰）：按普通文本显示（「图片 WxH」）。
+        // 没有任何维度信息（载荷已被淘汰 / 不可识别）：按普通文本显示
+        // （「图片 WxH」/「图片 N 字节」），剪贴板工具的列表不能因为
+        // 一张坏图就少画一行。
         draw_text_preview(f, band, item, false);
         return;
     };
@@ -6814,40 +6825,68 @@ fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32
     let rect = Rect::from_min_size(band.min, vec2(disp_w, disp_h));
 
     // 纹理句柄：命中直接用，未命中走缓存 + 上传。
-    //
-    // CAUTION: `state.thumb_cache` 与 `svc` 是 Frame 的不同字段，
-    // 先分别借开才能在同一条表达式里用（闭包要读载荷、缓存要可写）。
-    let tex = match f.state.thumb_tex.get(&item.id).copied() {
+//
+// CAUTION: `state.thumb_cache` 与 `svc` 是 Frame 的不同字段，
+// 先分别借开才能在同一条表达式里用（闭包要读载荷、缓存要可写）。
+//
+// 三条降级：thumb_tex 命中 → 直接用；thumb_cache 解码 → 上传；
+// thumb_cache 失败（载荷已被 GC、超限、解码错误）→ **旁路**直接
+// 调 `thumbnail::decode` 再读一次，不写入 cache——避免 2 秒抑制
+// 把「确实能解的载荷」卡死。
+let tex = match f.state.thumb_tex.get(&item.id).copied() {
         Some(t) => Some(t),
         None => {
-            let cache = &mut f.state.thumb_cache;
-            let svc = &mut f.svc;
             let id = item.id;
-            let key = crate::thumbnail::CacheKey::new(id, item.hash.clone());
-            match cache.get_or_load(key, || svc.load_payload_bytes(id).map_err(|e| e.to_string())) {
-                Ok(thumb) => {
-                    let img = thumb.to_color_image();
-                    // 纹理名带条目 id：同一条目重复上传会**替换**而不是
-                    // 累积，egui 侧不会因此长出新纹理。
-                    // 只存 `TextureId`：纹理由 Context 持有（注册即托管），
-                    // 句柄（TextureHandle）只是引用，没必要长留。
-                    let t = f
-                        .ui
-                        .ctx()
-                        .load_texture(
-                            format!("mc_thumb_{id}"),
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        )
-                        .id();
-                    f.state.thumb_tex.insert(id, t);
-                    Some(t)
+            // 第一次：thumb_cache（含失败抑制）
+            let from_cache = {
+                let cache = &mut f.state.thumb_cache;
+                let svc = &mut f.svc;
+                let key = crate::thumbnail::CacheKey::new(id, item.hash.clone());
+                let load_closure =
+                    || svc.load_payload_bytes(id).map_err(|e| e.to_string());
+                // dims 一起交给缓存：载荷是裸 RGBA8 时（现行规范）
+                // 必须走 RGBA 旁路，编码格式嗅探对它必然失败。
+                cache.get_or_load_auto(key, Some(dims), load_closure).ok()
+            };
+            // 第二次（必要时）：旁路 cache 直接解码。
+            // thumb_cache 失败抑制表会让 2 秒内的失败调用直接返回 Err，
+            // 但用户看到的「图片」很可能就是这个失败链路——再读一次
+            // 字节、绕过抑制直接调 `thumbnail::decode`，往往就能显示。
+            let thumb_arc = from_cache.or_else(|| {
+                let svc = &mut f.svc;
+                let bytes = match svc.load_payload_bytes(id) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(id, ?e, "缩略图载荷读取失败");
+                        return None;
+                    }
+                };
+                match crate::thumbnail::decode_auto(&bytes, Some(dims), 256) {
+                    Ok(t) => Some(std::sync::Arc::new(t)),
+                    Err(e) => {
+                        tracing::debug!(id, ?e, "缩略图解码失败，回落文本预览");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::debug!(id, ?e, "缩略图获取失败，回落文本预览");
-                    None
-                }
-            }
+            });
+            thumb_arc.map(|thumb| {
+                let img = thumb.to_color_image();
+                // 纹理名带条目 id：同一条目重复上传会**替换**而不是
+                // 累积，egui 侧不会因此长出新纹理。
+                // 只存 `TextureId`：纹理由 Context 持有（注册即托管），
+                // 句柄（TextureHandle）只是引用，没必要长留。
+                let t = f
+                    .ui
+                    .ctx()
+                    .load_texture(
+                        format!("mc_thumb_{id}"),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    )
+                    .id();
+                f.state.thumb_tex.insert(id, t);
+                t
+            })
         }
     };
     let Some(tex) = tex else {
@@ -7093,6 +7132,7 @@ mod tests {
                     text: Some(text),
                     source_app: format!("App{i}"),
                     files: Vec::new(),
+                    dims: None,
                 };
                 if !self.svc.ingest(payload) {
                     tracing::warn!(i, "塞入测试记录失败");
@@ -9462,6 +9502,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             text: None,
             source_app: String::new(),
             files: Vec::new(),
+            dims: None,
         };
     }
 

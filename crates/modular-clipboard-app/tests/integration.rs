@@ -19,6 +19,7 @@ fn text_payload(text: &str, app: &str) -> modular_clipboard_core::CapturedPayloa
         text: Some(text.to_string()),
         source_app: app.to_string(),
         files: Vec::new(),
+        dims: None,
     }
 }
 
@@ -228,6 +229,7 @@ fn files_payload_produces_summary_preview() {
         text: Some("C:\\a.txt\nC:\\b.txt\nC:\\c.txt".into()),
         source_app: "explorer".into(),
         files: vec!["C:\\a.txt".into(), "C:\\b.txt".into(), "C:\\c.txt".into()],
+        dims: None,
     });
     assert_eq!(s.state.items.len(), 1);
     assert!(
@@ -250,6 +252,39 @@ fn large_payload_is_dropped_but_metadata_survives() {
         s.state.items[0].payload.is_none(),
         "超限载荷不应落盘"
     );
+}
+
+/// 回归测试：图片条目必须带着尺寸进入列表（快照）。
+///
+/// 修复前 arboard 交出的是裸 RGBA8（无文件头），store 的格式嗅探
+/// 必然失败 ⇒ dims 全列 NULL ⇒ 界面显示「图片 N 字节」且不渲染
+/// 缩略图（用户原话：「图片显示开启后还是显示 图片 xxxx 字节」）。
+/// 尺寸现在由捕获侧透传，本测试守住「透传不丢」。
+#[test]
+fn image_ingest_persists_dimensions_for_raw_rgba_payload() {
+    let mut s = svc();
+    let (w, h) = (320u32, 240u32);
+    s.ingest(modular_clipboard_core::CapturedPayload {
+        kind: ClipKind::Image,
+        // 纯色 RGBA：没有任何文件头——正是修复前每一环都解不动的形态。
+        bytes: vec![0x11u8; (w * h * 4) as usize],
+        html: None,
+        text: None,
+        source_app: "SnippingTool".into(),
+        files: Vec::new(),
+        dims: Some((w, h)),
+    });
+
+    assert_eq!(s.state.items.len(), 1);
+    let item = &s.state.items[0];
+    assert_eq!(
+        item.payload.as_ref().and_then(|p| p.dims),
+        Some((w, h)),
+        "尺寸必须透传到 img_w/img_h 列，否则界面无法渲染缩略图"
+    );
+    assert_eq!(item.preview, "图片 320×240");
+    // 载荷原样落盘（仍是裸 RGBA，长度自洽）。
+    assert_eq!(item.payload.as_ref().map(|p| p.len), Some((w * h * 4) as u64));
 }
 
 #[test]

@@ -862,7 +862,11 @@ impl LocalBackend {
 
         let item = ClipItem::new(payload.kind, hash, preview, source_app);
 
-        match self.store.insert(item, payload.bytes) {
+        // 图片尺寸透传：载荷是裸 RGBA8（arboard 解码 CF_DIBV5 的产物），
+        // store 侧的格式嗅探对它无效，只能由捕获侧给（见 CapturedPayload::dims）。
+        // 先取字段再移动 bytes，避免部分移动。
+        let dims = payload.dims.filter(|(w, h)| *w > 0 && *h > 0);
+        match self.store.insert_with_dims(item, payload.bytes, dims) {
             Ok(saved) => {
                 tracing::debug!(id = saved.id, kind = ?saved.kind, "新条目已入库");
                 self.store.touch(saved.id).ok();
@@ -941,7 +945,7 @@ impl LocalBackend {
             }
             ClipKind::Image => {
                 // 需要把原始图片字节解码为 RGBA 再写回。
-                let (rgba, w, h) = decode_to_rgba(&bytes)?;
+                let (rgba, w, h) = decode_to_rgba(&item, &bytes)?;
                 reader.write_image(rgba, w, h)?;
             }
         }
@@ -1355,7 +1359,13 @@ fn build_preview(payload: &CapturedPayload) -> String {
         }
         ClipKind::Image => {
             // 图片用尺寸描述作为预览，解码失败时给出可读提示。
-            match image_dimensions(&payload.bytes) {
+            // dims 优先取捕获侧透传的（载荷为裸 RGBA8 时这是唯一来源），
+            // 缺失才解析文件头（兼容历史编码格式数据）。
+            let dims = payload
+                .dims
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .or_else(|| image_dimensions(&payload.bytes));
+            match dims {
                 Some((w, h)) => format!("图片 {w}×{h}"),
                 None => format!("图片 {} 字节", payload.bytes.len()),
             }
@@ -1382,8 +1392,28 @@ pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         .ok()
 }
 
-/// 把任意格式图片解码为 RGBA8，供写回剪贴板使用。
-fn decode_to_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+/// 把载荷解码为 RGBA8，供写回剪贴板使用。
+///
+/// # 双形态
+///
+/// 1. **裸 RGBA8**（现行规范）：载荷长度与 `item.payload.dims` 声名的
+///    `w*h*4` 精确吻合时直接透传。这是 arboard 在 Windows 上交给我们的
+///    形态（CF_DIBV5 解码产物），`load_from_memory` 对它必然失败——
+///    曾导致历史图片条目「能看不能复制」。
+/// 2. **编码格式**（历史数据 / 其他来源）：走 `image` crate 全量解码。
+fn decode_to_rgba(item: &ClipItem, bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    if let Some((w, h)) = item
+        .payload
+        .as_ref()
+        .and_then(|p| p.dims)
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        && (w as u64)
+            .saturating_mul(h as u64)
+            .saturating_mul(4)
+            == bytes.len() as u64
+    {
+        return Ok((bytes.to_vec(), w, h));
+    }
     let img = image::load_from_memory(bytes)?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -1451,6 +1481,7 @@ mod tests {
             text: Some(text.to_string()),
             source_app: "test".into(),
             files: Vec::new(),
+            dims: None,
         }
     }
 
@@ -1463,6 +1494,7 @@ mod tests {
             text: Some("a\nb\nc".into()),
             source_app: "x".into(),
             files: vec!["C:\\a.txt".into(), "C:\\b.txt".into(), "C:\\c.txt".into()],
+            dims: None,
         };
         let preview = build_preview(&p);
         assert!(preview.contains("3 个文件"), "实际: {preview}");
@@ -1477,8 +1509,28 @@ mod tests {
             text: None,
             source_app: "x".into(),
             files: Vec::new(),
+            dims: None,
         };
         assert!(build_preview(&p).starts_with("图片"));
+    }
+
+    /// 裸 RGBA8 载荷（无文件头）也能得到尺寸文案——这正是修复前
+    /// 「图片显示开启后还是显示 图片 N 字节」的回归测试：
+    /// 尺寸必须来自捕获侧透传的 `dims`，而不是从字节里猜。
+    #[test]
+    fn preview_for_image_uses_captured_dims_for_raw_rgba() {
+        let w = 64u32;
+        let h = 48u32;
+        let p = CapturedPayload {
+            kind: ClipKind::Image,
+            bytes: vec![0x80u8; (w * h * 4) as usize],
+            html: None,
+            text: None,
+            source_app: "x".into(),
+            files: Vec::new(),
+            dims: Some((w, h)),
+        };
+        assert_eq!(build_preview(&p), "图片 64×48");
     }
 
     #[test]

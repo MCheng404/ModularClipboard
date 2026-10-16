@@ -285,7 +285,29 @@ impl Store {
     /// - `text`/`html`：文本进FTS，载荷写文件（超过阈值时仅存元数据）。
     /// - `image`：原始字节写文件，不进 FTS。
     /// - `files`：路径清单写文件，不进 FTS。
-    pub fn insert(&mut self, mut item: ClipItem, payload: Vec<u8>) -> Result<ClipItem> {
+    pub fn insert(&mut self, item: ClipItem, payload: Vec<u8>) -> Result<ClipItem> {
+        self.insert_with_dims(item, payload, None)
+    }
+
+    /// 同 [`Self::insert`]，但由调用方提供图片尺寸。
+    ///
+    /// # 为什么需要这个入口
+    ///
+    /// 本项目图片载荷的规范形态是**裸 RGBA8 像素**（arboard 在 Windows 上
+    /// 把 CF_DIBV5/CF_PNG 解码成 RGBA 后交出，字节里没有文件头），
+    /// [`compute_dims`] 的格式嗅探对它必然失败——曾因此整条图片链路
+    /// （预览文案 / dims 列 / 缩略图渲染）全部退化成「图片 N 字节」。
+    /// 尺寸只能在捕获侧拿到（[`CapturedPayload::dims`]，arboard 白给
+    /// `ImageData::width/height`，零成本），经此入口透传。
+    ///
+    /// `dims` 为 `None` 时（文本类 / 旧调用方）仍走 [`compute_dims`]
+    /// 兜底，兼容历史编码格式数据。
+    pub fn insert_with_dims(
+        &mut self,
+        mut item: ClipItem,
+        payload: Vec<u8>,
+        dims: Option<(u32, u32)>,
+    ) -> Result<ClipItem> {
         let cfg_max = self.current_payload_limit();
 
         // 载荷落盘，超限则只保留元数据。
@@ -295,7 +317,10 @@ impl Store {
         // 载荷文件（置顶条目不参与去重、dedup=false 时每次复制都插入一条），
         // 一个文件损坏会同时摧毁多条历史记录。
         let payload_ref = if payload.len() as u64 <= cfg_max {
-            let dims = compute_dims(&item.kind, &payload);
+            // 显式尺寸优先；缺失才嗅探文件头。
+            let dims = dims
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .or_else(|| compute_dims(&item.kind, &payload));
             let name = format!("{}.bin", item.hash);
             write_blob_atomic(&self.blob_dir, &name, &payload)?;
             Some(PayloadRef {

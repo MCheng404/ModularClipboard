@@ -63,6 +63,7 @@ impl ClipboardReader {
                 text: Some(joined.clone()),
                 source_app,
                 files,
+                dims: None,
             });
         }
 
@@ -72,6 +73,10 @@ impl ClipboardReader {
             if !bytes.is_empty() {
                 return Some(CapturedPayload {
                     kind: ClipKind::Image,
+                    // 尺寸必须在此刻留下：arboard 交出的是 DIB 解码后的
+                    // 裸 RGBA8（见 CapturedPayload::dims 文档），字节本身
+                    // 无法反推宽高，下游全部环节都靠这个字段。
+                    dims: Some((img.width as u32, img.height as u32)),
                     bytes,
                     html: None,
                     text: None,
@@ -101,6 +106,7 @@ impl ClipboardReader {
                 text: Some(t),
                 source_app,
                 files: Vec::new(),
+                dims: None,
             }),
             (None, Some(h)) if !h.is_empty() => Some(CapturedPayload {
                 kind: ClipKind::Html,
@@ -109,6 +115,7 @@ impl ClipboardReader {
                 text: Some(strip_html(&h)),
                 source_app,
                 files: Vec::new(),
+                dims: None,
             }),
             _ => None,
         }
