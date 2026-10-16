@@ -71,6 +71,15 @@ pub enum Op {
     /// 置顶模式切换。
     SetPinnedMode(PinnedMode),
 
+    // ---- 详情面板：图片原图查看 ----
+    /// 进入「原图模式」：详情面板渲染全尺寸原图而非缩略图。
+    ///
+    /// 同一 id 的二次进入是幂等的——已是 zoom 状态时不必再发。
+    /// 落地由 `App::apply_ops` 直接改 `UiState::detail_image_zoom`。
+    DetailImageZoom(modular_clipboard_core::EntryId),
+    /// 退出原图模式。
+    DetailImageZoomClear,
+
     // ---- 设置界面 ----
     //
     // CAUTION: 配置项**不能**在 paint 里直接改：`Frame` 借的是 `&UiConfig`，
@@ -502,6 +511,20 @@ pub struct UiState {
     /// 强制——早期实现每帧 `show_settings = true`，导致带该环境变量
     /// 启动时设置窗口**永远关不掉**（点 ✕ / 齿轮都被下一帧改回）。
     pub settings_startup_opened: bool,
+
+    // ---- 详情面板：图片原图查看 ----
+    /// 当前是否在「原图模式」：详情面板渲染**全尺寸原图**而非缩略图。
+    ///
+    /// 与 `detail_image_orig` 配对——前者表达意图、后者缓存 GPU 纹理。
+    /// 切换选中 / 关闭原图模式时同时清空两个。
+    pub detail_image_zoom: Option<modular_clipboard_core::EntryId>,
+    /// 已上传的原图 GPU 纹理（条目 id → 纹理句柄）。
+    ///
+    /// 仅在进入原图模式时上传一次；`detail_image_zoom` 变化时同步释放。
+    /// `TextureHandle` 是 RAII，drop 时由 egui 自动 `ctx.forget()`，
+    /// 因此不需要显式 free——只需要让本字段离开作用域。
+    pub detail_image_orig:
+        Option<(modular_clipboard_core::EntryId, egui::TextureHandle)>,
 
     // ---- 设置界面状态（左右导航 + 卡片布局）----
     /// 当前选中分类（左侧导航）。
@@ -5608,11 +5631,12 @@ const SCROLLBAR_RESERVE: f32 = crate::theme::SCROLLBAR_WIDTH;
 /// 每行文字的高度倍率。
 const LINE_H: f32 = 1.35;
 
-/// 图片条目内嵌缩略图的限高（逻辑点）≈ 3 行正文。
+/// 缩略图默认限高（逻辑点）≈ 3 行正文，与第三轮原型一致。
 ///
-/// 与原型一致：再高会让一条记录占据半屏，列表的信息密度崩塌；
-/// 更宽的图按比例缩窄，长宽比不变。
-const IMG_MAX_H: f32 = 108.0;
+/// 仅作为列表行内嵌缩略图的默认上限；详情面板在
+/// [`draw_image_preview`] 里另行传更大的值（图占满整宽）。
+/// 再高会让一条记录占据半屏、列表信息密度崩塌。
+pub const IMG_MAX_H_LIST: f32 = 108.0;
 
 /// 单条列表项的**实际**行高：按内容排版结果计算。
 ///
@@ -5628,7 +5652,7 @@ const IMG_MAX_H: f32 = 108.0;
 /// 中英文混排、全角半角混排都能正确处理。
 ///
 /// 2026-10-15 第三轮起有三种内容形态，行高各按各的算：
-/// - 图片（`image_inline` 开）= 缩略图显示高（限高 [`IMG_MAX_H`]）；
+/// - 图片（`image_inline` 开）= 缩略图显示高（限高 [`IMG_MAX_H_LIST`]）；
 /// - Markdown（`md_rendered` 开）= 排版实测高；
 /// - 其余 = 折行文本高。
 fn row_height_for(
@@ -5657,10 +5681,10 @@ fn row_height_for(
         && dims.0 > 0
         && dims.1 > 0
     {
-        // 缩略图显示高：限高 IMG_MAX_H，宽不超预览带（保持长宽比）。
+        // 缩略图显示高：限高 IMG_MAX_H_LIST，宽不超预览带（保持长宽比）。
         // dims 来自 store 插入时读的图片头，**不需要解码**——
         // 行高是每帧都要算的（滚动数学），为它解码全图太贵。
-        IMG_MAX_H.min(text_w * dims.1 as f32 / dims.0 as f32)
+        IMG_MAX_H_LIST.min(text_w * dims.1 as f32 / dims.0 as f32)
     } else if item.kind == modular_clipboard_core::ClipKind::Markdown && cfg.md_rendered {
         crate::md::MdDoc::parse(&item.preview).height(ui, pal, scale, text_w)
     } else {
@@ -5697,58 +5721,304 @@ fn row_height_for(
     (content_h + meta_h + top_h + 5.0 * 2.0 + 4.0).max(ROW_HEIGHT_MIN)
 }
 
+/// 详情面板：选中条目的全文视图。
+///
+/// 2026-10-16 起：详情面板按 [`ClipKind`] 分发——图片内嵌缩略图、
+/// Markdown 渲染 / 源码、文本折行，**不再只用 `elide_text` 截一段**。
+/// 这正是「图片内容直接显示」与「Markdown 渲染显示」在主窗口的另一
+/// 个展示位：列表行只显示一行内的预览（缩略图 / 第一屏 Markdown），
+/// 详情面板给完整内容（缩略图占满宽、Markdown 全文）。
+///
+/// 行高限制也不同于列表：列表行 `IMG_MAX_H_LIST ≈ 108pt` 防止单条
+/// 撑爆，本函数不限——内容带本身就被详情卡片高度约束，超长 Markdown
+/// 自动溢出滚动区。
+///
+/// # 配置开关
+///
+/// - `image_inline` 关闭 ⇒ 图片条目降级为「图片 WxH」文字；
+/// - `md_rendered` 关闭 ⇒ Markdown 条目降级为等宽纯文本。
+///
+/// 与列表行保持一致的开关语义——用户在一个地方关了，在另一处也看不到。
 fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
+    use modular_clipboard_core::ClipKind;
     let Some(id) = f.svc.state.selected else {
+        // 选中丢失：原图缓存随之丢弃。
+        clear_detail_image_zoom(f);
         draw_empty(f, body, "选中一条记录查看详情");
         return;
     };
-    let Some(item) = f.svc.state.items.iter().find(|it| it.id == id) else {
+    // 先把选中的 item 拷一份：原图模式分支与三分支都需要
+    // `item.id`（推 Op / 解码原图），而 `f.svc.state.items` 的借用会
+    // 与后面的 `&mut f` 冲突。`ClipItem` 字段少，clone 不贵。
+    let Some(item) = f.svc.state.items.iter().find(|it| it.id == id).cloned() else {
+        // 选中条目已不存在：原图缓存同样失效。
+        clear_detail_image_zoom(f);
         draw_empty(f, body, "该记录已不存在");
         return;
     };
+
+    // 原图模式：当前选中是图片、且 zoom 状态指向它——独占整张详情卡。
+    if item.kind == ClipKind::Image && f.state.detail_image_zoom == Some(item.id) {
+        draw_detail_image_zoom(f, body, &item);
+        return;
+    }
+
+    // 不是原图模式：清掉残留的原图缓存（zoom 已失效或选中已换）。
+    if f.state.detail_image_zoom.is_some() {
+        clear_detail_image_zoom(f);
+    }
+
     let pal = f.pal;
     let scale = f.scale;
 
-    // 详情文字按可用矩形裁剪：长内容不得溢出卡片。
-    let text_area = body.shrink2(vec2(pal.space_xs, 0.0));
-    let font = sized(pal.font_sm, scale);
-    let preview = if item.preview.is_empty() {
-        "（无预览）"
-    } else {
-        item.preview.as_str()
-    };
-    let shown = crate::text::elide_text(f.ui, preview, &font, text_area.width());
-    f.ui.painter_at(text_area).text(
-        pos2(text_area.min.x, text_area.min.y + font.size),
-        Align2::LEFT_TOP,
-        shown,
-        font.clone(),
-        pal.text,
+    // 底栏：来源 · 时间（meta 行）。与原实现保持一致的位置与字号。
+    let meta_font = sized(pal.font_xs, scale);
+    let meta_h = meta_font.size * 1.2;
+    let meta_band = Rect::from_min_max(
+        pos2(body.min.x, body.max.y - meta_h),
+        pos2(body.max.x, body.max.y),
     );
+    // 内容带：去掉底栏后剩下的全部空间。
+    let content_band = Rect::from_min_max(body.min, pos2(body.max.x, meta_band.min.y));
+    if content_band.width() <= 0.0 || content_band.height() <= 0.0 {
+        return;
+    }
 
-    // 来源与时间。
-    let meta_y = text_area.min.y + font.size * 2.4;
-    if meta_y < text_area.max.y {
-        // CAUTION: `max.y` 只能是 `meta_y + 高`，**不能**再叠加 `text_area.min.y`。
-        // 叠加后高度会变成 `min.y + 高`（几百 pt），而文字画在
-        // `meta_area.left_center()` —— 「来源 · 时间」会跑到卡片中部甚至
-        // 卡片之外；而 `painter_at(meta_area)` 的裁剪就是它自己，
-        // 越界部分不受任何裁剪。
-        let meta_area = Rect::from_min_max(
-            pos2(text_area.min.x, meta_y),
-            pos2(text_area.max.x, meta_y + font.size * 1.2),
-        );
-        let meta_font = sized(pal.font_xs, scale);
-        let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
-        let meta_shown =
-            crate::text::elide_text(f.ui, &meta, &meta_font, meta_area.width());
-        f.ui.painter_at(meta_area).text(
-            meta_area.left_center(),
+    // 判据：从 config 现取，不能持有 `&cfg` 跨 `&mut f`。
+    let image_inline = f.svc.state.config.ui.image_inline;
+    let md_rendered = f.svc.state.config.ui.md_rendered;
+
+    // 三分支：图片直显 / Markdown 渲染 / 文本折行。
+    //
+    // CAUTION: `draw_image_preview` 与 `draw_markdown_preview` 都需要
+    // `&mut f`，所以这里**只能二选一**——开关决定具体走哪一支。
+    match item.kind {
+        ClipKind::Image if image_inline => {
+            // 详情面板让图占满宽（不限 IMG_MAX_H_LIST，按 band.height
+            // 走，长宽比由 `draw_image_preview` 内部保持）。
+            //
+            // 报告到 `thumb_seen`：让本帧上传的纹理在 `draw` 收尾
+            // retain 时不被误淘汰（与列表行用同一机制）。
+            f.state.thumb_seen.insert(item.id);
+            draw_image_preview(f, content_band, &item, content_band.height());
+            // 缩略图右下角：「放大」按钮，点击进入原图模式。
+            draw_zoom_button(f, pal, &item);
+        }
+        ClipKind::Markdown if md_rendered => {
+            draw_markdown_preview(f, content_band, &item);
+        }
+        ClipKind::Markdown => {
+            // md_rendered 关：等宽源码按 band 高度计算可见行数（不截断），
+            // 溢出自动换行。`draw_source_preview` 内部已 max_rows 限位，
+            // 详情面板空间通常足够放下整段。
+            draw_source_preview(f, content_band, &item);
+        }
+        _ => {
+            // 文本 / HTML / Files / Markdown 关 / Image 关 ⇒ 等宽折行。
+            //
+            // 用 `draw_text_preview` 而不是 `elide_text`：详情面板就该把
+            // 全文铺开，让用户读到完整内容。`draw_text_preview` 内部按
+            // band 宽度折行，溢出自动到下一行（撑出可见区会被外层
+            // 滚动框裁剪）。
+            draw_text_preview(f, content_band, &item, false);
+        }
+    }
+
+    // 来源 · 时间：永远画在最底，与列表行语义一致。
+    let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
+    let meta_shown = crate::text::elide_text(f.ui, &meta, &meta_font, meta_band.width());
+    if !meta_shown.is_empty() {
+        f.ui.painter_at(meta_band).text(
+            meta_band.left_center(),
             Align2::LEFT_CENTER,
             meta_shown,
             meta_font,
             pal.text_dim,
         );
+    }
+}
+
+/// 清掉详情面板的原图模式缓存（zoom + 已上传的 orig 纹理）。
+///
+/// `TextureHandle` 是 RAII：drop 时 egui 自动 `ctx.forget()`，所以只需
+/// 让 `detail_image_orig` 离开作用域——这里统一清两个字段保证一致。
+fn clear_detail_image_zoom(f: &mut Frame<'_>) {
+    f.state.detail_image_zoom = None;
+    f.state.detail_image_orig = None;
+}
+
+/// 在图片缩略图右下角画一个「放大」按钮。点击推一个 [`Op::DetailImageZoom`]。
+///
+/// `image_inline` 关闭或载荷被淘汰（无 dims）时不画——按钮的出现与
+/// 实际能进入原图模式的能力保持一致。
+fn draw_zoom_button(f: &mut Frame<'_>, pal: &Palette, item: &ClipItem) {
+    // 载荷被淘汰（无 dims）：缩略图也画不出来——按钮更不该出现。
+    let has_dims = item
+        .payload
+        .as_ref()
+        .and_then(|p| p.dims)
+        .map(|(w, h)| w > 0 && h > 0)
+        .unwrap_or(false);
+    if !has_dims {
+        return;
+    }
+    let btn_size = 24.0;
+    let pad = 8.0;
+    // 按钮位置：内容带右下角。`painter_at` 与按钮的 rect 一致。
+    let btn_rect = Rect::from_min_size(
+        pos2(
+            f.area.max.x - btn_size - pad,
+            f.area.max.y - btn_size - pad,
+        ),
+        vec2(btn_size, btn_size),
+    );
+    // 用 `ui.interact` 而**不是**直接 push Op：每帧都画按钮，
+    // 直接 push 等于「每帧推同一个 Op」，会让 IPC 通讯爆炸；
+    // `clicked` 仅在用户真正点击时为 true。
+    let id = egui::Id::new(("detail_image_zoom", item.id));
+    let resp = f.ui.interact(btn_rect, id, Sense::click());
+    let painter = f.ui.painter_at(btn_rect);
+    painter.rect_filled(
+        btn_rect,
+        pal.radius_md,
+        if resp.hovered() {
+            pal.surface
+        } else {
+            pal.surface_variant
+        },
+    );
+    Icon::Image.paint(&painter, btn_rect.shrink(4.0), pal.text_dim);
+    if resp.clicked() {
+        f.state.ops.push(Op::DetailImageZoom(item.id));
+    }
+}
+
+/// 原图模式：直接渲染**全尺寸**原图，按内容带保持长宽比。
+///
+/// 与缩略图路径分两条：
+/// - 缩略图走 `thumb_cache` + `IMG_MAX_H_LIST` 限位；
+/// - 原图用 `thumbnail::decode(bytes, u32::MAX)` 不限尺寸、单独缓存
+///   在 `detail_image_orig`，避免污染缩略图缓存。
+///
+/// `decode` 是同步调用——4K 图可能让 UI 卡几十毫秒。当前项目里
+/// 一次只点一次，先把功能接通；后续若需要可加后台线程（见 TODO）。
+fn draw_detail_image_zoom(f: &mut Frame<'_>, body: Rect, item: &ClipItem) {
+    let pal = f.pal;
+    let scale = f.scale;
+
+    // 底栏：与缩略图模式一致；返回按钮放在右上角，与 meta 行同行。
+    let meta_font = sized(pal.font_xs, scale);
+    let meta_h = meta_font.size * 1.2;
+    let meta_band = Rect::from_min_max(
+        pos2(body.min.x, body.max.y - meta_h),
+        pos2(body.max.x, body.max.y),
+    );
+    let content_band = Rect::from_min_max(body.min, pos2(body.max.x, meta_band.min.y));
+
+    // 原图按需解码 + 上传：缓存命中（id 匹配）就跳过。
+    let dims = item
+        .payload
+        .as_ref()
+        .and_then(|p| p.dims)
+        .filter(|(w, h)| *w > 0 && *h > 0);
+    let needs_upload = f
+        .state
+        .detail_image_orig
+        .as_ref()
+        .map(|(id, _)| *id != item.id)
+        .unwrap_or(true);
+    if needs_upload {
+        match f.svc.load_payload_bytes(item.id) {
+            Ok(bytes) => match crate::thumbnail::decode(&bytes, u32::MAX) {
+                Ok(thumb) => {
+                    let img = thumb.to_color_image();
+                    let handle = f.ui.ctx().load_texture(
+                        format!("mc_orig_{}", item.id),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    f.state.detail_image_orig = Some((item.id, handle));
+                }
+                Err(e) => {
+                    tracing::debug!(id = item.id, ?e, "原图解码失败");
+                    f.state.detail_image_orig = None;
+                }
+            },
+            Err(e) => {
+                tracing::debug!(id = item.id, ?e, "原图读取失败");
+                f.state.detail_image_orig = None;
+            }
+        }
+    }
+
+    // 取当前已上传的纹理——失败时画错误提示。
+    let handle_id = f
+        .state
+        .detail_image_orig
+        .as_ref()
+        .filter(|(id, _)| *id == item.id)
+        .map(|(_, h)| h.id());
+
+    if let Some(tex_id) = handle_id {
+        // 原图占满内容带、保持长宽比。
+        if let Some((w, h)) = dims {
+            let ratio = w as f32 / h as f32;
+            let mut disp_w = content_band.width();
+            let mut disp_h = disp_w / ratio;
+            if disp_h > content_band.height() {
+                disp_h = content_band.height();
+                disp_w = disp_h * ratio;
+            }
+            let rect = Rect::from_min_size(content_band.min, vec2(disp_w, disp_h));
+            let painter = f.ui.painter_at(rect);
+            painter.image(
+                tex_id,
+                rect,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            // 1px 描边：浅色图与深色面板之间需要边界。
+            painter.rect_stroke(
+                rect,
+                6.0,
+                Stroke::new(1.0, pal.border_subtle),
+                egui::StrokeKind::Inside,
+            );
+        } else {
+            draw_empty(f, content_band, "原图尺寸未知");
+        }
+    } else {
+        draw_empty(f, content_band, "原图加载失败");
+    }
+
+    // 来源 · 时间：给返回按钮留 80pt 空间。
+    let meta = format!("{} · {}", item.source_app, format_meta(item.created_at));
+    let meta_shown = crate::text::elide_text(f.ui, &meta, &meta_font, meta_band.width() - 80.0);
+    if !meta_shown.is_empty() {
+        f.ui.painter_at(meta_band).text(
+            meta_band.left_center(),
+            Align2::LEFT_CENTER,
+            meta_shown,
+            meta_font,
+            pal.text_dim,
+        );
+    }
+
+    // 右上角「返回」按钮：点击清除 zoom 与 orig 缓存。
+    let back_size = 20.0;
+    let back_pad = 6.0;
+    let back_rect = Rect::from_min_size(
+        pos2(
+            meta_band.max.x - back_size - back_pad,
+            meta_band.min.y + (meta_h - back_size) * 0.5,
+        ),
+        vec2(back_size, back_size),
+    );
+    let back_id = egui::Id::new(("detail_image_back", item.id));
+    let back_resp = f.ui.interact(back_rect, back_id, Sense::click());
+    Icon::Close.paint(&f.ui.painter_at(back_rect), back_rect, pal.text_dim);
+    if back_resp.clicked() {
+        f.state.ops.push(Op::DetailImageZoomClear);
     }
 }
 
@@ -6196,13 +6466,13 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 
     if preview_band.height() > 4.0 {
         if is_image && image_inline {
-            draw_image_preview(f, ui, preview_band, item);
+            draw_image_preview(f, preview_band, item, IMG_MAX_H_LIST);
         } else if is_markdown && md_rendered {
-            draw_markdown_preview(f, ui, preview_band, item);
+            draw_markdown_preview(f, preview_band, item);
         } else if is_markdown {
-            draw_source_preview(f, ui, preview_band, item);
+            draw_source_preview(f, preview_band, item);
         } else {
-            draw_text_preview(f, ui, preview_band, item, selected);
+            draw_text_preview(f, preview_band, item, selected);
         }
     }
 
@@ -6421,7 +6691,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 /// 文本预览（默认形态）：按预览带宽度折行，**完整显示**。
 ///
 /// 选中态把文字提亮一档（与 `sel_fx` 的描边/底色叠加表达选中）。
-fn draw_text_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem, selected: bool) {
+fn draw_text_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, selected: bool) {
     let pal = f.pal;
     // 用 `Painter::layout_job` 按宽度折行，返回**完整** Galley——
     // 这才是「完整显示」：不丢任何字符，只是折行。
@@ -6459,14 +6729,15 @@ fn draw_text_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipIt
     // 长路径/无空格的长串要在任意字符间断行，否则会横向溢出。
     job.wrap.break_anywhere = true;
     let galley = f.ui.painter().layout_job(job);
-    ui.painter_at(band)
+    f.ui
+        .painter_at(band)
         .galley(pos2(band.min.x, band.min.y), galley, pal.text);
 }
 
 /// Markdown 源码预览（`md_rendered` 关闭时）：等宽 + 弱化色。
 ///
 /// 与渲染态明确区分——用户能一眼看出「现在看到的是原始 Markdown」。
-fn draw_source_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
+fn draw_source_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
     let pal = f.pal;
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -6482,7 +6753,8 @@ fn draw_source_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &Clip
     job.wrap.max_rows = ((band.height() / (pal.font_sm * 1.45)).floor().max(1.0)) as usize;
     job.wrap.break_anywhere = true;
     let galley = f.ui.painter().layout_job(job);
-    ui.painter_at(band)
+    f.ui
+        .painter_at(band)
         .galley(pos2(band.min.x, band.min.y), galley, pal.text_dim);
 }
 
@@ -6491,13 +6763,13 @@ fn draw_source_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &Clip
 /// 行高由 `row_height_for` 调**同一个** `md::MdDoc` 的 `height()` 算出，
 /// 绘制调 `draw()`——同一函数、同一宽度，测量与绘制不可能漂移。
 /// 选中态不提亮文字（`sel_fx` 覆盖层已足够表达），与原型一致。
-fn draw_markdown_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
+fn draw_markdown_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
     let doc = crate::md::MdDoc::parse(&item.preview);
     if doc.is_empty() {
         return;
     }
     let pal = f.pal;
-    doc.draw(ui, pal, f.scale, band.min, band.width());
+    doc.draw(f.ui, pal, f.scale, band.min, band.width());
 }
 
 /// 图片预览（第三轮新增）：内容区直接显示缩略图。
@@ -6509,10 +6781,14 @@ fn draw_markdown_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &Cl
 ///
 /// 任何一步失败（载荷被淘汰 / 不是图片 / 解码失败）都**回落文本预览**：
 /// 剪贴板工具的列表不能因为一张坏图就少画一行。
-fn draw_image_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
+///
+/// `max_h` 是缩略图显示高的**上限**——列表行传 [`IMG_MAX_H_LIST`] 防止
+/// 单条记录撑爆，详情面板传 `[body.width(), body.height()]` 让图按
+/// 长宽比尽量放大。
+fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32) {
     use modular_clipboard_core::ClipKind;
     let _ = ClipKind::Image;
-    // 显示矩形：限高 IMG_MAX_H、限宽预览带，保持长宽比，左上对齐。
+    // 显示矩形：限高 max_h、限宽预览带，保持长宽比，左上对齐。
     let Some(dims) = item
         .payload
         .as_ref()
@@ -6520,16 +6796,16 @@ fn draw_image_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipI
         .filter(|(w, h)| *w > 0 && *h > 0)
     else {
         // 没有尺寸信息（载荷已被淘汰）：按普通文本显示（「图片 WxH」）。
-        draw_text_preview(f, ui, band, item, false);
+        draw_text_preview(f, band, item, false);
         return;
     };
     let ratio = dims.0 as f32 / dims.1 as f32;
-    // 显示矩形：限高 IMG_MAX_H、限宽预览带，**两步都保持长宽比**。
+    // 显示矩形：限高 max_h、限宽预览带，**两步都保持长宽比**。
     //
     // CAUTION: 不能「高先定死、宽超了再截」——那会把图拉扁
     // （painter.image 按 uv 0..1 把整张图填进矩形）。宽超限时必须
     // 回头按比例缩高，否则极窄窗口下截图变成压扁的条。
-    let mut disp_h = IMG_MAX_H.min(band.height());
+    let mut disp_h = max_h.min(band.height());
     let mut disp_w = disp_h * ratio;
     if disp_w > band.width() {
         disp_w = band.width();
@@ -6555,7 +6831,8 @@ fn draw_image_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipI
                     // 累积，egui 侧不会因此长出新纹理。
                     // 只存 `TextureId`：纹理由 Context 持有（注册即托管），
                     // 句柄（TextureHandle）只是引用，没必要长留。
-                    let t = ui
+                    let t = f
+                        .ui
                         .ctx()
                         .load_texture(
                             format!("mc_thumb_{id}"),
@@ -6574,10 +6851,10 @@ fn draw_image_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipI
         }
     };
     let Some(tex) = tex else {
-        draw_text_preview(f, ui, band, item, false);
+        draw_text_preview(f, band, item, false);
         return;
     };
-    let painter = ui.painter_at(rect);
+    let painter = f.ui.painter_at(rect);
     // uv 给整张图（0..1），tint 白色（不染色——缩略图颜色即原图）。
     painter.image(
         tex,
@@ -9334,7 +9611,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 图片条目的行高 = 缩略图显示高（限高 [`IMG_MAX_H`]）+ 固定段，
+    /// 图片条目的行高 = 缩略图显示高（限高 [`IMG_MAX_H_LIST`]）+ 固定段，
     /// 与同尺寸文本行**不同**——证明走的是图片分支而不是文本分支。
     #[test]
     fn row_height_uses_thumbnail_height_for_images() {

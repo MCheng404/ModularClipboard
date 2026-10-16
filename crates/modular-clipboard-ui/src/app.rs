@@ -2381,6 +2381,18 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 Op::ToggleSettings => {
                     self.paint_state.show_settings = !self.paint_state.show_settings;
                 }
+                Op::DetailImageZoom(id) => {
+                    // 进入原图模式——绘制层下一帧直接走 `draw_detail_image_zoom`。
+                    // 幂等：已是该 id 的 zoom 不必再清 orig（缓存仍然有效）。
+                    if self.paint_state.detail_image_zoom != Some(id) {
+                        self.paint_state.detail_image_zoom = Some(id);
+                        self.paint_state.detail_image_orig = None;
+                    }
+                }
+                Op::DetailImageZoomClear => {
+                    self.paint_state.detail_image_zoom = None;
+                    self.paint_state.detail_image_orig = None;
+                }
                 Op::ClearAll => {
                     if let Err(e) = self.svc.clear_all() {
                         self.svc.notify(format!("清空失败: {e}"));
