@@ -894,6 +894,7 @@ impl Batch {
                     height: (y1 - y0).max(0) as u32,
                 },
             }),
+            user_set: ash::vk::DescriptorSet::null(),
         }
     }
 }

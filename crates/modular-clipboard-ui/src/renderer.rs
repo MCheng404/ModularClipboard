@@ -20,10 +20,13 @@ use modular_clipboard_gfx::backdrop::{
 };
 use modular_clipboard_gfx::blur::{BlurChain, BlurPipeline, DEFAULT_DIVISOR, DEFAULT_RADIUS};
 use modular_clipboard_gfx::buffer::{Buffer, UniformBuffer, Vertex};
-use modular_clipboard_gfx::frame::{DrawInput, FrameRenderer};
+use modular_clipboard_gfx::frame::{
+    CommonBindings, DrawInput, FrameRenderer, USER_TEXTURE_SET_CAP,
+};
 use modular_clipboard_gfx::pipeline::Uniforms;
 use modular_clipboard_gfx::texture::{DeviceImage, FONT_FORMAT, Sampler};
 
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 /// 窗口标题，同时作为 Vulkan 应用标识。
@@ -72,6 +75,22 @@ pub fn texture_slot(id: egui::TextureId) -> u32 {
     } else {
         TEX_SLOT_USER
     }
+}
+
+/// 纹理增量是否为「整图更新」。
+///
+/// # 这个判据曾经写反过（2026-10-16 修）
+///
+/// `upload_font_delta` 早前写成 `let Some(_pos) = last.pos else { continue }`
+/// ——把 `pos == None`（**整图更新**，`ctx.load_texture` 的唯一形态）
+/// 当成「局部更新」跳过 ⇒ 缩略图纹理从未上传，症状是
+/// **「缩略图区域一片空白」且不报任何 GPU 错误**（描述符绑的是
+/// 占位图，一切合法，只是没有内容）。
+///
+/// egui 语义（`epaint::ImageDelta`）：`pos == None` ⇒ 整图替换；
+/// `Some(offset)` ⇒ 纹理内某个子区域的补丁。
+pub fn is_full_image_update(pos: Option<[usize; 2]>) -> bool {
+    pos.is_none()
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +177,10 @@ impl Batch {
                 offset: vk::Offset2D { x: x0, y: y0 },
                 extent: vk::Extent2D { width: w, height: h },
             }),
+            // 默认不重绑（文字/形状批）。缩略图批由 paint() 在转换后
+            // 按 `tex_id` 从 `Painter::user_textures` 查表填上该纹理
+            // 的描述符集——本方法拿不到纹理表。
+            user_set: vk::DescriptorSet::null(),
         }
     }
 }
@@ -384,6 +407,16 @@ pub fn repaint_delay(output: &egui::FullOutput) -> Option<std::time::Duration> {
 // Painter
 // ---------------------------------------------------------------------------
 
+/// 一张用户纹理（图片缩略图）在 GPU 侧的全部资源。
+///
+/// `set` 是**这张纹理专属**的描述符集：uniform / sampler / 字体图集
+/// 与帧槽集合相同，只有 `BINDING_USER_TEXTURE` 指向本图的视图。
+/// 批次绘制前按需重绑（见 `DrawBatch::user_set`）。
+struct UserTexture {
+    image: DeviceImage,
+    set: vk::DescriptorSet,
+}
+
 /// 一帧的绘制上下文。
 ///
 /// 借用 `Gpu`（内部要建缓冲、查表面能力）。`Drop` 时先 `device_wait_idle`
@@ -402,9 +435,19 @@ pub struct Painter<'a> {
     /// 且片元着色器对它们的合成方式不同——字体图集取单通道
     /// 乘顶点色，缩略图直接用 RGBA。
     ///
-    /// 只存**一张**：详情区当前只显示一张图。
-    /// 若要同时显示多张，需按纹理分批（每批绑不同纹理）。
-    user_tex: Option<DeviceImage>,
+    /// # 为什么是一张表而不是一张图
+    ///
+    /// 列表里可以同时显示多张缩略图（若干图片行），每张是各自的
+    /// egui `TextureId`。早前只存**一张**，后上传的覆盖先前的 ⇒
+    /// 所有图片行采样到同一张图（且 `upload_font_delta` 的
+    /// `pos` 判据还是反的，整图更新被当局部更新跳过——症状是
+    /// 「缩略图区域一片空白」）。现在每张纹理带自己的描述符集，
+    /// 由 `record_to` 在画该批前重绑（见 `DrawBatch::user_set`）。
+    user_textures: HashMap<egui::TextureId, UserTexture>,
+    /// 用户纹理的 LRU 顺序，队首最久未用。超过
+    /// [`USER_TEXTURE_SET_CAP`](modular_clipboard_gfx::frame::USER_TEXTURE_SET_CAP)
+    /// 时从队首淘汰（销毁图像 + 归还描述符集）。
+    user_order: VecDeque<egui::TextureId>,
     /// 1×1 白色占位纹理，绑在 `BINDING_USER_TEXTURE` 上当没有缩略图时用。
     ///
     /// # 为什么必须有占位
@@ -565,7 +608,8 @@ impl<'a> Painter<'a> {
             gpu,
             sampler,
             font: None,
-            user_tex: None,
+            user_textures: HashMap::new(),
+            user_order: VecDeque::new(),
             // 首帧上传，见 paint()。
             placeholder: None,
             uniform,
@@ -824,12 +868,23 @@ impl<'a> Painter<'a> {
         }
 
         // ---- 录制绘制 ----------------------------------------------------
+        // 缩略图批换成该纹理自己的描述符集（多张缩略图同屏时各自采样
+        // 各自的图）；字体批保持 null，用帧槽集合。
+        //
+        // CAUTION: 必须写成字段级借用的 for 循环，不能用
+        // `extend(map(|b| ... self.user_set_for(...)))`——后者对整个
+        // `self` 不可变借用，与 `self.draw_batches` 的可变借用冲突
+        // （E0502）。`user_textures` 与 `batches`/`draw_batches` 是
+        // 不同字段，直接访问字段即可各自借开。
         self.draw_batches.clear();
-        self.draw_batches.extend(
-            self.batches
-                .iter()
-                .map(|b| b.to_draw(render_extent, pixels_per_point)),
-        );
+        for b in &self.batches {
+            let mut d = b.to_draw(render_extent, pixels_per_point);
+            d.user_set = match self.user_textures.get(&b.tex_id) {
+                Some(t) if b.tex_id != FONT_TEXTURE_ID => t.set,
+                _ => vk::DescriptorSet::null(),
+            };
+            self.draw_batches.push(d);
+        }
 
         // 模糊路径仅在「覆盖层模式 + 本帧确有分割标记 + 标记两侧都有内容」
         // 时走。标记落在 0（覆盖层前没有内容）或末尾（没有覆盖层）时走
@@ -1350,6 +1405,48 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
         // 磨砂资源按交换链/渲染目标尺寸派生，同样整体销毁、下帧懒重建。
         // `rebuild_swapchain` 已 `device_wait_idle`，销毁安全。
         self.backdrop.destroy(self.gpu);
+        // 用户纹理的描述符集合必须整体重新分配。
+        //
+        // `FrameRenderer::rebuild_swapchain` → `allocate_frame_resources`
+        // 会**连描述符池一起销毁重建**（见 `destroy_frame_resources`），
+        // 而每张用户纹理的集合都分配自那个池 ⇒ 重建后全部变成悬空句柄。
+        // 照旧绑定就是「use-after-free 描述符」：验证层报
+        // `VUID-vkCmdBindDescriptorSets-pDescriptorSets-00336`，实机上
+        // 可能直接 device lost。图像本身还有效（不在池里），
+        // 不能连图一起丢——egui 只在纹理变化时送增量，
+        // 丢了就再也传不回来。
+        //
+        // 此刻 `rebuild_swapchain` 已 wait_idle，无在飞命令读旧集合，
+        // 直接分配新集合替换即可（旧集合随池销毁，无需逐个 free）。
+        if !self.user_textures.is_empty() {
+            // 表非空 ⇒ paint() 至少跑过一次 ⇒ 占位图必然已建
+            // （paint() 先建占位再处理纹理增量）。
+            let placeholder = self
+                .placeholder
+                .as_ref()
+                .expect("有用户纹理时占位图必已创建");
+            // 字体视图取当前图集；图集还没建过时退回占位图
+            // （与 `upload_user_texture` 的兜底一致）。
+            let (font_view, font_layout) = match self.font.as_ref() {
+                Some(f) => (f.view, f.layout),
+                None => (placeholder.view, placeholder.layout),
+            };
+            let common = CommonBindings {
+                sampler: self.sampler.handle(),
+                font_view,
+                font_layout,
+                uniform_buffer: self.uniform.buffer().handle(),
+                uniform_offset: 0,
+                uniform_range: self.uniform.buffer().size(),
+            };
+            for t in self.user_textures.values_mut() {
+                t.set = fr.allocate_user_texture_set(common, t.image.view, t.image.layout)?;
+            }
+            tracing::debug!(
+                sets = self.user_textures.len(),
+                "交换链重建后已重配用户纹理描述符集合"
+            );
+        }
         self.stats.rebuilds += 1;
         Ok(())
     }
@@ -1366,9 +1463,10 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
     fn bind_all(&self, fr: &FrameRenderer<'a>, font: &DeviceImage) -> anyhow::Result<()> {
         for slot in 0..fr.slot_count() {
             fr.update_texture_binding(slot, self.sampler.handle(), font.view, font.layout)?;
-            // 用户纹理（缩略图）。缺省时绑 1×1 白色占位图——
-            // 描述符绝不能留空，未初始化是 UB。
-            if let Some(t) = self.user_tex.as_ref().or(self.placeholder.as_ref()) {
+            // 帧槽集合的用户纹理绑定永远写占位图：字体/形状批不采样它，
+            // 而着色器静态声明了该绑定，任何被绑的集合都必须给它合法值。
+            // 真正的缩略图用各自纹理的集合（`DrawBatch::user_set`）。
+            if let Some(t) = self.placeholder.as_ref() {
                 fr.update_user_texture_binding(
                     slot,
                     self.sampler.handle(),
@@ -1395,74 +1493,32 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
     /// 此时必须销毁旧图像并新建，图像视图随之改变 → 描述符需要重绑。
     /// 销毁前要 `device_wait_idle`：旧图像可能仍被在途命令引用。
     ///
-    /// # 只支持字体图集
+    /// 应用 egui 的纹理增量：字体图集 + 用户纹理（图片缩略图）。
     ///
-    /// 着色器只绑了一张纹理（`BINDING_TEXTURE`）。用户纹理（图片缩略图等）
-    /// 需要按 `TextureId` 分批 + 多描述符集，当前渲染管线不支持。
+    /// # 两趟处理，顺序不能反
+    ///
+    /// 先字体图集、后用户纹理：用户纹理的描述符集里要写**字体图集
+    /// 视图**，而 `delta.set` 是 `HashMap`，迭代顺序随机。若某帧同时
+    /// 首帧创建字体图集与上传缩略图，先处理缩略图就会把 null 视图
+    /// 写进它的集合（未定义行为）。分两趟后字体必然先就绪。
+    ///
+    /// # 用户纹理为什么是「一张表」而不是「一张图」
+    ///
+    /// 列表可同时显示多张缩略图，每张是各自的 egui `TextureId`。
+    /// 只留一张会让所有图片行采样到同一张图。现在每张纹理带自己的
+    /// 描述符集，`record_to` 画到该批前重绑（见 `DrawBatch::user_set`）。
     fn upload_font_delta(
         &mut self,
         fr: &mut FrameRenderer<'a>,
         delta: &mut egui::TexturesDelta,
     ) -> anyhow::Result<u64> {
         let mut uploads = 0u64;
+        // 字体图集本趟是否被重建（视图变了 ⇒ 所有用户纹理集合要重写）。
+        let mut font_view_changed = false;
 
+        // ---- 第一趟：字体图集 -------------------------------------------
         for (id, deltas) in &delta.set {
             if *id != FONT_TEXTURE_ID {
-                // 用户纹理（图片缩略图）。与字体图集走不同的绑定与格式。
-                //
-                // 只取**最后一个** delta：着色器的 `BINDING_USER_TEXTURE`
-                // 只有一张，而详情区一次只显示一张图。
-                // 若 egui 送多个，取最新的那个（与 egui 语义一致：
-                // 同一 TextureId 的后一次增量覆盖前一次）。
-                let Some(last) = deltas.last() else { continue };
-                // 局部更新（pos != None）无法处理：我们只有一张独立纹理，
-                // 没有「纹理子区域」的概念。缩略图总是整图更新
-                // （`Thumbnail` 走 `ctx.load_texture` 的整图路径）。
-                let Some(_pos) = last.pos else {
-                    tracing::debug!("跳过用户纹理 {id:?} 的局部更新");
-                    continue;
-                };
-                let [w, h] = last.image.size();
-                let (w, h) = (w as u32, h as u32);
-                if w == 0 || h == 0 {
-                    tracing::debug!("用户纹理 {id:?} 尺寸为 0，跳过");
-                    continue;
-                }
-                // 尺寸变了就重建纹理。
-                let need_new = match self.user_tex.as_ref() {
-                    None => true,
-                    Some(t) => t.size.width != w || t.size.height != h,
-                };
-                if need_new {
-                    if let Some(mut old) = self.user_tex.take() {
-                        // 旧纹理可能仍被在途命令读取，必须等GPU 空闲再销毁。
-                        self.gpu.wait_idle();
-                        old.destroy(&self.gpu.device);
-                    }
-                    self.user_tex = Some(DeviceImage::new(
-                        self.gpu,
-                        vk::Extent2D {
-                            width: w,
-                            height: h,
-                        },
-                        vk::Format::R8G8B8A8_UNORM,
-                        vk::ImageUsageFlags::TRANSFER_DST
-                            | vk::ImageUsageFlags::SAMPLED,
-                    )?);
-                }
-                // egui 的 `ColorImage.pixels` 是预乘 alpha 的 `Color32`，
-                // 直接展平为 RGBA 字节（与 `coverage_bytes` 同样的取法，
-                // 只是保留全部 4 通道而非取单通道）。
-                let rgba: Vec<u8> = match &last.image {
-                    egui::ImageData::Color(img) => {
-                        img.pixels.iter().flat_map(|p| p.to_array()).collect()
-                    }
-                };
-                if let Some(tex) = self.user_tex.as_mut() {
-                    fr.record_texture_upload(tex, &rgba, None, (w, h))?;
-                    uploads += 1;
-                }
-                self.bindings_dirty = true;
                 continue;
             }
             for d in deltas {
@@ -1501,6 +1557,9 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
                         )?);
                         // 图集尺寸是「字形画错」类问题的关键数据，留一条 debug。
                         tracing::debug!(w, h, "字体图集纹理已重建");
+                        // 视图换了：所有用户纹理集合里写的还是旧视图，
+                        // 必须整体重写（上面刚 wait_idle，此刻无在飞读取）。
+                        font_view_changed = true;
                     }
                 }
 
@@ -1514,11 +1573,169 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
             }
         }
 
-        // egui 的 `TexturesDelta` 在 drop 时断言「增量为空」。本函数只消费
-        // 字体图集、用户纹理一律忽略，因此显式清空——否则 debug 断言误报，
-        // 而那属于「帧循环写法不对」，不该掩盖真正的失败。
+        // ---- 第二趟：用户纹理（图片缩略图）------------------------------
+        //
+        // 只取每个 ID 的**最后一个** delta：同一 TextureId 的后一次
+        // 增量覆盖前一次（egui 语义）。
+        //
+        // CAUTION: 只处理**整图更新**（`pos == None`）。这个判据曾经
+        // 写反过——`let Some(_pos) = last.pos else { continue }` 把
+        // 整图更新当成「局部更新」跳过，缩略图纹理从未上传，
+        // 症状是「缩略图区域一片空白」且不报任何 GPU 错误。
+        // 局部更新（`pos == Some`）才没有对应能力：每张纹理都是
+        // 独立整图，没有「子区域」概念。
+        for (id, deltas) in &delta.set {
+            if *id == FONT_TEXTURE_ID {
+                continue;
+            }
+            let Some(last) = deltas.last() else { continue };
+            if !is_full_image_update(last.pos) {
+                tracing::debug!("跳过用户纹理 {id:?} 的局部更新");
+                continue;
+            }
+            let [w, h] = last.image.size();
+            let (w, h) = (w as u32, h as u32);
+            if w == 0 || h == 0 {
+                tracing::debug!("用户纹理 {id:?} 尺寸为 0，跳过");
+                continue;
+            }
+            self.upload_user_texture(fr, *id, w, h, &last.image)?;
+            uploads += 1;
+        }
+
+        // 字体图集换了视图 ⇒ 重写全部用户纹理集合（此刻仍在录制之前，
+        // 且重建路径已 wait_idle，无在飞命令读旧视图）。
+        if font_view_changed {
+            self.rewrite_user_texture_sets(fr)?;
+        }
+
+        // egui 的 `TexturesDelta` 在 drop 时断言「增量为空」。本函数已消费
+        // 全部增量（字体图集 + 用户纹理），因此显式清空——否则 debug 断言
+        // 误报，而那属于「帧循环写法不对」，不该掩盖真正的失败。
         delta.clear();
         Ok(uploads)
+    }
+
+    /// 上传（首建/重建）一张用户纹理，并分配或复用它自己的描述符集。
+    ///
+    /// 同尺寸的重复上传只传像素（图像与集合都不动）——缩略图滚动时
+    /// 同一 `TextureId` 不会重复送增量，这条路径主要服务详情大图。
+    fn upload_user_texture(
+        &mut self,
+        fr: &mut FrameRenderer<'a>,
+        id: egui::TextureId,
+        w: u32,
+        h: u32,
+        image: &egui::ImageData,
+    ) -> anyhow::Result<()> {
+        let same_size = self
+            .user_textures
+            .get(&id)
+            .is_some_and(|t| t.image.size.width == w && t.image.size.height == h);
+        if !same_size {
+            // 尺寸变了（或首次见到）：旧图与旧集合都可能被在途命令
+            // 引用，必须等 GPU 空闲再销毁/归还。
+            if let Some(mut old) = self.user_textures.remove(&id) {
+                self.gpu.wait_idle();
+                old.image.destroy(&self.gpu.device);
+                fr.free_user_texture_set(old.set)?;
+            }
+            let img = DeviceImage::new(
+                self.gpu,
+                vk::Extent2D { width: w, height: h },
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            // 字体视图取当前图集；首帧图集可能还没建（本函数在两趟
+            // 处理的第二趟，正常已有），兜底用占位图——占位在 paint()
+            // 里先于本函数创建，必然存在。
+            let (font_view, font_layout) = match self.font.as_ref() {
+                Some(f) => (f.view, f.layout),
+                None => {
+                    let p = self
+                        .placeholder
+                        .as_ref()
+                        .expect("占位纹理应先于用户纹理创建");
+                    (p.view, p.layout)
+                }
+            };
+            let set = fr.allocate_user_texture_set(
+                CommonBindings {
+                    sampler: self.sampler.handle(),
+                    font_view,
+                    font_layout,
+                    uniform_buffer: self.uniform.buffer().handle(),
+                    uniform_offset: 0,
+                    uniform_range: self.uniform.buffer().size(),
+                },
+                img.view,
+                img.layout,
+            )?;
+            self.user_textures.insert(id, UserTexture { image: img, set });
+            self.touch_user_order(id);
+            self.evict_user_textures_if_needed(fr)?;
+        }
+        // egui 的 `ColorImage.pixels` 是预乘 alpha 的 `Color32`，
+        // 展平为 RGBA 字节（与 `coverage_bytes` 同样的取法，
+        // 只是保留全部 4 通道而非取单通道）。
+        let rgba: Vec<u8> = match image {
+            egui::ImageData::Color(img) => img.pixels.iter().flat_map(|p| p.to_array()).collect(),
+        };
+        if let Some(t) = self.user_textures.get_mut(&id) {
+            fr.record_texture_upload(&mut t.image, &rgba, None, (w, h))?;
+        }
+        Ok(())
+    }
+
+    /// 字体图集换视图后，重写全部用户纹理集合里的字体绑定。
+    fn rewrite_user_texture_sets(&self, fr: &FrameRenderer<'a>) -> anyhow::Result<()> {
+        let Some(font) = self.font.as_ref() else {
+            return Ok(());
+        };
+        for t in self.user_textures.values() {
+            fr.rewrite_user_texture_set(
+                t.set,
+                CommonBindings {
+                    sampler: self.sampler.handle(),
+                    font_view: font.view,
+                    font_layout: font.layout,
+                    uniform_buffer: self.uniform.buffer().handle(),
+                    uniform_offset: 0,
+                    uniform_range: self.uniform.buffer().size(),
+                },
+                t.image.view,
+                t.image.layout,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// LRU 淘汰：超过 [`USER_TEXTURE_SET_CAP`] 时销毁最久未用的纹理。
+    ///
+    /// 图像与描述符集都可能被在飞命令引用，销毁前 `wait_idle`。
+    /// 被淘汰的纹理若仍在屏幕上，该批会退化为采样占位图（空白），
+    /// 等它滚出屏再滚回时 paint 侧重传、这里重建——自愈。
+    fn evict_user_textures_if_needed(&mut self, fr: &FrameRenderer<'a>) -> anyhow::Result<()> {
+        while self.user_textures.len() > USER_TEXTURE_SET_CAP as usize {
+            // 队首可能已是残留键（淘汰/替换时未同步），取第一个仍在表里的。
+            let Some(victim) = self.user_order.pop_front() else {
+                break;
+            };
+            if let Some(mut t) = self.user_textures.remove(&victim) {
+                self.gpu.wait_idle();
+                t.image.destroy(&self.gpu.device);
+                fr.free_user_texture_set(t.set)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 把某个纹理移到 LRU 队尾（最近使用）。
+    fn touch_user_order(&mut self, id: egui::TextureId) {
+        if let Some(pos) = self.user_order.iter().position(|k| *k == id) {
+            self.user_order.remove(pos);
+        }
+        self.user_order.push_back(id);
     }
 }
 
@@ -1529,18 +1746,22 @@ impl Drop for Painter<'_> {
         if let Some(mut f) = self.font.take() {
             f.destroy(&self.gpu.device);
         }
-        // NOTE: 早前**漏了** `user_tex` 与 `placeholder`。
+        // NOTE: 早前**漏了** `placeholder` 与用户纹理。
         //
-        // 两者都是 `Option<DeviceImage>`，各持有 image + image view +
-        // DeviceMemory 三样 Vulkan 对象。`placeholder` 在第一次需要纹理
-        // 时就会创建，之后**每个窗口都会有一份**（每个窗口一个 `Painter`），
+        // 用户纹理表里每张各持有 image + image view + DeviceMemory
+        // 三样 Vulkan 对象，`placeholder` 同理。后者在第一次需要纹理时
+        // 就会创建，之后**每个窗口都会有一份**（每个窗口一个 `Painter`），
         // 而设置窗口是「每次开关都新建」⇒ 反复开关设置会持续泄漏。
         //
         // 退出时验证层还会因此报 `VUID-vkDestroyDevice-device-05137`
         // （销毁 device 时仍有活对象）。
-        if let Some(mut t) = self.user_tex.take() {
-            t.destroy(&self.gpu.device);
+        //
+        // 描述符集**不在这里释放**：它们属于 `FrameRenderer` 的描述符池，
+        // 池销毁时统一收回；本结构只销毁自己创建的图像。
+        for (_, mut t) in self.user_textures.drain() {
+            t.image.destroy(&self.gpu.device);
         }
+        self.user_order.clear();
         if let Some(mut t) = self.placeholder.take() {
             t.destroy(&self.gpu.device);
         }
@@ -2212,8 +2433,9 @@ mod tests {
 
     #[test]
     fn batch_tex_id_defaults_survive_to_draw_conversion() {
-        // `to_draw` 不提交 tex_id（GPU 侧接线未定案），
-        // 但转换本身不能因此丢批次或崩。
+        // `to_draw` 本身不查纹理表（拿不到），默认 `user_set` 为 null
+        // （文字/形状批就该用帧槽集合）；缩略图批的集合由 paint()
+        // 在转换后按 `tex_id` 填。转换本身不能因此丢批次或崩。
         let b = Batch {
             index_offset: 4,
             index_count: 6,
@@ -2227,6 +2449,23 @@ mod tests {
         let d = b.to_draw(extent, 1.0);
         assert_eq!(d.index_offset, 4);
         assert_eq!(d.index_count, 6);
+        assert_eq!(
+            d.user_set,
+            vk::DescriptorSet::null(),
+            "默认不得重绑用户纹理"
+        );
+    }
+
+    // ---- 纹理增量的「整图 / 局部」判据 ---------------------------------
+
+    #[test]
+    fn full_image_update_is_pos_none() {
+        // 回归测试：判据反过会让整图更新被当成局部更新跳过，
+        // 缩略图永远上传不上去——表现为「缩略图区域一片空白」
+        // （用户实机反馈：渲染空白画布），且不报任何 GPU 错误。
+        assert!(is_full_image_update(None), "pos=None 才是整图更新");
+        assert!(!is_full_image_update(Some([0, 0])), "pos=Some 是局部更新");
+        assert!(!is_full_image_update(Some([16, 32])));
     }
 
     // ---- 裁剪矩形换算 --------------------------------------------------

@@ -19,7 +19,13 @@
 //! let input = DrawInput {
 //!     vertex_buffer: vk::Buffer::null(),
 //!     index_buffer: vk::Buffer::null(),
-//!     batches: &[DrawBatch { index_offset: 0, index_count: 3, clip: None }],
+//!     batches: &[DrawBatch {
+//!         index_offset: 0,
+//!         index_count: 3,
+//!         clip: None,
+//!         // 纯字体批：null 表示不额外绑定用户纹理集合
+//!         user_set: vk::DescriptorSet::null(),
+//!     }],
 //!     ..Default::default()
 //! };
 //! fr.record(&input)?;
@@ -78,6 +84,13 @@ pub const RESULT_SUBOPTIMAL_KHR: i32 = 1_000_001_003;
 
 /// `VK_ERROR_OUT_OF_DATE_KHR` 的原始返回码。同样没有现成常量。
 pub const RESULT_OUT_OF_DATE_KHR: i32 = -1_000_001_004;
+
+/// 用户纹理（图片缩略图）描述符集的数量上限。
+///
+/// 每张同时在场的用户纹理占一个集合。选中详情大图 + 列表若干图片行，
+/// 实际用量在个位数；64 留足滚动余量，超出由调用方按 LRU 淘汰。
+/// 池容量按 `帧槽数 + 本常量` 一次性建好，运行中不再扩容。
+pub const USER_TEXTURE_SET_CAP: u32 = 64;
 
 /// 无法从表面能力推断尺寸时使用的兜底窗口尺寸。
 ///
@@ -218,6 +231,47 @@ pub struct DrawBatch {
     ///
     /// `None` 表示「不额外裁剪」（沿用全屏 scissor）。
     pub clip: Option<vk::Rect2D>,
+    /// 本批次采样**用户纹理**（图片缩略图）时使用的描述符集。
+    ///
+    /// # 为什么逐批给
+    ///
+    /// 着色器的 `BINDING_USER_TEXTURE` 只有一个绑定，而一次绘制里
+    /// 可以同时有多张缩略图（列表里若干图片行）。只绑一张 ⇒
+    /// 所有图片行采样到同一张图（症状：每行显示同一个缩略图，
+    /// **不报任何 GPU 错误**）。
+    ///
+    /// 正确做法是「按纹理分批 + 批前重绑」：`ui::renderer` 已按
+    /// `mesh.texture_id` 切批（见 `Batch::tex_id`），这里给每批带上
+    /// 它那张纹理的描述符集，`record_to` 在画该批前重绑。
+    ///
+    /// `null` = 本批不采样用户纹理（文字/形状），沿用帧槽自带的
+    /// 描述符集（其 `BINDING_USER_TEXTURE` 绑的是占位图）。
+    pub user_set: vk::DescriptorSet,
+}
+
+/// 描述符集里**每张图共用**的三个绑定：采样器、字体图集、uniform。
+///
+/// 收成结构体有两个原因：
+///
+/// 1. 用户纹理集合的分配/重写 API 有 4 个绑定要写，参数摊平会越过
+///    clippy 的 7 参数线；而这三项对所有集合取值相同，天然是一组。
+/// 2. 语义上它们属于「渲染器级共享状态」：采样器与 uniform buffer
+///    进程内恒定；字体图集扩容时**视图**会换，由
+///    [`FrameRenderer::rewrite_user_texture_set`] 统一刷新全部集合。
+#[derive(Debug, Clone, Copy)]
+pub struct CommonBindings {
+    /// 采样器（与字体图集共用同一个）。
+    pub sampler: vk::Sampler,
+    /// 字体图集视图（`BINDING_TEXTURE`）。
+    pub font_view: vk::ImageView,
+    /// 字体图集当前布局。
+    pub font_layout: vk::ImageLayout,
+    /// uniform 缓冲。
+    pub uniform_buffer: vk::Buffer,
+    /// uniform 偏移（本项目恒为 0）。
+    pub uniform_offset: vk::DeviceSize,
+    /// uniform 范围（整个缓冲）。
+    pub uniform_range: vk::DeviceSize,
 }
 
 /// 一帧的绘制输入。
@@ -275,17 +329,25 @@ impl Default for DrawInput<'_> {
 }
 
 impl<'a> DrawInput<'a> {
+    /// 单三角形批次（探针/测试用）。
+    ///
+    /// CAUTION: 必须是 `const` 而不能在函数体内写 `&[DrawBatch { .. }]`——
+    /// 返回位置的数组临时量不享受生命周期延长（E0515），加上
+    /// `user_set` 字段后这一条必然触发。提到 const 即 'static。
+    const SINGLE_TRIANGLE: &'static [DrawBatch] = &[DrawBatch {
+        index_offset: 0,
+        index_count: 3,
+        // 不额外裁剪（沿用全屏 scissor）。仅测试/便捷构造用。
+        clip: None,
+        user_set: vk::DescriptorSet::null(),
+    }];
+
     /// 只画一个三角形批次，其余字段取默认值。
     pub fn single_batch(vertex_buffer: vk::Buffer, index_buffer: vk::Buffer) -> Self {
         Self {
             vertex_buffer,
             index_buffer,
-            batches: &[DrawBatch {
-                index_offset: 0,
-                index_count: 3,
-                // 不额外裁剪（沿用全屏 scissor）。仅测试/便捷构造用。
-                clip: None,
-            }],
+            batches: Self::SINGLE_TRIANGLE,
             ..Default::default()
         }
     }
@@ -1061,6 +1123,124 @@ impl<'a> FrameRenderer<'a> {
         Ok(())
     }
 
+    /// 为一张**用户纹理**（图片缩略图）分配专属描述符集并写满四个绑定。
+    ///
+    /// # 与帧槽描述符集的关系
+    ///
+    /// 帧槽自带的集合仍然写 `BINDING_USER_TEXTURE`（占位图）——
+    /// 着色器静态使用该绑定，任何被绑的集合都必须给它一个合法值。
+    /// 用户纹理批在 `record_to` 里改绑本方法产出的集合，
+    /// 于是「多张缩略图同屏」各自采样各自的纹理。
+    ///
+    /// # 调用时机约束
+    ///
+    /// 必须在**命令缓冲录制之外**调用（`upload_font_delta` 所在阶段），
+    /// 且写入时不得有在飞 GPU 工作引用本集合——本集合是新建的，
+    /// 天然满足。`font_view` 变化（字体图集扩容）后调用
+    /// [`Self::rewrite_user_texture_set`] 刷新全部旧集合。
+    pub fn allocate_user_texture_set(
+        &self,
+        common: CommonBindings,
+        user_view: vk::ImageView,
+        user_layout: vk::ImageLayout,
+    ) -> anyhow::Result<vk::DescriptorSet> {
+        let layouts = [self.bundle.descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+        let sets = unsafe { self.gpu.device.allocate_descriptor_sets(&alloc_info)? };
+        let set = sets
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("用户纹理描述符集分配失败（池已满？）"))?;
+        self.write_user_texture_set(set, common, user_view, user_layout)?;
+        Ok(set)
+    }
+
+    /// 重写一张已分配的用户纹理描述符集（字体图集换视图 / 纹理换图时用）。
+    ///
+    /// # 安全前提
+    ///
+    /// 调用方必须保证没有在飞 GPU 工作正在读该集合（换字体视图的路径
+    /// 已 `wait_idle`；换纹理图的路径同样先 `wait_idle` 再销毁旧图）。
+    pub fn rewrite_user_texture_set(
+        &self,
+        set: vk::DescriptorSet,
+        common: CommonBindings,
+        user_view: vk::ImageView,
+        user_layout: vk::ImageLayout,
+    ) -> anyhow::Result<()> {
+        self.write_user_texture_set(set, common, user_view, user_layout)
+    }
+
+    /// 释放一张用户纹理描述符集（LRU 淘汰纹理时调用）。
+    ///
+    /// 同样要求无在飞 GPU 工作引用它。
+    pub fn free_user_texture_set(&self, set: vk::DescriptorSet) -> anyhow::Result<()> {
+        anyhow::ensure!(!set.is_null(), "不能释放空的用户纹理描述符集");
+        // ash 的 `free_descriptor_sets` 按值收 `DescriptorPool`（Handle 是 Copy），
+        // 传引用会 E0308。
+        unsafe {
+            self.gpu
+                .device
+                .free_descriptor_sets(self.descriptor_pool, &[set])?;
+        }
+        Ok(())
+    }
+
+    /// 四个绑定的一次性写入（`allocate` 与 `rewrite` 的共同实现）。
+    fn write_user_texture_set(
+        &self,
+        set: vk::DescriptorSet,
+        common: CommonBindings,
+        user_view: vk::ImageView,
+        user_layout: vk::ImageLayout,
+    ) -> anyhow::Result<()> {
+        let ubo = vk::DescriptorBufferInfo {
+            buffer: common.uniform_buffer,
+            offset: common.uniform_offset,
+            range: common.uniform_range,
+        };
+        let font = vk::DescriptorImageInfo {
+            sampler: common.sampler,
+            image_view: common.font_view,
+            image_layout: common.font_layout,
+        };
+        let user = vk::DescriptorImageInfo {
+            sampler: common.sampler,
+            image_view: user_view,
+            image_layout: user_layout,
+        };
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_UNIFORM)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(std::slice::from_ref(&ubo)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_SAMPLER)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(std::slice::from_ref(&font)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_TEXTURE)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&font)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_USER_TEXTURE)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&user)),
+        ];
+        unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
+        Ok(())
+    }
+
     /// 交换链重建后，把「绑定到交换链图像」的资源重新绑一遍。
     ///
     /// # 为什么必须显式调用
@@ -1403,6 +1583,23 @@ impl<'a> FrameRenderer<'a> {
 
             unsafe {
                 device.cmd_set_scissor(cmd, 0, std::slice::from_ref(&rect));
+                // 用户纹理批：换成该纹理自己的描述符集再画。
+                //
+                // `vkCmdBindDescriptorSets` 是**录制命令**，在渲染通道内
+                // 反复调用完全合法（egui-wgpu 对多纹理正是这么做的）。
+                // 集合内容在上传阶段（录制之前）写好，帧内只做绑定，
+                // 不存在「改在飞描述符」的竞态。
+                if !batch.user_set.is_null() {
+                    let user_sets = [batch.user_set];
+                    device.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.bundle.pipeline_layout,
+                        0,
+                        &user_sets,
+                        &[],
+                    );
+                }
                 device.cmd_draw_indexed(cmd, batch.index_count, 1, batch.index_offset, 0, 0);
             }
         }
@@ -1797,14 +1994,24 @@ impl<'a> FrameRenderer<'a> {
         let count = self.swapchain.image_count.max(1);
         let device = &self.gpu.device;
 
+        // 用户纹理（缩略图）描述符集的容量上限。
+        //
+        // 每张同时在场的用户纹理占**一个**描述符集（不是每帧槽一个）：
+        // 集合内容只在该纹理创建/换尺寸时写（写之前调用方已 wait_idle），
+        // 帧内只绑定不修改，因此无需按在飞帧复制。
+        //
+        // 64 张：列表同屏可见的图片行通常个位数，64 已留足滚动余量；
+        // 超出由调用方按 LRU 淘汰（`free_user_texture_set` 收回）。
+        // 每张集合含 uniform/sampler/两张 combined image sampler。
+        let user_cap = USER_TEXTURE_SET_CAP;
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: count,
+                descriptor_count: count + user_cap,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: count,
+                descriptor_count: count + user_cap,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -1819,7 +2026,7 @@ impl<'a> FrameRenderer<'a> {
                 // 纹理数组方案在此不可行：egui 纹理尺寸任意，
                 // 而数组要求所有层同尺寸（要么按最大尺寸 pad、
                 // 要么按尺寸分组），都比多一个绑定复杂得多。
-                descriptor_count: count * 2,
+                descriptor_count: count * 2 + user_cap * 2,
             },
         ];
         // 用了 `UPDATE_AFTER_BIND` 的绑定，其描述符池**必须**带
@@ -1829,14 +2036,16 @@ impl<'a> FrameRenderer<'a> {
         // ash 0.38 陷阱：`DescriptorPoolCreateFlags` 在 `vk::bitflags` 里
         // 只暴露了 `FREE_DESCRIPTOR_SET`，`UPDATE_AFTER_BIND` 属于
         // Vulkan 1.2 段（在 `vk::feature_extensions`），照抄 0.37 示例找不到。
-        let pool_flags = if self.desc_update_after_bind {
-            vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND
-        } else {
-            vk::DescriptorPoolCreateFlags::empty()
-        };
+        //
+        // `FREE_DESCRIPTOR_SET`：用户纹理按 LRU 淘汰时要收回集合，
+        // 否则池很快耗尽（每张纹理一个集合，只进不出）。
+        let mut pool_flags = vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET;
+        if self.desc_update_after_bind {
+            pool_flags |= vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND;
+        }
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .flags(pool_flags)
-            .max_sets(count)
+            .max_sets(count + user_cap)
             .pool_sizes(&pool_sizes);
         self.descriptor_pool =
             unsafe { device.create_descriptor_pool(&pool_info, None) }
@@ -2499,11 +2708,13 @@ mod tests {
                     index_offset: 0,
                     index_count: 0,
                     clip: None,
+                    user_set: vk::DescriptorSet::null(),
                 },
                 DrawBatch {
                     index_offset: 3,
                     index_count: 6,
                     clip: None,
+                    user_set: vk::DescriptorSet::null(),
                 },
             ],
             ..Default::default()

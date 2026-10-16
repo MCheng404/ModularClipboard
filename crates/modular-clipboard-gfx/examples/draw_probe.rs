@@ -217,6 +217,7 @@ fn run() -> anyhow::Result<()> {
             index_count: 3,
             // 不额外裁剪（沿用全屏 scissor）。本探针只验描述符绑定。
             clip: None,
+            user_set: ash::vk::DescriptorSet::null(),
         }],
         ..Default::default()
     };
