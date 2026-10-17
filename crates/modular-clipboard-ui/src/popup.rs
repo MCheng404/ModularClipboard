@@ -51,7 +51,18 @@ use crate::multiwindow::{SharedGfx, WindowGfx};
 ///
 /// 不能为 0：投影只能画在面板矩形之外，没有余量就只能压在面板边缘上、
 /// 再被窗口边界裁掉 ⇒ 四边出现三角形暗块（踩过）。
-pub const SHADOW_MARGIN: f32 = 12.0;
+///
+/// # 由投影参数反推，别随手改小
+///
+/// 必须 ≥「投影最外层可见外扩 + 垂直偏移」：
+/// `crate::paint::POPUP_SHADOW_BLUR`（10，σ=5）的最大可见 grow 是 11，
+/// 加 `POPUP_SHADOW_OFFSET_Y`（2）= 13，取 14 留 1pt 余量。
+///
+/// 小于这个值 ⇒ 外层的层被**窗口边界硬切**，窗口最外圈像素留下一条
+/// 等浓度的黑框——实机就是「弹窗有一圈黑色描边」。有测试守着
+/// （`paint::tests::popup_shadow_decays_before_window_edge`），
+/// 改任一侧都要同步另一侧。
+pub const SHADOW_MARGIN: f32 = 14.0;
 
 /// 弹窗**空闲**时的心跳重绘间隔。
 ///
@@ -687,7 +698,7 @@ mod tests {
     #[test]
     fn panel_rect_leaves_a_shadow_margin_on_each_side() {
         let r = panel_rect_in(egui::vec2(720.0, 45.0));
-        assert_eq!(r.min, egui::pos2(12.0, 12.0));
+        assert_eq!(r.min, egui::pos2(SHADOW_MARGIN, SHADOW_MARGIN));
         assert_eq!(r.size(), egui::vec2(720.0, 45.0));
     }
 
@@ -695,23 +706,45 @@ mod tests {
     fn panel_rect_rounds_to_whole_pixels() {
         // Win32 命中判定按整数像素，亚像素矩形会漏边。
         let r = panel_rect_in(egui::vec2(10.4, 10.6));
-        assert_eq!(r.max.x, 22.0, "12 + 10.4 = 22.4 → 22");
-        assert_eq!(r.max.y, 23.0, "12 + 10.6 = 22.6 → 23");
+        assert_eq!(
+            r.max.x,
+            (SHADOW_MARGIN + 10.4).round(),
+            "{SHADOW_MARGIN} + 10.4 = {} 应取整到整像素",
+            SHADOW_MARGIN + 10.4
+        );
+        assert_eq!(
+            r.max.y,
+            (SHADOW_MARGIN + 10.6).round(),
+            "{SHADOW_MARGIN} + 10.6 = {} 应取整到整像素",
+            SHADOW_MARGIN + 10.6
+        );
     }
 
     #[test]
     fn client_size_is_panel_plus_two_margins_in_physical_pixels() {
-        assert_eq!(client_size_px(egui::vec2(100.0, 50.0), 1.0), (124, 74));
-        assert_eq!(client_size_px(egui::vec2(100.0, 50.0), 1.5), (186, 111));
+        // 用常量算期望值：`SHADOW_MARGIN` 由投影参数反推，会跟着调。
+        let m = SHADOW_MARGIN * 2.0;
+        assert_eq!(
+            client_size_px(egui::vec2(100.0, 50.0), 1.0),
+            ((100.0 + m) as u32, (50.0 + m) as u32)
+        );
+        assert_eq!(
+            client_size_px(egui::vec2(100.0, 50.0), 1.5),
+            (((100.0 + m) * 1.5) as u32, ((50.0 + m) * 1.5) as u32)
+        );
     }
 
     #[test]
     fn client_size_never_collapses_to_zero() {
         // 0 会被 `set_size_physical` 拒绝（客户区塌成 0×0 ⇒ 交换链重建失败、
         // 窗口看着像消失），所以只留投影边距也算一个合法尺寸。
-        assert_eq!(client_size_px(egui::vec2(0.0, 0.0), 1.0), (24, 24));
+        let m = (SHADOW_MARGIN * 2.0) as u32;
+        assert_eq!(client_size_px(egui::vec2(0.0, 0.0), 1.0), (m, m));
         // 退化缩放按 1.0 处理，不能算出 0。
-        assert_eq!(client_size_px(egui::vec2(10.0, 10.0), 0.0), (34, 34));
+        assert_eq!(
+            client_size_px(egui::vec2(10.0, 10.0), 0.0),
+            (10 + m, 10 + m)
+        );
     }
 
     // ---- 重绘闸门 ----

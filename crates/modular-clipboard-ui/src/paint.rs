@@ -927,6 +927,21 @@ pub fn draw(f: &mut Frame<'_>) {
 /// 类型过滤栏与主窗口的间距（逻辑点）。
 const RAIL_GAP: f32 = 12.0;
 
+/// 类型过滤栏**面板**相对按钮组的内边距（逻辑点）。
+///
+/// 面板必须比按钮组大一圈：它是**不透明**的底，用来盖住投影。
+///
+/// # 为什么不能让面板 = 按钮组
+///
+/// 投影是「面板矩形外扩」的实心圆角矩形，天然**包含面板内部**；别的
+/// 面板都有自己的底色把它盖住，而类型栏此前直接拿按钮组当面板 ⇒
+/// 按钮之间的缝隙和四周一圈透出投影的颜色，整块看着就是**黑色背景**
+/// （投影色是纯黑，见 [`POPUP_SHADOW_STRENGTH`] 的说明）。
+///
+/// 弹窗窗口尺寸 = 面板 + [`crate::popup::SHADOW_MARGIN`]，所以加这份
+/// padding 会让窗口跟着大一圈——这是必须的，不是浪费。
+pub const RAIL_PAD: f32 = 6.0;
+
 /// 悬浮搜索面板高度（逻辑点）。
 const SEARCH_PANEL_H: f32 = 30.0;
 
@@ -1005,34 +1020,38 @@ impl FloatLayout {
         let size = modular_clipboard_core::config::clamp_type_rail_size(rail_cfg.size);
         let gap = RAIL_GAP.min(8.0); // 按钮间距比面板间距紧一档
 
-        // ---- 类型栏：按钮组矩形（弹窗按它定尺寸，投影边距由弹窗自己加） ----
+        // ---- 类型栏：**面板**矩形（弹窗按它定尺寸，投影边距由弹窗自己加） ----
+        //
+        // 面板 = 按钮组 + 四周 [`RAIL_PAD`]。多出来的这一圈是不透明底色，
+        // 用来盖住投影（投影矩形包含面板内部，见 `RAIL_PAD` 的说明）。
         let rail_kinds = Self::kinds(cfg, items);
         let rail = match rail_kinds.len() {
             0 => None,
             n => {
-                // 弹窗客户区只包住按钮组本身（+ 投影边距），不做成
+                // 弹窗客户区只包住面板本身（+ 投影边距），不做成
                 // 「整条侧栏那么高」——那圈空白是透明窗口面积，
                 // 既费显存又会挡下面的窗口（要靠点击穿透兜，更容易出岔子）。
-                let total = n as f32 * size + (n as f32 - 1.0) * gap;
+                let total = n as f32 * size + (n as f32 - 1.0) * gap + RAIL_PAD * 2.0;
+                let cross = size + RAIL_PAD * 2.0;
                 let card = crate::solver::card_area(area);
                 Some(match rail_cfg.pos {
                     // 右 / 左：贴在窗口对应侧缘外，垂直对齐卡片区中心。
                     TypeRailPos::Right => Rect::from_center_size(
-                        pos2(area.max.x + RAIL_GAP + size * 0.5, card.center().y),
-                        vec2(size, total),
+                        pos2(area.max.x + RAIL_GAP + cross * 0.5, card.center().y),
+                        vec2(cross, total),
                     ),
                     TypeRailPos::Left => Rect::from_center_size(
-                        pos2(area.min.x - RAIL_GAP - size * 0.5, card.center().y),
-                        vec2(size, total),
+                        pos2(area.min.x - RAIL_GAP - cross * 0.5, card.center().y),
+                        vec2(cross, total),
                     ),
                     // 上 / 下：横向一行，对齐卡片区中心。
                     TypeRailPos::Top => Rect::from_center_size(
-                        pos2(card.center().x, area.min.y - RAIL_GAP - size * 0.5),
-                        vec2(total, size),
+                        pos2(card.center().x, area.min.y - RAIL_GAP - cross * 0.5),
+                        vec2(total, cross),
                     ),
                     TypeRailPos::Bottom => Rect::from_center_size(
-                        pos2(card.center().x, area.max.y + RAIL_GAP + size * 0.5),
-                        vec2(total, size),
+                        pos2(card.center().x, area.max.y + RAIL_GAP + cross * 0.5),
+                        vec2(total, cross),
                     ),
                 })
             }
@@ -1478,29 +1497,85 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
+/// 弹窗投影的**贴边浓度**（紧贴面板外第一环带的 alpha，0~1）。
+///
+/// # 为什么不能沿用卡片投影的浓度
+///
+/// `Palette::shadow` 是 `rgba_unmultiplied(0,0,0,255)`——**alpha=255 的
+/// 纯黑**。卡片投影再乘用户浓度倍率，反混合后贴边强度被顶到 0.95。
+/// 这对主窗口卡片是对的：它压在**不透明底图**上，0.95 的黑看着就是
+/// 阴影。
+///
+/// 弹窗画布是**透明**的（清屏 alpha=0，见 `crate::popup`），同一强度
+/// 直接裸在桌面上 ⇒ 紧贴面板外一圈 alpha≈0.42 的纯黑，实机就是一条
+/// **黑色描边**；当时类型栏还没有背景板，整块投影更是被看成
+/// 「黑色背景」（那一半已由 `draw_type_rail` 的面板底修掉，但浓度
+/// 不改的话描边仍在）。
+///
+/// 弹窗可能压在任意桌面颜色上（浅色壁纸下最明显），浓度必须按「没有
+/// 底图托底」重新定，取卡片量级的五分之一左右。
+pub const POPUP_SHADOW_STRENGTH: f32 = 0.18;
+
+/// 弹窗投影的模糊半径（逻辑点）。
+///
+/// 必须让投影在 [`crate::popup::SHADOW_MARGIN`] **之内衰减完**：外扩超出
+/// 边距的层会被窗口边界**硬切**，最外圈像素留下一条等浓度的黑框——
+/// 比完全没有投影更丑（这正是「描边」的第二重来源）。
+///
+/// 取 10（σ=5）：`card_shadow_layers` 的可见判据（单层 alpha ≥ 0.003）
+/// 会在 k ≥ 12 处全部跳过，最外层可见 grow 为 11 ⇒ 窗口边界处强度
+/// < 1/255，看不出截断。有测试守着这个关系，别随手调大。
+pub const POPUP_SHADOW_BLUR: f32 = 10.0;
+
+/// 弹窗投影的垂直偏移（逻辑点，正值 = 向下）。
+///
+/// 向下偏移会吃掉**底部**余量（顶部反而更宽裕），所以它同样参与
+/// 「不越界」的约束。
+pub const POPUP_SHADOW_OFFSET_Y: f32 = 2.0;
+
 /// 画悬浮弹窗的投影（面板外围那一圈 alpha）。
 ///
 /// 必须用**弹窗客户区级** painter（`ui.painter()`），不能用
 /// `painter_at(panel)`——后者按面板矩形裁剪，投影会被切掉一圈，
 /// 表现为「面板贴着桌面、没有浮起来」。
 ///
-/// 参数比行卡片投影稍重：行卡片在窗口**内部**（投影只从缝隙里透出来），
-/// 弹窗是压在**桌面**上的，需要更强的层次才浮得起来。
+/// # 与卡片投影的关系
+///
+/// 只复用 `card_shadow_layers` 这层**高斯轮廓**，不复用
+/// [`draw_card_shadow`] 的浓度逻辑——后者是按「有不透明底图托底」标定
+/// 的，套到透明画布上就是黑描边（见 [`POPUP_SHADOW_STRENGTH`]）。
+/// 同理也不画 `draw_card_shadow` 里的「近投影」：那一组浓度 ×1.15、
+/// 紧贴边缘，正是描边感的主要来源。
 pub fn draw_popup_shadow(painter: &egui::Painter, panel: Rect, pal: &Palette) {
-    let cfg = modular_clipboard_core::config::CardShadowConfig {
-        enabled: true,
-        blur: 16.0,
-        opacity: 0.32,
-        offset_y: 2.0,
-    };
-    draw_card_shadow(painter, panel, 9.0, &cfg, pal);
+    // 圆角**跟随面板**（`radius_md`），投影矩形外扩 grow 时半径同步增大
+    // ⇒ 矩形与圆角始终同心。早前硬编码 9.0，与面板圆角脱钩，圆角处会
+    // 露出一条投影的直角边。
+    let radius = pal.radius_md;
+    // 阴影**颜色**仍取主题令牌（可配成冷/暖调），只有浓度用弹窗常量。
+    let [sr, sg, sb, _] = pal.shadow.to_array();
+    let base = panel.translate(vec2(0.0, POPUP_SHADOW_OFFSET_Y));
+    for (grow, a) in card_shadow_layers(POPUP_SHADOW_BLUR, POPUP_SHADOW_STRENGTH) {
+        // 环带 alpha 走 `from_rgba_unmultiplied`：与 `draw_card_shadow`
+        // 同一条路径，别在这里改成 `from_rgba_premultiplied`（管线的混合
+        // 是预乘的，egui 送进来的顶点色本来就是非预乘）。
+        painter.rect_filled(
+            base.expand(grow),
+            radius + grow,
+            egui::Color32::from_rgba_unmultiplied(
+                sr,
+                sg,
+                sb,
+                (a * 255.0).round().clamp(0.0, 255.0) as u8,
+            ),
+        );
+    }
 }
 
 /// 画悬浮类型过滤栏的内容（2026-10-15 第三轮新增，待移植设置联动）。
 ///
-/// 由**弹窗**调用（`crate::popup`），`rail` 是弹窗客户区中央的按钮组
-/// 矩形——[`FloatLayout::compute`] 已把按钮组的尺寸算好，这里只负责
-/// 按停靠方向从组矩形左上角依次摆按钮。
+/// 由**弹窗**调用（`crate::popup`），`rail` 是弹窗客户区中央的**面板**
+/// 矩形（= 按钮组 + 四周 [`RAIL_PAD`]）——[`FloatLayout::compute`] 已把
+/// 面板尺寸算好，这里负责画面板底并按停靠方向依次摆按钮。
 ///
 /// 按钮外观：圆角方块，`surface_raised` 底 + 1px 弱描边；激活 =
 /// `accent` 底 + `text_on_accent` 图标。点击过滤、再点一次取消
@@ -1515,8 +1590,24 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     if n == 0 || rail.width() <= 0.0 || rail.height() <= 0.0 {
         return;
     }
+    // ---- 面板底（不透明）----
+    //
+    // 必须在按钮**之前**画，且必须不透明：投影是「面板外扩」的实心矩形，
+    // 天然覆盖面板内部，只有不透明底能把它盖住。少了这一层，按钮之间的
+    // 缝隙会透出投影的纯黑（实机「类型栏是一块黑色背景」）。
+    let radius = pal.radius_md;
+    let painter = f.ui.painter_at(rail);
+    painter.rect_filled(rail, radius, pal.surface);
+    painter.rect_stroke(
+        rail,
+        radius,
+        Stroke::new(1.0, pal.border),
+        egui::StrokeKind::Inside,
+    );
     let vertical = matches!(rail_cfg.pos, TypeRailPos::Left | TypeRailPos::Right);
-    let (mut x, mut y) = (rail.min.x, rail.min.y);
+    // 按钮组从面板内侧起排（跳过 padding）——横竖两个方向都只需把
+    // 起点各挪一个 `RAIL_PAD`。
+    let (mut x, mut y) = (rail.min.x + RAIL_PAD, rail.min.y + RAIL_PAD);
 
     for &kind in kinds {
         let slot = Rect::from_min_size(pos2(x, y), vec2(size, size));
@@ -7329,12 +7420,12 @@ fn with_pinned(mut self, n: usize) -> Self {
                 pos2(margin, margin),
                 pos2(margin + group.width(), margin + group.height()),
             );
-            // 按钮槽位从**面板原点**起排——与 `draw_type_rail` 同一算式
-            // （它拿到的 `rail` 就是这个面板矩形）。
+            // 按钮槽位从**面板内侧**起排（跳过 `RAIL_PAD`）——与
+            // `draw_type_rail` 同一算式（它拿到的 `rail` 就是这个面板矩形）。
             let slot = Rect::from_min_size(
                 pos2(
-                    panel.min.x,
-                    panel.min.y + idx as f32 * (size + RAIL_GAP.min(8.0)),
+                    panel.min.x + RAIL_PAD,
+                    panel.min.y + RAIL_PAD + idx as f32 * (size + RAIL_GAP.min(8.0)),
                 ),
                 vec2(size, size),
             );
@@ -9405,7 +9496,10 @@ fn with_pinned(mut self, n: usize) -> Self {
             r.min.x,
             area.max.x
         );
-        assert!((r.width() - size).abs() < 0.01, "右/左停靠宽度 = 图标边长");
+        assert!(
+            (r.width() - (size + RAIL_PAD * 2.0)).abs() < 0.01,
+            "右/左停靠宽度 = 图标边长 + 面板内边距"
+        );
 
         // 左。
         cfg.type_rail.pos = TypeRailPos::Left;
@@ -9429,7 +9523,10 @@ fn with_pinned(mut self, n: usize) -> Self {
             "上停靠时类型栏底缘 {:.1} 应在窗口顶缘之外：{r:?}",
             r.max.y
         );
-        assert!((r.height() - size).abs() < 0.01, "上/下停靠高度 = 图标边长");
+        assert!(
+            (r.height() - (size + RAIL_PAD * 2.0)).abs() < 0.01,
+            "上/下停靠高度 = 图标边长 + 面板内边距"
+        );
 
         cfg.type_rail.pos = TypeRailPos::Bottom;
         let r = FloatLayout::compute(&cfg, &items, false, area)
@@ -9440,8 +9537,8 @@ fn with_pinned(mut self, n: usize) -> Self {
             "下停靠时类型栏顶缘 {:.1} 应在窗口底缘之外：{r:?}",
             r.min.y
         );
-        // 按钮数 × 边长 + 间隙 = 组宽（弹窗据此定尺寸）。
-        let expect_w = 5.0 * size + 4.0 * (RAIL_GAP.min(8.0));
+        // 按钮数 × 边长 + 间隙 + 两侧内边距 = 面板宽（弹窗据此定尺寸）。
+        let expect_w = 5.0 * size + 4.0 * (RAIL_GAP.min(8.0)) + RAIL_PAD * 2.0;
         assert!(
             (r.width() - expect_w).abs() < 0.01,
             "横向停靠时组宽应为 5×size + 4×gap = {expect_w}，实际 {:.1}",
@@ -10177,6 +10274,55 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 退化输入：无层、不 panic。
         assert!(card_shadow_layers(0.0, 0.4).is_empty());
         assert!(card_shadow_layers(6.0, 0.0).is_empty());
+    }
+
+    /// 弹窗投影**必须在窗口边距内衰减完**。
+    ///
+    /// 守的是「黑色描边」的第二重来源：外扩超出
+    /// [`crate::popup::SHADOW_MARGIN`] 的层会被窗口边界**硬切**，最外圈
+    /// 像素留下一条等浓度的黑框——比完全没有投影更丑。
+    #[test]
+    fn popup_shadow_decays_before_window_edge() {
+        let layers = card_shadow_layers(POPUP_SHADOW_BLUR, POPUP_SHADOW_STRENGTH);
+        assert!(!layers.is_empty(), "弹窗应有可见投影层");
+        let max_grow = layers.iter().map(|(g, _)| *g).fold(0.0f32, f32::max);
+        // 向下偏移吃掉**底部**余量（顶部反而更宽裕），故按
+        // `margin - offset` 算而不是 `margin`。
+        let budget = crate::popup::SHADOW_MARGIN - POPUP_SHADOW_OFFSET_Y;
+        assert!(
+            max_grow <= budget,
+            "最外层 grow {max_grow} 超出可用余量 {budget}：投影会被窗口边界切断"
+        );
+        // 边界处的合成强度必须不可见（< 1/255），否则仍是一条淡黑框。
+        let edge = POPUP_SHADOW_STRENGTH
+            * gaussian_outer((budget - 0.5).max(0.0), POPUP_SHADOW_BLUR * 0.5);
+        assert!(
+            edge * 255.0 < 1.0,
+            "窗口边界处仍有 {:.2}/255 的强度——会看出截断",
+            edge * 255.0
+        );
+    }
+
+    /// 弹窗投影浓度必须**远低于**卡片量级。
+    ///
+    /// 守的是「有人把强度改回 `Palette::shadow` 的量级」：该令牌是
+    /// alpha=255 的纯黑，卡片倍率后贴边强度 0.95；主窗口有不透明底图
+    /// 托着看着是阴影，弹窗画布是透明的，同一强度裸在桌面上就是
+    /// 一条黑色描边（类型栏无背景板时更是整块被看成「黑色背景」）。
+    #[test]
+    fn popup_shadow_strength_stays_far_below_card_level() {
+        // 卡片贴边强度：alpha=255 × 默认倍率 1.0 ⇒ clamp 到 0.95。
+        let card_edge = 0.95 * gaussian_outer(0.5, 16.0 * 0.5);
+        let popup_edge =
+            POPUP_SHADOW_STRENGTH * gaussian_outer(0.5, POPUP_SHADOW_BLUR * 0.5);
+        assert!(
+            popup_edge < 0.10,
+            "弹窗贴边 alpha {popup_edge:.3} 过高，会看成描边"
+        );
+        assert!(
+            popup_edge * 4.0 < card_edge,
+            "弹窗贴边 {popup_edge:.3} 应显著低于卡片 {card_edge:.3}"
+        );
     }
 
     /// 一键配对提示词：包含 10 项能力与接入参数，随配置动态拼接。
