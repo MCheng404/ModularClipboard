@@ -1386,13 +1386,10 @@ fn drive_attach_windows<'a>(
         // 它们是**贴着主窗口**的浮动面板，主窗口不在了却留着两块面板
         // 浮在桌面上，是最刺眼的一种「渲染 bug」。
         let want_search = main_visible && app.paint_state.search_expanded;
-        let acrylic = app.svc.state.config.ui.window_backdrop
-            == modular_clipboard_core::config::WindowBackdrop::Acrylic;
         // 弹窗把主窗口设为**属主**：始终叠在主窗之上、随主窗最小化一起
         // 收起、主窗被激活时一起到前台（不设属主的话它们是三块互不相干
         // 的顶层窗口，Z 序各自为政）。
         let owner = Some(window.hwnd());
-        let blur_strength = app.svc.state.config.ui.window_blur_strength;
         popups.sync_search(
             app,
             want_search,
@@ -1401,8 +1398,6 @@ fn drive_attach_windows<'a>(
             s,
             shared,
             topmost,
-            acrylic,
-            blur_strength,
             owner,
         );
         // 隐藏时**必须清**弹窗回报的两项：否则上一次「正在打字」
@@ -1420,8 +1415,6 @@ fn drive_attach_windows<'a>(
             s,
             shared,
             topmost,
-            acrylic,
-            blur_strength,
             owner,
         );
     }
@@ -2486,17 +2479,11 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
         egui::pos2(client.min.x + margin, client.min.y + margin),
         egui::pos2(client.max.x - margin, client.max.y - margin),
     );
-    // ---- 磨砂底图：裁到面板圆角内 ----
+    // ---- 没有磨砂底图 ----
     //
-    // 只在「磨砂」模式下有（见 `crate::popup::Popup::update_frost`）。
-    // 必须**裁剪到面板矩形**：底图铺满整个客户区的话，那圈本该透明的
-    // 投影区就变成不透明的模糊矩形，浮不起来的同时还会显出一个大方块。
-    //
-    // 底图已整体移除（弹窗不做磨砂，见 `crate::popup`），此处不再有
-    // 磨砂底图的绘制与背景层降 alpha。
-    // 弹窗一律用**不透明**调色板：磨砂已不在弹窗上启用（见
-    // `crate::popup::Popup::sync_and_render`），背景层再降 alpha 就只剩
-    // 一圈描边、内部透明了。
+    // 弹窗一律**不透明**面板：它不走主窗口那套 GPU 磨砂通道（原因见
+    // `crate::popup::Popup::sync_and_render`），因此这里也没有底图可画。
+    // 背景层不能降 alpha——降了就只剩一圈描边、内部全透。
     let pal_ref: &crate::theme::Palette = &self.pal;
     // ---- 自研投影（画在**客户区级** painter 上）----
     //
