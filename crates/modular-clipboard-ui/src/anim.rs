@@ -177,15 +177,19 @@ pub fn restart(ctx: &Context, id: Id, from: f32, to: f32, dur: Duration, ease: E
 
 /// 颜色补间：四通道各自补间后组装。
 ///
-/// 透明度参与补间（淡入淡出的常用轴）。`target` 为 `None` 表示该通道
-/// 不插值、直接用当前值——调用方传 `None` 的通道应保证两侧一致。
+/// 透明度参与补间（淡入淡出的常用轴）。
+///
+/// CAUTION: `to_array()` 返回的是**预乘**分量（[`Color32`] 内部按预乘
+/// alpha 存储），补间后必须用 `from_rgba_premultiplied` 重组——用
+/// `from_rgba_unmultiplied` 会二次预乘，半透明色在补间途中整体发暗
+/// （2026-10-17 修，与 `paint::fade_color` 同一个坑）。
 pub fn tween_color(ctx: &Context, id: Id, target: Color32, dur: Duration) -> Color32 {
     let [r, g, b, a] = target.to_array();
     let r = tween_f32(ctx, id.with("r"), r as f32, dur, Ease::OutCubic) as u8;
     let g = tween_f32(ctx, id.with("g"), g as f32, dur, Ease::OutCubic) as u8;
     let b = tween_f32(ctx, id.with("b"), b as f32, dur, Ease::OutCubic) as u8;
     let a = tween_f32(ctx, id.with("a"), a as f32, dur, Ease::OutCubic) as u8;
-    Color32::from_rgba_unmultiplied(r, g, b, a)
+    Color32::from_rgba_premultiplied(r, g, b, a)
 }
 
 /// 矩形补间：四边各自补间。用于面板滑入、选中块位移。

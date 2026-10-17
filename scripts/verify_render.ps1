@@ -65,6 +65,7 @@ public static class V {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int ht, bool repaint);
@@ -80,7 +81,8 @@ public static class V {
   }
   public static List<IntPtr> TopLevel(uint want) {
     var r = new List<IntPtr>();
-    EnumWindows((h,l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == want) r.Add(h); return true; }, IntPtr.Zero);
+    // want == 0 ⇒ 枚举全部顶层窗口（界面窗口住在子进程里，按 pid 找不到）。
+    EnumWindows((h,l) => { if (want == 0) { r.Add(h); return true; } uint p; GetWindowThreadProcessId(h, out p); if (p == want) r.Add(h); return true; }, IntPtr.Zero);
     return r;
   }
   public static string Cls(IntPtr h) { var sb = new StringBuilder(256); GetClassNameW(h, sb, 256); return sb.ToString(); }
@@ -103,16 +105,39 @@ $err = "$OutDir\verify-render.err"
 Remove-Item $err -ErrorAction SilentlyContinue
 $env:RUST_LOG = 'info,modular_clipboard=debug'
 $env:MC_DIAG = '1'
+# CAUTION: 磨砂模式（`window_backdrop = Acrylic`，默认配置即是）会给主窗口
+# 设 `WDA_EXCLUDEFROMCAPTURE`——窗口在**所有捕获表面**里被跳过，
+# `PrintWindow` 因此返回全黑（2026-10-17 实测）。`MC_NO_EXCLUDE=1` 是
+# 程序内置的验证开关：关掉捕获自排除后外部截图才能拍到窗口本身。
+# 副作用仅限「磨砂可能把窗口自己的上一帧抓进底图形成拖影」，
+# 对覆盖率/包围盒这类像素判据没有影响。
+$env:MC_NO_EXCLUDE = '1'
 # `-Settings` 开关：把设置面板打开后截图（它平时是覆盖层，拍不到）。
 if ($Settings) { $env:MC_SETTINGS = '1' } else { Remove-Item Env:\MC_SETTINGS -ErrorAction SilentlyContinue }
+# CAUTION: 界面窗口住在**子进程**里（常驻进程拉起 `--ui`），且配置
+# `ui.start_minimized = true` 时常驻进程**不主动拉起界面**（自启动场景
+# 的正确行为）。因此分两步：先起常驻进程，再显式拉起界面进程；
+# 窗口枚举也必须按类名全局找，按父进程 pid 找不到（2026-10-17 修）。
 $p = Start-Process -FilePath $exe -ArgumentList '--no-capture' -PassThru `
   -RedirectStandardOutput "$OutDir\verify-render.log" -RedirectStandardError $err
+Start-Sleep -Seconds 2
+$uiProc = Start-Process -FilePath $exe -ArgumentList '--ui' -PassThru `
+  -RedirectStandardOutput "$OutDir\verify-render-ui.log" -RedirectStandardError "$OutDir\verify-render-ui.err"
 Start-Sleep -Seconds 4
 $p.Refresh()
 
 $main = [IntPtr]::Zero
-foreach ($h in [V]::TopLevel([uint32]$p.Id)) {
-  if ([V]::Cls($h) -eq 'ModularClipboardWindow' -and [V]::IsWindowVisible($h)) { $main = $h; break }
+# 全局按类名枚举，取面积最大的可见窗口：界面窗口在子进程里，按父进程
+# pid 枚举永远找不到（2026-10-17 修）。同名类可能有多个（搜索弹窗
+# 也是这个类），面积最大的一定是主窗口。
+$best = 0
+foreach ($h in [V]::TopLevel(0)) {
+  if ([V]::Cls($h) -eq 'ModularClipboardWindow' -and [V]::IsWindowVisible($h)) {
+    $rr = New-Object V+RECT
+    [void][V]::GetWindowRect($h, [ref]$rr)
+    $area = ($rr.R - $rr.L) * ($rr.B - $rr.T)
+    if ($area -gt $best) { $best = $area; $main = $h }
+  }
 }
 if ($main -eq [IntPtr]::Zero) {
   # IMPORTANT: 必须把实际枚举到的窗口全打出来。
@@ -121,14 +146,18 @@ if ($main -eq [IntPtr]::Zero) {
   # 「窗口已创建」且手动运行完全正常——说明问题在**查找方式**，
   # 不在程序。此时只报一句「找不到」等于把线索全丢了，
   # 下一步只能靠猜。
-  Write-Host "找不到主窗口句柄（进程 id=$($p.Id)）。实际枚举到的顶层窗口：" -ForegroundColor Red
-  foreach ($h in [V]::TopLevel([uint32]$p.Id)) {
-    $cls = [V]::Cls($h)
+  Write-Host "找不到主窗口句柄。诊断信息：" -ForegroundColor Red
+  $all = [V]::TopLevel(0)
+  Write-Host ("  全局顶层窗口共 {0} 个" -f $all.Count)
+  $mc = $all | Where-Object { [V]::Cls($_) -like '*Modular*' }
+  foreach ($h in $mc) {
     $vis = [V]::IsWindowVisible($h)
-    Write-Host ("  hwnd=0x{0:X}  class='{1}'  visible={2}" -f [int64]$h, $cls, $vis)
+    Write-Host ("  hwnd=0x{0:X}  class='{1}'  visible={2}" -f [int64]$h, [V]::Cls($h), $vis)
   }
-  Write-Host "（若列表为空说明进程已退出；若都在但 visible=False 说明窗口被隐藏）"
+  if (-not $mc) { Write-Host "  没有任何类名含 'Modular' 的窗口——程序可能没起来（看 verify-render.err）" }
+  Write-Host "（若都在但 visible=False 说明窗口被隐藏；若类名不匹配说明窗口类改了）"
   Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+  Stop-Process -Id $uiProc.Id -Force -ErrorAction SilentlyContinue
   exit 1
 }
 
@@ -181,7 +210,12 @@ foreach ($w in $Widths) {
   #
   # `PrintWindow` 直接让窗口**自己绘制到 DC**，与遮挡、置顶、
   # 前台焦点全都无关。Vulkan 直写的窗口需要 `PW_RENDERFULLCONTENT`
-  // （flag = 2）才能抓到内容，否则得到全黑。
+  # （flag = 2）才能抓到内容，否则得到全黑。
+  #
+  # CAUTION: 磨砂模式下仅靠 flag=2 **仍然不够**——主窗口设了
+  # `WDA_EXCLUDEFROMCAPTURE`（见文件头 `MC_NO_EXCLUDE` 的说明），
+  # 捕获表面整体跳过该窗口 ⇒ PrintWindow 返回全黑。必须配
+  # `MC_NO_EXCLUDE=1` 启动（2026-10-17 实测）。
   [void][V]::PrintWindow($main, $gfx.GetHdc(), 2)
   $gfx.ReleaseHdc()
   $png = "$OutDir\shot-w$w.png"
@@ -282,6 +316,7 @@ foreach ($w in $Widths) {
 }
 
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+Stop-Process -Id $uiProc.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 
 Write-Host "=========================================================="

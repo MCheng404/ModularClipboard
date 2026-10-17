@@ -62,10 +62,16 @@ macro_rules! palette_lerp {
     (color, $a:expr, $b:expr, $t:expr) => {{
         // sRGB 分量线性插值。对 220ms 的短暂过渡，人眼对中间色不敏感，
         // 感知均匀（oklab）插值的成本不划算。
+        //
+        // CAUTION: `to_array()` 返回的是**预乘**分量（Color32 内部预乘
+        // alpha 存储），在预乘空间插值本来就是正确做法（避免半透明
+        // 边缘出现暗晕），但重组时必须用 `from_rgba_premultiplied`——
+        // 用 `from_rgba_unmultiplied` 会二次预乘，主题过渡途中半透明
+        // 令牌（row_hover 等）整体发暗（2026-10-17 修复）。
         let [ar, ag, ab, aa] = $a.to_array();
         let [br, bg, bb, ba] = $b.to_array();
         let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * $t).round() as u8;
-        egui::Color32::from_rgba_unmultiplied(m(ar, br), m(ag, bg), m(ab, bb), m(aa, ba))
+        egui::Color32::from_rgba_premultiplied(m(ar, br), m(ag, bg), m(ab, bb), m(aa, ba))
     }};
     (num, $a:expr, $b:expr, $_t:expr) => { $b };
     (dur, $a:expr, $b:expr, $_t:expr) => { $b };
@@ -1938,6 +1944,41 @@ mod tests {
         // is_dark 中点翻转：避免「深色文字配浅色底」的中间态。
         assert!(dark.lerp(&light, 0.4).is_dark, "t<0.5 应保持源的明暗");
         assert!(!dark.lerp(&light, 0.6).is_dark, "t≥0.5 应翻到目标的明暗");
+    }
+
+    /// 半透明令牌的补间必须在**预乘空间**线性插值后原样重组。
+    ///
+    /// 回归守卫（2026-10-17）：`to_array()` 拿到的是预乘分量，若用
+    /// `from_rgba_unmultiplied` 重组会**二次预乘**——`row_hover` 从
+    /// 白 30 → 黑 26 过渡时，中点的预乘 rgb 应是 15，二次预乘后被压到
+    /// ~2，主题切换途中悬停/按下底色整体发暗。期望值从两端现算，
+    /// 改色板数值也不会让这条测试失真。
+    #[test]
+    fn palette_lerp_keeps_premultiplied_channels() {
+        let dark = Palette::dark();
+        let light = Palette::light();
+        let mid = dark.lerp(&light, 0.5);
+        for (name, got) in [
+            ("row_hover", mid.row_hover),
+            ("row_active", mid.row_active),
+            ("row_selected", mid.row_selected),
+        ] {
+            let (a, b) = match name {
+                "row_hover" => (dark.row_hover, light.row_hover),
+                "row_active" => (dark.row_active, light.row_active),
+                _ => (dark.row_selected, light.row_selected),
+            };
+            for ch in 0..4 {
+                let av = a.to_array()[ch] as f32;
+                let bv = b.to_array()[ch] as f32;
+                let want = ((av + bv) / 2.0).round() as u8;
+                assert_eq!(
+                    got.to_array()[ch], want,
+                    "{name} 通道 {ch} 应为两端预乘均值 {want}，实际 {}（疑似二次预乘）",
+                    got.to_array()[ch]
+                );
+            }
+        }
     }
 
     #[test]

@@ -43,28 +43,37 @@ public static class Cap {
 
   public static List<IntPtr> TopLevel(uint want) {
     var r = new List<IntPtr>();
-    EnumWindows((h,l) => { uint p; GetWindowThreadProcessId(h, out p); if (p == want) r.Add(h); return true; }, IntPtr.Zero);
+    // want == 0 ⇒ 枚举全部顶层窗口（界面窗口住在子进程里，按 pid 找不到）。
+    EnumWindows((h,l) => { if (want == 0) { r.Add(h); return true; } uint p; GetWindowThreadProcessId(h, out p); if (p == want) r.Add(h); return true; }, IntPtr.Zero);
     return r;
   }
   public static string Cls(IntPtr h) { var sb = new StringBuilder(256); GetClassNameW(h, sb, 256); return sb.ToString(); }
 }
 '@
 
-$exe = '$RepoRoot\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe'
+$exe = "$RepoRoot\target\x86_64-pc-windows-msvc\debug\modular-clipboard.exe"
 Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 
 $env:RUST_LOG = 'info,modular_clipboard=debug'
-$err = '$RepoRoot\shot.err'
+$err = "$RepoRoot\shot.err"
 Remove-Item $err -ErrorAction SilentlyContinue
+# CAUTION: 配置里 `ui.start_minimized = true` 时常驻进程**不主动拉起界面**
+# （这是自启动场景的正确行为）。截图流程因此分两步：先起常驻进程，
+# 再显式 `--ui` 拉起界面进程（界面窗口住在后者里面）。
 $p = Start-Process -FilePath $exe -ArgumentList '--no-capture' -PassThru `
-  -RedirectStandardOutput '$RepoRoot\shot.log' -RedirectStandardError $err
+  -RedirectStandardOutput "$RepoRoot\shot.log" -RedirectStandardError $err
+Start-Sleep -Seconds 2
+$ui = Start-Process -FilePath $exe -ArgumentList '--ui' -PassThru `
+  -RedirectStandardOutput "$RepoRoot\shot-ui.log" -RedirectStandardError "$RepoRoot\shot-ui.err"
 Start-Sleep -Seconds 4
-$p.Refresh()
+$ui.Refresh()
 
 $main = [IntPtr]::Zero
-foreach ($h in [Cap]::TopLevel([uint32]$p.Id)) { if ([Cap]::Cls($h) -eq 'ModularClipboardWindow') { $main = $h; break } }
-if ($main -eq [IntPtr]::Zero) { Write-Host "找不到主窗口"; Stop-Process -Id $p.Id -Force; exit 1 }
+# CAUTION: 界面窗口是**子进程**（常驻进程拉起 `--ui`），只枚举主进程的
+# 顶层窗口永远找不到它。这里按类名全局枚举。
+foreach ($h in [Cap]::TopLevel(0)) { if ([Cap]::Cls($h) -eq 'ModularClipboardWindow') { $main = $h; break } }
+if ($main -eq [IntPtr]::Zero) { Write-Host "找不到主窗口"; Get-Process | Where-Object { $_.ProcessName -like '*modular*' } | Stop-Process -Force -ErrorAction SilentlyContinue; exit 1 }
 
 # IMPORTANT: 必须先把窗口移到**屏幕空白区**再截图。
 # 窗口默认创建在 (120,120)，那里往往被用户的浏览器/终端/编辑器盖住——
@@ -118,7 +127,7 @@ Add-Type -AssemblyName System.Drawing
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $gfx = [System.Drawing.Graphics]::FromImage($bmp)
 $gfx.CopyFromScreen($pt.X, $pt.Y, 0, 0, (New-Object System.Drawing.Size($w, $h)))
-$png = '$RepoRoot\shot-client.png'
+$png = "$RepoRoot\shot-client.png"
 $bmp.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
 $gfx.Dispose(); $bmp.Dispose()
 Write-Host "客户区截图已存: $png"
@@ -132,12 +141,13 @@ $sb = [System.Windows.Forms.SystemInformation]::VirtualScreen
 $fb = New-Object System.Drawing.Bitmap $sb.Width, $sb.Height
 $fg = [System.Drawing.Graphics]::FromImage($fb)
 $fg.CopyFromScreen($sb.Left, $sb.Top, 0, 0, (New-Object System.Drawing.Size($sb.Width, $sb.Height)))
-$fpng = '$RepoRoot\shot-fullscreen.png'
+$fpng = "$RepoRoot\shot-fullscreen.png"
 $fb.Save($fpng, [System.Drawing.Imaging.ImageFormat]::Png)
 $fg.Dispose(); $fb.Dispose()
 Write-Host "全屏截图已存: $fpng ($($sb.Width)x$($sb.Height))"
 
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+Stop-Process -Id $ui.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 300
 Write-Host ""
 Write-Host "=== 运行日志（尾部）==="

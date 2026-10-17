@@ -1146,10 +1146,24 @@ impl FloatLayout {
 /// 行为：在窗口**上方居中**显示（宽度按内容自适应并钳在窗口内，
 /// 窄窗口也不会渲染到窗外），[`NOTICE_TTL`] 后自动消失；过期的那一帧
 /// 顺带把 `notice` 清掉（读取即消费，不需要额外的定时器）。
+///
+/// # 出入场动效（2026-10-17）
+///
+/// 早前 toast 是「硬现、硬消失」——满不透明度瞬间出现在最终位置，
+/// 3 秒后瞬间蒸发，与其余界面元素（悬停/选中全部走补间）的观感
+/// 断裂。现在入场 140ms OutCubic 下滑 8pt + 淡入，出场在最后 220ms
+/// 线性淡出。alpha 走 [`fade_color`]（预乘缩放），三层（底/描边/文字）
+/// 同步淡，不会出现「底没了字还在」。
 fn draw_notice_toast(f: &mut Frame<'_>) {
     /// toast 存活时间。3 秒是桌面端通知的惯例时长：足够读完一句话，
     /// 又不至于挡太久。
     const NOTICE_TTL: std::time::Duration = std::time::Duration::from_secs(3);
+    /// 入场时长（秒）：下滑 + 淡入。
+    const ENTER: f32 = 0.14;
+    /// 出场淡化时长（秒）：TTL 结束前这么久开始淡出。
+    const EXIT: f32 = 0.22;
+    /// 入场位移幅度（逻辑点）：从上方 8pt 滑入。
+    const SLIDE: f32 = 8.0;
     /// 右边距与顶栏间距。
     const MARGIN: f32 = 12.0;
     /// 宽度按内容自适应时的上下限。
@@ -1194,17 +1208,48 @@ fn draw_notice_toast(f: &mut Frame<'_>) {
         vec2(w, H),
     );
     // 自报热区：与其它命名区域同一套路，测试与自动化读坐标而不重算公式。
+    // 报的是**稳态**矩形（不含入场位移）——MCP 自动化要的是可复用的
+    // 落点，动画中途的 8pt 偏移不该让它每周换一个坐标。
     f.hit_insert("notice_toast", r);
+    // 出入场进度：enter 0→1（OutCubic）配下滑；exit 在 TTL 末尾 1→0。
+    let age = at.elapsed().as_secs_f32();
+    let enter = crate::anim::Ease::OutCubic.apply((age / ENTER).clamp(0.0, 1.0));
+    let exit = ((NOTICE_TTL.as_secs_f32() - age) / EXIT).clamp(0.0, 1.0);
+    let k = enter * exit;
+    // ---- 重绘预约：没有它，空闲闸门会把动画「饿死」 --------------------
+    //
+    // 主循环有 `skip_render` 闸门（见 app.rs 帧循环）：无事件、无补间在飞、
+    // 无重绘请求时整帧跳过。而本动画的进度是 `at.elapsed()`（不走
+    // `anim` 注册表，因此不被 `anim::busy` 覆盖）——不主动预约帧的话：
+    // 1. 入场可能只播了一半就被闸门掐住，toast 僵在中间；
+    // 2. 更糟的是**出场**：2.78s 时那一帧永远等不到，toast 会满亮度挂在
+    //    屏幕上直到用户动一下鼠标，然后瞬间消失（过期帧 k=0 直接不画）。
+    //
+    // 策略：动画中（k<1）逐帧续请求；稳态（k==1）一次性预约到
+    // 「出场开始前一点」的那一帧。稳态期间不占渲染预算（2.6s 空闲）。
+    let ctx = f.ui.ctx();
+    if k < 1.0 - 1e-4 {
+        ctx.request_repaint();
+    } else {
+        let wake = (NOTICE_TTL.as_secs_f32() - age - EXIT).max(0.001);
+        ctx.request_repaint_after(std::time::Duration::from_secs_f32(wake));
+    }
+    if k <= 0.004 {
+        // 完全透明（入场第一帧 / 淡出完毕那一帧）：不画。
+        return;
+    }
+    // 入场位移：从最终位置上方 8pt 滑入（enter 补完后归位）。
+    let r = r.translate(vec2(0.0, (1.0 - enter) * SLIDE));
     let painter = f.ui.painter_at(r);
     // 圆角取调色板令牌而非硬编码 6：toast 是浮层控件，规格与按钮/输入框
     // 同级（`radius_md`）。写死数字的话，改主题圆角时 toast 会独自
     // 留在旧值上——这类「一半跟随主题一半不跟随」最难被肉眼发现。
     let radius = CornerRadius::same(pal.radius_md as u8);
-    painter.rect_filled(r, radius, pal.surface_raised);
+    painter.rect_filled(r, radius, fade_color(pal.surface_raised, k));
     painter.rect_stroke(
         r,
         radius,
-        Stroke::new(1.0, pal.border_subtle),
+        Stroke::new(1.0, fade_color(pal.border_subtle, k)),
         egui::StrokeKind::Inside,
     );
     painter.text(
@@ -1212,7 +1257,7 @@ fn draw_notice_toast(f: &mut Frame<'_>) {
         Align2::CENTER_CENTER,
         msg,
         font,
-        pal.text,
+        fade_color(pal.text, k),
     );
 }
 
@@ -1928,9 +1973,21 @@ fn icon_button(
         |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
     );
     let resp = resp.inner;
-    // 悬停底色叠在热区矩形上（`painter_at` 把裁剪限制在顶栏内）。
-    if resp.hovered() {
-        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
+    // 悬停底色**补间**（110ms OutCubic，与行悬停同档）：早前是
+    // `hovered()` 当帧瞬间 `rect_filled`，鼠标划过时底「硬现」、移开
+    // 「硬没」，与列表行的平滑悬停观感不一致。id 用按钮名（每帧稳定）。
+    let hov = crate::anim::tween_f32(
+        f.ui.ctx(),
+        egui::Id::new(("icon_btn_hover", id)),
+        if resp.hovered() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(110),
+        crate::anim::Ease::OutCubic,
+    );
+    if hov > 0.004 {
+        // 底色叠在热区矩形上（`painter_at` 把裁剪限制在顶栏内）。
+        f.ui
+            .painter_at(r)
+            .rect_filled(r, pal.radius_sm, fade_color(pal.row_hover, hov));
     }
     draw_topbar_icon(
         &f.ui.painter_at(r),
@@ -1985,8 +2042,18 @@ fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response {
         |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
     );
     let resp = resp.inner;
-    if resp.hovered() {
-        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
+    // 悬停底色补间：与 [`icon_button`] 同一套（110ms OutCubic）。
+    let hov = crate::anim::tween_f32(
+        f.ui.ctx(),
+        egui::Id::new("search_icon_hover"),
+        if resp.hovered() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(110),
+        crate::anim::Ease::OutCubic,
+    );
+    if hov > 0.004 {
+        f.ui
+            .painter_at(r)
+            .rect_filled(r, pal.radius_sm, fade_color(pal.row_hover, hov));
     }
     draw_search_icon(
         &f.ui.painter_at(r),
@@ -5417,21 +5484,22 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // NOTE: 这里用的是**整行**宽度（不减按钮列）：预览带位于按钮行下方，
     // 因此测量折行数时也必须按整行宽算，否则量出的行数会偏多、行高虚高。
     //
-    // IMPORTANT: **无条件**让出滚动条占位。绘制侧的行矩形在「可滚动」
-    // 时会内缩 [`SCROLLBAR_RESERVE`]（否则滚动条压住删除按钮，见下面
+    // IMPORTANT: **无条件**让出滚动条占位与呼吸空间。绘制侧的行矩形在
+    // 「可滚动」时会内缩 [`SCROLLBAR_RESERVE`] + [`SCROLLBAR_GAP`]
+    // （否则 egui 的 floating 滚动条会盖住删除按钮，见下面
     // `row_w` 的注释），而「是否可滚动」取决于 `content_h`、也就是
     // 本函数算出来的行高——直接用 `content.width()` 测量就是一个**先鸡
     // 先蛋**：量的时候按宽宽度算，量完才知道要滚动，那时行已经窄了
-    // 10pt ⇒ 折行数偏少 ⇒ 行高偏小 ⇒ 文字被裁。实测症状正是
+    // 16pt ⇒ 折行数偏少 ⇒ 行高偏小 ⇒ 文字被裁。实测症状正是
     // 「条目少时正常、条目一多就每行少显示一点」。
     //
     // 无条件让出为什么**不会**引入新问题（两个方向都是安全的）：
     // 1. 可滚动时：测量与绘制**完全同宽**（都让出），这是要修的情况；
-    // 2. 不可滚动时：绘制宽度比测量**多** 10pt ⇒ 文字实际能放的比
+    // 2. 不可滚动时：绘制宽度比测量**多** 16pt ⇒ 文字实际能放的比
     //    量出来的更宽 ⇒ 行高**偏大**而非偏小 ⇒ 最多多留一点空白，
     //    绝不会裁字。方向反了才是 bug（那是早前的写法）。
     //
-    // 单调性保证不会来回抖：让出 10pt 只会让行变高，`content_h` 只增
+    // 单调性保证不会来回抖：让出 16pt 只会让行变高，`content_h` 只增
     // 不减，所以「本来可滚动 ⇒ 让出后仍可滚动」，滚动条不会闪。
     let text_w = preview_full_width(row_measure_width(content.width()));
     let version = f.svc.state.list_version;
@@ -5631,9 +5699,13 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 自动全部避开，不必逐个改。
             //
             // 仅在 `content_h > 视口高`（有滚动条）时让出：否则白白
-            // 损失 10pt 可用宽度。
+            // 损失 16pt 可用宽度。
+            //
+            // 让出量 = 滚动条热区（`SCROLLBAR_RESERVE`）+ 呼吸空间
+            // （`SCROLLBAR_GAP`）：滑块与卡片之间不再零距相贴
+            // （2026-10-17 用户反馈「滑动条容易和卡片挤在一起」）。
             let row_w = if content_h > content.height() {
-                content.width() - SCROLLBAR_RESERVE
+                content.width() - SCROLLBAR_RESERVE - SCROLLBAR_GAP
             } else {
                 content.width()
             };
@@ -5694,15 +5766,17 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 // 为拖动区：WM_NCHITTEST 返回 HTCAPTION，用户按住行间
                 // 缝隙即可拖动窗口，不必精确瞄准左右留白。
                 //
-                // NOTE: 右缘让出垂直滚动条占位（`content.max.x - RESERVE`），
-                // 否则「拖滚动条」会被系统判成 HTCAPTION 变成拖窗口——
-                // 与左右留白拖动区避开滚动条是同一个原因。
+                // NOTE: 右缘让出滚动条热区**与呼吸空间**（`content.max.x
+                // - RESERVE - GAP`），否则「拖滚动条」会被系统判成
+                // HTCAPTION 变成拖窗口——与左右留白拖动区避开滚动条是同
+                // 一个原因。GAP 一并让出：拖动条若伸进呼吸空间，用户在
+                // 滑块旁按住会同时命中两个区域。
                 let gap_top = if i == 0 { content.min.y } else { r.min.y - row_gap };
                 let gap_bottom = r.min.y.min(content.max.y);
                 if gap_bottom > gap_top {
                     f.state.drag_regions.push(Rect::from_min_max(
                         pos2(content.min.x, gap_top.max(content.min.y)),
-                        pos2(content.max.x - SCROLLBAR_RESERVE, gap_bottom),
+                        pos2(content.max.x - SCROLLBAR_RESERVE - SCROLLBAR_GAP, gap_bottom),
                     ));
                 }
                 draw_item_row(f, ui, r, &visible[k]);
@@ -5764,29 +5838,30 @@ fn preview_full_width(body_w: f32) -> f32 {
     (body_w - ROW_PAD_H * 2.0).max(20.0)
 }
 
-/// 行**测量**用的内容宽度：内容区宽度**无条件**让出滚动条占位。
+/// 行**测量**用的内容宽度：内容区宽度**无条件**让出滚动条占位与呼吸空间。
 ///
 /// # 为什么必须让出，以及为什么无条件
 ///
-/// 绘制侧的行矩形在「可滚动」时会内缩 [`SCROLLBAR_RESERVE`]（见
-/// `draw_history_body` 里的 `row_w`；不缩的话 egui 的 floating 滚动条
-/// 会盖住删除按钮，滚动条压过所有行内控件）。而「是否可滚动」由
-/// `content_h > 可视高` 判定，`content_h` 又来自行高——行高来自本函数。
+/// 绘制侧的行矩形在「可滚动」时会内缩 [`SCROLLBAR_RESERVE`] +
+/// [`SCROLLBAR_GAP`]（见 `draw_history_body` 里的 `row_w`；不缩的话
+/// egui 的 floating 滚动条会盖住删除按钮，滚动条压过所有行内控件）。
+/// 而「是否可滚动」由 `content_h > 可视高` 判定，`content_h` 又来自
+/// 行高——行高来自本函数。
 ///
 /// 于是直接按 `content.width()` 测量就是先鸡先蛋：量的时候按**宽**
-/// 宽度算折行，量完才发现要滚动，那时真实宽度已经窄了 10pt ⇒ 折行数
+/// 宽度算折行，量完才发现要滚动，那时真实宽度已经窄了 16pt ⇒ 折行数
 /// 偏少 ⇒ 行高偏小 ⇒ 文字被裁。症状有明确指纹：**条目少时正常、
 /// 条目一多（出现滚动条）就每行少显示一点**。
 ///
 /// 无条件让出在两个方向都安全：
 /// - 可滚动：测量与绘制同宽（都让出）——修好的正是这一支；
-/// - 不可滚动：绘制比测量**多** 10pt ⇒ 行高**偏大**，最多留一点空白，
+/// - 不可滚动：绘制比测量**多** 16pt ⇒ 行高**偏大**，最多留一点空白，
 ///   绝不裁字。
 ///
 /// 且单调：让出只会让行变高，`content_h` 只增不减 ⇒ 滚动条不会在两
 /// 帧之间来回闪。
 fn row_measure_width(content_w: f32) -> f32 {
-    (content_w - SCROLLBAR_RESERVE).max(20.0)
+    (content_w - SCROLLBAR_RESERVE - SCROLLBAR_GAP).max(20.0)
 }
 
 /// 行内**顶部一行**的高度：左侧「来源·时间」与右侧操作按钮取较高者。
@@ -5889,6 +5964,29 @@ const SEARCH_HOVER_DELAY: f64 = 0.18;
 /// 早前这里是 8.0，比滚动条实际宽度**小 2pt** —— 于是按它算出的
 /// 「已避开滚动条」的位置，仍然有 2pt 落在滚动条下面。
 const SCROLLBAR_RESERVE: f32 = crate::theme::SCROLLBAR_WIDTH;
+
+/// 滚动条热区与行卡片之间的**呼吸空间**（逻辑点）。
+///
+/// # 为什么需要它（2026-10-17 用户反馈「滑动条容易和卡片挤在一起」）
+///
+/// egui 0.36 默认 `ScrollStyle` 是 **floating**：滚动条不占布局宽度，
+/// 而是浮在 `[content.max.x - bar_width, content.max.x]` 上。行矩形按
+/// [`SCROLLBAR_RESERVE`] 让位后，右缘恰好贴在滚动条热区的左边界上——
+/// **零间距**。滑块本身还有 `bar_inner_margin`（3pt）的内缩，视觉上
+/// 缝隙只剩 1~2pt，卡片的删除按钮、文字都与滑块擦身而过；拖动滑块时
+/// 手指压到的也是卡片边缘，「挤在一起」的观感与误触都源于此。
+///
+/// 6pt 的取值依据：滑块视觉宽 = `bar_width - 2×bar_inner_margin` = 4pt，
+/// 让出 6pt 后滑块与卡片之间约有 9pt 净空——与 `ROW_GAP`（6~8pt）的
+/// 行间缝隙同档，整窗的「空白节奏」一致。
+///
+/// # 为什么测量侧要**无条件**让出（与 `SCROLLBAR_RESERVE` 同一理由）
+///
+/// 「是否可滚动」取决于行高，行高又取决于测量宽度——直接按
+/// `content.width()` 量就是先鸡先蛋。两个方向都安全：可滚动时测量与
+/// 绘制同宽（要修的情况）；不可滚动时绘制比测量宽 ⇒ 行高**偏大**，
+/// 最多多留空白，绝不裁字。且单调 ⇒ 滚动条不会两帧之间闪。
+const SCROLLBAR_GAP: f32 = 6.0;
 
 /// 每行文字的高度倍率。
 const LINE_H: f32 = 1.35;
@@ -6401,6 +6499,32 @@ fn draw_empty(f: &mut Frame<'_>, body: Rect, msg: &str) {
     );
 }
 
+/// 按比例 `k ∈ [0,1]` 缩放颜色的**不透明度**（补间淡入淡出用）。
+///
+/// # 为什么必须走预乘分量
+///
+/// egui 的 [`egui::Color32`] 内部是**预乘 alpha** 存储（`r()` 返回的是
+/// 已经乘过 alpha 的通道，见 ecolor `color32.rs` 模块文档）。因此缩放
+/// 不透明度要把**四个通道一起乘 k**，再用 `from_rgba_premultiplied`
+/// 组装：
+///
+/// ```text
+/// from_rgba_premultiplied(r·k, g·k, b·k, a·k)
+/// ```
+///
+/// 若改用 `from_rgba_unmultiplied(r, g, b, a·k)`（把预乘分量当普通
+/// RGBA 传进去），rgb 会被**二次预乘**——本仓踩过：行悬停底色
+/// `row_hover = from_white_alpha(30)`，正确值应是 11.8% 的白，二次
+/// 预乘后只剩 ~1.6%，悬停提亮几乎看不见（2026-10-17 修复）。
+///
+/// 纯函数：不碰 egui 运行时，单测直接覆盖。
+pub(crate) fn fade_color(c: egui::Color32, k: f32) -> egui::Color32 {
+    let k = k.clamp(0.0, 1.0);
+    let [r, g, b, a] = c.to_array();
+    let s = |v: u8| (v as f32 * k).round().clamp(0.0, 255.0) as u8;
+    egui::Color32::from_rgba_premultiplied(s(r), s(g), s(b), s(a))
+}
+
 /// 画一圈圆角描边：**两次填充**，而不是路径描边。
 ///
 /// # 为什么不用 `Painter::rect_stroke`
@@ -6654,42 +6778,78 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // CAUTION: 宽度是**逻辑点**、不乘 scale（F-35 / UI-P1-4）：egui 的
     // Stroke 单位就是逻辑点，乘 ppp 会让 150% DPI 下画成 3pt，与注释
     // 承诺的「2pt」不符，也和其他 1.0 逻辑点的描边不成体系。
-    if selected {
-        fill_rounded_border(&painter, r, radius, 2.0, pal.accent, |p, inner, inner_r| {
+    //
+    // ---- 卡片分层：底 → 置顶 → 选中 → 悬停 → 按下 ---------------------
+    //
+    // 每层都是一层半透明矩形往上叠；除置顶（静态数据标记）外全部走补间
+    // （`anim::tween_f32`：目标值由本帧状态给出、从当前显示值续接）——
+    // 鼠标划过、按下、选中、取消选中都有平滑过渡，不再是硬切。
+    //
+    // 顺序上选中在悬停/按下**之下**：accent 环是稳定骨架，指针反馈叠在
+    // 它上面——悬停一个已选中的行仍然看得到反应（旧实现选中与悬停互斥，
+    // 选中行对指针毫无反馈）。
+    painter.rect_filled(r, radius, pal.surface_raised);
+    // 置顶标记：底色微亮。置顶条目就在同一个列表里，靠这个区分。
+    //
+    // NOTE: 只靠色差是不够的 —— 实测 7% 透明叠加几乎看不出差别。
+    // 行内 pin 按钮的实心/描边是主要的形状线索，底色只是辅助。
+    if item.pinned {
+        painter.rect_filled(r, radius, pal.pin_tint);
+    }
+    // 选中态补间（140ms OutCubic）：accent 描边 0→2pt、选中底 alpha
+    // 0→满。切换选中时 accent 环从细到粗「长」出来，取消时收回去。
+    //
+    // 阈值 0.004：淡出完成后一层 alpha≈0 的矩形是纯浪费。同时它保证
+    // `fill_rounded_border` 收到的 w > 0——该函数对 w<=0 的兜底是
+    // 「整块实心 border 填充」，被 0 触发的后果是整行刷成 accent。
+    let sel = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("row_sel", item.id)),
+        if selected { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(140),
+        crate::anim::Ease::OutCubic,
+    );
+    if sel > 0.004 {
+        fill_rounded_border(&painter, r, radius, 2.0 * sel, pal.accent, |p, inner, inner_r| {
             p.rect_filled(inner, inner_r, pal.surface_raised);
-            p.rect_filled(inner, inner_r, pal.row_selected);
+            p.rect_filled(inner, inner_r, fade_color(pal.row_selected, sel));
         });
-    } else {
-        painter.rect_filled(r, radius, pal.surface_raised);
-        // 置顶标记：底色微亮。置顶条目就在同一个列表里，靠这个区分。
-        //
-        // NOTE: 只靠色差是不够的 —— 实测 7% 透明叠加几乎看不出差别。
-        // 行内 pin 按钮的实心/描边是主要的形状线索，底色只是辅助。
-        if item.pinned {
-            painter.rect_filled(r, radius, pal.pin_tint);
-        }
-        // 悬停底色**补间**（动效 B 表 #3，110ms OutCubic）：
-        // 目标值由本帧是否悬停给出，补间从当前显示值续接——鼠标划过时
-        // 背景平滑淡入淡出，不再是硬切（「界面显得廉价」的主要来源之一）。
-        //
-        // id 带 `item.id`：每行一个独立补间，滚动时各行互不影响。
-        // 滚出可视区的行停止绘制，其补间条目留在 ctx.data 里——
-        // 上界是「历史条目数 × 40 字节」（≤2000 条即 80KB），可接受；
-        // 需要更紧的宿主可调 `anim::clear`。
-        let hover = crate::anim::tween_f32(
-            ui.ctx(),
-            egui::Id::new(("row_hover", item.id)),
-            if resp.hovered() { 1.0 } else { 0.0 },
-            std::time::Duration::from_millis(110),
-            crate::anim::Ease::OutCubic,
-        );
-        // 阈值跳过：淡出完成后再画一层 alpha≈0 的矩形是纯浪费。
-        if hover > 0.004 {
-            let [hr, hg, hb, ha] = pal.row_hover.to_array();
-            let hover_color =
-                egui::Color32::from_rgba_unmultiplied(hr, hg, hb, (ha as f32 * hover) as u8);
-            painter.rect_filled(r, radius, hover_color);
-        }
+    }
+    // 悬停底色**补间**（110ms OutCubic）：
+    // 目标值由本帧是否悬停给出，补间从当前显示值续接——鼠标划过时
+    // 背景平滑淡入淡出，不再是硬切（「界面显得廉价」的主要来源之一）。
+    //
+    // id 带 `item.id`：每行一个独立补间，滚动时各行互不影响。
+    // 滚出可视区的行停止绘制，其补间条目留在 ctx.data 里。本函数每行
+    // 最多持有 4 条（悬停 / 按下 / 选中 + 三个操作按钮各自的悬停），
+    // 上界 ≈ 条目数 × 4 × 50 字节（默认上限 1 万条 ⇒ ~2MB），可接受；
+    // 需要更紧的宿主可在列表刷新时按 id 调 `anim::clear`。
+    let hover = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("row_hover", item.id)),
+        if resp.hovered() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(110),
+        crate::anim::Ease::OutCubic,
+    );
+    // 阈值跳过：淡出完成后再画一层 alpha≈0 的矩形是纯浪费。
+    if hover > 0.004 {
+        // CAUTION: 必须整体缩放预乘分量（`fade_color`）——`to_array()`
+        // 拿到的就是预乘后的 rgb，若用 `from_rgba_unmultiplied` 重组
+        // 会二次预乘，把 11.8% 的悬停提亮压暗成 ~1.6%（几乎看不见）。
+        painter.rect_filled(r, radius, fade_color(pal.row_hover, hover));
+    }
+    // 按下反馈（90ms OutCubic）：指针按住条目时叠一层 `row_active`
+    // （白 20%），松手淡出。桌面列表的标准按压反馈；与悬停叠加表达
+    // 「按住了」，也让点击到选中的衔接有 intermediate 状态。
+    let press = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("row_press", item.id)),
+        if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(90),
+        crate::anim::Ease::OutCubic,
+    );
+    if press > 0.004 {
+        painter.rect_filled(r, radius, fade_color(pal.row_active, press));
     }
 
     // ---- 顶部受光高光（在卡片填充之上）----
@@ -6979,6 +7139,20 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
             break; // 卡片太窄，放不下就不画操作
         }
         let rr = ui.interact(b, egui::Id::new(("row_act", item.id, i)), Sense::click());
+        // 悬停圆角底（110ms OutCubic 补间）：小图标按钮只有「图标变色」
+        // 时反馈太弱，加一层 `row_hover` 底让按钮有可点的实体感。底色先
+        // 画、图标后画，顺序不能反。id 带条目与槽位，三个按钮各自独立。
+        let bh = crate::anim::tween_f32(
+            ui.ctx(),
+            egui::Id::new(("row_act_hover", item.id, i)),
+            if rr.hovered() { 1.0 } else { 0.0 },
+            std::time::Duration::from_millis(110),
+            crate::anim::Ease::OutCubic,
+        );
+        if bh > 0.004 {
+            ui.painter_at(b)
+                .rect_filled(b, pal.radius_sm, fade_color(pal.row_hover, bh));
+        }
         let color = if !*enabled {
             pal.text_dim
         } else if i == 2 && rr.hovered() {
@@ -8243,8 +8417,9 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 卡片行间缝隙（`history_row_gap` 横带）与首行顶部半条缝必须是拖动区：
     /// 按住行间空白即可拖动窗口，不必精确瞄准左右留白。
     ///
-    /// CAUTION: 缝隙横条右缘让出滚动条占位（`SCROLLBAR_RESERVE`），否则
-    /// 拖滚动条会被系统判成 HTCAPTION 变成拖窗口。
+    /// CAUTION: 缝隙横条右缘让出滚动条热区与呼吸空间
+    /// （`SCROLLBAR_RESERVE + SCROLLBAR_GAP`），否则拖滚动条会被系统
+    /// 判成 HTCAPTION 变成拖窗口。
     #[test]
     fn row_gap_is_drag_region() {
         let mut h = Harness::new("row-gap-drag", vec2(700.0, 600.0)).with_items(3);
@@ -8258,11 +8433,11 @@ fn with_pinned(mut self, n: usize) -> Self {
         // （|0| + 8 = 8，与旧默认 2+6=8 恰好相同）。
         let gap = history_row_gap(&modular_clipboard_core::Config::default().ui.card_shadow);
         let near = |a: f32, b: f32| (a - b).abs() < 0.6;
-        // ① 首行顶部的半条缝：从列表顶到第一行顶，右缘让出滚动条位。
+        // ① 首行顶部的半条缝：从列表顶到第一行顶，右缘让出滚动条位与呼吸空间。
         let top_gap = Rect::from_min_max(
             content.min,
             pos2(
-                content.max.x - SCROLLBAR_RESERVE,
+                content.max.x - SCROLLBAR_RESERVE - SCROLLBAR_GAP,
                 content.min.y + gap * 0.5,
             ),
         );
@@ -8297,24 +8472,24 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 行高测量宽度必须与绘制宽度同源：都让出滚动条占位。
+    /// 行高测量宽度必须与绘制宽度同源：都让出滚动条占位与呼吸空间。
     ///
     /// 回归守卫（L3）：测量早前用 `content.width()`，而绘制侧在「可
-    /// 滚动」时把行矩形内缩 [`SCROLLBAR_RESERVE`]（不缩的话 egui 的
-    /// floating 滚动条会盖住删除按钮）。于是量的时候按宽 10pt 算折行，
-    /// 画的时候窄 10pt ⇒ 折行数偏少 ⇒ 行高偏小 ⇒ **文字被裁**。
-    /// 症状指纹：条目少时正常、条目一多就每行少显示一点。
+    /// 滚动」时把行矩形内缩 [`SCROLLBAR_RESERVE`] + [`SCROLLBAR_GAP`]
+    /// （不缩的话 egui 的 floating 滚动条会盖住删除按钮）。于是量的
+    /// 时候按宽 16pt 算折行，画的时候窄 16pt ⇒ 折行数偏少 ⇒ 行高偏小
+    /// ⇒ **文字被裁**。症状指纹：条目少时正常、条目一多就每行少显示一点。
     #[test]
     fn row_measure_width_reserves_scrollbar_like_rendering() {
         let content_w = 500.0;
         let measured = row_measure_width(content_w);
         assert!(
             measured < content_w,
-            "测量宽度必须让出滚动条占位，否则测量比绘制宽"
+            "测量宽度必须让出滚动条占位与呼吸空间，否则测量比绘制宽"
         );
         assert!(
-            (measured - (content_w - SCROLLBAR_RESERVE)).abs() < 1e-4,
-            "让出的量必须恰好等于 SCROLLBAR_RESERVE（绘制侧同值）"
+            (measured - (content_w - SCROLLBAR_RESERVE - SCROLLBAR_GAP)).abs() < 1e-4,
+            "让出的量必须恰好等于 SCROLLBAR_RESERVE + SCROLLBAR_GAP（绘制侧同值）"
         );
         // 单调性：内容越宽，测量宽度单调递增——这是「不会来回抖」的
         // 基础（行高随宽度单调不减 ⇒ 滚动条不会在两帧之间闪）。
@@ -9127,8 +9302,9 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// `pinned_row_button_can_unpin` 只放 3 条记录、窗口 600pt 高
     /// ⇒ `content_h` 远小于视口 ⇒ **根本没有滚动条**。
     ///
-    /// 修法是让**行矩形**在可滚动时右缘内缩 `SCROLLBAR_RESERVE`，
-    /// 按钮与文字都以 `r.max.x` 为基准，于是自动全部避开。
+    /// 修法是让**行矩形**在可滚动时右缘内缩 `SCROLLBAR_RESERVE`
+    /// + `SCROLLBAR_GAP`（后者是 2026-10-17 加的呼吸空间），按钮与文字
+    ///   都以 `r.max.x` 为基准，于是自动全部避开。
     #[test]
     fn delete_button_is_clickable_when_list_is_scrollable() {
         // 条目足够多，确保撑出滚动条（这是本测试成立的前提）。
@@ -9147,8 +9323,9 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         let btn = h.pal.control_height * 0.55;
         let acts_w = acts_width(&h.pal);
-        // 行矩形已内缩，按钮基准 = content.max.x - SCROLLBAR_RESERVE - ROW_PAD_H。
-        let right = body.max.x - LIST_PAD_X - SCROLLBAR_RESERVE - ROW_PAD_H;
+        // 行矩形已内缩，按钮基准 = content.max.x - SCROLLBAR_RESERVE
+        // - SCROLLBAR_GAP - ROW_PAD_H（2026-10-17 起多让一项呼吸空间）。
+        let right = body.max.x - LIST_PAD_X - SCROLLBAR_RESERVE - SCROLLBAR_GAP - ROW_PAD_H;
         // i=2 是删除（最右一个），中心偏左 acts_w - 2.5*(btn+space_xs)。
         let x = right - acts_w + 2.5 * (btn + h.pal.space_xs);
 
@@ -10982,6 +11159,38 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 退化输入：无层、不 panic。
         assert!(card_shadow_layers(0.0, 0.4).is_empty());
         assert!(card_shadow_layers(6.0, 0.0).is_empty());
+    }
+
+    /// `fade_color` 必须按**预乘**语义缩放：四通道一起乘 k。
+    ///
+    /// 回归守卫（2026-10-17）：行悬停底色曾用 `from_rgba_unmultiplied`
+    /// 重组 `to_array()` 的预乘分量，二次预乘把 11.8% 的悬停提亮压暗成
+    /// 1.4%（`from_white_alpha(30)` 变成 rgb≈3），鼠标划过几乎看不出
+    /// 反馈。k=1 恒等这条直接守那个 bug。
+    #[test]
+    fn fade_color_scales_premultiplied_channels() {
+        // `from_white_alpha(30)` 的预乘存储就是 [30,30,30,30]（rgb==a）。
+        let white30 = egui::Color32::from_white_alpha(30);
+        assert_eq!(white30.to_array(), [30, 30, 30, 30]);
+        // k=1 恒等——旧写法在这里就会露出二次预乘（rgb 掉到 ~3）。
+        assert_eq!(fade_color(white30, 1.0), white30);
+        // k=0 全透明：预乘语义下「不可见」就是四通道全零。
+        assert_eq!(fade_color(white30, 0.0).to_array(), [0, 0, 0, 0]);
+        // k=0.5：四通道一起缩半（色相不变，只降不透明度）。
+        assert_eq!(fade_color(white30, 0.5).to_array(), [15, 15, 15, 15]);
+        // 越界输入钳住（动画补间可能给出 1.0000001）。
+        assert_eq!(fade_color(white30, 2.0), white30);
+        assert_eq!(fade_color(white30, -1.0).to_array(), [0, 0, 0, 0]);
+        // 饱和色（rgb 已是满值、只有 alpha 低）同样只缩 alpha。
+        let sel = crate::theme::Palette::light().row_selected;
+        assert_eq!(fade_color(sel, 1.0), sel);
+        let half = fade_color(sel, 0.5);
+        assert!(
+            half.a() < sel.a(),
+            "半透明缩放后 alpha 必须下降：{} -> {}",
+            sel.a(),
+            half.a()
+        );
     }
 
     /// 弹窗投影**必须在窗口边距内衰减完**。
