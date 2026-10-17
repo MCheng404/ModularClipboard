@@ -210,6 +210,43 @@ pub fn clear(ctx: &Context, id: Id) {
     });
 }
 
+/// `id` 是否已有补间条目（不论是否已到达目标）。
+///
+/// 供「一次性入场动画」判断「这个控件本会话首次出现吗」——到达目标后
+/// 条目仍在（完成态不是消失态），这是与 [`busy`] 的关键区别。
+pub fn has(ctx: &Context, id: Id) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<AnimStore>(store_id())
+            .is_some_and(|s| s.map.contains_key(&id))
+    })
+}
+
+/// 一次性入场动画：`id` **首次出现**时从 0 重播到 1，之后直接取当前值。
+///
+/// # 为什么需要它（与 [`tween_f32` 的分工）
+///
+/// `tween_f32` 是惰性的：首帧插入时 `from == to == target`，控件第一次
+/// 出现就**直接落在目标上**——对「跟着状态走」的场景（悬停、选中）这是
+/// 对的。但「每次出现都播一遍入场」的场景（空状态淡入、Toast 滑入）
+/// 需要相反的行为：第一次出现时从 0 开始放。
+///
+/// 判据用 [`has`] 而不是「是否在飞」：完成后条目仍在，不会每帧重播
+/// （否则空状态会无限重启动画，永远停在半透明）。
+///
+/// 同一 `id` 在**同一帧被多次调用**是安全的：第一调用责重启，后续
+/// 调用只推进——两个区域用同一条消息时两者同步淡入，不会互相覆盖。
+pub fn fade_in_once(
+    ctx: &Context,
+    id: Id,
+    dur: Duration,
+    ease: Ease,
+) -> f32 {
+    if !has(ctx, id) {
+        restart(ctx, id, 0.0, 1.0, dur, ease);
+    }
+    tween_f32(ctx, id, 1.0, dur, ease)
+}
+
 /// 是否仍有补间在飞行（未达目标）。
 ///
 /// 帧循环的**空闲闸门**用它决定「没有事件也要渲染」：否则动画只在
@@ -388,5 +425,50 @@ mod tests {
         assert!(!busy(&ctx), "已完成（惰性 1.0）时不该算在飞");
         restart(&ctx, id, 0.0, 1.0, Duration::from_millis(100), Ease::Linear);
         assert!(busy(&ctx), "重启后必须算在飞");
+    }
+
+    /// `fade_in_once`：首现从 0 重播、完成后停稳、**不反复重播**。
+    ///
+    /// 守卫的是空状态淡入的语义：每帧重播会让它永远停在半透明。
+    #[test]
+    fn fade_in_once_plays_once_then_settles() {
+        let (ctx, mut input) = ctx_with_time(0.0);
+        let id = Id::new("empty-in");
+        // 首现：从 0 起播（与 tween_f32 的「直接落目标」相反）。
+        assert_eq!(
+            fade_in_once(&ctx, id, Duration::from_millis(100), Ease::Linear),
+            0.0,
+            "首次出现必须从 0 开始放"
+        );
+        assert!(has(&ctx, id), "重播后应留下条目");
+        assert!(busy(&ctx), "入场中必须算在飞（否则空闲闸门会掐掉它）");
+        // 推进到中点。
+        input.time = Some(0.05);
+        let mut out = ctx.run_ui(input.clone(), |_| {});
+        out.textures_delta.clear();
+        let mid = fade_in_once(&ctx, id, Duration::from_millis(100), Ease::Linear);
+        assert!((mid - 0.5).abs() < 1e-5, "中点应约 0.5，实际 {mid}");
+        // 完成后：稳定在 1，不再重播。
+        input.time = Some(1.0);
+        let mut out = ctx.run_ui(input, |_| {});
+        out.textures_delta.clear();
+        for _ in 0..3 {
+            assert_eq!(
+                fade_in_once(&ctx, id, Duration::from_millis(100), Ease::Linear),
+                1.0,
+                "完成后必须恒为 1 且不重播（每帧重播会永远停在半透明）"
+            );
+        }
+        assert!(!busy(&ctx), "落定后不该算在飞");
+        // `has` 与 `busy` 的区别：落定后条目仍在（完成态 ≠ 消失态）。
+        assert!(has(&ctx, id));
+        // clear 之后视为全新：下次首现重新从 0 放。
+        clear(&ctx, id);
+        assert!(!has(&ctx, id));
+        assert_eq!(
+            fade_in_once(&ctx, id, Duration::from_millis(100), Ease::Linear),
+            0.0,
+            "清除后应视为首次出现"
+        );
     }
 }

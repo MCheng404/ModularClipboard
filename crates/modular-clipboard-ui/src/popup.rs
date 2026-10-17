@@ -410,6 +410,13 @@ impl<'a> Popup<'a> {
         // 首次显示：抬到 Z 序顶部，避免被主窗口盖住；搜索面板还要
         // 抢焦点（用户要立刻打字），类型栏保持不抢（no_activate）。
         if just_opened {
+            // 入场动画重播：弹窗 ctx **跨展开/收起存活**（本函数只切
+            // `set_visible`，窗口与 Context 都不重建），`("popup_in", kind)`
+            // 的补间条目在第一次展开后就一直躺在 data store 里 ⇒
+            // `anim::fade_in_once` 判「首次出现」不再成立，之后每次展开
+            // 都没有滑入动效。这里显式清掉，让每次展开都重播一遍。
+            // （绘制侧的同名 id 见 `App::draw_popup`。）
+            crate::anim::clear(&self.ctx, egui::Id::new(("popup_in", kind)));
             crate::presence::raise_to_top(self.window.hwnd());
             if kind.activatable() {
                 crate::presence::focus_window(self.window.hwnd());

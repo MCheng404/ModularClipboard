@@ -2555,10 +2555,42 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         let ppp = ui.ctx().pixels_per_point();
         let margin = crate::popup::SHADOW_MARGIN;
         let client = ui.max_rect();
-        let panel = egui::Rect::from_min_max(
+        let mut panel = egui::Rect::from_min_max(
             egui::pos2(client.min.x + margin, client.min.y + margin),
             egui::pos2(client.max.x - margin, client.max.y - margin),
         );
+        // ---- 入场动效（2026-10-17）：面板从停靠方向滑入 6pt --------------
+        //
+        // 弹窗窗口跨展开/收起**存活**（`Popup::sync_and_render` 只切
+        // `set_visible`），ctx 里的补间条目不会自己重置 ⇒ 只有程序生命周期
+        // 内第一次展开有动画。重播由 `sync_and_render` 的 `just_opened`
+        // 清掉 `("popup_in", kind)` 触发（见那里的说明）。
+        //
+        // 只做位移、不淡内容：弹窗画布透明，半透明文字会直接压到桌面上，
+        // 160ms 的可读性风险不值得（观感增强不许牺牲可读性）。投影与
+        // 面板用同一个矩形，两者同步位移。
+        let k = crate::anim::fade_in_once(
+            ui.ctx(),
+            egui::Id::new(("popup_in", kind)),
+            std::time::Duration::from_millis(160),
+            crate::anim::Ease::OutCubic,
+        );
+        if k < 1.0 {
+            use modular_clipboard_core::config::TypeRailPos;
+            let slide = (1.0 - k) * 6.0;
+            let dir = match kind {
+                // 搜索面板贴在窗口**上方**：从更上方落下。
+                crate::popup::PopupKind::Search => egui::vec2(0.0, -slide),
+                // 类型栏按停靠边：从那一侧的外沿滑入。
+                crate::popup::PopupKind::Rail => match self.svc.state.config.ui.type_rail.pos {
+                    TypeRailPos::Right => egui::vec2(slide, 0.0),
+                    TypeRailPos::Left => egui::vec2(-slide, 0.0),
+                    TypeRailPos::Top => egui::vec2(0.0, -slide),
+                    TypeRailPos::Bottom => egui::vec2(0.0, slide),
+                },
+            };
+            panel = panel.translate(dir);
+        }
         // ---- 没有磨砂底图 ----
         //
         // 弹窗一律**不透明**面板：它不走主窗口那套 GPU 磨砂通道（原因见
@@ -2614,6 +2646,19 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         // 必须对主 `Context` 请求重绘。
         if self.apply_ops() {
             self.ctx.request_repaint();
+        }
+        // ---- 补间续帧（弹窗闸门不统计 anim）------------------------------
+        //
+        // `RedrawGate` 的判据里没有「有补间在飞」这一项（主窗口闸门有），
+        // 而入场滑移、类型栏悬停/激活、清除按钮悬停全是自绘补间 ⇒ 不主动
+        // 预约帧的话，动画会在第一帧后卡住，等下一次鼠标事件才跳变。
+        //
+        // `request_repaint()` 必须在绘制闭包内调用：egui 只在 pass 结束
+        // 时把它写进 `FullOutput`（repaint_delay = ZERO），闸门读的正是
+        // 这个值。busy 为假时什么都不请求——动画落定后闸门自然回到
+        // 10Hz 心跳。
+        if crate::anim::busy(ui.ctx()) {
+            ui.ctx().request_repaint();
         }
     }
 

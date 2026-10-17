@@ -1588,10 +1588,30 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         let cr = f
             .ui
             .interact(clear, egui::Id::new("card_search_clear"), Sense::click());
+        // 悬停圆角底 + 图标颜色补间（110ms）：与行内操作按钮同一套。
+        // 弹窗 ctx 里的补间要靠末尾的 busy 续帧（见本函数结尾）。
+        let chov = crate::anim::tween_f32(
+            f.ui.ctx(),
+            egui::Id::new("search_clear_hover"),
+            if cr.hovered() { 1.0 } else { 0.0 },
+            std::time::Duration::from_millis(110),
+            crate::anim::Ease::OutCubic,
+        );
+        if chov > 0.004 {
+            f.ui
+                .painter_at(clear)
+                .rect_filled(clear, pal.radius_sm, fade_color(pal.row_hover, chov));
+        }
+        let clear_icon_color = crate::anim::tween_color(
+            f.ui.ctx(),
+            egui::Id::new("search_clear_icon"),
+            if cr.hovered() { pal.text_bright } else { pal.text_dim },
+            std::time::Duration::from_millis(110),
+        );
         crate::icons::Icon::Close.paint(
             &f.ui.painter_at(clear),
             Rect::from_center_size(clear.center(), vec2(btn, btn) * 0.7),
-            if cr.hovered() { pal.text_bright } else { pal.text_dim },
+            clear_icon_color,
         );
         if cr.clicked() {
             f.state.query.clear();
@@ -1777,14 +1797,26 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         let resp = f
             .ui
             .interact(slot, egui::Id::new(("rail", kind)), Sense::click());
-        // 底色：激活 accent / 悬停（row_hover 叠在不透明底上）/ 常态 surface_raised。
+        // 底色：激活 accent / 常态 surface_raised（磨砂模式降 alpha）。
         //
         // CAUTION: `row_hover` 是**半透明**令牌（`from_white_alpha(30)`），
         // 在主窗口里它下面有整块不透明背景托着；而弹窗的画布是**透明**的
         // （清屏 alpha=0），直接拿它当填充会把按钮画成半透明——透出背后
         // 的深色桌面，实机就是「鼠标一放上去图标变黑」。
         // 所以半透明态一律**先铺不透明底、再叠色调**。
-        let mut base = if active { pal.accent } else { pal.surface_raised };
+        //
+        // ---- 动效（2026-10-17）：激活交叉淡入 + 悬停补间 -----------------
+        //
+        // 底色目标按「是否激活」取，`tween_color` 从当前显示值向目标
+        // 续接 ⇒ 点下过滤时方块从 surface_raised 平滑染到 accent，
+        // 取消时反向；描边随激活淡出，图标颜色同步补间。
+        let act = crate::anim::tween_f32(
+            f.ui.ctx(),
+            egui::Id::new(("rail_active", kind)),
+            if active { 1.0 } else { 0.0 },
+            std::time::Duration::from_millis(160),
+            crate::anim::Ease::OutCubic,
+        );
         // 磨砂模式：面板底图要透出来，方块底色就得跟着降 alpha。
         //
         // 判据取「`surface` 令牌是否被降过透明度」——`with_backdrop_alpha`
@@ -1792,29 +1824,59 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // `surface_raised` 不在名单里（它是卡片色，主窗口里必须保持不透明）。
         // 弹窗的方块是**面板本身**，所以按同一比例手降一次。
         let frost_k = pal.surface.a() as f32 / 255.0;
+        let mut base_target = if active {
+            pal.accent
+        } else {
+            pal.surface_raised
+        };
         if frost_k < 1.0 && !active {
-            base = base.gamma_multiply(frost_k);
+            base_target = base_target.gamma_multiply(frost_k);
         }
+        let base = crate::anim::tween_color(
+            f.ui.ctx(),
+            egui::Id::new(("rail_base", kind)),
+            base_target,
+            std::time::Duration::from_millis(160),
+        );
         let sq_radius = size * 0.25;
-        f.ui.painter_at(slot).rect_filled(slot, sq_radius, base);
-        if resp.hovered() && !active {
-            f.ui.painter_at(slot).rect_filled(slot, sq_radius, pal.row_hover);
-        }
+        let slot_painter = f.ui.painter_at(slot);
+        slot_painter.rect_filled(slot, sq_radius, base);
         if !active {
-            f.ui.painter_at(slot).rect_stroke(
-                slot,
-                sq_radius,
-                Stroke::new(1.0, pal.border_subtle),
-                egui::StrokeKind::Inside,
+            // 悬停底（110ms）：先铺不透明底（上面的 base），再叠半透明
+            // 提亮；alpha 走预乘缩放（`fade_color`），不用 raw row_hover。
+            let hov = crate::anim::tween_f32(
+                f.ui.ctx(),
+                egui::Id::new(("rail_hover", kind)),
+                if resp.hovered() { 1.0 } else { 0.0 },
+                std::time::Duration::from_millis(110),
+                crate::anim::Ease::OutCubic,
             );
+            if hov > 0.004 {
+                slot_painter.rect_filled(slot, sq_radius, fade_color(pal.row_hover, hov));
+            }
+            // 常态描边随激活淡出（act→1 时完全收进去，与 accent 底交替）。
+            if act < 0.996 {
+                slot_painter.rect_stroke(
+                    slot,
+                    sq_radius,
+                    Stroke::new(1.0, fade_color(pal.border_subtle, 1.0 - act)),
+                    egui::StrokeKind::Inside,
+                );
+            }
         }
-        let icon_color = if active {
+        let icon_target = if active {
             pal.text_on_accent
         } else if resp.hovered() {
             pal.text_bright
         } else {
             pal.text_dim
         };
+        let icon_color = crate::anim::tween_color(
+            f.ui.ctx(),
+            egui::Id::new(("rail_icon", kind)),
+            icon_target,
+            std::time::Duration::from_millis(130),
+        );
         let icon_px = size * 0.5625; // 32pt → 18pt（同行内按钮比例）
         crate::icons::paint_kind_icon(
             &f.ui.painter_at(slot),
@@ -2335,6 +2397,10 @@ pub fn draw_settings(f: &mut Frame<'_>) {
         draw_recording_overlay(f, area);
         return;
     }
+    // 录制结束 ⇒ 清掉入场补间条目：`fade_in_once` 判「首次出现」，
+    // 不清的话只有程序生命周期内**第一次**录制有淡入动效，第二次起
+    // 硬现（与弹窗 `just_opened` 清 `("popup_in", kind)` 同一个道理）。
+    crate::anim::clear(f.ui.ctx(), egui::Id::new("recording_overlay_in"));
 
     // MCP 调用设置覆盖层（限制在本窗口客户区内，不遮桌面）。
     //
@@ -2483,15 +2549,35 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         let resp = f
             .ui
             .interact(r, egui::Id::new(("settings_cat", *cat)), egui::Sense::click());
-        let bg = if selected {
-            pal.row_selected
-        } else if resp.hovered() {
-            pal.row_hover
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-        if bg != egui::Color32::TRANSPARENT {
-            painter.rect_filled(r, pal.radius_md, bg);
+        // ---- 动效（2026-10-17）：选中底淡入 + 悬停补间 -----------------
+        //
+        // 选中底（row_selected，160ms）与悬停底（row_hover，110ms）各自
+        // 补间；悬停只在未选中时生效（与旧实现的优先级一致：选中态压住
+        // 悬停）。alpha 走预乘缩放（`fade_color`）——这两个令牌都是半
+        // 透明色，直接乘会二次预乘（见 `fade_color` 文档）。
+        //
+        // 设置窗口没有空闲闸门（每帧都驱动），这里不需要续帧请求。
+        let sel_t = crate::anim::tween_f32(
+            f.ui.ctx(),
+            egui::Id::new(("nav_sel", *cat)),
+            if selected { 1.0 } else { 0.0 },
+            std::time::Duration::from_millis(160),
+            crate::anim::Ease::OutCubic,
+        );
+        if sel_t > 0.004 {
+            painter.rect_filled(r, pal.radius_md, fade_color(pal.row_selected, sel_t));
+        }
+        if !selected {
+            let hov_t = crate::anim::tween_f32(
+                f.ui.ctx(),
+                egui::Id::new(("nav_hover", *cat)),
+                if resp.hovered() { 1.0 } else { 0.0 },
+                std::time::Duration::from_millis(110),
+                crate::anim::Ease::OutCubic,
+            );
+            if hov_t > 0.004 {
+                painter.rect_filled(r, pal.radius_md, fade_color(pal.row_hover, hov_t));
+            }
         }
         // 图标（左）+ 标题（紧挨图标，不留大空隙）。
         //
@@ -2500,7 +2586,20 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         // 观感「图标和字体离得太远」（2026-10-11 用户反馈）。改为文字
         // 起点 = 图标右缘 + 8pt，图标与标题紧凑成组。
         let icon_r = Rect::from_center_size(pos2(r.min.x + 17.0, r.center().y), vec2(16.0, 16.0));
-        let icon_color = if selected { pal.accent } else { pal.text_dim };
+        // 图标与文字颜色补间（130ms）：切分类时旧项褪色、新项点亮，
+        // 与选中底同步。首帧落目标（`tween_color` 惰性插入）。
+        let icon_color = crate::anim::tween_color(
+            f.ui.ctx(),
+            egui::Id::new(("nav_icon", *cat)),
+            if selected { pal.accent } else { pal.text_dim },
+            std::time::Duration::from_millis(130),
+        );
+        let text_color = crate::anim::tween_color(
+            f.ui.ctx(),
+            egui::Id::new(("nav_text", *cat)),
+            if selected { pal.text_bright } else { pal.text_dim },
+            std::time::Duration::from_millis(130),
+        );
         // 「通信」用自绘插头（图标字体里没有插头字形，新增需重新生成
         // TTF，成本高）：头 + 两个脚 + 线。其余分类用字体图标。
         if *cat == SettingsCat::Comm {
@@ -2513,7 +2612,7 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
             egui::Align2::LEFT_CENTER,
             cat.title(),
             egui::FontId::proportional(pal.font_sm),
-            if selected { pal.text_bright } else { pal.text_dim },
+            text_color,
         );
         f.hit_insert(cat.hot_key(), r);
         if resp.clicked() {
@@ -3558,6 +3657,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 let picked = draw_segmented(
                     f,
                     ui,
+                    "pinned_mode",
                     &[
                         (PinnedMode::SharedColumn, "共用单栏"),
                         (PinnedMode::OwnCard, "独立分栏"),
@@ -3586,7 +3686,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     egui::RichText::new(readout).color(pal.text_dim),
                 ));
                 // 分段控件：值与配置同源，点哪段设哪个倍率。
-                let picked = draw_segmented(f, ui, FONT_SCALE_PRESETS, font_scale_percent(cur));
+                let picked = draw_segmented(f, ui, "font_scale", FONT_SCALE_PRESETS, font_scale_percent(cur));
                 if let Some(p) = picked {
                     f.state.push(Op::SetNumber {
                         group: ConfigGroup::Ui,
@@ -3603,6 +3703,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 let picked = draw_segmented(
                     f,
                     ui,
+                    "theme_mode",
                     &[
                         (crate::theme::ThemeMode::FollowSystem, "跟随系统"),
                         (crate::theme::ThemeMode::Dark, "深色"),
@@ -3622,6 +3723,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 let picked = draw_segmented(
                     f,
                     ui,
+                    "window_backdrop",
                     &[
                         (WindowBackdrop::None, "无"),
                         (WindowBackdrop::Acrylic, "磨砂"),
@@ -3753,6 +3855,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     let picked = draw_segmented(
                         f,
                         ui,
+                        "type_rail_pos",
                         &[
                             (TypeRailPos::Right, "右"),
                             (TypeRailPos::Left, "左"),
@@ -4247,13 +4350,23 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // - 关：中性灰实底（surface_variant），**无描边**——旧版那圈
     //   border 灰边 + 灰色滑块整体灰扑扑，是「丑」的主要来源。
     //   关闭态 hover 叠一层白提亮。
-    let track_color = if on {
+    //
+    // 轨道颜色也走补间（130ms）：滑块位置本来就有 `animate_bool` 在滑，
+    // 轨道却是硬切——两者不同步会读出「颜色先到、滑块后到」的撕裂感。
+    // 设置窗口每帧驱动（无空闲闸门），不需要续帧请求。
+    let track_target = if on {
         if resp.hovered() { pal.accent_hover } else { pal.accent }
     } else if resp.hovered() {
         crate::theme::composite(egui::Color32::from_white_alpha(16), pal.surface_variant)
     } else {
         pal.surface_variant
     };
+    let track_color = crate::anim::tween_color(
+        ui.ctx(),
+        egui::Id::new(("switch_track", id_suffix)),
+        track_target,
+        std::time::Duration::from_millis(130),
+    );
     p.rect_filled(track, h * 0.5, track_color);
 
     // 滑块位置：平滑动画（egui 按帧插值），不再硬切。
@@ -4476,12 +4589,24 @@ fn draw_step_slider(
 ///
 /// 替代 egui 的 `selectable_label`——后者选中态是半透明 row_selected，
 /// 多个胶囊标签挨着时半透明叠半透明，显脏（2026-10-11 用户反馈）。
+///
+/// # 选中指示器滑动（2026-10-17 动效）
+///
+/// 早前选中块是「哪项选中就往哪项画一个实底」——切换时旧块消失、
+/// 新块出现，观感上是**跳变**。现在选中块的位置按**段索引**补间
+/// （`("seg_pill", id_suffix)`，160ms OutCubic）：切换时它从旧段
+/// **滑到**新段，文字颜色同步交叉淡入。`id_suffix` 必须是每个控件
+/// 实例稳定且唯一的标识（传设置项字段名）——同一帧里可能有多个
+/// 分段控件，共用 id 会互相串台。
+///
 /// 返回 `Some(value)` 表示本帧点击了某项。
 fn draw_segmented<T: Copy + PartialEq>(
     f: &mut Frame<'_>,
     ui: &mut Ui,
-    // 选项文字必须是 `'static`：它同时作为热区 key（`hit` 表的键是
-    // `&'static str`）。全部调用点传的都是字面量，无额外负担。
+    // 本实例的唯一标识。同时是热区注释里说的「同帧多控件不互相覆盖」的
+    // 补间键前缀——交互 Id 用 `("seg", i, label)`（选项文字全局唯一），
+    // 补间 Id 必须再叠一层本实例名，否则两个控件会共享同一段补间。
+    id_suffix: &'static str,
     options: &[(T, &'static str)],
     cur: T,
 ) -> Option<T> {
@@ -4515,6 +4640,28 @@ fn draw_segmented<T: Copy + PartialEq>(
     let (r, _) = ui.allocate_exact_size(vec2(total_w, h), egui::Sense::empty());
     let painter = ui.painter_at(r);
     painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+    // ---- 选中指示器：按段索引补间滑动 --------------------------------
+    //
+    // 目标值 = 当前选中段的下标（`position` 找不到时给 0——理论上
+    // `cur` 必在 options 里，但泛型调用方不保证，兜底 0 比 panic 好）。
+    // 补间从当前显示值续接：连续切换时它在中途改方向，不会跳。
+    let sel_idx = options
+        .iter()
+        .position(|(v, _)| *v == cur)
+        .unwrap_or(0) as f32;
+    let pill_idx = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("seg_pill", id_suffix)),
+        sel_idx,
+        std::time::Duration::from_millis(160),
+        crate::anim::Ease::OutCubic,
+    );
+    // 指示器左右各内缩 2pt（与原实现一致），圆角 radius_sm。
+    let pill = Rect::from_min_max(
+        pos2(r.min.x + seg_w * pill_idx + 2.0, r.min.y + 2.0),
+        pos2(r.min.x + seg_w * (pill_idx + 1.0) - 2.0, r.max.y - 2.0),
+    );
+    painter.rect_filled(pill, pal.radius_sm, pal.surface);
     let mut picked = None;
     for (i, (value, label)) in options.iter().enumerate() {
         let seg = egui::Rect::from_min_max(
@@ -4525,25 +4672,29 @@ fn draw_segmented<T: Copy + PartialEq>(
         // 文字放不下时按**段宽**省略：`draw_text` 不裁剪，直接画会
         // 越到相邻段上（视觉上两段文字叠在一起）。
         let text = elide_to_width(ui, label, &font, seg.width() - 8.0);
-        if cur == *value {
-            painter.rect_filled(seg.shrink2(vec2(2.0, 2.0)), pal.radius_sm, pal.surface);
-            painter.text(
-                seg.center(),
-                egui::Align2::CENTER_CENTER,
-                text,
-                font.clone(),
-                pal.accent,
-            );
+        // 文字颜色补间（130ms）：选中态 accent、悬停提亮、常态弱化，
+        // 三者之间交叉淡入，与滑动指示器同步。首帧直接落到目标
+        // （`tween_color` 惰性插入），之后才在变化时补间。
+        let target_color = if cur == *value {
+            pal.accent
+        } else if resp.hovered() {
+            pal.text
         } else {
-            let color = if resp.hovered() { pal.text } else { pal.text_dim };
-            painter.text(
-                seg.center(),
-                egui::Align2::CENTER_CENTER,
-                text,
-                font.clone(),
-                color,
-            );
-        }
+            pal.text_dim
+        };
+        let color = crate::anim::tween_color(
+            ui.ctx(),
+            egui::Id::new(("seg_text", id_suffix, label)),
+            target_color,
+            std::time::Duration::from_millis(130),
+        );
+        painter.text(
+            seg.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font.clone(),
+            color,
+        );
         if resp.clicked() {
             picked = Some(*value);
         }
@@ -4700,6 +4851,18 @@ fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Response {
 fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     let pal = f.pal;
 
+    // 入场动效：遮罩淡入 + 面板下沉 8pt（200ms OutCubic）。
+    //
+    // 录制态下用户会不停按键 ⇒ 事件驱动的帧不会停，动画天然能播完，
+    // 不需要额外续帧请求。id 由调用方在录制结束时清除（见 `draw_settings`
+    // 的 else 分支），每次开始录制都重播一遍。
+    let k = crate::anim::fade_in_once(
+        f.ui.ctx(),
+        egui::Id::new("recording_overlay_in"),
+        std::time::Duration::from_millis(200),
+        crate::anim::Ease::OutCubic,
+    );
+
     // 遮罩：与 MCP 覆盖层同色同 alpha（96）——压暗但不糊死，
     // 模糊本身才是「失焦」的主体。
     let dark = pal.surface.r() < 128;
@@ -4708,7 +4871,10 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     } else {
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 96)
     };
-    f.ui.painter_at(area).rect_filled(area, 0.0, shade);
+    // 遮罩随入场淡入（预乘缩放，见 `fade_color`）。
+    f.ui
+        .painter_at(area)
+        .rect_filled(area, 0.0, fade_color(shade, k));
 
     // ---- 第一个圆角正方形：外层面板（居中）----
     //
@@ -4718,7 +4884,11 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     let side = 340.0_f32
         .min(area.width() * 0.92)
         .min(area.height() * 0.92);
-    let panel = Rect::from_center_size(area.center(), vec2(side, side));
+    // 面板从上方 8pt 沉入（k=1 时归位）。
+    let panel = Rect::from_center_size(
+        area.center() + vec2(0.0, (1.0 - k) * 8.0),
+        vec2(side, side),
+    );
 
     // 全屏交互：录制态下**任意位置**（含面板内）的点击都算确认。
     // 子内容全部 painter 直绘、不注册交互区，点击自然落到这层。
@@ -6300,16 +6470,27 @@ fn draw_zoom_button(f: &mut Frame<'_>, pal: &Palette, item: &ClipItem) {
     let id = egui::Id::new(("detail_image_zoom", item.id));
     let resp = f.ui.interact(btn_rect, id, Sense::click());
     let painter = f.ui.painter_at(btn_rect);
-    painter.rect_filled(
-        btn_rect,
-        pal.radius_md,
+    // 底色补间（110ms）：悬停时 surface_variant → surface，与行内按钮
+    // 同一套动效；不悬停时停在 surface_variant。
+    let bg = crate::anim::tween_color(
+        f.ui.ctx(),
+        id.with("bg"),
         if resp.hovered() {
             pal.surface
         } else {
             pal.surface_variant
         },
+        std::time::Duration::from_millis(110),
     );
-    Icon::Image.paint(&painter, btn_rect.shrink(4.0), pal.text_dim);
+    painter.rect_filled(btn_rect, pal.radius_md, bg);
+    // 图标颜色补间（110ms）：悬停提亮一档。
+    let icon_color = crate::anim::tween_color(
+        f.ui.ctx(),
+        id.with("icon"),
+        if resp.hovered() { pal.text } else { pal.text_dim },
+        std::time::Duration::from_millis(110),
+    );
+    Icon::Image.paint(&painter, btn_rect.shrink(4.0), icon_color);
     if resp.clicked() {
         f.state.ops.push(Op::DetailImageZoom(item.id));
     }
@@ -6488,15 +6669,30 @@ fn draw_rail_body(f: &mut Frame<'_>, body: Rect) {
 fn draw_empty(f: &mut Frame<'_>, body: Rect, msg: &str) {
     let pal = f.pal;
     let font = sized(pal.font_sm, f.scale);
+    // 入场补间（200ms OutCubic）：文案淡入 + 上浮 8pt。
+    //
+    // 为什么用 `fade_in_once` 而不是 `tween_f32`：后者首帧插入即落在
+    // 目标上（惰性语义，悬停/选中就该这样），入场动画要的是「首次出现
+    // 从 0 开始放」。`fade_in_once` 用「条目是否存在」判重，落定后不
+    // 重播——搜索时每条击键都不会重启它。
+    //
+    // id 带消息文本：不同提示（没有记录 / 没有匹配 / 选中一条…）各放
+    // 各的；同一消息重复出现（清了搜索又回到空列表）不重播，可接受。
+    let k = crate::anim::fade_in_once(
+        f.ui.ctx(),
+        egui::Id::new(("empty_in", msg)),
+        std::time::Duration::from_millis(200),
+        crate::anim::Ease::OutCubic,
+    );
+    if k <= 0.004 {
+        return; // 完全透明：不画
+    }
     // NOTE: painter_at(body)：空状态文案是居中的，而窄卡片（折叠把手
     // 旁的详情栏）装不下整句，根 painter 会让它溢出到相邻卡片上。
-    f.ui.painter_at(body).text(
-        body.center(),
-        Align2::CENTER_CENTER,
-        msg,
-        font,
-        pal.text_dim,
-    );
+    let center = body.center() - vec2(0.0, (1.0 - k) * 8.0);
+    f.ui
+        .painter_at(body)
+        .text(center, Align2::CENTER_CENTER, msg, font, fade_color(pal.text_dim, k));
 }
 
 /// 按比例 `k ∈ [0,1]` 缩放颜色的**不透明度**（补间淡入淡出用）。
@@ -10811,8 +11007,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 覆盖层打开时，能力开关点击 ⇒ 产生对应字段的 `SetBool`。
     #[test]
-    fn mcp_overlay_switch_emits_set_bool() {
-        let mut h = Harness::new("mcp-overlay-sw", vec2(780.0, 560.0));
+    fn mcp_overlay_switch_emits_set_bool() {        let mut h = Harness::new("mcp-overlay-sw", vec2(780.0, 560.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Comm;
         h.state.mcp_overlay_open = true;
