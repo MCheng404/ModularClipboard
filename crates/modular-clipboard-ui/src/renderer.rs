@@ -1599,7 +1599,22 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
                 tracing::debug!("用户纹理 {id:?} 尺寸为 0，跳过");
                 continue;
             }
-            self.upload_user_texture(fr, *id, w, h, &last.image)?;
+            // CAUTION: 单张缩略图上传失败**就地降级**，不能往上冒泡。
+            //
+            // 2026-10-17 实测：缩略图分辨率提到 512² 后，首帧「字体图集
+            // + 多张缩略图 + 桌面底图」会挤满 staging arena，上传返回
+            // Err ⇒ 一路冒泡到 `run_remote` ⇒ 界面进程退出，用户只看到
+            // 「无法打开界面」。一张缩略图是观感增强，它没有这个权限
+            // （与磨砂底图同款处理，见 `paint_backdrop`）。
+            //
+            // 降级后把该纹理**移除**：图像尚未写入像素，留着会画出未定义
+            // 内容；移除后下一帧会重新解码上传（像素仍在 `thumb_cache`，
+            // 不会重复读盘）。
+            if let Err(e) = self.upload_user_texture(fr, *id, w, h, &last.image) {
+                tracing::warn!(?id, w, h, "缩略图上传失败，本帧跳过该图: {e:#}");
+                self.drop_user_texture(fr, *id);
+                continue;
+            }
             uploads += 1;
         }
 
@@ -1640,7 +1655,8 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
                 old.image.destroy(&self.gpu.device);
                 fr.free_user_texture_set(old.set)?;
             }
-            let img = DeviceImage::new(
+            // `mut`：集合分配失败的分支要就地销毁它（见下）。
+            let mut img = DeviceImage::new(
                 self.gpu,
                 vk::Extent2D { width: w, height: h },
                 vk::Format::R8G8B8A8_UNORM,
@@ -1659,7 +1675,7 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
                     (p.view, p.layout)
                 }
             };
-            let set = fr.allocate_user_texture_set(
+            let set = match fr.allocate_user_texture_set(
                 CommonBindings {
                     sampler: self.sampler.handle(),
                     font_view,
@@ -1670,7 +1686,17 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
                 },
                 img.view,
                 img.layout,
-            )?;
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    // 集合分配失败时 `img` 还没入表，就地销毁再返回。
+                    // 不销毁的代价是每次失败漏一张全尺寸 RGBA 图
+                    // （512² = 1MB），失败路径会反复走到。
+                    self.gpu.wait_idle();
+                    img.destroy(&self.gpu.device);
+                    return Err(e);
+                }
+            };
             self.user_textures.insert(id, UserTexture { image: img, set });
             self.touch_user_order(id);
             self.evict_user_textures_if_needed(fr)?;
@@ -1728,6 +1754,31 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
             }
         }
         Ok(())
+    }
+
+    /// 按键移除一张用户纹理（上传失败降级用）。
+    ///
+    /// 与 [`Self::evict_user_textures_if_needed`] 的单次版本区别：
+    /// - 表里没有这一项时**静默返回**——失败可能发生在建图阶段
+    ///   （`DeviceImage::new` / 集合分配），那时表里本来就没有它；
+    /// - 同时清 LRU 队列里的残留键（`touch_user_order` 在建表前就可能
+    ///   已写过队尾，见淘汰函数里「队首可能有残留键」的注释）。
+    ///
+    /// `wait_idle` 的纪律与淘汰一致：图像与集合都可能被在飞命令引用。
+    ///
+    /// 返回 `()` 而不是 `Result`：这是**清理**路径，调用方（上传失败
+    /// 降级）已经处于异常分支，此时归还描述符集再失败也只能记日志——
+    /// 漏一个集合远好过把异常继续往上抛。返回 Result 会让调用方被迫
+    /// 再包一层 `if let Err`，双重告警纯属噪音。
+    fn drop_user_texture(&mut self, fr: &FrameRenderer<'a>, id: egui::TextureId) {
+        self.user_order.retain(|k| *k != id);
+        if let Some(mut t) = self.user_textures.remove(&id) {
+            self.gpu.wait_idle();
+            t.image.destroy(&self.gpu.device);
+            if let Err(e) = fr.free_user_texture_set(t.set) {
+                tracing::warn!(?id, "归还用户纹理描述符集失败（集合将泄漏）: {e:#}");
+            }
+        }
     }
 
     /// 把某个纹理移到 LRU 队尾（最近使用）。

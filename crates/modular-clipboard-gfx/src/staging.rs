@@ -59,6 +59,36 @@ pub fn chunk_count_for(slot_count: usize) -> usize {
 /// GPU 读完之前不能被下一帧覆写。
 pub const UPLOAD_POOL_CAPACITY: usize = 3;
 
+/// 无空闲块时，等待「最老在途块」的栅栏的最长时间（纳秒）。
+///
+/// 正常一帧的 GPU 工作在毫秒级；等满 2 秒只可能是设备卡死或栅栏记账
+/// 出错，那时继续等下去等于让界面假死——宁可报错也不无限等。
+pub const INFLIGHT_WAIT_NS: u64 = 2_000_000_000;
+
+/// 从 `(owner_frame, 是否已关联栅栏)` 列表里挑出**最老的在途块**。
+///
+/// 纯函数（不碰 Vulkan）是为了能脱离 GPU 断言「选中的确实是最老那一
+/// 块」：选错的代价是等到**新**帧的栅栏、而老块仍占着，arena 依旧耗尽。
+///
+/// 两个排除条件（都必须满足才会被选）：
+/// - `owner_frame == FREE` ⇒ 本来就空闲，不需要等；
+/// - 尚未关联栅栏 ⇒ 该帧还没提交，等一个 null 栅栏没有意义
+///   （`wait_for_fences` 会直接返回错误）。
+pub(crate) fn oldest_inflight_chunk(owners: &[(u64, bool)]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, &(frame, has_fence)) in owners.iter().enumerate() {
+        if frame == FREE || !has_fence {
+            continue;
+        }
+        best = match best {
+            None => Some(i),
+            Some(b) if frame < owners[b].0 => Some(i),
+            Some(b) => Some(b),
+        };
+    }
+    best
+}
+
 /// staging 内部分配的字节对齐。
 ///
 /// Vulkan 要求 `vkCmdCopyBufferToImage` 的 `bufferOffset` 是
@@ -194,7 +224,8 @@ const FREE: u64 = u64::MAX;
 /// 2. 复用一块 chunk 前，必须确认它上一任主人已退休 —— 由
 ///    [`StagingArena::retire`] 查询栅栏确认，**不靠帧号差值猜测**。
 ///    猜测会在某帧栅栏没等到时静默覆写GPU 正在读的数据。
-/// 3. 块数 ≥ 在飞帧数。
+/// 3. 块数 ≥ 在飞帧数（初始块数之外还可能在单帧上传量超预期时**追加**，
+///    见 [`StagingArena::push_chunk`]）。
 ///
 /// # 逻辑与资源分离
 ///
@@ -213,6 +244,9 @@ impl<'a> StagingArena<'a> {
     /// `frame_count` 应传在飞帧数（交换链图像数）。此时**不创建任何
     /// Vulkan 资源** —— 每块在首次 [`StagingArena::allocate`] 时才按需
     /// 建成，避免小图集场景白占 12 MiB 主机可见内存。
+    ///
+    /// 这只是**初始**块数：单帧上传量超过它时 `allocate` 会追加新块
+    /// （见 [`StagingArena::push_chunk`]），不会因此失败。
     pub fn new(gpu: &'a Gpu, frame_count: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(frame_count > 0, "staging 块数必须大于 0");
         let chunks = (0..frame_count)
@@ -273,8 +307,13 @@ impl<'a> StagingArena<'a> {
     ///   （egui 一帧可能有十几次纹理增量）。
     /// - **空闲**的块（`owner_frame == FREE`，即已被 [`StagingArena::retire`]
     ///   确认 GPU 读完）才会被本帧接管。
-    /// - **在途**的块（属于别的帧）既不复用也不扩容——否则 GPU 正在读的
-    ///   内容会被 `destroy_buffer` 掉。
+    /// - **在途**的块（属于别的帧）默认不复用；只有当 arena 里连一块
+    ///   空闲都没有时，才**等最老那块的在途栅栏 signal 后接管**
+    ///   （见 [`StagingArena::wait_and_reclaim_oldest`]）；连可等的块都
+    ///   没有（首帧，全部块都属于当前帧）就**新加一块**
+    ///   （见 [`StagingArena::push_chunk`]）。等 = 让出 CPU 掉一帧，
+    ///   加块 = 多占一份显存，报错 = 界面进程启动失败——2026-10-17 起
+    ///   只选前两者。
     ///
     /// 容量不足时在**本帧可写**的那块上原地扩容，必要时惰性新建。
     pub fn allocate(&mut self, size: vk::DeviceSize) -> anyhow::Result<StagingSlice> {
@@ -293,17 +332,20 @@ impl<'a> StagingArena<'a> {
             .position(|c| c.owner_frame == frame)
             .or_else(|| self.chunks.iter().position(|c| c.owner_frame == FREE));
 
+        // 2026-10-17：没有本帧块、也没有空闲块时，先**等最老那块完成并
+        // 收回**；连可等的都没有（首帧，全部块都属于当前帧且未提交）
+        // 就**新加一块**。不再报错。
+        //
+        // 为什么不能报错：单帧上传量是会变的（缩略图分辨率调大、
+        // 首帧字体图集 + 桌面底图 + 多张缩略图同帧上传），块数一旦不够
+        // 就用「启动失败」的形式暴露出来——界面进程直接退出，用户看到
+        // 的只是「无法打开界面」。上传是**观感增强**，它没有这个权限。
         let i = match pick {
             Some(i) => i,
-            None => {
-                // 所有块都在途。这不该发生：块数 ≥ 在飞帧数，
-                // 且 acquire 会等栅栏。仍需给出明确错误而不是静默复用。
-                anyhow::bail!(
-                    "staging arena 的 {} 块全部在途，无可分配空间；\
-                     请确认块数 ≥ 在飞帧数且每帧都等过了栅栏",
-                    self.chunks.len()
-                );
-            }
+            None => match self.wait_and_reclaim_oldest()? {
+                Some(i) => i,
+                None => self.push_chunk(),
+            },
         };
 
         // 剩余空间不够**本次追加**时才重建。
@@ -320,28 +362,33 @@ impl<'a> StagingArena<'a> {
                 .checked_add(aligned)
                 .unwrap_or(vk::DeviceSize::MAX)
                 .max(MIN_STAGING_CAPACITY);
-            // 摊销式扩容：多留 50% 余量（与 `Vec` 的几何增长同理）。
+            // 摊销式扩容：**翻倍**（与 `Vec` 的几何增长同理）。
             //
             // 不留余量的代价是真实的：一次大上传会把块**恰好**填满，
             // 同一帧随后的每一次小上传都只能另起一块——块数是按在飞帧
-            // 数给的（3），一帧占满 3 块后下一帧就「全部在途、无可分配」。
-            // 实测触发路径：首帧先上传 4MB 字体图集（占满块 0），
-            // 紧接着的自研磨砂桌面捕获（约 0.4MB）只能另起块 1，
-            // 再来一次就吃掉块 2 ⇒ 程序直接启动失败。
-            let want = want.saturating_add(want / 2);
+            // 数给的（3+2），一帧占满 5 块后就只能等 GPU 追上来。
+            // 实测触发路径（2026-10-17「无法打开界面」）：首帧先上传
+            // 4MB 字体图集（占满块 0），紧接着的自研磨砂桌面捕获只能另起
+            // 块 1，再来一次就吃掉块 2。当时 5 块耗尽即报错退出，现在改为
+            // 等最老块的栅栏（见 `reclaim_oldest`）。
+            //
+            // 2026-10-17 把 +50% 改成 ×2：缩略图涨到 512²（1MB/张）后，
+            // +50% 意味着「一张图就填满一块」，同帧第二张必然另起一块，
+            // 5 块在 4~5 张图内耗尽。
+            let want = want.saturating_mul(2);
             // 只有「该块一字节未写」时才能原地重建：否则本帧已录制的
             // 拷贝命令仍引用旧 buffer，释放它就是 use-after-free。
             if used == 0 {
                 self.rebuild_chunk(i, want, frame)?;
             } else {
-                // 改用空闲块。块数 >= 槽位数，正常每帧退休上一轮后必有。
-                let alt = self.chunks.iter().position(|c| c.owner_frame == FREE).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "staging 块 {i} 剩余空间不足且已被本帧写入，\
-                         而 arena 没有空闲块可另用。\
-                         请增大块数或减小单帧上传量"
-                    )
-                })?;
+                // 改用空闲块；没有就等最老在途块；再没有就新加一块。
+                let alt = match self.chunks.iter().position(|c| c.owner_frame == FREE) {
+                    Some(a) => a,
+                    None => match self.wait_and_reclaim_oldest()? {
+                        Some(a) => a,
+                        None => self.push_chunk(),
+                    },
+                };
                 self.rebuild_chunk(alt, want, frame)?;
                 let c = &mut self.chunks[alt];
                 c.cursor = aligned;
@@ -365,6 +412,71 @@ impl<'a> StagingArena<'a> {
         c.cursor += aligned;
         c.owner_frame = frame;
         Ok(slice)
+    }
+
+    /// 等最老在途块的栅栏 signal，然后回收它并返回其索引。
+    ///
+    /// `Ok(None)` = 没有可等的块：要么 arena 是空的（不可能，`new` 保证
+    /// 非空），要么**所有块都属于当前帧且尚未提交**（首帧上传量超过初始
+    /// 块数时会这样）。调用方此时应新加一块，见 [`StagingArena::push_chunk`]。
+    ///
+    /// # 为什么是「等」而不是「报错」
+    ///
+    /// arena 块数是按在飞帧数给的，但**单帧上传量**是会变的：字体图集
+    /// 整图上传、自研磨砂的桌面位图、多张缩略图——任何一项变大都可能
+    /// 让 5 块同帧耗尽。耗尽不是编程错误，把它当致命错误抛出，界面进程
+    /// 就会在启动时直接退出（实测：缩略图从 256² 提到 512² 后首帧即
+    /// 「5 块全部在途」⇒ 弹窗「无法打开界面」）。
+    ///
+    /// 等最老的那一块是**唯一正确**的选择：它对应最早提交、因而最可能
+    /// 已经跑完的帧。等新帧的栅栏只会白等，老块依旧占着。
+    ///
+    /// # 安全前提
+    ///
+    /// 等待返回即代表该块的 `cmd_copy_*` 已被 GPU 读完，此后
+    /// [`StagingArena::retire_chunk`]（游标归零）与
+    /// [`StagingArena::rebuild_chunk`]（销毁重建）都合法。
+    fn wait_and_reclaim_oldest(&mut self) -> anyhow::Result<Option<usize>> {
+        let owners: Vec<(u64, bool)> = self
+            .chunks
+            .iter()
+            .map(|c| (c.owner_frame, !c.fence.is_null()))
+            .collect();
+        let Some(i) = oldest_inflight_chunk(&owners) else {
+            return Ok(None);
+        };
+        let fence = self.chunks[i].fence;
+        unsafe { self.gpu.device.wait_for_fences(&[fence], true, INFLIGHT_WAIT_NS) }
+            .map_err(|e| anyhow::anyhow!("等待在途 staging 栅栏失败（{INFLIGHT_WAIT_NS} ns 超时）: {e:?}"))?;
+        // 栅栏已 signal ⇒ 该块数据 GPU 读完，可以复用。
+        self.retire_chunk(i);
+        Ok(Some(i))
+    }
+
+    /// 在块表末尾追加一块**尚未实体化**的 staging，返回其下标。
+    ///
+    /// 这是 arena 的第三级兜底，用来消掉最后一个会杀死界面的错误路径：
+    /// 首帧上传量超过初始块数时，所有块都属于当前帧、还没提交 ⇒
+    /// 没有栅栏可等（`wait_and_reclaim_oldest` 返回 `None`）。此时
+    /// 「新加一块」是唯一不报错的选择——staging 是主机可见内存，
+    /// 加块的代价是显存，报错的代价是「无法打开界面」。
+    ///
+    /// 块表只增不减，收敛到单帧上传峰值后即稳定复用（与 Vec 的几何
+    /// 增长同理）。不变式「块数 ≥ 在飞帧数」只会被加强。
+    ///
+    /// 新块 `capacity == 0`，返回后调用方必然走 `rebuild_chunk`
+    /// （`need_new` 恒真）把它建成所需大小。
+    fn push_chunk(&mut self) -> usize {
+        self.chunks.push(ArenaChunk {
+            buffer: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            capacity: 0,
+            cursor: 0,
+            owner_frame: FREE,
+            fence: vk::Fence::null(),
+            materialized: false,
+        });
+        self.chunks.len() - 1
     }
 
     /// 记账：把本帧占用的块与该帧的栅栏关联。
@@ -895,6 +1007,39 @@ fn arena_retire_only_frees_completed_frames() {
     d.retire(1); // 现在第 1 帧完成了
     assert_eq!(d.owner(0), FREE);
     assert!(d.begin_frame().is_ok());
+}
+
+// -- reclaim_oldest：耗尽时等最老在途块，而不是报错 --------------------
+//
+// 2026-10-17「无法打开界面」的根因：arena 报错会一路冒泡成界面进程
+// 退出。选块逻辑抽成纯函数，就能脱离 GPU 验证「等的确实是最老那块」：
+// 等错块的代价是白等 + 老块依旧占着，arena 照样耗尽。
+
+#[test]
+fn oldest_inflight_picks_the_oldest_with_a_fence() {
+    // (owner_frame, has_fence)。frame 7 最新、1 最老。
+    let owners = [(7u64, true), (3, true), (5, true)];
+    assert_eq!(oldest_inflight_chunk(&owners), Some(1), "应选帧号最小的那块");
+}
+
+#[test]
+fn oldest_inflight_skips_free_and_fenceless() {
+    // 空闲块不需要等；没有栅栏的块说明该帧还没提交，等它毫无意义
+    // （wait_for_fences 对 null 栅栏直接报错）。
+    let owners = [(1u64, false), (u64::MAX, true), (4, true)];
+    assert_eq!(oldest_inflight_chunk(&owners), Some(2));
+}
+
+#[test]
+fn oldest_inflight_returns_none_when_nothing_is_waitable() {
+    // 全部空闲：调用方本该走空闲路径，不会到这里；但函数必须给出
+    // 明确的 None 而不是随便挑一块（挑错 = use-after-free）。
+    let all_free = [(u64::MAX, true), (u64::MAX, false)];
+    assert_eq!(oldest_inflight_chunk(&all_free), None);
+    // 全部属于当前帧且未提交：没有可等的块。
+    let all_current = [(9u64, false), (9, false)];
+    assert_eq!(oldest_inflight_chunk(&all_current), None);
+    assert_eq!(oldest_inflight_chunk(&[]), None);
 }
 
 #[test]
