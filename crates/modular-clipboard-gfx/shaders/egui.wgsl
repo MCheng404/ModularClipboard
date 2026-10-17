@@ -5,12 +5,17 @@
 // - 裁剪：egui 会为每个图元给出 `clip_rect`，通过 uniform 传入以避免顶点撕裂
 // - 混合：标准 src-alpha 混合
 //
-// 顶点位置以「像素」传入，乘以 dpr 转成物理像素，再经 clip_from_uv 变换到 NDC。
-// 变换矩阵而非逐顶点乘算是为了让 egui 侧的裁剪与变换逻辑保持单一来源。
+// 顶点位置以「像素」传入，乘以 dpr 转成物理像素，再换算成 NDC。
+//
+// 2026-10-17：删掉了 `clip_from_uv`（恒为单位矩阵的 mat4x4）——它从来
+// 只有一个值，而像素→NDC 由本着色器自己完成，留下它等于每顶点白算
+// 16 个 FMA，还埋着「谁设成非单位矩阵就二次变换」的陷阱。裁剪现在
+// 完全由 uniform 的 `size_in_pixels` + CPU 侧 scissor 负责。
+//
+// 历史版本的头注释写的是「变换矩阵而非逐顶点乘算是为了让 egui 侧的
+// 裁剪与变换逻辑保持单一来源」——那是矩阵还在时的理由，现已作废。
 
 struct Uniforms {
-    // 像素坐标 → NDC 的变换矩阵（列主序）
-    clip_from_uv: mat4x4<f32>,
     // 视口尺寸（物理像素）
     size_in_pixels: vec2<f32>,
     // 设备像素比
@@ -25,6 +30,19 @@ struct Uniforms {
 // 用户纹理（图片缩略图）。字体图集是单通道覆盖率，
 // 缩略图是 RGBA 彩色图——两者语义不同，故各用一张。
 @group(0) @binding(3) var user_tex: texture_2d<f32>;
+// 用户纹理的采样器（linear，2026-10-17 起与字体图集分开）。
+//
+// 为什么必须是 linear：缩略图的**显示尺寸与纹理尺寸几乎从不相等的**：
+// 512² 纹理要显示成 320pt（100% DPI 下 320px）或 696pt 大图，都是
+// 1.6~2.4× 的**缩小**。nearest 采样在非 1:1 比例下按纹素抽点，
+// 照片细节直接变成摩尔纹/锯齿（实测）。
+// 字体图集正相反——它必须 nearest（小字号线性会糊），故两者各一个
+// sampler 绑定，见 `pipeline.rs::BINDING_USER_SAMPLER`。
+//
+// 帧槽集合里这个绑定写的是占位值（字体批次不采样 user_tex，
+// 静态声明要求合法句柄即可）；真正的线性采样器写在每张用户纹理
+// 自己的描述符集里（`frame.rs::allocate_user_texture_set`）。
+@group(0) @binding(4) var user_sampler: sampler;
 
 struct VertexInput {
     @location(0) pos: vec2<f32>,
@@ -54,7 +72,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let ndc_y = 1.0 - 2.0 * scaled.y / u.size_in_pixels.y;
     let ndc_x = 2.0 * scaled.x / u.size_in_pixels.x - 1.0;
 
-    out.clip_position = u.clip_from_uv * vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    // 直接输出 NDC（2026-10-17 起不再乘 clip_from_uv，见头注释）。
+    out.clip_position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.uv = in.uv;
     // egui 把颜色打包为 ABGR 小端序的 u32
     out.color = unpack4x8unorm(in.color);
@@ -95,6 +114,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     // 用户纹理（图片缩略图）是**直通 alpha**（PNG 解码结果），
     // 必须先预乘再交给预乘混合，否则半透明像素会偏亮。
-    let c = textureSampleLevel(user_tex, tex_sampler, in.uv, 0.0);
+    // 用独立的 `user_sampler`（linear）采样：显示尺寸 ≠ 纹理尺寸时
+    // 最近邻会让照片出摩尔纹（见绑定处的长注释）。
+    let c = textureSampleLevel(user_tex, user_sampler, in.uv, 0.0);
     return vec4<f32>(c.rgb * c.a, c.a);
 }

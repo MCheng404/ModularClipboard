@@ -841,6 +841,23 @@ pub struct EventLoop {
     focused: bool,
     /// 已收到 `WM_QUIT`。
     quit: bool,
+    /// 本循环是否负责收取 [`WM_QUIT`]。
+    ///
+    /// # 为什么需要这个标志
+    ///
+    /// `WM_QUIT` 是**线程级**消息，不属于任何窗口 ⇒ `PeekMessageW` 按
+    /// hwnd 过滤**收不到**它，必须单独用不过滤的 `hwnd = None` 去peek。
+    /// 而那一行是 `PM_REMOVE`：**谁先 poll 谁就把消息摘走**。
+    ///
+    /// 本项目有 1 + N 个 `EventLoop`（主窗口 + 弹窗 + 设置窗 + 卡片子窗），
+    /// 它们每帧都 poll。若不加归属，弹窗/子窗完全可能先摘走 `WM_QUIT`
+    /// ⇒ 它被记进**那个窗口**的 `quit` 标志与事件缓冲，而主窗口的
+    /// `quit_requested()` 恒为 false ⇒ **点关闭 / 托盘退出后程序不退出**
+    /// （那个窗口还顺手把自己的 CloseRequested 当成「关我」处理了：
+    /// 弹窗会收搜索面板、子窗会把卡片收回工作区）。
+    ///
+    /// 只有主窗口用 [`Self::new_primary`] 建，其余用 [`Self::new`]。
+    owns_quit: bool,
     /// 告知 egui 的纹理尺寸上限，见 [`Window::max_texture_side`]。
     max_texture_side: usize,
     /// 应用请求的下次重绘间隔。
@@ -850,8 +867,23 @@ pub struct EventLoop {
 }
 
 impl EventLoop {
-    /// 为给定窗口创建事件循环。
+    /// 为给定窗口创建事件循环（**不**负责收取 `WM_QUIT`）。
+    ///
+    /// 附属窗口（弹窗 / 设置窗 / 卡片子窗）一律用这个。
     pub fn new(window: &Window) -> Self {
+        Self::build(window, false)
+    }
+
+    /// 主窗口专用：额外负责收取 [`WM_QUIT`]。
+    ///
+    /// 全进程**只能有一个**这样的循环。`WM_QUIT` 是线程级消息，谁先
+    /// `poll` 谁摘走（见 [`Self::owns_quit`] 的说明），所以这个归属必须
+    /// 显式指定，不能靠「谁先跑」碰运气。
+    pub fn new_primary(window: &Window) -> Self {
+        Self::build(window, true)
+    }
+
+    fn build(window: &Window, owns_quit: bool) -> Self {
         let (w, h) = window.inner_size_points();
         Self {
             hwnd: window.hwnd(),
@@ -862,6 +894,7 @@ impl EventLoop {
             modifiers: Modifiers::default(),
             focused: true,
             quit: false,
+            owns_quit,
             // 从窗口复制；主窗口在 `Gpu` 就绪后还会用
             // [`Self::set_max_texture_side`] 覆盖一次（它的 `EventLoop`
             // 建在 `Gpu::new` 之前）。
@@ -1020,7 +1053,17 @@ impl EventLoop {
             while unsafe { PeekMessageW(&mut msg, Some(self.hwnd), 0, 0, PM_REMOVE) }.as_bool() {
             // WM_QUIT 不属于任何窗口，按 hwnd 过滤**收不到它**。
             // 单独用不过滤的 peek 检查一次。
-            if unsafe { PeekMessageW(&mut quit_msg, None, WM_QUIT, WM_QUIT, PM_REMOVE) }.as_bool() {
+            //
+            // CAUTION: **只有 `owns_quit` 的那个循环能做这件事**。这一行是
+            // `PM_REMOVE`，全线程只有一条 `WM_QUIT`，谁摘走谁的。附属窗口
+            // 也 peek 的话，弹窗/子窗可能先摘走 ⇒ 主窗口 `quit_requested()`
+            // 恒 false（程序退不掉），而那个窗口还会把自己的
+            // `CloseRequested` 误当成「关我」（弹窗收搜索面板 / 子窗收回卡片）。
+            // 见 `EventLoop::owns_quit` 字段的说明。
+            if self.owns_quit
+                && unsafe { PeekMessageW(&mut quit_msg, None, WM_QUIT, WM_QUIT, PM_REMOVE) }
+                    .as_bool()
+            {
                 self.quit = true;
                 events.push(WindowEvent::CloseRequested);
             }
@@ -1835,6 +1878,8 @@ mod tests {
             modifiers: Modifiers::default(),
             focused: true,
             quit: false,
+            // 测试默认**不**当主循环：让 `owns_quit` 的行为可被单测覆盖。
+            owns_quit: false,
             // 测试用默认上限（与 `Window::new` 的初值一致）。
             max_texture_side: 2048,
             repaint_after: None,
@@ -2646,6 +2691,44 @@ mod tests {
         assert!(!is_close(0xF020), "SC_MINIMIZE 不该当关闭");
         assert!(!is_close(0xF030), "SC_MAXIMIZE 不该当关闭");
         assert!(!is_close(0), "空wParam");
+    }
+
+    /// `WM_QUIT` 的归属必须显式，且**只有一个**循环能收。
+    ///
+    /// 回归守卫：`WM_QUIT` 是线程级消息，`PeekMessageW` 收它时**不能**
+    /// 按 hwnd 过滤（否则永远收不到），而那一行是 `PM_REMOVE`——全线程
+    /// 只有一条，谁先 `poll` 谁摘走。本项目有 1+N 个 `EventLoop`
+    /// （主窗口 + 弹窗 + 设置窗 + 卡片子窗）且每帧都 poll。
+    ///
+    /// 早前没有归属，弹窗/子窗可能先摘走 `WM_QUIT`：主窗口的
+    /// `quit_requested()` 恒为 false ⇒ **点关闭 / 托盘退出后程序退不掉**，
+    /// 而那个附属窗口还把 `CloseRequested` 误当成「关我」（弹窗收搜索
+    /// 面板、子窗把卡片收回工作区）。
+    #[test]
+    fn only_the_primary_loop_owns_wm_quit() {
+        // 默认（非主循环）不收 WM_QUIT：即使线程队列里真有它，
+        // `poll` 也不该认领——这条只能靠字段语义断言，无法在单测里
+        // 真的投递 WM_QUIT（那会污染整个测试进程的消息队列）。
+        let secondary = fake_loop();
+        assert!(
+            !secondary.owns_quit,
+            "附属窗口的 EventLoop 默认不得声称自己负责 WM_QUIT"
+        );
+        assert!(
+            !secondary.quit_requested(),
+            "非主循环的 quit_requested 应恒为 false"
+        );
+
+        // 主循环显式声明归属。
+        let primary = fake_loop_with_quit();
+        assert!(primary.owns_quit, "主循环必须 owns_quit");
+    }
+
+    fn fake_loop_with_quit() -> EventLoop {
+        EventLoop {
+            owns_quit: true,
+            ..fake_loop()
+        }
     }
 
     /// 事件累积缓冲的语义守卫。

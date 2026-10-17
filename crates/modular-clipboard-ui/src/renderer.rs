@@ -316,9 +316,6 @@ pub fn pack_color(c: egui::Color32) -> u32 {
 
 /// 构造本帧的 uniform。
 ///
-/// `clip_from_uv` 传单位矩阵：着色器内部已把像素坐标换算成 NDC（并做了 y 轴
-/// 翻转），再乘一个矩阵只会引入二次变换。
-///
 /// # IMPORTANT: 坐标系不变式（务必与 `EventLoop::egui_input` 成对阅读）
 ///
 /// * `size_in_pixels` = **物理像素**（交换链尺寸），来自 [`Painter::paint`] 的
@@ -344,12 +341,6 @@ pub fn pack_color(c: egui::Color32) -> u32 {
 /// 右侧与底部各空 1/3，且**不产生任何 GPU 错误**。
 pub fn uniforms_for(extent: vk::Extent2D, pixels_per_point: f32) -> Uniforms {
     Uniforms::new(
-        [
-            1.0, 0.0, 0.0, 0.0, //
-            0.0, 1.0, 0.0, 0.0, //
-            0.0, 0.0, 1.0, 0.0, //
-            0.0, 0.0, 0.0, 1.0,
-        ],
         [extent.width as f32, extent.height as f32],
         pixels_per_point,
     )
@@ -427,6 +418,16 @@ pub struct Painter<'a> {
     /// 当前字形边缘，小字号下整段文字糊成一团灰。这是自写字体图集渲染器
     /// 最常见的错误来源。
     sampler: Sampler,
+    /// 用户纹理（缩略图 / 原图）采样器，**线性过滤**。
+    ///
+    /// 与 [`Self::sampler`] 分开是必要的：缩略图显示尺寸（160pt 高）与
+    /// 纹理尺寸（512²）相差 1.6~2.4×，即典型的**降采样**。最近邻在
+    /// 降采样下不做什么平均，逐像素抽稀会引入摩尔纹与闪点（细密纹理上
+    /// 尤其明显）；线性过滤靠双线性插值做等效 2×2 平均，虽不及 mipmap
+    /// 也能显著缓解。字体图集反过来必须点采样（见 [`Self::sampler`]），
+    /// 两者无法共用一个 sampler ⇒ 着色器里分开两个 binding
+    /// （`BINDING_SAMPLER` / `BINDING_USER_SAMPLER`）。
+    sampler_linear: Sampler,
     /// 字体图集（覆盖率图，`R8_UNORM`）。
     font: Option<DeviceImage>,
     /// 用户纹理（图片缩略图，RGBA）。
@@ -478,10 +479,32 @@ pub struct Painter<'a> {
     post: Option<PostFx>,
     /// 自研磨砂背景（懒创建，仅主窗口在 Acrylic 模式下存在）。
     backdrop: BackdropState,
-    /// 磨砂是否已降级过（只记一次告警，避免每帧刷屏）。
-    backdrop_warned: bool,
+    /// 已经告警过的磨砂降级**原因**（每种只记一次）。
+    ///
+    /// 为什么不是一个 `bool`：磨砂链上有四个独立的失败点（拿不到命令
+    /// 缓冲 / 位图上传失败 / 强度更新失败 / 模糊链录制失败）。单个
+    /// `bool` 意味着「第一次失败的原因」会把后面所有原因一起吞掉——
+    /// 比如首帧偶发上传失败置位后，之后真正的**持续性**故障
+    /// （驱动抽风导致卷积反复失败）就再也不会出现在日志里，
+    /// 而那恰恰是最该被看见的那次。
+    ///
+    /// 按原因去重则每个原因各记一次，既不刷屏也不丢信息。
+    backdrop_warned: std::collections::HashSet<BackdropWarn>,
     /// 累计统计，供上层显示与诊断。
     pub stats: FrameStats,
+}
+
+/// 磨砂降级的**原因**分类（告警按它去重，见 `Painter::backdrop_warned`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BackdropWarn {
+    /// 拿不到当前命令缓冲（`acquire` 未成功等）。
+    NoCommandBuffer,
+    /// 捕获的桌面位图上传 staging 失败。
+    Upload,
+    /// 写卷积半径 uniform 失败。
+    SetRadius,
+    /// 录制高斯卷积命令失败。
+    Record,
 }
 
 /// 一帧后处理所需的全部 GPU 资源。
@@ -596,6 +619,7 @@ impl<'a> Painter<'a> {
     pub fn new(gpu: &'a Gpu, slot_count: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(slot_count > 0, "在飞帧槽位数必须大于 0");
         let sampler = Sampler::new_nearest(&gpu.device)?;
+        let sampler_linear = Sampler::new_linear_clamped(&gpu.device)?;
         let uniform = UniformBuffer::new(gpu)?;
         let slots = SlotBuffers::new(
             gpu,
@@ -607,6 +631,7 @@ impl<'a> Painter<'a> {
         Ok(Self {
             gpu,
             sampler,
+            sampler_linear,
             font: None,
             user_textures: HashMap::new(),
             user_order: VecDeque::new(),
@@ -624,7 +649,7 @@ impl<'a> Painter<'a> {
             // 后处理资源按需创建，见 `ensure_post`。
             post: None,
             backdrop: BackdropState::default(),
-            backdrop_warned: false,
+            backdrop_warned: std::collections::HashSet::new(),
             stats: FrameStats::default(),
         })
     }
@@ -835,8 +860,18 @@ impl<'a> Painter<'a> {
         // 左上 1/N（与历史上「UI 只画左上角 2/3」同源，且同样不报错）。
         let ssaa = if dpi_scale > 0.01 {
             // 反推：窗口层设的 ppp = dpi_scale × 实际倍率。
-            // 夹到 [1,3] 与 `render_scale()` 的取值域一致，防脏数据。
-            (pixels_per_point / dpi_scale).clamp(1.0, 3.0)
+            //
+            // IMPORTANT: 下限**不能**是 1.0。250%/300% DPI 时
+            // `render_scale_for` 会把倍率压到 1.0 **以下**（欠采样），
+            // 好让 `ppp` 落回 `MAX_RENDER_PPP` 以内——那是唯一能避免
+            // 「图标字形被画坏」的做法（见 `gfx::render_scale_for`）。
+            // 这里若又抬回 1.0，两侧对倍率的认知就不一致了：
+            // uniform 的 `size_in_pixels` 按抬后的值算、窗口层给的
+            // `ppp` 按压后的值算 ⇒ 不变式 `screen_rect × ppp ==
+            // size_in_pixels` 断裂 ⇒ 画面整体缩放错误且**不报 GPU 错误**。
+            // 上限 3.0 与 `render_scale()` 的取值域一致，防脏数据；
+            // 下限 0.25 与 `render_scale_for` 的兜底下限一致。
+            (pixels_per_point / dpi_scale).clamp(0.25, 3.0)
         } else {
             1.0
         };
@@ -937,9 +972,19 @@ impl<'a> Painter<'a> {
             None
         };
 
-        // 超采样倍率为 1 时不做离屏，直接画到交换链（最省的老路径，
+        // 倍率**恰好**为 1 时不做离屏，直接画到交换链（最省的老路径，
         // 也是出问题时的逃生开关）。
-        if ssaa <= 1.0 {
+        //
+        // CAUTION: 判据必须是 `== 1.0` 而不是 `<= 1.0`。超高 DPI
+        // （250%/300%）下 `render_scale_for` 会把倍率压到 1.0 **以下**
+        // （欠采样，让 `ppp` 落回 `MAX_RENDER_PPP` 以内）。那时
+        // `render_extent < swap_extent`，若还走直画路径，uniform 里的
+        // `size_in_pixels = render_extent` 与真实目标（交换链）不符 ⇒
+        // 画面只占左上角一块，且**不报任何 GPU 错误**——与历史上
+        // 「UI 只画左上角 2/3」完全同一类故障。
+        // 走离屏路径即可：末尾那趟 blit 是线性采样的全屏三角形，
+        // 放大与缩小都能正确处理（`fs_copy` 按 uv 采样）。
+        if (ssaa - 1.0).abs() < f32::EPSILON {
             let input = DrawInput {
                 vertex_buffer,
                 index_buffer,
@@ -1075,78 +1120,88 @@ impl<'a> Painter<'a> {
     }
 
     /// 采样估算图像的平均亮度（0~1，sRGB 字节域的 Rec.709 加权均值）。
-///
-/// 只用于「背景该压多实」这类粗粒度决策，因此**稀疏采样**即可：
-/// 每 97 个像素取一个（素数步长，避免与行宽对齐产生条纹偏差）。
-/// 每帧成本约 260×400/97 ≈ 1000 次加法，可忽略。
-fn luminance_of(rgba: &[u8]) -> f32 {
-    let mut sum: u64 = 0;
-    let mut n: u64 = 0;
-    let mut i = 0usize;
-    while i + 2 < rgba.len() {
-        // Rec.709 亮度权重（整数化：2126/7152/722 ≈ 0.2126/0.7152/0.0722）
-        sum += 2126 * u64::from(rgba[i])
-            + 7152 * u64::from(rgba[i + 1])
-            + 722 * u64::from(rgba[i + 2]);
-        n += 10_000;
-        i += 4 * 97;
+    ///
+    /// 只用于「背景该压多实」这类粗粒度决策，因此**稀疏采样**即可：
+    /// 每 97 个像素取一个（素数步长，避免与行宽对齐产生条纹偏差）。
+    /// 每帧成本约 260×400/97 ≈ 1000 次加法，可忽略。
+    fn luminance_of(rgba: &[u8]) -> f32 {
+        let mut sum: u64 = 0;
+        let mut n: u64 = 0;
+        let mut i = 0usize;
+        while i + 2 < rgba.len() {
+            // Rec.709 亮度权重（整数化：2126/7152/722 ≈ 0.2126/0.7152/0.0722）
+            sum += 2126 * u64::from(rgba[i])
+                + 7152 * u64::from(rgba[i + 1])
+                + 722 * u64::from(rgba[i + 2]);
+            n += 10_000;
+            i += 4 * 97;
+        }
+        if n == 0 {
+            return 0.5;
+        }
+        (sum as f32 / n as f32 / 255.0).clamp(0.0, 1.0)
     }
-    if n == 0 {
-        return 0.5;
+
+    /// 背景（窗口身后桌面）的平均亮度，`None` = 还没有成功捕获过。
+    pub fn backdrop_luminance(&self) -> Option<f32> {
+        self.backdrop.luminance
     }
-    (sum as f32 / n as f32 / 255.0).clamp(0.0, 1.0)
-}
 
-/// 背景（窗口身后桌面）的平均亮度，`None` = 还没有成功捕获过。
-pub fn backdrop_luminance(&self) -> Option<f32> {
-    self.backdrop.luminance
-}
+    /// 磨砂底图合成时的 UV 位移（push constant，目标 UV 单位）。
+    ///
+    /// # 算的是什么
+    ///
+    /// 底图是 `capture_origin` 时刻抓的快照，而窗口现在（帧呈现时更晚）
+    /// 在 `预测位置`。把采样坐标平移 `(预测 − 捕获) / 交换链尺寸` 后，
+    /// 快照内容正好落在窗口当前所占的屏幕区域上——**静止时该值为 0**
+    /// （两个位置相同），行为与加此机制前完全一致；拖动时它逐帧把
+    /// 过期快照「拉」回窗口，消除磨砂背景跟不上窗口的轻微拖影。
+    ///
+    /// # 为什么除以交换链尺寸而不是模糊链尺寸
+    ///
+    /// 合成用的全屏三角形把 `[0,1]²` 的 UV 映射到**整个绘制目标**；
+    /// 无论目标是交换链（`ssaa ≤ 1` 路径）还是超采样场景图
+    /// （内容先画场景、再统一降采样），一像素的物理位移都等于
+    /// `d / swap_extent` 个 UV 单位——两条路径口径一致。
+    ///
+    /// # 为什么还要一帧预测
+    ///
+    /// 补偿只算到「本帧观测时刻」，而帧提交后还要过约一个帧间隔才
+    /// 真正呈现，那时窗口已又走过 `v × 帧间隔`。 `MotionPredictor`
+    /// 用速度外推补上这段，观感上底图与窗口「正好跟住」而不是总慢
+    /// 半拍。预测失误的代价是有界的：`CLAMP_TO_EDGE` 采样器只会把
+    /// 越界的一小条边缘拉伸，而模糊半径（等效全分辨率 ~32px）远大于
+    /// 单帧位移，看不出来。
+    ///
+    /// 无捕获原点（首帧前 / 刚重建）时返回零——那时本就不铺底图
+    /// （`fx.uploaded == false`），零值只是不改变任何行为。
+    ///
+    /// # 分母必须是 `swap_extent`（物理像素），不是 `render_extent`
+    ///
+    /// 三个量纲必须对齐：`dx`/`dy` 来自 [`client_origin`]，是**屏幕物理
+    /// 像素**；`swap_extent` 是客户区**物理像素**；而 `uv_offset` 是
+    /// **归一化 UV**（`fs_copy` 在 `in.uv + offset` 处采样，源图铺满目标）。
+    ///
+    /// 用 `render_extent`（= 交换链 × 超采样倍率）当分母会让位移**小
+    /// `ssaa` 倍**：窗口拖了 10 物理像素，2× 超采样下只补偿了 5 像素 ⇒
+    /// 磨砂底图与窗口错开半个身位，表现为「拖动时底图跟不上」。
+    /// 归一化的好处正在于**与目标分辨率无关**，所以分母取哪个物理尺寸
+    /// 都行，唯独不能取「物理像素 × 倍率」这种混合量纲。
+    ///
+    /// 算术本身抽成 [`backdrop_uv_offset_from`]（纯函数，便于单测钉住量纲）。
+    fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
+        let (Some(cap), Some(_cur)) = (self.backdrop.capture_origin, self.backdrop.origin) else {
+            return [0.0, 0.0];
+        };
+        let pred = self
+            .backdrop
+            .predictor
+            .predict_next_frame()
+            .unwrap_or((cap.0, cap.1));
+        backdrop_uv_offset_from(pred, cap, swap_extent)
+    }
 
-/// 磨砂底图合成时的 UV 位移（push constant，目标 UV 单位）。
-///
-/// # 算的是什么
-///
-/// 底图是 `capture_origin` 时刻抓的快照，而窗口现在（帧呈现时更晚）
-/// 在 `预测位置`。把采样坐标平移 `(预测 − 捕获) / 交换链尺寸` 后，
-/// 快照内容正好落在窗口当前所占的屏幕区域上——**静止时该值为 0**
-/// （两个位置相同），行为与加此机制前完全一致；拖动时它逐帧把
-/// 过期快照「拉」回窗口，消除磨砂背景跟不上窗口的轻微拖影。
-///
-/// # 为什么除以交换链尺寸而不是模糊链尺寸
-///
-/// 合成用的全屏三角形把 `[0,1]²` 的 UV 映射到**整个绘制目标**；
-/// 无论目标是交换链（`ssaa ≤ 1` 路径）还是超采样场景图
-/// （内容先画场景、再统一降采样），一像素的物理位移都等于
-/// `d / swap_extent` 个 UV 单位——两条路径口径一致。
-///
-/// # 为什么还要一帧预测
-///
-/// 补偿只算到「本帧观测时刻」，而帧提交后还要过约一个帧间隔才
-/// 真正呈现，那时窗口已又走过 `v × 帧间隔`。 `MotionPredictor`
-/// 用速度外推补上这段，观感上底图与窗口「正好跟住」而不是总慢
-/// 半拍。预测失误的代价是有界的：`CLAMP_TO_EDGE` 采样器只会把
-/// 越界的一小条边缘拉伸，而模糊半径（等效全分辨率 ~32px）远大于
-/// 单帧位移，看不出来。
-///
-/// 无捕获原点（首帧前 / 刚重建）时返回零——那时本就不铺底图
-/// （`fx.uploaded == false`），零值只是不改变任何行为。
-fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
-    let (Some(cap), Some(_cur)) = (self.backdrop.capture_origin, self.backdrop.origin) else {
-        return [0.0, 0.0];
-    };
-    let pred = self
-        .backdrop
-        .predictor
-        .predict_next_frame()
-        .unwrap_or((cap.0, cap.1));
-    let dx = pred.0 - cap.0;
-    let dy = pred.1 - cap.1;
-    let w = swap_extent.width.max(1) as f32;
-    let h = swap_extent.height.max(1) as f32;
-    [dx / w, dy / h]
-}
-
-/// 交换链为 RGBA 字节序时需要 R/B 交换（GDI DIB 恒为 BGRA）。
+    /// 交换链为 RGBA 字节序时需要 R/B 交换（GDI DIB 恒为 BGRA）。
     ///
     /// `pick_format` 只会给出 `B8G8R8A8_UNORM` / `R8G8B8A8_UNORM` 两种；
     /// 其余（单格式表面报出的罕见格式）按不交换处理——错序仅影响
@@ -1269,20 +1324,20 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
         let cmd = match fr.current_command_buffer() {
             Some(c) => c,
             None => {
-                self.warn_backdrop("拿不到当前命令缓冲");
+                self.warn_backdrop(BackdropWarn::NoCommandBuffer, "拿不到当前命令缓冲");
                 return Ok(());
             }
         };
         let render_pass = fr.render_pass();
         let gpu = self.gpu;
         if let Err(e) = fr.record_texture_upload(&mut fx.capture_img, bits, None, (w, h)) {
-            self.warn_backdrop(&format!("桌面位图上传失败: {e:#}"));
+            self.warn_backdrop(BackdropWarn::Upload, &format!("桌面位图上传失败: {e:#}"));
             return Ok(());
         }
         // 写入本帧的卷积半径（磨砂强度）。描述符集指向的是同一块 uniform
         // 缓冲，改完紧接着的 record_from 即按新半径卷积——无需重建管线。
         if let Err(e) = fx.pipeline.set_radius(gpu, &fx.chain, blur_radius) {
-            self.warn_backdrop(&format!("磨砂强度更新失败: {e:#}"));
+            self.warn_backdrop(BackdropWarn::SetRadius, &format!("磨砂强度更新失败: {e:#}"));
             return Ok(());
         }
         if let Err(e) = fx.pipeline.record_from(
@@ -1292,7 +1347,7 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
             render_pass,
             fx.pipeline.backdrop_set(),
         ) {
-            self.warn_backdrop(&format!("模糊链录制失败: {e:#}"));
+            self.warn_backdrop(BackdropWarn::Record, &format!("模糊链录制失败: {e:#}"));
             return Ok(());
         }
         fx.uploaded = true;
@@ -1303,10 +1358,9 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
         Ok(())
     }
 
-    /// 磨砂降级告警：只记一次，避免每帧刷屏。
-    fn warn_backdrop(&mut self, msg: &str) {
-        if !self.backdrop_warned {
-            self.backdrop_warned = true;
+    /// 磨砂降级告警：按**原因**去重（每种只记一次，避免每帧刷屏）。
+    fn warn_backdrop(&mut self, kind: BackdropWarn, msg: &str) {
+        if self.backdrop_warned.insert(kind) {
             tracing::warn!("磨砂背景降级（沿用上一张底图）: {msg}");
         }
     }
@@ -1433,6 +1487,7 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
             };
             let common = CommonBindings {
                 sampler: self.sampler.handle(),
+                user_sampler: self.sampler_linear.handle(),
                 font_view,
                 font_layout,
                 uniform_buffer: self.uniform.buffer().handle(),
@@ -1678,6 +1733,7 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
             let set = match fr.allocate_user_texture_set(
                 CommonBindings {
                     sampler: self.sampler.handle(),
+                    user_sampler: self.sampler_linear.handle(),
                     font_view,
                     font_layout,
                     uniform_buffer: self.uniform.buffer().handle(),
@@ -1698,7 +1754,7 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
                 }
             };
             self.user_textures.insert(id, UserTexture { image: img, set });
-            self.touch_user_order(id);
+            // LRU 位置由函数尾统一 touch（两条路径都要），这里不重复调。
             self.evict_user_textures_if_needed(fr)?;
         }
         // egui 的 `ColorImage.pixels` 是预乘 alpha 的 `Color32`，
@@ -1710,6 +1766,15 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
         if let Some(t) = self.user_textures.get_mut(&id) {
             fr.record_texture_upload(&mut t.image, &rgba, None, (w, h))?;
         }
+        // IMPORTANT: **两条路径都要**刷新 LRU 位置。
+        //
+        // 同尺寸重复上传不会重建纹理（上面 `same_size` 分支跳过），但它
+        // 同样是「这张纹理这一帧正在被用」的证据。不touch 的后果：
+        // 同一张图反复重传（同尺寸详情图切换、缩略图重解码出同尺寸）
+        // 却一直挂在 LRU 队首附近，被 `evict_user_textures_if_needed`
+        // 当成最久未用淘汰 ⇒ 下一帧又得重新上传（一次完整 GPU 上传，
+        // 512² 缩略图 = 1MB），滚动时反复发生。
+        self.touch_user_order(id);
         Ok(())
     }
 
@@ -1723,6 +1788,7 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
                 t.set,
                 CommonBindings {
                     sampler: self.sampler.handle(),
+                    user_sampler: self.sampler_linear.handle(),
                     font_view: font.view,
                     font_layout: font.layout,
                     uniform_buffer: self.uniform.buffer().handle(),
@@ -1790,6 +1856,24 @@ fn backdrop_uv_offset(&self, swap_extent: vk::Extent2D) -> [f32; 2] {
     }
 }
 
+/// 磨砂移动预测的 UV 位移（纯函数，便于单测）。
+///
+/// `pred` / `captured` 都是**屏幕物理像素**坐标，`extent` 是客户区
+/// **物理像素**尺寸；返回**归一化** UV 位移。三者量纲必须一致，
+/// 详见 [`Painter::backdrop_uv_offset`] 的说明（那里解释了为什么
+/// 分母不能用 `render_extent`）。
+fn backdrop_uv_offset_from(
+    pred: (f32, f32),
+    captured: (f32, f32),
+    extent: vk::Extent2D,
+) -> [f32; 2] {
+    let dx = pred.0 - captured.0;
+    let dy = pred.1 - captured.1;
+    let w = extent.width.max(1) as f32;
+    let h = extent.height.max(1) as f32;
+    [dx / w, dy / h]
+}
+
 impl Drop for Painter<'_> {
     fn drop(&mut self) {
         // 必须先让 GPU 彻底空闲：下面这些对象都可能被在途命令引用。
@@ -1825,6 +1909,7 @@ impl Drop for Painter<'_> {
         // 磨砂背景资源同理：漏销毁会在退出时报 VUID-vkDestroyDevice-device-05137。
         self.backdrop.destroy(self.gpu);
         self.sampler.destroy(&self.gpu.device);
+        self.sampler_linear.destroy(&self.gpu.device);
         self.slots.destroy(&self.gpu.device);
         self.uniform.destroy(&self.gpu.device);
     }
@@ -2025,6 +2110,62 @@ mod tests {
             clip_rect: clip,
             primitive: Primitive::Mesh(mesh),
         }
+    }
+
+    /// 磨砂移动预测的 UV 位移必须与**物理像素**口径对齐。
+    ///
+    /// 钉住两件事：
+    /// 1. 位移 = 屏幕物理像素差 ÷ 客户区物理像素尺寸（归一化）；
+    /// 2. **与超采样倍率无关**——用 `render_extent`（物理像素 × 倍率）
+    ///    当分母会让补偿小 `ssaa` 倍，表现为「2× 超采样时拖动窗口、
+    ///    磨砂底图跟不上半个身位」。
+    #[test]
+    fn backdrop_uv_offset_uses_physical_pixel_extent() {
+        let ext = vk::Extent2D {
+            width: 1000,
+            height: 500,
+        };
+        // 无位移 → 零。
+        assert_eq!(
+            backdrop_uv_offset_from((100.0, 200.0), (100.0, 200.0), ext),
+            [0.0, 0.0]
+        );
+        // 移动 100/1000 = 0.1、200/500 = 0.4。
+        let off = backdrop_uv_offset_from((200.0, 400.0), (100.0, 200.0), ext);
+        assert!((off[0] - 0.1).abs() < 1e-6, "x 位移应按宽度归一化：{off:?}");
+        assert!((off[1] - 0.4).abs() < 1e-6, "y 位移应按高度归一化：{off:?}");
+        // 负位移（窗口向左/上移动）同样成立。
+        let back = backdrop_uv_offset_from((0.0, 0.0), (100.0, 200.0), ext);
+        assert!((back[0] + 0.1).abs() < 1e-6, "反向位移应取负：{back:?}");
+        // 若误用 `render_extent`（×ssaa）当分母，结果会小 ssaa 倍——
+        // 这里显式算出那个错误值，证明两者确实不同（防「测试恒真」）。
+        let ssaa = 2.0_f32;
+        let wrong = backdrop_uv_offset_from(
+            (200.0, 400.0),
+            (100.0, 200.0),
+            vk::Extent2D {
+                width: (ext.width as f32 * ssaa) as u32,
+                height: (ext.height as f32 * ssaa) as u32,
+            },
+        );
+        assert!(
+            (wrong[0] - off[0]).abs() > 1e-3,
+            "用 render_extent 当分母会得到不同的（小 ssaa 倍的）值——\
+             本测试才有意义"
+        );
+        // 退化尺寸不得除零。
+        let tiny = backdrop_uv_offset_from(
+            (10.0, 10.0),
+            (0.0, 0.0),
+            vk::Extent2D {
+                width: 0,
+                height: 0,
+            },
+        );
+        assert!(
+            tiny[0].is_finite() && tiny[1].is_finite(),
+            "零尺寸不得产生 NaN"
+        );
     }
 
     #[test]
@@ -2741,19 +2882,19 @@ mod tests {
     }
 
     #[test]
-    fn uniform_matrix_is_identity() {
-        // 着色器已自己做像素→NDC；再乘非单位矩阵会二次变换。
+    fn uniforms_carry_viewport_and_dpr() {
+        // 本缺陷的判据（渲染侧）：uniform 只带视口尺寸与 dpr 两个换算
+        // 依据，顶点是逻辑点、视口是物理像素，`screen_rect * ppp ==
+        // size_in_pixels` 是唯一不变式（详见 `uniforms_for` 的文档）。
+        //
+        // 2026-10-17 前这里断言 `clip_from_uv` 是单位矩阵——该字段
+        // （恒为单位矩阵的 64 字节 mat4x4）已删除：着色器自己完成
+        // 像素→NDC，留它只会让「谁设非单位矩阵」变成二次变换陷阱。
         let u = uniforms_for(vk::Extent2D { width: 800, height: 600 }, 1.0);
-        assert_eq!(
-            u.clip_from_uv,
-            [
-                1.0, 0.0, 0.0, 0.0, //
-                0.0, 1.0, 0.0, 0.0, //
-                0.0, 0.0, 1.0, 0.0, //
-                0.0, 0.0, 0.0, 1.0,
-            ]
-        );
         assert_eq!(u.size_in_pixels, [800.0, 600.0]);
+        assert_eq!(u.dpr, 1.0);
+        // uniform 必须保持 16 字节（std140 与 WGSL 布局一致）。
+        assert_eq!(std::mem::size_of_val(&u), 16);
     }
 
     /// **本缺陷的判据（渲染侧）**：顶点是逻辑点、视口是物理像素，

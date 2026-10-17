@@ -186,9 +186,9 @@ pub fn render_scale() -> f32 {
     })
 }
 
-/// 按窗口 DPI 缩放求**实际生效**的超采样倍率。
+/// 按窗口 DPI缩放求**实际生效**的超采样倍率。
 ///
-/// 与 [`render_scale`] 的区别：这里把「`ppp = dpi_scale × 倍率` 不超过
+/// 与 [`render_scale`] 的区别：这里把「`ppp = dpi_scale ×倍率` 不超过
 /// [`MAX_RENDER_PPP`]」这条约束算进去。
 ///
 /// # 为什么窗口层与渲染层必须调用同一个函数
@@ -197,13 +197,33 @@ pub fn render_scale() -> f32 {
 /// 两处若各算各的（例如窗口层夹了上限、渲染层没夹），
 /// `screen_rect × ppp == 渲染目标像素` 这条不变式就断了——
 /// 表现是画面整体缩放错误，且**不报任何 GPU 错误**。
+///
+/// # 为什么允许倍率低于 1.0
+///
+/// 早前的写法是 `min(want, (MAX/s).max(1.0))`：那个 `.max(1.0)` 是为了
+/// 「DPI 已经很高时不再超采样」，但它同时把**上限本身架空**了——
+///
+/// ```text
+/// s = 2.5（250% DPI）⇒ MAX/s = 0.9 → 被抬回 1.0 ⇒ ppp = 2.5  > 2.25
+/// s = 3.0（300% DPI）⇒ MAX/s = 0.75 → 被抬回 1.0 ⇒ ppp = 3.0 > 2.25
+/// ```
+///
+/// 而 `ppp > 2.25` 恰好是 [`MAX_RENDER_PPP`] 记录的**图标字形被画坏**
+/// 区间（齿轮丢齿、垃圾桶丢盖）。也就是说：300% DPI 屏上这份「保护」
+/// 反而把人推进了坏区间。物理像素本来已经足够密，超采样对该屏只有
+/// 副作用，所以正确做法是**降到 1.0 以下**（渲染目标小于交换链），
+/// 让 `ppp` 回到已知安全区间。
+///
+/// 代价是 250%/300% 屏上画面按 `MAX/s` 的比例**欠采样**后再放大，
+/// 边缘略软。这比字形画坏好得多，且只在超高 DPI 时发生。
 pub fn render_scale_for(dpi_scale: f32) -> f32 {
     let s = if dpi_scale > 0.01 { dpi_scale } else { 1.0 };
     let want = render_scale();
     // ppp = s * rs ≤ MAX_RENDER_PPP ⇒ rs ≤ MAX_RENDER_PPP / s。
-    // 下限 1.0：DPI 已经很高时不再超采样（物理像素本来就密）。
-    let capped = (MAX_RENDER_PPP / s).max(1.0);
-    want.min(capped).max(1.0)
+    // 注意这里**不钳下限 1.0**：那是架空上限的根源（见上文）。
+    // 只在结果小到毫无意义（配置被手改成极大 render_scale 且 DPI 极高）
+    // 时兜一个正数下限，避免 render target 退化成 0 像素。
+    want.min(MAX_RENDER_PPP / s).max(0.25)
 }
 
 /// 已初始化的 Vulkan 设备上下文。
@@ -974,6 +994,63 @@ pub(crate) fn image_barrier<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`ppp` 不得超过 [`MAX_RENDER_PPP`]——任何 DPI 下。**
+    ///
+    /// 回归守卫：`render_scale_for` 早先是
+    /// `min(want, (MAX/s).max(1.0))`，那个 `.max(1.0)` 把上限架空了：
+    ///
+    /// ```text
+    /// s = 2.5 ⇒ 2.25/2.5 = 0.9 → 抬回 1.0 ⇒ ppp = 2.5 > 2.25
+    /// s = 3.0 ⇒ 2.25/3.0 = 0.75 → 抬回 1.0 ⇒ ppp = 3.0 > 2.25
+    /// ```
+    ///
+    /// 而 `ppp > 2.25` 正是 `MAX_RENDER_PPP` 记录的**图标字形被画坏**
+    /// 区间（齿轮丢齿、垃圾桶丢盖）——这份「保护」在高 DPI 屏上反而
+    /// 亲手把人推进了坏区间。修法是允许倍率低于 1.0（欠采样）。
+    ///
+    /// 用例覆盖到 300%（Windows 缩放的实际档位上限之一），并顺带
+    /// 钉住「脏输入不产生脏倍率」这条性质。
+    #[test]
+    fn render_ppp_never_exceeds_cap_at_any_dpi() {
+        for s in [
+            0.5_f32, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 4.0,
+        ] {
+            let rs = render_scale_for(s);
+            let ppp = s * rs;
+            assert!(
+                ppp <= MAX_RENDER_PPP + 1e-4,
+                "DPI {s}: ppp={ppp} 超过上限 {MAX_RENDER_PPP}（倍率 {rs}）"
+            );
+            // 不能反过来把画面缩到没有：倍率必须为正且不至于离谱地小。
+            assert!(
+                rs >= 0.25 - 1e-6 && rs.is_finite(),
+                "DPI {s}: 倍率 {rs} 非法（会退化成无意义的渲染目标）"
+            );
+        }
+        // 脏输入（0 / 负数 / NaN）必须按 1.0 处理，不得产出 NaN 倍率。
+        for s in [0.0, -1.0, f32::NAN] {
+            let rs = render_scale_for(s);
+            assert!(rs.is_finite() && rs > 0.0, "脏 DPI {s} 产出非法倍率 {rs}");
+        }
+    }
+
+    /// 常规 DPI（≤200%）下倍率仍是「超采样」方向，不因本次修复而改变。
+    ///
+    /// 单独列出是因为修复把下限从 1.0 放开了——必须确认**只有超高 DPI**
+    /// 才走到欠采样那条路，否则 100% 屏用户会莫名拿到 0.9 倍画面。
+    #[test]
+    fn render_scale_stays_supersampled_on_normal_dpi() {
+        for s in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let rs = render_scale_for(s);
+            assert!(
+                rs >= 1.0,
+                "DPI {s}: 倍率 {rs} 不该欠采样（该区间物理像素仍值得超采样）"
+            );
+            // 仍然受上限约束。
+            assert!(s * rs <= MAX_RENDER_PPP + 1e-4, "DPI {s} 超过上限");
+        }
+    }
 
     #[test]
     fn desc_caps_require_both_features() {

@@ -64,7 +64,7 @@ use ash::{Device, khr, vk};
 use std::time::Instant;
 
 use crate::pipeline::{
-    BINDING_SAMPLER, BINDING_TEXTURE, BINDING_UNIFORM, BINDING_USER_TEXTURE,
+    BINDING_SAMPLER, BINDING_TEXTURE, BINDING_UNIFORM, BINDING_USER_SAMPLER, BINDING_USER_TEXTURE,
 };
 use crate::{Gpu, Swapchain, image_barrier};
 
@@ -260,8 +260,17 @@ pub struct DrawBatch {
 ///    [`FrameRenderer::rewrite_user_texture_set`] 统一刷新全部集合。
 #[derive(Debug, Clone, Copy)]
 pub struct CommonBindings {
-    /// 采样器（与字体图集共用同一个）。
+    /// 采样器（与字体图集共用同一个，**nearest**）。
+    ///
+    /// 字体图集必须点采样：线性插值会把相邻字形的覆盖率渗进边缘。
     pub sampler: vk::Sampler,
+    /// 用户纹理的采样器（**linear**，`BINDING_USER_SAMPLER`）。
+    ///
+    /// 与 `sampler` 分开的理由：缩略图的显示尺寸几乎永远不等于纹理
+    /// 尺寸（512² 纹理显示成 320/696pt），nearest 在非 1:1 比例下
+    /// 让照片出摩尔纹。1:1 时双线性无损（整数纹素处权重为 1），
+    /// 所以统一 linear 对两种情况都正确。见 `pipeline.rs::BINDING_USER_SAMPLER`。
+    pub user_sampler: vk::Sampler,
     /// 字体图集视图（`BINDING_TEXTURE`）。
     pub font_view: vk::ImageView,
     /// 字体图集当前布局。
@@ -1055,6 +1064,11 @@ impl<'a> FrameRenderer<'a> {
     }
 
     /// 更新某帧槽位描述符集里的采样器 + 字体纹理绑定。
+    ///
+    /// 同时写 `BINDING_USER_SAMPLER` 的**占位值**（复用字体采样器）：
+    /// 着色器静态声明了该绑定，任何被绑的集合都必须给它合法句柄。
+    /// 帧槽集合只服务字体/形状批（`tex_id == 0`），不采样 user_tex——
+    /// 真正的缩略图用各自纹理的集合（linear 采样器写在那边）。
     pub fn update_texture_binding(
         &self,
         slot: usize,
@@ -1068,7 +1082,7 @@ impl<'a> FrameRenderer<'a> {
             image_view,
             image_layout: layout,
         };
-        // 两个绑定共用一次 update 调用：sampler 是裸 sampler，
+        // 三个绑定共用一次 update 调用：两个 sampler 是裸 sampler，
         // texture 是 combined image sampler，各写一条。
         let writes = [
             vk::WriteDescriptorSet::default()
@@ -1082,6 +1096,13 @@ impl<'a> FrameRenderer<'a> {
                 .dst_binding(BINDING_TEXTURE)
                 .descriptor_count(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&info)),
+            // 用户纹理采样器的占位值（见方法文档：帧槽集合不采样它）。
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_USER_SAMPLER)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
                 .image_info(std::slice::from_ref(&info)),
         ];
         unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
@@ -1188,7 +1209,7 @@ impl<'a> FrameRenderer<'a> {
         Ok(())
     }
 
-    /// 四个绑定的一次性写入（`allocate` 与 `rewrite` 的共同实现）。
+    /// 五个绑定的一次性写入（`allocate` 与 `rewrite` 的共同实现）。
     fn write_user_texture_set(
         &self,
         set: vk::DescriptorSet,
@@ -1206,8 +1227,10 @@ impl<'a> FrameRenderer<'a> {
             image_view: common.font_view,
             image_layout: common.font_layout,
         };
+        // 用户纹理用**自己的 linear 采样器**：缩略图显示尺寸 ≠ 纹理
+        // 尺寸，nearest 会出摩尔纹（见 `CommonBindings::user_sampler`）。
         let user = vk::DescriptorImageInfo {
-            sampler: common.sampler,
+            sampler: common.user_sampler,
             image_view: user_view,
             image_layout: user_layout,
         };
@@ -1235,6 +1258,13 @@ impl<'a> FrameRenderer<'a> {
                 .dst_binding(BINDING_USER_TEXTURE)
                 .descriptor_count(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&user)),
+            // 用户纹理的独立采样器（linear）。
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_USER_SAMPLER)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
                 .image_info(std::slice::from_ref(&user)),
         ];
         unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
@@ -2145,7 +2175,25 @@ impl<'a> FrameRenderer<'a> {
                 device.destroy_semaphore(slot.acquire_semaphore, None);
             }
         }
-        // 命令缓冲随命令池一起回收，不单独销毁。
+        // 命令缓冲必须**显式归还池子**，不存在「随命令池一起回收」。
+        //
+        // 2026-10-17 修的泄漏：命令池跨 rebuild 长期存活（只在 `Drop`
+        // 里销毁），于是 `allocate_frame_resources` 每轮从池里
+        // `allocate_command_buffers(image_count)` 而旧缓冲从未 reset 或
+        // free ⇒ 池内句柄计数单调增长（每轮泄漏 swap_image_count 个）。
+        // 重建（拖动窗口十几次）时这是几十个僵尸命令缓冲。
+        //
+        // 用 `reset_command_pool` 而不是逐缓冲 `free_command_buffers`：
+        // 这个池是帧槽专用的（全仓唯一分配点就是 `allocate_frame_resources`），
+        // 整池 reset 一次到位、也不用先收集句柄。调用方保证已 `wait_idle`
+        // （`rebuild_swapchain` 与 `Drop` 都先等）。
+        unsafe {
+            if let Err(e) =
+                device.reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
+            {
+                tracing::error!(?e, "重置帧命令池失败：旧命令缓冲可能仍被在途提交引用");
+            }
+        }
         self.slots.clear();
         // 呈现信号量按图像分配，漏销毁就是真泄漏
         // （验证层报 `VUID-vkDestroyDevice-device-05137`）。

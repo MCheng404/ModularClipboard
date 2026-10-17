@@ -85,7 +85,13 @@ const TRANSPARENT_CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 ///
 /// 我第一版就踩了这个坑：`full_app` 首帧明明成功渲染了 552 个顶点，
 /// 却在第二帧因为一处漏清的 delta panic 退出。用作用域守卫从根上消除。
-struct DeltaGuard(egui::TexturesDelta);
+///
+/// CAUTION: 不只是 debug 构建的问题。release 下断言编译掉，delta 被
+/// **静默丢弃** ⇒ 那一帧的字体图集 / 用户纹理增量永远传不上 GPU，而
+/// egui 侧的内存已经认为「传过了」（增量只在纹理变化时产出）⇒ 窗口
+/// 空白或字形缺失，且**不会**在下一帧自愈（要等纹理再次变化）。
+/// 因此所有「跑完 `run_ui` 之后」的分支都必须经由本守卫离开。
+pub(crate) struct DeltaGuard(pub(crate) egui::TexturesDelta);
 
 impl Drop for DeltaGuard {
     fn drop(&mut self) {
@@ -242,7 +248,12 @@ fn run_mode(
     // PF-3）：在这里就 focus_window 会让窗口在 GPU 初始化 + 字体读入
     // + DB 打开期间以「无响应」状态可见。
 
-    let mut events = EventLoop::new(&window);
+    // IMPORTANT: 必须是 `new_primary` 而不是 `new`——`WM_QUIT` 是线程级
+    // 消息、`PM_REMOVE` 谁先poll 谁摘走，归属必须显式指定（见
+    // `EventLoop::owns_quit`）。用 `new` 的话弹窗/子窗可能先摘走它，
+    // 主窗口 `quit_requested()` 恒 false ⇒ **点关闭 / 托盘退出后程序
+    // 退不掉**，而那个附属窗口还把自己的 CloseRequested 误当成「关我」。
+    let mut events = EventLoop::new_primary(&window);
     tracing::info!(
         width = window.inner_size_physical().0,
         height = window.inner_size_physical().1,
@@ -560,6 +571,12 @@ fn run_mode(
         let mut saw_close = false;
         // 另一个进程请求唤起主窗口（单实例：用户又双击了一次图标）。
         let mut saw_show = false;
+        // 2026-10-17：尺寸变更只打标记，不在事件循环里逐条重建交换链。
+        // 拖动窗口时 WM_SIZE 每几毫秒来一次，同一轮循环里可能积压多条
+        // → 逐条 `rebuild` 每次都 `device_wait_idle` + 销毁重建全部帧
+        // 资源（实测拖动一次十几次重建）。标记在事件循环结束后统一消费
+        // （见 ---- 1.4 ----）。
+        let mut resize_pending = false;
         // `take_pending` 而非 `poll()` 的返回值：节流路径 `poll_for` 也会读
         // 消息并把事件记进累积缓冲，把它们一起取走才能保证关闭请求不丢。
         // 见 `gfx::window::EventLoop::poll` 的说明。
@@ -598,9 +615,10 @@ fn run_mode(
                     tracing::info!("收到隐藏请求（热键 toggle），已隐藏主窗口并收起设置窗");
                 }
                 WindowEvent::Resized { .. } => {
-                    // 客户区尺寸变了 → 交换链必须重建。`rebuild_swapchain`
-                    // 内部会 `device_wait_idle` 并重查表面能力。
-                    rebuild(&mut fr, &mut painter)?;
+                    // 客户区尺寸变了 → 交换链必须重建。但**不在这里重建**：
+                    // 打标记，等本轮事件全部处理完后统一做一次（逻辑见
+                    // 标记声明处与 ---- 1.4 ----）。
+                    resize_pending = true;
                 }
                 WindowEvent::Focused(gained) => {
                     // ⚠️ 这里**必须接** `hide_on_focus_lost`。
@@ -662,15 +680,43 @@ fn run_mode(
         // 语义由下面的 `decide_on_close` 统一处理，提前 break 会让
         // 那条分支永远走不到，只存在于单测里。
 
+        // ---- 1.4 尺寸变更合帧重建 ----
+        //
+        // 2026-10-17：拖动时一轮循环可能收到多条 Resized（WM_SIZE 高频）。
+        // 全部合并成**一次**重建：以最新查询到的客户区尺寸为准，与
+        // `fr.extent()` 相同则跳过（不带真实变化的重复 WM_SIZE 很常见）。
+        // 放在 `run_ui` 之前，让本帧布局就用上新尺寸——否则会用旧
+        // screen_rect 排一帧，present 时又被交换链裁掉。
+        //
+        // ---- 3 ---- 的兜底检查保留：它兜「事件与查询不一致」的残余
+        // 情况（如 SetWindowPos 合并消息），两者互补不重复。
+        if resize_pending {
+            let (cw, ch) = window.inner_size_physical();
+            if cw > 0 && ch > 0 && (cw, ch) != (fr.extent().width, fr.extent().height) {
+                rebuild(&mut fr, &mut painter)?;
+            }
+        }
+
         // ---- 1.5 托盘与全局快捷键 ----
         //
         // 放在窗口事件之后、业务 UI 之前：唤起动作要在本帧绘制出内容，
         // 否则用户会看到「窗口弹出来了但还是空的，下一帧才有东西」。
         if let Some(r) = resident.as_ref() {
             let f = r.poll();
+            //
+            // 下面三处失败一律 `notify`（toast 通道）而不只写日志。
+            //
+            // 理由：这三项都是**用户刚点的托盘动作**，而托盘交互发生
+            // 在**主窗口之外**——失败时主窗口甚至可能收着。日志只在
+            // `%APPDATA%/…/app.log` 里，普通用户永远不会去看，于是
+            // 「点了没反应」与「点了失败了」在用户眼里完全一样。
+            //
+            // 与 `Op::ClearAll` / `Op::Copy` 等**界面内**路径同款
+            // 处置（它们也都 notify），保持失败反馈的一致性。
             if f.clear_history {
                 if let Err(e) = app.clear_history() {
                     tracing::warn!(%e, "托盘清空历史失败");
+                    app.svc.notify(format!("清空失败: {e}"));
                 }
                 // IMPORTANT: 必须请求重绘。
                 //
@@ -690,6 +736,7 @@ fn run_mode(
                 if let Some(id) = app.svc.state.items.first().map(|i| i.id) {
                     if let Err(e) = app.svc.copy_and_paste(id) {
                         tracing::warn!(%e, "粘贴上一条失败");
+                        app.svc.notify(format!("粘贴失败: {e}"));
                     }
                 } else {
                     tracing::debug!("历史为空，忽略「粘贴上一条」");
@@ -700,6 +747,7 @@ fn run_mode(
             if let Some(id) = f.mini_pick {
                 if let Err(e) = app.svc.copy_item(id) {
                     tracing::warn!(%e, "迷你面板复制条目失败");
+                    app.svc.notify(format!("复制失败: {e}"));
                 }
                 // 复制可能改变列表顺序（最近使用），请求重绘。
                 ctx.request_repaint();
@@ -1919,7 +1967,10 @@ impl App {
         self.capture_recording(&ctx);
 
         // 绘制层只识别操作、不改布局：统一在这里落到工作区与服务上。
-        self.apply_ops();
+        //
+        // NOTE: 主窗口自己的 Op **不需要**在这里 `request_repaint()`：
+        // 本函数就运行在主窗口这一帧的绘制里，画面立刻就带上新状态。
+        let _ = self.apply_ops();
 
         // 快捷键注册失败（常驻进程侧的反馈）要浮到界面上。
         self.surface_hotkey_error();
@@ -2099,9 +2150,19 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
     ///
     /// 绘制层**只识别、不改状态**——所有变更集中在这里，
     /// 于是「点了折叠按钮」这件事不会散落在几十个绘制函数里。
-    fn apply_ops(&mut self) {
+    ///
+    /// 返回「本帧是否真的改了共享状态」。**调用方必须看这个返回值**：
+    /// 弹窗 / 设置窗 / 卡片子窗各有**独立的 `egui::Context` 与消息队列**，
+    /// 它们改了 `paint_state`（选中、类型过滤、搜索词…）或服务层（列表、
+    /// 通知）之后，主窗口既收不到事件也不会请求重绘 ⇒ 主循环的渲染闸门
+    /// （`skip_render`）判定「没事可做」而跳过整帧 ⇒ **主窗口画面停在旧
+    /// 状态**，直到用户碰一下鼠标才刷新（表现为「点了类型过滤但列表不变」）。
+    /// 因此非主窗口的三个入口都要在返回 `true` 时 `ctx.request_repaint()`。
+    fn apply_ops(&mut self) -> bool {
         use crate::paint::Op;
         let ops = self.paint_state.take_ops();
+        // 有 Op 被上报 = 用户确实做过交互（Op 只在交互时 push）。
+        let mut changed = !ops.is_empty();
         // 「任意操作取消选中」（2026-10-15 第三轮原型定稿）：
         // 选中是临时状态，任何**行操作**（置顶 / 删除 / 复制 / 打开 /
         // 清空）之后都不该继续高亮——否则用户会以为选中项还有后续
@@ -2259,16 +2320,25 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 Op::FinishRecording => {
                     // 录制覆盖层上点击任意位置 = 确认。有候选组合才落地，
                     // 没有（用户什么都没按就点了）等同取消。
-                    let Some(slot) = self.paint_state.hotkey_recording.take() else {
-                        return;
-                    };
-                    let Some(hotkey) = self.paint_state.recording_combo.take() else {
-                        tracing::debug!(?slot, "录制未捕获到组合，视为取消");
-                        self.set_hotkeys_suspended(false);
-                        return;
-                    };
-                    tracing::info!(?slot, keys = %hotkey.display(), "录制确认");
-                    self.apply_hotkey(slot, hotkey);
+                    //
+                    // CAUTION: 这里**不能** `return`：函数尾部的「搜索文本
+                    // 同步到服务层」与「行操作清选中」还没跑。录制确认与
+                    // 搜索词改动完全可能出现在同一帧（用户在搜索弹窗里
+                    // 按 Esc 关面板 ⇒ 先落 FinishRecording 那一支），
+                    // 早前的 `return` 会让搜索词**这一帧不同步**——虽然
+                    // 下一帧会补上，但中间那一帧列表是按旧词筛的。
+                    if let Some(slot) = self.paint_state.hotkey_recording.take() {
+                        match self.paint_state.recording_combo.take() {
+                            Some(hotkey) => {
+                                tracing::info!(?slot, keys = %hotkey.display(), "录制确认");
+                                self.apply_hotkey(slot, hotkey);
+                            }
+                            None => {
+                                tracing::debug!(?slot, "录制未捕获到组合，视为取消");
+                                self.set_hotkeys_suspended(false);
+                            }
+                        }
+                    }
                 }
                 Op::SetHotkeyText { slot, text } => {
                     match modular_clipboard_core::config::Hotkey::parse(&text) {
@@ -2402,8 +2472,16 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 }
                 Op::OpenLink(url) => {
                     // 关于页的项目 / 作者主页：用系统默认浏览器打开。
+                    //
+                    // 失败必须告知用户，与下一支 `Op::OpenUrl` 同款处置。
+                    // 两者是同一个动作（打开 URL）的两条入口，只是一条
+                    // 读设置里的自定义浏览器路径；早前只有 `OpenUrl`
+                    // 通知，于是「关于页的链接打不开」彻底静默——而
+                    // 打不开的原因（默认浏览器未关联 / 被策略禁用）
+                    // 恰恰是用户最需要知道的那类。
                     if let Err(e) = modular_clipboard_platform::open_url(url) {
                         tracing::warn!("打开链接失败 {url}: {e}");
+                        self.svc.notify(format!("打开链接失败: {e}"));
                     }
                 }
                 Op::OpenUrl(url) => {
@@ -2458,87 +2536,93 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
             // 过滤让「哪一行被选中」失去意义）。
             self.svc.state.selected = None;
             self.svc.search(q);
+            changed = true;
         }
         if row_op {
             self.svc.state.selected = None;
         }
+        changed
     }
 
     /// 画一个悬浮弹窗的内容（`crate::popup` 调用）。
-///
-/// 与 [`Self::draw_child_frame`] 同一套路：把 `paint::Frame` 的字段
-/// 组装收敛在 app.rs，`popup` 不需要知道 `App` 的内部结构。
-///
-/// 弹窗客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
-/// 面板矩形取中央那块；投影由 `paint` 画在边距里（alpha=0 处即桌面）。
-pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
-    let ppp = ui.ctx().pixels_per_point();
-    let margin = crate::popup::SHADOW_MARGIN;
-    let client = ui.max_rect();
-    let panel = egui::Rect::from_min_max(
-        egui::pos2(client.min.x + margin, client.min.y + margin),
-        egui::pos2(client.max.x - margin, client.max.y - margin),
-    );
-    // ---- 没有磨砂底图 ----
-    //
-    // 弹窗一律**不透明**面板：它不走主窗口那套 GPU 磨砂通道（原因见
-    // `crate::popup::Popup::sync_and_render`），因此这里也没有底图可画。
-    // 背景层不能降 alpha——降了就只剩一圈描边、内部全透。
-    let pal_ref: &crate::theme::Palette = &self.pal;
-    // ---- 自研投影（画在**客户区级** painter 上）----
-    //
-    // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，那圈是透明的；高斯投影画在
-    // 内容矩形外围、向外渐隐到全透明 ⇒ 不需要 DWM，也不需要抓桌面。
-    // 用 `painter_at(panel)` 会把投影裁掉一圈，所以这里必须用
-    // `ui.painter()`。
-    crate::paint::draw_popup_shadow(ui.painter(), panel, pal_ref);
-    // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
-    // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
-    let rail_kinds = crate::paint::FloatLayout::kinds(
-        &self.svc.state.config.ui,
-        &self.svc.state.items,
-    );
-    let mut frame = crate::paint::Frame {
-        ui,
-        state: &mut self.paint_state,
-        svc: &mut self.svc,
-        ws: &self.ws,
-        pal: pal_ref,
-        scale: ppp,
-        area: panel,
-        card_id: None,
-        hit_ns: crate::paint::HitNs::Popup(kind),
-    };
-    match kind {
-        crate::popup::PopupKind::Search => {
-            crate::paint::draw_search_panel(&mut frame, panel);
-            // 搜索面板把「输入框焦点 / 指针是否在面板上」回报给主窗口：
-            // 焦点住在**弹窗自己的** `Context` 里，主窗口的
-            // `memory()` 恒为空——不回报的话状态机认为「没人持有焦点」，
-            // 面板会在用户点进输入框的瞬间自己收回去。
-            self.paint_state.search_popup_focus = frame
-                .state
-                .search_edit_id
-                .is_some_and(|id| ui.memory(|m| m.focused()) == Some(id));
+    ///
+    /// 与 [`Self::draw_child_frame`] 同一套路：把 `paint::Frame` 的字段
+    /// 组装收敛在 app.rs，`popup` 不需要知道 `App` 的内部结构。
+    ///
+    /// 弹窗客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
+    /// 面板矩形取中央那块；投影由 `paint` 画在边距里（alpha=0 处即桌面）。
+    pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
+        let ppp = ui.ctx().pixels_per_point();
+        let margin = crate::popup::SHADOW_MARGIN;
+        let client = ui.max_rect();
+        let panel = egui::Rect::from_min_max(
+            egui::pos2(client.min.x + margin, client.min.y + margin),
+            egui::pos2(client.max.x - margin, client.max.y - margin),
+        );
+        // ---- 没有磨砂底图 ----
+        //
+        // 弹窗一律**不透明**面板：它不走主窗口那套 GPU 磨砂通道（原因见
+        // `crate::popup::Popup::sync_and_render`），因此这里也没有底图可画。
+        // 背景层不能降 alpha——降了就只剩一圈描边、内部全透。
+        let pal_ref: &crate::theme::Palette = &self.pal;
+        // ---- 自研投影（画在**客户区级** painter 上）----
+        //
+        // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，那圈是透明的；高斯投影画在
+        // 内容矩形外围、向外渐隐到全透明 ⇒ 不需要 DWM，也不需要抓桌面。
+        // 用 `painter_at(panel)` 会把投影裁掉一圈，所以这里必须用
+        // `ui.painter()`。
+        crate::paint::draw_popup_shadow(ui.painter(), panel, pal_ref);
+        // CAUTION: 类型列表必须在构造 `frame`（借走 `&mut self.svc`）**之前**
+        // 算好——frame 持有 svc 的可变借用，再去读同一份配置就是二借用。
+        let rail_kinds = crate::paint::FloatLayout::kinds(
+            &self.svc.state.config.ui,
+            &self.svc.state.items,
+        );
+        let mut frame = crate::paint::Frame {
+            ui,
+            state: &mut self.paint_state,
+            svc: &mut self.svc,
+            ws: &self.ws,
+            pal: pal_ref,
+            scale: ppp,
+            area: panel,
+            card_id: None,
+            hit_ns: crate::paint::HitNs::Popup(kind),
+        };
+        match kind {
+            crate::popup::PopupKind::Search => {
+                crate::paint::draw_search_panel(&mut frame, panel);
+                // 搜索面板把「输入框焦点 / 指针是否在面板上」回报给主窗口：
+                // 焦点住在**弹窗自己的** `Context` 里，主窗口的
+                // `memory()` 恒为空——不回报的话状态机认为「没人持有焦点」，
+                // 面板会在用户点进输入框的瞬间自己收回去。
+                self.paint_state.search_popup_focus = frame
+                    .state
+                    .search_edit_id
+                    .is_some_and(|id| ui.memory(|m| m.focused()) == Some(id));
+            }
+            crate::popup::PopupKind::Rail => {
+                crate::paint::draw_type_rail(&mut frame, panel, &rail_kinds);
+            }
         }
-        crate::popup::PopupKind::Rail => {
-            crate::paint::draw_type_rail(&mut frame, panel, &rail_kinds);
+        // 弹窗里的操作（点类型栏按钮、清搜索、Esc）也要落地。
+        //
+        // IMPORTANT: 搜索面板打字 / 点类型过滤按钮都改的是**主窗口**那份
+        // `paint_state`（搜索词、类型过滤），列表由主窗口绘制。弹窗有自己的
+        // `Context` 与事件队列 ⇒ 主窗口收不到事件、也不请求重绘，渲染闸门
+        // 会整帧跳过 ⇒ **「在搜索框里打字，列表不跟着筛」**。返回 `true` 时
+        // 必须对主 `Context` 请求重绘。
+        if self.apply_ops() {
+            self.ctx.request_repaint();
         }
     }
-    // 弹窗里的操作（点类型栏按钮、清搜索、Esc）也要落地。
-    self.apply_ops();
-}
 
-/// 画一个卡片子窗口的内容。
+    /// 画一个卡片子窗口的内容。
     ///
     /// 与 [`Self::draw_frame`] 分开而不是加参数：`draw_frame` 还要跑
     /// 主窗口专属的逻辑（`svc.pump()`、拖动区上报、操作落地），
     /// 那些对子窗口没有意义——子窗口只是一张卡片的容器。
-    pub fn draw_child_frame(
-        &mut self,
-        ui: &mut egui::Ui,
-        card_id: crate::card::CardId,
-    ) {
+    pub fn draw_child_frame(&mut self, ui: &mut egui::Ui, card_id: crate::card::CardId) {
         let area = ui.max_rect();
         let ppp = ui.ctx().pixels_per_point();
         let mut frame = crate::paint::Frame {
@@ -2554,7 +2638,14 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
         };
         crate::paint::draw_child(&mut frame);
         // 子窗口里的操作（点叉收回、点拖动条收回）也要落地。
-        self.apply_ops();
+        //
+        // IMPORTANT: 返回 `true` 必须对**主窗口**请求重绘——子窗口有自己的
+        // `Context` 与事件队列，它改了 `ws`/`paint_state` 之后主窗口收不到
+        // 任何事件，渲染闸门会跳过整帧 ⇒ 画面停在旧状态（用户看到的是
+        // 「点了收回但卡片还在」）。
+        if self.apply_ops() {
+            self.ctx.request_repaint();
+        }
     }
 
     /// 画设置窗口的一帧（由 [`crate::settingswin`] 调用）。
@@ -2588,7 +2679,15 @@ pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
 
         // 设置项的改动要立刻落盘——用户在设置窗口里点了开关就
         // 关掉窗口，不该丢。
-        self.apply_ops();
+        //
+        // IMPORTANT: 返回 `true` 时必须对**主窗口**请求重绘。设置窗改了
+        // 配置（主题、字号、模糊强度、置顶…）之后，主窗口既收不到事件、
+        // 也不请求重绘，渲染闸门会整帧跳过 ⇒ 主窗口停在旧配置的画面上。
+        // 闸门里只比对了 `always_on_top` 与 `window_backdrop` 两个字段，
+        // 其余配置项全靠这条兜住。
+        if self.apply_ops() {
+            self.ctx.request_repaint();
+        }
     }
 
     /// 设置窗口打开时调用：设置界面状态归零。

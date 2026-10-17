@@ -19,6 +19,9 @@ pub const BINDING_TEXTURE: u32 = 2;
 /// 字体图集是单通道覆盖率图，缩略图是 RGBA 彩色图，
 /// 片元着色器对两者的合成方式不同。
 pub const BINDING_USER_TEXTURE: u32 = 3;
+/// 用户纹理的**独立采样器**（linear）。字体图集走 [`BINDING_SAMPLER`]
+/// （nearest），两者过滤要求正相反，见布局构造处的长注释。
+pub const BINDING_USER_SAMPLER: u32 = 4;
 
 /// 顶点属性位置。
 mod location {
@@ -42,8 +45,6 @@ mod location {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Uniforms {
-    /// 像素 → NDC 的变换矩阵（列主序）。
-    pub clip_from_uv: [f32; 16],
     /// 视口尺寸（物理像素）。
     pub size_in_pixels: [f32; 2],
     /// 设备像素比。
@@ -56,9 +57,13 @@ impl Uniforms {
     /// 构造 uniform。
     ///
     /// `scale` 是 egui 的 `pixels_per_point`（逻辑像素 → 物理像素的比例）。
-    pub fn new(clip_from_uv: [f32; 16], size_in_pixels: [f32; 2], scale: f32) -> Self {
+    ///
+    /// 2026-10-17：删掉了恒为单位矩阵的 `clip_from_uv`（64 字节）。
+    /// 它从来只有单位矩阵一个值（有测试钉过），而着色器自己做
+    /// 像素→NDC ⇒ 每顶点 16 个 FMA 的纯浪费，还留着一个
+    /// 「谁把它设成非单位矩阵就二次变换」的陷阱。uniform 80 → 16 字节。
+    pub fn new(size_in_pixels: [f32; 2], scale: f32) -> Self {
         Self {
-            clip_from_uv,
             size_in_pixels,
             dpr: scale,
             pad: 0.0,
@@ -218,6 +223,20 @@ impl DescriptorLayout {
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_USER_TEXTURE)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // 用户纹理的**独立采样器**（2026-10-17）。
+            //
+            // 字体图集必须点采样（`BINDING_SAMPLER` + nearest）：
+            // 线性插值会把相邻字形的覆盖率渗进边缘，小字号糊成灰块。
+            // 但缩略图/原图用 nearest 会在「显示 ≠ 纹理」的所有比例下
+            // 走样（实测 100% DPI：320pt 显示 vs 512px 纹理 = 1.6× 缩小，
+            // 照片全是摩尔纹）。两者过滤要求正相反 ⇒ 两个 sampler 绑定。
+            //
+            // 帧槽集合写占位值（字体批次不采样它），用户纹理集合写线性。
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_USER_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
@@ -631,11 +650,12 @@ mod tests {
 
     #[test]
     fn uniform_layout_matches_wgsl() {
-        // WGSL Uniforms: mat4x4(64) + vec2(8) + f32(4) + f32(4) = 80
-        // Rust 侧 [f32;16] + [f32;2] + f32 + f32 同样应是 80 字节
+        // WGSL Uniforms: vec2(8) + f32(4) + f32(4) = 16
+        // Rust 侧 [f32;2] + f32 + f32 同样应是 16 字节
+        // （2026-10-17 删掉了恒为单位矩阵的 clip_from_uv：80 → 16）
         assert_eq!(
             size_of::<Uniforms>(),
-            80,
+            16,
             "uniform 大小与 WGSL 声明不符，着色器会读到错位数据"
         );
     }
@@ -643,11 +663,11 @@ mod tests {
     #[test]
     fn uniform_is_pod_and_zeroable() {
         // bytemuck 派生要求字段无填充差异；构造后再逐字节比较以验证
-        let u = Uniforms::new([0.0; 16], [800.0, 600.0], 1.5);
+        let u = Uniforms::new([800.0, 600.0], 1.5);
         let bytes = unsafe {
             std::slice::from_raw_parts(&u as *const Uniforms as *const u8, size_of::<Uniforms>())
         };
-        let zero = Uniforms::new([0.0; 16], [0.0, 0.0], 0.0);
+        let zero = Uniforms::new([0.0, 0.0], 0.0);
         assert_ne!(bytes, unsafe {
             std::slice::from_raw_parts(
                 &zero as *const Uniforms as *const u8,

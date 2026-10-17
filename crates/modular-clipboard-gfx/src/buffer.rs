@@ -615,7 +615,7 @@ impl UniformBuffer {
         )?;
         Ok(Self {
             buffer,
-            data: Uniforms::new([0.0; 16], [1.0, 1.0], 1.0),
+            data: Uniforms::new([1.0, 1.0], 1.0),
         })
     }
 

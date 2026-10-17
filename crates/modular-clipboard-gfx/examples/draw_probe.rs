@@ -157,10 +157,10 @@ fn run() -> anyhow::Result<()> {
     let indices: [u32; 3] = [0, 1, 2];
     ib.write(&gpu.device, 0, bytemuck::cast_slice(&indices))?;
 
-    // uniform：单位矩阵 + 视口尺寸。矩阵全 0 会让顶点退化但不丢设备，
-    // 这里给单位矩阵以保证绘制本身有效。
+    // uniform：视口尺寸 + 像素比。着色器自己做像素 → NDC，
+    // 矩阵字段已删（恒单位矩阵 = 每顶点 16 FMA 死乘）。
     let (w, h) = (fr.extent().width as f32, fr.extent().height as f32);
-    ub.write(&gpu.device, &Uniforms::new(IDENTITY, [w, h], 1.0))?;
+    ub.write(&gpu.device, &Uniforms::new([w, h], 1.0))?;
     println!("OK 顶点/索引/uniform 数据已上传");
 
     // IMPORTANT: 关键顺序（本探针存在过的真实违规）：
@@ -276,16 +276,8 @@ fn atlas_coverage(size: u32) -> Vec<u8> {
         .collect()
 }
 
-/// 4x4 单位矩阵（列主序）。
-///
-/// 本探针的着色器自己按 `size_in_pixels` 做像素→NDC 变换，
-/// 这里的矩阵只作为「非零占位」传入。
-const IDENTITY: [f32; 16] = [
-    1.0, 0.0, 0.0, 0.0, //
-    0.0, 1.0, 0.0, 0.0, //
-    0.0, 0.0, 1.0, 0.0, //
-    0.0, 0.0, 0.0, 1.0, //
-];
+// 着色器按 `size_in_pixels` 自己做像素→NDC 变换（uniform 里的
+// `clip_from_uv` 矩阵已删：恒单位矩阵 = 每顶点 16 FMA 死乘）。
 
 fn create_window(hinstance: HINSTANCE) -> anyhow::Result<HWND> {
     let class_name = windows::core::HSTRING::from("TiezDrawProbeClass");

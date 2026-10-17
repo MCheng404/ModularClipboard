@@ -87,14 +87,16 @@ impl Solution {
 /// |---|---|---|---|
 /// | `solve` 里的内联 `layout` | DONE: | DONE: | DONE: |
 /// | `Card::layout_width` | DONE: | ERROR: | ERROR: |
-/// | `Workspace::required_width` | 间接 | ERROR: | ERROR: |
+/// | `Workspace::required_width`（已删） | 间接 | ERROR: | ERROR: |
 ///
 /// 于是 `required_width()` 会算出一个 `solve` 永远不会兑现的数字：
 /// 置顶内嵌时它把置顶那一栏也算进去，`n` 与 solver 不同，连带
 /// `gaps` 也不一致。那种漂移极难查——两个函数各自都「看起来对」。
 ///
-/// 现在 `solve` 与 `Workspace::required_width` 都走这里，口径由
-/// 构造保证一致。
+/// 现在 `solve` 与 `needed_width` / `comfortable_width` 都走这里，
+/// 口径由构造保证一致。（`required_width` 本身是第四份重复口径、
+/// 生产代码从不调用，已于 2026-10-17 删除——留着它就是给未来留一个
+/// 「看起来能用、其实少算了 `CARD_AREA_INSET × 2 + 24pt` 余量」的坑。）
 pub fn layout_demand(ws: &Workspace) -> Vec<f32> {
     // IMPORTANT: 判据必须与 paint 一致：**内嵌的置顶卡片宽度必须是 0**。
     //

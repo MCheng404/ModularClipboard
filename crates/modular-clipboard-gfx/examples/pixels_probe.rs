@@ -196,14 +196,6 @@ const SYNTH_FONT_TEX: u32 = 64;
 /// （MEMORY 坑 82：未初始化描述符被绑定是 UB，症状是丢设备）。
 const PLACEHOLDER_USER_TEX: u32 = 4;
 
-/// 4×4 单位矩阵（列主序）。着色器自己做像素 → NDC，矩阵只作非零占位。
-const IDENTITY: [f32; 16] = [
-    1.0, 0.0, 0.0, 0.0, //
-    0.0, 1.0, 0.0, 0.0, //
-    0.0, 0.0, 1.0, 0.0, //
-    0.0, 0.0, 0.0, 1.0,
-];
-
 /// 等栅栏的超时（纳秒）。
 ///
 /// 取 5 秒：本探针每次只提交一次很小的渲染，正常是毫秒级；
@@ -577,7 +569,6 @@ fn placeholder_rgba() -> Vec<u8> {
 /// 构造本帧的 uniform。
 fn uniforms_for(extent: vk::Extent2D, pixels_per_point: f32) -> Uniforms {
     Uniforms::new(
-        IDENTITY,
         [extent.width as f32, extent.height as f32],
         pixels_per_point,
     )
@@ -2052,12 +2043,5 @@ mod tests {
         // 而非「没有内容」，很容易被读成噪声。
         let u = uniforms_for(vk::Extent2D { width: 800, height: 600 }, 1.0);
         assert_eq!(u.size_in_pixels, [800.0, 600.0]);
-    }
-
-    #[test]
-    fn uniform_matrix_is_identity() {
-        // 着色器已自己做像素 → NDC；再乘非单位矩阵会二次变换。
-        let u = uniforms_for(vk::Extent2D { width: 800, height: 600 }, 1.0);
-        assert_eq!(u.clip_from_uv, IDENTITY);
     }
 }

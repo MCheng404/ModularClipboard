@@ -287,7 +287,11 @@ impl<'a> SettingsWindow<'a> {
         // 本模块不需要知道 `App` 的内部结构。
         let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_settings_window(ui));
         let ppp = out.pixels_per_point;
-        let mut textures_delta = std::mem::take(&mut out.textures_delta);
+        // CAUTION: 从这里开始的**每一个**离开路径都必须清空 delta。
+        // 守卫兜住 `acquire` 返回 None（下面）与 `paint` 报错两处早退，
+        // 手工 `clear()` 只写在正常路径上极易漏（release 下不 panic，
+        // 而是字体图集增量被静默丢弃 ⇒ 设置窗空白/缺字形且不自愈）。
+        let mut textures_delta = crate::app::DeltaGuard(std::mem::take(&mut out.textures_delta));
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
         drop(out);
 
@@ -312,7 +316,7 @@ impl<'a> SettingsWindow<'a> {
                 &primitives,
                 ppp,
                 dpi_scale,
-                &mut textures_delta,
+                &mut textures_delta.0,
             )
         } else {
             self.gfx.painter.paint(
@@ -320,21 +324,18 @@ impl<'a> SettingsWindow<'a> {
                 &primitives,
                 ppp,
                 dpi_scale,
-                &mut textures_delta,
+                &mut textures_delta.0,
             )
         };
         if let Err(e) = painted {
             // CAUTION: 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
             // 每次 `acquire()` 都 bail ⇒ **该窗口永久死掉**（黑屏 +
             // 报「上一帧尚未 present」，与真实原因毫无关系）。
+            // `textures_delta` 由守卫在返回时清空。
             self.gfx.fr.abandon_frame();
             return Err(e);
         }
         let _ = self.gfx.fr.present(acquired)?;
-        // IMPORTANT: 必须 clear：`TexturesDelta` 的 `Drop` 有debug 断言
-        // 「未应用的 delta 必须先clear」，否则 panic 且报错与真实
-        // 原因毫无关系。
-        textures_delta.clear();
 
         // CAUTION: 这里**不能**做任何周期性的 `SetWindowPos(HWND_TOPMOST)`
         // 提升：置顶窗口之间按激活顺序排 Z 序，用户点击主窗口后主

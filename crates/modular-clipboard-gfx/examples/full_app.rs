@@ -51,7 +51,7 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     // ---- 窗口 ----------------------------------------------------------
     let window = Window::new("ModularClipboard — full_app", W, H)?;
-    let mut events = EventLoop::new(&window);
+    let mut events = EventLoop::new_primary(&window);
     println!(
         "OK Window  客户区 {}x{}  scale_factor={}",
         W,
@@ -900,17 +900,8 @@ impl Batch {
 }
 
 /// 构造本帧的 uniform。
-///
-/// `clip_from_uv` 传单位矩阵：着色器内部已经把像素坐标换算成 NDC
-/// （并做了 y 轴翻转），再乘一个矩阵只会引入二次变换。
 fn uniforms_for(extent: vk::Extent2D, pixels_per_point: f32) -> Uniforms {
     Uniforms::new(
-        [
-            1.0, 0.0, 0.0, 0.0, //
-            0.0, 1.0, 0.0, 0.0, //
-            0.0, 0.0, 1.0, 0.0, //
-            0.0, 0.0, 0.0, 1.0,
-        ],
         [extent.width as f32, extent.height as f32],
         pixels_per_point,
     )

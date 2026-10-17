@@ -621,11 +621,12 @@ pub struct UiState {
 
     /// 行高缓存（PF-1），按列表分槽：`[0]` 主栏、`[1]` 置顶栏。
     ///
-    /// 行高只取决于「条目文本 + 测量宽度 + 缩放」，跨帧不变。每帧重算
-    /// 等于把 2000 次 `LayoutJob` 测量（含 galley cache 查找的键哈希）
-    /// 重复付一遍——帧成本随列表总字节线性膨胀的根因之一。
-    /// 失效判据：列表版本号（`AppState::list_version`，每次 reload +1）、
-    /// 测量宽度、缩放、已解码图片尺寸数四者全部相同才复用。
+    /// 行高只取决于「条目文本 + 测量宽度 + 过滤条件 + 缩放」，跨帧不变。
+    /// 每帧重算等于把 2000 次 `LayoutJob` 测量（含 galley cache 查找的
+    /// 键哈希）重复付一遍——帧成本随列表总字节线性膨胀的根因之一。
+    /// 失效判据见 [`RowHeightCache`]：`list_version`（每次 reload +1）、
+    /// [`RowFilterKey`]、测量宽度、缩放、已解码图片尺寸数，
+    /// **五者全部相同**才复用。
     row_height_cache: [Option<RowHeightCache>; 2],
 }
 
@@ -633,6 +634,21 @@ pub struct UiState {
 #[derive(Clone)]
 struct RowHeightCache {
     version: u64,
+    /// 建缓存时的**行过滤条件**。
+    ///
+    /// # 为什么必须进键
+    ///
+    /// `heights` 是**按行下标**存的（`heights[i]` ↔ `rows[i]`），而下标
+    /// 的含义完全由过滤条件决定。`type_filter` / `only_pinned` /
+    /// `pinned_drawn_separately` 都是**绘制层本地**状态，不过 store ⇒
+    /// [`AppState::list_version`](modular_clipboard_app::AppState::list_version)
+    /// 不会变（它只在 `reload_list` 时 +1）。
+    ///
+    /// 长度检查（`heights.len() == rows.len()`）挡不住这一类：3 条 Text
+    /// 与 3 条 Image 条目，从「全部」切到「文本」再切到「图片」，行数
+    /// 两次都是 3 ⇒ 缓存命中 ⇒ **图片行套用文本行的行高**，表现为
+    /// 图被压扁或留出大片空白（且没有任何报错）。
+    filter: RowFilterKey,
     text_w: f32,
     scale: f32,
     /// 建缓存时 [`UiState::thumb_dims`] 的条目数。
@@ -647,6 +663,23 @@ struct RowHeightCache {
     /// 缓存就每帧失效了（这正是它不参与淘汰的原因）。
     dims_known: usize,
     heights: Vec<f32>,
+}
+
+/// 行高缓存键里的**过滤维度**（其余维度见 [`RowHeightCache`]）。
+///
+/// 单独抽成具名类型而不是三个散字段：这三项必须**同时**出现在
+/// 「写入缓存」与「查缓存」两处，合成一个可比较的值才能保证不漏。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RowFilterKey {
+    /// 类型过滤（`None` = 不过滤）。
+    type_filter: Option<modular_clipboard_core::ClipKind>,
+    /// 只看置顶 / 只看非置顶；`None` = 主栏（含置顶，按模式决定排除）。
+    only_pinned: Option<bool>,
+    /// 置顶卡片是否被**独立绘制**（`PinnedMode::Separate`）。
+    ///
+    /// 它决定主栏要不要把置顶条目让出去（否则同一个 `("row", id)` 被画
+    /// 两次，egui 会报 ID 冲突警告）。
+    pinned_drawn_separately: bool,
 }
 
 /// 热区属于**哪个窗口**。
@@ -1163,10 +1196,14 @@ fn draw_notice_toast(f: &mut Frame<'_>) {
     // 自报热区：与其它命名区域同一套路，测试与自动化读坐标而不重算公式。
     f.hit_insert("notice_toast", r);
     let painter = f.ui.painter_at(r);
-    painter.rect_filled(r, CornerRadius::same(6), pal.surface_raised);
+    // 圆角取调色板令牌而非硬编码 6：toast 是浮层控件，规格与按钮/输入框
+    // 同级（`radius_md`）。写死数字的话，改主题圆角时 toast 会独自
+    // 留在旧值上——这类「一半跟随主题一半不跟随」最难被肉眼发现。
+    let radius = CornerRadius::same(pal.radius_md as u8);
+    painter.rect_filled(r, radius, pal.surface_raised);
     painter.rect_stroke(
         r,
-        CornerRadius::same(6),
+        radius,
         Stroke::new(1.0, pal.border_subtle),
         egui::StrokeKind::Inside,
     );
@@ -1303,6 +1340,10 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
 /// - 离开图标与**面板** ⇒ **宽限** [`SEARCH_COLLAPSE_DELAY`] 后才折叠；
 /// - 输入框持有焦点、或里面有查询词 ⇒ 永不折叠。
 ///
+/// Esc **不在这里**处理：按键落在搜索面板弹窗自己的 `egui::Context`
+/// 里，主窗口读不到（`search_popup_focus` 之所以要弹窗每帧回报，
+/// 就是同一个原因）。Esc 由 `draw_search_panel` 消费。
+///
 /// 面板是独立弹窗，因此「悬停面板」与「面板持有焦点」两项都由弹窗
 /// 每帧回报到 [`UiState::search_popup_hover`] / [`UiState::search_popup_focus`]——
 /// 指针在主窗口客户区之外、主窗口也读不到弹窗 Context 的焦点。
@@ -1380,8 +1421,12 @@ fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response) {
 
 /// 展开 / 收起搜索面板。
 ///
-/// 单一入口：图标点击、悬停计时、Esc、弹窗自关都走这里，保证
+/// 单一入口：图标点击、悬停计时、弹窗内的 Esc 都走这里，保证
 /// 「状态翻转」只有一处。弹窗的显隐由帧循环按 `search_expanded` 同步。
+///
+/// NOTE: 弹窗的**关窗请求**（标题栏 ✕）不走这里——它由
+/// `crate::popup` 直接改 `search_expanded`（那时没有 `Frame` 可借，
+/// 且那条路径不来自绘制层）。两处语义一致，计时器的复位由那一侧自理。
 fn set_search_expanded(f: &mut Frame<'_>, v: bool) {
     if f.state.search_expanded == v {
         return;
@@ -1526,6 +1571,31 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         && let Some(id) = f.state.search_edit_id
     {
         f.ui.memory_mut(|m| m.request_focus(id));
+    }
+
+    // ---- Esc 收起面板 ----
+    //
+    // 为什么必须在这里而不是主窗口：按键落在**弹窗自己的
+    // `egui::Context`** 里，主窗口的 `run_search_state_machine` 读不到
+    // （`search_popup_focus` 需要弹窗每帧回报，就是同一个原因）。
+    //
+    // 为什么不能只 `set_search_expanded(f, false)`：输入框此刻持有焦点，
+    // 而状态机的 `hold_open` 里「焦点」这一项是无条件的 ⇒ 下一帧又把它
+    // 展开回来，Esc 看起来「按了没用」。所以必须同时把焦点交出去。
+    //
+    // 收起时置 `search_hover_suppressed` 与点击路径同理：光标多半还停在
+    // 图标上，否则 0.18s 后悬停计时会立刻把它重新展开。
+    if f.ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        set_search_expanded(f, false);
+        f.state.search_hover_suppressed = true;
+        // 交还焦点：焦点留在已隐藏的输入框上会让 `TextEdit` 继续吃按键，
+        // 且 `hold_open` 继续为真（见上）。用**自报的真实 id**
+        // 而不是 `m.focused()`：后者此刻可能已被别的控件抢走，
+        // 那会把别人的焦点也一起收掉。
+        if let Some(id) = f.state.search_edit_id {
+            f.ui.memory_mut(|m| m.surrender_focus(id));
+        }
+        f.state.search_popup_focus = false;
     }
 }
 
@@ -5346,19 +5416,47 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     //
     // NOTE: 这里用的是**整行**宽度（不减按钮列）：预览带位于按钮行下方，
     // 因此测量折行数时也必须按整行宽算，否则量出的行数会偏多、行高虚高。
-    let text_w = preview_full_width(content.width());
+    //
+    // IMPORTANT: **无条件**让出滚动条占位。绘制侧的行矩形在「可滚动」
+    // 时会内缩 [`SCROLLBAR_RESERVE`]（否则滚动条压住删除按钮，见下面
+    // `row_w` 的注释），而「是否可滚动」取决于 `content_h`、也就是
+    // 本函数算出来的行高——直接用 `content.width()` 测量就是一个**先鸡
+    // 先蛋**：量的时候按宽宽度算，量完才知道要滚动，那时行已经窄了
+    // 10pt ⇒ 折行数偏少 ⇒ 行高偏小 ⇒ 文字被裁。实测症状正是
+    // 「条目少时正常、条目一多就每行少显示一点」。
+    //
+    // 无条件让出为什么**不会**引入新问题（两个方向都是安全的）：
+    // 1. 可滚动时：测量与绘制**完全同宽**（都让出），这是要修的情况；
+    // 2. 不可滚动时：绘制宽度比测量**多** 10pt ⇒ 文字实际能放的比
+    //    量出来的更宽 ⇒ 行高**偏大**而非偏小 ⇒ 最多多留一点空白，
+    //    绝不会裁字。方向反了才是 bug（那是早前的写法）。
+    //
+    // 单调性保证不会来回抖：让出 10pt 只会让行变高，`content_h` 只增
+    // 不减，所以「本来可滚动 ⇒ 让出后仍可滚动」，滚动条不会闪。
+    let text_w = preview_full_width(row_measure_width(content.width()));
     let version = f.svc.state.list_version;
     // 解码得到的尺寸数：图片行高的输入之一，进缓存的失效判据
     // （见 [`RowHeightCache::dims_known`]）。
     let dims_known = f.state.thumb_dims.len();
+    // 过滤维度必须进键（见 [`RowFilterKey`]）：`type_filter` 等是绘制层
+    // 本地状态，不过 store ⇒ `list_version` 不变，而长度相同的两次过滤
+    // 会让缓存误命中、下标错位。
+    let filter = RowFilterKey {
+        type_filter,
+        only_pinned,
+        pinned_drawn_separately,
+    };
     let heights: Vec<f32> = {
-        let hit = f.state.row_height_cache[pinned_slot as usize].as_ref().filter(|c| {
-            c.version == version
-                && c.text_w == text_w
-                && c.scale == scale
-                && c.dims_known == dims_known
-                && c.heights.len() == rows.len()
-        });
+        let hit = f.state.row_height_cache[pinned_slot as usize]
+            .as_ref()
+            .filter(|c| {
+                c.version == version
+                    && c.filter == filter
+                    && c.text_w == text_w
+                    && c.scale == scale
+                    && c.dims_known == dims_known
+                    && c.heights.len() == rows.len()
+            });
         match hit {
             Some(c) => c.heights.clone(),
             None => {
@@ -5382,6 +5480,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                     .collect();
                 f.state.row_height_cache[pinned_slot as usize] = Some(RowHeightCache {
                     version,
+                    filter,
                     text_w,
                     scale,
                     dims_known,
@@ -5663,6 +5762,31 @@ fn preview_width(body_w: f32, pal: &Palette) -> f32 {
 /// 位置却被迫折行或截断。用户反馈的「内容显示不到右侧」就是它。
 fn preview_full_width(body_w: f32) -> f32 {
     (body_w - ROW_PAD_H * 2.0).max(20.0)
+}
+
+/// 行**测量**用的内容宽度：内容区宽度**无条件**让出滚动条占位。
+///
+/// # 为什么必须让出，以及为什么无条件
+///
+/// 绘制侧的行矩形在「可滚动」时会内缩 [`SCROLLBAR_RESERVE`]（见
+/// `draw_history_body` 里的 `row_w`；不缩的话 egui 的 floating 滚动条
+/// 会盖住删除按钮，滚动条压过所有行内控件）。而「是否可滚动」由
+/// `content_h > 可视高` 判定，`content_h` 又来自行高——行高来自本函数。
+///
+/// 于是直接按 `content.width()` 测量就是先鸡先蛋：量的时候按**宽**
+/// 宽度算折行，量完才发现要滚动，那时真实宽度已经窄了 10pt ⇒ 折行数
+/// 偏少 ⇒ 行高偏小 ⇒ 文字被裁。症状有明确指纹：**条目少时正常、
+/// 条目一多（出现滚动条）就每行少显示一点**。
+///
+/// 无条件让出在两个方向都安全：
+/// - 可滚动：测量与绘制同宽（都让出）——修好的正是这一支；
+/// - 不可滚动：绘制比测量**多** 10pt ⇒ 行高**偏大**，最多留一点空白，
+///   绝不裁字。
+///
+/// 且单调：让出只会让行变高，`content_h` 只增不减 ⇒ 滚动条不会在两
+/// 帧之间来回闪。
+fn row_measure_width(content_w: f32) -> f32 {
+    (content_w - SCROLLBAR_RESERVE).max(20.0)
 }
 
 /// 行内**顶部一行**的高度：左侧「来源·时间」与右侧操作按钮取较高者。
@@ -8173,6 +8297,83 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
+    /// 行高测量宽度必须与绘制宽度同源：都让出滚动条占位。
+    ///
+    /// 回归守卫（L3）：测量早前用 `content.width()`，而绘制侧在「可
+    /// 滚动」时把行矩形内缩 [`SCROLLBAR_RESERVE`]（不缩的话 egui 的
+    /// floating 滚动条会盖住删除按钮）。于是量的时候按宽 10pt 算折行，
+    /// 画的时候窄 10pt ⇒ 折行数偏少 ⇒ 行高偏小 ⇒ **文字被裁**。
+    /// 症状指纹：条目少时正常、条目一多就每行少显示一点。
+    #[test]
+    fn row_measure_width_reserves_scrollbar_like_rendering() {
+        let content_w = 500.0;
+        let measured = row_measure_width(content_w);
+        assert!(
+            measured < content_w,
+            "测量宽度必须让出滚动条占位，否则测量比绘制宽"
+        );
+        assert!(
+            (measured - (content_w - SCROLLBAR_RESERVE)).abs() < 1e-4,
+            "让出的量必须恰好等于 SCROLLBAR_RESERVE（绘制侧同值）"
+        );
+        // 单调性：内容越宽，测量宽度单调递增——这是「不会来回抖」的
+        // 基础（行高随宽度单调不减 ⇒ 滚动条不会在两帧之间闪）。
+        assert!(row_measure_width(600.0) > row_measure_width(400.0));
+        // 极窄内容区不得为负（否则 `preview_full_width` 拿到负宽度）。
+        assert!(row_measure_width(0.0) >= 20.0);
+    }
+
+    /// 行高缓存键必须包含过滤维度，否则长度相同的两次过滤会误命中。
+    ///
+    /// 回归守卫（L2）：`heights` 按**行下标**存，下标含义由过滤条件决定。
+    /// `type_filter` / `only_pinned` / `pinned_drawn_separately` 是绘制层
+    /// 本地状态、不过 store ⇒ `list_version` 不变。而长度检查挡不住：
+    /// 3 条 Text 与 3 条 Image，从「文本」切到「图片」行数都是 3 ⇒
+    /// 缓存命中 ⇒ **图片行套用文本行的行高**（图被压扁/留白，无报错）。
+    #[test]
+    fn row_height_cache_key_includes_filter() {
+        use modular_clipboard_core::ClipKind;
+        let base = RowFilterKey {
+            type_filter: None,
+            only_pinned: None,
+            pinned_drawn_separately: false,
+        };
+        // 三个维度各自变化都必须让键不等（否则该维度漏在键外）。
+        assert_ne!(
+            base,
+            RowFilterKey {
+                type_filter: Some(ClipKind::Text),
+                ..base
+            },
+            "类型过滤必须进键"
+        );
+        assert_ne!(
+            base,
+            RowFilterKey {
+                only_pinned: Some(true),
+                ..base
+            },
+            "置顶过滤必须进键"
+        );
+        assert_ne!(
+            base,
+            RowFilterKey {
+                pinned_drawn_separately: true,
+                ..base
+            },
+            "置顶独立分栏必须进键（它决定主栏是否让出置顶条目）"
+        );
+        // 相同条件必须相等，否则缓存永远不命中（退化成每帧重算）。
+        assert_eq!(
+            base,
+            RowFilterKey {
+                type_filter: None,
+                only_pinned: None,
+                pinned_drawn_separately: false,
+            }
+        );
+    }
+
     /// 动态行距：阴影关闭回落基础 6pt；开启时按「偏移 + 弥散」加宽；
     /// 大参数截断到 `ROW_GAP_MAX`；向上偏移同样计入（取绝对值）。
     #[test]
@@ -10074,6 +10275,48 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             with > without + 60.0,
             "拿到解码尺寸后行高应显著变高：之前={without} 之后={with}"
+        );
+    }
+
+    /// `thumb_dims` **不随纹理淘汰**——它的 `len()` 是行高缓存的失效判据
+    /// （[`RowHeightCache::dims_known`]）。
+    ///
+    /// 回归守卫：2026-10-17 之前 `thumb_dims` 与 `thumb_tex` 一起
+    /// `retain`，滚出屏就丢。而 `dims_known` 的语义是
+    /// 「数量变化 == 有新图刚拿到尺寸」——尺寸一丢，整份行高缓存
+    /// 当帧失效；滚回来又拿到尺寸，数量再变一次 ⇒ **滚动时每帧重算
+    /// 全部行高**（2000 条 = 2000 次 `LayoutJob` 测量）。
+    ///
+    /// 因此这两张表的淘汰策略**必须不同**，而它们在代码里紧挨着
+    /// （`draw` 收尾只对 `thumb_tex` 写了 `retain`，`thumb_dims` 的
+    /// 「不淘汰」只存在于字段注释里）—— 注释不是防线，测试才是。
+    #[test]
+    fn thumb_dims_survives_texture_eviction() {
+        let mut h = Harness::new("thumb-dims", vec2(700.0, 500.0)).with_items(3);
+        let ids: Vec<_> = h.svc.state.items.iter().map(|i| i.id).collect();
+        assert!(!ids.is_empty(), "夹具应至少有一条记录");
+
+        // 假装这些条目都拿到过解码尺寸（真实路径由 `preview_image_tex`
+        // 在上传成功时写入）。
+        for id in &ids {
+            h.state.thumb_dims.insert(*id, (1920, 1080));
+        }
+        h.state.thumb_seen.clear();
+        let before = h.state.thumb_dims.len();
+
+        // 跑一帧：本帧没有任何条目被看见（`thumb_seen` 为空），
+        // ⇒ `thumb_tex` 会被整表清空，而 `thumb_dims` 必须原样留下。
+        h.frame();
+
+        assert!(
+            h.state.thumb_tex.is_empty(),
+            "本帧无可见图片时纹理应被淘汰（否则显存只涨不消）"
+        );
+        assert_eq!(
+            h.state.thumb_dims.len(),
+            before,
+            "thumb_dims 不得随纹理一起淘汰：它的 len() 是行高缓存的失效判据\
+             （dims_known），跟着淘汰会让滚动时每帧重算全部行高"
         );
     }
 

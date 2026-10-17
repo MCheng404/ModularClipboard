@@ -122,14 +122,6 @@ const SATURATION_THRESHOLD: i32 = 60;
 const QUAD_VERTS: usize = 4;
 const QUAD_INDICES: [u32; 6] = [0, 1, 2, 0, 2, 3];
 
-/// 4×4 单位矩阵（列主序）。着色器自己做像素 → NDC，矩阵只作非零占位。
-const IDENTITY: [f32; 16] = [
-    1.0, 0.0, 0.0, 0.0, //
-    0.0, 1.0, 0.0, 0.0, //
-    0.0, 0.0, 1.0, 0.0, //
-    0.0, 0.0, 0.0, 1.0,
-];
-
 fn main() {
     if let Err(e) = run() {
         eprintln!("FAIL thumb_probe: {e:#}");
@@ -604,10 +596,7 @@ fn part3_ab_pixel_readback(
 
     // ---- uniform + 描述符集 ------------------------------------------------
     let mut ub = UniformBuffer::new(gpu)?;
-    ub.write(
-        device,
-        &Uniforms::new(IDENTITY, [TARGET as f32, TARGET as f32], 1.0),
-    )?;
+    ub.write(device, &Uniforms::new([TARGET as f32, TARGET as f32], 1.0))?;
 
     // 池的三种计数与 `frame.rs` 一致：
     // 1 个 uniform、1 个采样器、**2** 张组合图像采样器（字体 + 用户）。

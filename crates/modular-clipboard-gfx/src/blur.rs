@@ -86,8 +86,11 @@ const SET_COUNT: usize = 6;
 
 /// 模糊 uniform。布局必须与 `blur.wgsl` 的 `BlurUniforms` 逐字段一致。
 ///
-/// 大小 32 字节（8+4+4+8+8），无内部填充，`std140` 下与 WGSL 对齐规则
-/// 相容（首个 `vec2` 对齐 8、其后 `f32` 顺排、第二个 `vec2` 对齐 8）。
+/// 大小 16 字节（8+4+4），无内部填充，`std140` 下与 WGSL 对齐规则相容。
+///
+/// 2026-10-17：删掉了 `texel`（源纹理尺寸）与随后的 `_pad`——锥形核用
+/// 不到它，而 WGSL uniform 的 `vec2` 占 16 字节（对齐 8、填充 8），
+/// **留 `texel` 删 `_pad` 反而从 32 涨到 40**。现在正好 16 字节。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, PartialEq)]
 pub struct BlurUniforms {
@@ -97,10 +100,6 @@ pub struct BlurUniforms {
     pub radius: f32,
     /// 高斯标准差。
     pub sigma: f32,
-    /// 源纹理尺寸（纹素）。
-    pub texel: [f32; 2],
-    /// 填充到 32 字节，保证结构体大小是 16 的倍数。
-    pub _pad: [f32; 2],
 }
 
 impl BlurUniforms {
@@ -110,8 +109,6 @@ impl BlurUniforms {
             dir: [texel[0], 0.0],
             radius: clamp_radius(radius) as f32,
             sigma,
-            texel,
-            _pad: [0.0; 2],
         }
     }
 
@@ -121,8 +118,6 @@ impl BlurUniforms {
             dir: [0.0, texel[1]],
             radius: clamp_radius(radius) as f32,
             sigma,
-            texel,
-            _pad: [0.0; 2],
         }
     }
 }
@@ -513,7 +508,8 @@ impl BlurPipeline {
     /// 描述符集绑定的是**同一块** uniform buffer：这里写完，下一趟
     /// [`Self::record_from`] 即按新半径卷积。半径在着色器里是运行时
     /// uniform、循环上限固定为 [`MAX_BLUR_RADIUS`]，因此**无需重建管线或
-    /// 离屏链**，只改两个 host-visible 的 32 字节缓冲，开销可忽略。
+    /// 离屏链**，只改两个 host-visible 的 16 字节缓冲（`vec2 + f32 + f32`），
+    /// 开销可忽略。
     ///
     /// 每次重新卷积前调用即可；半径不变时重复调用结果相同（幂等）。
     pub fn set_radius(
@@ -856,10 +852,10 @@ mod tests {
 
     #[test]
     fn uniform_layout_matches_wgsl() {
-        // WGSL：vec2(8) + f32(4) + f32(4) + vec2(8) + vec2(8) = 32
+        // WGSL：vec2(8) + f32(4) + f32(4) = 16
         assert_eq!(
             std::mem::size_of::<BlurUniforms>(),
-            32,
+            16,
             "模糊 uniform 大小与 WGSL 声明不符，着色器会读到错位数据"
         );
         // 16 的倍数是 std140 对 uniform 缓冲的硬要求。
@@ -994,6 +990,185 @@ mod tests {
                 w[i],
                 w[i + 1]
             );
+        }
+    }
+
+    // -- fs_blur 合并采样的黄金模型 ------------------------------------
+    //
+    // WGSL 没法直接单测，这里逐字复现 blur.wgsl 里 `fs_blur` 的两种卷积
+    // 路径（朴素逐 tap / 相邻合并），在 Rust 侧量化「采样次数减半」的
+    // 代价。改 blur.wgsl 的卷积结构必须同步改这两个函数，否则测的
+    // 就不是真实着色器。
+
+    /// blur.wgsl `fs_blur` 的 σ 合并阈值：σ ≥ 2.5 才启用相邻合并
+    /// （本项目 σ = r/3 ⇒ r ≥ 8）。低强度档逐 tap 精采。
+    ///
+    /// CAUTION: 这个值在 `blur.wgsl` 里也**硬编码了一份**
+    /// （`let merge = s >= 2.5`）——WGSL 没有「从 Rust 拿常量」的机制。
+    /// 两处漂移的后果很隐蔽：着色器按A 阈值合并、黄金模型按 B 阈值
+    /// 断言，测试照样全绿，而实机画质已经变了。
+    /// [`merge_sigma_matches_shader`] 用 `include_str!` 钉住两者一致。
+    const MERGE_SIGMA: f32 = 2.5;
+
+    /// 守住 `MERGE_SIGMA` 与 `blur.wgsl` 里那份硬编码阈值一致。
+    ///
+    /// 判据取着色器里**真正决定行为的那一行**：必须以 `let merge` **开头**
+    /// （trim 后），从而排除注释里引用同一代码的说明文字——`blur.wgsl`
+    /// 的注释就写着「把下方 `let merge = s >= 2.5` 改为 …」，按包含关系
+    /// 搜会先撞上它。按数字全文搜索更糟：注释里出现同一个数字是正常的。
+    #[test]
+    fn merge_sigma_matches_shader() {
+        let src = include_str!("../shaders/blur.wgsl");
+        let line = src
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("let merge"))
+            .expect("blur.wgsl 里应有 `let merge = s >= ...` 这一行");
+        assert_eq!(
+            line,
+            format!("let merge = s >= {};", MERGE_SIGMA),
+            "blur.wgsl 的合并阈值与 Rust 的 MERGE_SIGMA 不一致：\
+             着色器与黄金模型会按不同阈值工作（测试全绿但画质已变）"
+        );
+    }
+
+    /// 朴素逐 tap 卷积：Σ g_k·T_k / Σ g_k。
+    fn naive_blur(signal: &[f32], w: &[f32]) -> f32 {
+        let r = (w.len() - 1) / 2;
+        let mut acc = 0.0;
+        let mut sum = 0.0;
+        for (i, &g) in w.iter().enumerate() {
+            let k = i as i32 - r as i32;
+            acc += g * signal[(r as i32 + k) as usize];
+            sum += g;
+        }
+        acc / sum
+    }
+
+    /// blur.wgsl `fs_blur` 的结构：中心单独采；σ ≥ [`MERGE_SIGMA`] 时
+    /// 其余按 (1,2)(3,4)… 成对、每对一次「中点采样」（线性过滤器 =
+    /// 相邻两纹素的 50/50 平均）打 ± 两侧，权重取两权**精确之和**；
+    /// 否则逐 tap。奇数半径多出来的最后一个 tap 单独采。
+    fn merged_blur(signal: &[f32], w: &[f32], sigma: f32) -> f32 {
+        let r = (w.len() as i32 - 1) / 2;
+        let g = |k: i32| -> f32 { w[(k + r) as usize] };
+        let t = |k: i32| -> f32 { signal[(r + k) as usize] };
+        let merge = sigma.max(0.5) >= MERGE_SIGMA;
+
+        let mut acc = g(0) * t(0);
+        let mut sum = g(0);
+        let mut i = 1i32;
+        while i <= r {
+            let fi = i as f32;
+            let w1 = (-0.5 * fi * fi / (sigma * sigma)).exp();
+            if merge && i < r {
+                // 中点采样：±(i + 0.5) 纹素 ⇒ (T_i + T_{i+1}) / 2。
+                let wm = w1 + (-0.5 * (fi + 1.0) * (fi + 1.0) / (sigma * sigma)).exp();
+                let pos = 0.5 * (t(i) + t(i + 1));
+                let neg = 0.5 * (t(-i) + t(-i - 1));
+                acc += wm * (pos + neg);
+                sum += 2.0 * wm;
+                i += 2;
+            } else {
+                acc += w1 * (t(i) + t(-i));
+                sum += 2.0 * w1;
+                i += 1;
+            }
+        }
+        acc / sum
+    }
+
+    #[test]
+    fn merged_blur_is_exact_on_flat_and_smooth_signals() {
+        // 合并采样的代价只在**局部梯度**上（差 = (g_{i+1}-g_i)/2·ΔT）。
+        // 平坦区域必须逐位一致——磨砂底图的大面积纯色就在这一类。
+        for r in [1u32, 2, 3, 5, 7, 8, 11, 12] {
+            let sigma = sigma_for_radius(r);
+            let w = gaussian_weights(r, sigma);
+            let n = w.len();
+
+            let flat = vec![0.37f32; n];
+            let (a, b) = (naive_blur(&flat, &w), merged_blur(&flat, &w, sigma));
+            assert!(
+                (a - b).abs() < 1e-6,
+                "半径 {r} 平坦信号必须完全一致：朴素 {a} vs 合并 {b}"
+            );
+
+            if sigma < MERGE_SIGMA {
+                // 未走合并路径：与朴素逐 tap 必须逐位一致（任何信号）。
+                let checker: Vec<f32> =
+                    (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+                let sine: Vec<f32> = (0..n).map(|i| 0.5 + 0.5 * (i as f32 * 0.7).sin()).collect();
+                for (name, sig) in [("棋盘格", &checker), ("正弦", &sine)] {
+                    let dev = (naive_blur(sig, &w) - merged_blur(sig, &w, sigma)).abs();
+                    assert!(
+                        dev < 1e-6,
+                        "半径 {r}（σ={sigma} < {MERGE_SIGMA}）不该合并，{name}偏差 {dev}"
+                    );
+                }
+            } else {
+                // 合并路径。两类信号分开断言：
+                // - 真实桌面内容的模型（低频，相邻纹素差 ~0.08）：
+                //   偏差 < 1/255（8bit 量化），即不可辨；
+                // - 高频压力信号（相邻差 ~0.35）：偏差 < 1/100，
+                //   这条是防「权重被改坏」的哨兵，不是质量标准线。
+                let smooth: Vec<f32> = (0..n)
+                    .map(|i| 0.5 + 0.5 * (i as f32 * 0.15).sin())
+                    .collect();
+                let dev = (naive_blur(&smooth, &w) - merged_blur(&smooth, &w, sigma)).abs();
+                assert!(dev < 1.0 / 255.0, "半径 {r} 平滑信号偏差 {dev} 超过 1/255");
+                let hf: Vec<f32> = (0..n).map(|i| 0.5 + 0.5 * (i as f32 * 0.7).sin()).collect();
+                let dev_hf = (naive_blur(&hf, &w) - merged_blur(&hf, &w, sigma)).abs();
+                assert!(
+                    dev_hf < 0.01,
+                    "半径 {r} 高频压力信号偏差 {dev_hf} 超过 1/100"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merged_blur_preserves_total_weight_and_bounds_worst_case() {
+        // 1) 权重守恒：合并不得偷偷改变归一化分母（否则整体亮度漂移）。
+        //    朴素核分母 = Σ_{k=-r..r} g_k；合并核分母 = g_0 + 2·Σ 对权重。
+        // 2) 最坏情形量化：±1 交替（1 纹素棋盘格）是理论最坏信号。
+        //    合并路径（σ ≥ 2.5）钉住上界；非合并路径必须精确。
+        for r in [2u32, 6, 8, 12] {
+            let sigma = sigma_for_radius(r);
+            let w = gaussian_weights(r, sigma);
+            let r_mid = (w.len() as i32 - 1) / 2;
+            let g_at = |k: i32| -> f32 { w[(k + r_mid) as usize] };
+
+            let mut denom_merged = g_at(0);
+            let mut i = 1i32;
+            while i <= r_mid {
+                if sigma >= MERGE_SIGMA && i < r_mid {
+                    denom_merged += 2.0 * (g_at(i) + g_at(i + 1));
+                    i += 2;
+                } else {
+                    denom_merged += 2.0 * g_at(i);
+                    i += 1;
+                }
+            }
+            let denom_naive: f32 = w.iter().sum();
+            assert!(
+                (denom_naive - denom_merged).abs() < 1e-4,
+                "半径 {r} 归一化分母不一致：朴素 {denom_naive} vs 合并 {denom_merged}"
+            );
+
+            let n = w.len();
+            let checker: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
+            let dev = (naive_blur(&checker, &w) - merged_blur(&checker, &w, sigma)).abs();
+            if sigma >= MERGE_SIGMA {
+                // 实测 r=8 时约 0.074（19/255）；这是纯合成信号的上界，
+                // 真实桌面内容（尤其还经过降采样）远小于此。
+                assert!(
+                    dev < 0.08,
+                    "半径 {r} 棋盘格偏差 {dev} 超过合并路径上界 0.08"
+                );
+            } else {
+                assert!(dev < 1e-6, "半径 {r} 不该合并，棋盘格偏差 {dev}");
+            }
         }
     }
 

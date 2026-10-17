@@ -442,7 +442,13 @@ impl<'a> Popup<'a> {
         {
             // 关窗请求等价于「收起」：交回状态机的唯一入口——
             // 直接改 `search_expanded` / `type_filter`，不绕过 Op。
+            //
+            // IMPORTANT: 必须对**主窗口**请求重绘。顶栏的搜索框是主窗口
+            // 画的，而这里的写入发生在弹窗自己的 `Context` 里 ⇒ 主窗口
+            // 既收不到事件也不请求重绘，渲染闸门会整帧跳过，画面停在
+            // 「搜索框还展开着」而弹窗已经没了（两块 UI 对不上）。
             app.paint_state.search_expanded = false;
+            app.ctx.request_repaint();
         }
 
         // ---- 重绘闸门 ----
@@ -467,7 +473,11 @@ impl<'a> Popup<'a> {
         crate::theme::apply(&self.ctx, app.palette());
         let mut out = self.ctx.run_ui(raw_input, |ui| app.draw_popup(ui, kind));
         let ppp = out.pixels_per_point;
-        let mut textures_delta = std::mem::take(&mut out.textures_delta);
+        // CAUTION: 从这里开始的**每一个**离开路径都必须清空 delta
+        // （守卫兜住 `acquire` 返回 None、`paint` 报错这两处早退）。
+        // release 下漏清不会 panic，而是那一帧的字体图集增量被静默丢弃
+        // ⇒ 弹窗空白/缺字形且不自愈（egui 认为已传过）。
+        let mut textures_delta = crate::app::DeltaGuard(std::mem::take(&mut out.textures_delta));
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
         // 记账必须在 `out` 被拆散之前：`repaint_delay` 只看
         // `viewport_output`，而拆走 `shapes`/`textures_delta` 后字段还在，
@@ -506,17 +516,15 @@ impl<'a> Popup<'a> {
             &primitives,
             ppp,
             dpi_scale,
-            &mut textures_delta,
+            &mut textures_delta.0,
         );
         if let Err(e) = painted {
             // 出错必须放弃本帧，否则该窗口永久死掉（见设置窗口同款注释）。
+            // `textures_delta` 由守卫在返回时清空，不必在此手工收尾。
             self.gfx.fr.abandon_frame();
             return Err(e);
         }
         let _ = self.gfx.fr.present(acquired)?;
-        // IMPORTANT: 必须 clear：`TexturesDelta` 的 `Drop` 有 debug 断言
-        // 「未被应用的 delta」。
-        textures_delta.clear();
         Ok(())
     }
 }
