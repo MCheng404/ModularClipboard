@@ -416,6 +416,20 @@ pub struct UiState {
     /// 每帧重复传 GPU。收拢到帧级：两个列表都往这里报，`draw`
     /// 在画完全部卡片后统一 retain 一次。
     pub thumb_seen: std::collections::HashSet<modular_clipboard_core::EntryId>,
+    /// 已解码图片的**尺寸**（条目 id → 宽高）。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 显示矩形必须知道长宽比，而**文件型图片**（从资源管理器复制的
+    /// `.png`/`.jpg`）没有 `PayloadRef::dims`——它的载荷是路径列表，
+    /// 尺寸只能靠解码得到。解码完顺手记在这里，就不必为了量尺寸每帧
+    /// 再解一次码（那正是 PF-1 禁止的每帧 IO）。
+    ///
+    /// 图片型条目（`ClipKind::Image`）也一起记：解码出来的尺寸比载荷里
+    /// 存的更权威，且 `payload.dims` 缺失时（载荷被淘汰）仍能正常排版。
+    ///
+    /// 与 `thumb_tex` 同一个淘汰节奏（`draw` 收尾统一 retain）。
+    pub thumb_dims: std::collections::HashMap<modular_clipboard_core::EntryId, (u32, u32)>,
     /// 搜索框是否展开（顶栏右侧图标折叠式搜索）。
     ///
     /// 折叠时顶栏只显示一枚放大镜图标（贴近窗口按钮），左侧整片
@@ -912,7 +926,10 @@ pub fn draw(f: &mut Frame<'_>) {
     // 缩略图纹理按**本帧全部可见图片条目**淘汰（帧级，跨列表）：
     // 滚出屏的条目释放 GPU 纹理；像素仍在 `thumb_cache`（LRU）里，
     // 滚回来只需重新上传，不必重新解码。
+    // `thumb_dims` 与 `thumb_tex` 一一对应，一起淘汰（少了纹理就没必要
+    // 留尺寸；留着只会让表无限增长）。
     f.state.thumb_tex.retain(|id, _| f.state.thumb_seen.contains(id));
+    f.state.thumb_dims.retain(|id, _| f.state.thumb_seen.contains(id));
     f.state.thumb_seen.clear();
 
     // NOTE: 搜索面板与类型过滤栏**不在这里画**——它们是独立弹窗
@@ -5519,7 +5536,12 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             // 淘汰在 `draw` 收尾统一做，见该字段的说明。
             for (_, i, _) in &frames {
                 let it = &f.svc.state.items[rows[*i]];
-                if it.kind == modular_clipboard_core::ClipKind::Image {
+                // CAUTION: 判据必须是 [`preview_is_image`] 而不是
+                // `kind == Image`。文件型图片（从资源管理器复制的 .png）
+                // 同样会上传纹理，漏报它 ⇒ `draw` 收尾的 retain 把刚传的
+                // 纹理当「已滚出屏」丢掉 ⇒ **下一帧重新读盘解码**，
+                // 每帧一次磁盘 IO（正是 PF-1 禁止的），界面会持续卡顿。
+                if preview_is_image(it) {
                     f.state.thumb_seen.insert(it.id);
                 }
             }
@@ -5884,7 +5906,9 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     // CAUTION: `draw_image_preview` 与 `draw_markdown_preview` 都需要
     // `&mut f`，所以这里**只能二选一**——开关决定具体走哪一支。
     match item.kind {
-        ClipKind::Image if image_inline => {
+        // `ClipKind::Files` 也进来：从资源管理器复制的**单个图片文件**
+        // 在详情面板同样直显（图在磁盘上，载荷里只有路径）。
+        ClipKind::Image | ClipKind::Files if preview_is_image(&item) && image_inline => {
             // 详情面板让图占满宽（不限 IMG_MAX_H_LIST，按 band.height
             // 走，长宽比由 `draw_image_preview` 内部保持）。
             //
@@ -6019,7 +6043,9 @@ fn draw_detail_image_zoom(f: &mut Frame<'_>, body: Rect, item: &ClipItem) {
         .map(|(id, _)| *id != item.id)
         .unwrap_or(true);
     if needs_upload {
-        match f.svc.load_payload_bytes(item.id) {
+        // 字节来源与缩略图同一条：图片型读载荷，文件型按首行路径**读盘**
+        // （从资源管理器复制的 .png 只有路径在库里）。
+        match load_image_bytes(f.svc, item) {
             Ok(bytes) => {
                 // 与缩略图同一套 auto 入口：裸 RGBA8（现行规范）走旁路，
                 // 历史编码格式回落嗅探。`u32::MAX` = 不降采样（原图）。
@@ -6046,17 +6072,22 @@ fn draw_detail_image_zoom(f: &mut Frame<'_>, body: Rect, item: &ClipItem) {
         }
     }
 
-    // 取当前已上传的纹理——失败时画错误提示。
-    let handle_id = f
+    // 取当前已上传的纹理**与其尺寸**——失败时画错误提示。
+    //
+    // 尺寸取自纹理本身而不是 `payload.dims`：文件型图片没有后者（载荷
+    // 是路径列表），而纹理 size 就是解码出来的真实像素尺寸，两类条目
+    // 通用，也不怕载荷被淘汰。
+    let uploaded = f
         .state
         .detail_image_orig
         .as_ref()
         .filter(|(id, _)| *id == item.id)
-        .map(|(_, h)| h.id());
+        .map(|(_, h)| (h.id(), h.size()));
 
-    if let Some(tex_id) = handle_id {
+    if let Some((tex_id, size)) = uploaded {
         // 原图占满内容带、保持长宽比。
-        if let Some((w, h)) = dims {
+        let (w, h) = (size[0] as u32, size[1] as u32);
+        if w > 0 && h > 0 {
             let ratio = w as f32 / h as f32;
             let mut disp_w = content_band.width();
             let mut disp_h = disp_w / ratio;
@@ -6556,7 +6587,9 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 下面的 `&mut f` 调用——先拷成两个 bool。
     let image_inline = f.svc.state.config.ui.image_inline;
     let md_rendered = f.svc.state.config.ui.md_rendered;
-    let is_image = item.kind == modular_clipboard_core::ClipKind::Image;
+    // 「该不该内嵌成图片」用 [`preview_is_image`]：除了 `ClipKind::Image`，
+    // 还包括从资源管理器复制的**单个图片文件**（载荷只有路径，图在磁盘上）。
+    let is_image = preview_is_image(item);
     let is_markdown = item.kind == modular_clipboard_core::ClipKind::Markdown;
 
     if preview_band.height() > 4.0 {
@@ -6881,27 +6914,23 @@ fn draw_markdown_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
 /// 单条记录撑爆，详情面板传 `[body.width(), body.height()]` 让图按
 /// 长宽比尽量放大。
 fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32) {
-    // 显示矩形：限高 max_h、限宽预览带，保持长宽比，左上对齐。
+    // 纹理先取：解码产物自带尺寸，取不到就说明这张图不该内嵌显示
+    // （载荷被淘汰 / 文件已删 / 解码失败）⇒ 降级文本。
     //
-    // dims 只认 store 入库时存的（`PayloadRef::dims`）。2026-10-16 起
-    // 图片载荷的规范形态是裸 RGBA8（arboard 解 CF_DIBV5 的产物），
-    // 尺寸由捕获侧透传，新条目必有；缺失只可能是「载荷已被淘汰」或
-    // 极老的编码格式数据——两者都无法从字节反推尺寸（RGBA 的
-    // `len = w*h*4` 有无穷多分解），按文本降级显示，不做每帧读盘
-    // 嗅探（那正是 PF-1 明令禁止的）。
-    let Some(dims) = item
-        .payload
-        .as_ref()
-        .and_then(|p| p.dims)
-        .filter(|(w, h)| *w > 0 && *h > 0)
-    else {
-        // 没有任何维度信息（载荷已被淘汰 / 不可识别）：按普通文本显示
-        // （「图片 WxH」/「图片 N 字节」），剪贴板工具的列表不能因为
-        // 一张坏图就少画一行。
+    // 顺序为什么是「先纹理后尺寸」：文件型图片（从资源管理器复制的
+    // `.png`）**没有** `PayloadRef::dims`——载荷里只有路径列表，尺寸
+    // 只能靠解码拿到。统一走解码结果，两类条目共用同一条排版路径。
+    let Some(tex) = preview_image_tex(f, item) else {
         draw_text_preview(f, band, item, false);
         return;
     };
-    let ratio = dims.0 as f32 / dims.1 as f32;
+    let Some((w, h)) = preview_image_dims(f, item) else {
+        // 没有任何维度信息：按普通文本显示（「图片 WxH」/「图片 N 字节」/
+        // 文件名），剪贴板工具的列表不能因为一张坏图就少画一行。
+        draw_text_preview(f, band, item, false);
+        return;
+    };
+    let ratio = w as f32 / h as f32;
     // 显示矩形：限高 max_h、限宽预览带，**两步都保持长宽比**。
     //
     // CAUTION: 不能「高先定死、宽超了再截」——那会把图拉扁
@@ -6915,75 +6944,6 @@ fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32
     }
     let rect = Rect::from_min_size(band.min, vec2(disp_w, disp_h));
 
-    // 纹理句柄：命中直接用，未命中走缓存 + 上传。
-//
-// CAUTION: `state.thumb_cache` 与 `svc` 是 Frame 的不同字段，
-// 先分别借开才能在同一条表达式里用（闭包要读载荷、缓存要可写）。
-//
-// 三条降级：thumb_tex 命中 → 直接用；thumb_cache 解码 → 上传；
-// thumb_cache 失败（载荷已被 GC、超限、解码错误）→ **旁路**直接
-// 调 `thumbnail::decode` 再读一次，不写入 cache——避免 2 秒抑制
-// 把「确实能解的载荷」卡死。
-let tex = match f.state.thumb_tex.get(&item.id).copied() {
-        Some(t) => Some(t),
-        None => {
-            let id = item.id;
-            // 第一次：thumb_cache（含失败抑制）
-            let from_cache = {
-                let cache = &mut f.state.thumb_cache;
-                let svc = &mut f.svc;
-                let key = crate::thumbnail::CacheKey::new(id, item.hash.clone());
-                let load_closure =
-                    || svc.load_payload_bytes(id).map_err(|e| e.to_string());
-                // dims 一起交给缓存：载荷是裸 RGBA8 时（现行规范）
-                // 必须走 RGBA 旁路，编码格式嗅探对它必然失败。
-                cache.get_or_load_auto(key, Some(dims), load_closure).ok()
-            };
-            // 第二次（必要时）：旁路 cache 直接解码。
-            // thumb_cache 失败抑制表会让 2 秒内的失败调用直接返回 Err，
-            // 但用户看到的「图片」很可能就是这个失败链路——再读一次
-            // 字节、绕过抑制直接调 `thumbnail::decode`，往往就能显示。
-            let thumb_arc = from_cache.or_else(|| {
-                let svc = &mut f.svc;
-                let bytes = match svc.load_payload_bytes(id) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::debug!(id, ?e, "缩略图载荷读取失败");
-                        return None;
-                    }
-                };
-                match crate::thumbnail::decode_auto(&bytes, Some(dims), 256) {
-                    Ok(t) => Some(std::sync::Arc::new(t)),
-                    Err(e) => {
-                        tracing::debug!(id, ?e, "缩略图解码失败，回落文本预览");
-                        None
-                    }
-                }
-            });
-            thumb_arc.map(|thumb| {
-                let img = thumb.to_color_image();
-                // 纹理名带条目 id：同一条目重复上传会**替换**而不是
-                // 累积，egui 侧不会因此长出新纹理。
-                // 只存 `TextureId`：纹理由 Context 持有（注册即托管），
-                // 句柄（TextureHandle）只是引用，没必要长留。
-                let t = f
-                    .ui
-                    .ctx()
-                    .load_texture(
-                        format!("mc_thumb_{id}"),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    )
-                    .id();
-                f.state.thumb_tex.insert(id, t);
-                t
-            })
-        }
-    };
-    let Some(tex) = tex else {
-        draw_text_preview(f, band, item, false);
-        return;
-    };
     let painter = f.ui.painter_at(rect);
     // uv 给整张图（0..1），tint 白色（不染色——缩略图颜色即原图）。
     painter.image(
@@ -6999,6 +6959,164 @@ let tex = match f.state.thumb_tex.get(&item.id).copied() {
         Stroke::new(1.0, f.pal.border_subtle),
         egui::StrokeKind::Inside,
     );
+}
+
+/// 缩略图的最长边（列表与详情共用）。
+const THUMB_MAX_EDGE: u32 = 256;
+
+/// 文件型图片**读盘**的大小上限（字节）。
+///
+/// 读盘与解码都发生在 UI 线程上：一次几十 MB 的读 + 解码会明显卡一帧
+/// （主循环空转 ~125Hz，掉一帧就是 8ms+ 的停顿）。超过这个量就不读，
+/// 直接按文本显示——超大图的缩略图价值远低于一次卡顿。
+const FILE_IMAGE_MAX_BYTES: u64 = 24 * 1024 * 1024;
+
+/// 条目是否应当**内嵌显示成图片**。
+///
+/// 两类来源：
+/// - `ClipKind::Image`：载荷就是像素（现行规范是裸 RGBA8）；
+/// - `ClipKind::Files`：**单个**图片文件（从资源管理器复制的 `.png` 等）。
+///
+/// # 文件型为什么只看 `preview`（零 IO）
+///
+/// 完整路径只存在于载荷字节里，而列表**每帧**都要跑这条判定 ——
+/// 每帧读载荷正是 PF-1 禁止的。好在单文件条目 `preview` 就是文件名
+/// （`build_preview` 的 `names.len() == 1` 分支），按扩展名判定即可。
+///
+/// # 多文件为什么不画缩略图
+///
+/// 多文件条目 `preview` 是摘要（`a.png 等 5 个文件`），拿不到首行路径
+/// 除非读载荷；而且「显示第一张图」与「这一行代表 5 个文件」语义冲突
+/// ——用户会以为缩略图就是全部内容。保持文本列表。
+pub fn preview_is_image(item: &ClipItem) -> bool {
+    match item.kind {
+        modular_clipboard_core::ClipKind::Image => true,
+        modular_clipboard_core::ClipKind::Files => {
+            crate::thumbnail::is_image_file(&item.preview)
+        }
+        _ => false,
+    }
+}
+
+/// 取条目图片的字节：图片型读载荷，文件型按首行路径读盘。
+///
+/// 只在缓存未命中时被调用（见 [`preview_image_thumb`]），不是每帧 IO。
+fn load_image_bytes(svc: &mut Service, item: &ClipItem) -> anyhow::Result<Vec<u8>> {
+    if item.kind != modular_clipboard_core::ClipKind::Files {
+        return svc.load_payload_bytes(item.id);
+    }
+    // 载荷是换行拼接的路径列表，取第一行——与双击跳转
+    // （`double_click_op` → `Op::RevealPath`）同一条规则：看到的缩略图
+    // 和双击打开的是同一个文件。
+    let bytes = svc.load_payload_bytes(item.id)?;
+    let path = String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("文件条目载荷里没有路径"))?;
+    // 大小先查 metadata（比读全文件廉价得多）：超限直接放弃。
+    let len = std::fs::metadata(&path)
+        .map_err(|e| anyhow::anyhow!("读取图片文件信息失败 {path}: {e}"))?
+        .len();
+    if len > FILE_IMAGE_MAX_BYTES {
+        anyhow::bail!("图片文件过大（{len} 字节 > {FILE_IMAGE_MAX_BYTES}），跳过缩略图");
+    }
+    std::fs::read(&path).map_err(|e| anyhow::anyhow!("读取图片文件失败 {path}: {e}"))
+}
+
+/// 解码并上传缩略图纹理；命中已上传的纹理时直接返回。
+///
+/// 上传成功后把**尺寸**写进 `state.thumb_dims`：文件型图片没有
+/// `PayloadRef::dims`，排版需要的长宽比只能从这里拿。
+fn preview_image_tex(f: &mut Frame<'_>, item: &ClipItem) -> Option<egui::TextureId> {
+    let id = item.id;
+    if let Some(t) = f.state.thumb_tex.get(&id).copied() {
+        return Some(t);
+    }
+    let thumb = preview_image_thumb(f, item)?;
+    let dims = (thumb.width, thumb.height);
+    let img = thumb.to_color_image();
+    // 纹理名带条目 id：同一条目重复上传会**替换**而不是累积，
+    // egui 侧不会因此长出新纹理。
+    // 只存 `TextureId`：纹理由 Context 持有（注册即托管），
+    // 句柄（TextureHandle）只是引用，没必要长留。
+    let t = f
+        .ui
+        .ctx()
+        .load_texture(
+            format!("mc_thumb_{id}"),
+            img,
+            egui::TextureOptions::LINEAR,
+        )
+        .id();
+    f.state.thumb_tex.insert(id, t);
+    f.state.thumb_dims.insert(id, dims);
+    Some(t)
+}
+
+/// 缩略图的长宽比来源。
+///
+/// 优先解码得到的真实尺寸（`thumb_dims`），其次载荷里存的 `dims`。
+fn preview_image_dims(f: &Frame<'_>, item: &ClipItem) -> Option<(u32, u32)> {
+    f.state
+        .thumb_dims
+        .get(&item.id)
+        .copied()
+        .or_else(|| {
+            item.payload
+                .as_ref()
+                .and_then(|p| p.dims)
+                .filter(|(w, h)| *w > 0 && *h > 0)
+        })
+}
+
+/// 取（必要时解码）条目的缩略图像素。
+///
+/// CAUTION: `state.thumb_cache` 与 `svc` 是 `Frame` 的不同字段，
+/// 先分别借开才能在同一条表达式里用（闭包要读字节、缓存要可写）。
+fn preview_image_thumb(
+    f: &mut Frame<'_>,
+    item: &ClipItem,
+) -> Option<std::sync::Arc<crate::thumbnail::Thumbnail>> {
+    let id = item.id;
+    // 载荷里存的尺寸（裸 RGBA8 时是唯一来源）；文件型条目没有。
+    let dims = item
+        .payload
+        .as_ref()
+        .and_then(|p| p.dims)
+        .filter(|(w, h)| *w > 0 && *h > 0);
+    // 第一段：缓存（含失败抑制）。
+    let from_cache = {
+        let cache = &mut f.state.thumb_cache;
+        let svc = &mut f.svc;
+        let key = crate::thumbnail::CacheKey::new(id, item.hash.clone());
+        let load = || load_image_bytes(svc, item).map_err(|e| e.to_string());
+        // dims 一起交给缓存：载荷是裸 RGBA8 时（现行规范）必须走 RGBA
+        // 旁路，编码格式嗅探对它必然失败；文件型传 `None` ⇒ 走嗅探。
+        cache.get_or_load_auto(key, dims, load).ok()
+    };
+    // 第二段（必要时）：旁路 cache 直接解一次。
+    // thumb_cache 的失败抑制会让 2 秒内的失败调用直接返回 Err，但用户
+    // 看到的「图片」很可能就卡在这条链路上——绕过抑制再解一次，往往就
+    // 能显示（例如文件刚写好、上一帧还没落盘）。
+    from_cache.or_else(|| {
+        let svc = &mut f.svc;
+        let bytes = match load_image_bytes(svc, item) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(id, %e, "缩略图字节读取失败");
+                return None;
+            }
+        };
+        match crate::thumbnail::decode_auto(&bytes, dims, THUMB_MAX_EDGE) {
+            Ok(t) => Some(std::sync::Arc::new(t)),
+            Err(e) => {
+                tracing::debug!(id, ?e, "缩略图解码失败，回落文本预览");
+                None
+            }
+        }
+    })
 }
 
 /// 双击列表行的目标操作（2026-10-15 第三轮定稿）：
@@ -9779,6 +9897,135 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             (h - expect).abs() < 0.6,
             "图片行高应等于 图高108 + 固定段（{expect}），实际 {h}"
+        );
+    }
+
+    // ---- 文件型图片（从资源管理器复制的图片文件）----
+    //
+    // 这类条目的载荷是**路径列表**，图在磁盘上。判据、读盘、行高三处
+    // 都要单独关照，所以各自有一个测试。
+
+    /// 在夹具的临时目录里造一个真实可解的 PNG。
+    fn write_png(dir: &std::path::Path, name: &str, w: u32, h: u32) -> std::path::PathBuf {
+        let mut buf = Vec::new();
+        let img = image::ImageBuffer::from_pixel(w, h, image::Rgba([200u8, 40, 60, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .expect("测试用 PNG 编码失败");
+        let p = dir.join(name);
+        std::fs::write(&p, &buf).expect("写测试用 PNG 失败");
+        p
+    }
+
+    /// 塞一个 `ClipKind::Files` 条目：载荷是**换行拼接的路径列表**（与
+    /// 捕获层一致），`preview` 由 `build_preview` 生成。
+    fn ingest_files(h: &mut Harness, names: &[&str]) {
+        let paths: Vec<std::path::PathBuf> =
+            names.iter().map(|n| h._dir.path().join(n)).collect();
+        let list = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = modular_clipboard_core::CapturedPayload {
+            kind: modular_clipboard_core::ClipKind::Files,
+            bytes: list.into_bytes(),
+            html: None,
+            text: None,
+            source_app: "explorer".into(),
+            files: paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect(),
+            dims: None,
+        };
+        assert!(h.svc.ingest(payload), "测试前置：文件条目应入库");
+        h.svc.reload_list();
+    }
+
+    /// 从资源管理器复制的**单个图片文件**要显示缩略图，而不是只显示
+    /// 文件名（用户报的问题）。
+    #[test]
+    fn single_image_file_item_shows_thumbnail_not_just_the_name() {
+        let mut h = Harness::new("file-img", vec2(700.0, 500.0));
+        write_png(h._dir.path(), "shot.png", 40, 30);
+        ingest_files(&mut h, &["shot.png"]);
+
+        let item = h.svc.state.items[0].clone();
+        assert_eq!(item.preview, "shot.png", "单文件条目的 preview 就是文件名");
+        // 入库时已把尺寸嗅出来 ⇒ 行高从第一帧起就是图片行高（不跳变）。
+        assert_eq!(
+            item.payload.as_ref().and_then(|p| p.dims),
+            Some((40, 30)),
+            "入库应补齐图片尺寸（`first_image_file_dims`）"
+        );
+        assert!(preview_is_image(&item), "单个 .png 应判为图片条目");
+
+        h.frame();
+        assert!(
+            h.state.thumb_tex.contains_key(&item.id),
+            "图片文件条目应上传缩略图纹理——只显示文件名就是没走上这条路径"
+        );
+        assert_eq!(
+            h.state.thumb_dims.get(&item.id),
+            Some(&(40, 30)),
+            "尺寸应来自解码结果"
+        );
+    }
+
+    /// 非图片文件：既不该去读文件头，也不该画缩略图。
+    #[test]
+    fn non_image_file_item_stays_text() {
+        let mut h = Harness::new("file-txt", vec2(700.0, 500.0));
+        std::fs::write(h._dir.path().join("notes.txt"), "hello").expect("写 .txt 失败");
+        ingest_files(&mut h, &["notes.txt"]);
+
+        let item = h.svc.state.items[0].clone();
+        assert!(!preview_is_image(&item), ".txt 不应判为图片条目");
+        assert_eq!(
+            item.payload.as_ref().and_then(|p| p.dims),
+            None,
+            "不该为 .txt 去读文件头（白名单预筛应挡住）"
+        );
+        h.frame();
+        assert!(
+            !h.state.thumb_tex.contains_key(&item.id),
+            "非图片文件不应上传纹理"
+        );
+    }
+
+    /// 多文件条目**不**画缩略图：语义上「显示第一张」会让人以为缩略图
+    /// 就是全部内容。
+    #[test]
+    fn multi_file_item_does_not_show_thumbnail() {
+        let mut h = Harness::new("file-multi", vec2(700.0, 500.0));
+        write_png(h._dir.path(), "a.png", 20, 20);
+        write_png(h._dir.path(), "b.png", 20, 20);
+        ingest_files(&mut h, &["a.png", "b.png"]);
+
+        let item = h.svc.state.items[0].clone();
+        assert!(
+            !preview_is_image(&item),
+            "多文件条目（preview 是『a.png 等 2 个文件』）不该只画第一张"
+        );
+        h.frame();
+        assert!(!h.state.thumb_tex.contains_key(&item.id));
+    }
+
+    /// 图片文件已被删除（或被移走）：降级成文本，不能卡住入库/渲染。
+    #[test]
+    fn deleted_image_file_falls_back_to_text() {
+        let mut h = Harness::new("file-gone", vec2(700.0, 500.0));
+        let p = write_png(h._dir.path(), "gone.png", 16, 16);
+        ingest_files(&mut h, &["gone.png"]);
+        let item = h.svc.state.items[0].clone();
+        // 入库时文件还在 ⇒ 尺寸已经记下；之后删掉，缩略图应当取不到。
+        std::fs::remove_file(&p).expect("删除测试文件失败");
+
+        h.frame();
+        assert!(
+            !h.state.thumb_tex.contains_key(&item.id),
+            "文件已删 ⇒ 不应有纹理（应降级为文本预览）"
         );
     }
 

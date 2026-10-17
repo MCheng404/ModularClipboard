@@ -1,6 +1,7 @@
 pub mod config;
 pub mod event;
 pub mod item;
+pub mod media;
 
 pub use config::{
     ActionRule, CaptureConfig, Config, Hotkey, LayoutConfig, StorageConfig, UiConfig, WindowPos,

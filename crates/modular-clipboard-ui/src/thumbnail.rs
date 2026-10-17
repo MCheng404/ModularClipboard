@@ -74,6 +74,19 @@ fn now_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// 图片文件判定
+// ---------------------------------------------------------------------------
+
+/// 路径是否指向一个**能解码的图片文件**（只看扩展名，不读盘）。
+///
+/// 供「从资源管理器复制的文件条目」（`ClipKind::Files`）判断要不要走
+/// 缩略图分支：载荷里只有路径列表，不读盘就无从知道它是什么。
+///
+/// 实现在 core（[`modular_clipboard_core::media`]）：入库侧嗅尺寸也要
+/// 用同一份白名单，各写一份迟早漂移。
+pub use modular_clipboard_core::media::is_image_file;
+
+// ---------------------------------------------------------------------------
 // 尺寸计算
 // ---------------------------------------------------------------------------
 
@@ -570,6 +583,42 @@ impl ThumbnailCache {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // ---- 图片文件判定 ----
+    //
+    // `is_image_file` 的字符串行为由 core 的单测覆盖；这里只多验一条
+    // core 测不了的：**白名单与 image crate 的实际解码能力是否对齐**
+    // （core 不依赖 image，没法自己验）。
+
+    /// 白名单里的每个扩展名都必须**真的能解**。
+    ///
+    /// 守的是「`IMAGE_EXTS` 与根 `Cargo.toml` 里 `image` 的 features 脱节」：
+    /// 列了却解不出来 ⇒ 条目在「缩略图」与「解码失败」之间反复横跳，
+    /// 比直接按文本显示更糟。
+    #[test]
+    fn every_whitelisted_extension_actually_decodes() {
+        for ext in modular_clipboard_core::media::IMAGE_EXTS {
+            let bytes = tiny_encoded(ext)
+                .unwrap_or_else(|| panic!("{ext} 在白名单里，但 image crate 编不出样本（feature 未启用？）"));
+            assert!(
+                decode(&bytes, 32).is_ok(),
+                "扩展名 {ext} 在白名单里，但解不出来"
+            );
+        }
+    }
+
+    /// 用 `image` 编一张 1×1 的图，格式由扩展名反查。
+    ///
+    /// `None` = 该格式 image 不认（或编码器未启用）。
+    fn tiny_encoded(ext: &str) -> Option<Vec<u8>> {
+        let fmt = image::ImageFormat::from_extension(ext)?;
+        let mut buf = Vec::new();
+        let img = image::ImageBuffer::from_pixel(1, 1, image::Rgba([1u8, 2, 3, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut buf), fmt)
+            .ok()?;
+        Some(buf)
+    }
 
     // ---- 尺寸计算 ----
 

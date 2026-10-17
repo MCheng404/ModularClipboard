@@ -864,8 +864,17 @@ impl LocalBackend {
 
         // 图片尺寸透传：载荷是裸 RGBA8（arboard 解码 CF_DIBV5 的产物），
         // store 侧的格式嗅探对它无效，只能由捕获侧给（见 CapturedPayload::dims）。
+        //
+        // 文件型条目（`ClipKind::Files`）走不了这条链路——它的载荷是
+        // **路径列表**，图在磁盘上。若第一个文件是图片，这里顺手读一下
+        // 文件头补上尺寸：UI 的列表行高（`row_height_for`）只认
+        // `payload.dims`，缺了它图片行会先按文本行排、解码出真实尺寸后
+        // 又跳一次高度（列表抖动）。
         // 先取字段再移动 bytes，避免部分移动。
-        let dims = payload.dims.filter(|(w, h)| *w > 0 && *h > 0);
+        let dims = payload
+            .dims
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .or_else(|| first_image_file_dims(&payload.files));
         match self.store.insert_with_dims(item, payload.bytes, dims) {
             Ok(saved) => {
                 tracing::debug!(id = saved.id, kind = ?saved.kind, "新条目已入库");
@@ -1386,6 +1395,34 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// 读取图片尺寸（仅解析文件头，不解码像素）。
 pub fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// 文件列表里**第一个图片文件**的像素尺寸（只读文件头，不读全文件）。
+///
+/// 供 `ClipKind::Files` 条目在入库时补齐 `dims`——见
+/// [`crate::Service::ingest`] 里那段关于行高跳变的说明。
+///
+/// # 只对「扩展名像图片」的文件动手
+///
+/// 资源管理器复制的文件可以是任何东西，对每个都去读文件头等于每次
+/// 复制都白搭一次磁盘 IO。`is_image_file` 是 `O(1)` 的字符串预筛。
+///
+/// # 失败即放弃
+///
+/// 文件被删、没权限、内容其实是别的格式——一律返回 `None`，条目退化成
+/// 「普通文件条目」（文本预览）。入库路径不能被一个坏文件卡住。
+fn first_image_file_dims(files: &[String]) -> Option<(u32, u32)> {
+    let path = files.first()?;
+    if !modular_clipboard_core::media::is_image_file(path) {
+        return None;
+    }
+    // `into_dimensions` 只解析文件头，不会把整张图读进内存。
+    let f = std::fs::File::open(path).ok()?;
+    image::ImageReader::new(std::io::BufReader::new(f))
         .with_guessed_format()
         .ok()?
         .into_dimensions()
