@@ -523,6 +523,16 @@ pub struct UiState {
     /// [`Self::list_scroll`] / [`Self::set_list_scroll`] 访问。
     list_scroll: [f32; 2],
 
+    /// 上一帧绘制时的列表版本号（新条目入场动画的闸门），**按列表分开存**。
+    ///
+    /// `None` = 本会话还没画过该列表（首帧只记录、不播放——启动时不应该
+    /// 无缘无故放一次滑入）。版本号变化 ⇒ store 侧有增删置顶 ⇒ 首行
+    /// 播放一次「从上方滑入」。搜索 / 类型过滤**不** bump 版本
+    /// （绘制层本地状态，见 `RowFilterKey` 的说明），因此敲键筛选不会触发。
+    ///
+    /// 约定同 `list_scroll`：`[0]` = 历史列表，`[1]` = 置顶列表。
+    list_version_seen: [Option<u64>; 2],
+
     /// 设置界面是否打开。
     pub show_settings: bool,
     /// `MC_SETTINGS` 启动开关是否已消费（一次性）。
@@ -1568,12 +1578,29 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     // 自报真实 Id，供测试精确判断焦点落在哪个控件上（见字段说明）。
     f.state.search_edit_id = Some(edit_resp.id);
 
-    if edit_resp.has_focus() {
-        // 聚焦时描边加强，给出明确的视觉反馈。
-        f.ui.painter_at(r).rect_stroke(
+    // 聚焦描边补间（130ms）：点进输入框时 border → accent 淡入、失焦
+    // 淡回，与设置页输入框同一套（`draw_text_field`）。判据用**本帧
+    // 实时焦点**（`edit_resp.has_focus()`），不用滞后一帧的
+    // `search_popup_focus`——那是回报给主窗口的状态机用的。
+    // 弹窗 ctx 的补间由 `draw_popup` 末尾的 busy 检查续帧。
+    let focus_k = crate::anim::tween_f32(
+        f.ui.ctx(),
+        egui::Id::new("search_panel_focus"),
+        if edit_resp.has_focus() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(130),
+        crate::anim::Ease::OutCubic,
+    );
+    if focus_k > 0.004 {
+        let ring = crate::anim::tween_color(
+            f.ui.ctx(),
+            egui::Id::new("search_panel_focus_color"),
+            pal.accent,
+            std::time::Duration::from_millis(130),
+        );
+        painter.rect_stroke(
             r,
             radius,
-            Stroke::new(1.5, pal.border_strong),
+            Stroke::new(1.0 + 0.5 * focus_k, ring),
             egui::StrokeKind::Inside,
         );
     }
@@ -3995,7 +4022,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // 宽度随字号缩放（基准 170 / 230 @ font_sm 15），
                 // 否则 2× 字号下框里只显示得下 4~5 个字。
                 let w = pal.font_sm * if *secret { 11.3 } else { 15.3 };
-                draw_text_field(f, ui, &mut buf, ph, *secret, w)
+                draw_text_field(f, ui, field, &mut buf, ph, *secret, w)
             });
             if changed {
                 f.state.push(Op::SetText {
@@ -4015,7 +4042,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             };
             let changed = setting_row(ui, it.label, it.desc, |ui| {
                 // 宽度随字号缩放（基准 110 @ font_sm 15）。
-                draw_text_field(f, ui, &mut buf, "9123", false, pal.font_sm * 7.3)
+                draw_text_field(f, ui, "mcp_port", &mut buf, "9123", false, pal.font_sm * 7.3)
             });
             if changed {
                 let v: u16 = buf.trim().parse().unwrap_or(0);
@@ -4751,6 +4778,9 @@ fn elide_to_width(ui: &Ui, text: &str, font: &egui::FontId, max_w: f32) -> Strin
 fn draw_text_field(
     f: &mut Frame<'_>,
     ui: &mut Ui,
+    // 本输入框的唯一标识（配置字段名）。聚焦描边的补间键要按框分开——
+    // 共用 id 会让两个框的聚焦动画互相串台（点 A 框时 B 框也亮）。
+    id_suffix: &'static str,
     buf: &mut String,
     ph: &str,
     secret: bool,
@@ -4762,6 +4792,9 @@ fn draw_text_field(
     let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::empty());
     let painter = ui.painter_at(r);
     painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+    // 常态描边；聚焦时**叠**一层补间的 accent 描边（颜色 130ms 过渡，
+    // 宽度仍按 1.0 → 1.5 两档硬切——宽度补间在 1px 量级上看不出，反而
+    // 要让抗锯齿边缘抖一下）。
     painter.rect_stroke(
         r,
         pal.radius_md,
@@ -4782,11 +4815,26 @@ fn draw_text_field(
             .text_color(pal.text)
             .desired_width(text_rect.width()),
     );
-    if resp.has_focus() {
+    // 聚焦描边补间（130ms）：失焦时 accent 淡回 border 色，不再是
+    // 「亮点一下又缩回去」的硬切。设置窗口每帧驱动，无需续帧请求。
+    let focus_k = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("field_focus", id_suffix)),
+        if resp.has_focus() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(130),
+        crate::anim::Ease::OutCubic,
+    );
+    if focus_k > 0.004 {
+        let ring = crate::anim::tween_color(
+            ui.ctx(),
+            egui::Id::new(("field_focus_color", id_suffix)),
+            pal.accent,
+            std::time::Duration::from_millis(130),
+        );
         painter.rect_stroke(
             r,
             pal.radius_md,
-            egui::Stroke::new(1.5, pal.accent),
+            egui::Stroke::new(1.0 + 0.5 * focus_k, ring),
             egui::StrokeKind::Inside,
         );
     }
@@ -5880,6 +5928,38 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 content.width()
             };
 
+            // ---- 新条目入场：首行从上方滑入 --------------------------------
+            //
+            // 版本号变化 = store 侧有增删置顶（复制新内容、置顶、删除）。
+            // 变化的那一帧把入场补间**重启**到 0→1（200ms OutCubic），
+            // 之后每帧由下面的 `tween_f32` 推进；行矩形按当前值从上方
+            // 12pt 归位。只滑行矩形——`offsets`/行高不参与动画，布局
+            // 与测量保持稳态（否则行高缓存要跟着抖）。
+            //
+            // 三个闸门缺一不可：
+            // 1. **只首行**（`first == 0`）：滚到半截时复制的新条目在
+            //    视口外，放了也看不见；且不该让「当前第一屏」无缘无故
+            //    滑一下。
+            // 2. **版本闸门**：搜索/类型过滤是绘制层本地状态、不 bump
+            //    `list_version`（见 `RowFilterKey`）⇒ 敲键筛选不触发。
+            //    没有这层，每敲一个键首行就滑一次，像卡带。
+            // 3. **重启而非惰性目标**：`tween_f32` 的目标恒为 1，第一次
+            //    调用后 from==to，之后再也不会重播（主题切换踩过同一个
+            //    坑，见 `anim::restart` 的文档）。
+            let slot_seen = &mut f.state.list_version_seen[pinned_slot as usize];
+            let play_entry = first == 0 && slot_seen.is_some_and(|v| v != version);
+            *slot_seen = Some(version);
+            if play_entry {
+                crate::anim::restart(
+                    ui.ctx(),
+                    egui::Id::new(("list_row_in", pinned_slot)),
+                    0.0,
+                    1.0,
+                    std::time::Duration::from_millis(200),
+                    crate::anim::Ease::OutCubic,
+                );
+            }
+
             // 先收集真正可见行的几何（过滤条件与下面的内容绘制循环
             // 完全一致），供阴影/内容两遍渲染共用。
             let mut frames: Vec<(usize, usize, Rect)> = Vec::new();
@@ -5888,6 +5968,21 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 if y > content.max.y {
                     break; // 已越过可视区底部
                 }
+                // 首行的入场位移：稳态 k=1（无位移）；动画进行中时行矩形
+                // （绘制与交互同一矩形）从上方 12pt 归位，被 ScrollArea
+                // 的视口裁剪 ⇒ 观感是「新卡片从列表上缘被发出来」。
+                let y = if i == 0 {
+                    let k_in = crate::anim::tween_f32(
+                        ui.ctx(),
+                        egui::Id::new(("list_row_in", pinned_slot)),
+                        1.0,
+                        std::time::Duration::from_millis(200),
+                        crate::anim::Ease::OutCubic,
+                    );
+                    y - (1.0 - k_in) * ROW_IN_SLIDE
+                } else {
+                    y
+                };
                 let r = Rect::from_min_size(
                     pos2(content.min.x, y),
                     vec2(row_w, heights[i]),
@@ -6090,6 +6185,12 @@ const LIST_PAD_X: f32 = 8.0;
 /// 卡片样式 = 每条历史是一张圆角小卡，卡与卡之间留这条缝；
 /// 首项顶部再留半条，让整体上下边缘也有留白。
 const ROW_GAP: f32 = 6.0;
+/// 新条目入场滑入的距离（逻辑点）：首行从上方这么远归位。
+///
+/// 取 2 倍行隙：足以被感知为「滑入」，又不至于让首行在归位途中压到
+/// 顶栏。位移只作用于**行矩形**（绘制与交互同一矩形），`offsets`/行高
+/// 不参与——布局保持稳态，行高缓存不会因动画失效。
+const ROW_IN_SLIDE: f32 = 12.0;
 /// 阴影开启时行间缝隙的最大值：参数拉满（offset 16 + blur 24）理论
 /// 需要 40pt，列表会过度松散，视觉上也不成立——设上限截断。
 const ROW_GAP_MAX: f32 = 30.0;
@@ -9605,6 +9706,55 @@ fn with_pinned(mut self, n: usize) -> Self {
             top.iter().any(|o| matches!(o, Op::Select(_))),
             "列表可视区**顶部**应有行——顶部留白说明行带整体下移了。\
              body={body:?} 实际={top:?}"
+        );
+    }
+
+    /// 新条目入场动画结束后，首行必须**精确归位**（点击落点不受动画残留影响）。
+    ///
+    /// 回归守卫（2026-10-18）：入场滑入用 `anim::restart` 把 0→1 补间
+    /// 重启、行矩形按当前值从上方 12pt 归位。若补间卡在 0（忘了续帧、
+    /// restart 目标写错、或闸门把动画饿死），行会**永远偏移 12pt**——
+    /// 点击全部落空，而画面看着只是「歪一点」，极难自查。
+    /// 本测试把时钟拨过动画时长后点首行，必须命中最新那条。
+    #[test]
+    fn new_row_entry_animation_settles_back_in_place() {
+        let mut h = Harness::new("row-entry", vec2(700.0, 500.0)).with_items(5);
+        // 首帧：记录版本基线（首帧不播放，见 `list_version_seen` 的说明）。
+        h.frame();
+        let body = hit(&h, "history_body");
+        // 探测点取**首行底部内侧**（单行预览行高 ≈75，底沿 ≈ +79）。
+        // 这个位置是判别关键：补间归位时它在行内；若动画卡在 0（行永远
+        // 上移 12pt，底沿只到 ≈+67），探测点落在行外 ⇒ 点空。
+        // （实证标定：+72 在两种状态下一边命中一边落空，双侧各 4pt 余量；
+        //   点行中部两种状态都命中，没有判别力——别往中间挪。）
+        let row0_bottom = body.min.y + 72.0;
+
+        // 复制一条新内容 ⇒ list_version +1 ⇒ 下一帧首行滑入。
+        let text = "刚复制的新内容，应该滑入到列表顶部".to_string();
+        assert!(
+            h.svc.ingest(modular_clipboard_core::CapturedPayload {
+                kind: modular_clipboard_core::ClipKind::Text,
+                bytes: text.as_bytes().to_vec(),
+                html: None,
+                text: Some(text),
+                source_app: "NewApp".into(),
+                files: Vec::new(),
+                dims: None,
+            }),
+            "前置条件：新条目应入库"
+        );
+        h.svc.reload_list();
+        // 动画起始帧 + 把时钟拨到 200ms 之外（补间必须已落定）。
+        h.frame();
+        h.advance_secs(0.5);
+        h.frame();
+
+        // 归位后点首行底部：必须选中**最新那条**（偏移没归位就会点空）。
+        let ops = h.click_at(pos2(body.center().x, row0_bottom));
+        let newest = h.svc.state.items.first().expect("列表非空").id;
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::Select(id) if *id == newest)),
+            "入场动画落定后首行必须归位并可点中最新条目，实际={ops:?}"
         );
     }
 
