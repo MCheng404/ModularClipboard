@@ -428,7 +428,13 @@ pub struct UiState {
     /// 图片型条目（`ClipKind::Image`）也一起记：解码出来的尺寸比载荷里
     /// 存的更权威，且 `payload.dims` 缺失时（载荷被淘汰）仍能正常排版。
     ///
-    /// 与 `thumb_tex` 同一个淘汰节奏（`draw` 收尾统一 retain）。
+    /// # 为什么不随纹理淘汰
+    ///
+    /// 2026-10-17 改：原先与 `thumb_tex` 一起 retain，结果滚出屏就丢
+    /// ——而行高缓存以它的 `len()` 作为失效判据之一（见
+    /// [`RowHeightCache::dims_known`]），丢一次就让整份行高缓存失效一次，
+    /// 滚动时等于每帧重算全部行高。尺寸一条只有 16 字节，常驻更划算，
+    /// 而且它是**行高**的输入：老条目（`payload.dims` 缺失）全靠它排图。
     pub thumb_dims: std::collections::HashMap<modular_clipboard_core::EntryId, (u32, u32)>,
     /// 搜索框是否展开（顶栏右侧图标折叠式搜索）。
     ///
@@ -619,7 +625,7 @@ pub struct UiState {
     /// 等于把 2000 次 `LayoutJob` 测量（含 galley cache 查找的键哈希）
     /// 重复付一遍——帧成本随列表总字节线性膨胀的根因之一。
     /// 失效判据：列表版本号（`AppState::list_version`，每次 reload +1）、
-    /// 测量宽度、缩放三者全部相同才复用。
+    /// 测量宽度、缩放、已解码图片尺寸数四者全部相同才复用。
     row_height_cache: [Option<RowHeightCache>; 2],
 }
 
@@ -629,6 +635,17 @@ struct RowHeightCache {
     version: u64,
     text_w: f32,
     scale: f32,
+    /// 建缓存时 [`UiState::thumb_dims`] 的条目数。
+    ///
+    /// 图片的行高取决于长宽比，而长宽比的来源有先后：载荷里记的
+    /// `dims`（入库时读的文件头）→ 解码得到的 `thumb_dims`。老条目
+    /// 缺前者，第一次解码后行高才会变——缓存必须因此失效，否则
+    /// 那一行永远是「按文本量出来的高度」，图被压成一条细带。
+    ///
+    /// 用条目数而不是版本号：`thumb_dims` 只增不减，数量变化就等价于
+    /// 「有新图刚拿到尺寸」；反过来若它也随纹理淘汰，数量会反复抖动，
+    /// 缓存就每帧失效了（这正是它不参与淘汰的原因）。
+    dims_known: usize,
     heights: Vec<f32>,
 }
 
@@ -926,10 +943,8 @@ pub fn draw(f: &mut Frame<'_>) {
     // 缩略图纹理按**本帧全部可见图片条目**淘汰（帧级，跨列表）：
     // 滚出屏的条目释放 GPU 纹理；像素仍在 `thumb_cache`（LRU）里，
     // 滚回来只需重新上传，不必重新解码。
-    // `thumb_dims` 与 `thumb_tex` 一一对应，一起淘汰（少了纹理就没必要
-    // 留尺寸；留着只会让表无限增长）。
+    // `thumb_dims` **不参与淘汰**（尺寸是行高的输入，见字段注释）。
     f.state.thumb_tex.retain(|id, _| f.state.thumb_seen.contains(id));
-    f.state.thumb_dims.retain(|id, _| f.state.thumb_seen.contains(id));
     f.state.thumb_seen.clear();
 
     // NOTE: 搜索面板与类型过滤栏**不在这里画**——它们是独立弹窗
@@ -5333,26 +5348,35 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 因此测量折行数时也必须按整行宽算，否则量出的行数会偏多、行高虚高。
     let text_w = preview_full_width(content.width());
     let version = f.svc.state.list_version;
+    // 解码得到的尺寸数：图片行高的输入之一，进缓存的失效判据
+    // （见 [`RowHeightCache::dims_known`]）。
+    let dims_known = f.state.thumb_dims.len();
     let heights: Vec<f32> = {
         let hit = f.state.row_height_cache[pinned_slot as usize].as_ref().filter(|c| {
             c.version == version
                 && c.text_w == text_w
                 && c.scale == scale
+                && c.dims_known == dims_known
                 && c.heights.len() == rows.len()
         });
         match hit {
             Some(c) => c.heights.clone(),
             None => {
+                // CAUTION: `thumb_dims` 的引用必须在**可变借用**
+                // `row_height_cache` 之前取好，否则借用冲突。
+                let known = &f.state.thumb_dims;
                 let h: Vec<f32> = rows
                     .iter()
                     .map(|&i| {
+                        let item = &f.svc.state.items[i];
                         row_height_for(
                             f.ui,
-                            &f.svc.state.items[i],
+                            item,
                             pal,
                             scale,
                             text_w,
                             &f.svc.state.config.ui,
+                            known.get(&item.id).copied(),
                         )
                     })
                     .collect();
@@ -5360,6 +5384,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                     version,
                     text_w,
                     scale,
+                    dims_known,
                     heights: h.clone(),
                 });
                 h
@@ -5744,12 +5769,48 @@ const SCROLLBAR_RESERVE: f32 = crate::theme::SCROLLBAR_WIDTH;
 /// 每行文字的高度倍率。
 const LINE_H: f32 = 1.35;
 
-/// 缩略图默认限高（逻辑点）≈ 3 行正文，与第三轮原型一致。
+/// 缩略图默认限高（逻辑点）。
 ///
 /// 仅作为列表行内嵌缩略图的默认上限；详情面板在
 /// [`draw_image_preview`] 里另行传更大的值（图占满整宽）。
-/// 再高会让一条记录占据半屏、列表信息密度崩塌。
-pub const IMG_MAX_H_LIST: f32 = 108.0;
+///
+/// 2026-10-17 从 108 提到 160：108pt 下 16:9 的截图只有 192pt 宽，
+/// 在 400+pt 的列表里只占不到一半宽度，用户反馈「尺寸太小」。
+/// 160 是「看得清」与「一屏还能放三四条」之间的折中——再往上
+/// 一条记录就会占掉半屏，列表信息密度崩塌。
+///
+/// 配套：缩略图解码上限 [`crate::thumbnail::THUMB_MAX_EDGE`] 必须
+/// ≥ 本值 × 常见 DPI 缩放（2x ⇒ 320px），否则放大显示会糊。
+pub const IMG_MAX_H_LIST: f32 = 160.0;
+
+/// 图片在给定带内的显示尺寸（宽, 高），保持长宽比。
+///
+/// 限高 `max_h`、限宽 `band_w`，两步都保持长宽比——
+///
+/// CAUTION: 不能「高先定死、宽超了再截」：那会把图拉扁
+/// （`painter.image` 按 uv 0..1 把整张图填进矩形）。宽超限时必须
+/// 回头按比例缩高，否则极窄窗口下截图变成压扁的条。
+///
+/// # 为什么必须是共用函数
+///
+/// [`row_height_for`] 用它量出行高，[`draw_image_preview`] 按那个行高
+/// 画——两处各写一份算式的后果是**图片被压扁**：
+/// 2026-10-17 修的就是这个（`row_height_for` 的文件型分支没走图片算式，
+/// 行高按文件名文本算成 ~24pt，图被 `band.height()` 压成一条细带）。
+/// 想改显示规则只能改这里。
+pub fn image_display_size(dims: (u32, u32), band_w: f32, max_h: f32) -> (f32, f32) {
+    if dims.0 == 0 || dims.1 == 0 {
+        return (0.0, 0.0);
+    }
+    let ratio = dims.0 as f32 / dims.1 as f32;
+    let mut h = max_h;
+    let mut w = h * ratio;
+    if w > band_w {
+        w = band_w;
+        h = w / ratio;
+    }
+    (w, h)
+}
 
 /// 单条列表项的**实际**行高：按内容排版结果计算。
 ///
@@ -5768,6 +5829,17 @@ pub const IMG_MAX_H_LIST: f32 = 108.0;
 /// - 图片（`image_inline` 开）= 缩略图显示高（限高 [`IMG_MAX_H_LIST`]）；
 /// - Markdown（`md_rendered` 开）= 排版实测高；
 /// - 其余 = 折行文本高。
+///
+/// # 图片分支的判据必须是 [`preview_is_image`]
+///
+/// 2026-10-17 修：这里原先写 `item.kind == ClipKind::Image`，于是从资源
+/// 管理器复制的图片**文件**（`ClipKind::Files`）走的是文本分支——行高按
+/// 文件名那一行算（~24pt），而绘制侧 [`draw_image_preview`] 受
+/// `band.height()` 约束，图就被压成一条细带（用户反馈「尺寸太小」）。
+/// 判据与绘制侧**必须同源**，两类条目共用 [`image_display_size`]。
+///
+/// `known_dims` 是 [`UiState::thumb_dims`] 里已解码得到的尺寸：老条目
+/// 的载荷里没有 `dims`，只能靠它排图（第一次解码后行高才对）。
 fn row_height_for(
     ui: &egui::Ui,
     item: &ClipItem,
@@ -5775,6 +5847,7 @@ fn row_height_for(
     scale: f32,
     text_w: f32,
     cfg: &modular_clipboard_core::config::UiConfig,
+    known_dims: Option<(u32, u32)>,
 ) -> f32 {
     let preview_font = sized(pal.font_md, scale);
     let meta_font = sized(pal.font_xs, scale);
@@ -5788,16 +5861,21 @@ fn row_height_for(
     let top_h = row_top_height(pal);
 
     // ---- 内容高：图片 / Markdown / 文本三分支 ----
-    let content_h = if item.kind == modular_clipboard_core::ClipKind::Image
-        && cfg.image_inline
-        && let Some(dims) = item.payload.as_ref().and_then(|p| p.dims)
-        && dims.0 > 0
-        && dims.1 > 0
+    // 尺寸两个来源，都不需要当场解码：
+    // - `payload.dims`：入库时读的图片头（文件型由
+    //   `app::first_image_file_dims` 补齐）；
+    // - `known_dims`：上一次解码记下的真实尺寸（老条目缺前者时靠它）。
+    let content_h = if cfg.image_inline
+        && preview_is_image(item)
+        && let Some(dims) = item
+            .payload
+            .as_ref()
+            .and_then(|p| p.dims)
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .or(known_dims.filter(|(w, h)| *w > 0 && *h > 0))
     {
-        // 缩略图显示高：限高 IMG_MAX_H_LIST，宽不超预览带（保持长宽比）。
-        // dims 来自 store 插入时读的图片头，**不需要解码**——
-        // 行高是每帧都要算的（滚动数学），为它解码全图太贵。
-        IMG_MAX_H_LIST.min(text_w * dims.1 as f32 / dims.0 as f32)
+        // 缩略图显示高：与 [`draw_image_preview`] 共用算式。
+        image_display_size(dims, text_w, IMG_MAX_H_LIST).1
     } else if item.kind == modular_clipboard_core::ClipKind::Markdown && cfg.md_rendered {
         crate::md::MdDoc::parse(&item.preview).height(ui, pal, scale, text_w)
     } else {
@@ -5842,7 +5920,7 @@ fn row_height_for(
 /// 个展示位：列表行只显示一行内的预览（缩略图 / 第一屏 Markdown），
 /// 详情面板给完整内容（缩略图占满宽、Markdown 全文）。
 ///
-/// 行高限制也不同于列表：列表行 `IMG_MAX_H_LIST ≈ 108pt` 防止单条
+/// 行高限制也不同于列表：列表行 `IMG_MAX_H_LIST`（160pt）防止单条
 /// 撑爆，本函数不限——内容带本身就被详情卡片高度约束，超长 Markdown
 /// 自动溢出滚动区。
 ///
@@ -5871,7 +5949,11 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     };
 
     // 原图模式：当前选中是图片、且 zoom 状态指向它——独占整张详情卡。
-    if item.kind == ClipKind::Image && f.state.detail_image_zoom == Some(item.id) {
+    //
+    // 判据用 [`preview_is_image`] 而不是 `kind == Image`：详情面板的
+    // 「放大」按钮对**文件型图片**也画（见上面的三分支），这里若只认
+    // `Image`，文件型点了放大没反应（按钮在了、功能没接上）。
+    if preview_is_image(&item) && f.state.detail_image_zoom == Some(item.id) {
         draw_detail_image_zoom(f, body, &item);
         return;
     }
@@ -5967,11 +6049,14 @@ fn clear_detail_image_zoom(f: &mut Frame<'_>) {
 /// `image_inline` 关闭或载荷被淘汰（无 dims）时不画——按钮的出现与
 /// 实际能进入原图模式的能力保持一致。
 fn draw_zoom_button(f: &mut Frame<'_>, pal: &Palette, item: &ClipItem) {
-    // 载荷被淘汰（无 dims）：缩略图也画不出来——按钮更不该出现。
+    // 判据 = 「能不能进原图模式」：尺寸要么在载荷里，要么是解码时记下的
+    // （老条目缺 `payload.dims`，解码后靠 [`UiState::thumb_dims`]）。
+    // 两条都没有 ⇒ 缩略图也画不出来，按钮更不该出现。
     let has_dims = item
         .payload
         .as_ref()
         .and_then(|p| p.dims)
+        .or_else(|| f.state.thumb_dims.get(&item.id).copied())
         .map(|(w, h)| w > 0 && h > 0)
         .unwrap_or(false);
     if !has_dims {
@@ -6930,17 +7015,15 @@ fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32
         draw_text_preview(f, band, item, false);
         return;
     };
-    let ratio = w as f32 / h as f32;
-    // 显示矩形：限高 max_h、限宽预览带，**两步都保持长宽比**。
+    // 显示矩形：与 [`row_height_for`] 共用 [`image_display_size`]
+    // （行高就是按它量出来的，这里再写一份算式必然漂移）。
     //
-    // CAUTION: 不能「高先定死、宽超了再截」——那会把图拉扁
-    // （painter.image 按 uv 0..1 把整张图填进矩形）。宽超限时必须
-    // 回头按比例缩高，否则极窄窗口下截图变成压扁的条。
-    let mut disp_h = max_h.min(band.height());
-    let mut disp_w = disp_h * ratio;
-    if disp_w > band.width() {
-        disp_w = band.width();
-        disp_h = disp_w / ratio;
+    // `max_h` 与 `band.height()` 取小：调用方给的限高只是「默认」，
+    // 带子本身更矮时（列表行按内容算出的行高）以带子为准。
+    let (disp_w, disp_h) = image_display_size((w, h), band.width(), max_h.min(band.height()));
+    if disp_w <= 0.0 || disp_h <= 0.0 {
+        draw_text_preview(f, band, item, false);
+        return;
     }
     let rect = Rect::from_min_size(band.min, vec2(disp_w, disp_h));
 
@@ -6960,9 +7043,6 @@ fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32
         egui::StrokeKind::Inside,
     );
 }
-
-/// 缩略图的最长边（列表与详情共用）。
-const THUMB_MAX_EDGE: u32 = 256;
 
 /// 文件型图片**读盘**的大小上限（字节）。
 ///
@@ -7109,7 +7189,7 @@ fn preview_image_thumb(
                 return None;
             }
         };
-        match crate::thumbnail::decode_auto(&bytes, dims, THUMB_MAX_EDGE) {
+        match crate::thumbnail::decode_auto(&bytes, dims, crate::thumbnail::THUMB_MAX_EDGE) {
             Ok(t) => Some(std::sync::Arc::new(t)),
             Err(e) => {
                 tracing::debug!(id, ?e, "缩略图解码失败，回落文本预览");
@@ -9843,7 +9923,7 @@ fn with_pinned(mut self, n: usize) -> Self {
                 "test".into(),
             );
             let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                *h = row_height_for(ui, &item, &pal, 1.0, 200.0, &cfg);
+                *h = row_height_for(ui, &item, &pal, 1.0, 200.0, &cfg, None);
             });
             // IMPORTANT: 必须 `clear()`：排版会往纹理图集里加新字形，
             // `FullOutput` 被 drop 时若还带着未应用的 deltas，egui 会 panic
@@ -9889,15 +9969,153 @@ fn with_pinned(mut self, n: usize) -> Self {
                 len: 1024,
                 dims: Some((1920, 1080)),
             });
-            h = row_height_for(ui, &item, &pal, 1.0, 600.0, &cfg);
+            h = row_height_for(ui, &item, &pal, 1.0, 600.0, &cfg, None);
         });
         out.textures_delta.clear();
-        // 600pt 宽的带、16:9 的图：显示高 = min(108, 600*1080/1920=337.5) = 108。
-        let expect = 108.0 + pal.font_xs.max(10.0) + row_top_height(&pal) + 5.0 * 2.0 + 4.0;
+        // 600pt 宽的带、16:9 的图：显示高 = min(IMG_MAX_H_LIST, 600*1080/1920=337.5)
+        // = IMG_MAX_H_LIST（限高生效）。
+        let expect = IMG_MAX_H_LIST + pal.font_xs.max(10.0) + row_top_height(&pal) + 5.0 * 2.0 + 4.0;
         assert!(
             (h - expect).abs() < 0.6,
-            "图片行高应等于 图高108 + 固定段（{expect}），实际 {h}"
+            "图片行高应等于 图高{IMG_MAX_H_LIST} + 固定段（{expect}），实际 {h}"
         );
+    }
+
+    /// 文件型图片（从资源管理器复制的 `.png`）的行高也必须走图片算式。
+    ///
+    /// 2026-10-17 实测缺陷：`row_height_for` 的图片分支只认
+    /// `kind == ClipKind::Image`，文件型条目按**文件名文本**算行高
+    /// （~24pt），而绘制侧受 `band.height()` 约束 ⇒ 缩略图被压成一条
+    /// 细带（用户反馈「尺寸太小」）。这条测试钉死「两类条目同一算式」。
+    #[test]
+    fn row_height_uses_thumbnail_height_for_image_files() {
+        let ctx = settled_ctx();
+        let pal = crate::theme::Palette::dark();
+        let cfg = modular_clipboard_core::config::UiConfig::default();
+        let mut file_h = 0.0_f32;
+        let mut img_h = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            // 同一尺寸、同一文本，只有 kind / preview 不同。
+            let mut file_item = modular_clipboard_core::ClipItem::new(
+                modular_clipboard_core::ClipKind::Files,
+                "h".into(),
+                "wallpaper.png".into(),
+                "test".into(),
+            );
+            file_item.payload = Some(modular_clipboard_core::PayloadRef {
+                file: "h.bin".into(),
+                len: 4096,
+                // 入库侧 `first_image_file_dims` 读文件头补齐的尺寸。
+                dims: Some((1920, 1080)),
+            });
+            let mut img_item = file_item.clone();
+            img_item.kind = modular_clipboard_core::ClipKind::Image;
+
+            file_h = row_height_for(ui, &file_item, &pal, 1.0, 600.0, &cfg, None);
+            img_h = row_height_for(ui, &img_item, &pal, 1.0, 600.0, &cfg, None);
+        });
+        out.textures_delta.clear();
+        assert!(
+            (file_h - img_h).abs() < 0.01,
+            "文件型图片的行高应与剪贴板图片一致：文件={file_h} 图片={img_h}"
+        );
+        // 且必须显著高于「文件名一行」的行高——否则说明又跌回文本分支。
+        let mut text_h = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut text_item = modular_clipboard_core::ClipItem::new(
+                modular_clipboard_core::ClipKind::Files,
+                "h".into(),
+                "wallpaper.png".into(),
+                "test".into(),
+            );
+            // 无 dims：图也画不出来，只能按文本排。
+            text_item.payload = Some(modular_clipboard_core::PayloadRef {
+                file: "h.bin".into(),
+                len: 4096,
+                dims: None,
+            });
+            text_h = row_height_for(ui, &text_item, &pal, 1.0, 600.0, &cfg, None);
+        });
+        out.textures_delta.clear();
+        assert!(
+            file_h > text_h + 60.0,
+            "文件型图片行高（{file_h}）应远高于纯文本行高（{text_h}）"
+        );
+    }
+
+    /// 老条目（载荷里没有 `dims`）：解码记下的尺寸也能把行高撑起来。
+    ///
+    /// 这是 2026-10-17 那批「文件型图片」的兜底路径——入库侧
+    /// `first_image_file_dims` 只对**新**条目补齐，此前已入库的老条目
+    /// 只能等第一次解码后靠 `thumb_dims` 排版。
+    #[test]
+    fn row_height_falls_back_to_decoded_dims() {
+        let ctx = settled_ctx();
+        let pal = crate::theme::Palette::dark();
+        let cfg = modular_clipboard_core::config::UiConfig::default();
+        let mut without = 0.0_f32;
+        let mut with = 0.0_f32;
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let mut item = modular_clipboard_core::ClipItem::new(
+                modular_clipboard_core::ClipKind::Files,
+                "h".into(),
+                "old.png".into(),
+                "test".into(),
+            );
+            item.payload = Some(modular_clipboard_core::PayloadRef {
+                file: "h.bin".into(),
+                len: 4096,
+                dims: None, // 老条目：入库时没记尺寸
+            });
+            without = row_height_for(ui, &item, &pal, 1.0, 600.0, &cfg, None);
+            with = row_height_for(ui, &item, &pal, 1.0, 600.0, &cfg, Some((1920, 1080)));
+        });
+        out.textures_delta.clear();
+        assert!(
+            with > without + 60.0,
+            "拿到解码尺寸后行高应显著变高：之前={without} 之后={with}"
+        );
+    }
+
+    /// 显示尺寸算式：限高与限宽两步都保持长宽比，且**不放大**。
+    #[test]
+    fn image_display_size_keeps_aspect_ratio() {
+        // 16:9 宽图：限高生效 ⇒ 高=限高、宽按比例。
+        let (w, h) = image_display_size((1920, 1080), 600.0, 160.0);
+        assert!((h - 160.0).abs() < 0.01, "限高生效：h={h}");
+        assert!((w - 160.0 * 16.0 / 9.0).abs() < 0.5, "宽按比例：w={w}");
+
+        // 窄带：限高算出的宽超出带子 ⇒ 改由限宽决定，高按比例回缩
+        // （不能只截宽——那会把图拉扁）。
+        let (w, h) = image_display_size((1920, 1080), 200.0, 160.0);
+        assert!((w - 200.0).abs() < 0.01, "限宽生效：w={w}");
+        assert!((h - 200.0 * 9.0 / 16.0).abs() < 0.5, "高按比例回缩：h={h}");
+
+        // 退化尺寸：返回 0 而不是 NaN（除零会让整个行高变 NaN）。
+        assert_eq!(image_display_size((0, 100), 200.0, 160.0), (0.0, 0.0));
+    }
+
+    /// 缩略图纹理分辨率必须够「限高 × 2x DPI」，否则放大显示是糊的。
+    ///
+    /// 2026-10-17：`IMG_MAX_H_LIST` 从 108 提到 160 时，`THUMB_MAX_EDGE`
+    /// 仍是 256 —— 200% 缩放下需要 320px，纹理不够就只能放大插值。
+    /// 两个常量分开在两个文件里，改一个忘另一个不会编译报错，只能靠
+    /// 这条测试钉住（`const` 块 ⇒ 编译期就失败）。
+    #[test]
+    fn thumbnail_resolution_covers_display_size_at_2x_dpi() {
+        const {
+            assert!(
+                crate::thumbnail::THUMB_MAX_EDGE as f32 >= crate::paint::IMG_MAX_H_LIST * 2.0,
+                "缩略图最长边必须 ≥ 列表限高 × 2（DPI 200%），否则放大显示会糊"
+            );
+        }
+        // 顺带：限高必须为正，否则图片行高会退化成纯文本行（编译期）。
+        const {
+            assert!(
+                crate::paint::IMG_MAX_H_LIST > 0.0,
+                "限高必须为正，否则图片行高会退化成纯文本行"
+            );
+        }
     }
 
     // ---- 文件型图片（从资源管理器复制的图片文件）----
@@ -10052,7 +10270,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut md_h = 0.0_f32;
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
             md_h = crate::md::MdDoc::parse(src).height(ui, &pal, 1.0, 400.0);
-            rendered = row_height_for(ui, &item, &pal, 1.0, 400.0, &cfg);
+            rendered = row_height_for(ui, &item, &pal, 1.0, 400.0, &cfg, None);
         });
         out.textures_delta.clear();
         let fixed = pal.font_xs.max(10.0) + row_top_height(&pal) + 5.0 * 2.0 + 4.0;
@@ -10064,7 +10282,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         cfg.md_rendered = false;
         let mut source = 0.0_f32;
         let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            source = row_height_for(ui, &item, &pal, 1.0, 400.0, &cfg);
+            source = row_height_for(ui, &item, &pal, 1.0, 400.0, &cfg, None);
         });
         out.textures_delta.clear();
         assert!(

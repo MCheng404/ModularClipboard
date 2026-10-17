@@ -23,14 +23,20 @@ use modular_clipboard_core::EntryId;
 /// 缩略图最长边上限（像素）。
 ///
 /// 原图保留在 blob 里按需查看，这里只给界面显示用的小图。
-/// 256px 在 1xDPI 下约一个详情面板的宽度，足够看清缩略内容；
-/// 再大只是浪费显存（RGBA8 下256×256 = 256KB，不缩则 4K 图要 32MB）。
-pub const THUMB_MAX_EDGE: u32 = 256;
+///
+/// 2026-10-17 从 256 提到 512：列表缩略图限高 160pt
+/// （[`crate::paint::IMG_MAX_H_LIST`]），200%/250% 缩放的屏上折算成
+/// 320~400 物理像素，256px 的纹理被放大显示就是糊的——缩略图的分辨率
+/// 必须按「显示尺寸 × DPI」给，不能按 1x 给。
+///
+/// 代价：单张从 256KB 涨到 1MB（512×512 RGBA8），32MiB 预算约可留 32 张
+/// ——远多于同屏可见行数，LRU 淘汰照旧生效。
+pub const THUMB_MAX_EDGE: u32 = 512;
 
 /// 缓存默认字节预算（32 MiB）。
 ///
-/// 按每张 256KB 估算约可留 128 张。剪贴板历史里图片通常远少于这个数，
-/// 预算的作用是「防止极端情况下（连续复制大图）无上限增长」。
+/// 按每张 1MB（512×512 RGBA8）估算约可留 32 张。剪贴板历史里图片通常
+/// 远少于这个数，预算的作用是「防止极端情况下（连续复制大图）无上限增长」。
 pub const DEFAULT_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// 单个载荷的字节上限，超过则不尝试解码。
@@ -705,8 +711,12 @@ mod tests {
     fn decode_downscales_large_png() {
         let png = encode_png(1920, 1080);
         let t = decode(&png, THUMB_MAX_EDGE).unwrap();
-        assert_eq!((t.width, t.height), (256, 144));
-        assert_eq!(t.pixels.len(), 256 * 144 * 4);
+        // 期望值按 [`fit_within`] 算，不硬编码像素数——否则调
+        // `THUMB_MAX_EDGE` 时这条测试会假失败。
+        let (w, h) = fit_within(1920, 1080, THUMB_MAX_EDGE).unwrap();
+        assert!(w < 1920, "1920 宽的图必须被缩小（w={w}）");
+        assert_eq!((t.width, t.height), (w, h));
+        assert_eq!(t.pixels.len(), w as usize * h as usize * 4);
     }
 
     #[test]
@@ -856,7 +866,8 @@ mod tests {
             Ok(raw_rgba(300, 200, [5, 6, 7, 255]))
         };
         let t = c.get_or_load_auto(k.clone(), Some((300, 200)), load).unwrap();
-        assert_eq!((t.width, t.height), (256, 171));
+        let expect = fit_within(300, 200, THUMB_MAX_EDGE).unwrap();
+        assert_eq!((t.width, t.height), expect);
         let t2 = c.get_or_load_auto(k, Some((300, 200)), load).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "命中缓存不应再次 load");
         assert_eq!(t, t2);
@@ -1059,11 +1070,12 @@ mod tests {
     fn decode_reports_post_resize_dimensions_not_source() {
         // 回归测试：曾把**原图**尺寸填进 Thumbnail，
         // 而像素是缩放后的。于是 1920×1080 的图被标成 1920×1080
-        // 却只带256×144 的像素 —— `to_color_image` 按 width 切分
+        // 却只带缩小后的像素 —— `to_color_image` 按 width 切分
         // `chunks_exact(4)` 时数量对不上，`ColorImage` 与实际像素
         // 不一致，渲染层按 1920 宽读会越界。
         let t = decode(&encode_png(1920, 1080), THUMB_MAX_EDGE).unwrap();
-        assert_eq!((t.width, t.height), (256, 144));
+        let (w, h) = fit_within(1920, 1080, THUMB_MAX_EDGE).unwrap();
+        assert_eq!((t.width, t.height), (w, h));
         // 自洽性：声明的尺寸必须与像素长度精确吻合。
         assert_eq!(
             t.pixels.len(),
@@ -1072,8 +1084,8 @@ mod tests {
         );
         //顺带验证 egui 侧不会因此panic。
         let ci = t.to_color_image();
-        assert_eq!(ci.size, [256, 144]);
-        assert_eq!(ci.pixels.len(), 256 * 144);
+        assert_eq!(ci.size, [w as usize, h as usize]);
+        assert_eq!(ci.pixels.len(), w as usize * h as usize);
     }
 
     #[test]
