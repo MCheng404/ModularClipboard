@@ -31,7 +31,7 @@ use modular_clipboard_core::config::{RowMetaPart, WindowBackdrop};
 
 use crate::card::{Card, CardHost, CardKind, PinnedMode};
 use crate::icons::Icon;
-use crate::theme::{Palette, sized};
+use crate::theme::{Palette, TokenValue, sized};
 use crate::workspace::Workspace;
 
 /// 卡片边框宽度（逻辑点）。
@@ -133,6 +133,34 @@ pub enum Op {
     /// 由 `App::apply_ops` 落地：更新 `App.pal` 并重灌主窗口 `Visuals`；
     /// 设置窗口的 `Visuals` 由 `settingswin` 每帧从 `App.pal` 同步。
     SetThemeMode(crate::theme::ThemeMode),
+    /// 设置主题强调色（`None` = 恢复主题内置默认蓝）。
+    ///
+    /// 落地时重跑主题解析链（`theme::resolve_palette`）并走 220ms
+    /// 补间——与 [`Op::SetThemeMode`] 同一套机制，换色不该是硬切。
+    SetAccent(Option<modular_clipboard_core::config::AccentColor>),
+    /// 切换二级主题（无 / 纸质纹理 / 护眼绿 / 星空紫 / OLED）。
+    ///
+    /// 二级主题在深浅两套基底下各有一套目标色板，一级切换时自动
+    /// 落到对应变体（见 `theme::apply_secondary`）。
+    SetSecondaryTheme(modular_clipboard_core::config::SecondaryTheme),
+    /// 整包替换二级主题参数（两个旋钮可能同帧连改）。
+    ///
+    /// 同 [`Op::SetCardShadow`]：整包替换，避免一次拖动写两次盘。
+    SetThemeParams(modular_clipboard_core::config::ThemeParams),
+    /// 覆盖单个主题令牌（高级微调：任何元素任何参数都可调）。
+    ///
+    /// 颜色令牌进 `theme_overrides.colors`、数值令牌进 `.nums`；
+    /// 落地即重跑解析链，覆盖优先级最高（见 `theme::resolve_palette`）。
+    SetTokenOverride {
+        /// 令牌名（`theme::Palette::tokens()` 的键）。
+        name: String,
+        /// 目标值。
+        value: crate::theme::TokenValue,
+    },
+    /// 清除单个令牌覆盖（恢复解析链派生值）。
+    ClearTokenOverride(String),
+    /// 清空全部令牌覆盖。
+    ClearAllTokenOverrides,
     /// 设置全局快捷键绑定（写入配置）。
     ///
     /// NOTE: 当前托盘线程注册的是硬编码 `DEFAULT_HOTKEY`，配置里的
@@ -303,7 +331,14 @@ pub enum SettingsCat {
     /// 常规：窗口行为。
     #[default]
     General,
-    /// 外观：主题 / 背景效果。
+    /// 主题：一级深浅 / 主题色 / 二级主题 / 高级微调。
+    ///
+    /// 2026-10-18 从「外观」拆出：主题层（一级 → 二级 → 强调色 →
+    /// 令牌覆盖）自成一张关注点卡，且令牌编辑器有近 60 行——混在
+    /// 外观卡里会把背景效果 / 卡片阴影挤出一屏（热区登记跳过不可见
+    /// 控件，回归测试全线飘红）。
+    Theme,
+    /// 外观：背景效果 / 卡片阴影等窗口与列表观感。
     Appearance,
     /// 捕获：剪贴板记录行为。
     Capture,
@@ -319,8 +354,9 @@ pub enum SettingsCat {
 
 impl SettingsCat {
     /// 全部分类（导航顺序）。
-    pub const ALL: [SettingsCat; 7] = [
+    pub const ALL: [SettingsCat; 8] = [
         SettingsCat::General,
+        SettingsCat::Theme,
         SettingsCat::Appearance,
         SettingsCat::Capture,
         SettingsCat::Storage,
@@ -333,6 +369,7 @@ impl SettingsCat {
     pub fn title(self) -> &'static str {
         match self {
             SettingsCat::General => "常规",
+            SettingsCat::Theme => "主题",
             SettingsCat::Appearance => "外观",
             SettingsCat::Capture => "捕获",
             SettingsCat::Storage => "存储",
@@ -346,6 +383,9 @@ impl SettingsCat {
     pub fn icon(self) -> crate::icons::Icon {
         match self {
             SettingsCat::General => crate::icons::Icon::Settings,
+            // 主题分类用自绘调色板（图标字体的 PUA 码位已占满，新增
+            // 字形要重新生成 TTF——见 draw_settings_nav 的特判）。
+            SettingsCat::Theme => crate::icons::Icon::Settings,
             SettingsCat::Appearance => crate::icons::Icon::Image,
             SettingsCat::Capture => crate::icons::Icon::Text,
             SettingsCat::Storage => crate::icons::Icon::Table,
@@ -359,6 +399,7 @@ impl SettingsCat {
     pub fn hot_key(self) -> &'static str {
         match self {
             SettingsCat::General => "settings_cat_general",
+            SettingsCat::Theme => "settings_cat_theme",
             SettingsCat::Appearance => "settings_cat_appearance",
             SettingsCat::Capture => "settings_cat_capture",
             SettingsCat::Storage => "settings_cat_storage",
@@ -372,6 +413,7 @@ impl SettingsCat {
     pub fn reset_key(self) -> &'static str {
         match self {
             SettingsCat::General => "settings_reset_general",
+            SettingsCat::Theme => "settings_reset_theme",
             SettingsCat::Appearance => "settings_reset_appearance",
             SettingsCat::Capture => "settings_reset_capture",
             SettingsCat::Storage => "settings_reset_storage",
@@ -436,6 +478,37 @@ pub struct UiState {
     /// 滚动时等于每帧重算全部行高。尺寸一条只有 16 字节，常驻更划算，
     /// 而且它是**行高**的输入：老条目（`payload.dims` 缺失）全靠它排图。
     pub thumb_dims: std::collections::HashMap<modular_clipboard_core::EntryId, (u32, u32)>,
+    /// 二级主题「纸质纹理」的程序化纤维 tile（惰性生成，见
+    /// [`crate::tex::paper_tile`]）。
+    ///
+    /// `None` = 本会话还没画过纸质主题。切到别的主题时**不清**：
+    /// 一份 96×96 白底纹理不到 40KB，来回切主题不值得反复生成；
+    /// 真正的释放发生在 `UiState` 丢弃（窗口关闭）时 `TextureHandle`
+    /// 的 `Drop` 里。
+    ///
+    /// CAUTION: 不能每帧 `load_texture`——同名覆盖语义虽然正确，但
+    /// 每帧上传 36KB 像素 + 走一次纹理管理器的写锁，纯浪费。
+    pub paper_tex: Option<egui::TextureHandle>,
+    /// 二级主题「星空紫」的程序化星点 tile。语义同 [`UiState::paper_tex`]。
+    pub star_tex: Option<egui::TextureHandle>,
+    /// 主题色十六进制输入框的草稿。
+    ///
+    /// # 为什么需要「焦点感知」的同步
+    ///
+    /// 输入框没焦点时，每帧把草稿覆写为当前色的 hex——用户点预设
+    /// 色块、拖 HSV 滑条时，输入框跟着显示新值。有焦点时（用户正在
+    /// 打字）绝不能覆写，否则输一个字符就被打回原色。
+    ///
+    /// 打字中途的非法输入（如只敲了 `#F`）不清除已选颜色：
+    /// [`AccentColor::from_hex`] 返回 `None` 时保持原值。
+    pub accent_hex: String,
+    /// 「高级微调」令牌编辑器是否展开（默认收起）。
+    ///
+    /// 令牌表有近 60 行，平铺会把主题卡撑到五屏以上——而它 95% 的
+    /// 用户一辈子不需要打开（二级主题的旋钮已覆盖常见需求）。默认
+    /// 收起显示摘要，需要时一键展开。折叠态**不绘制**令牌行，也就
+    /// 不注册它们的热区（与「只登记部分可见控件」的约定一致）。
+    pub theme_tokens_expanded: bool,
     /// 搜索框是否展开（顶栏右侧图标折叠式搜索）。
     ///
     /// 折叠时顶栏只显示一枚放大镜图标（贴近窗口按钮），左侧整片
@@ -957,6 +1030,16 @@ pub fn draw(f: &mut Frame<'_>) {
     // 背景必须铺满整个客户区，否则窗口边缘会露出 clear color。
     f.ui.painter().rect_filled(area, 0.0, f.pal.bg);
 
+    // 二级主题的**质感层**（纸质纤维 / 星空星点）：紧跟背景、先于
+    // 一切内容。颜色层由 `theme::apply_secondary` 在调色板解析时
+    // 完成，这一层只补「程序化纹理」那一半。
+    //
+    // CAUTION: 磨砂 / 半透明模式下 `bg` 是半透明的（模糊底图透出来），
+    // 纹理画在它之上仍然正确——tint alpha 很低，只是加一层墨，
+    // 不会盖住底图。且本层**不参与**磨砂的抓图（磨砂抓的是窗口
+    // 身后的桌面，不是自己画的内容），不存在反馈回路。
+    draw_theme_texture(f);
+
     let top = Rect::from_min_max(
         pos2(area.min.x, area.min.y),
         pos2(area.max.x, area.min.y + crate::solver::TOPBAR_HEIGHT),
@@ -997,6 +1080,90 @@ pub fn draw(f: &mut Frame<'_>) {
     // NOTE: 设置界面同样不在这里画（独立窗口，见 `settingswin`）。
 
     draw_notice_toast(f);
+}
+
+/// 二级主题的质感层：纸质纤维 / 星空星点。
+///
+/// 与颜色层（`theme::apply_secondary`）分工：那里换**整套令牌**，
+/// 这里补程序化纹理。判据是配置里的 `secondary_theme` 与参数
+/// （`paper_texture` / `purple_stars`，0 时整层不画——省一次
+/// draw call）。
+///
+/// # 为什么只在主窗口画
+///
+/// 纹理 id 是**每个 `egui::Context` 独立**的：主窗口 ctx 加载的
+/// tile 直接拿到设置窗口 / 弹窗的 ctx 上画会显示成别的纹理（或空白）。
+/// 要么每窗口各缓存一份（`UiState` 要按窗口分槽，纹理翻倍），要么
+/// 接受「设置窗口没有质感层」。选后者：设置窗口是工具页，用户盯着
+/// 看的是主窗口；且**颜色层完全同步**（`settingswin` 每帧从
+/// `App.palette()` apply），二级主题的色温在设置窗口里一样看得到。
+///
+/// # tint 的取色
+///
+/// tile 是白底、alpha 起伏（见 [`crate::tex`] 的说明），颜色由 tint
+/// 乘入，所以深浅两套共用一份纹理：
+/// - 纸质深色：暖白墨（纤维比纸基亮一点，读出「一丝一丝」的反光）；
+/// - 纸质浅色：暖棕墨（印刷纸的纤维是深色的）；
+/// - 星空：纯白，密度即 tint alpha。
+fn draw_theme_texture(f: &mut Frame<'_>) {
+    use modular_clipboard_core::config::SecondaryTheme;
+    let ui = &f.svc.state.config.ui;
+    match ui.secondary_theme {
+        SecondaryTheme::Paper => {
+            let k = ui.theme_params.paper_texture.clamp(0.0, 1.0);
+            if k <= 0.004 {
+                return;
+            }
+            let tex = match &f.state.paper_tex {
+                Some(t) => t.clone(),
+                None => {
+                    let t = crate::tex::paper_tile(f.ui.ctx());
+                    f.state.paper_tex = Some(t.clone());
+                    t
+                }
+            };
+            // 墨色强度：深色下更弱（亮纤维在暗底上更显眼），浅色下
+            // 略强（深纤维在亮底上需要更实才读得出）。
+            let (ir, ig, ib, base_a) = if f.pal.is_dark {
+                (235u8, 220u8, 195u8, 14.0)
+            } else {
+                (112u8, 94u8, 66u8, 18.0)
+            };
+            let a = (base_a * k).round() as u8;
+            crate::tex::paint_tiled(
+                f.ui.painter(),
+                f.area,
+                &tex,
+                egui::Color32::from_rgba_unmultiplied(ir, ig, ib, a),
+                crate::tex::PAPER_TILE_PT,
+            );
+        }
+        SecondaryTheme::Purple => {
+            let k = ui.theme_params.purple_stars.clamp(0.0, 1.0);
+            if k <= 0.004 {
+                return;
+            }
+            let tex = match &f.state.star_tex {
+                Some(t) => t.clone(),
+                None => {
+                    let t = crate::tex::star_tile(f.ui.ctx());
+                    f.state.star_tex = Some(t.clone());
+                    t
+                }
+            };
+            // 星点亮度跟随密度（密度 0 = 关，1 = 满亮）——星空主题的
+            // 「星点密度」同时控制可见数量感与亮度，比只调 alpha 更直观。
+            let a = (255.0 * k).round() as u8;
+            crate::tex::paint_tiled(
+                f.ui.painter(),
+                f.area,
+                &tex,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, a),
+                crate::tex::STAR_TILE_PT,
+            );
+        }
+        _ => {}
+    }
 }
 
 /// 类型过滤栏与主窗口的间距（逻辑点）。
@@ -2557,6 +2724,28 @@ fn draw_plug_icon(painter: &egui::Painter, r: egui::Rect, color: egui::Color32, 
     painter.line_segment([u(8.0, 11.0), u(8.0, 14.5)], stroke);
 }
 
+/// 自绘调色板图标（「主题」分类导航项）。
+///
+/// 三个色圆点 + 一道斜笔：既读出「调色板」的形状，又暗示「多个颜色
+/// 可选」。用**当前主题的明暗关系**取色（而不是固定红黄蓝）——导航
+/// 图标跟着主题走，切到 OLED / 纸质时不会出现一个刺眼的原色块。
+///
+/// CAUTION: 三个点必须用不透明色：透明点在磨砂卡片上会透出底图，
+/// 小尺寸下糊成一团。
+fn draw_palette_icon(painter: &egui::Painter, r: egui::Rect, color: egui::Color32) {
+    let u = |x: f32, y: f32| -> egui::Pos2 { pos2(r.min.x + x, r.min.y + y) };
+    let rad = 2.6_f32;
+    // 三点错位排布（上二下一），避免一条直线的呆板感。
+    painter.circle_filled(u(4.6, 5.0), rad, color);
+    painter.circle_filled(u(11.4, 4.2), rad, color);
+    painter.circle_filled(u(8.0, 10.6), rad, color);
+    // 一道斜笔（画家的笔触感），从左上划到右下。
+    painter.line_segment(
+        [u(3.0, 13.2), u(13.0, 13.2)],
+        egui::Stroke::new(1.4, color),
+    );
+}
+
 fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
     let pal = f.pal;
     let painter = f.ui.painter_at(nav_rect);
@@ -2627,10 +2816,13 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
             if selected { pal.text_bright } else { pal.text_dim },
             std::time::Duration::from_millis(130),
         );
-        // 「通信」用自绘插头（图标字体里没有插头字形，新增需重新生成
-        // TTF，成本高）：头 + 两个脚 + 线。其余分类用字体图标。
+        // 「通信」用自绘插头、「主题」用自绘调色板（图标字体的 PUA
+        // 码位已占满，新增字形要重新生成 TTF，成本高）：头 + 两个脚
+        // + 线。其余分类用字体图标。
         if *cat == SettingsCat::Comm {
             draw_plug_icon(&painter, icon_r, icon_color, pal.stroke_normal);
+        } else if *cat == SettingsCat::Theme {
+            draw_palette_icon(&painter, icon_r, icon_color);
         } else {
             cat.icon().paint(&painter, icon_r, icon_color);
         }
@@ -2729,6 +2921,25 @@ enum ItemKind {
     PinnedMode,
     /// 主题单选（跟随系统 / 深色 / 浅色）。
     Theme,
+    /// 主题强调色：预设色板 + HSV 滑条 + 十六进制输入 + 恢复默认。
+    ///
+    /// 独立成变体：这是「一个配置字段 + 三种调节方式」的富编辑器，
+    /// `Bool`/`Number` 的通用渲染表达不了色板与多滑条。
+    Accent,
+    /// 二级主题选择（无 / 纸质纹理 / 护眼绿 / 星空紫 / OLED）。
+    ///
+    /// 与 [`ItemKind::Backdrop`] 同款分段控件，只是选项是风格层。
+    SecondaryTheme,
+    /// 当前二级主题的参数旋钮（按 `SecondaryTheme::knobs()` 动态生成）。
+    ///
+    /// 二级主题选「无」时整项禁用并压暗——与磨砂强度在非磨砂模式下
+    /// 禁用的处理一致（见 [`ItemKind::BlurStrength`]）。
+    ThemeParams,
+    /// 令牌级覆盖编辑器（高级微调）：列出全部主题令牌，逐项可调。
+    ///
+    /// 「界面上任何元素、任何参数都允许自由调整」的最终出口：二级
+    /// 主题的旋钮覆盖常见需求，这里覆盖其余一切。
+    TokenOverrides,
     /// 背景效果单选（无 / 磨砂 / 半透明）。
     Backdrop,
     /// 背景不透明度滑块。
@@ -2929,6 +3140,17 @@ impl SettingsItem {
             }
             ItemKind::PinnedMode => ws.pinned_mode() != PinnedMode::SharedColumn,
             ItemKind::Theme => cfg.ui.dark_mode.is_some(),
+            ItemKind::Accent => cfg.ui.accent.is_some(),
+            ItemKind::SecondaryTheme => {
+                cfg.ui.secondary_theme != modular_clipboard_core::config::SecondaryTheme::None
+            }
+            ItemKind::ThemeParams => {
+                cfg.ui.theme_params != modular_clipboard_core::config::ThemeParams::default()
+            }
+            ItemKind::TokenOverrides => {
+                !cfg.ui.theme_overrides.colors.is_empty()
+                    || !cfg.ui.theme_overrides.nums.is_empty()
+            }
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
@@ -2972,6 +3194,14 @@ impl SettingsItem {
             }),
             ItemKind::PinnedMode => Some(Op::SetPinnedMode(PinnedMode::SharedColumn)),
             ItemKind::Theme => Some(Op::SetThemeMode(crate::theme::ThemeMode::FollowSystem)),
+            ItemKind::Accent => Some(Op::SetAccent(None)),
+            ItemKind::SecondaryTheme => Some(Op::SetSecondaryTheme(
+                modular_clipboard_core::config::SecondaryTheme::None,
+            )),
+            ItemKind::ThemeParams => Some(Op::SetThemeParams(
+                modular_clipboard_core::config::ThemeParams::default(),
+            )),
+            ItemKind::TokenOverrides => Some(Op::ClearAllTokenOverrides),
             ItemKind::Backdrop => Some(Op::SetBackdrop(WindowBackdrop::None)),
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
@@ -3076,14 +3306,40 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
         ],
     },
     SettingsCard {
-        cat: SettingsCat::Appearance,
-        title: "外观",
+        cat: SettingsCat::Theme,
+        title: "主题",
         items: &[
             SettingsItem {
-                label: "主题",
+                label: "明暗模式",
                 desc: "跟随系统 / 深色 / 浅色",
                 kind: ItemKind::Theme,
             },
+            SettingsItem {
+                label: "主题色",
+                desc: "强调色：预设色板 / 色相滑块 / 十六进制，三种方式任选",
+                kind: ItemKind::Accent,
+            },
+            SettingsItem {
+                label: "二级主题",
+                desc: "叠加在深浅模式上的风格层：纸质纹理 / 护眼绿 / 星空紫 / OLED",
+                kind: ItemKind::SecondaryTheme,
+            },
+            SettingsItem {
+                label: "二级主题参数",
+                desc: "当前二级主题的浓度与效果强度",
+                kind: ItemKind::ThemeParams,
+            },
+            SettingsItem {
+                label: "高级微调",
+                desc: "逐个令牌覆盖主题取值（任何元素、任何参数）",
+                kind: ItemKind::TokenOverrides,
+            },
+        ],
+    },
+    SettingsCard {
+        cat: SettingsCat::Appearance,
+        title: "外观",
+        items: &[
             SettingsItem {
                 label: "字体缩放",
                 desc: "界面文字大小（预设档位，即改即生效）",
@@ -3507,7 +3763,7 @@ fn shadow_param_row(
             ui.add(
                 egui::Label::new(egui::RichText::new(readout).color(f.pal.text_dim)),
             );
-            changed = draw_slider(f, ui, id_suffix, v, range, true);
+            changed = draw_slider(f, ui, id_suffix, "", v, range, true);
             // 剩余宽度给标签列（与 `setting_row` 同款布局，见其注释）。
             let rest = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
             ui.allocate_ui_with_layout(
@@ -3745,6 +4001,86 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 picked.is_some()
             });
         }
+        ItemKind::Accent => {
+            if draw_accent_editor(f, ui) {
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::SecondaryTheme => {
+            use modular_clipboard_core::config::SecondaryTheme;
+            setting_row(ui, it.label, it.desc, |ui| {
+                let picked = draw_segmented(
+                    f,
+                    ui,
+                    "secondary_theme",
+                    &[
+                        (SecondaryTheme::None, "无"),
+                        (SecondaryTheme::Paper, "纸质"),
+                        (SecondaryTheme::Green, "护眼"),
+                        (SecondaryTheme::Purple, "星空"),
+                        (SecondaryTheme::Oled, "OLED"),
+                    ],
+                    f.svc.state.config.ui.secondary_theme,
+                );
+                if let Some(t) = picked {
+                    f.state.push(Op::SetSecondaryTheme(t));
+                    record_recent(f, it.label);
+                }
+                picked.is_some()
+            });
+        }
+        ItemKind::ThemeParams => {
+            let theme = f.svc.state.config.ui.secondary_theme;
+            let mut params = f.svc.state.config.ui.theme_params;
+            let mut changed = false;
+            if theme.knobs().is_empty() {
+                // 没有二级主题：整项禁用并压暗（与磨砂强度在非磨砂模式下
+                // 禁用的处理一致——「关着还能调」会让用户以为参数没保存）。
+                let _ = setting_row(ui, it.label, it.desc, |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("先选择一个二级主题").color(f.pal.text_dim),
+                    ));
+                    false
+                });
+            } else {
+                // 摘要行：右侧显示当前主题名（参数归属一眼可见）。
+                let _ = setting_row(ui, it.label, it.desc, |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(theme.label()).color(f.pal.text_dim),
+                    ));
+                    false
+                });
+                // 旋钮按主题的 `knobs()` 动态生成：新增主题参数只用在
+                // core 侧登记，设置界面自动跟上（键名寻址测试守着）。
+                for knob in theme.knobs() {
+                    let mut v = params.get(knob.key).unwrap_or(0.5);
+                    ui.add_space(2.0);
+                    let c = shadow_param_row(
+                        f,
+                        ui,
+                        knob.key,
+                        knob.label,
+                        format!("{}%", (v * 100.0).round() as i32),
+                        &mut v,
+                        0.0..=1.0,
+                    );
+                    if c {
+                        params.set(knob.key, v);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                // 整包替换：两个旋钮可能同帧连改（见 Op::SetThemeParams）。
+                f.state.push(Op::SetThemeParams(params));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::TokenOverrides => {
+            if draw_token_overrides(f, ui) {
+                record_recent(f, it.label);
+            }
+        }
         ItemKind::Backdrop => {
             setting_row(ui, it.label, it.desc, |ui| {
                 let picked = draw_segmented(
@@ -3775,7 +4111,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     egui::RichText::new(format!("{}%", (op * 100.0).round() as i32))
                         .color(pal.text_dim),
                 ));
-                draw_slider(f, ui, "window_opacity", &mut op, 0.3..=1.0, enabled)
+                draw_slider(f, ui, "window_opacity", "", &mut op, 0.3..=1.0, enabled)
             });
             if changed && enabled {
                 f.state.push(Op::SetOpacity(op));
@@ -3908,6 +4244,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                         f,
                         ui,
                         "type_rail_size",
+                        "",
                         &mut size,
                         modular_clipboard_core::config::TYPE_RAIL_SIZE_MIN
                             ..=modular_clipboard_core::config::TYPE_RAIL_SIZE_MAX,
@@ -4441,10 +4778,17 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
 ///
 /// 点击轨道任意处跳转到该值，按住拖动连续调整。禁用态（如背景效果为
 /// 「无」时不透明度无意义）只绘制不交互，整体压暗。
+///
+/// # `variant`：同一 `id_suffix` 下的第几条滑条
+///
+/// 令牌编辑器里「色相 / 透明度」双滑条共用令牌名，靠本参数区分 Id。
+/// CAUTION: 不区分的话，同一帧两个矩形注册同一个 `Id`，后注册者赢得
+/// 交互——拖动 A 会连带动 B，且毫无征兆。空串 = 唯一滑条。
 fn draw_slider(
     f: &mut Frame<'_>,
     ui: &mut Ui,
     id_suffix: &'static str,
+    variant: &'static str,
     v: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     enabled: bool,
@@ -4460,7 +4804,7 @@ fn draw_slider(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
     let resp = ui.interact(
         rect,
-        egui::Id::new(("slider", id_suffix)),
+        egui::Id::new(("slider", id_suffix, variant)),
         if enabled {
             Sense::click_and_drag()
         } else {
@@ -4839,6 +5183,489 @@ fn draw_text_field(
         );
     }
     resp.changed()
+}
+
+/// 迷你文字按钮（设置页行内辅助动作：「恢复默认」「重置」等）。
+///
+/// 自绘理由同开关 / 滑块：纯平毛玻璃语言要统一，`egui::Button` 的
+/// 默认立体感与整体观感不符。悬停底色走 110ms 补间（与顶栏图标按钮
+/// 同一套机制，见 `icon_button` 附近的注释）。
+///
+/// # id_suffix 必须全局唯一
+///
+/// 同时是补间键与交互 Id——同一帧出现两个同名迷你按钮会共享交互与
+/// 动画状态（`draw_slider` 的 `variant` 参数是同一教训的行内版）。
+///
+/// # `hit`：热区登记开关
+///
+/// `Some(key)` 时把按钮矩形登记进热区表（自动化寻址用）；`None` 时
+/// 不登记——令牌行的「重置」按钮与色相滑条**共用令牌名**，都登记的
+/// 话后画的覆盖先画的（`hit` 是 HashMap），自动化就再也找不到滑条。
+/// 交互本身走 egui `Id`（`id_suffix`），与热区表无关。
+fn draw_mini_button(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    id_suffix: &'static str,
+    text: &str,
+    hit: Option<&'static str>,
+) -> bool {
+    let pal = f.pal;
+    let font = egui::FontId::proportional(pal.font_sm);
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), pal.text)
+        .rect
+        .width();
+    let size = vec2(text_w + 16.0, pal.control_height * 0.82);
+    let (r, _) = ui.allocate_exact_size(size, egui::Sense::empty());
+    let resp = ui.interact(r, egui::Id::new(("mini_btn", id_suffix)), Sense::click());
+    let p = ui.painter_at(r);
+    // 悬停补间（110ms OutCubic）：目标值由本帧是否悬停给出。
+    let hover = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("mini_btn_hover", id_suffix)),
+        if resp.hovered() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(110),
+        crate::anim::Ease::OutCubic,
+    );
+    // 先铺不透明底再叠半透明提亮（与类型栏按钮同一个理由：半透明
+    // 令牌不能直接当填充，见 `draw_type_rail` 的 CAUTION）。
+    p.rect_filled(r, pal.radius_sm, pal.surface_variant);
+    if hover > 0.004 {
+        p.rect_filled(r, pal.radius_sm, fade_color(pal.row_hover, hover));
+    }
+    p.rect_stroke(
+        r,
+        pal.radius_sm,
+        egui::Stroke::new(1.0, pal.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+    p.text(r.center(), Align2::CENTER_CENTER, text, font, pal.text);
+    if let Some(key) = hit {
+        f.hit_insert(key, r);
+    }
+    resp.clicked()
+}
+
+/// 主题强调色编辑器（「主题色」设置项）。
+///
+/// 三种调节方式（对应用户要求的「多中自定义调节颜色方式」）：
+/// 1. **预设色板**：10 个色块，单击即用——最常见的路径；
+/// 2. **HSV 滑条**：色相 / 饱和度 / 明度各一条——精细调节；
+/// 3. **十六进制输入**：`#RRGGBB`——从设计稿抄色。
+///
+/// 返回 `true` 表示本帧有改动（调用方 `record_recent`）。
+fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
+    use modular_clipboard_core::config::AccentColor;
+    let pal = f.pal;
+    let cur = f.svc.state.config.ui.accent;
+    let shown = cur.unwrap_or_else(AccentColor::default_blue);
+    let mut next = cur;
+    let mut changed = false;
+
+    // ---- 预览行：当前色块 + 来源 + hex ----
+    let rgb = shown.to_rgb();
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(48.0, 26.0), Sense::empty());
+        ui.painter_at(r)
+            .rect_filled(r, pal.radius_sm, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+        ui.add_space(8.0);
+        // 来源标注：预设 / 自定义 / 默认。比只显示颜色多一分确定性
+        // （用户看得知道自己用的是哪一个预设）。
+        let source = if cur.is_none() {
+            "默认"
+        } else if crate::theme::ACCENT_PRESETS
+            .iter()
+            .any(|(_, p)| AccentColor::from_rgb(*p).to_rgb() == rgb)
+        {
+            "预设"
+        } else {
+            "自定义"
+        };
+        ui.add(egui::Label::new(
+            egui::RichText::new(format!("{source}  {}", shown.to_hex())).color(pal.text_dim),
+        ));
+    });
+
+    // ---- 预设色板 ----
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space(1.0);
+        for (i, (name, prgb)) in crate::theme::ACCENT_PRESETS.iter().enumerate() {
+            let s = 20.0;
+            let (r, _) = ui.allocate_exact_size(vec2(s, s), Sense::empty());
+            let resp = ui.interact(r, egui::Id::new(("accent_preset", i)), Sense::click());
+            let selected = cur.is_some_and(|c| c.to_rgb() == *prgb);
+            let p = ui.painter_at(r);
+            p.rect_filled(
+                r,
+                pal.radius_sm,
+                egui::Color32::from_rgb(prgb[0], prgb[1], prgb[2]),
+            );
+            if selected {
+                // 选中圈：text_bright 描边（任何底色上都看得见）。
+                p.rect_stroke(
+                    r,
+                    pal.radius_sm,
+                    egui::Stroke::new(2.0, pal.text_bright),
+                    egui::StrokeKind::Inside,
+                );
+            } else if resp.hovered() {
+                p.rect_stroke(
+                    r,
+                    pal.radius_sm,
+                    egui::Stroke::new(1.0, pal.text_dim),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if resp.clicked() {
+                next = Some(AccentColor::from_rgb(*prgb));
+                changed = true;
+            }
+            // 热区键 = 预设名（全局唯一，同分段控件的约定）。
+            f.hit_insert(name, r);
+            ui.add_space(5.0);
+        }
+    });
+
+    // ---- HSV 滑条 ----
+    ui.add_space(4.0);
+    let mut hsv = shown;
+    let mut h = hsv.h;
+    if shadow_param_row(
+        f,
+        ui,
+        "accent_hue",
+        "色相",
+        format!("{:.0}°", h),
+        &mut h,
+        0.0..=360.0,
+    ) {
+        hsv.h = h;
+        next = Some(hsv);
+        changed = true;
+    }
+    let mut s = hsv.s;
+    if shadow_param_row(
+        f,
+        ui,
+        "accent_sat",
+        "饱和度",
+        format!("{}%", (s * 100.0).round() as i32),
+        &mut s,
+        0.0..=1.0,
+    ) {
+        hsv.s = s;
+        next = Some(hsv);
+        changed = true;
+    }
+    let mut v = hsv.v;
+    if shadow_param_row(
+        f,
+        ui,
+        "accent_val",
+        "明度",
+        format!("{}%", (v * 100.0).round() as i32),
+        &mut v,
+        0.0..=1.0,
+    ) {
+        hsv.v = v;
+        next = Some(hsv);
+        changed = true;
+    }
+
+    // ---- 十六进制输入 + 恢复默认 ----
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new("十六进制"));
+        ui.add_space(8.0);
+        // 草稿同步的焦点感知：无焦点时每帧覆写为当前色（点预设 / 拖滑条
+        // 后输入框跟着变），有焦点时保留用户输入（ rationale 见
+        // `UiState::accent_hex`）。非法半截输入不清除已选颜色。
+        let editing = ui.ctx().memory(|m| m.has_focus(egui::Id::new("accent_hex_edit")));
+        if !editing {
+            f.state.accent_hex = shown.to_hex();
+        }
+        let w = pal.font_sm * 7.3;
+        let (r, _) = ui.allocate_exact_size(
+            vec2(w, pal.control_height + 2.0),
+            egui::Sense::empty(),
+        );
+        let painter = ui.painter_at(r);
+        painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+        painter.rect_stroke(
+            r,
+            pal.radius_md,
+            egui::Stroke::new(1.0, pal.border),
+            egui::StrokeKind::Inside,
+        );
+        let text_rect = r.shrink2(vec2(8.0, 4.0));
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(text_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let resp = child.add(
+            egui::TextEdit::singleline(&mut f.state.accent_hex)
+                .id(egui::Id::new("accent_hex_edit"))
+                .hint_text("#RRGGBB")
+                .frame(egui::Frame::NONE)
+                .text_color(pal.text)
+                .desired_width(text_rect.width()),
+        );
+        if resp.has_focus() {
+            // 聚焦描边补间（130ms）：与设置页其它输入框同一套。
+            let focus_k = crate::anim::tween_f32(
+                ui.ctx(),
+                egui::Id::new("accent_hex_focus"),
+                1.0,
+                std::time::Duration::from_millis(130),
+                crate::anim::Ease::OutCubic,
+            );
+            let ring = crate::anim::tween_color(
+                ui.ctx(),
+                egui::Id::new("accent_hex_focus_color"),
+                pal.accent,
+                std::time::Duration::from_millis(130),
+            );
+            painter.rect_stroke(
+                r,
+                pal.radius_md,
+                egui::Stroke::new(1.0 + 0.5 * focus_k, ring),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if resp.changed()
+            && let Some(c) = AccentColor::from_hex(&f.state.accent_hex)
+        {
+            next = Some(c);
+            changed = true;
+        }
+        // 恢复默认：仅在用户改过时出现（默认态放个按钮是噪声）。
+        if cur.is_some() {
+            ui.add_space(8.0);
+            if draw_mini_button(f, ui, "accent_reset_default", "恢复默认", Some("accent_reset_default")) {
+                next = None;
+                changed = true;
+            }
+        }
+    });
+
+    if changed {
+        f.state.push(Op::SetAccent(next));
+    }
+    changed
+}
+
+/// 数值令牌的滑条量程（按令牌名推断）。
+///
+/// 推断而不是另维护一张表：新增令牌时忘记登记量程的后果只是「量程
+/// 不合理」（滑起来别别扭扭），而忘记登记**令牌本身**的后果是
+/// 「这个令牌在编辑器里根本不出现」——前者良性得多。
+fn token_num_range(name: &str) -> std::ops::RangeInclusive<f32> {
+    if name.starts_with("font_") {
+        8.0..=48.0
+    } else if name.starts_with("radius_") || name.starts_with("space_") {
+        0.0..=40.0
+    } else if name.starts_with("stroke_") {
+        0.0..=6.0
+    } else if name == "control_height" {
+        16.0..=64.0
+    } else if name == "icon_size" {
+        8.0..=48.0
+    } else {
+        0.0..=64.0
+    }
+}
+
+/// 令牌级覆盖编辑器（「高级微调」设置项）。
+///
+/// 列出**全部**主题令牌（[`Palette::tokens`]），逐项给出当前生效值
+/// 与调节入口——「界面上任何元素、任何参数都允许自由调整」的最终
+/// 出口（二级主题的旋钮覆盖常见需求，这里覆盖其余一切）。
+///
+/// - 颜色令牌：色块 + 色相滑条；**半透明**令牌追加透明度滑条
+///   （不透明令牌的 alpha 滑条没有意义——拖了没有任何视觉效果）；
+/// - 数值令牌：滑条（量程按名字推断，见 [`token_num_range`]）；
+/// - 时长令牌：只读（动效时长不适合滑条连续拖，且极少有人调）。
+///
+/// 已覆盖的令牌行尾有「重置」按钮，恢复解析链派生值。
+fn draw_token_overrides(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
+    let pal = f.pal;
+    let n_over = f.svc.state.config.ui.theme_overrides.colors.len()
+        + f.svc.state.config.ui.theme_overrides.nums.len();
+
+    // ---- 摘要行：覆盖数 + 展开/收起 + 全部重置 ----
+    let mut reset_all = false;
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(
+            egui::RichText::new(format!("已覆盖 {n_over} 个令牌")).color(pal.text_dim),
+        ));
+        ui.add_space(8.0);
+        // 展开/收起：令牌表近 60 行，默认收起（ rationale 见
+        // `UiState::theme_tokens_expanded`）。
+        let (label, key) = if f.state.theme_tokens_expanded {
+            ("收起", "token_collapse")
+        } else {
+            ("展开", "token_expand")
+        };
+        if draw_mini_button(f, ui, key, label, Some(key)) {
+            f.state.theme_tokens_expanded = !f.state.theme_tokens_expanded;
+        }
+        if n_over > 0 {
+            ui.add_space(8.0);
+            reset_all = draw_mini_button(f, ui, "token_reset_all", "全部重置", Some("token_reset_all"));
+        }
+    });
+    if reset_all {
+        f.state.push(Op::ClearAllTokenOverrides);
+        return true;
+    }
+    if !f.state.theme_tokens_expanded {
+        // 折叠态：只画摘要。令牌行不绘制 ⇒ 不注册热区 ⇒ 自动化点不到
+        // 不存在的控件（与 hit_insert 的「部分可见才登记」同一精神）。
+        return false;
+    }
+    ui.add_space(4.0);
+
+    // ---- 逐令牌 ----
+    //
+    // CAUTION: ops 先收集后统一 push——`f.state.push` 要 `&mut Frame`，
+    // 而循环里还要读 `f.svc.state.config`（是否已覆盖）。边读边写在
+    // Rust 里是借用冲突，收集式则天然顺序执行。
+    let mut ops: Vec<Op> = Vec::new();
+    for (name, value) in pal.tokens() {
+        match value {
+            TokenValue::Color(c) => {
+                let overridden = f.svc.state.config.ui.theme_overrides.colors.contains_key(name);
+                let [sr, sg, sb, sa] = c.to_srgba_unmultiplied();
+                let hsv = modular_clipboard_core::config::AccentColor::from_rgb([sr, sg, sb]);
+                let mut h = hsv.h;
+                ui.horizontal(|ui| {
+                    // 左列：色块 + 令牌名（等宽小字，令牌名是给「知道自己在
+                    // 找什么」的用户看的，不需要好看）。
+                    let (lr, _) = ui.allocate_exact_size(vec2(118.0, 18.0), Sense::empty());
+                    let p = ui.painter_at(lr);
+                    let sw = Rect::from_min_size(lr.min, vec2(14.0, 14.0));
+                    p.rect_filled(sw, pal.radius_sm, c);
+                    p.text(
+                        pos2(sw.max.x + 6.0, lr.center().y),
+                        Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(pal.font_xs),
+                        if overridden { pal.text } else { pal.text_dim },
+                    );
+                    // 右列：色相滑条（+ 半透明令牌的透明度滑条）。
+                    if draw_slider(
+                        f,
+                        ui,
+                        name,
+                        "hue",
+                        &mut h,
+                        0.0..=360.0,
+                        true,
+                    ) {
+                        let nc = modular_clipboard_core::config::AccentColor::new(h, hsv.s, hsv.v);
+                        let rgb2 = nc.to_rgb();
+                        ops.push(Op::SetTokenOverride {
+                            name: name.to_string(),
+                            value: TokenValue::Color(egui::Color32::from_rgba_unmultiplied(
+                                rgb2[0], rgb2[1], rgb2[2], sa,
+                            )),
+                        });
+                    }
+                    if sa < 255 {
+                        // 半透明令牌：第二行放透明度滑条（与色相滑条共用
+                        // 令牌名，靠 variant 区分 Id，见 draw_slider 的
+                        // CAUTION）。
+                        let mut a = f32::from(sa);
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            let (lr2, _) =
+                                ui.allocate_exact_size(vec2(118.0, 18.0), Sense::empty());
+                            ui.painter_at(lr2).text(
+                                pos2(lr2.min.x + 20.0, lr2.center().y),
+                                Align2::LEFT_CENTER,
+                                "└ 透明度",
+                                egui::FontId::proportional(pal.font_xs),
+                                pal.text_dim,
+                            );
+                            if draw_slider(f, ui, name, "alpha", &mut a, 0.0..=255.0, true) {
+                                let rgb2 = modular_clipboard_core::config::AccentColor::new(
+                                    hsv.h, hsv.s, hsv.v,
+                                )
+                                .to_rgb();
+                                ops.push(Op::SetTokenOverride {
+                                    name: name.to_string(),
+                                    value: TokenValue::Color(
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            rgb2[0],
+                                            rgb2[1],
+                                            rgb2[2],
+                                            a.round() as u8,
+                                        ),
+                                    ),
+                                });
+                            }
+                        });
+                    }
+                    // 重置按钮（仅已覆盖的令牌）。
+                    if overridden {
+                        ui.add_space(6.0);
+                        // hit=None：重置按钮与色相滑条共用令牌名，登记会
+                        // 覆盖滑条的热区（见 draw_mini_button 的 `hit`）。
+                        if draw_mini_button(f, ui, name, "重置", None) {
+                            ops.push(Op::ClearTokenOverride(name.to_string()));
+                        }
+                    }
+                    // CAUTION: 这里**不**再登记左列——`draw_slider` 已用
+                    // 同一个 key 登记了滑条矩形，重复登记会把它覆盖掉，
+                    // 自动化就拖不到色相滑条了。
+                });
+            }
+            TokenValue::Num(n) => {
+                let overridden = f.svc.state.config.ui.theme_overrides.nums.contains_key(name);
+                let mut v = n;
+                let range = token_num_range(name);
+                ui.horizontal(|ui| {
+                    let (lr, _) = ui.allocate_exact_size(vec2(118.0, 18.0), Sense::empty());
+                    ui.painter_at(lr).text(
+                        lr.min,
+                        Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(pal.font_xs),
+                        if overridden { pal.text } else { pal.text_dim },
+                    );
+                    let c = draw_slider(f, ui, name, "num", &mut v, range.clone(), true);
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(format!("{:.0}", v)).color(pal.text_dim),
+                    ));
+                    if c {
+                        ops.push(Op::SetTokenOverride {
+                            name: name.to_string(),
+                            value: TokenValue::Num(v),
+                        });
+                    }
+                    if overridden {
+                        ui.add_space(6.0);
+                        if draw_mini_button(f, ui, name, "重置", None) {
+                            ops.push(Op::ClearTokenOverride(name.to_string()));
+                        }
+                    }
+                    // 同颜色行：左列不登记，滑条的热区（draw_slider 内）
+                    // 保留给自动化。
+                });
+            }
+            // 时长令牌只读：动效时长不适合滑条连续拖（90ms 与 91ms 没有
+            // 任何可感差别），且调整它的用户极少——列出来只是噪声。
+            TokenValue::Dur(_) => {}
+        }
+    }
+    for op in ops {
+        f.state.push(op);
+    }
+    n_over > 0
 }
 
 fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Response {
@@ -8380,6 +9207,40 @@ fn with_pinned(mut self, n: usize) -> Self {
         ]
     }
 
+    /// 只按下（不松开）的一帧事件——滑条类交互专用。
+    ///
+    /// CAUTION: [`Self::click_events`] 把 down/up 压进**同一帧**。
+    /// `Response::clicked()` 靠「press→release 同帧配对」仍然成立
+    /// （所以按钮类测试照常工作），但滑条响应的是
+    /// `is_pointer_button_down_on`——它检查的是**帧末**的按下状态，
+    /// up 处理后恒为 false ⇒ 滑条永远收不到「按下即跳转」。
+    /// 真实用户的操作天然分帧（down 一帧、up 一帧），是测试压缩
+    /// 丢了中间态。滑条测试必须 press 一帧、release 一帧。
+    fn press_events(p: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    /// 只松开的一帧事件（与 [`Self::press_events`] 配对）。
+    fn release_events(p: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
 
     /// 读回某个热区的矩形（逻辑点）。
     ///
@@ -11155,6 +12016,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(!h.state.mcp_overlay_open, "点遮罩应关闭覆盖层");
     }
 
+
     /// 覆盖层打开时，能力开关点击 ⇒ 产生对应字段的 `SetBool`。
     #[test]
     fn mcp_overlay_switch_emits_set_bool() {        let mut h = Harness::new("mcp-overlay-sw", vec2(780.0, 560.0));
@@ -11674,31 +12536,192 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
 
-        // 1.0×：并排 —— 主题分段与字体缩放分段**同一行**（y 区间一致）。
+        // 1.0×：并排 —— 字体缩放分段与背景效果分段**同一行**（y 区间一致）。
         h.pal = crate::theme::Palette::light();
         crate::theme::apply(&h.ctx, &h.pal);
         h.settings_frame();
-        let theme_y = settings_hit(&h, "浅色").min.y;
-        let font_y = settings_hit(&h, "超大").min.y;
+        let font_y = settings_hit(&h, "标准").min.y;
+        let backdrop_y = settings_hit(&h, "无").min.y;
         assert!(
-            (theme_y - font_y).abs() > 20.0,
-            "1.0× 下主题行与字体缩放行本就在不同行（间距应 > 20）：{theme_y} vs {font_y}"
+            (font_y - backdrop_y).abs() > 20.0,
+            "1.0× 下两行本就在不同行（间距应 > 20）：{font_y} vs {backdrop_y}"
         );
 
         // 1.5×：堆叠 —— 每行的控件独占一行，行距显著变大。
         h.pal = crate::theme::Palette::light().with_font_scale(1.5);
         crate::theme::apply(&h.ctx, &h.pal);
         h.settings_frame();
-        let theme_y15 = settings_hit(&h, "浅色").min.y;
-        let font_y15 = settings_hit(&h, "超大").min.y;
-        let pitch_10 = font_y - theme_y;
-        let pitch_15 = font_y15 - theme_y15;
+        let font_y15 = settings_hit(&h, "标准").min.y;
+        let backdrop_y15 = settings_hit(&h, "无").min.y;
+        let pitch_10 = backdrop_y - font_y;
+        let pitch_15 = backdrop_y15 - font_y15;
         assert!(
             pitch_15 > pitch_10 * 1.5,
             "1.5× 下应改为上下堆叠（行距 {pitch_15:.1} 应远大于 1.0× 的 {pitch_10:.1}）"
         );
     }
 
+
+    // ------------------------------------------------------------------
+    // 主题：强调色 / 二级主题 / 令牌覆盖（2026-10-18）
+    // ------------------------------------------------------------------
+
+    /// 点预设色板 ⇒ 推出 `SetAccent(Some(该色 HSV))`。
+    ///
+    /// 守的是「三种调节方式」里最常用的那条路径：色板点击必须落地成
+    /// 配置变更，而不是只改显示。
+    #[test]
+    fn accent_preset_click_emits_set_accent() {
+        let mut h = Harness::new("accent-preset", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Theme;
+        h.settings_frame();
+
+        // 10 个预设都应有热区（key = 预设名）。
+        for (name, _) in crate::theme::ACCENT_PRESETS {
+            let sw = settings_hit(&h, name);
+            assert!(sw.width() > 0.0, "预设「{name}」应有热区");
+        }
+        // 点「翠绿」⇒ SetAccent(Some(绿))。
+        let green = settings_hit(&h, "翠绿");
+        let ops = h.settings_click_at(green.center());
+        let hit = ops.iter().any(|o| match o {
+            Op::SetAccent(Some(c)) => {
+                let rgb = c.to_rgb();
+                // 翠绿 #4C9A4C：g 通道最大。
+                rgb[1] > rgb[0] && rgb[1] > rgb[2]
+            }
+            _ => false,
+        });
+        assert!(hit, "点「翠绿」应推出 SetAccent(Some(绿))，实际={ops:?}");
+    }
+
+    /// 二级主题分段：五个选项都有热区；点「纸质」⇒ `SetSecondaryTheme(Paper)`。
+    #[test]
+    fn secondary_theme_segment_emits_op() {
+        let mut h = Harness::new("secondary-theme", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Theme;
+        h.settings_frame();
+        for name in ["无", "纸质", "护眼", "星空", "OLED"] {
+            assert!(
+                settings_hit(&h, name).width() > 0.0,
+                "二级主题选项「{name}」应有热区"
+            );
+        }
+        let paper = settings_hit(&h, "纸质");
+        let ops = h.settings_click_at(paper.center());
+        let hit = ops.iter().any(|o| {
+            matches!(
+                o,
+                Op::SetSecondaryTheme(modular_clipboard_core::config::SecondaryTheme::Paper)
+            )
+        });
+        assert!(hit, "点「纸质」应推出 SetSecondaryTheme(Paper)，实际={ops:?}");
+    }
+
+    /// 二级主题选「无」时，参数项显示禁用提示（不画旋钮）。
+    #[test]
+    fn theme_params_disabled_without_secondary_theme() {
+        let mut h = Harness::new("theme-params-off", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Theme;
+        h.svc.state.config.ui.secondary_theme = modular_clipboard_core::config::SecondaryTheme::None;
+        h.settings_frame();
+        // 无主题 ⇒ 没有旋钮热区（paper_tint 等键名不存在于热区表）。
+        assert!(
+            settings_hit_missing(&h, "paper_tint"),
+            "无二级主题时不应出现参数旋钮"
+        );
+        // 选纸质后旋钮出现（两个：paper_tint / paper_texture）。
+        h.svc.state.config.ui.secondary_theme =
+            modular_clipboard_core::config::SecondaryTheme::Paper;
+        h.settings_frame();
+        assert!(settings_hit(&h, "paper_tint").width() > 0.0);
+        assert!(settings_hit(&h, "paper_texture").width() > 0.0);
+    }
+
+    /// 令牌编辑器默认**折叠**：令牌行不绘制、不注册热区；点「展开」后
+    /// 才出现——近 60 行平铺会把主题卡撑到五屏（ rationale 见
+    /// `UiState::theme_tokens_expanded`）。
+    #[test]
+    fn token_editor_collapsed_by_default_and_expands() {
+        let mut h = Harness::new("token-editor", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Theme;
+        h.settings_frame();
+        // 折叠态：令牌名不在热区表里。
+        assert!(
+            settings_hit_missing(&h, "bg"),
+            "默认折叠时不应登记令牌热区"
+        );
+        // 点「展开」⇒ 令牌行出现。
+        let expand = settings_hit(&h, "token_expand");
+        let _ops = h.settings_click_at(expand.center());
+        assert!(
+            settings_hit(&h, "bg").width() > 0.0,
+            "展开后应登记令牌热区"
+        );
+        assert!(h.state.theme_tokens_expanded, "展开状态应被记住");
+    }
+
+    /// 展开后点 bg 的色相滑条 ⇒ 推出 `SetTokenOverride`（颜色覆盖）。
+    ///
+    /// 拖滑条即改值：`draw_slider` 响应「按下即跳转」，点轨道左侧
+    /// 应把色相压向 0（红）。
+    #[test]
+    fn token_override_hue_slider_emits_op() {
+        let mut h = Harness::new("token-override", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Theme;
+        h.settings_frame();
+        // 展开令牌编辑器。
+        let _ops = h.settings_click_at(settings_hit(&h, "token_expand").center());
+        h.settings_frame();
+        // 按 bg 色相滑条的左端（色相 → 0，红）。
+        //
+        // CAUTION: 必须两帧（press 一帧、release 一帧）——单帧压缩的
+        // `click_events` 到不了滑条的「按下即跳转」（帧末按下状态已被
+        // up 清掉，见 `press_events` 的文档）。这不是测试的权宜，真实
+        // 用户的操作本来就分帧。
+        let hue = settings_hit(&h, "bg");
+        let p = pos2(hue.min.x + 4.0, hue.center().y);
+        let ops = h.settings_frame_with(press_events(p));
+        // 松开帧：op 已在 down 帧产出，这一帧让交互状态归位（与真实
+        // 用户「按下 → 松开」的两帧结构一致）。
+        let _ = h.settings_frame_with(release_events(p));
+        let hit = ops.iter().any(|o| match o {
+            Op::SetTokenOverride { name, value } => {
+                name == "bg"
+                    && matches!(value, crate::theme::TokenValue::Color(c) if c.r() > c.g())
+            }
+            _ => false,
+        });
+        assert!(hit, "点色相滑条左端应推出 bg 的红色覆盖，实际={ops:?}");
+    }
+
+    /// 「全部重置」⇒ `ClearAllTokenOverrides`；重置按钮仅在**有覆盖**时
+    /// 出现（默认态放个按钮是噪声）。
+    #[test]
+    fn token_reset_all_emits_clear() {
+        let mut h = Harness::new("token-reset", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Theme;
+        h.svc.state.config.ui.theme_overrides.nums.insert("radius_md".into(), 12.0);
+        h.settings_frame();
+        let reset = settings_hit(&h, "token_reset_all");
+        let ops = h.settings_click_at(reset.center());
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, Op::ClearAllTokenOverrides)),
+            "点「全部重置」应推出 ClearAllTokenOverrides，实际={ops:?}"
+        );
+    }
+
+    /// 热区表查询的否定形式（不存在返回 None 而不是 panic）。
+    fn settings_hit_missing(h: &Harness, name: &str) -> bool {
+        h.state.hit.get(HitNs::Settings, name).is_none()
+    }
     /// 量一段文字的像素宽（不换行口径）。
     fn measure_w(ctx: &egui::Context, s: &str, size: f32) -> f32 {
         let mut w = 0.0f32;

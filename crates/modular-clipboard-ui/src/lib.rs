@@ -50,6 +50,7 @@ pub mod settingswin;
 pub mod renderer;
 pub mod theme;
 pub mod thumbnail;
+pub mod tex;
 
 pub use app::{run, run_remote, run_with_capture_override, run_with_options, App};
 pub use presence::Resident;

@@ -380,6 +380,27 @@ pub struct UiConfig {
     /// （Directory Opus / Total Commander / Everything 等）。
     #[serde(default)]
     pub explorer_path: String,
+    /// 主题强调色（`None` = 主题内置默认蓝）。
+    ///
+    /// 只换**强调色一族**（accent / accent_hover / accent_active /
+    /// row_selected / pin_tint），背景与文字层不动——「护眼绿」这类
+    /// 整体风格走 [`UiConfig::secondary_theme]。
+    #[serde(default)]
+    pub accent: Option<AccentColor>,
+    /// 二级主题（叠加在一级深浅模式上的风格层，默认无）。
+    ///
+    /// 深浅两套变体由 ui 侧主题层提供（`theme::SecondaryTheme::apply`），
+    /// 一级切换时自动落到对应变体。
+    #[serde(default)]
+    pub secondary_theme: SecondaryTheme,
+    /// 二级主题参数（见 [`ThemeParams`]）。
+    ///
+    /// 按主题分字段平铺：切换主题时各主题参数互相保留。
+    #[serde(default)]
+    pub theme_params: ThemeParams,
+    /// 令牌级覆盖（高级微调，见 [`ThemeOverrides`]）。
+    #[serde(default)]
+    pub theme_overrides: ThemeOverrides,
 }
 
 /// 类型过滤栏配置（第三轮原型移植项）。
@@ -683,6 +704,364 @@ impl WindowPos {
     }
 }
 
+/// 二级主题：叠加在一级（深浅）模式之上的**风格层**。
+///
+/// 与 [`WindowBackdrop`] 的分工：背景效果改的是「窗口怎么透出桌面」，
+/// 二级主题改的是「整套配色与质感」。每个二级主题在深浅两种基底下
+/// 各有一套取值（见 ui 侧 `theme::SecondaryTheme::apply`），一级切换时
+/// 自动落到对应变体，不需要用户选两遍。
+///
+/// # 为什么不做成「配色方案」平铺
+///
+/// 一级模式（深浅）是**功能位**：它决定文字与底的明暗关系，错了整个
+/// 界面不可读。二级主题是**审美位**：只在同一种明暗关系里换色温与
+/// 质感。两者叠成一个枚举会让「OLED + 浅色」这种组合无法表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecondaryTheme {
+    /// 不加二级主题（默认）：纯正的一级深浅主题。
+    #[default]
+    None,
+    /// 纸质纹理：暖色纸基 + 程序化纤维/噪点。
+    Paper,
+    /// 护眼绿：低蓝光绿基。
+    Green,
+    /// 星空紫：深紫基 + 程序化星点。
+    Purple,
+    /// OLED：纯黑背景（自发光屏幕省电、暗环境不刺眼）。
+    Oled,
+}
+
+impl SecondaryTheme {
+    /// 设置界面展示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            SecondaryTheme::None => "无",
+            SecondaryTheme::Paper => "纸质纹理",
+            SecondaryTheme::Green => "护眼绿",
+            SecondaryTheme::Purple => "星空紫",
+            SecondaryTheme::Oled => "OLED",
+        }
+    }
+
+    /// 配置里的稳定字符串（与 serde 编码一致）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecondaryTheme::None => "none",
+            SecondaryTheme::Paper => "paper",
+            SecondaryTheme::Green => "green",
+            SecondaryTheme::Purple => "purple",
+            SecondaryTheme::Oled => "oled",
+        }
+    }
+
+    /// 从字符串解析，无法识别时回落 [`SecondaryTheme::None`]。
+    ///
+    /// 容错而不是报错：这个值可能来自用户手装的 config.json，
+    /// 为一个 cosmetic 设置让整个配置加载失败不值得。
+    pub fn from_str_opt(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "paper" => SecondaryTheme::Paper,
+            "green" => SecondaryTheme::Green,
+            "purple" => SecondaryTheme::Purple,
+            "oled" => SecondaryTheme::Oled,
+            _ => SecondaryTheme::None,
+        }
+    }
+
+    /// 本主题可调的参数旋钮（设置界面据此生成滑块）。
+    ///
+    /// 键名与 [`ThemeParams`] 的字段一一对应；`None` 主题没有旋钮。
+    pub fn knobs(self) -> &'static [ThemeKnob] {
+        match self {
+            SecondaryTheme::None => &[],
+            SecondaryTheme::Paper => PAPER_KNOBS,
+            SecondaryTheme::Green => GREEN_KNOBS,
+            SecondaryTheme::Purple => PURPLE_KNOBS,
+            SecondaryTheme::Oled => OLED_KNOBS,
+        }
+    }
+}
+
+/// 纸质主题的旋钮（[`SecondaryTheme::Paper`]）。
+static PAPER_KNOBS: &[ThemeKnob] = &[
+    ThemeKnob::new("paper_tint", "纸基浓度", "暖色纸基的混合比例"),
+    ThemeKnob::new("paper_texture", "纹理强度", "纤维与噪点的明显程度"),
+];
+
+/// 护眼绿主题的旋钮（[`SecondaryTheme::Green`]）。
+static GREEN_KNOBS: &[ThemeKnob] = &[
+    ThemeKnob::new("green_tint", "绿意浓度", "绿色基调的混合比例"),
+    ThemeKnob::new("green_warmth", "色温", "偏青（冷）到偏黄（暖）"),
+];
+
+/// 星空紫主题的旋钮（[`SecondaryTheme::Purple`]）。
+static PURPLE_KNOBS: &[ThemeKnob] = &[
+    ThemeKnob::new("purple_tint", "紫度", "紫色基调的混合比例"),
+    ThemeKnob::new("purple_stars", "星点密度", "背景星点的明显程度"),
+];
+
+/// OLED 主题的旋钮（[`SecondaryTheme::Oled`]）。
+static OLED_KNOBS: &[ThemeKnob] = &[
+    ThemeKnob::new("oled_black", "纯黑程度", "背景压向纯黑的比例"),
+    ThemeKnob::new("oled_borders", "分隔提亮", "纯黑下靠描边区分层级"),
+];
+
+/// 二级主题的一个可调参数（[`SecondaryTheme::knobs`] 的元素）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThemeKnob {
+    /// [`ThemeParams`] 里的字段名（稳定键）。
+    pub key: &'static str,
+    /// 设置界面展示名。
+    pub label: &'static str,
+    /// 一句话说明。
+    pub desc: &'static str,
+}
+
+impl ThemeKnob {
+    const fn new(key: &'static str, label: &'static str, desc: &'static str) -> Self {
+        Self { key, label, desc }
+    }
+}
+
+/// 二级主题参数（全部 0..1 归一化，显示侧各自映射量程）。
+///
+/// 平铺成一个结构体而不是按主题分结构：配置里只有一个
+/// `theme_params` 对象，切换主题时各主题的参数**互相保留**——
+/// 用户把纸质的纹理强度调到 0.9，切到 OLED 再切回来，还是 0.9。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ThemeParams {
+    /// 纸质：暖色纸基混合比例（0 = 原主题色，1 = 完全纸基）。
+    #[serde(default = "default_param_high")]
+    pub paper_tint: f32,
+    /// 纸质：纹理强度（0 = 无纹理，1 = 满纹理）。
+    #[serde(default = "default_param_mid")]
+    pub paper_texture: f32,
+    /// 护眼绿：绿意混合比例。
+    #[serde(default = "default_param_high")]
+    pub green_tint: f32,
+    /// 护眼绿：色温（0 = 偏青，1 = 偏黄）。
+    #[serde(default = "default_param_mid")]
+    pub green_warmth: f32,
+    /// 星空紫：紫色基调混合比例。
+    #[serde(default = "default_param_high")]
+    pub purple_tint: f32,
+    /// 星空紫：星点密度。
+    #[serde(default = "default_param_mid")]
+    pub purple_stars: f32,
+    /// OLED：背景压向纯黑的比例。
+    #[serde(default = "default_param_high")]
+    pub oled_black: f32,
+    /// OLED：描边提亮（纯黑下靠描边区分层级）。
+    #[serde(default = "default_param_mid")]
+    pub oled_borders: f32,
+}
+
+impl Default for ThemeParams {
+    fn default() -> Self {
+        Self {
+            paper_tint: default_param_high(),
+            paper_texture: default_param_mid(),
+            green_tint: default_param_high(),
+            green_warmth: default_param_mid(),
+            purple_tint: default_param_high(),
+            purple_stars: default_param_mid(),
+            oled_black: default_param_high(),
+            oled_borders: default_param_mid(),
+        }
+    }
+}
+
+/// 「浓度类」旋钮的缺省值：默认就有效果，但留出调大空间。
+fn default_param_high() -> f32 {
+    0.8
+}
+
+/// 「效果类」旋钮的缺省值：默认可见但不喧宾夺主。
+fn default_param_mid() -> f32 {
+    0.5
+}
+
+impl ThemeParams {
+    /// 按键名读参数（找不到返回 `None`）。
+    ///
+    /// 与 [`SecondaryTheme::knobs`] 的键名对应，供设置界面与绘制侧
+    /// 用同一套字符串寻址。
+    pub fn get(&self, key: &str) -> Option<f32> {
+        Some(match key {
+            "paper_tint" => self.paper_tint,
+            "paper_texture" => self.paper_texture,
+            "green_tint" => self.green_tint,
+            "green_warmth" => self.green_warmth,
+            "purple_tint" => self.purple_tint,
+            "purple_stars" => self.purple_stars,
+            "oled_black" => self.oled_black,
+            "oled_borders" => self.oled_borders,
+            _ => return None,
+        })
+    }
+
+    /// 按键名写参数（找不到返回 `false`，调用方应报错而非静默）。
+    pub fn set(&mut self, key: &str, v: f32) -> bool {
+        let v = clamp_theme_param(v);
+        match key {
+            "paper_tint" => self.paper_tint = v,
+            "paper_texture" => self.paper_texture = v,
+            "green_tint" => self.green_tint = v,
+            "green_warmth" => self.green_warmth = v,
+            "purple_tint" => self.purple_tint = v,
+            "purple_stars" => self.purple_stars = v,
+            "oled_black" => self.oled_black = v,
+            "oled_borders" => self.oled_borders = v,
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// 把任意来源的参数值收敛到 0..1（非有限值回落 0.5）。
+///
+/// 手改 config.json 是常态，越界值不能让滑块或混合比例失控。
+pub fn clamp_theme_param(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        default_param_mid()
+    }
+}
+
+/// 主题强调色（HSV 表示）。
+///
+/// `None`（配置里不设置）= 用主题内置默认蓝。设置后，一级主题的
+/// 蓝系强调色（选中、主操作、相关底色）整体换成用户选的颜色，
+/// 深浅两套都换。
+///
+/// # 为什么用 HSV 而不是 RGB
+///
+/// 「换主题色」的直觉是「沿着色相环挑一个颜色」：HSV 的 H 滑条正好
+/// 对应这个动作，S/V 分别控制鲜艳与明暗。RGB 三个滑条没有一个是
+/// 「 hue」，用户想从蓝渐变到紫得同时猜两个分量。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AccentColor {
+    /// 色相（度，0..360，0/360 = 红）。
+    pub h: f32,
+    /// 饱和度（0..1）。
+    pub s: f32,
+    /// 明度（0..1）。
+    pub v: f32,
+}
+
+impl AccentColor {
+    /// 新建并钳制到合法区间（非有限值分量回落默认蓝的对应分量）。
+    pub fn new(h: f32, s: f32, v: f32) -> Self {
+        Self {
+            h: if h.is_finite() { h.rem_euclid(360.0) } else { 211.0 },
+            s: if s.is_finite() { s.clamp(0.0, 1.0) } else { 0.8 },
+            v: if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.69 },
+        }
+    }
+
+    /// 默认蓝（与内置主题的 accent 同色：`#1D65AF` 反推）。
+    pub fn default_blue() -> Self {
+        Self::from_rgb([0x1D, 0x65, 0xAF])
+    }
+
+    /// 转成 RGB 字节（标准 HSV→RGB，`v` 直接作为最大通道）。
+    pub fn to_rgb(&self) -> [u8; 3] {
+        let c = Self::new(self.h, self.s, self.v);
+        let sector = (c.h / 60.0).floor() as i32 % 6;
+        let f = (c.h / 60.0).fract();
+        let chroma = c.v * c.s;
+        let m = c.v - chroma;
+        // 中间通道：偶数扇区取 `chroma * f`、奇数扇区取 `chroma * (1 - f)`
+        // （`|h/60 mod 2 - 1|` 在两个扇区之间交替）。最小通道恒为 `m`。
+        let mid = |k: i32| {
+            if k % 2 == 0 {
+                chroma * f
+            } else {
+                chroma * (1.0 - f)
+            }
+        };
+        let (r, g, b) = match sector {
+            0 => (c.v, mid(0) + m, m),
+            1 => (mid(1) + m, c.v, m),
+            2 => (m, c.v, mid(2) + m),
+            3 => (m, mid(3) + m, c.v),
+            4 => (mid(4) + m, m, c.v),
+            _ => (c.v, m, mid(5) + m),
+        };
+        [
+            (r * 255.0).round() as u8,
+            (g * 255.0).round() as u8,
+            (b * 255.0).round() as u8,
+        ]
+    }
+
+    /// 从 RGB 字节反推 HSV（用于预设色板与十六进制输入落地）。
+    pub fn from_rgb(rgb: [u8; 3]) -> Self {
+        let [r, g, b] = [rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0];
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let d = max - min;
+        let h = if d < f32::EPSILON {
+            0.0
+        } else if max == r {
+            60.0 * (((g - b) / d).rem_euclid(6.0))
+        } else if max == g {
+            60.0 * (((b - r) / d) + 2.0)
+        } else {
+            60.0 * (((r - g) / d) + 4.0)
+        };
+        let s = if max < f32::EPSILON { 0.0 } else { d / max };
+        Self::new(h, s, max)
+    }
+
+    /// `#RRGGBB` 十六进制字符串（设置界面输入框回显）。
+    pub fn to_hex(&self) -> String {
+        let [r, g, b] = self.to_rgb();
+        format!("#{r:02X}{g:02X}{b:02X}")
+    }
+
+    /// 解析 `#RRGGBB` / `RRGGBB`（容忍缺失 `#` 与大小写）。
+    ///
+    /// 失败返回 `None`：输入框正在打字中途（如只敲了 `#F`）不能
+    /// 把用户已选的颜色清掉。
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.trim().trim_start_matches('#');
+        if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        Some(Self::from_rgb([r, g, b]))
+    }
+}
+
+/// 用户对单个主题令牌的覆盖——「界面上任何元素、任何参数都可调」
+/// 的落地机制。
+///
+/// 键是 ui 侧 [`Palette`](crate::ui 不可见，见 `modular-clipboard-ui`
+/// 的 `theme::Palette::tokens`) 的字段名；值是**非预乘** RGBA（颜色）
+/// 或数值（几何 / 字号 / 描边宽度）。覆盖在一级主题、二级主题、
+/// 强调色**之后**应用——用户显式改的旋钮优先级最高。
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ThemeOverrides {
+    /// 令牌名 → 非预乘 RGBA。
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, [u8; 4]>,
+    /// 令牌名 → 数值。
+    #[serde(default)]
+    pub nums: std::collections::BTreeMap<String, f32>,
+}
+
+impl UiConfig {
+    /// 当前生效的强调色（配置优先，缺省用内置默认蓝）。
+    pub fn accent_color(&self) -> AccentColor {
+        self.accent.unwrap_or_else(AccentColor::default_blue)
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -709,6 +1088,10 @@ impl Default for UiConfig {
             type_rail: TypeRailConfig::default(),
             browser_path: String::new(),
             explorer_path: String::new(),
+            accent: None,
+            secondary_theme: SecondaryTheme::None,
+            theme_params: ThemeParams::default(),
+            theme_overrides: ThemeOverrides::default(),
         }
     }
 }
@@ -1090,6 +1473,99 @@ mod tests {
             win: false,
         };
         assert_eq!(h.display(), "Ctrl+Shift+V");
+    }
+
+    // ---- 主题：强调色 / 二级主题 / 参数 / 覆盖 ----
+
+    /// HSV→RGB 再回 HSV 必须闭环（预设色板与十六进制输入都走这条路）。
+    #[test]
+    fn accent_rgb_round_trips_through_hsv() {
+        for c in [
+            AccentColor::default_blue(),
+            AccentColor::new(0.0, 1.0, 1.0),   // 红
+            AccentColor::new(120.0, 0.5, 0.5), // 灰绿
+            AccentColor::new(300.0, 0.9, 0.3), // 暗紫
+        ] {
+            let back = AccentColor::from_rgb(c.to_rgb());
+            // 8bit 量化的往返容差：分量各自 ±1 档。
+            assert!((back.h - c.h).abs() < 1.0, "{c:?} → {back:?}");
+            assert!((back.s - c.s).abs() < 0.01, "{c:?} → {back:?}");
+            assert!((back.v - c.v).abs() < 0.01, "{c:?} → {back:?}");
+        }
+    }
+
+    /// 十六进制解析容忍缺 `#`，拒绝半截输入（打字中途不能清掉已选颜色）。
+    #[test]
+    fn accent_hex_parsing_tolerates_and_rejects() {
+        assert_eq!(
+            AccentColor::from_hex("#1D65AF"),
+            Some(AccentColor::default_blue())
+        );
+        assert_eq!(AccentColor::from_hex("1d65af"), Some(AccentColor::default_blue()));
+        assert_eq!(AccentColor::from_hex("#F"), None);
+        assert_eq!(AccentColor::from_hex("#GGGGGG"), None);
+        assert_eq!(AccentColor::from_hex(""), None);
+    }
+
+    /// 二级主题的字符串互转：serde 名与手写解析必须一致（`from_str_opt`
+    /// 用于 MCP/脚本侧，绕过 serde）。
+    #[test]
+    fn secondary_theme_str_round_trips() {
+        for t in [
+            SecondaryTheme::None,
+            SecondaryTheme::Paper,
+            SecondaryTheme::Green,
+            SecondaryTheme::Purple,
+            SecondaryTheme::Oled,
+        ] {
+            assert_eq!(SecondaryTheme::from_str_opt(t.as_str()), t);
+        }
+        assert_eq!(SecondaryTheme::from_str_opt("不存在的主题"), SecondaryTheme::None);
+    }
+
+    /// 每个非 None 主题的旋钮键名必须能在 [`ThemeParams`] 上寻址——
+    /// 键名打错字的话，设置界面滑块会静默失效（改的是另一个字段）。
+    #[test]
+    fn theme_knob_keys_address_params() {
+        let params = ThemeParams::default();
+        for t in [
+            SecondaryTheme::Paper,
+            SecondaryTheme::Green,
+            SecondaryTheme::Purple,
+            SecondaryTheme::Oled,
+        ] {
+            assert!(!t.knobs().is_empty(), "{t:?} 必须有旋钮");
+            for k in t.knobs() {
+                assert!(params.get(k.key).is_some(), "键名 {} 寻址不到参数", k.key);
+            }
+        }
+        assert!(SecondaryTheme::None.knobs().is_empty());
+    }
+
+    /// 参数写入必须钳制（手改 config.json 是常态），且 get/set 闭环。
+    #[test]
+    fn theme_params_clamp_and_round_trip() {
+        let mut p = ThemeParams::default();
+        assert!(p.set("paper_texture", 2.5));
+        assert_eq!(p.paper_texture, 1.0);
+        assert!(!p.set("不存在的旋钮", 0.5), "未知键必须返回 false");
+        assert!(p.get("oled_black").is_some());
+        assert!(p.get("不存在的旋钮").is_none());
+    }
+
+    /// 旧版 config.json（无主题新字段）必须能解析——容器级 `serde(default)`
+    /// 管不到**新字段**，字段级标注才行。少了它，升级用户的外观设置
+    /// 会被整体回退抹掉。
+    #[test]
+    fn legacy_config_without_theme_fields_still_parses() {
+        let json = r#"{"ui": {"dark_mode": true, "font_scale": 1.0}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ui.accent, None);
+        assert_eq!(cfg.ui.secondary_theme, SecondaryTheme::None);
+        assert_eq!(cfg.ui.theme_params, ThemeParams::default());
+        assert!(cfg.ui.theme_overrides.colors.is_empty());
+        // 旧字段不被抹掉。
+        assert_eq!(cfg.ui.dark_mode, Some(true));
     }
 
     #[test]

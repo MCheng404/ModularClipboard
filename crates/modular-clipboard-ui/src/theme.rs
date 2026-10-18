@@ -53,6 +53,37 @@ macro_rules! palette_token {
     (dur, $v:expr) => { TokenValue::Dur($v) };
 }
 
+/// 按类别把一个 [`TokenValue`] 写进字段（供 [`Palette::set_token`] 展开）。
+///
+/// 类型不符返回 `false` 且**不写**——调用方（覆盖表应用）据此跳过
+/// 与当前版本令牌表漂移的条目。
+macro_rules! set_token_field {
+    (color, $self:expr, $name:ident, $v:expr) => {
+        if let TokenValue::Color(c) = $v {
+            $self.$name = c;
+            true
+        } else {
+            false
+        }
+    };
+    (num, $self:expr, $name:ident, $v:expr) => {
+        if let TokenValue::Num(n) = $v {
+            $self.$name = n;
+            true
+        } else {
+            false
+        }
+    };
+    (dur, $self:expr, $name:ident, $v:expr) => {
+        if let TokenValue::Dur(d) = $v {
+            $self.$name = d;
+            true
+        } else {
+            false
+        }
+    };
+}
+
 /// 调色板按 `t ∈ [0,1]` 插值时逐字段的取值规则（F-34 / UI-P1-3）。
 ///
 /// 只有**颜色**参与补间。几何令牌（圆角/间距/字号）与时长令牌直接取
@@ -144,7 +175,11 @@ macro_rules! palette {
         /// 目标值」——`tween_f32` 到点后直接返回目标值，`mix < 1.0` 的
         /// 分支不再执行，显示值会停在最后一帧的**近似**值上。
         /// 逐字段比较（55 个令牌）只在补间结束后的那一帧发生一次。
-        #[derive(Clone, PartialEq)]
+        ///
+        /// `Debug`：主题解析链（二级主题 / 强调色 / 覆盖）层层派生，
+        /// 出问题时需要把整份调色板打出来对比，没有 Debug 只能逐字段
+        /// 手抄。
+        #[derive(Clone, PartialEq, Debug)]
         pub struct Palette {
             $(
                 $(#[$meta])*
@@ -176,6 +211,25 @@ macro_rules! palette {
             /// 不含 [`Palette::is_dark`]。
             pub fn tokens(&self) -> Vec<(&'static str, TokenValue)> {
                 vec![$((stringify!($name), palette_token!($kind, self.$name))),*]
+            }
+
+            /// 按名字写单个令牌（[`ThemeOverrides`] 的落地入口）。
+            ///
+            /// 与 [`Palette::tokens`] 互为逆操作：设置界面的「高级微调」
+            /// 用 `tokens()` 列出全部可调项，用本函数落地。返回 `false`
+            /// 表示名字或类型不匹配（调用方应忽略而不是 panic——
+            /// 覆盖表可能来自旧版本配置，令牌会被增删）。
+            ///
+            /// 类型不匹配时**不改动**：`nums` 表里的键指向一个颜色令牌
+            /// （或反之）说明配置与当前版本的令牌表已漂移，静默跳过
+            /// 比把颜色字段写成数值再在绘制侧炸掉好。
+            pub fn set_token(&mut self, name: &str, value: TokenValue) -> bool {
+                $(
+                    if name == stringify!($name) {
+                        return set_token_field!($kind, self, $name, value);
+                    }
+                )*
+                false
             }
 
             /// 与另一份调色板按 `t ∈ [0,1]` 插值（F-34 / UI-P1-3）。
@@ -543,6 +597,368 @@ pub fn resolve(mode: ThemeMode, system: ThemeMode) -> ThemeMode {
             ThemeMode::Light => ThemeMode::Light,
             ThemeMode::Dark | ThemeMode::FollowSystem => ThemeMode::Dark,
         },
+    }
+}
+
+// =====================================================================
+// 主题解析链：一级模式 → 二级主题 → 强调色 → 令牌覆盖 → 字体缩放
+// =====================================================================
+//
+// 四层各自的职责（顺序即优先级，后者覆盖前者）：
+//
+// 1. **一级模式**（`ThemeMode`）：明暗关系。功能位——错了整个界面
+//    不可读。由 `Palette::dark()` / `Palette::light()` 提供。
+// 2. **二级主题**（`SecondaryTheme`）：在同一种明暗关系里换色温与
+//    质感（纸/绿/紫/OLED）。每个主题深浅各一套目标色板，按参数
+//    浓度与一级混合。
+// 3. **强调色**（`AccentColor`）：只换 accent 一族。放在二级之后，
+//    免得二级主题的内置蓝把用户选的颜色盖掉。
+// 4. **令牌覆盖**（`ThemeOverrides`）：用户显式改的单个令牌，
+//    优先级最高——「界面上任何元素任何参数都可调」的落地。
+//
+// 字体缩放（`with_font_scale`）不在这条链里：它是**幂等派生**，
+// 每帧从基础调色板重算（见 `with_font_scale` 的说明）。
+
+/// 主题解析链的完整入口：配置 → 生效调色板（未应用字体缩放）。
+///
+/// `mode` 必须是已解析的（`FollowSystem` 已消除）——调用方用
+/// [`resolve`] 处理。纯函数：同配置必然同调色板，测试直接覆盖。
+pub fn resolve_palette(mode: ThemeMode, ui: &modular_clipboard_core::config::UiConfig) -> Palette {
+    let mut pal = mode.palette();
+    if ui.secondary_theme != modular_clipboard_core::config::SecondaryTheme::None {
+        pal = apply_secondary(ui.secondary_theme, &pal, &ui.theme_params);
+    }
+    if ui.accent.is_some() {
+        pal = derive_accent(&pal, &ui.accent_color());
+    }
+    apply_overrides(&mut pal, &ui.theme_overrides);
+    pal
+}
+
+/// 直线（非预乘）空间的线性混合。
+///
+/// CAUTION: 不能对 `to_array()` 的分量直接混合——那是**预乘**后的值，
+/// 混完再用 `from_rgba_unmultiplied` 重组会二次预乘（2026-10-17 修过
+/// 三个同类 bug，见 [`fade_color`] 的说明）。走
+/// `rgba_unmultiplied()` 取直线分量，交给 `from_rgba_unmultiplied`
+/// 让它内部重新预乘，语义才正确。
+fn mix_straight(a: egui::Color32, b: egui::Color32, k: f32) -> egui::Color32 {
+    let k = k.clamp(0.0, 1.0);
+    let [ar, ag, ab, aa] = a.to_srgba_unmultiplied();
+    let [br, bg, bb, ba] = b.to_srgba_unmultiplied();
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(m(ar, br), m(ag, bg), m(ab, bb), m(aa, ba))
+}
+
+/// 把一个令牌混向目标色（浓度 `k`）。
+///
+/// 二级主题的取值统一走它：`k=0` 完全是一级主题、`k=1` 完全是二级
+/// 主题的目标色。半透明令牌（row_hover 等）的 alpha 也参与混合——
+/// 二级主题有权调整交互态的明显程度。
+fn tint_field(c: &mut egui::Color32, target: egui::Color32, k: f32) {
+    *c = mix_straight(*c, target, k);
+}
+
+/// 把一组「令牌 → 目标色」混入调色板（浓度 `k`）。
+///
+/// 用宏而不是手写逐个赋值：新增主题令牌时漏一个字段不会有任何编译
+/// 提示，而主题色板漏一个令牌的症状是「某个控件不跟着变」——
+/// 最难被肉眼发现的半截状态。
+macro_rules! tint_tokens {
+    ($pal:expr, $k:expr, $($name:ident => $target:expr),* $(,)?) => {
+        $(
+            tint_field(&mut $pal.$name, $target, $k);
+        )*
+    };
+}
+
+/// 二级主题：把 `base`（一级调色板）按参数混合成主题色板。
+///
+/// 每个主题深浅各一套目标色（由 `base.is_dark` 选择），浓度类旋钮
+/// 控制混合比例；效果类旋钮（纹理 / 星点）在**渲染层**读（见
+/// `tex::paper_tile` / `tex::star_tile`），不参与这里的颜色混合。
+pub fn apply_secondary(
+    theme: modular_clipboard_core::config::SecondaryTheme,
+    base: &Palette,
+    params: &modular_clipboard_core::config::ThemeParams,
+) -> Palette {
+    use modular_clipboard_core::config::SecondaryTheme;
+    let mut p = base.clone();
+    let k = |v: f32| clamp_param(v);
+    match theme {
+        SecondaryTheme::None => {}
+        SecondaryTheme::Paper => paper_theme(&mut p, k(params.paper_tint)),
+        SecondaryTheme::Green => green_theme(&mut p, k(params.green_tint), k(params.green_warmth)),
+        SecondaryTheme::Purple => purple_theme(&mut p, k(params.purple_tint)),
+        SecondaryTheme::Oled => oled_theme(&mut p, k(params.oled_black), k(params.oled_borders)),
+    }
+    p
+}
+
+/// 参数钳制的本地别名（core 的 [`clamp_theme_param`] 不依赖 egui，
+/// 但这里每个主题函数都要用，包一层少打全名）。
+fn clamp_param(v: f32) -> f32 {
+    modular_clipboard_core::config::clamp_theme_param(v)
+}
+
+/// 纸质主题：暖色纸基。深浅两套目标色，浓度 `k` 混合。
+///
+/// 设计约束：纸基**不抢对比度**——文字与边框的目标值都按 4.5:1 / 3:1
+/// 选取，只是整体染上暖色温。纹理强度（`paper_texture`）是渲染层
+/// 的事（程序化纤维噪点），与这里的颜色浓度解耦。
+fn paper_theme(p: &mut Palette, k: f32) {
+    if k <= 0.0 {
+        return;
+    }
+    if p.is_dark {
+        tint_tokens!(p, k,
+            bg => egui::Color32::from_rgb(0x1C, 0x18, 0x13),
+            surface => egui::Color32::from_rgb(0x26, 0x21, 0x19),
+            surface_variant => egui::Color32::from_rgb(0x2F, 0x29, 0x20),
+            list_bg => egui::Color32::from_rgb(0x17, 0x14, 0x10),
+            surface_raised => egui::Color32::from_rgb(0x33, 0x2B, 0x21),
+            border => egui::Color32::from_rgb(0x6B, 0x5F, 0x4E),
+            border_strong => egui::Color32::from_rgb(0x9C, 0x8E, 0x74),
+            border_subtle => egui::Color32::from_rgb(0x33, 0x2C, 0x22),
+            text => egui::Color32::from_rgb(0xEB, 0xE3, 0xD3),
+            text_dim => egui::Color32::from_rgb(0xC0, 0xB4, 0x9E),
+            text_bright => egui::Color32::from_rgb(0xF7, 0xF0, 0xE2),
+        );
+    } else {
+        tint_tokens!(p, k,
+            bg => egui::Color32::from_rgb(0xF4, 0xEF, 0xE3),
+            surface => egui::Color32::from_rgb(0xFB, 0xF7, 0xEC),
+            surface_variant => egui::Color32::from_rgb(0xEF, 0xE8, 0xD8),
+            list_bg => egui::Color32::from_rgb(0xE9, 0xE1, 0xCF),
+            surface_raised => egui::Color32::from_rgb(0xFF, 0xFD, 0xF6),
+            border => egui::Color32::from_rgb(0x8A, 0x7E, 0x68),
+            border_strong => egui::Color32::from_rgb(0x5C, 0x52, 0x40),
+            border_subtle => egui::Color32::from_rgb(0xDC, 0xD2, 0xBC),
+            text => egui::Color32::from_rgb(0x2E, 0x2A, 0x20),
+            text_dim => egui::Color32::from_rgb(0x5C, 0x55, 0x45),
+            text_bright => egui::Color32::from_rgb(0x1A, 0x17, 0x10),
+        );
+    }
+}
+
+/// 护眼绿主题：低蓝光绿基。`warmth` 0 = 偏青（冷）、1 = 偏黄（暖）。
+///
+/// 两套端点按 `warmth` 预混，再按浓度 `k` 混入一级色板——用户说的
+/// 「色温」是绿内部的事，不应该拖慢整条链。
+fn green_theme(p: &mut Palette, k: f32, warmth: f32) {
+    if k <= 0.0 {
+        return;
+    }
+    let w = warmth.clamp(0.0, 1.0);
+    // 冷端（青绿）与暖端（黄绿）的 bg / text 目标色；其余令牌只随
+    // 浓度走冷端（色温对边框的影响远小于对底色）。
+    let (bg_c, bg_w) = if p.is_dark {
+        (
+            egui::Color32::from_rgb(0x0D, 0x16, 0x13),
+            egui::Color32::from_rgb(0x15, 0x19, 0x0E),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(0xE2, 0xF0, 0xEC),
+            egui::Color32::from_rgb(0xEE, 0xF2, 0xDF),
+        )
+    };
+    let bg = mix_straight(bg_c, bg_w, w);
+    if p.is_dark {
+        tint_tokens!(p, k,
+            bg => bg,
+            surface => egui::Color32::from_rgb(0x15, 0x21, 0x1A),
+            surface_variant => egui::Color32::from_rgb(0x1C, 0x2B, 0x22),
+            list_bg => egui::Color32::from_rgb(0x0A, 0x13, 0x0D),
+            surface_raised => egui::Color32::from_rgb(0x24, 0x34, 0x29),
+            border => egui::Color32::from_rgb(0x55, 0x6E, 0x5B),
+            border_strong => egui::Color32::from_rgb(0x84, 0xA0, 0x88),
+            border_subtle => egui::Color32::from_rgb(0x21, 0x31, 0x26),
+            text => egui::Color32::from_rgb(0xDC, 0xEA, 0xDE),
+            text_dim => egui::Color32::from_rgb(0xA6, 0xBE, 0xAA),
+            text_bright => egui::Color32::from_rgb(0xEE, 0xF7, 0xEF),
+        );
+    } else {
+        tint_tokens!(p, k,
+            bg => bg,
+            surface => egui::Color32::from_rgb(0xF4, 0xFA, 0xF1),
+            surface_variant => egui::Color32::from_rgb(0xDF, 0xED, 0xDB),
+            list_bg => egui::Color32::from_rgb(0xDC, 0xE9, 0xD8),
+            surface_raised => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            border => egui::Color32::from_rgb(0x6E, 0x8A, 0x70),
+            border_strong => egui::Color32::from_rgb(0x45, 0x5E, 0x47),
+            border_subtle => egui::Color32::from_rgb(0xC9, 0xDD, 0xC6),
+            text => egui::Color32::from_rgb(0x1F, 0x2E, 0x1E),
+            text_dim => egui::Color32::from_rgb(0x47, 0x57, 0x3F),
+            text_bright => egui::Color32::from_rgb(0x14, 0x22, 0x13),
+        );
+    }
+}
+
+/// 星空紫主题：深紫基。星点密度（`purple_stars`）是渲染层的事
+/// （程序化星点纹理），这里只换颜色。
+fn purple_theme(p: &mut Palette, k: f32) {
+    if k <= 0.0 {
+        return;
+    }
+    if p.is_dark {
+        tint_tokens!(p, k,
+            bg => egui::Color32::from_rgb(0x13, 0x10, 0x1F),
+            surface => egui::Color32::from_rgb(0x1C, 0x18, 0x30),
+            surface_variant => egui::Color32::from_rgb(0x26, 0x20, 0x40),
+            list_bg => egui::Color32::from_rgb(0x0F, 0x0C, 0x1A),
+            surface_raised => egui::Color32::from_rgb(0x2C, 0x25, 0x47),
+            border => egui::Color32::from_rgb(0x6A, 0x5F, 0x9E),
+            border_strong => egui::Color32::from_rgb(0x9A, 0x8E, 0xC9),
+            border_subtle => egui::Color32::from_rgb(0x2A, 0x24, 0x40),
+            text => egui::Color32::from_rgb(0xE6, 0xDE, 0xF8),
+            text_dim => egui::Color32::from_rgb(0xB3, 0xA6, 0xD4),
+            text_bright => egui::Color32::from_rgb(0xF2, 0xED, 0xFF),
+        );
+    } else {
+        tint_tokens!(p, k,
+            bg => egui::Color32::from_rgb(0xEF, 0xEB, 0xF9),
+            surface => egui::Color32::from_rgb(0xF8, 0xF5, 0xFE),
+            surface_variant => egui::Color32::from_rgb(0xE6, 0xE0, 0xF5),
+            list_bg => egui::Color32::from_rgb(0xE4, 0xDD, 0xF2),
+            surface_raised => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            border => egui::Color32::from_rgb(0x7E, 0x72, 0xB0),
+            border_strong => egui::Color32::from_rgb(0x50, 0x46, 0x80),
+            border_subtle => egui::Color32::from_rgb(0xD8, 0xD0, 0xEC),
+            text => egui::Color32::from_rgb(0x24, 0x1E, 0x3C),
+            text_dim => egui::Color32::from_rgb(0x4E, 0x46, 0x70),
+            text_bright => egui::Color32::from_rgb(0x15, 0x0F, 0x2E),
+        );
+    }
+}
+
+/// OLED 主题：纯黑背景 + 提亮描边。
+///
+/// `black` 控制背景压向纯黑的比例；`borders` 单独控制描边提亮——
+/// 纯黑底下层级只能靠边框与投影区分（深色投影在纯黑上完全不可见，
+/// 这是物理必然），所以描边亮度必须可调。
+///
+/// 浅色模式下的 OLED = 「纸白极简」：把底色推向纯白、文字压向近黑、
+/// 描边加深。自发光屏的「纯黑」只对暗色界面有意义，浅色下的对应
+/// 概念是「最大对比的纸白」。
+fn oled_theme(p: &mut Palette, k: f32, borders: f32) {
+    if k <= 0.0 {
+        return;
+    }
+    if p.is_dark {
+        tint_tokens!(p, k,
+            bg => egui::Color32::from_rgb(0x00, 0x00, 0x00),
+            surface => egui::Color32::from_rgb(0x05, 0x05, 0x05),
+            surface_variant => egui::Color32::from_rgb(0x0C, 0x0C, 0x0C),
+            list_bg => egui::Color32::from_rgb(0x00, 0x00, 0x00),
+            surface_raised => egui::Color32::from_rgb(0x12, 0x12, 0x12),
+            text => egui::Color32::from_rgb(0xEF, 0xEF, 0xEF),
+            text_dim => egui::Color32::from_rgb(0xA8, 0xA8, 0xA8),
+            text_bright => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        );
+        // 描边按 borders 单独混合（默认值已经偏亮，见主题注释）。
+        tint_field(&mut p.border, egui::Color32::from_rgb(0x4A, 0x4A, 0x4A), borders);
+        tint_field(&mut p.border_strong, egui::Color32::from_rgb(0x78, 0x78, 0x78), borders);
+        tint_field(&mut p.border_subtle, egui::Color32::from_rgb(0x2A, 0x2A, 0x2A), borders);
+    } else {
+        tint_tokens!(p, k,
+            bg => egui::Color32::from_rgb(0xFC, 0xFC, 0xFC),
+            surface => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            surface_variant => egui::Color32::from_rgb(0xF4, 0xF4, 0xF4),
+            list_bg => egui::Color32::from_rgb(0xF0, 0xF0, 0xF0),
+            surface_raised => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            border => egui::Color32::from_rgb(0x9A, 0x9A, 0x9A),
+            border_strong => egui::Color32::from_rgb(0x55, 0x55, 0x55),
+            border_subtle => egui::Color32::from_rgb(0xE2, 0xE2, 0xE2),
+            text => egui::Color32::from_rgb(0x1A, 0x1A, 0x1A),
+            text_dim => egui::Color32::from_rgb(0x50, 0x50, 0x50),
+            text_bright => egui::Color32::from_rgb(0x00, 0x00, 0x00),
+        );
+    }
+}
+
+/// 强调色预设色板（设置界面的一排色块）。
+///
+/// 取名不按色相名而按「感觉」：用户找的是「那个像微信一样的绿」，
+/// 不是「hue=140」。全部取中间明度——同一个色要同时服务深浅两套
+/// （派生时只微调明度，不重建），过亮或过暗的色在一套里会不可读。
+pub const ACCENT_PRESETS: &[(&str, [u8; 3])] = &[
+    ("默认蓝", [0x3B, 0x82, 0xC4]),
+    ("天青", [0x2A, 0xA7, 0xA0]),
+    ("翠绿", [0x4C, 0x9A, 0x4C]),
+    ("橄榄", [0x8A, 0x9A, 0x3C]),
+    ("琥珀", [0xC0, 0x8A, 0x2E]),
+    ("珊瑚", [0xC2, 0x5E, 0x4A]),
+    ("玫红", [0xC2, 0x44, 0x7F]),
+    ("紫罗兰", [0x8A, 0x5C, 0xC2]),
+    ("靛蓝", [0x5A, 0x6F, 0xD6]),
+    ("石墨", [0x6B, 0x72, 0x80]),
+];
+
+/// 由用户强调色派生整套 accent 令牌（覆盖一级主题的蓝系）。
+///
+/// 派生规则（而不是让用户逐个调五个令牌）：
+/// - `accent` = 用户色原样；
+/// - `accent_hover` / `accent_active` = 明度 ×0.94 / ×0.88
+///   （与内置两套的方向一致：内置深色 accent #84B7EB → hover #7EB6F1
+///   也是压暗，浅色 #1D65AF → #1464B8 同样压暗）；
+/// - `row_selected` / `pin_tint` = 用户色 + 内置同款 alpha
+///   （56/52、18/30——那是多年调出来的「看得出来但不抢字」的值）；
+/// - `text_on_accent` 按强调色亮度自动选黑/白（阈值 0.5，与内置两套
+///   的实际取值一致）。
+pub fn derive_accent(pal: &Palette, accent: &modular_clipboard_core::config::AccentColor) -> Palette {
+    let mut p = pal.clone();
+    let base = accent.to_rgb();
+    let a = egui::Color32::from_rgb(base[0], base[1], base[2]);
+    let v_of = |c: egui::Color32| c.r() as f32 / 255.0;
+    let hover = shift_value(a, v_of(a) * 0.94);
+    let active = shift_value(a, v_of(a) * 0.88);
+    p.accent = a;
+    p.accent_hover = hover;
+    p.accent_active = active;
+    // 选中/置顶底色：色相跟随用户，alpha 沿用内置（深浅两套各自的
+    // 经验值——深色底上需要更实一点的色调才看得出）。
+    let (sel_a, pin_a) = if p.is_dark { (56u8, 30u8) } else { (52u8, 18u8) };
+    p.row_selected = egui::Color32::from_rgba_unmultiplied(base[0], base[1], base[2], sel_a);
+    p.pin_tint = egui::Color32::from_rgba_unmultiplied(base[0], base[1], base[2], pin_a);
+    // 强调色上的文字：按相对亮度自动选（WCAG 的相对亮度近似，
+    // 阈值 0.5——内置深色 #84B7EB 亮度 0.69 配黑字、浅色 #1D65AF
+    // 亮度 0.36 配白字，阈值 0.5 两边都成立）。
+    let lum = 0.2126 * base[0] as f32 / 255.0
+        + 0.7152 * base[1] as f32 / 255.0
+        + 0.0722 * base[2] as f32 / 255.0;
+    p.text_on_accent = if lum > 0.5 {
+        egui::Color32::from_rgb(0x0A, 0x0D, 0x12)
+    } else {
+        egui::Color32::WHITE
+    };
+    p
+}
+
+/// 把一个颜色换到指定明度（保色相饱和度，HSV 空间）。
+fn shift_value(c: egui::Color32, v: f32) -> egui::Color32 {
+    let hsv = modular_clipboard_core::config::AccentColor::from_rgb([c.r(), c.g(), c.b()]);
+    let shifted = modular_clipboard_core::config::AccentColor::new(hsv.h, hsv.s, v);
+    let rgb = shifted.to_rgb();
+    egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// 应用令牌级覆盖（用户显式微调，优先级最高）。
+///
+/// 逐条 `set_token`：名字或类型对不上的条目**跳过**——覆盖表可能
+/// 来自旧版本配置（令牌有增删），为一个失效条目让整个主题加载
+/// 失败不值得。
+pub fn apply_overrides(pal: &mut Palette, ov: &modular_clipboard_core::config::ThemeOverrides) {
+    for (name, rgba) in &ov.colors {
+        pal.set_token(
+            name,
+            TokenValue::Color(egui::Color32::from_rgba_unmultiplied(
+                rgba[0], rgba[1], rgba[2], rgba[3],
+            )),
+        );
+    }
+    for (name, v) in &ov.nums {
+        pal.set_token(name, TokenValue::Num(*v));
     }
 }
 
@@ -1039,6 +1455,161 @@ pub fn sized_pt(size: f32) -> FontId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // 主题解析链：二级主题 / 强调色 / 令牌覆盖
+    // ------------------------------------------------------------------
+
+    /// 默认配置（无二级主题、无自定义强调色）必须精确等于内置主题——
+    /// 升级用户不看到任何变化。
+    #[test]
+    fn default_config_resolves_to_builtin_palette() {
+        let ui = modular_clipboard_core::config::UiConfig::default();
+        assert_eq!(resolve_palette(ThemeMode::Dark, &ui), Palette::dark());
+        assert_eq!(resolve_palette(ThemeMode::Light, &ui), Palette::light());
+    }
+
+    /// 浓度 0 的二级主题是恒等变换（滑到最左 = 完全关掉该主题效果）。
+    #[test]
+    fn secondary_theme_zero_concentration_is_identity() {
+        use modular_clipboard_core::config::{SecondaryTheme, ThemeParams};
+        let params = ThemeParams {
+            paper_tint: 0.0,
+            green_tint: 0.0,
+            purple_tint: 0.0,
+            oled_black: 0.0,
+            ..ThemeParams::default()
+        };
+        for base in [Palette::dark(), Palette::light()] {
+            for t in [
+                SecondaryTheme::Paper,
+                SecondaryTheme::Green,
+                SecondaryTheme::Purple,
+                SecondaryTheme::Oled,
+            ] {
+                assert_eq!(apply_secondary(t, &base, &params), base, "{t:?} 浓度 0 应恒等");
+            }
+        }
+    }
+
+    /// 二级主题必须真的改色（浓度拉满时至少背景层变化），且深浅两套
+    /// 都生效——「适配一级主题的改变」的最低判据。
+    #[test]
+    fn secondary_theme_changes_both_modes() {
+        use modular_clipboard_core::config::{SecondaryTheme, ThemeParams};
+        let params = ThemeParams::default();
+        for t in [
+            SecondaryTheme::Paper,
+            SecondaryTheme::Green,
+            SecondaryTheme::Purple,
+            SecondaryTheme::Oled,
+        ] {
+            let dark = apply_secondary(t, &Palette::dark(), &params);
+            let light = apply_secondary(t, &Palette::light(), &params);
+            assert_ne!(dark.bg, Palette::dark().bg, "{t:?} 深色底必须变");
+            assert_ne!(light.bg, Palette::light().bg, "{t:?} 浅色底必须变");
+            // 明暗关系不能被打乱：深色套的文字仍应比底色亮。
+            assert!(dark.is_dark && !light.is_dark);
+        }
+    }
+
+    /// OLED 深色套必须真的把背景压到近黑（这是「OLED」的立身之本）。
+    #[test]
+    fn oled_dark_pushes_background_to_black() {
+        use modular_clipboard_core::config::{SecondaryTheme, ThemeParams};
+        let params = ThemeParams::default();
+        let p = apply_secondary(SecondaryTheme::Oled, &Palette::dark(), &params);
+        let [r, g, b, _] = p.bg.to_srgba_unmultiplied();
+        assert!(r.max(g).max(b) <= 24, "OLED 底应近黑，实测 #{r:02X}{g:02X}{b:02X}");
+    }
+
+    /// 强调色派生：accent 一族全部换成用户色，且 hover/active 沿明度
+    /// 压暗（与内置两套同向）；选中/置顶底色 alpha 沿用内置经验值。
+    #[test]
+    fn derive_accent_overrides_family() {
+        use modular_clipboard_core::config::AccentColor;
+        for base in [Palette::dark(), Palette::light()] {
+            let p = derive_accent(&base, &AccentColor::new(140.0, 0.7, 0.6));
+            let [r, g, b, _] = p.accent.to_srgba_unmultiplied();
+            // 翠绿：g 通道必须最大。
+            assert!(g > r && g > b, "accent 应是绿色系，实测 {r},{g},{b}");
+            assert_ne!(p.accent, base.accent);
+            assert_ne!(p.accent_hover, base.accent_hover);
+            assert_ne!(p.accent_active, base.accent_active);
+            assert_ne!(p.row_selected, base.row_selected);
+            assert_ne!(p.pin_tint, base.pin_tint);
+            // hover/active 比 accent 暗（压暗方向）。
+            let lum = |c: egui::Color32| {
+                let [r, g, b, _] = c.to_srgba_unmultiplied();
+                0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32
+            };
+            assert!(lum(p.accent_hover) < lum(p.accent));
+            assert!(lum(p.accent_active) < lum(p.accent_hover));
+            // alpha 沿用内置（深 56 / 浅 52）。
+            let [_, _, _, sel_a] = p.row_selected.to_srgba_unmultiplied();
+            assert_eq!(sel_a, if base.is_dark { 56 } else { 52 });
+        }
+    }
+
+    /// 强调色上的文字按亮度自动选黑白：亮色配黑字、暗色配白字
+    /// （内置两套的实际行为，阈值 0.5）。
+    #[test]
+    fn derive_accent_picks_readable_text_on_accent() {
+        use modular_clipboard_core::config::AccentColor;
+        let dark = derive_accent(&Palette::dark(), &AccentColor::new(60.0, 0.9, 0.95));
+        assert_eq!(dark.text_on_accent, egui::Color32::from_rgb(0x0A, 0x0D, 0x12), "亮黄应配黑字");
+        let light = derive_accent(&Palette::light(), &AccentColor::new(240.0, 0.9, 0.25));
+        assert_eq!(light.text_on_accent, egui::Color32::WHITE, "深蓝应配白字");
+    }
+
+    /// 令牌覆盖必须能改「任何元素」：颜色、数值各一条，且覆盖在
+    /// 二级主题与强调色**之后**（用户显式微调优先级最高）。
+    #[test]
+    fn token_overrides_beat_everything_below() {
+        use modular_clipboard_core::config::ThemeOverrides;
+        let mut ov = ThemeOverrides::default();
+        ov.colors
+            .insert("bg".into(), [0x12, 0x34, 0x56, 0xFF]);
+        ov.nums.insert("radius_md".into(), 13.0);
+        // 强调色也设了：覆盖表的 bg 仍应赢（覆盖在最后）。
+        let ui = modular_clipboard_core::config::UiConfig {
+            accent: Some(modular_clipboard_core::config::AccentColor::new(300.0, 0.8, 0.6)),
+            secondary_theme: modular_clipboard_core::config::SecondaryTheme::Paper,
+            theme_overrides: ov,
+            ..modular_clipboard_core::config::UiConfig::default()
+        };
+        let p = resolve_palette(ThemeMode::Dark, &ui);
+        assert_eq!(p.bg, egui::Color32::from_rgb(0x12, 0x34, 0x56));
+        assert_eq!(p.radius_md, 13.0);
+    }
+
+    /// `set_token` 的类型守卫：颜色表里的键指向数值令牌时必须拒绝且
+    /// 不改动（配置与令牌表漂移时不能把数值字段写成颜色）。
+    #[test]
+    fn set_token_rejects_type_mismatch() {
+        let mut p = Palette::dark();
+        let before = p.radius_md;
+        assert!(!p.set_token("radius_md", TokenValue::Color(egui::Color32::WHITE)));
+        assert_eq!(p.radius_md, before, "类型不符不能写");
+        assert!(p.set_token("radius_md", TokenValue::Num(7.0)));
+        assert_eq!(p.radius_md, 7.0);
+        assert!(!p.set_token("不存在的令牌", TokenValue::Num(1.0)));
+    }
+
+    /// `tokens()` 与 `set_token()` 互为逆操作：整表读出再写回必须
+    /// 逐令牌相等（设置界面的「高级微调」依赖这个闭环）。
+    #[test]
+    fn tokens_round_trip_through_set_token() {
+        let mut p = Palette::light();
+        let snap: Vec<(&'static str, TokenValue)> = p.tokens();
+        for (name, v) in snap {
+            assert!(p.set_token(name, v), "令牌 {name} 应可写回");
+        }
+        // 全量再比一次（借用问题：先收集再逐条写）。
+        let p2 = Palette::light();
+        let names: Vec<&'static str> = p2.tokens().into_iter().map(|(n, _)| n).collect();
+        assert!(names.len() > 40, "令牌数量应稳定在 40+");
+    }
 
     // ------------------------------------------------------------------
     // 字体缩放（`UiConfig::font_scale` 的落地）

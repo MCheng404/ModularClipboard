@@ -1766,27 +1766,33 @@ impl App {
             tracing::warn!("图标字体注册失败，界面图标将缺失");
         }
 
-        // 载入界面偏好。未指定时跟随系统（`set_theme` 内部会探测）。
+        // 载入界面偏好。未指定时跟随系统（`resolve` 内部会探测）。
         //
         // 解析与灌入一次做完，返回的 `Palette` 存进 `App.pal` 给每帧自绘用——
         // 两处必须同源，早前`view::draw` 每帧自己算一遍，既浪费
         // （55 个字段逐个构造）又可能与灌进 Visuals 的那次解析分叉。
         //
         // 字体缩放（`UiConfig::font_scale`）叠加在主题原色之上：
-        // `set_theme` 返回的是 1.0× 原色，这里派生显示用的缩放版并
+        // 解析链返回的是 1.0× 原色，这里派生显示用的缩放版并
         // **再灌一次** egui——否则控件层（输入框/按钮内文字）拿到的
-        // 还是 `set_theme` 灌进去的未缩放字号，与自绘层不一致。
+        // 还是未缩放字号，与自绘层不一致。
+        //
+        // 主题解析链（一级 → 二级 → 强调色 → 覆盖）只有这一个入口；
+        // 运行时的任何一层变化走 `App::retint`（同一函数）。
         let font_scale = theme::clamp_font_scale(svc.state.config.ui.font_scale);
-        let pal_base = theme::set_theme(
-            &ctx,
-            theme::ThemeMode::from_dark_mode(svc.state.config.ui.dark_mode),
-        );
+        let init_mode = theme::ThemeMode::from_dark_mode(svc.state.config.ui.dark_mode);
+        let init_effective = theme::resolve(init_mode, theme::detect_system_theme());
+        let pal_base = theme::resolve_palette(init_effective, &svc.state.config.ui);
         let pal = pal_base.with_font_scale(font_scale);
         theme::apply(&ctx, &pal);
         tracing::info!(
             dark = pal.is_dark,
             font_scale,
             configured = ?svc.state.config.ui.dark_mode,
+            secondary = ?svc.state.config.ui.secondary_theme,
+            accent = ?svc.state.config.ui.accent,
+            overrides = svc.state.config.ui.theme_overrides.colors.len()
+                + svc.state.config.ui.theme_overrides.nums.len(),
             "主题已解析"
         );
 
@@ -2271,39 +2277,70 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 主题必须**运行时立即生效**：记录选择 + 重灌调色板。
                     //
                     // CAUTION: 必须同时更新 `App.pal`（自绘层每帧从它取色）
-                    // 与主窗口 `Visuals`（egui 控件层）。`set_theme` 两件事
+                    // 与主窗口 `Visuals`（egui 控件层）。`retint` 两件事
                     // 一起做；设置窗口自己的 `Visuals` 由 `settingswin` 每帧
                     // 从 `App.pal` 同步，这里不用管。
                     self.svc.state.config.ui.dark_mode = mode.to_dark_mode();
-                    // 补间切换（F-34 / UI-P1-3）：从**当前显示中**的调色板
-                    // 渐变到新主题。整窗瞬跳在纯平毛玻璃审美下刺眼
-                    // （背景模糊内容不变、全部前景色瞬换）。`pal_from` 取
-                    // 当前显示值而非上一次的目标——连续切换时从当下续接。
-                    //
-                    // CAUTION（「主题切换失效」的根因，2026-10-14）：
-                    // `pal_mix` 这个补间的目标恒为 1.0，而 `anim::tween_f32`
-                    // 在目标不变时是**惰性**的——首帧插入即 from == to == 1.0，
-                    // 之后永远返回 1.0，`draw_frame` 里 `if pal_mix < 1.0`
-                    // 的分支再也不会执行 ⇒ `self.pal` 从不更新。
-                    // 于是：主窗口的 egui `Visuals` 变了（`set_theme` 立即
-                    // 灌入），而**自绘层与设置/子窗口全部停在旧主题**——
-                    // 用户看到的就是「切主题没反应」。
-                    // 修法：切换时显式 `anim::restart` 把进度重置为 0→1。
-                    let scale = self.font_scale();
-                    let base = crate::theme::set_theme(&self.ctx, mode);
-                    self.pal_base = base.clone();
-                    self.pal_from = self.pal.clone();
-                    // 目标带上当前字体缩放：否则切主题会把用户设的字号
-                    // 打回 1.0×（`set_theme` 返回的是未缩放的 1.0× 原色）。
-                    self.pal_to = base.with_font_scale(scale);
-                    crate::anim::restart(
-                        &self.ctx,
-                        egui::Id::new("pal_mix"),
-                        0.0,
-                        1.0,
-                        crate::theme::PALETTE_TWEEN,
-                        crate::anim::Ease::InOutCubic,
-                    );
+                    // 补间切换（F-34 / UI-P1-3）与解析链重跑都在 `retint`
+                    // 里——主题的每一层变化（一级 / 强调色 / 二级 / 参数 /
+                    // 覆盖）共用同一条路径，分头写必然漂移。
+                    self.retint();
+                    self.after_config_change();
+                }
+                Op::SetAccent(accent) => {
+                    // 强调色：只改配置 + 重跑解析链。accent 一族由
+                    // `theme::derive_accent` 派生（含 hover/active/选中底），
+                    // 背景与文字层不动。
+                    self.svc.state.config.ui.accent = accent;
+                    self.retint();
+                    self.after_config_change();
+                }
+                Op::SetSecondaryTheme(theme) => {
+                    // 二级主题：整包换风格层（深浅两套变体由解析链按当前
+                    // 一级模式选取，见 `theme::apply_secondary`）。
+                    self.svc.state.config.ui.secondary_theme = theme;
+                    self.retint();
+                    self.after_config_change();
+                }
+                Op::SetThemeParams(params) => {
+                    // 二级主题参数：两个旋钮可能同帧连改，整包替换。
+                    self.svc.state.config.ui.theme_params = params;
+                    self.retint();
+                    self.after_config_change();
+                }
+                Op::SetTokenOverride { name, value } => {
+                    // 令牌覆盖：按值类型分表写（颜色 → `colors`，数值 →
+                    // `nums`）。时长令牌不可覆盖（编辑器不暴露，见
+                    // `draw_token_overrides`）——真收到了就忽略。
+                    let ov = &mut self.svc.state.config.ui.theme_overrides;
+                    match value {
+                        crate::theme::TokenValue::Color(c) => {
+                            // CAUTION: 存**非预乘** RGBA（`to_srgba_unmultiplied`
+                            // 的逆）——配置是给人看的 JSON，预乘值存进去，
+                            // 用户手改时看到的不是他认为的那个颜色。
+                            let [r, g, b, a] = c.to_srgba_unmultiplied();
+                            ov.colors.insert(name, [r, g, b, a]);
+                        }
+                        crate::theme::TokenValue::Num(n) => {
+                            ov.nums.insert(name, n);
+                        }
+                        crate::theme::TokenValue::Dur(_) => {}
+                    }
+                    self.retint();
+                    self.after_config_change();
+                }
+                Op::ClearTokenOverride(name) => {
+                    let ov = &mut self.svc.state.config.ui.theme_overrides;
+                    ov.colors.remove(&name);
+                    ov.nums.remove(&name);
+                    self.retint();
+                    self.after_config_change();
+                }
+                Op::ClearAllTokenOverrides => {
+                    let ov = &mut self.svc.state.config.ui.theme_overrides;
+                    ov.colors.clear();
+                    ov.nums.clear();
+                    self.retint();
                     self.after_config_change();
                 }
                 Op::StartRecording(slot) => {
@@ -2863,6 +2900,55 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
             tracing::warn!(%e, "保存配置失败");
             self.svc.notify(format!("保存设置失败: {e}"));
         }
+    }
+
+    /// 重跑主题解析链，并走 220ms 补间切换到新调色板。
+    ///
+    /// 主题的**每一层**变化都走这里：一级模式（[`Op::SetThemeMode`]）、
+    /// 强调色（[`Op::SetAccent`]）、二级主题（[`Op::SetSecondaryTheme`]）、
+    /// 二级主题参数（[`Op::SetThemeParams`]）、令牌覆盖
+    /// （[`Op::SetTokenOverride`] 一族）。五者共一条路径是刻意的：
+    /// 解析链只有一份（`theme::resolve_palette`）、补间机制只有一份
+    /// （`pal_mix`）——分头写必然漂移，2026-10-14 的「切主题没反应」
+    /// 就是这么来的（只灌了 `Visuals`，没更新 `App.pal`）。
+    ///
+    /// # 为什么强调色 / 二级主题也要补间
+    ///
+    /// 整窗瞬跳在纯平毛玻璃审美下刺眼（背景模糊内容不变、全部前景色
+    /// 瞬换，见 F-34）。换主题色与换二级主题是同一类「大面积变色」，
+    /// 没有理由一个渐变一个硬切。
+    fn retint(&mut self) {
+        let mode = crate::theme::ThemeMode::from_dark_mode(self.svc.state.config.ui.dark_mode);
+        let system = crate::theme::detect_system_theme();
+        let effective = crate::theme::resolve(mode, system);
+        // 解析链：一级模式 → 二级主题 → 强调色 → 令牌覆盖。
+        // 字体缩放不在这条链里（幂等派生，见 `theme::resolve_palette`）。
+        let base = crate::theme::resolve_palette(effective, &self.svc.state.config.ui);
+        let scale = self.font_scale();
+        // 灌**缩放版**：`apply` 的入参就是每帧自绘用的那一份，
+        // 与初始化处（`App::new` 末尾的 `theme::apply`）保持同一状态。
+        // 帧循环在补间期间与落定帧还会再灌一次（`draw_frame` 的
+        // `pal_mix` 分支），这里是让「变化当帧」的 Visuals 就正确。
+        crate::theme::apply(&self.ctx, &base.with_font_scale(scale));
+        self.pal_base = base;
+        // `pal_from` 取**当前显示值**而非上一次的目标：连续切换时
+        // 从当下续接，不会跳。
+        self.pal_from = self.pal.clone();
+        self.pal_to = self.pal_base.with_font_scale(scale);
+        // CAUTION（「主题切换失效」的根因，2026-10-14）：`pal_mix` 这个
+        // 补间的目标恒为 1.0，而 `anim::tween_f32` 在目标不变时是
+        // **惰性**的——首帧插入即 from == to == 1.0，之后永远返回 1.0，
+        // `draw_frame` 里 `if pal_mix < 1.0` 的分支再也不会执行
+        // ⇒ `self.pal` 从不更新。于是 Visuals 变了而自绘层停在旧主题。
+        // 修法：切换时显式 `anim::restart` 把进度重置为 0→1。
+        crate::anim::restart(
+            &self.ctx,
+            egui::Id::new("pal_mix"),
+            0.0,
+            1.0,
+            crate::theme::PALETTE_TWEEN,
+            crate::anim::Ease::InOutCubic,
+        );
     }
 
     /// 当前生效调色板。
