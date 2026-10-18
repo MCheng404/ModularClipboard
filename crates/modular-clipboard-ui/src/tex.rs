@@ -27,25 +27,33 @@
 
 /// tile 边长（像素）。同时是 UV 的重复基准（见 [`paint_tiled`]）。
 ///
-/// 96 是折中：再小（32）噪声的周期性会被看出来（同一块 32px 图案
-/// 在 800px 高的窗口里重复 25 次，眼睛能数出来）；再大（256）上传
-/// 与生成成本翻四倍，而纹理本身是低分辨率的——它是**质感**不是图像，
-/// 放大镜下不需要细节。
-pub const TILE: usize = 96;
+/// 128 是「重复图案可感性」与成本的折中：96 实测下星空的随机分布
+/// 会被人眼数出重复的「星座图案」（2026-10-18 星空主题反馈），
+/// 128 把重复周期拉到 5~6 个 tile，随机性足够摊薄；256 的上传与
+/// 生成成本翻四倍而边际收益很小。
+pub const TILE: usize = 128;
 
 /// 纸质感 tile 在窗口里的逻辑尺寸（pt）。
 ///
-/// 比 [`TILE`] 像素大 4 倍：纸纤维的物理尺度约 0.5~2mm，在 96 DPI
-/// 下折合 2~8 逻辑点；取 24pt 意味着一个 tile 覆盖约 4 个「纤维团」，
-/// 重复 30+ 次也不显单调。
-pub const PAPER_TILE_PT: f32 = 24.0;
+/// # 为什么必须与 [`TILE`] **1:1**（2026-10-18 实测修正）
+///
+/// 初版取 24pt：96px 纹理缩到 24pt 显示 ⇒ 4:1 降采样，线性过滤把
+/// 稀疏的斑点与纤维**平均成一层脏雾**（实测整窗标准差 0.8 色阶，
+/// 用户反馈「纸质渲染不正常」）。1:1 映射下每个纹素占一个物理像素
+/// （ppp=1 时），4px 的噪点格与 6~20px 的纤维都清晰可辨。
+///
+/// 物理尺度也正好：4px 格 ≈ 4pt ≈ 1.3mm（96 DPI），与真实纸纤维
+/// 的斑驳尺度同量级；一个 tile 覆盖 128pt，720pt 宽的窗口重复 5.6 次，
+/// 周期性不会被人眼数出来。
+pub const PAPER_TILE_PT: f32 = 128.0;
 
 /// 星空 tile 的逻辑尺寸（pt）。
 ///
-/// 星点比纤维稀疏得多，tile 放大到 48pt：96px 里撒约 14 颗星，
-/// 一块 48pt 的「天区」里有 14 颗，密度接近真实夜空（当然亮度和
-/// 分布是风格化的）。
-pub const STAR_TILE_PT: f32 = 48.0;
+/// 同为 1:1 映射（理由见 [`PAPER_TILE_PT`]）：星星核心半径 1~2.6px
+/// 在 1:1 下是 1~2.6pt 的亮点，缩小则被过滤成一个半透明像素。
+/// 密度随之重标定：每 tile 6 颗 ⇒ 720×700 的窗口约 165 颗，
+/// 接近真实夜空的「稀疏但找得到」。
+pub const STAR_TILE_PT: f32 = 128.0;
 
 /// 确定性伪随机数（xorshift32）。
 ///
@@ -111,9 +119,17 @@ fn hash2(x: usize, y: usize, seed: u32) -> f32 {
     (h >> 8) as f32 / (1u32 << 24) as f32
 }
 
-/// 生成纸质感 tile：细密噪点 + 少量横向纤维。
+/// 生成纸质感 tile：局部斑点 + 少量横向纤维。
 ///
-/// 输出为**白色**、alpha 随噪点起伏（tint 在上色时乘进去，见
+/// # 为什么均值必须归零（2026-10-18 实测修正）
+///
+/// 初版把噪声 alpha 的均值放在 128（50%）——那等于「半透明墨均匀蒙
+/// 满整个窗口」，实测整窗亮度标准差只有 0.8 色阶、峰值与均值没有
+/// 区别：用户看到的就是一层脏雾，不是纸。纸的质感在物理上是**局部
+/// 特征**（纤维、斑点、杂质），背景大部分是干净的。因此 alpha 以 0
+/// 为基、只有噪声高于均值的区域出墨，峰值约 90；纤维再叠一层。
+///
+/// 输出为**白色**、alpha 起伏（tint 在上色时乘进去，见
 /// [`paint_tiled`]）：这样同一份 tile 在深浅两套下只需换 tint 颜色，
 /// 不必生成两份纹理。
 fn paper_pixels() -> Vec<u8> {
@@ -124,9 +140,11 @@ fn paper_pixels() -> Vec<u8> {
         for x in 0..TILE {
             let fine = value_noise(x, y, 0x9E37_79B9);
             let coarse = value_noise(x / 4, y / 4, 0x7F4A_7C15);
-            // 中值 0.5 附近波动 ⇒ alpha 以 128 为轴、幅度 ±64。
+            // 中值 0.5 附近波动 ⇒ alpha 以 0 为轴、峰值 90。
+            // 阈值 0.5 是硬切：低于它的区域全透明（干净纸面），
+            // 高于它的按超出量出墨——「斑驳」而不是「均匀」。
             let n = fine * 0.65 + coarse * 0.35;
-            let a = (128.0 + (n - 0.5) * 128.0).clamp(0.0, 255.0) as u8;
+            let a = ((n - 0.5) * 200.0).clamp(0.0, 90.0) as u8;
             let i = (y * TILE + x) * 4;
             px[i] = 255;
             px[i + 1] = 255;
@@ -134,20 +152,23 @@ fn paper_pixels() -> Vec<u8> {
             px[i + 3] = a;
         }
     }
-    // 横向纤维：十几条短划，方向略斜、亮度略高——纸纹里最可辨的
+    // 横向纤维：少量短划，方向略斜、亮度略高——纸纹里最可辨的
     // 线索其实是这些「一丝一丝」的反光，纯噪点读起来像磨砂。
+    // 密度按 1:1 重标：128² tile 里 8 条 ⇒ 720×700 窗口约 350 条，
+    // 初版 14 条是 24pt tile 时代的密度（缩采样 4:1 后约 90 条），
+    // 放到 1:1 会连成块状横带（2026-10-18 截图标定）。
     let mut rng = Rng::new(PAPER_FIBER_SEED);
-    for _ in 0..14 {
+    for _ in 0..8 {
         let x0 = rng.unit() * TILE as f32;
         let y0 = rng.unit() * TILE as f32;
         let len = 6.0 + rng.unit() * 14.0;
         let slope = (rng.unit() - 0.5) * 0.25;
-        let bright = 180 + (rng.unit() * 60.0) as u8;
+        let bright = 90 + (rng.unit() * 50.0) as u8;
         for t in 0..(len as usize) {
             let x = (x0 as usize + t) % TILE;
             let y = (y0 + slope * t as f32).rem_euclid(TILE as f32) as usize % TILE;
             let i = (y * TILE + x) * 4;
-            px[i + 3] = px[i + 3].saturating_add(bright / 3);
+            px[i + 3] = px[i + 3].saturating_add(bright);
         }
     }
     px
@@ -163,12 +184,24 @@ const PAPER_FIBER_SEED: u32 = 0x51ED_2701;
 fn star_pixels() -> Vec<u8> {
     let mut px = vec![0u8; TILE * TILE * 4];
     let mut rng = Rng::new(STAR_BASE_SEED);
-    for _ in 0..14 {
+    // 每 tile 6 颗：1:1 映射下 720×700 的窗口约 165 颗（见
+    // `STAR_TILE_PT` 的密度标定）。初版 14 颗是 48pt tile 时代的
+    // 密度，放到 1:1 会是 780 颗——满天麻点，且随机分布会数出
+    // 重复的「星座图案」。
+    for _ in 0..6 {
         let cx = rng.unit() * TILE as f32;
         let cy = rng.unit() * TILE as f32;
-        let r = 1.0 + rng.unit() * 1.6;
-        let core = 200 + (rng.unit() * 55.0) as u8;
-        let halo = (core as f32 * 0.35) as u8;
+        // 半径压到 1px 级：1:1 下 0.8~1.6pt 的细点才像远处的星，
+        // 大光晕在深紫底上是一团团糊斑。
+        let r = 0.8 + rng.unit() * 0.8;
+        // 亮度分级（暗星多、亮星少）：真实星空的亮度分布是指数的，
+        // 均匀随机会得到一排一样亮的「珠子」。
+        let core = if rng.unit() < 0.25 {
+            200 + (rng.unit() * 40.0) as u8
+        } else {
+            110 + (rng.unit() * 60.0) as u8
+        };
+        let halo = (core as f32 * 0.3) as u8;
         let x0 = (cx - r - 1.0).max(0.0) as usize;
         let x1 = ((cx + r + 1.0).min(TILE as f32 - 1.0)) as usize;
         let y0 = (cy - r - 1.0).max(0.0) as usize;
@@ -208,12 +241,12 @@ pub fn paper_tile(ctx: &egui::Context) -> egui::TextureHandle {
     ctx.load_texture(
         "theme_paper_fibers",
         egui::ColorImage::from_rgba_unmultiplied([TILE, TILE], &paper_pixels()),
-        egui::TextureOptions {
-            magnification: egui::TextureFilter::Linear,
-            minification: egui::TextureFilter::Linear,
-            wrap_mode: egui::TextureWrapMode::Repeat,
-            mipmap_mode: None,
-        },
+        // CAUTION: 必须是 **REPEAT**——`paint_tiled` 的 UV 超出 [0,1]
+        // 靠它环绕。renderer 按本选项选采样器（`UserTexture::wrap_repeat`），
+        // 写成 ClampToEdge 的话整个窗口会被 tile 的角落像素拉伸铺满
+        // （2026-10-18 纸质/星空的实际故障）。与 `LINEAR_REPEAT` 常量同义，
+        // 用常量是为了与 renderer 建采样器的那处同源。
+        egui::TextureOptions::LINEAR_REPEAT,
     )
 }
 
@@ -222,12 +255,12 @@ pub fn star_tile(ctx: &egui::Context) -> egui::TextureHandle {
     ctx.load_texture(
         "theme_starfield",
         egui::ColorImage::from_rgba_unmultiplied([TILE, TILE], &star_pixels()),
-        egui::TextureOptions {
-            magnification: egui::TextureFilter::Linear,
-            minification: egui::TextureFilter::Linear,
-            wrap_mode: egui::TextureWrapMode::Repeat,
-            mipmap_mode: None,
-        },
+        // CAUTION: 必须是 **REPEAT**——`paint_tiled` 的 UV 超出 [0,1]
+        // 靠它环绕。renderer 按本选项选采样器（`UserTexture::wrap_repeat`），
+        // 写成 ClampToEdge 的话整个窗口会被 tile 的角落像素拉伸铺满
+        // （2026-10-18 纸质/星空的实际故障）。与 `LINEAR_REPEAT` 常量同义，
+        // 用常量是为了与 renderer 建采样器的那处同源。
+        egui::TextureOptions::LINEAR_REPEAT,
     )
 }
 
@@ -286,7 +319,8 @@ mod tests {
         }
     }
 
-    /// 纸纹 tile：确定性（两次生成逐字节相同）+ alpha 有起伏但不全饱和。
+    /// 纸纹 tile：确定性（两次生成逐字节相同）+ alpha 以 0 为基、
+    /// 有局部峰值（「斑驳」而非「均匀蒙层」，2026-10-18 修正的判据）。
     #[test]
     fn paper_pixels_deterministic_and_varied() {
         let a = paper_pixels();
@@ -296,8 +330,14 @@ mod tests {
         assert!(!alphas.iter().all(|&x| x == 0), "不能全透明");
         assert!(!alphas.iter().all(|&x| x == 255), "不能全不透明");
         let mean: f32 = alphas.iter().map(|&x| x as f32).sum::<f32>() / alphas.len() as f32;
-        // 均值应在 128 附近（中轴）——偏离太远说明强度需要重新标定。
-        assert!((mean - 128.0).abs() < 40.0, "alpha 均值 {mean} 偏离中轴");
+        // 均值必须**接近 0**：均匀蒙层（旧实现的均值 128）实测让整个
+        // 窗口像蒙了一层脏雾，纸纹的「斑驳」感来自大面积干净 + 局部出墨。
+        assert!(mean < 30.0, "alpha 均值 {mean} 应接近 0（干净纸面为底）");
+        // 峰值要够：没有任何超过 60 的像素就只剩底噪、读不出纤维。
+        assert!(
+            alphas.iter().any(|&x| x > 60),
+            "应有纤维级峰值（>60）"
+        );
         // RGB 恒白（tint 在上色时乘入，见 `paint_tiled` 的说明）。
         assert!(a.chunks_exact(4).all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255));
     }

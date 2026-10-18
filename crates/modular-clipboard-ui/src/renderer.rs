@@ -406,6 +406,14 @@ pub fn repaint_delay(output: &egui::FullOutput) -> Option<std::time::Duration> {
 struct UserTexture {
     image: DeviceImage,
     set: vk::DescriptorSet,
+    /// 本纹理的采样器是否为**环绕**（`TextureOptions::wrap_mode =
+    /// Repeat`）。
+    ///
+    /// CAUTION: 必须记住——`rewrite_user_texture_sets` 在字体图集重建时
+    /// 要重写全部用户纹理集合，若统一用 clamp 采样器，环绕纹理会静默
+    /// 退化（UV 超出 [0,1] 被拉到角落像素，平铺质感变成一块纯色）。
+    /// 缩略图全是 clamp，默认 false。
+    wrap_repeat: bool,
 }
 
 /// 一帧的绘制上下文。
@@ -428,6 +436,9 @@ pub struct Painter<'a> {
     /// 两者无法共用一个 sampler ⇒ 着色器里分开两个 binding
     /// （`BINDING_SAMPLER` / `BINDING_USER_SAMPLER`）。
     sampler_linear: Sampler,
+    /// 用户纹理的环绕采样器（`TextureOptions::wrap_mode = Repeat`），
+    /// 见 `Painter::new` 的分配处与 `UserTexture::wrap_repeat`。
+    sampler_linear_repeat: Sampler,
     /// 字体图集（覆盖率图，`R8_UNORM`）。
     font: Option<DeviceImage>,
     /// 用户纹理（图片缩略图，RGBA）。
@@ -620,6 +631,13 @@ impl<'a> Painter<'a> {
         anyhow::ensure!(slot_count > 0, "在飞帧槽位数必须大于 0");
         let sampler = Sampler::new_nearest(&gpu.device)?;
         let sampler_linear = Sampler::new_linear_clamped(&gpu.device)?;
+        // 用户纹理的**环绕**采样器：egui 的 `TextureOptions::wrap_mode =
+        // Repeat` 要用（程序化质感 tile 靠它平铺，见 `crate::tex`）。
+        // 缺了它，UV 超出 [0,1] 的部分被 clamp 到 tile 的角落像素 ⇒
+        // 整个窗口被一个像素拉伸铺满，「纹理没有纹理」（2026-10-18
+        // 纸质/星空主题的实际故障）。
+        let sampler_linear_repeat =
+            Sampler::from_egui(&gpu.device, &egui::TextureOptions::LINEAR_REPEAT)?;
         let uniform = UniformBuffer::new(gpu)?;
         let slots = SlotBuffers::new(
             gpu,
@@ -632,6 +650,7 @@ impl<'a> Painter<'a> {
             gpu,
             sampler,
             sampler_linear,
+            sampler_linear_repeat,
             font: None,
             user_textures: HashMap::new(),
             user_order: VecDeque::new(),
@@ -1665,7 +1684,9 @@ impl<'a> Painter<'a> {
             // 降级后把该纹理**移除**：图像尚未写入像素，留着会画出未定义
             // 内容；移除后下一帧会重新解码上传（像素仍在 `thumb_cache`，
             // 不会重复读盘）。
-            if let Err(e) = self.upload_user_texture(fr, *id, w, h, &last.image) {
+            if let Err(e) =
+                self.upload_user_texture(fr, *id, w, h, &last.image, &last.options)
+            {
                 tracing::warn!(?id, w, h, "缩略图上传失败，本帧跳过该图: {e:#}");
                 self.drop_user_texture(fr, *id);
                 continue;
@@ -1697,6 +1718,7 @@ impl<'a> Painter<'a> {
         w: u32,
         h: u32,
         image: &egui::ImageData,
+        options: &egui::TextureOptions,
     ) -> anyhow::Result<()> {
         let same_size = self
             .user_textures
@@ -1710,6 +1732,16 @@ impl<'a> Painter<'a> {
                 old.image.destroy(&self.gpu.device);
                 fr.free_user_texture_set(old.set)?;
             }
+            // 环绕采样按纹理逐张开（egui 的 TextureOptions 语义）：
+            // 缩略图 clamp、程序化质感 tile repeat。采样器绑在描述符
+            // 集合里，集合只在尺寸变化时重建，因此这里选一次就定。
+            let wrap_repeat = options.wrap_mode == egui::TextureWrapMode::Repeat
+                || options.wrap_mode == egui::TextureWrapMode::MirroredRepeat;
+            let user_sampler = if wrap_repeat {
+                self.sampler_linear_repeat.handle()
+            } else {
+                self.sampler_linear.handle()
+            };
             // `mut`：集合分配失败的分支要就地销毁它（见下）。
             let mut img = DeviceImage::new(
                 self.gpu,
@@ -1733,7 +1765,7 @@ impl<'a> Painter<'a> {
             let set = match fr.allocate_user_texture_set(
                 CommonBindings {
                     sampler: self.sampler.handle(),
-                    user_sampler: self.sampler_linear.handle(),
+                    user_sampler,
                     font_view,
                     font_layout,
                     uniform_buffer: self.uniform.buffer().handle(),
@@ -1753,7 +1785,14 @@ impl<'a> Painter<'a> {
                     return Err(e);
                 }
             };
-            self.user_textures.insert(id, UserTexture { image: img, set });
+            self.user_textures.insert(
+                id,
+                UserTexture {
+                    image: img,
+                    set,
+                    wrap_repeat,
+                },
+            );
             // LRU 位置由函数尾统一 touch（两条路径都要），这里不重复调。
             self.evict_user_textures_if_needed(fr)?;
         }
@@ -1784,11 +1823,17 @@ impl<'a> Painter<'a> {
             return Ok(());
         };
         for t in self.user_textures.values() {
+            // 按各纹理自己的 wrap 选采样器（见 `UserTexture::wrap_repeat`）。
+            let user_sampler = if t.wrap_repeat {
+                self.sampler_linear_repeat.handle()
+            } else {
+                self.sampler_linear.handle()
+            };
             fr.rewrite_user_texture_set(
                 t.set,
                 CommonBindings {
                     sampler: self.sampler.handle(),
-                    user_sampler: self.sampler_linear.handle(),
+                    user_sampler,
                     font_view: font.view,
                     font_layout: font.layout,
                     uniform_buffer: self.uniform.buffer().handle(),

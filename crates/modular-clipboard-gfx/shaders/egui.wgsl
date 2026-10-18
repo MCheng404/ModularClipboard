@@ -112,10 +112,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let cov = textureSampleLevel(font_tex, tex_sampler, in.uv, 0.0).r;
         return in.color * cov;
     }
-    // 用户纹理（图片缩略图）是**直通 alpha**（PNG 解码结果），
-    // 必须先预乘再交给预乘混合，否则半透明像素会偏亮。
-    // 用独立的 `user_sampler`（linear）采样：显示尺寸 ≠ 纹理尺寸时
-    // 最近邻会让照片出摩尔纹（见绑定处的长注释）。
+    // 用户纹理（图片缩略图、程序化质感 tile）。用独立的 `user_sampler`
+    // 采样：显示尺寸 ≠ 纹理尺寸时最近邻会让照片出摩尔纹（见绑定处的
+    // 长注释）。环绕模式（`TextureWrapMode::Repeat`）也由该采样器承载
+    // ——egui 逐纹理指定 wrap，renderer 按 `ImageDelta::options` 选采样
+    // 器并绑进本纹理的描述符集合（见 `UserTexture::wrap_repeat`）。
     let c = textureSampleLevel(user_tex, user_sampler, in.uv, 0.0);
-    return vec4<f32>(c.rgb * c.a, c.a);
+    // CAUTION（2026-10-18 修，两个错误都被「不透明 + 白 tint」掩盖）：
+    //
+    // ① 上传的字节是**预乘**的：egui 的 `ColorImage.pixels` 是 `Color32`，
+    //    `to_array()` 返回预乘分量，renderer 原样送进 GPU（见
+    //    `upload_user_texture` 的 rgba 收集）。旧代码把 `c.rgb` 又乘一遍
+    //    `c.a` ⇒ 二次预乘，半透明纹理的 RGB 被压暗两次 alpha（纸纹的
+    //    纤维因此淡到几乎看不见）。
+    // ② 旧代码**完全丢弃顶点色** ⇒ `painter.image` 的 tint 不起作用：
+    //    纸纹的墨色（暖棕/暖白）与强度、星点的密度全都丢了。
+    //
+    // 正确做法：预乘 × 预乘 逐通道相乘。顶点色同为 `Color32` 预乘语义
+    // （`unpack4x8unorm(in.color)`），结果直接交给
+    // `ONE, ONE_MINUS_SRC_ALPHA` 预乘混合。
+    //
+    // 对现有缩略图零变化：它们不透明（a=1）且 tint 恒为 WHITE，
+    // `c * white == c`。
+    return c * in.color;
 }
