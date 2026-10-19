@@ -12724,6 +12724,24 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.settings_frame();
         assert!(settings_hit(&h, "paper_tint").width() > 0.0);
         assert!(settings_hit(&h, "paper_texture").width() > 0.0);
+        // 星空有五个旋钮（2026-10-19：随机化 / 闪烁 / 大小加入后）——
+        // 新增旋钮只靠 core 的 knobs() 表驱动，这里守住「表里登记的都
+        // 真的画出了热区」。
+        h.svc.state.config.ui.secondary_theme =
+            modular_clipboard_core::config::SecondaryTheme::Purple;
+        h.settings_frame();
+        for key in [
+            "purple_tint",
+            "purple_stars",
+            "star_random",
+            "star_twinkle",
+            "star_size_var",
+        ] {
+            assert!(
+                settings_hit(&h, key).width() > 0.0,
+                "星空旋钮 {key} 应渲染出热区"
+            );
+        }
     }
 
     /// 令牌编辑器默认**折叠**：令牌行不绘制、不注册热区；点「展开」后
