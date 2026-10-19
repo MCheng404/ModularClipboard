@@ -47,14 +47,6 @@ pub const TILE: usize = 128;
 /// 周期性不会被人眼数出来。
 pub const PAPER_TILE_PT: f32 = 128.0;
 
-/// 星空 tile 的逻辑尺寸（pt）。
-///
-/// 同为 1:1 映射（理由见 [`PAPER_TILE_PT`]）：星星核心半径 1~2.6px
-/// 在 1:1 下是 1~2.6pt 的亮点，缩小则被过滤成一个半透明像素。
-/// 密度随之重标定：每 tile 6 颗 ⇒ 720×700 的窗口约 165 颗，
-/// 接近真实夜空的「稀疏但找得到」。
-pub const STAR_TILE_PT: f32 = 128.0;
-
 /// 确定性伪随机数（xorshift32）。
 ///
 /// 不自带 crate：只需要一个能复现的序列，xorshift 的状态转移足够。
@@ -177,66 +169,10 @@ fn paper_pixels() -> Vec<u8> {
 /// 纸纤维的随机种子（固定值：纹理必须可复现）。
 const PAPER_FIBER_SEED: u32 = 0x51ED_2701;
 
-/// 生成星空 tile：稀疏星点，亮度/半径随机。
-///
-/// 每颗星 = 中心实点 + 一圈衰减光晕（手写径向衰减，不用高斯——
-/// 3px 半径上手写核与高斯无视觉差别，但便宜一个数量级）。
-fn star_pixels() -> Vec<u8> {
-    let mut px = vec![0u8; TILE * TILE * 4];
-    let mut rng = Rng::new(STAR_BASE_SEED);
-    // 每 tile 6 颗：1:1 映射下 720×700 的窗口约 165 颗（见
-    // `STAR_TILE_PT` 的密度标定）。初版 14 颗是 48pt tile 时代的
-    // 密度，放到 1:1 会是 780 颗——满天麻点，且随机分布会数出
-    // 重复的「星座图案」。
-    for _ in 0..6 {
-        let cx = rng.unit() * TILE as f32;
-        let cy = rng.unit() * TILE as f32;
-        // 半径压到 1px 级：1:1 下 0.8~1.6pt 的细点才像远处的星，
-        // 大光晕在深紫底上是一团团糊斑。
-        let r = 0.8 + rng.unit() * 0.8;
-        // 亮度分级（暗星多、亮星少）：真实星空的亮度分布是指数的，
-        // 均匀随机会得到一排一样亮的「珠子」。
-        let core = if rng.unit() < 0.25 {
-            200 + (rng.unit() * 40.0) as u8
-        } else {
-            110 + (rng.unit() * 60.0) as u8
-        };
-        let halo = (core as f32 * 0.3) as u8;
-        let x0 = (cx - r - 1.0).max(0.0) as usize;
-        let x1 = ((cx + r + 1.0).min(TILE as f32 - 1.0)) as usize;
-        let y0 = (cy - r - 1.0).max(0.0) as usize;
-        let y1 = ((cy + r + 1.0).min(TILE as f32 - 1.0)) as usize;
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let dx = x as f32 - cx;
-                let dy = y as f32 - cy;
-                let d = (dx * dx + dy * dy).sqrt();
-                let a = if d <= r {
-                    core
-                } else if d <= r + 1.0 {
-                    halo
-                } else {
-                    continue;
-                };
-                let i = (y * TILE + x) * 4;
-                px[i] = 255;
-                px[i + 1] = 255;
-                px[i + 2] = 255;
-                // 星点可能重叠：取更亮者（叠加会糊成团）。
-                px[i + 3] = px[i + 3].max(a);
-            }
-        }
-    }
-    px
-}
-
-/// 星空种子（固定值）。
-const STAR_BASE_SEED: u32 = 0x5741_5ED2;
-
 /// 惰性加载纸质感 tile（每个 `Context` 一份）。
 ///
 /// 只生成一次：`load_texture` 用同名覆盖语义，但没必要每帧调——
-/// 生成是 96×96 的 CPU 循环，缓存后零成本。
+/// 生成是 128×128 的 CPU 循环，缓存后零成本。
 pub fn paper_tile(ctx: &egui::Context) -> egui::TextureHandle {
     ctx.load_texture(
         "theme_paper_fibers",
@@ -244,23 +180,178 @@ pub fn paper_tile(ctx: &egui::Context) -> egui::TextureHandle {
         // CAUTION: 必须是 **REPEAT**——`paint_tiled` 的 UV 超出 [0,1]
         // 靠它环绕。renderer 按本选项选采样器（`UserTexture::wrap_repeat`），
         // 写成 ClampToEdge 的话整个窗口会被 tile 的角落像素拉伸铺满
-        // （2026-10-18 纸质/星空的实际故障）。与 `LINEAR_REPEAT` 常量同义，
+        // （2026-10-18 纸质的实际故障）。与 `LINEAR_REPEAT` 常量同义，
         // 用常量是为了与 renderer 建采样器的那处同源。
         egui::TextureOptions::LINEAR_REPEAT,
     )
 }
 
-/// 惰性加载星空 tile。语义同 [`paper_tile`]。
-pub fn star_tile(ctx: &egui::Context) -> egui::TextureHandle {
+/// 星点精灵纹理的边长（像素）：**单颗星**的「照片」。
+///
+/// 2026-10-19 从「整片星空 tile」改为「精灵 + CPU 星星列表」：tile
+/// 方案下，随机化（换一片星）、动态（闪烁）、大小不规则（逐颗半径）
+/// 三个需求都做不到——纹理上传后就是静态的。精灵方案下每颗星是一个
+/// 小 quad，位置/大小/亮度全部由 CPU 逐帧算，tint 通道（2026-10-18
+/// 修好的预乘路径）承载闪烁 alpha。
+///
+/// 16px 足够：星星本身 1~3pt，16px 容纳核心 + 光晕还有余量。
+pub const STAR_SPRITE: usize = 16;
+
+/// 一颗星。
+///
+/// 坐标为**归一化** [0,1)（相对窗口左上角）：窗口 resize 时星星按
+/// 比例跟随，不必重生成列表。半径是逻辑点（不归一化）——它不该随
+/// 窗口变大而变大，星星的物理大小是恒定的。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Star {
+    /// 归一化 x ∈ [0,1)。
+    pub x: f32,
+    /// 归一化 y ∈ [0,1)。
+    pub y: f32,
+    /// 半径（逻辑点）。
+    pub radius: f32,
+    /// 闪烁相位（弧度）。每颗星不同 ⇒ 不会齐刷刷地闪。
+    pub phase: f32,
+    /// 闪烁频率（Hz）。很慢——肉眼可辨的「呼吸」而不是频闪。
+    pub freq: f32,
+    /// 基础亮度 alpha（0..1，含亮度分级：少数亮星、多数暗星）。
+    pub base: f32,
+}
+
+/// CPU 侧的「一片星空」。
+///
+/// 生成是纯函数（同种子同列表，见 [`StarField::generate`]），调用方
+/// 按 [`StarField::fingerprint_of`] 判断是否需要重建——参数没变就
+/// 每帧复用同一份列表，只重算闪烁。
+pub struct StarField {
+    /// 全部星星（数量由密度参数决定，0 密度 = 空表）。
+    pub stars: Vec<Star>,
+    /// 生成时的参数指纹（调用方据此判重建）。
+    pub fingerprint: String,
+}
+
+impl StarField {
+    /// 密度参数 → 星星数量（0..1 → 0..[`STAR_COUNT_MAX`]）。
+    ///
+    /// 上限 220 是 draw call 预算：每颗星一个 quad，220 个 image shape
+    /// 经 tessellator 同纹理合批后仍是一批，但 CPU 侧每帧要算 220 次
+    /// 三角函数——再密就是「麻点」而不是「星空」了（用户反馈过）。
+    pub const COUNT_MAX: usize = 220;
+
+    /// 生成一片星空。
+    ///
+    /// - `density` / `size_var` 见 [`modular_clipboard_core::config::ThemeParams`]；
+    /// - `random` = 0 时**完全确定性**（固定种子，每次启动同一片星，
+    ///   回归测试可断言）；> 0 时按比例混入 `entropy` 与位置抖动——
+    ///   1.0 时每次重建都是一片新星空。
+    /// - `entropy`：重建时的随机熵（调用方传 egui 时间等；random=0 时忽略）。
+    pub fn generate(density: f32, random: f32, size_var: f32, entropy: u64) -> Self {
+        let density = density.clamp(0.0, 1.0);
+        let random = random.clamp(0.0, 1.0);
+        let size_var = size_var.clamp(0.0, 1.0);
+        let count = (density * Self::COUNT_MAX as f32).round() as usize;
+        // 种子：固定基底 ^ 按 random 比例混入的熵。random=0 时熵不参与
+        // （乘 0 后异或固定种子，仍是确定性星空）。
+        let entropy_mix = (entropy as f64 * f64::from(random)) as u64;
+        let seed = 0x5741_5ED2 ^ entropy_mix as u32;
+        let mut rng = Rng::new(seed | 1);
+        let mut stars = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut x = rng.unit();
+            let mut y = rng.unit();
+            // 位置抖动：random 在 [0,1] 时叠加 ±1% 窗口尺寸的偏移——
+            // 破除 hash 均匀分布残留的微弱网格规律。random=0 时无抖动。
+            if random > 0.0 {
+                x = (x + (rng.unit() - 0.5) * 0.02 * random).rem_euclid(1.0);
+                y = (y + (rng.unit() - 0.5) * 0.02 * random).rem_euclid(1.0);
+            }
+            // 大小：size_var=0 时全部 1.2pt（整齐的哑星），1 时 0.6~3.2pt
+            // 全范围随机（读出纵深）。
+            let radius = 1.2 + (rng.unit() - 0.5) * 2.6 * size_var;
+            // 亮度分级（25% 亮星）：真实星空的亮度分布是指数的，均匀
+            // 随机会得到一排一样亮的「珠子」。
+            let base = if rng.unit() < 0.25 {
+                0.82 + rng.unit() * 0.18
+            } else {
+                0.35 + rng.unit() * 0.35
+            };
+            stars.push(Star {
+                x,
+                y,
+                radius: radius.clamp(0.4, 4.0),
+                phase: rng.unit() * std::f32::consts::TAU,
+                freq: 0.05 + rng.unit() * 0.12,
+                base,
+            });
+        }
+        Self {
+            stars,
+            fingerprint: Self::fingerprint_of(density, random, size_var),
+        }
+    }
+
+    /// 参数指纹：三个影响列表的参数（密度/随机化/大小）。旋钮的其余
+    /// 两个（紫度是颜色层、闪烁是逐帧量）不进指纹。
+    pub fn fingerprint_of(density: f32, random: f32, size_var: f32) -> String {
+        format!(
+            "{:.3}:{:.3}:{:.3}",
+            density.clamp(0.0, 1.0),
+            random.clamp(0.0, 1.0),
+            size_var.clamp(0.0, 1.0)
+        )
+    }
+}
+
+/// 闪烁 alpha（纯函数，便于单测）。
+///
+/// `twinkle` = 0 时恒定返回 `star.base`（静态星）；1 时在
+/// `base × [0, 1]` 之间按每颗星自己的相位与频率呼吸。中间值线性
+/// 缩放摆幅——用户要「闪得含蓄一点」时不会得到一个奇怪的曲线。
+pub fn twinkle_alpha(star: &Star, twinkle: f32, t: f64) -> f32 {
+    let twinkle = twinkle.clamp(0.0, 1.0);
+    if twinkle <= 0.004 {
+        return star.base;
+    }
+    let wave = 0.5 + 0.5 * (t * f64::from(star.freq) * std::f64::consts::TAU + f64::from(star.phase)).sin();
+    (star.base * (1.0 - twinkle + twinkle * wave as f32)).clamp(0.0, 1.0)
+}
+
+/// 生成星点精灵像素：中心实点 + 径向衰减光晕，白底。
+///
+/// 径向核手写（不用高斯）：16px 上手写核与高斯无视觉差别，便宜一个
+/// 数量级。tint 只调 alpha（白星），所以 RGB 恒 255。
+fn star_sprite_pixels() -> Vec<u8> {
+    let n = STAR_SPRITE;
+    let mut px = vec![0u8; n * n * 4];
+    let c = (n as f32 - 1.0) * 0.5;
+    for y in 0..n {
+        for x in 0..n {
+            let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt() / (n as f32 * 0.5);
+            // 核心（d ≤ 0.25）实点，之外幂衰减到 0。
+            let a = if d <= 0.25 {
+                255.0
+            } else {
+                (1.0 - d).max(0.0).powf(2.2) * 220.0
+            };
+            let i = (y * n + x) * 4;
+            px[i] = 255;
+            px[i + 1] = 255;
+            px[i + 2] = 255;
+            px[i + 3] = a as u8;
+        }
+    }
+    px
+}
+
+/// 惰性加载星点精灵（每个 `Context` 一份）。语义同 [`paper_tile`]。
+///
+/// 采样器用默认 LINEAR + Clamp：精灵的 UV 恒为 [0,1]（不超出），
+/// 不需要 Repeat。
+pub fn star_sprite(ctx: &egui::Context) -> egui::TextureHandle {
     ctx.load_texture(
-        "theme_starfield",
-        egui::ColorImage::from_rgba_unmultiplied([TILE, TILE], &star_pixels()),
-        // CAUTION: 必须是 **REPEAT**——`paint_tiled` 的 UV 超出 [0,1]
-        // 靠它环绕。renderer 按本选项选采样器（`UserTexture::wrap_repeat`），
-        // 写成 ClampToEdge 的话整个窗口会被 tile 的角落像素拉伸铺满
-        // （2026-10-18 纸质/星空的实际故障）。与 `LINEAR_REPEAT` 常量同义，
-        // 用常量是为了与 renderer 建采样器的那处同源。
-        egui::TextureOptions::LINEAR_REPEAT,
+        "theme_star_sprite",
+        egui::ColorImage::from_rgba_unmultiplied([STAR_SPRITE, STAR_SPRITE], &star_sprite_pixels()),
+        egui::TextureOptions::LINEAR,
     )
 }
 
@@ -342,26 +433,114 @@ mod tests {
         assert!(a.chunks_exact(4).all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255));
     }
 
-    /// 星空 tile：确定性 + 确实有亮点（星点）+ 大部分区域是暗的
-    /// （夜空不能是麻子脸）。
+    /// 星点精灵：确定性 + 中心亮、边缘透明（径向核的形状判据）。
     #[test]
-    fn star_pixels_deterministic_and_sparse() {
-        let a = star_pixels();
-        assert_eq!(a, star_pixels(), "同种子必须生成同一份纹理");
-        let alphas: Vec<u8> = a.chunks_exact(4).map(|p| p[3]).collect();
-        let lit = alphas.iter().filter(|&&x| x > 64).count();
-        assert!(lit > 20, "星点太少：{lit}");
-        assert!(
-            lit < alphas.len() / 8,
-            "星点太密：{lit}/{}",
-            alphas.len()
-        );
+    fn star_sprite_deterministic_and_radial() {
+        let a = star_sprite_pixels();
+        assert_eq!(a, star_sprite_pixels(), "精灵是纯函数，两次生成必须相同");
+        let n = STAR_SPRITE;
+        assert_eq!(a.len(), n * n * 4);
+        // 中心像素必须不透明（实点核心）。
+        let c = (n / 2) * n + n / 2;
+        assert!(a[c * 4 + 3] > 200, "精灵中心应是不透明核心");
+        // 四角必须全透明（光晕衰减到 0，否则小星星带方框）。
+        for &(x, y) in &[(0usize, 0usize), (n - 1, 0), (0, n - 1), (n - 1, n - 1)] {
+            assert_eq!(a[(y * n + x) * 4 + 3], 0, "角点 ({x},{y}) 应全透明");
+        }
+        // RGB 恒白（闪烁只调 tint alpha）。
+        assert!(a.chunks_exact(4).all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255));
     }
 
-    /// tile 尺寸与常量一致（`paint_tiled` 的 UV 依赖它）。
+    /// 精灵尺寸与常量一致（CPU 侧按半径放大它，两者必须对上）。
     #[test]
     fn tile_dimensions_match_pixel_buffers() {
         assert_eq!(paper_pixels().len(), TILE * TILE * 4);
-        assert_eq!(star_pixels().len(), TILE * TILE * 4);
+        assert_eq!(star_sprite_pixels().len(), STAR_SPRITE * STAR_SPRITE * 4);
+    }
+
+    // ---- 星星列表（StarField）-----------------------------------------
+
+    /// random=0 时**完全确定性**：同参数两次生成的列表逐字段相等
+    /// （回归测试与「固定一片星空」的产品语义都依赖这条）。
+    #[test]
+    fn star_field_deterministic_at_zero_random() {
+        let a = StarField::generate(0.5, 0.0, 0.5, 0);
+        let b = StarField::generate(0.5, 0.0, 0.5, 999_999);
+        assert_eq!(a.stars, b.stars, "random=0 时熵不参与");
+        assert_eq!(a.fingerprint, b.fingerprint);
+        assert!(!a.stars.is_empty(), "密度 0.5 应有星星");
+    }
+
+    /// random=1 时熵参与：不同 entropy 生成不同列表（「换一片星空」）。
+    #[test]
+    fn star_field_random_mixes_entropy() {
+        let a = StarField::generate(0.5, 1.0, 0.5, 1);
+        let b = StarField::generate(0.5, 1.0, 0.5, 2);
+        assert_ne!(a.stars, b.stars, "random=1 时不同熵应生成不同星空");
+    }
+
+    /// 密度 → 数量：0 密度空表、满密度达到上限、中间单调。
+    #[test]
+    fn star_field_count_follows_density() {
+        assert!(StarField::generate(0.0, 0.0, 0.0, 0).stars.is_empty());
+        let mid = StarField::generate(0.5, 0.0, 0.0, 0).stars.len();
+        let full = StarField::generate(1.0, 0.0, 0.0, 0).stars.len();
+        assert_eq!(full, StarField::COUNT_MAX);
+        assert!(mid > 0 && mid < full, "中间密度应介于两者之间");
+    }
+
+    /// 大小不规则：size_var=0 时半径全相等（整齐），1 时有方差。
+    #[test]
+    fn star_size_variance_follows_param() {
+        let uniform = StarField::generate(1.0, 0.0, 0.0, 0);
+        assert!(
+            uniform.stars.windows(2).all(|w| (w[0].radius - w[1].radius).abs() < 1e-6),
+            "size_var=0 时半径应全部相等"
+        );
+        let varied = StarField::generate(1.0, 0.0, 1.0, 0);
+        let radii: Vec<f32> = varied.stars.iter().map(|s| s.radius).collect();
+        let mean = radii.iter().sum::<f32>() / radii.len() as f32;
+        let var = radii.iter().map(|r| (r - mean).powi(2)).sum::<f32>() / radii.len() as f32;
+        assert!(var > 0.1, "size_var=1 时半径应有可观方差，实测 {var}");
+    }
+
+    /// 亮度分级：约 1/4 是亮星（真实星空的指数分布近似）。
+    #[test]
+    fn star_brightness_is_graded() {
+        let f = StarField::generate(1.0, 0.0, 0.0, 0);
+        let bright = f.stars.iter().filter(|s| s.base > 0.8).count();
+        let ratio = bright as f32 / f.stars.len() as f32;
+        assert!(
+            (0.1..0.45).contains(&ratio),
+            "亮星占比应接近 25%，实测 {ratio}"
+        );
+    }
+
+    /// 闪烁纯函数：twinkle=0 恒定、twinkle=1 在 [0, base] 间呼吸、
+    /// 相同时刻同值（可断言）。
+    #[test]
+    fn twinkle_alpha_is_pure_and_bounded() {
+        let star = StarField::generate(1.0, 0.0, 0.0, 0).stars[0];
+        // 静态。
+        assert_eq!(twinkle_alpha(&star, 0.0, 0.0), star.base);
+        assert_eq!(twinkle_alpha(&star, 0.0, 12.34), star.base);
+        // 呼吸：一个周期内应同时出现接近 base 与接近 0 的值。
+        let period = 1.0 / star.freq as f64;
+        let mut lo = f32::MAX;
+        let mut hi = 0.0_f32;
+        for i in 0..32 {
+            let t = period * i as f64 / 32.0;
+            let a = twinkle_alpha(&star, 1.0, t);
+            assert!((0.0..=star.base + 1e-6).contains(&a), "闪烁值越界: {a}");
+            lo = lo.min(a);
+            hi = hi.max(a);
+        }
+        assert!(hi > star.base * 0.9, "应能闪到接近全亮");
+        assert!(lo < star.base * 0.15, "应能暗到接近熄灭");
+        // 同输入同输出（纯函数）。
+        assert_eq!(
+            twinkle_alpha(&star, 0.6, 3.21),
+            twinkle_alpha(&star, 0.6, 3.21)
+        );
     }
 }

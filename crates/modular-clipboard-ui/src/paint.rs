@@ -489,8 +489,16 @@ pub struct UiState {
     /// CAUTION: 不能每帧 `load_texture`——同名覆盖语义虽然正确，但
     /// 每帧上传 36KB 像素 + 走一次纹理管理器的写锁，纯浪费。
     pub paper_tex: Option<egui::TextureHandle>,
-    /// 二级主题「星空紫」的程序化星点 tile。语义同 [`UiState::paper_tex`]。
+    /// 星空主题的星点**精灵**（单颗星的 16px 纹理，见
+    /// [`crate::tex::star_sprite`]）。语义同 [`UiState::paper_tex`]。
     pub star_tex: Option<egui::TextureHandle>,
+    /// 星空主题的星星列表（CPU 侧「一片星空」，见 [`crate::tex::StarField`]）。
+    ///
+    /// 2026-10-19 起星空改「精灵逐颗绘制」：随机化（换一片星）、闪烁
+    /// （每帧 tint alpha 呼吸）、大小不规则（逐颗半径）三个可设参数都
+    /// 要求 CPU 逐帧参与，静态 tile 做不到。列表按参数指纹重建，
+    /// 没变就复用（只重算闪烁）。
+    pub star_field: Option<crate::tex::StarField>,
     /// 主题色十六进制输入框的草稿。
     ///
     /// # 为什么需要「焦点感知」的同步
@@ -1150,28 +1158,94 @@ fn draw_theme_texture(f: &mut Frame<'_>) {
             );
         }
         SecondaryTheme::Purple => {
-            let k = ui.theme_params.purple_stars.clamp(0.0, 1.0);
+            let params = &ui.theme_params;
+            let k = params.purple_stars.clamp(0.0, 1.0);
             if k <= 0.004 {
                 return;
             }
+            // ---- 星星列表：参数指纹变化才重建 ----------------------------
+            //
+            // 三个影响列表的参数（密度 / 随机化 / 大小）编成指纹，
+            // `StarField` 自己记住生成时的指纹——没变就每帧复用同一份
+            // 列表，只重算闪烁。random > 0 时把 egui 时间当熵混入种子，
+            // 于是「每次重建换一片星空」；random = 0 时确定性（同一片星）。
+            let fp = crate::tex::StarField::fingerprint_of(
+                params.purple_stars,
+                params.star_random,
+                params.star_size_var,
+            );
+            let rebuild = f
+                .state
+                .star_field
+                .as_ref()
+                .is_none_or(|s| s.fingerprint != fp);
+            if rebuild {
+                let entropy = if params.star_random > 0.004 {
+                    (f.ui.input(|i| i.time) * 1000.0) as u64
+                } else {
+                    0
+                };
+                f.state.star_field = Some(crate::tex::StarField::generate(
+                    params.purple_stars,
+                    params.star_random,
+                    params.star_size_var,
+                    entropy,
+                ));
+            }
+            let Some(field) = f.state.star_field.as_ref() else {
+                return;
+            };
+            if field.stars.is_empty() {
+                return;
+            }
+            // ---- 精灵纹理（惰性，每 Context 一份）------------------------
             let tex = match &f.state.star_tex {
                 Some(t) => t.clone(),
                 None => {
-                    let t = crate::tex::star_tile(f.ui.ctx());
+                    let t = crate::tex::star_sprite(f.ui.ctx());
                     f.state.star_tex = Some(t.clone());
                     t
                 }
             };
-            // 星点亮度跟随密度（密度 0 = 关，1 = 满亮）——星空主题的
-            // 「星点密度」同时控制可见数量感与亮度，比只调 alpha 更直观。
-            let a = (255.0 * k).round() as u8;
-            crate::tex::paint_tiled(
-                f.ui.painter(),
-                f.area,
-                &tex,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, a),
-                crate::tex::STAR_TILE_PT,
-            );
+            // ---- 逐颗绘制：闪烁 alpha + 大小 ------------------------------
+            //
+            // 每颗星一个小 quad（16px 精灵按半径放大）。tint 只带 alpha
+            // （白星）——闪烁 = tint alpha 随时间呼吸（2026-10-18 修好的
+            // 预乘 tint 通道）。暗到谷底的星跳过，省 draw call。
+            let t = f.ui.input(|i| i.time);
+            let painter = f.ui.painter();
+            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            let area = f.area;
+            for star in &field.stars {
+                let a = crate::tex::twinkle_alpha(star, params.star_twinkle, t);
+                if a <= 0.004 {
+                    continue;
+                }
+                let c = pos2(
+                    area.min.x + star.x * area.width(),
+                    area.min.y + star.y * area.height(),
+                );
+                let r = Rect::from_center_size(c, vec2(star.radius * 2.0, star.radius * 2.0));
+                painter.image(
+                    tex.id(),
+                    r,
+                    uv,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, (a * 255.0) as u8),
+                );
+            }
+            // ---- 闪烁续帧 -------------------------------------------------
+            //
+            // CAUTION: 闪烁由 `input.time` 驱动（不走 anim 补间注册表 ⇒
+            // 不被 `anim::busy` 覆盖），而主循环有空闲闸门：无事件、无
+            // 重绘请求时整帧跳过 ⇒ 闪烁会停在某一帧（与 2026-10-17
+            // Toast 出场动画被饿死是同一个坑）。twinkle > 0 时每帧续请求；
+            // twinkle = 0（用户关掉闪烁）不请求，界面恢复空闲。
+            //
+            // 必须在绘制闭包内调用：egui 只在 pass 结束时把请求写进
+            // `FullOutput.repaint_delay`，闸门读的正是这个值。
+            if params.star_twinkle > 0.004 {
+                f.ui.ctx().request_repaint();
+            }
         }
         _ => {}
     }
@@ -12733,6 +12807,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn settings_hit_missing(h: &Harness, name: &str) -> bool {
         h.state.hit.get(HitNs::Settings, name).is_none()
     }
+
 
     /// 量一段文字的像素宽（不换行口径）。
     fn measure_w(ctx: &egui::Context, s: &str, size: f32) -> f32 {

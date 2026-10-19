@@ -799,6 +799,9 @@ static GREEN_KNOBS: &[ThemeKnob] = &[
 static PURPLE_KNOBS: &[ThemeKnob] = &[
     ThemeKnob::new("purple_tint", "紫度", "紫色基调的混合比例"),
     ThemeKnob::new("purple_stars", "星点密度", "背景星点的明显程度"),
+    ThemeKnob::new("star_random", "分布随机化", "0 = 固定一片星空，1 = 每次重建换一片"),
+    ThemeKnob::new("star_twinkle", "闪烁", "星点缓慢明暗呼吸的强度"),
+    ThemeKnob::new("star_size_var", "大小不规则", "星点半径的差异程度"),
 ];
 
 /// OLED 主题的旋钮（[`SecondaryTheme::Oled`]）。
@@ -849,6 +852,26 @@ pub struct ThemeParams {
     /// 星空紫：星点密度。
     #[serde(default = "default_param_mid")]
     pub purple_stars: f32,
+    /// 星空紫：星点**分布随机化**强度（0 = 固定种子，每次启动同一片
+    /// 星空；1 = 每次重建混入时间熵，且每颗星叠加全幅位置抖动）。
+    ///
+    /// 中间值按比例混入两者。设计成「确定性 ↔ 随机」的连续旋钮而不是
+    /// 布尔：回归测试需要 0 档可断言，用户需要 1 档每次不一样。
+    #[serde(default = "default_param_mid")]
+    pub star_random: f32,
+    /// 星空紫：星点**闪烁**强度（0 = 静态星点；1 = 全幅缓慢闪烁）。
+    ///
+    /// 闪烁是「夜空是活的」的主要来源——完全静止的星点看起来像一张
+    /// 贴图。每颗星有自己的相位与频率（不是齐刷刷地闪）。
+    #[serde(default = "default_param_high")]
+    pub star_twinkle: f32,
+    /// 星空紫：星点**大小不规则度**（0 = 均一大小的哑星；1 = 半径在
+    /// 0.6~3.2pt 全范围随机）。
+    ///
+    /// 真实星空的大小差异来自距离，这里用半径方差模拟——均一的星点
+    /// 是「矢量图标感」，大小分级才读出纵深。
+    #[serde(default = "default_param_mid")]
+    pub star_size_var: f32,
     /// OLED：背景压向纯黑的比例。
     #[serde(default = "default_param_high")]
     pub oled_black: f32,
@@ -866,6 +889,9 @@ impl Default for ThemeParams {
             green_warmth: default_param_mid(),
             purple_tint: default_param_high(),
             purple_stars: default_param_mid(),
+            star_random: default_param_mid(),
+            star_twinkle: default_param_high(),
+            star_size_var: default_param_mid(),
             oled_black: default_param_high(),
             oled_borders: default_param_mid(),
         }
@@ -895,6 +921,9 @@ impl ThemeParams {
             "green_warmth" => self.green_warmth,
             "purple_tint" => self.purple_tint,
             "purple_stars" => self.purple_stars,
+            "star_random" => self.star_random,
+            "star_twinkle" => self.star_twinkle,
+            "star_size_var" => self.star_size_var,
             "oled_black" => self.oled_black,
             "oled_borders" => self.oled_borders,
             _ => return None,
@@ -911,6 +940,9 @@ impl ThemeParams {
             "green_warmth" => self.green_warmth = v,
             "purple_tint" => self.purple_tint = v,
             "purple_stars" => self.purple_stars = v,
+            "star_random" => self.star_random = v,
+            "star_twinkle" => self.star_twinkle = v,
+            "star_size_var" => self.star_size_var = v,
             "oled_black" => self.oled_black = v,
             "oled_borders" => self.oled_borders = v,
             _ => return false,
