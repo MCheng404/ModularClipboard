@@ -3865,7 +3865,7 @@ fn shadow_param_row(
             ui.add(
                 egui::Label::new(egui::RichText::new(readout).color(f.pal.text_dim)),
             );
-            changed = draw_slider(f, ui, id_suffix, "", v, range, true);
+            changed = draw_slider(f, ui, id_suffix, "", v, range, true, 0.0);
             // 剩余宽度给标签列（与 `setting_row` 同款布局，见其注释）。
             let rest = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
             ui.allocate_ui_with_layout(
@@ -4213,7 +4213,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     egui::RichText::new(format!("{}%", (op * 100.0).round() as i32))
                         .color(pal.text_dim),
                 ));
-                draw_slider(f, ui, "window_opacity", "", &mut op, 0.3..=1.0, enabled)
+                draw_slider(f, ui, "window_opacity", "", &mut op, 0.3..=1.0, enabled, 0.0)
             });
             if changed && enabled {
                 f.state.push(Op::SetOpacity(op));
@@ -4351,6 +4351,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                         modular_clipboard_core::config::TYPE_RAIL_SIZE_MIN
                             ..=modular_clipboard_core::config::TYPE_RAIL_SIZE_MAX,
                         true,
+                        0.0,
                     )
                 });
                 cfg.size = modular_clipboard_core::config::clamp_type_rail_size(size);
@@ -4886,6 +4887,7 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
 /// 令牌编辑器里「色相 / 透明度」双滑条共用令牌名，靠本参数区分 Id。
 /// CAUTION: 不区分的话，同一帧两个矩形注册同一个 `Id`，后注册者赢得
 /// 交互——拖动 A 会连带动 B，且毫无征兆。空串 = 唯一滑条。
+#[allow(clippy::too_many_arguments)]
 fn draw_slider(
     f: &mut Frame<'_>,
     ui: &mut Ui,
@@ -4894,6 +4896,15 @@ fn draw_slider(
     v: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     enabled: bool,
+    // CAUTION: 行高兜底，必须由调用方按「本行最高控件」传入（令牌行
+    // 见 `token_row_h`）。传 0 = 保持旧的「滑条自定高」行为。
+    //
+    // 为什么需要它：egui 的 horizontal **不重排先放置的控件**——若滑条
+    // 比左列文字高，左列被顶部对齐，文字相对滑条偏高；150% DPI 下
+    // font_xs=21（galley 高 27pt）而左列格子写死 18pt 时还会把字形
+    // 上下裁掉（用户实机反馈「文字向上且渲染不完整」，2026-10-19）。
+    // 三列同高 + 本参数兜底，两个病一起治。
+    cell_h: f32,
 ) -> bool {
     let pal = f.pal;
     // 轨道 150x6，knob 直径 16——比开关轨道（20）细，但 knob 同为白圆，
@@ -4901,7 +4912,7 @@ fn draw_slider(
     let track_w = pal.font_sm * 10.0;
     let track_h = (pal.font_sm * 0.4).max(4.0);
     let knob_d: f32 = pal.font_sm * 1.07;
-    let cell_h = knob_d.max(track_h);
+    let cell_h = cell_h.max(knob_d).max(track_h);
     // 分工同 draw_switch：allocate 只占位，交互走显式 interact（Id 绑字段名）。
     let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
     let resp = ui.interact(
@@ -5630,6 +5641,30 @@ fn draw_token_entry(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     false
 }
 
+/// 令牌行的统一行高（逻辑点）。
+///
+/// # 为什么不能写死 18pt（2026-10-19 用户实机反馈「文字向上且渲染
+/// 不完整」的根因）
+///
+/// 令牌行是 horizontal 三列：左列（118pt 文字格）、滑条、数值。
+/// egui 的 horizontal **不重排先放置的控件**——行高被后放的高控件
+/// 撑大时，先放的左列仍顶部对齐 ⇒ 文字相对滑条偏高。
+///
+/// 150% DPI（ppp=1.5）下两件事同时发生：
+/// 1. 滑条 cell 高 = font_sm×1.07 = 22.5×1.07 ≈ 24pt > 18 ⇒ 行高被
+///    撑到 24，左列（18pt）顶格 ⇒ 文字比滑条 knob 中心高约 3pt；
+/// 2. 令牌名字号 font_xs = 14×1.5 = 21pt，galley 行高 ≈ 21×1.28
+///    ≈ 27pt > 18pt 的格子 ⇒ 字形上下各被裁约 4.5pt（视觉上
+///    「上半还在、下半不见了」）。
+///
+/// 测试 harness 的 ppp=1.0 恰好复现不了这两个数（21→14、24→16），
+/// 所以单测全绿而实机糊——**依赖字号的布局必须按字号算，不能拍
+/// 常数**。本函数取三者的最大值：左列字形（font_xs×1.45，含 galley
+/// 行距）、滑条 cell（font_sm×1.07）、保底 18pt。
+fn token_row_h(pal: &Palette) -> f32 {
+    (pal.font_xs * 1.45).max(pal.font_sm * 1.07).max(18.0)
+}
+
 /// 令牌级覆盖**二级面板**（主题分类的二级视图）。
 ///
 /// 列出**全部**主题令牌（[`Palette::tokens`]），逐项给出当前生效值
@@ -5714,6 +5749,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     // CAUTION: ops 先收集后统一 push——`f.state.push` 要 `&mut Frame`，
     // 而循环里还要读 `f.svc.state.config`（是否已覆盖）。边读边写在
     // Rust 里是借用冲突，收集式则天然顺序执行。
+    let row_h = token_row_h(pal);
     let mut ops: Vec<Op> = Vec::new();
     let mut group = "";
     for (name, value) in pal.tokens() {
@@ -5739,7 +5775,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     // 左列：色块 + 令牌名（等宽小字，令牌名是给「知道自己在
                     // 找什么」的用户看的，不需要好看）。
-                    let (lr, _) = ui.allocate_exact_size(vec2(118.0, 18.0), Sense::empty());
+                    let (lr, _) = ui.allocate_exact_size(vec2(118.0, row_h), Sense::empty());
                     let p = ui.painter_at(lr);
                     let sw = Rect::from_min_size(lr.min, vec2(14.0, 14.0));
                     p.rect_filled(sw, pal.radius_sm, c);
@@ -5759,6 +5795,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                         &mut h,
                         0.0..=360.0,
                         true,
+                        row_h,
                     ) {
                         let nc = modular_clipboard_core::config::AccentColor::new(h, hsv.s, hsv.v);
                         let rgb2 = nc.to_rgb();
@@ -5777,7 +5814,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
                             let (lr2, _) =
-                                ui.allocate_exact_size(vec2(118.0, 18.0), Sense::empty());
+                                ui.allocate_exact_size(vec2(118.0, row_h), Sense::empty());
                             ui.painter_at(lr2).text(
                                 pos2(lr2.min.x + 20.0, lr2.center().y),
                                 Align2::LEFT_CENTER,
@@ -5785,7 +5822,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                                 egui::FontId::proportional(pal.font_xs),
                                 pal.text_dim,
                             );
-                            if draw_slider(f, ui, name, "alpha", &mut a, 0.0..=255.0, true) {
+                            if draw_slider(f, ui, name, "alpha", &mut a, 0.0..=255.0, true, row_h) {
                                 let rgb2 = modular_clipboard_core::config::AccentColor::new(
                                     hsv.h, hsv.s, hsv.v,
                                 )
@@ -5821,7 +5858,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                 let mut v = n;
                 let range = token_num_range(name);
                 ui.horizontal(|ui| {
-                    let (lr, _) = ui.allocate_exact_size(vec2(118.0, 18.0), Sense::empty());
+                    let (lr, _) = ui.allocate_exact_size(vec2(118.0, row_h), Sense::empty());
                     ui.painter_at(lr).text(
                         lr.min,
                         Align2::LEFT_CENTER,
@@ -5829,11 +5866,17 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                         egui::FontId::proportional(pal.font_xs),
                         if overridden { pal.text } else { pal.text_dim },
                     );
-                    let c = draw_slider(f, ui, name, "num", &mut v, range.clone(), true);
+                    let c = draw_slider(f, ui, name, "num", &mut v, range.clone(), true, row_h);
                     ui.add_space(4.0);
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(format!("{:.0}", v)).color(pal.text_dim),
-                    ));
+                    // 显式给行高：Label 默认字号（font_md）在高 DPI 下可能
+                    // 超过 row_h，把 horizontal 行高撑开后又把先放置的左列
+                    // 顶上去（同一个「不重排」病）。
+                    ui.add_sized(
+                        egui::vec2(30.0, row_h),
+                        egui::Label::new(
+                            egui::RichText::new(format!("{:.0}", v)).color(pal.text_dim),
+                        ),
+                    );
                     if c {
                         ops.push(Op::SetTokenOverride {
                             name: name.to_string(),
@@ -12852,10 +12895,12 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
+
     /// 令牌编辑器默认**折叠**：令牌行不绘制、不注册热区；点「展开」后
     /// 才出现——近 60 行平铺会把主题卡撑到五屏（ rationale 见
     /// `UiState::theme_tokens_expanded`）。
     #[test]
+
     fn token_editor_collapsed_by_default_and_expands() {
         let mut h = Harness::new("token-editor", vec2(780.0, 900.0));
         h.state.show_settings = true;
@@ -12903,6 +12948,34 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(settings_hit_missing(&h, "bg"), "返回后令牌热区应消失");
     }
 
+
+    /// 令牌行高必须在**任意 font_scale** 下都装得下字形与滑条
+    /// （2026-10-19 用户实机反馈「文字向上且渲染不完整」的守门）。
+    ///
+    /// 根因：令牌行的 horizontal 三列里，左列格子曾写死 18pt——
+    /// font_scale 调大后（滑条 cell = font_sm×1.07 涨过 18 ⇒ 左列被
+    /// 顶格偏高；字形 galley ≈ font_xs×1.28 涨过 18 ⇒ 上下被裁）。
+    /// harness 默认 font_scale=1.0 恰好两个数都不越界，单测全绿而
+    /// 实机糊——所以这条显式遍历 0.75~2.0 全量程。
+    #[test]
+    fn token_row_h_covers_glyphs_and_slider_at_any_font_scale() {
+        for scale in [0.75f32, 1.0, 1.25, 1.5, 2.0] {
+            let pal = Palette::light().with_font_scale(scale);
+            let row = token_row_h(&pal);
+            assert!(
+                row >= pal.font_xs * 1.28,
+                "font_scale={scale}：行高 {row} 装不下字形 galley（font_xs={}，需要 {}）",
+                pal.font_xs,
+                pal.font_xs * 1.28
+            );
+            assert!(
+                row >= pal.font_sm * 1.07,
+                "font_scale={scale}：行高 {row} 装不下滑条 cell（font_sm={}）",
+                pal.font_sm
+            );
+            assert!(row >= 18.0, "font_scale={scale}：行高 {row} 低于保底 18pt");
+        }
+    }
     /// 展开后点 bg 的色相滑条 ⇒ 推出 `SetTokenOverride`（颜色覆盖）。
     ///
     /// 拖滑条即改值：`draw_slider` 响应「按下即跳转」，点轨道左侧
