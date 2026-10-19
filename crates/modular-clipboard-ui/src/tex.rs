@@ -302,6 +302,54 @@ impl StarField {
     }
 }
 
+/// 光标视差：星点位置随光标**反向偏移**（纯函数，便于单测）。
+///
+/// # 语义：让开，而不是吸引
+///
+/// 光标靠近时星点沿「光标 → 星点」方向被推开——像手电筒照进夜空、
+/// 星点轻轻让开。选「推开」而不是「吸引」有两个理由：吸引会把星点
+/// 拉成一团（密集处糊成斑），而推开保持分布；且推开的直觉更接近
+/// 「光照使东西显形又回避」。
+///
+/// # 纵深感：距离衰减
+///
+/// 偏移幅度 = `基准 × 强度 / (1 + 距离/影响半径)`：近的星动得多、
+/// 远的几乎不动——这正是视差（parallax）的本义（近处物体位移大）。
+/// 影响半径 160pt 约覆盖光标周围一小片，整窗星点不会一起晃。
+///
+/// # 边界
+///
+/// - `pointer = None`（光标不在窗口上）⇒ 零偏移，星点回原位；
+/// - 光标几乎压在星点上 ⇒ 零偏移（不抖）；
+/// - 偏移量钳制到距离的一半——不越过光标，否则视觉上「跳过去」。
+pub fn cursor_offset(
+    star: &Star,
+    pointer: Option<egui::Pos2>,
+    area: egui::Rect,
+    strength: f32,
+) -> egui::Vec2 {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.004 {
+        return egui::Vec2::ZERO;
+    }
+    let Some(p) = pointer else {
+        return egui::Vec2::ZERO;
+    };
+    let c = egui::pos2(
+        area.min.x + star.x * area.width(),
+        area.min.y + star.y * area.height(),
+    );
+    let d = c - p; // 光标 → 星点
+    let dist = d.length();
+    if dist < 0.5 {
+        return egui::Vec2::ZERO;
+    }
+    // 基准幅度 18pt（满强度下近处星点的位移），影响半径 160pt。
+    let falloff = 1.0 / (1.0 + dist / 160.0);
+    let mag = (18.0 * strength * falloff).min(dist * 0.5);
+    d / dist * mag
+}
+
 /// 闪烁 alpha（纯函数，便于单测）。
 ///
 /// `twinkle` = 0 时恒定返回 `star.base`（静态星）；1 时在
@@ -513,6 +561,52 @@ mod tests {
         assert!(
             (0.1..0.45).contains(&ratio),
             "亮星占比应接近 25%，实测 {ratio}"
+        );
+    }
+
+    // ---- 光标视差（cursor_offset）--------------------------------------
+
+    /// 视差纯函数：关 = 零偏移、无光标 = 零偏移、方向 = 让开光标、
+    /// 近大远小、不越过光标。
+    #[test]
+    fn cursor_offset_parallax_laws() {
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(720.0, 700.0));
+        let star = Star {
+            x: 0.75,
+            y: 0.5,
+            radius: 1.2,
+            phase: 0.0,
+            freq: 0.1,
+            base: 0.8,
+        };
+        // 关（strength=0）⇒ 零偏移。
+        assert_eq!(
+            cursor_offset(&star, Some(egui::pos2(100.0, 350.0)), area, 0.0),
+            egui::Vec2::ZERO
+        );
+        // 光标不在窗口上 ⇒ 零偏移（星点回原位）。
+        assert_eq!(cursor_offset(&star, None, area, 1.0), egui::Vec2::ZERO);
+        // 星点在光标右侧（540 vs 100）⇒ 偏移 x > 0（被推离光标）。
+        let off = cursor_offset(&star, Some(egui::pos2(100.0, 350.0)), area, 1.0);
+        assert!(off.x > 0.0, "星点应被推离光标（x 正向），实测 {off:?}");
+        // 同距离下满强度比半强度偏移大。
+        let half = cursor_offset(&star, Some(egui::pos2(100.0, 350.0)), area, 0.5);
+        assert!(off.length() > half.length(), "强度应线性缩放偏移");
+        // 近大远小（视差纵深）：同一颗星，光标 400pt 外的偏移应小于
+        // 100pt 外的。
+        let near = cursor_offset(&star, Some(egui::pos2(440.0, 350.0)), area, 1.0);
+        assert!(
+            near.length() > off.length(),
+            "近处偏移应更大：near={near:?} far={off:?}"
+        );
+        // 不越过光标：偏移量 < 星点到光线的距离。
+        let c = egui::pos2(540.0, 350.0);
+        let p = egui::pos2(100.0, 350.0);
+        assert!(off.length() < (c - p).length());
+        // 光标几乎压在星点上 ⇒ 零偏移（不抖）。
+        assert_eq!(
+            cursor_offset(&star, Some(egui::pos2(540.0, 350.0)), area, 1.0),
+            egui::Vec2::ZERO
         );
     }
 

@@ -1207,12 +1207,18 @@ fn draw_theme_texture(f: &mut Frame<'_>) {
                     t
                 }
             };
-            // ---- 逐颗绘制：闪烁 alpha + 大小 ------------------------------
+            // ---- 逐颗绘制：闪烁 alpha + 大小 + 光标视差 ------------------
             //
             // 每颗星一个小 quad（16px 精灵按半径放大）。tint 只带 alpha
             // （白星）——闪烁 = tint alpha 随时间呼吸（2026-10-18 修好的
             // 预乘 tint 通道）。暗到谷底的星跳过，省 draw call。
+            //
+            // 光标视差（`star_cursor`，0 = 关）：星点随光标反向偏移，
+            // 近的动得多、远的几乎不动（视差纵深）。光标离开窗口
+            // （hover_pos = None）⇒ 零偏移回位。指针移动本身就是事件，
+            // 不需要额外续帧。
             let t = f.ui.input(|i| i.time);
+            let pointer = f.ui.input(|i| i.pointer.hover_pos());
             let painter = f.ui.painter();
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             let area = f.area;
@@ -1221,10 +1227,11 @@ fn draw_theme_texture(f: &mut Frame<'_>) {
                 if a <= 0.004 {
                     continue;
                 }
-                let c = pos2(
+                let base = pos2(
                     area.min.x + star.x * area.width(),
                     area.min.y + star.y * area.height(),
                 );
+                let c = base + crate::tex::cursor_offset(star, pointer, area, params.star_cursor);
                 let r = Rect::from_center_size(c, vec2(star.radius * 2.0, star.radius * 2.0));
                 painter.image(
                     tex.id(),
@@ -12724,9 +12731,9 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.settings_frame();
         assert!(settings_hit(&h, "paper_tint").width() > 0.0);
         assert!(settings_hit(&h, "paper_texture").width() > 0.0);
-        // 星空有五个旋钮（2026-10-19：随机化 / 闪烁 / 大小加入后）——
-        // 新增旋钮只靠 core 的 knobs() 表驱动，这里守住「表里登记的都
-        // 真的画出了热区」。
+        // 星空有六个旋钮（2026-10-19：随机化 / 闪烁 / 大小 / 光标互动
+        // 先后加入）——新增旋钮只靠 core 的 knobs() 表驱动，这里守住
+        // 「表里登记的都真的画出了热区」。
         h.svc.state.config.ui.secondary_theme =
             modular_clipboard_core::config::SecondaryTheme::Purple;
         h.settings_frame();
@@ -12736,6 +12743,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             "star_random",
             "star_twinkle",
             "star_size_var",
+            "star_cursor",
         ] {
             assert!(
                 settings_hit(&h, key).width() > 0.0,

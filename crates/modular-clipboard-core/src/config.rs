@@ -802,6 +802,7 @@ static PURPLE_KNOBS: &[ThemeKnob] = &[
     ThemeKnob::new("star_random", "分布随机化", "0 = 固定一片星空，1 = 每次重建换一片"),
     ThemeKnob::new("star_twinkle", "闪烁", "星点缓慢明暗呼吸的强度"),
     ThemeKnob::new("star_size_var", "大小不规则", "星点半径的差异程度"),
+    ThemeKnob::new("star_cursor", "光标互动", "星点随光标位置反向偏移（视差）"),
 ];
 
 /// OLED 主题的旋钮（[`SecondaryTheme::Oled`]）。
@@ -872,6 +873,16 @@ pub struct ThemeParams {
     /// 是「矢量图标感」，大小分级才读出纵深。
     #[serde(default = "default_param_mid")]
     pub star_size_var: f32,
+    /// 星空紫：**光标与星点的互动强度**（0 = 关闭互动，星点静止于
+    /// 各自位置；1 = 满幅视差——星点随光标位置反向偏移，且越近的星
+    /// 偏移越大）。
+    ///
+    /// 交互语义是「视差」而不是「吸引/排斥」：光标靠近时星点轻轻让开
+    /// （像被吹开），比吸引更符合「手电筒照夜空」的直觉，也不会把
+    /// 星点拉成一团。光标离开窗口（`pointer.pos()` 为 None）时平滑
+    /// 回到原位。
+    #[serde(default = "default_param_off")]
+    pub star_cursor: f32,
     /// OLED：背景压向纯黑的比例。
     #[serde(default = "default_param_high")]
     pub oled_black: f32,
@@ -892,10 +903,19 @@ impl Default for ThemeParams {
             star_random: default_param_mid(),
             star_twinkle: default_param_high(),
             star_size_var: default_param_mid(),
+            star_cursor: default_param_off(),
             oled_black: default_param_high(),
             oled_borders: default_param_mid(),
         }
     }
+}
+
+/// 「互动类」旋钮的缺省值：默认关闭。
+///
+/// 视差互动是「用户主动要的玩具」，默认开会让光标划过时星点乱晃——
+/// 工具软件不该默认动。要开的用户自己拖滑块。
+fn default_param_off() -> f32 {
+    0.0
 }
 
 /// 「浓度类」旋钮的缺省值：默认就有效果，但留出调大空间。
@@ -924,6 +944,7 @@ impl ThemeParams {
             "star_random" => self.star_random,
             "star_twinkle" => self.star_twinkle,
             "star_size_var" => self.star_size_var,
+            "star_cursor" => self.star_cursor,
             "oled_black" => self.oled_black,
             "oled_borders" => self.oled_borders,
             _ => return None,
@@ -943,6 +964,7 @@ impl ThemeParams {
             "star_random" => self.star_random = v,
             "star_twinkle" => self.star_twinkle = v,
             "star_size_var" => self.star_size_var = v,
+            "star_cursor" => self.star_cursor = v,
             "oled_black" => self.oled_black = v,
             "oled_borders" => self.oled_borders = v,
             _ => return false,
