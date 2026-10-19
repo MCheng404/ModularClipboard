@@ -618,7 +618,7 @@ impl Window {
 
     /// 缩放比例，`dpi / 96`。`1.0` 为 100%。
     pub fn scale_factor(&self) -> f32 {
-        dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) })
+        dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) }, 1.0)
     }
 
     /// 窗口左上角的**屏幕坐标**，逻辑点。
@@ -765,9 +765,18 @@ fn clamp_i32(v: u32) -> i32 {
     v.min(i32::MAX as u32) as i32
 }
 
-/// `dpi / 96`。`dpi == 0`（窗口无效时）返回 `1.0`。
-fn dpi_scale_factor(dpi: u32) -> f32 {
-    if dpi == 0 { 1.0 } else { dpi as f32 / BASE_DPI as f32 }
+/// `dpi / 96`。查询失败（`dpi == 0`，窗口无效/销毁瞬间）返回 `fallback`
+/// 而不是硬编码 `1.0`。
+///
+/// CAUTION（2026-10-19 DPI 治理）：把查询失败静默当 100% DPI 会让 scale
+/// 从 2.0 瞬跳 1.0——当帧 ppp 与 render_extent 双双跳变（布局突变一帧）
+/// 并误报 `ScaleFactorChanged`。调用方传入 last-good 值兜底即可。
+fn dpi_scale_factor(dpi: u32, fallback: f32) -> f32 {
+    if dpi == 0 {
+        fallback
+    } else {
+        dpi as f32 / BASE_DPI as f32
+    }
 }
 
 /// 注册窗口类，进程内只做一次。
@@ -1021,7 +1030,8 @@ impl EventLoop {
         // 修法：每轮用 `GetClientRect` 直接问系统真实尺寸（O(1) 系统调用），
         // 与消息无关，任何来源的 resize 都能跟上。
         // 消息分支保留，它额外携带 `wParam` 的最小化/还原语义。
-        let scale_now = dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) });
+        let scale_now =
+            dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) }, self.scale_factor);
         if (scale_now - self.scale_factor).abs() > f32::EPSILON {
             self.scale_factor = scale_now;
             events.push(WindowEvent::ScaleFactorChanged(scale_now as f64));
@@ -1197,8 +1207,10 @@ impl EventLoop {
 
     /// 把一条消息翻译成语义事件，追加到 `out`。
     fn translate(&mut self, msg: &MSG, out: &mut Vec<WindowEvent>) {
-        let scale = self.scale_factor;
-
+        // NOTE: 不在入口缓存 `scale`——同一批消息里 WM_DPICHANGED 可能
+        // 先到，之后的 MouseMoved/MouseButton 必须用**新**比例换算
+        // （跨屏拖动时 DPI 变化与鼠标移动同帧到达是常态）。各分支直接
+        // 读 `self.scale_factor`。
         match msg.message {
             WM_SIZE => {
                 // wParam 携带状态变化原因：最小化/ 最大化 / 还原。
@@ -1213,6 +1225,7 @@ impl EventLoop {
                 }
                 let (w_px, h_px) = unpack_size(msg.lParam.0);
                 // WM_SIZE 给的是物理像素，egui 要逻辑点。
+                let scale = self.scale_factor;
                 let w = w_px / scale;
                 let h = h_px / scale;
                 self.inner_size = Vec2::new(w, h);
@@ -1222,12 +1235,37 @@ impl EventLoop {
                 });
             }
 
-            // 缩放变了，随后的 WM_SIZE 会带来新的像素尺寸。
-            // 这里只报比例，不改 inner_size——改了会用旧像素尺寸除新比例。
+            // DPI 变了（跨显示器拖动 / 系统改缩放）。两件事必须都做：
+            //
+            // 1. **按系统建议矩形 SetWindowPos**（lParam 指向 `RECT`，
+            //    物理像素）——这是微软推荐做法，效果是**逻辑尺寸恒定**：
+            //    100%→200% 时窗口物理尺寸翻倍，逻辑客户区不变。不做的
+            //    话窗口保持物理尺寸 ⇒ 逻辑面积塌成 1/4（720×800 逻辑点
+            //    变 360×400），solver 按比例压缩卡片、UI 密度突变
+            //    （2026-10-19 DPI 治理，P1-1）。
+            // 2. 更新 scale 并报事件。
+            //
+            // SetWindowPos 会再送来 WM_SIZE（物理尺寸变了），`inner_size`
+            // 由那条消息按新 scale 更新，这里不动。
             WM_DPICHANGED => {
-                let new_scale = dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) });
-                if (new_scale - scale).abs() > f32::EPSILON {
+                let new_scale =
+                    dpi_scale_factor(unsafe { GetDpiForWindow(self.hwnd) }, self.scale_factor);
+                if (new_scale - self.scale_factor).abs() > f32::EPSILON {
                     self.scale_factor = new_scale;
+                    let r = unsafe { &*(msg.lParam.0 as *const RECT) };
+                    let w = r.right - r.left;
+                    let h = r.bottom - r.top;
+                    unsafe {
+                        let _ = SetWindowPos(
+                            self.hwnd,
+                            None,
+                            r.left,
+                            r.top,
+                            w,
+                            h,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
                     out.push(WindowEvent::ScaleFactorChanged(new_scale as f64));
                 }
             }
@@ -1243,7 +1281,7 @@ impl EventLoop {
 
             WM_MOUSEMOVE => {
                 out.push(WindowEvent::MouseMoved {
-                    pos: unpack_pos(msg.lParam.0, scale),
+                    pos: unpack_pos(msg.lParam.0, self.scale_factor),
                 });
             }
 
@@ -1262,7 +1300,7 @@ impl EventLoop {
                 out.push(WindowEvent::MouseButton {
                     button: mouse_button_of(msg.message),
                     pressed,
-                    pos: unpack_pos(msg.lParam.0, scale),
+                    pos: unpack_pos(msg.lParam.0, self.scale_factor),
                 });
             }
 
@@ -1270,7 +1308,7 @@ impl EventLoop {
             // 事件，否则控件会一直停在「按下」态。
             WM_CAPTURECHANGED => {
                 if unsafe { GetCapture() } != self.hwnd {
-                    let pos = self.pointer_in_points(scale).unwrap_or(Pos2::ZERO);
+                    let pos = self.pointer_in_points(self.scale_factor).unwrap_or(Pos2::ZERO);
                     out.push(WindowEvent::MouseButton {
                         button: PointerButton::Primary,
                         pressed: false,
@@ -2693,11 +2731,14 @@ mod tests {
 
     #[test]
     fn dpi_scale_factor_guards_zero() {
-        // 窗口无效时 GetDpiForWindow 返回 0，不能除出 NaN
-        assert_eq!(dpi_scale_factor(0), 1.0);
-        assert_eq!(dpi_scale_factor(96), 1.0);
-        assert_eq!(dpi_scale_factor(192), 2.0);
-        assert_eq!(dpi_scale_factor(144), 1.5);
+        // 窗口无效时 GetDpiForWindow 返回 0：不能除出 NaN，也不能硬编码
+        // 1.0（那会让 200% 屏瞬跳 100%，当帧布局突变——P2-3，2026-10-19
+        // DPI 治理）。必须返回调用方的 last-good fallback。
+        assert_eq!(dpi_scale_factor(0, 0.5), 0.5, "查询失败应回 fallback");
+        assert_eq!(dpi_scale_factor(0, 2.0), 2.0, "fallback 随调用方上下文");
+        assert_eq!(dpi_scale_factor(96, 9.9), 1.0);
+        assert_eq!(dpi_scale_factor(192, 9.9), 2.0);
+        assert_eq!(dpi_scale_factor(144, 9.9), 1.5);
     }
 
     #[test]

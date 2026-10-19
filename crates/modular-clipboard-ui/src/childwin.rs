@@ -330,18 +330,38 @@ impl<'a> ChildWindow<'a> {
         scale_factor: f32,
         shared: &crate::multiwindow::SharedGfx<'a>,
     ) -> anyhow::Result<Self> {
+        let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
         let mut window = Window::new(title, width, height)?;
         // 与主窗口一致：告知设备纹理上限，否则超采样下字体图集会溢出。
         window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
+        // DPI 治理（P1-3）：调用方按**主窗口** scale 折算物理尺寸，而本
+        // 窗口在混合 DPI 多屏上可能落在不同缩放的显示器 ⇒ 物理尺寸错
+        // 一个档位（内容裁切或留白）。建窗后按本窗口真实 scale 复核：
+        // 把初值还原成逻辑点，再按真实 scale 重算。
+        let real_s = window.scale_factor();
+        if (real_s - s).abs() > 0.01 {
+            let lw = (width as f32 / s).max(160.0);
+            let lh = (height as f32 / s).max(120.0);
+            window.set_size_physical(
+                (lw * real_s).round() as u32,
+                (lh * real_s).round() as u32,
+            );
+            tracing::debug!(
+                card = ?card_id,
+                main_scale = s,
+                real_scale = real_s,
+                "子窗口按真实 DPI 复核尺寸"
+            );
+        }
         // 立刻定位到卡片记录的位置。
         //
         // NOTE: 早前 `window_pos` 只在「收回时写入」、**从不读取**，
         // 于是所有子窗口都停在Win32 默认位置（层叠在一起），
         // 表现为「多个窗口重叠、界面像缺了一块」。
         //
-        // `window_pos` 是逻辑点，`move_to` 要物理像素。
-        let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
-        window.move_to((pos.x * s) as i32, (pos.y * s) as i32);
+        // `window_pos` 是逻辑点，`move_to` 要物理像素。用**本窗口**的
+        // 真实 scale（见上方 P1-3 的复核说明）。
+        window.move_to((pos.x * real_s) as i32, (pos.y * real_s) as i32);
         // IMPORTANT: 必须走 `SharedGfx::new_context`：它带的字体配置与主窗口
         // 一致（此前这里传 `None`，用户配的字体在子窗口里不生效）。
         let ctx = shared.new_context();

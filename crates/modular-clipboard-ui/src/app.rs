@@ -215,9 +215,12 @@ fn run_mode(
     let paste_spec =
         modular_clipboard_platform::hotkey::spec_or_default(&config.hotkey_paste_previous);
 
-    // `Window::new` 的宽高是**物理像素**，而配置里存的是逻辑点。
-    // DPI 缩放在窗口创建后才可查，因此先按 1.0 换算——创建后第一帧的
-    // `Resized` 事件（或帧循环里的尺寸兜底检查）会把交换链纠正到真实尺寸。
+    // `Window::new` 的宽高是**物理像素**——`UiConfig::window_width/height`
+    // 也是物理像素（见 config.rs 的字段文档），两者同口径，直接透传。
+    //
+    // NOTE（P2-8 口径澄清，2026-10-19）：这里曾写「配置里存的是逻辑点」，
+    // 与 config.rs 直接矛盾。以 config.rs 为准：width/height 物理像素、
+    // window_pos 屏幕**逻辑点**（历史语义，保留兼容）。
     let window = Window::new(
         WINDOW_TITLE,
         config.ui.window_width.max(1.0) as u32,
@@ -232,7 +235,21 @@ fn run_mode(
     // 不能用它当「未设置」的哨兵值。
     if let Some(p) = config.ui.window_pos {
         let s = window.scale_factor();
-        window.move_to((p.x * s) as i32, (p.y * s) as i32);
+        // P1-2（2026-10-19 DPI 治理）：位置以「退出时那台显示器 DPI 下的
+        // 逻辑点」持久化，恢复时乘**当前** scale——混合 DPI 换屏/换机后
+        // 物理位置按比例漂移（200% 屏存的 500，100% 屏恢复成 250）。
+        // 彻底修法是持久化物理像素（需 config 语义迁移），这里先加护栏：
+        // **钳制到工作区内**——漂移最多导致贴边，不会跑到屏外点不着。
+        let w_px = (config.ui.window_width.max(1.0) * s) as i32;
+        let h_px = (config.ui.window_height.max(1.0) * s) as i32;
+        let (x, y) = crate::presence::clamp_to_work_area(
+            window.hwnd(),
+            (p.x * s) as i32,
+            (p.y * s) as i32,
+            w_px,
+            h_px,
+        );
+        window.move_to(x, y);
     }
     // CAUTION: `CreateWindowExW` 创建的窗口**默认不可见**，
     // 必须显式 `ShowWindow` 才会出现在桌面上。

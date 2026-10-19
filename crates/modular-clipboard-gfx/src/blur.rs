@@ -427,7 +427,14 @@ impl BlurPipeline {
     pub fn configure(&mut self, gpu: &Gpu, chain: &BlurChain) -> anyhow::Result<()> {
         let device = &gpu.device;
         let low = chain.blur_a.extent;
-        let texel = [1.0 / low.width as f32, 1.0 / low.height as f32];
+        // `.max(1)` 与 `set_radius` 同口径（防御：extent 为 0 时除出 inf/
+        // NaN 半径，着色器行为未定义）。当前 `downsample_extent` 保证 ≥1
+        // 不可触发，但两处算法口径必须一致——将来从别的路径拿 extent
+        // 就不会踩坑。
+        let texel = [
+            1.0 / (low.width as f32).max(1.0),
+            1.0 / (low.height as f32).max(1.0),
+        ];
         let sigma = sigma_for_radius(DEFAULT_RADIUS);
 
         self.uniform_h.write(

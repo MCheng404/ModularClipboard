@@ -4408,7 +4408,9 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     ui.label(
                         egui::RichText::new(format!("⚠ {err}"))
                             .color(pal.danger)
-                            .size(11.0),
+                            // 小一号提示字：随字号缩放（11.0 裸值在
+                            // font_scale=2 时不放大，用户看到「半截文字」）。
+                            .size(pal.font_xs),
                     );
                 });
             }
@@ -4572,7 +4574,7 @@ fn settings_search_results(f: &mut Frame<'_>, ui: &mut Ui, q: &str) {
             continue;
         }
         total += hits.len();
-        section(ui, card.title);
+        section(ui, card.title, f.pal);
         for it in hits {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::click());
             if resp.hovered() {
@@ -4611,7 +4613,7 @@ fn settings_recent_view(f: &mut Frame<'_>, ui: &mut Ui) {
         ui.label(egui::RichText::new("暂无最近修改的设置").color(pal.text_dim));
         return;
     }
-    section(ui, "最近修改");
+    section(ui, "最近修改", f.pal);
     for (label, _ts) in f.state.settings_recent.iter().rev() {
         let cat_title = SETTINGS_CARDS
             .iter()
@@ -4650,12 +4652,14 @@ fn record_recent(f: &mut Frame<'_>, label: &str) {
 }
 
 /// 分组标题。
-fn section(ui: &mut Ui, title: &str) {
+fn section(ui: &mut Ui, title: &str, pal: &Palette) {
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(title)
             .strong()
-            .size(15.0)
+            // 15.0 裸值 == font_sm @scale1，但不随 font_scale 放大
+            // （高字号下分组标题反而比正文小，倒挂）。
+            .size(pal.font_sm)
             .color(ui.visuals().weak_text_color()),
     );
 }
@@ -5379,7 +5383,12 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     // ---- 预览行：当前色块 + 来源 + hex ----
     let rgb = shown.to_rgb();
     ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(vec2(48.0, 26.0), Sense::empty());
+        // 高度随字号（font_sm×1.7 @scale1≈26）：本行是 horizontal，
+        // 色块先放置、来源标注后放置——egui 不重排先放的控件，固定高
+        // 在 font_scale>1 时被文字 galley 撑行后色块会顶格偏高（与令牌
+        // 行同款病，见 token_row_h 的 CAUTION）。
+        let swatch_h = (pal.font_sm * 1.7).max(22.0);
+        let (r, _) = ui.allocate_exact_size(vec2(48.0, swatch_h), Sense::empty());
         ui.painter_at(r)
             .rect_filled(r, pal.radius_sm, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         ui.add_space(8.0);
@@ -6081,7 +6090,9 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
         main.center(),
         egui::Align2::CENTER_CENTER,
         main_label,
-        egui::FontId::proportional(24.0),
+        // 主键名的「大显示」：比 font_lg 大一档，随 font_scale 缩放
+        // （裸 24.0 在高字号下会比周围文字小，失去焦点效果）。
+        egui::FontId::proportional(pal.font_lg * 1.25),
         fg,
     );
     y += main_h + 18.0;
@@ -6150,14 +6161,20 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
                 .color(pal.text_bright),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), egui::Sense::click());
+            // 按钮尺寸随 control_height（@scale1≈26）：固定 26 在高字号
+            // 下相对文字偏小、可点区域缩水。
+            let btn = pal.control_height * 0.93;
+            let (r, resp) = ui.allocate_exact_size(vec2(btn, btn), egui::Sense::click());
             let p = ui.painter_at(r);
             if resp.hovered() {
                 p.rect_filled(r, pal.radius_sm, pal.row_hover);
             }
             crate::icons::Icon::Close.paint(
                 &p,
-                Rect::from_center_size(r.center(), vec2(13.0, 13.0)),
+                Rect::from_center_size(
+                    r.center(),
+                    vec2(pal.icon_size * 0.81, pal.icon_size * 0.81),
+                ),
                 if resp.hovered() { pal.text_bright } else { pal.text_dim },
             );
             f.hit_insert("settings_mcp_overlay_close", r);

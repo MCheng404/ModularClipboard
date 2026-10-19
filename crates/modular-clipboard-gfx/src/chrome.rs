@@ -428,7 +428,12 @@ pub fn set_drag_regions(hwnd: HWND, rects: &[Rect]) {
         .iter()
         .take(MAX_DRAG_SEGS)
         .filter(|r| r.width() > 0.0 && r.height() > 0.0)
-        // 取整：Win32 命中判定按整数像素，亚像素矩形会漏边。
+        // 取整（P2-4 口径澄清，2026-10-19）：`hit_test` 也在**逻辑点**空间
+        // 取整后比对，两者口径一致即可。早前注释写「Win32 命中判定按整数
+        // 像素」并不成立——非整数缩放下逻辑整数 ≠ 物理整数（150% 时逻辑
+        // 1.0 = 物理 1.5px），真正对齐物理像素要 `round(x·s)/s`。当前
+        // 行为是「逻辑空间自洽」，边界最多差 0.5 逻辑点（150% 时 0.75px），
+        // 不值得为此引入物理换算。
         .map(|r| {
             Rect::from_min_max(
                 Pos2::new(r.min.x.round(), r.min.y.round()),

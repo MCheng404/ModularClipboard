@@ -223,7 +223,13 @@ pub fn render_scale_for(dpi_scale: f32) -> f32 {
     // 注意这里**不钳下限 1.0**：那是架空上限的根源（见上文）。
     // 只在结果小到毫无意义（配置被手改成极大 render_scale 且 DPI 极高）
     // 时兜一个正数下限，避免 render target 退化成 0 像素。
-    want.min(MAX_RENDER_PPP / s).max(0.25)
+    let ceiling = MAX_RENDER_PPP / s;
+    // 下限与上限联动（P2-2）：s > MAX_RENDER_PPP/0.25（=9）时 ceiling
+    // 已低于 0.25，若仍硬抬到 0.25，ppp = 0.25·s 会突破 MAX_RENDER_PPP
+    // ——恰好落进图标字形画坏区间。下限取 `ceiling.min(0.25)`：
+    // s≤9 时行为与旧版一致；s>9 时贴住上限。
+    let floor = ceiling.min(0.25);
+    want.min(ceiling).max(floor)
 }
 
 /// 已初始化的 Vulkan 设备上下文。
@@ -1013,8 +1019,13 @@ mod tests {
     /// 钉住「脏输入不产生脏倍率」这条性质。
     #[test]
     fn render_ppp_never_exceeds_cap_at_any_dpi() {
+        // 量程含 s > MAX_RENDER_PPP/0.25 = 9 的理论极端（P2-2，2026-10-19
+        // DPI 治理）：该区间下限必须**贴住上限**（ceiling.min(0.25)），
+        // 不能再硬抬到 0.25——否则 ppp = 0.25·s 突破 MAX_RENDER_PPP，
+        // 恰好落进图标字形画坏区间。
         for s in [
-            0.5_f32, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 4.0,
+            0.5_f32, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 4.0, 9.0, 12.0,
+            16.0,
         ] {
             let rs = render_scale_for(s);
             let ppp = s * rs;
@@ -1022,9 +1033,10 @@ mod tests {
                 ppp <= MAX_RENDER_PPP + 1e-4,
                 "DPI {s}: ppp={ppp} 超过上限 {MAX_RENDER_PPP}（倍率 {rs}）"
             );
-            // 不能反过来把画面缩到没有：倍率必须为正且不至于离谱地小。
+            // 倍率必须为正且有限。下限语义是 `min(ceiling, 0.25)`（随
+            // DPI 浮动）——s>9 时允许低于 0.25，以贴住 ppp 上限优先。
             assert!(
-                rs >= 0.25 - 1e-6 && rs.is_finite(),
+                rs > 0.0 && rs.is_finite(),
                 "DPI {s}: 倍率 {rs} 非法（会退化成无意义的渲染目标）"
             );
         }
