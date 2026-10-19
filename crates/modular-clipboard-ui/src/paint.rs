@@ -512,10 +512,15 @@ pub struct UiState {
     pub accent_hex: String,
     /// 「高级微调」令牌编辑器是否展开（默认收起）。
     ///
-    /// 令牌表有近 60 行，平铺会把主题卡撑到五屏以上——而它 95% 的
-    /// 用户一辈子不需要打开（二级主题的旋钮已覆盖常见需求）。默认
-    /// 收起显示摘要，需要时一键展开。折叠态**不绘制**令牌行，也就
-    /// 不注册它们的热区（与「只登记部分可见控件」的约定一致）。
+    /// 令牌**二级面板**是否打开（2026-10-19 语义升级）。
+    ///
+    /// 令牌表有近 60 行：平铺在主题卡里会把卡片撑到五屏以上，一屏内
+    /// 连一个设置项都看不全。因此升级为二级视图——主题卡只留一行
+    /// 「高级微调」摘要入口，点开后右侧内容区**整体切换**为令牌面板
+    /// （占设置窗口一大半区域），左上角「‹」返回。
+    ///
+    /// 折叠态（主题卡内）**不绘制**令牌行，也就不注册它们的热区
+    /// （与「只登记部分可见控件」的约定一致）。
     pub theme_tokens_expanded: bool,
     /// 搜索框是否展开（顶栏右侧图标折叠式搜索）。
     ///
@@ -3722,6 +3727,11 @@ fn settings_content(f: &mut Frame<'_>, ui: &mut Ui) {
         settings_search_results(f, ui, &q);
     } else if f.state.settings_show_recent {
         settings_recent_view(f, ui);
+    } else if f.state.settings_cat == SettingsCat::Theme && f.state.theme_tokens_expanded {
+        // 二级视图（2026-10-19）：令牌面板占据整个右侧内容区——用户要求
+        // 「基本覆盖设置窗口的一大半区域」。左导航与搜索框保持可见，
+        // 返回按钮（面板左上角 ‹）关掉它。
+        draw_token_panel(f, ui);
     } else {
         settings_category_cards(f, ui);
     }
@@ -4169,9 +4179,9 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             }
         }
         ItemKind::TokenOverrides => {
-            if draw_token_overrides(f, ui) {
-                record_recent(f, it.label);
-            }
+            // 2026-10-19：入口行只负责打开二级面板（draw_token_panel），
+            // 近 60 行令牌不再内联在主题卡里。
+            draw_token_entry(f, ui);
         }
         ItemKind::Backdrop => {
             setting_row(ui, it.label, it.desc, |ui| {
@@ -5570,7 +5580,57 @@ fn token_num_range(name: &str) -> std::ops::RangeInclusive<f32> {
     }
 }
 
-/// 令牌级覆盖编辑器（「高级微调」设置项）。
+/// 「高级微调」入口行（主题卡片内）。
+///
+/// 2026-10-19 起令牌编辑器从「卡片内联长列表」升级为**二级面板**：
+/// 点击本行把设置窗口右侧内容区整体切换为令牌面板（占一大半区域），
+/// 近 60 行令牌终于有地方完整铺开。 rationale：
+/// - 内联在主题卡里时，55 行把主题卡撑到五屏，滚半天才能滚完，
+///   与「外观/常规」等卡片的信息密度完全失衡；
+/// - 折叠态只有本行一个摘要，主题卡回到一屏以内。
+///
+/// 返回 true 表示本帧产生了 Op（调用方记「最近修改」）。
+fn draw_token_entry(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
+    let pal = f.pal;
+    let n_over = f.svc.state.config.ui.theme_overrides.colors.len()
+        + f.svc.state.config.ui.theme_overrides.nums.len();
+
+    // 入口行本身做成一个可点条目：标签 + 摘要 + 「调整」。
+    let label = if n_over > 0 {
+        format!("高级微调 · 已覆盖 {n_over} 个令牌")
+    } else {
+        "高级微调".to_string()
+    };
+    let (r, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), pal.control_height),
+        egui::Sense::click(),
+    );
+    let p = ui.painter_at(r);
+    if resp.hovered() {
+        p.rect_filled(r, pal.radius_sm, pal.row_hover);
+    }
+    p.text(
+        egui::pos2(r.min.x + 4.0, r.center().y),
+        Align2::LEFT_CENTER,
+        &label,
+        egui::FontId::proportional(pal.font_sm),
+        pal.text,
+    );
+    p.text(
+        egui::pos2(r.max.x - 4.0, r.center().y),
+        Align2::RIGHT_CENTER,
+        "调整 ›",
+        egui::FontId::proportional(pal.font_sm),
+        pal.accent,
+    );
+    f.hit_insert("token_expand", r);
+    if resp.clicked() {
+        f.state.theme_tokens_expanded = true;
+    }
+    false
+}
+
+/// 令牌级覆盖**二级面板**（主题分类的二级视图）。
 ///
 /// 列出**全部**主题令牌（[`Palette::tokens`]），逐项给出当前生效值
 /// 与调节入口——「界面上任何元素、任何参数都允许自由调整」的最终
@@ -5582,51 +5642,94 @@ fn token_num_range(name: &str) -> std::ops::RangeInclusive<f32> {
 /// - 时长令牌：只读（动效时长不适合滑条连续拖，且极少有人调）。
 ///
 /// 已覆盖的令牌行尾有「重置」按钮，恢复解析链派生值。
-fn draw_token_overrides(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
+///
+/// # 分组标题
+///
+/// 55 个令牌平铺是一面墙。按类型分三组（颜色 / 数值 / 时长）并给组
+/// 标题，用户能靠分组定位而不是逐行扫描。组标题不注册热区。
+fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     let pal = f.pal;
+
+    // ---- 顶部：返回 + 标题 ----
+    ui.horizontal(|ui| {
+        // 返回：二级视图的唯一出口。做成图标按钮 + 文字。
+        let (r, resp) = ui.allocate_exact_size(
+            egui::vec2(pal.control_height, pal.control_height),
+            egui::Sense::click(),
+        );
+        let p = ui.painter_at(r);
+        if resp.hovered() {
+            p.rect_filled(r, pal.radius_sm, pal.row_hover);
+        }
+        p.text(
+            r.center(),
+            Align2::CENTER_CENTER,
+            "‹",
+            egui::FontId::proportional(pal.font_lg),
+            if resp.hovered() { pal.text_bright } else { pal.text_dim },
+        );
+        f.hit_insert("token_back", r);
+        if resp.clicked() {
+            f.state.theme_tokens_expanded = false;
+        }
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("高级微调").color(pal.text).size(pal.font_lg),
+            ),
+        );
+    });
+    ui.add_space(2.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "全部主题令牌的当前生效值。拖动即写入覆盖，优先于二级主题与强调色的派生值。",
+            )
+            .color(pal.text_dim),
+        )
+        .wrap(),
+    );
+    ui.add_space(6.0);
+
     let n_over = f.svc.state.config.ui.theme_overrides.colors.len()
         + f.svc.state.config.ui.theme_overrides.nums.len();
-
-    // ---- 摘要行：覆盖数 + 展开/收起 + 全部重置 ----
-    let mut reset_all = false;
+    // 摘要 + 全部重置（仅在有覆盖时出现——默认态放个按钮是噪声）。
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
             egui::RichText::new(format!("已覆盖 {n_over} 个令牌")).color(pal.text_dim),
         ));
-        ui.add_space(8.0);
-        // 展开/收起：令牌表近 60 行，默认收起（ rationale 见
-        // `UiState::theme_tokens_expanded`）。
-        let (label, key) = if f.state.theme_tokens_expanded {
-            ("收起", "token_collapse")
-        } else {
-            ("展开", "token_expand")
-        };
-        if draw_mini_button(f, ui, key, label, Some(key)) {
-            f.state.theme_tokens_expanded = !f.state.theme_tokens_expanded;
-        }
         if n_over > 0 {
             ui.add_space(8.0);
-            reset_all = draw_mini_button(f, ui, "token_reset_all", "全部重置", Some("token_reset_all"));
+            let reset_all =
+                draw_mini_button(f, ui, "token_reset_all", "全部重置", Some("token_reset_all"));
+            if reset_all {
+                f.state.push(Op::ClearAllTokenOverrides);
+            }
         }
     });
-    if reset_all {
-        f.state.push(Op::ClearAllTokenOverrides);
-        return true;
-    }
-    if !f.state.theme_tokens_expanded {
-        // 折叠态：只画摘要。令牌行不绘制 ⇒ 不注册热区 ⇒ 自动化点不到
-        // 不存在的控件（与 hit_insert 的「部分可见才登记」同一精神）。
-        return false;
-    }
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 
-    // ---- 逐令牌 ----
+    // ---- 逐令牌（按类型分组）----
     //
     // CAUTION: ops 先收集后统一 push——`f.state.push` 要 `&mut Frame`，
     // 而循环里还要读 `f.svc.state.config`（是否已覆盖）。边读边写在
     // Rust 里是借用冲突，收集式则天然顺序执行。
     let mut ops: Vec<Op> = Vec::new();
+    let mut group = "";
     for (name, value) in pal.tokens() {
+        // 组标题：只在分组变化时画一次。
+        let g = match value {
+            TokenValue::Color(_) => "颜色",
+            TokenValue::Num(_) => "数值",
+            TokenValue::Dur(_) => "时长（只读）",
+        };
+        if g != group {
+            group = g;
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(egui::RichText::new(g).color(pal.text_dim).size(pal.font_xs)),
+            );
+        }
         match value {
             TokenValue::Color(c) => {
                 let overridden = f.svc.state.config.ui.theme_overrides.colors.contains_key(name);
@@ -5691,9 +5794,7 @@ fn draw_token_overrides(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
                                     name: name.to_string(),
                                     value: TokenValue::Color(
                                         egui::Color32::from_rgba_unmultiplied(
-                                            rgb2[0],
-                                            rgb2[1],
-                                            rgb2[2],
+                                            rgb2[0], rgb2[1], rgb2[2],
                                             a.round() as u8,
                                         ),
                                     ),
@@ -5757,7 +5858,6 @@ fn draw_token_overrides(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     for op in ops {
         f.state.push(op);
     }
-    n_over > 0
 }
 
 fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Response {
@@ -12760,20 +12860,47 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("token-editor", vec2(780.0, 900.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Theme;
+        // 选中星空主题：主题卡才会画旋钮（None 时只有「先选择一个
+        // 二级主题」提示行），「内容区整体切换」才有可断言的对照。
+        h.svc.state.config.ui.secondary_theme =
+            modular_clipboard_core::config::SecondaryTheme::Purple;
         h.settings_frame();
         // 折叠态：令牌名不在热区表里。
         assert!(
             settings_hit_missing(&h, "bg"),
             "默认折叠时不应登记令牌热区"
         );
-        // 点「展开」⇒ 令牌行出现。
+        // 点入口行「高级微调」⇒ 二级面板打开。
+        //
+        // CAUTION: 面板在**下一帧**才绘制（分发在 settings_content，
+        // 与入口行的点击不在同一帧）——必须再跑一帧才断言热区。
+        // 旧实现是「点击当帧即展开」（toggle 与令牌循环在同一函数
+        // 后半），二级视图化后这个时序变化是必然的。
         let expand = settings_hit(&h, "token_expand");
         let _ops = h.settings_click_at(expand.center());
+        assert!(h.state.theme_tokens_expanded, "入口点击应记住打开状态");
+        h.settings_frame();
         assert!(
             settings_hit(&h, "bg").width() > 0.0,
-            "展开后应登记令牌热区"
+            "面板打开后应登记令牌热区"
         );
-        assert!(h.state.theme_tokens_expanded, "展开状态应被记住");
+        // 面板特征：返回按钮出现；主题卡的旋钮（paper_tint 属于纸质，
+        // 星空下是 purple_tint）不再同屏出现（内容区整体切换）。
+        assert!(settings_hit(&h, "token_back").width() > 0.0, "应有返回按钮");
+        assert!(
+            settings_hit_missing(&h, "purple_tint"),
+            "二级视图下主题卡旋钮不应同屏"
+        );
+        // 返回：点 ‹ ⇒ 面板关闭，回到主题卡。
+        let back = settings_hit(&h, "token_back");
+        let _ops = h.settings_click_at(back.center());
+        assert!(!h.state.theme_tokens_expanded, "点返回应关闭面板");
+        h.settings_frame();
+        assert!(
+            settings_hit(&h, "purple_tint").width() > 0.0,
+            "返回后主题卡应恢复"
+        );
+        assert!(settings_hit_missing(&h, "bg"), "返回后令牌热区应消失");
     }
 
     /// 展开后点 bg 的色相滑条 ⇒ 推出 `SetTokenOverride`（颜色覆盖）。
@@ -12819,6 +12946,10 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Theme;
         h.svc.state.config.ui.theme_overrides.nums.insert("radius_md".into(), 12.0);
+        h.settings_frame();
+        // 「全部重置」在**二级面板**里（2026-10-19）：先点入口行打开。
+        let expand = settings_hit(&h, "token_expand");
+        let _ops = h.settings_click_at(expand.center());
         h.settings_frame();
         let reset = settings_hit(&h, "token_reset_all");
         let ops = h.settings_click_at(reset.center());
