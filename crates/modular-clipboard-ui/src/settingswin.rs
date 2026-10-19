@@ -359,10 +359,21 @@ impl<'a> SettingsWindow<'a> {
 
 impl<'a> Drop for SettingsWindow<'a> {
     fn drop(&mut self) {
-        // IMPORTANT: 必须销毁表面：设置窗口是「每次开关都新建」，不销毁就是
-        // 每开关一次泄漏一个 `vk::SurfaceKHR`。
+        // 顺序是硬性的（2026-10-19「连点设置按钮有概率未响应」根因修复，
+        // 三个附属窗口同款）：
         //
-        // 先销毁表面再让字段 drop —— `gfx`（含交换链）还引用着它。
+        // 1. **先抽干残留消息**（此刻 hwnd 还有效）。`poll` 按 hwnd 过滤，
+        //    窗口销毁后属于它的 posted 消息永远摘不走 ⇒ 线程队列累积，
+        //    逼近系统上限时系统判线程「未响应」。
+        // 2. **再等 GPU 空闲**。销毁 surface 的同一刻，上一帧的 in-flight
+        //    命令可能仍在读它（呈现/清屏都经过交换链图像）。Vulkan 规范
+        //    要求「销毁前无 in-flight 使用」；不等的后果是驱动内部竞态
+        //    ——实测症状正是偶发卡死。renderer 销毁纹理前一直有 wait_idle，
+        //    这三个窗口的 Drop 是漏网的那几处。
+        // 3. 最后销毁 surface（它属于 `Gpu`，必须先于交换链销毁——
+        //    字段声明顺序保证了 `gfx` 在我们之后 drop）。
+        self.events.drain_pending();
+        self.gfx.gpu.wait_idle();
         unsafe {
             self.gfx.gpu.destroy_surface(self.surface);
         }

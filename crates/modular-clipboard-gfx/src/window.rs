@@ -1140,6 +1140,36 @@ impl EventLoop {
 
     /// 睡眠式轮询：有消息立即返回，空闲时最多阻塞 `timeout`。
     ///
+    /// 抽干线程队列里**属于本窗口**的残留 posted 消息。
+    ///
+    /// # 为什么需要它（2026-10-19「连点设置按钮未响应」的第二根因）
+    ///
+    /// [`Self::poll`] 按 `hwnd` 过滤消息。窗口销毁后，它存活期间入队的
+    /// posted 消息（鼠标移动 / `WM_PAINT` / `WM_TIMER` / 窗口位置变化……）
+    /// 就再没有主人的 `hwnd` 可匹配——**永远摘不走**，滞留线程队列。
+    ///
+    /// 设置窗口 / 弹窗 / 卡片子窗都是「开关即 create/destroy」的生命周期，
+    /// 连点齿轮几十轮就是几千条孤儿消息；Windows 的线程消息队列有上限
+    /// （万条量级），逼近上限时 `PostMessage` 开始失败、`GetMessage`
+    /// 行为异常，系统随即把线程判定为「未响应」。
+    ///
+    /// 在销毁窗口**之前**（hwnd 仍有效）抽干，孤儿消息就不产生。
+    /// 代价是一次 O(队列中本窗口消息数) 的扫描，窗口都要关了，无所谓。
+    pub fn drain_pending(&self) {
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        let mut n = 0u32;
+        // 上限防护：万一有别的来源持续投递（理论上不会——窗口即将销毁、
+        // 没有泵在跑），也不能在这里转成死循环。
+        while n < 10_000
+            && unsafe { PeekMessageW(&mut msg, Some(self.hwnd), 0, 0, PM_REMOVE) }.as_bool()
+        {
+            n += 1;
+        }
+        if n > 0 {
+            tracing::debug!(hwnd = ?self.hwnd.0, n, "抽干窗口残留消息");
+        }
+    }
+
     /// 用 `MsgWaitForMultipleObjects` 同时等「消息到达」和「超时」，
     /// 而不是 `while GetMessage() {}` 忙等——后者无事件时会把一个核跑满。
     pub fn poll_for(&mut self, timeout: Option<Duration>) -> Vec<WindowEvent> {

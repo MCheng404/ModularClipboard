@@ -540,6 +540,14 @@ impl Drop for Popup<'_> {
     fn drop(&mut self) {
         // 表面由 Gpu 创建、FrameRenderer 不销毁——必须自己收，
         // 否则每次重建弹窗泄漏一个 vk::SurfaceKHR。
+        //
+        // 2026-10-19 修（与设置窗口/卡片子窗同款，三处一起）：
+        // 先抽干残留 posted 消息（hwnd 还有效，窗口销毁后它们永远摘不走，
+        // 线程队列会随弹窗开关累积到系统上限 ⇒ 系统判「未响应」），
+        // 再等 GPU 空闲（in-flight 命令可能仍在读 surface），
+        // 最后销毁表面。
+        self.events.drain_pending();
+        self.gfx.gpu.wait_idle();
         unsafe {
             self.gfx.gpu.destroy_surface(self.surface);
         }

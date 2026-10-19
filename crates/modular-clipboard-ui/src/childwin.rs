@@ -301,10 +301,13 @@ impl<'a> Drop for ChildWindows<'a> {
 
 impl<'a> Drop for ChildWindow<'a> {
     fn drop(&mut self) {
-        // 顺序很重要：**先销毁表面**（它属于 `Gpu`），再让字段各自 drop。
-        // Rust 的字段 drop 顺序是声明顺序，`surface` 声明在 `gfx` 之前，
-        // 所以这里必须显式做——否则 `gfx`（含交换链）先销毁时
-        // 交换链还引用着这个表面。
+        // 顺序很重要（2026-10-19 修，与设置窗口/弹窗同款）：
+        // 先抽干本窗口残留的 posted 消息（hwnd 还有效——窗口销毁后
+        // 它们永远摘不走，线程消息队列会随开关累积到系统上限），
+        // 再等 GPU 空闲（上一帧的 in-flight 命令可能仍在读 surface），
+        // 最后销毁表面（它属于 `Gpu`，必须先于 `gfx` 的交换链销毁）。
+        self.events.drain_pending();
+        self.gfx.gpu.wait_idle();
         unsafe {
             // `gfx.gpu` 是 `&Gpu`，表面由它创建、由它销毁。
             self.gfx.gpu.destroy_surface(self.surface);
