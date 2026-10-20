@@ -284,6 +284,25 @@ macro_rules! palette {
                 }
             }
 
+            /// 卡片透明变体：只把「行卡片底色」（`surface_raised`）降 alpha，
+            /// 其余令牌原样。
+            ///
+            /// # 为什么单独一个方法
+            ///
+            /// [`Palette::with_backdrop_alpha`] 处理的是**窗口背景层**
+            /// （`bg` / `surface` / `surface_variant` / `list_bg`）；行卡片
+            /// 用的是 `surface_raised`，它不在那份名单里——因为卡片底色
+            /// 在弹窗、气泡、类型徽标上也被复用，全局降 alpha 会把那些
+            /// 浮层一起变透。所以卡片透明度必须是一个**独立的、只作用于
+            /// 列表行卡片**的派生，由调用方按配置值显式选择。
+            ///
+            /// `alpha` 取值 0-255，255 等于原色（不透明）。
+            pub fn with_card_alpha(&self, alpha: u8) -> Palette {
+                let mut p = self.clone();
+                p.surface_raised = p.surface_raised.gamma_multiply(alpha as f32 / 255.0);
+                p
+            }
+
             /// 字体缩放变体：`font_*` 令牌乘以 `scale`，其余令牌原样。
             ///
             /// # 为什么必须从**基础调色板**派生，而不是在显示值上再乘一次

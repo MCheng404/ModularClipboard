@@ -111,6 +111,8 @@ pub enum Op {
     SetBackdrop(modular_clipboard_core::config::WindowBackdrop),
     /// 调背景不透明度（0.3 ~ 1.0）。
     SetOpacity(f32),
+    /// 调卡片不透明度（0.3 ~ 1.0）。仅在磨砂 / 半透明背景下有意义。
+    SetCardOpacity(f32),
     /// 调磨砂强度档位（1 ~ 10）。
     SetBlurStrength(u8),
     /// 设置列表卡片阴影（开关 + 模糊 / 浓度 / 垂直偏移）。
@@ -564,6 +566,14 @@ pub struct UiState {
     /// 没有这个位的话，点一下收起、光标却还停在图标上 ⇒ 0.18s 后又被
     /// 悬停展开，用户觉得「点了关不掉」。
     pub search_hover_suppressed: bool,
+    /// 搜索面板**本次展开**的时刻（`input.time` 秒）。
+    ///
+    /// 展开后给一段宽限期（[`SEARCH_OPEN_GRACE`]），期间不判折叠。
+    /// 起因（2026-10-19 用户反馈「点一下搜索，闪一下就关闭」）：点击
+    /// 展开的那几帧里，焦点还没从弹窗回报回来、指针又可能已经离开图标
+    /// ⇒ 折叠条件短暂全部成立，0.35s 宽限一到面板就自己收回去。
+    /// 有了它，任何「刚打开」的面板都不可能被立刻判折叠。
+    pub search_open_at: Option<f64>,
     /// 搜索弹窗的输入框是否持有焦点（弹窗每帧回报）。
     ///
     /// 这条规则是「正在打字时不折叠面板」的依据，而焦点住在弹窗的
@@ -1063,6 +1073,17 @@ pub fn draw(f: &mut Frame<'_>) {
     // 「上一帧存在、这一帧已消失」的位置，症状是改了布局后
     // 测试仍通过但测的是空气。
     f.hit_clear();
+    // 拖动区同样是每帧重算。早前由 `draw_topbar` 用赋值完成（等于顺带
+    // 清零）；顶栏改到**最后**画之后，清零必须显式放在这里，否则顶栏
+    // 的 `extend` 会把上一帧的旧矩形一直留着。
+    f.state.drag_regions.clear();
+
+    // 卡片（矩形由 solver 算好，绘制层只读不判断）。
+    //
+    // NOTE: 卡片**先于**顶栏画。顶栏是不透明的顶条，画在最后才能把
+    // 任何越出列表区的内容遮住（行入场动画、投影、将来新增的绘制），
+    // 不会出现「内容直接渲染在顶栏上、没有遮蔽」。
+    draw_cards(f, body);
 
     // 顶栏（含搜索开关图标）。返回图标响应供状态机使用。
     let icon_resp = draw_topbar(f, top);
@@ -1075,9 +1096,6 @@ pub fn draw(f: &mut Frame<'_>) {
     // （焦点在弹窗的 `Context::memory()`）。`popup` 每帧把两者回报
     // 到 `UiState`（`search_popup_hover` / `search_popup_focus`）。
     run_search_state_machine(f, &icon_resp);
-
-    // 卡片（矩形由 solver 算好，绘制层只读不判断）。
-    draw_cards(f, body);
 
     // 缩略图纹理按**本帧全部可见图片条目**淘汰（帧级，跨列表）：
     // 滚出屏的条目释放 GPU 纹理；像素仍在 `thumb_cache`（LRU）里，
@@ -1646,7 +1664,10 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
             bar.max,
         ));
     }
-    f.state.drag_regions = drag;
+    // 拖动区是**累加**而不是赋值：列表（`draw_history_body`）先于顶栏
+    // 画，已经 push 了自己的矩形；赋值会把它们全丢掉（左右留白、行间
+    // 缝隙都拖不动）。清零在 `draw()` 开头统一做。
+    f.state.drag_regions.extend(drag);
 
     let _ = scale;
     icon_resp
@@ -1686,35 +1707,36 @@ fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Response) {
         set_search_expanded(f, true);
     }
 
-    // 输入框持有焦点 / 有查询词：无条件保持展开。
+    // 输入框持有焦点 / 有查询词 / 刚展开：无条件保持展开。
     //
     // 焦点这条最关键：用户要点进输入框打字。弹窗刚打开、输入框还没
     // 拿到焦点的那几帧里，既不悬停图标也不悬停面板——没有这条判定，
     // 面板会在焦点建立之前自己收回去，然后焦点被丢弃，字永远打不进去。
-    let hold_open = f.state.search_popup_focus || !f.state.query.is_empty();
+    //
+    // 「刚展开」这条是 2026-10-19 补的：焦点从请求到回报要跨一两帧，
+    // 指针又可能已经离开图标，那几帧里 `hold_open` 会短暂为假 ⇒ 折叠
+    // 计时启动 ⇒ 面板「闪一下就没」。宽限期把这段时间兜住。
+    let just_opened = f
+        .state
+        .search_open_at
+        .is_some_and(|t| now - t < SEARCH_OPEN_GRACE);
+    let hold_open =
+        f.state.search_popup_focus || !f.state.query.is_empty() || just_opened;
 
-    // 点击图标 = 展开 + 把焦点交给输入框。
+    // 点击图标 = **展开 + 把焦点交给输入框**，不做开合切换。
     //
-    // NOTE: 展开/折叠**不再由点击切换**。早前是点击 toggle，与悬停展开
-    // 叠加会互相打架：点一下折叠，可光标还停在图标上，下一帧又被悬停
-    // 展开——表现为「点不动」。
-    // ……但**现在**还不能写焦点：弹窗本帧可能一次都没画过（弹窗是
-    // 主窗口之后才渲染的），`search_edit_id` 还是 `None`。真正的请求
-    // 挂在 [`UiState::search_focus_pending`] 上，等弹窗自报出真实 id。
-    // 点击图标 = **开合切换**：折叠时展开并把焦点交给输入框，
-    // 展开时收起。
+    // CAUTION: 早前这里是 toggle（展开态点一下收起）。它与「悬停 0.18s
+    // 自动展开」天然打架：用户把鼠标移到图标上、面板已经自己展开了，
+    // 再点一下反而把它收起来——观感就是「点一下，闪一下，关闭了」
+    // （2026-10-19 用户反馈）。收起只走三条显式路径：Esc、面板 ✕、
+    // 以及「指针离开图标与面板且焦点不在输入框」的宽限折叠。
     //
-    // CAUTION: 收起后光标多半还停在图标上，若不管，悬停计时会在
-    // 0.18s 后把它重新展开——表现为「点了关不掉」。所以收起时置
-    // `search_hover_suppressed`，等光标**离开图标**才解除。
+    // 焦点请求要跨帧：弹窗本帧可能一次都没画过（弹窗是主窗口之后才
+    // 渲染的），`search_edit_id` 还是 `None`。真正的请求挂在
+    // [`UiState::search_focus_pending`] 上，等弹窗自报出真实 id。
     if icon_resp.clicked() {
-        if f.state.search_expanded {
-            set_search_expanded(f, false);
-            f.state.search_hover_suppressed = true;
-        } else {
-            set_search_expanded(f, true);
-            f.state.search_focus_pending = true;
-        }
+        set_search_expanded(f, true);
+        f.state.search_focus_pending = true;
     }
     // 光标离开图标 ⇒ 解除抑制（下次移入可以正常悬停展开）。
     if !hover_icon {
@@ -1753,6 +1775,10 @@ fn set_search_expanded(f: &mut Frame<'_>, v: bool) {
     f.state.search_expanded = v;
     f.state.search_hover_since = None;
     f.state.search_leave_since = None;
+    // 记录「本次展开时刻」：折叠判定用它做免折叠宽限（见
+    // [`SEARCH_OPEN_GRACE`]）。收起时清掉，避免下次展开沿用旧时刻
+    // 而让宽限失效。
+    f.state.search_open_at = v.then(|| f.ui.ctx().input(|i| i.time));
 }
 
 /// 画悬浮搜索面板（第三轮起输入框的新形态）。
@@ -2657,9 +2683,18 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     draw_settings_close(f, close_r);
 
     // 内容区：关闭按钮下方，可滚动。
+    //
+    // 右缘**让出滚动条宽度 + 呼吸空间**：egui 的浮动滚动条画在内容区
+    // 右缘之上（`ScrollStyle::floating`，不占布局宽度），正好压住右侧
+    // 控件——开关、分段控件的最后一段、滑条手柄都会被它挡住（用户反馈
+    // 「滑条展开后容易挡到按钮」）。让出后控件整体左移，滚动条落在
+    // 空白里，与列表行（`draw_history_body` 的 `row_w`）同一处理。
     let content = Rect::from_min_max(
         pos2(right.min.x, close_r.max.y + 6.0),
-        right.max,
+        pos2(
+            (right.max.x - SCROLLBAR_RESERVE - SCROLLBAR_GAP).max(right.min.x + 8.0),
+            right.max.y,
+        ),
     );
     if content.height() <= 8.0 {
         return;
@@ -2852,34 +2887,53 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
     let gap = 2.0;
     // 项高随字号缩放，否则大字号下导航文字会顶到相邻项。
     let item_h = pal.control_height * 1.43;
-    for (i, cat) in SettingsCat::ALL.iter().enumerate() {
-        let y0 = nav_rect.min.y + pad + i as f32 * (item_h + gap);
-        let r = Rect::from_min_max(
+    let row_step = item_h + gap;
+    let item_rect = |i: usize| {
+        let y0 = nav_rect.min.y + pad + i as f32 * row_step;
+        Rect::from_min_max(
             pos2(nav_rect.min.x + pad, y0),
             pos2(nav_rect.max.x - pad, y0 + item_h),
-        );
+        )
+    };
+
+    // ---- 选中底：**一整块**，在两项之间平移 -------------------------
+    //
+    // 早前是「每项各自淡入淡出」：切换分类时旧块淡出、新块淡入，两个
+    // 半透明块在中间同时存在——观感是「闪一下」而不是「移过去」。
+    // 用户要求「选中导航后背景平移到选择导航」，所以改成**单块**：
+    // 位置（下标）走补间，切换时从旧项滑到新项；颜色/圆角不变。
+    //
+    // 补间键与分类无关（`nav_pill`）——有键就只有一个块，天然不会
+    // 出现两块并存。从当前显示值续接：连续快速切换时它在中途改方向，
+    // 不会跳回起点（与分段控件的 `seg_pill` 同一套）。
+    let sel_idx = SettingsCat::ALL
+        .iter()
+        .position(|c| *c == f.state.settings_cat)
+        .unwrap_or(0) as f32;
+    let pill_idx = crate::anim::tween_f32(
+        f.ui.ctx(),
+        egui::Id::new("nav_pill"),
+        sel_idx,
+        std::time::Duration::from_millis(220),
+        crate::anim::Ease::OutCubic,
+    );
+    let pill_y = nav_rect.min.y + pad + pill_idx * row_step;
+    let pill = Rect::from_min_max(
+        pos2(nav_rect.min.x + pad, pill_y),
+        pos2(nav_rect.max.x - pad, pill_y + item_h),
+    );
+    painter.rect_filled(pill, pal.radius_md, pal.row_selected);
+
+    for (i, cat) in SettingsCat::ALL.iter().enumerate() {
+        let r = item_rect(i);
         let selected = f.state.settings_cat == *cat;
         let resp = f
             .ui
             .interact(r, egui::Id::new(("settings_cat", *cat)), egui::Sense::click());
-        // ---- 动效（2026-10-17）：选中底淡入 + 悬停补间 -----------------
+        // ---- 悬停底（110ms）：只在未选中时叠 -----------------------------
         //
-        // 选中底（row_selected，160ms）与悬停底（row_hover，110ms）各自
-        // 补间；悬停只在未选中时生效（与旧实现的优先级一致：选中态压住
-        // 悬停）。alpha 走预乘缩放（`fade_color`）——这两个令牌都是半
-        // 透明色，直接乘会二次预乘（见 `fade_color` 文档）。
-        //
-        // 设置窗口没有空闲闸门（每帧都驱动），这里不需要续帧请求。
-        let sel_t = crate::anim::tween_f32(
-            f.ui.ctx(),
-            egui::Id::new(("nav_sel", *cat)),
-            if selected { 1.0 } else { 0.0 },
-            std::time::Duration::from_millis(160),
-            crate::anim::Ease::OutCubic,
-        );
-        if sel_t > 0.004 {
-            painter.rect_filled(r, pal.radius_md, fade_color(pal.row_selected, sel_t));
-        }
+        // 选中态由上面那块**平移的**选中底表达，这里不再各画一份——
+        // 两块半透明底叠在一起会加深，滑过时颜色不匀。
         if !selected {
             let hov_t = crate::anim::tween_f32(
                 f.ui.ctx(),
@@ -3041,6 +3095,8 @@ enum ItemKind {
     Backdrop,
     /// 背景不透明度滑块。
     Opacity,
+    /// 卡片不透明度滑块（磨砂 / 半透明下让行卡片也透出模糊底图）。
+    CardOpacity,
     /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
     BlurStrength,
     /// 卡片阴影：开关行 + （开启时）模糊 / 浓度 / 垂直偏移三个滑条。
@@ -3250,6 +3306,7 @@ impl SettingsItem {
             }
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
+            ItemKind::CardOpacity => (cfg.ui.card_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
             ItemKind::CardShadow => cfg.ui.card_shadow != d.ui.card_shadow,
             ItemKind::RowMeta => cfg.ui.row_meta != d.ui.row_meta,
@@ -3301,6 +3358,7 @@ impl SettingsItem {
             ItemKind::TokenOverrides => Some(Op::ClearAllTokenOverrides),
             ItemKind::Backdrop => Some(Op::SetBackdrop(WindowBackdrop::None)),
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
+            ItemKind::CardOpacity => Some(Op::SetCardOpacity(d.ui.card_opacity)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
             ItemKind::CardShadow => Some(Op::SetCardShadow(d.ui.card_shadow)),
             ItemKind::RowMeta => Some(Op::SetRowMeta(d.ui.row_meta)),
@@ -3456,6 +3514,11 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: "背景不透明度",
                 desc: "背景层强度，文字始终不透明",
                 kind: ItemKind::Opacity,
+            },
+            SettingsItem {
+                label: "卡片不透明度",
+                desc: "磨砂 / 半透明模式下条目卡片的实度：调低让模糊底图透过卡片（仅这两种模式可调）",
+                kind: ItemKind::CardOpacity,
             },
             SettingsItem {
                 label: "卡片阴影",
@@ -3765,7 +3828,11 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
         .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             // 行间距：设置项之间拉开呼吸感（2.0 太挤，文字贴在一起）。
-            ui.spacing_mut().item_spacing = vec2(0.0, 8.0);
+            //
+            // 14.0 而不是 8.0：行高现在**精确等于标签块**（标题 + 说明），
+            // 早前那 8pt 里其实混着控件溢出撑出来的空白，看起来才够松。
+            // 行高收紧后必须把间距补回来，否则相邻两行贴在一起。
+            ui.spacing_mut().item_spacing = vec2(0.0, 14.0);
 
             // 顶部行：无标题文字，仅当有项偏离默认值时在**右上方**出现「重置」。
             let changed_any = {
@@ -3861,18 +3928,29 @@ fn shadow_param_row(
     let mut changed = false;
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // 读数：与 `ItemKind::Opacity` 同一习惯，数字显示在滑条右侧。
-            ui.add(
-                egui::Label::new(egui::RichText::new(readout).color(f.pal.text_dim)),
-            );
-            changed = draw_slider(f, ui, id_suffix, "", v, range, true, 0.0);
-            // 剩余宽度给标签列（与 `setting_row` 同款布局，见其注释）。
-            let rest = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
+            // 与 `setting_row` 同款：先把行高定成标签行高，滑条与读数才会
+            // 与标签在同一垂直中心上（否则滑条贴着行首，比文字高半行）。
+            let row_h = head_line_height(ui, label).max(CTRL_MIN_H);
+            let avail = ui.available_width();
             ui.allocate_ui_with_layout(
-                vec2(rest, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
+                vec2(avail, row_h),
+                egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    ui.add(egui::Label::new(label).truncate());
+                    // 读数：与 `ItemKind::Opacity` 同一习惯，数字显示在滑条右侧。
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(readout).color(f.pal.text_dim)),
+                    );
+                    changed = draw_slider(f, ui, id_suffix, "", v, range, true, 0.0);
+                    // 剩余宽度给标签列（与 `setting_row` 同款布局，见其注释）。
+                    // 高度同样必须是 `row_h`——0 会让内容溢出撑高整行。
+                    let rest = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
+                    ui.allocate_ui_with_layout(
+                        vec2(rest, row_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.add(egui::Label::new(label).truncate());
+                        },
+                    );
                 },
             );
         });
@@ -4217,6 +4295,33 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             });
             if changed && enabled {
                 f.state.push(Op::SetOpacity(op));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::CardOpacity => {
+            let mut op = f.svc.state.config.ui.card_opacity;
+            // 与「背景不透明度」同一条依赖：背景不透明时没有底图可透，
+            // 这个滑块禁用并压暗（「关着还能调」会让用户以为没保存）。
+            let enabled = f.svc.state.config.ui.window_backdrop != WindowBackdrop::None;
+            let pal = f.pal;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("{}%", (op * 100.0).round() as i32))
+                        .color(pal.text_dim),
+                ));
+                draw_slider(
+                    f,
+                    ui,
+                    "card_opacity",
+                    "",
+                    &mut op,
+                    0.3..=1.0,
+                    enabled,
+                    0.0,
+                )
+            });
+            if changed && enabled {
+                f.state.push(Op::SetCardOpacity(op));
                 record_recent(f, it.label);
             }
         }
@@ -4708,6 +4813,92 @@ fn row_font_scale(ui: &Ui) -> f32 {
     if base > 0.0 && cur.is_finite() { (cur / base).max(0.1) } else { 1.0 }
 }
 
+/// 标题与说明之间的行距（逻辑点）。
+///
+/// 与「行与行之间」的间距（`settings_card` 的 `item_spacing.y`）分开：
+/// 标题和说明是一组，贴紧才读得成一句；行与行之间要松。
+const LABEL_DESC_GAP: f32 = 5.0;
+
+/// 说明文字最多占几行。超出部分由 egui 省略（末行加「…」）。
+///
+/// 2 行是「读得完一句说明」与「行高不失控」的折中：设置项的描述通常
+/// 一到两句，3 行以上多半是文案该精简了。悬停仍可看到完整描述。
+const DESC_MAX_ROWS: usize = 2;
+
+/// 标题行高（逻辑点）。**与宽度无关**（标题单行 `truncate`），可精确预量。
+fn head_line_height(ui: &Ui, label: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+        .rect
+        .height()
+}
+
+/// 说明文字排版：按 `width` **折行**，最多 [`DESC_MAX_ROWS`] 行，超出加省略号。
+///
+/// # 为什么不用 `Label::truncate()` / `.wrap()`
+///
+/// - `truncate()` 只出**一行**，长说明被砍成半句（用户反馈「描述显示不全」）；
+/// - `wrap()` 不限行数，超长说明能把一行设置撑到五六行高，整张卡片失去节奏。
+///
+/// 用 `LayoutJob` 的 `wrap.max_rows` 才是「折行 + 到上限加省略号」——
+/// 与列表预览（`draw_text_preview`）同一套做法。
+fn desc_galley(ui: &Ui, desc: &str, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        desc,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Small.resolve(ui.style()),
+            color: ui.visuals().weak_text_color(),
+            ..Default::default()
+        },
+    );
+    job.wrap.max_width = width.max(1.0);
+    job.wrap.max_rows = DESC_MAX_ROWS;
+    job.wrap.break_anywhere = true;
+    ui.painter().layout_job(job)
+}
+
+/// 一行设置项的布局常量：控件列的最小高度。
+///
+/// 标题行本身只有 ~20pt，而按钮类控件（快捷键录制、迷你按钮）有 24~28pt。
+/// 容器按 24pt 起步，控件居中后不会向上/向下出界。
+const CTRL_MIN_H: f32 = 24.0;
+
+/// 一行「标签 + 说明 + 右侧控件」。
+///
+/// # 布局（三块，全部用**显式矩形**定位）
+///
+/// ```text
+/// ┌───────────────────────────────┬──────────────┐
+/// │ 标题                          │   控件（右对齐、垂直居中）│
+/// │ 说明（自动折行，最多 2 行…）   │              │
+/// └───────────────────────────────┴──────────────┘
+///   ← 标签列宽 = 可用宽 − 控件宽 − 间距 →
+/// ```
+///
+/// # 为什么必须「先量行高、再按矩形摆放」
+///
+/// 早前是「控件先放、标签列后放」，而 egui 的横向布局**不会重排先放的
+/// 控件**：控件放下时行高还只有它自己那么高，随后标签列把行撑高，控件
+/// 仍停在行首 ⇒ 开关贴着标题行、输入框贴着说明行、分段控件又高半行，
+/// 同一张卡片里三种对齐——观感就是「内容和按钮错位」。
+///
+/// 现在整行先 `allocate_exact_size` 占住，再把控件与标签列放进**显式
+/// 矩形**（`new_child` 不推进游标），三者的几何完全由本函数决定：
+/// - 控件：行右上角，在 `CTRL_MIN_H` 高的容器里垂直居中（与标题行同中心）；
+/// - 标签列：行左上角，宽度 = 可用宽 − 控件实际宽 − 间距；
+/// - 行高：标题行高 + 说明实际折行高度（说明折行后行会变高）。
+///
+/// # 为什么标签列宽度要减去控件宽
+///
+/// 说明按这个宽度折行——**量出来的行数就是画出来的行数**。若按整行宽
+/// 量、按窄列画，说明会被挤成更多行而撑出卡片（用户反馈「描述跑到
+/// 卡片外」的成因）。控件宽从 `min_rect` 取实际值，不靠猜。
 fn setting_row(
     ui: &mut Ui,
     label: &'static str,
@@ -4720,14 +4911,8 @@ fn setting_row(
         ui.vertical(|ui| {
             ui.add(egui::Label::new(label));
             if !desc.is_empty() {
-                let r = ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(desc)
-                            .small()
-                            .color(ui.visuals().weak_text_color()),
-                    )
-                    .truncate(),
-                );
+                let g = desc_galley(ui, desc, ui.available_width());
+                let r = ui.add(egui::Label::new(g));
                 r.on_hover_text(desc);
             }
             // CAUTION: 必须用 `ui.horizontal` 包一层。直接在纵向布局里
@@ -4742,39 +4927,66 @@ fn setting_row(
         });
         return changed;
     }
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            changed = control(ui);
-            // 扣掉与控件之间的行内间距：不减的话标签列会多占一个间距的
-            // 宽度、与控件左缘重叠几个点（实测 7pt）。
-            let rest = (ui.available_width() - ui.spacing().item_spacing.x).max(0.0);
-            // NOTE: 标签列**不登记热区**——`setting_row` 只拿到 `Ui`，
-            // 而命中表挂在 `UiState` 上（`Frame` 才有）。布局回归测试
-            // 因此改用两条可测判据：控件不越出卡片 + 控件之间不重叠。
-            ui.allocate_ui_with_layout(
-                vec2(rest, 0.0),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    // 用 `truncate()` 而不是默认的换行：换行会让长描述在窄列里
-                    // 折成多行，把行高撑得极不均匀（同一张卡片里 30pt 与 120pt
-                    // 的行交替出现，观感就是「错乱」）。
-                    ui.add(egui::Label::new(label).truncate());
-                    if !desc.is_empty() {
-                        let r = ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(desc)
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
-                            )
-                            .truncate(),
-                        );
-                        // 截断后看不到全文，悬停给出完整描述——否则等于丢信息。
-                        r.on_hover_text(desc);
-                    }
-                },
-            );
-        });
-    });
+
+    let avail = ui.available_width().max(1.0);
+    let head_h = head_line_height(ui, label);
+    let ctrl_h = head_h.max(CTRL_MIN_H);
+    // 1) 先占住整行（高度先按「标题行高」，说明折行后再补）。
+    let (row, _) = ui.allocate_exact_size(vec2(avail, ctrl_h), Sense::empty());
+
+    // 2) 控件：行右上角，从右往左排（右对齐）。
+    //
+    // 容器宽度 = 可用宽 − **标题实际宽度** − 间距：控件最多吃到这里，
+    // 标题永远拿得下自己的字（长标题也不会被控件挤没）。早前用固定
+    // 72% 上限，Info 行（右侧是长文本）被白白砍掉三成宽度。
+    let gap = ui.spacing().item_spacing.x;
+    let label_nat = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+        .rect
+        .width()
+        .min(avail * 0.5);
+    let ctrl_max = (avail - label_nat - gap).max(avail * 0.3);
+    let mut ctrl_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_max(
+                pos2(row.max.x - ctrl_max, row.min.y),
+                pos2(row.max.x, row.min.y + ctrl_h),
+            ))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    changed = control(&mut ctrl_ui);
+    // 实际占用的宽度（开关 ~38、分段 ~250、输入框 ~230）。
+    let ctrl_w = ctrl_ui.min_rect().width().min(ctrl_max);
+
+    // 3) 标签列：行左上角。宽度先定，说明按这个宽度折行 ⇒ 量=画。
+    let label_w = (avail - ctrl_w - gap).max(80.0);
+    let desc_g = (!desc.is_empty()).then(|| desc_galley(ui, desc, label_w));
+    let desc_h = desc_g.as_ref().map_or(0.0, |g| g.rect.height());
+    let label_h = head_h + if desc_g.is_some() { LABEL_DESC_GAP + desc_h } else { 0.0 };
+    // 说明折行后行更高：补足游标，下一行才不会压上来。
+    if label_h > ctrl_h {
+        ui.add_space(label_h - ctrl_h);
+    }
+    let mut lab = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_size(row.min, vec2(label_w, label_h)))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    lab.spacing_mut().item_spacing.y = LABEL_DESC_GAP;
+    // 标题单行：`truncate()` 让它在窄列里省略而不是换行（换行会把
+    // 标题和说明挤成一片，读不出层次）。
+    lab.add(egui::Label::new(label).truncate());
+    if let Some(g) = desc_g {
+        // 说明已经按列宽排好版（折行 + 省略），直接画 galley。
+        let r = lab.add(egui::Label::new(g));
+        // 折行到 2 行仍可能看不全，悬停给出完整描述。
+        r.on_hover_text(desc);
+    }
     changed
 }
 
@@ -7301,6 +7513,16 @@ const SEARCH_COLLAPSE_DELAY: f64 = 0.35;
 /// 太长（>0.4s）用户会觉得「没反应」。0.18s 接近 Windows 悬停提示的节奏。
 const SEARCH_HOVER_DELAY: f64 = 0.18;
 
+/// 面板刚展开后的**免折叠宽限**（秒）。
+///
+/// 展开的头几帧里状态还不稳：焦点要等弹窗画完才请求、再等它回报；
+/// 指针可能已经离开图标。若此时折叠计时就开始跑，`SEARCH_COLLAPSE_DELAY`
+/// 一到面板就自己收回去——用户看到的是「点一下闪一下就没了」。
+///
+/// 0.6s 覆盖「点击 → 弹窗首帧 → 焦点落地」的整条链路（实测 1~2 帧），
+/// 又不至于让「点开就想关」的用户觉得迟钝（Esc / 点图标仍是立即收起）。
+const SEARCH_OPEN_GRACE: f64 = 0.6;
+
 /// 垂直滚动条占位（逻辑点），缝隙拖动区右缘必须让出这一段。
 ///
 /// `ScrollArea` 的滚动条画在内容区右缘内侧；若缝隙横条直抵
@@ -7555,6 +7777,21 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     let image_inline = f.svc.state.config.ui.image_inline;
     let md_rendered = f.svc.state.config.ui.md_rendered;
 
+    // 预览绘制用的**裁剪 Ui**：裁剪到内容带。
+    //
+    // 与列表行同一个道理（见 `draw_text_preview` 的 CAUTION）：预览函数
+    // 一律用「调用方给的 Ui」画，才能被内容带裁剪；拿根 `f.ui` 会把
+    // 长文本/大图画到卡片之外。
+    //
+    // NOTE: `new_child` 只建 Ui、不推进父 Ui 的游标，也不借用 `f`——
+    // 因此可以与 `&mut f` 并存。
+    let preview_ui = f.ui.new_child(
+        egui::UiBuilder::new()
+            .id(egui::Id::new("detail_preview"))
+            .max_rect(content_band)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+
     // 三分支：图片直显 / Markdown 渲染 / 文本折行。
     //
     // CAUTION: `draw_image_preview` 与 `draw_markdown_preview` 都需要
@@ -7569,18 +7806,18 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
             // 报告到 `thumb_seen`：让本帧上传的纹理在 `draw` 收尾
             // retain 时不被误淘汰（与列表行用同一机制）。
             f.state.thumb_seen.insert(item.id);
-            draw_image_preview(f, content_band, &item, content_band.height());
+            draw_image_preview(f, &preview_ui, content_band, &item, content_band.height());
             // 缩略图右下角：「放大」按钮，点击进入原图模式。
             draw_zoom_button(f, pal, &item);
         }
         ClipKind::Markdown if md_rendered => {
-            draw_markdown_preview(f, content_band, &item);
+            draw_markdown_preview(f, &preview_ui, content_band, &item);
         }
         ClipKind::Markdown => {
             // md_rendered 关：等宽源码按 band 高度计算可见行数（不截断），
             // 溢出自动换行。`draw_source_preview` 内部已 max_rows 限位，
             // 详情面板空间通常足够放下整段。
-            draw_source_preview(f, content_band, &item);
+            draw_source_preview(f, &preview_ui, content_band, &item);
         }
         _ => {
             // 文本 / HTML / Files / Markdown 关 / Image 关 ⇒ 等宽折行。
@@ -7589,7 +7826,7 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
             // 全文铺开，让用户读到完整内容。`draw_text_preview` 内部按
             // band 宽度折行，溢出自动到下一行（撑出可见区会被外层
             // 滚动框裁剪）。
-            draw_text_preview(f, content_band, &item, false);
+            draw_text_preview(f, &preview_ui, content_band, &item, false);
         }
     }
 
@@ -8339,13 +8576,13 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 
     if preview_band.height() > 4.0 {
         if is_image && image_inline {
-            draw_image_preview(f, preview_band, item, IMG_MAX_H_LIST);
+            draw_image_preview(f, ui, preview_band, item, IMG_MAX_H_LIST);
         } else if is_markdown && md_rendered {
-            draw_markdown_preview(f, preview_band, item);
+            draw_markdown_preview(f, ui, preview_band, item);
         } else if is_markdown {
-            draw_source_preview(f, preview_band, item);
+            draw_source_preview(f, ui, preview_band, item);
         } else {
-            draw_text_preview(f, preview_band, item, selected);
+            draw_text_preview(f, ui, preview_band, item, selected);
         }
     }
 
@@ -8578,7 +8815,22 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
 /// 文本预览（默认形态）：按预览带宽度折行，**完整显示**。
 ///
 /// 选中态把文字提亮一档（与 `sel_fx` 的描边/底色叠加表达选中）。
-fn draw_text_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, selected: bool) {
+/// # CAUTION: 必须用**调用方给的那个 `Ui`**（列表传滚动区的内容 Ui）
+///
+/// 早前这里用的是 `f.ui`（根 Ui），它的裁剪矩形是**整个窗口** ⇒ 列表滚动时
+/// 预览文字会画到列表之外：越过卡片上缘、直接盖在顶栏上（图标被文字压住），
+/// 而卡片底色由滚动区的 `ui.painter_at` 画、被正确裁剪 —— 于是「只剩文字
+/// 浮在顶栏上，没有遮蔽」（2026-10-19 用户反馈）。
+///
+/// `Ui::painter_at` 的裁剪 = 自身矩形 ∩ **本 Ui 的裁剪矩形**，所以只要
+/// 传入滚动区的内容 Ui，越界的行自动被裁掉，与「看得见才画得出」一致。
+fn draw_text_preview(
+    f: &mut Frame<'_>,
+    ui: &egui::Ui,
+    band: Rect,
+    item: &ClipItem,
+    selected: bool,
+) {
     let pal = f.pal;
     // 用 `Painter::layout_job` 按宽度折行，返回**完整** Galley——
     // 这才是「完整显示」：不丢任何字符，只是折行。
@@ -8615,16 +8867,15 @@ fn draw_text_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, selected: b
     job.wrap.max_rows = ((band.height() / (pal.font_md * LINE_H)).floor().max(1.0)) as usize;
     // 长路径/无空格的长串要在任意字符间断行，否则会横向溢出。
     job.wrap.break_anywhere = true;
-    let galley = f.ui.painter().layout_job(job);
-    f.ui
-        .painter_at(band)
+    let galley = ui.painter().layout_job(job);
+    ui.painter_at(band)
         .galley(pos2(band.min.x, band.min.y), galley, pal.text);
 }
 
 /// Markdown 源码预览（`md_rendered` 关闭时）：等宽 + 弱化色。
 ///
 /// 与渲染态明确区分——用户能一眼看出「现在看到的是原始 Markdown」。
-fn draw_source_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
+fn draw_source_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
     let pal = f.pal;
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -8639,9 +8890,8 @@ fn draw_source_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
     job.wrap.max_width = band.width();
     job.wrap.max_rows = ((band.height() / (pal.font_sm * 1.45)).floor().max(1.0)) as usize;
     job.wrap.break_anywhere = true;
-    let galley = f.ui.painter().layout_job(job);
-    f.ui
-        .painter_at(band)
+    let galley = ui.painter().layout_job(job);
+    ui.painter_at(band)
         .galley(pos2(band.min.x, band.min.y), galley, pal.text_dim);
 }
 
@@ -8650,13 +8900,13 @@ fn draw_source_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
 /// 行高由 `row_height_for` 调**同一个** `md::MdDoc` 的 `height()` 算出，
 /// 绘制调 `draw()`——同一函数、同一宽度，测量与绘制不可能漂移。
 /// 选中态不提亮文字（`sel_fx` 覆盖层已足够表达），与原型一致。
-fn draw_markdown_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
+fn draw_markdown_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
     let doc = crate::md::MdDoc::parse(&item.preview);
     if doc.is_empty() {
         return;
     }
     let pal = f.pal;
-    doc.draw(f.ui, pal, f.scale, band.min, band.width());
+    doc.draw(ui, pal, f.scale, band.min, band.width());
 }
 
 /// 图片预览（第三轮新增）：内容区直接显示缩略图。
@@ -8672,7 +8922,7 @@ fn draw_markdown_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem) {
 /// `max_h` 是缩略图显示高的**上限**——列表行传 [`IMG_MAX_H_LIST`] 防止
 /// 单条记录撑爆，详情面板传 `[body.width(), body.height()]` 让图按
 /// 长宽比尽量放大。
-fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32) {
+fn draw_image_preview(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem, max_h: f32) {
     // 纹理先取：解码产物自带尺寸，取不到就说明这张图不该内嵌显示
     // （载荷被淘汰 / 文件已删 / 解码失败）⇒ 降级文本。
     //
@@ -8680,13 +8930,13 @@ fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32
     // `.png`）**没有** `PayloadRef::dims`——载荷里只有路径列表，尺寸
     // 只能靠解码拿到。统一走解码结果，两类条目共用同一条排版路径。
     let Some(tex) = preview_image_tex(f, item) else {
-        draw_text_preview(f, band, item, false);
+        draw_text_preview(f, ui, band, item, false);
         return;
     };
     let Some((w, h)) = preview_image_dims(f, item) else {
         // 没有任何维度信息：按普通文本显示（「图片 WxH」/「图片 N 字节」/
         // 文件名），剪贴板工具的列表不能因为一张坏图就少画一行。
-        draw_text_preview(f, band, item, false);
+        draw_text_preview(f, ui, band, item, false);
         return;
     };
     // 显示矩形：与 [`row_height_for`] 共用 [`image_display_size`]
@@ -8696,12 +8946,12 @@ fn draw_image_preview(f: &mut Frame<'_>, band: Rect, item: &ClipItem, max_h: f32
     // 带子本身更矮时（列表行按内容算出的行高）以带子为准。
     let (disp_w, disp_h) = image_display_size((w, h), band.width(), max_h.min(band.height()));
     if disp_w <= 0.0 || disp_h <= 0.0 {
-        draw_text_preview(f, band, item, false);
+        draw_text_preview(f, ui, band, item, false);
         return;
     }
     let rect = Rect::from_min_size(band.min, vec2(disp_w, disp_h));
 
-    let painter = f.ui.painter_at(rect);
+    let painter = ui.painter_at(rect);
     // uv 给整张图（0..1），tint 白色（不染色——缩略图颜色即原图）。
     painter.image(
         tex,
@@ -11281,10 +11531,16 @@ fn with_pinned(mut self, n: usize) -> Self {
         let drag = h.state.drag_regions.clone();
         assert!(!drag.is_empty(), "应有拖动区");
 
-        // 折叠态：drag[0] 是顶栏左段（窗口左缘 → 搜索图标左缘）。
+        // 折叠态：顶栏左段（窗口左缘 → 搜索图标左缘）。
         // 搜索框折叠成右侧图标后，顶栏左侧几乎整条都是拖动区——
         // 这是「顶部拖动区少」问题的最终形态，宽度必须守住。
-        let seg = drag[0];
+        //
+        // NOTE: 不能取 `drag[0]`——卡片先画，列表的左右留白（8pt 宽）
+        // 先入表；顶栏段是后 push 的。按几何找「贴着窗口顶缘且够高」那段。
+        let seg = *drag
+            .iter()
+            .find(|d| d.min.y <= 1.0 && d.height() >= 40.0)
+            .unwrap_or_else(|| panic!("应有顶栏拖动区，实际 {drag:?}"));
         assert!(
             seg.width() >= 100.0,
             "折叠态顶栏左段拖动区只有 {}pt（应 ≥ 100pt）—— \
@@ -11311,7 +11567,10 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 的几何已不存在）。仍必须存在且能拖。
         h.hover_search_icon();
         let drag2 = h.state.drag_regions.clone();
-        let seg2 = drag2[0];
+        let seg2 = *drag2
+            .iter()
+            .find(|d| d.min.y <= 1.0 && d.height() >= 40.0)
+            .unwrap_or_else(|| panic!("展开态应有顶栏拖动区，实际 {drag2:?}"));
         assert!(
             seg2.width() >= 100.0,
             "展开态顶栏左段拖动区只剩 {}pt（应 ≥ 100pt）—— \
@@ -11367,9 +11626,23 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
 
         // 宽限期耗尽 → 折叠。
+        //
+        // NOTE: 两段宽限是**串联**的，不是并联：
+        // ① 刚展开的免折叠宽限 `SEARCH_OPEN_GRACE`——期间即使指针已离开，
+        //    也只是「先不折叠」，`search_leave_since` 根本没开始记；
+        // ② 宽限过了才起折叠倒计时，再等 `SEARCH_COLLAPSE_DELAY`。
+        // 所以必须两次拨钟 + 两次跑帧：一次跨过①，让计时器起上；
+        // 一次跨过②。只拨一次大数时，①刚过的那一帧才刚把
+        // `leave_since` 置为 now，折叠自然还没发生。
+        h.advance_secs(SEARCH_OPEN_GRACE + 0.05);
+        h.frame();
+        assert!(
+            h.state.search_expanded,
+            "免折叠宽限刚过的那一帧仍在计时窗口内，不该已折叠"
+        );
         h.advance_secs(SEARCH_COLLAPSE_DELAY + 0.05);
         h.frame();
-        assert!(!h.state.search_expanded, "宽限期过后应收起搜索框");
+        assert!(!h.state.search_expanded, "两段宽限期都过后应收起搜索框");
     }
 
     /// 宽限期必须撑过「鼠标从图标走到输入框」这段行程。
@@ -11456,6 +11729,11 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 「被焦点钉住」分支，顺手把在途的 `leave_since` 清了。所以要
         // 先跑一帧让它把计时器重新起上，再等宽限期。
         h.state.search_popup_focus = false;
+        h.frame();
+        // 折叠要跨过**两段串联**的时间：先等刚展开的免折叠宽限
+        // `SEARCH_OPEN_GRACE` 过去（这一帧才起 `leave_since` 计时），
+        // 再等 `SEARCH_COLLAPSE_DELAY`。两次拨钟，各自留 0.05s 余量。
+        h.advance_secs(SEARCH_OPEN_GRACE + 0.05);
         h.frame();
         h.advance_secs(SEARCH_COLLAPSE_DELAY + 0.05);
         h.frame();

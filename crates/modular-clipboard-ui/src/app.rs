@@ -1465,6 +1465,20 @@ fn drive_attach_windows<'a>(
             topmost,
             owner,
         );
+        // 弹窗回报「指针是否在面板上 / 输入框是否持有焦点」。
+        //
+        // IMPORTANT: `Popups::search_hover_focus` 此前**没有任何生产调用方**
+        // ——`search_popup_hover` 只在测试里被写过，运行时恒为 false。
+        // 后果是状态机少了「悬停面板不折叠」这条判据（面板能不能留住
+        // 全靠焦点那条），而且焦点回报只在弹窗真正绘制的那帧才更新
+        // （闸门跳过时是旧值）。这里每帧读一次：`pointer_is_over` 是
+        // 系统查询、`memory().focused()` 是内存读，代价可忽略。
+        if app.paint_state.search_expanded {
+            let edit_id = app.paint_state.search_edit_id.unwrap_or(egui::Id::NULL);
+            let (hover, focus) = popups.search_hover_focus(edit_id);
+            app.paint_state.search_popup_hover = hover;
+            app.paint_state.search_popup_focus = focus;
+        }
         // 隐藏时**必须清**弹窗回报的两项：否则上一次「正在打字」
         // 的 true 会一直留在状态里，主窗口的搜索状态机认为有人持有
         // 焦点，面板再也收不回去。
@@ -1474,7 +1488,10 @@ fn drive_attach_windows<'a>(
         }
         popups.sync_rail(
             app,
-            main_visible && floats.rail.is_some(),
+            // 设置窗口打开时收起类型栏：它是**贴着主窗口**的悬浮装饰，
+            // 而设置窗口就摆在主窗口右侧——类型栏正好压在设置的导航列上
+            // （实机表现：导航里冒出几个悬浮图标按钮，像「按钮错位」）。
+            main_visible && floats.rail.is_some() && !app.paint_state.show_settings,
             floats.rail,
             anchor,
             s,
@@ -1950,19 +1967,30 @@ impl App {
         // 无模式用原 palette。
         let backdrop = self.svc.state.config.ui.window_backdrop;
         let opacity = self.svc.state.config.ui.window_opacity;
+        // 卡片不透明度：磨砂 / 半透明下把行卡片底色也降 alpha，让模糊底图
+        // 透过卡片显示（否则只有行间缝隙能看出磨砂，卡片本身仍是实底）。
+        // 无背景时不生效——不透明底图后面没有东西可透。
+        let card_alpha = (self.svc.state.config.ui.card_opacity.clamp(0.3, 1.0) * 255.0)
+            .round() as u8;
         let is_dark = self.pal.is_dark;
         let backdrop_pal;
         let pal_ref: &theme::Palette = match backdrop {
             modular_clipboard_core::config::WindowBackdrop::Acrylic => {
                 let base = opacity.clamp(0.3, 1.0) * 0.6;
                 let alpha = backdrop_alpha(base, self.backdrop_lum, is_dark);
-                backdrop_pal = self.pal.with_backdrop_alpha(alpha);
+                backdrop_pal = self
+                    .pal
+                    .with_backdrop_alpha(alpha)
+                    .with_card_alpha(card_alpha);
                 &backdrop_pal
             }
             modular_clipboard_core::config::WindowBackdrop::Translucent => {
                 let base = (opacity.clamp(0.3, 1.0) * 0.85).max(0.55);
                 let alpha = backdrop_alpha(base, self.backdrop_lum, is_dark);
-                backdrop_pal = self.pal.with_backdrop_alpha(alpha);
+                backdrop_pal = self
+                    .pal
+                    .with_backdrop_alpha(alpha)
+                    .with_card_alpha(card_alpha);
                 &backdrop_pal
             }
             modular_clipboard_core::config::WindowBackdrop::None => &self.pal,
@@ -2262,6 +2290,12 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 }
                 Op::SetOpacity(opacity) => {
                     self.svc.state.config.ui.window_opacity = opacity.clamp(0.3, 1.0);
+                    self.after_config_change();
+                }
+                Op::SetCardOpacity(opacity) => {
+                    // 卡片透明度只影响绘制（下一帧读配置即生效），
+                    // 钳制与背景不透明度同一区间。
+                    self.svc.state.config.ui.card_opacity = opacity.clamp(0.3, 1.0);
                     self.after_config_change();
                 }
                 Op::SetBlurStrength(level) => {

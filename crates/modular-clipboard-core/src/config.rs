@@ -330,6 +330,16 @@ pub struct UiConfig {
     /// - `Translucent`（半透明）：映射区间更实，直接透出未模糊桌面。
     #[serde(default = "default_window_opacity")]
     pub window_opacity: f32,
+    /// 卡片不透明度（0.3 ~ 1.0，1.0 = 完全不透明）。
+    ///
+    /// 只在背景效果为磨砂 / 半透明时才有意义：此时窗口背景层已经半透明，
+    /// 若条目卡片仍是不透明的实底，磨砂底图只能从行间缝隙透出来——
+    /// 「磨砂」几乎看不见。这个值把行卡片（`surface_raised`）也降 alpha，
+    /// 让模糊底图透过卡片显示，同时保留卡片自身的明暗层次。
+    ///
+    /// 默认 1.0（不改变既有观感）：需要「卡片也透」的用户自己往下调。
+    #[serde(default = "default_card_opacity")]
+    pub card_opacity: f32,
     /// 磨砂强度档位（1 ~ 10，默认 7）。仅在 `window_backdrop == Acrylic`
     /// 时生效。
     ///
@@ -679,6 +689,11 @@ pub enum WindowBackdrop {
 
 /// `window_opacity` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
 fn default_window_opacity() -> f32 {
+    1.0
+}
+
+/// `card_opacity` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
+fn default_card_opacity() -> f32 {
     1.0
 }
 
@@ -1134,6 +1149,7 @@ impl Default for UiConfig {
             pinned_window_pos: None,
             window_backdrop: WindowBackdrop::None,
             window_opacity: 1.0,
+            card_opacity: 1.0,
             window_blur_strength: default_window_blur_strength(),
             card_shadow: CardShadowConfig::default(),
             row_meta: RowMetaConfig::default(),
