@@ -78,9 +78,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetCapture, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_BACK, VK_CONTROL,
-    VK_DELETE, VK_DOWN, VK_END, VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU,
-    VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_102, VK_OEM_2, VK_OEM_3, VK_OEM_4,
-    VK_OEM_5, VK_OEM_6, VK_OEM_8, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+    VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT,
+    VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_1, VK_OEM_102, VK_OEM_2, VK_OEM_3,
+    VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_8, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
     VK_OEM_PLUS, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN,
     VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
@@ -1739,6 +1739,11 @@ pub fn key_from_vk(code: u16) -> Option<Key> {
         c if c == vk(VK_SPACE) => Key::Space,
         c if c == vk(VK_TAB) => Key::Tab,
         c if c == vk(VK_RETURN) => Key::Enter,
+        // IMPORTANT: Escape 必须映射——漏了它，`key_pressed(Key::Escape)`
+        // 在实机上恒为假（2026-10-21 用户反馈「搜索面板按 Esc 关不掉」）。
+        // 单测拦不住这条：测试直接注入 `egui::Event::Key`，绕过了
+        // Win32 → egui 的键位翻译。
+        c if c == vk(VK_ESCAPE) => Key::Escape,
 
         // 左右修饰键必须区分：egui 用它们判断单侧快捷键，
         // 合并会让「只用左 Ctrl」这类配置失效。
@@ -2197,6 +2202,16 @@ mod tests {
         assert_eq!(key_from_vk(vk(VK_RETURN)), Some(Key::Enter));
         assert_eq!(key_from_vk(vk(VK_DELETE)), Some(Key::Delete));
         assert_eq!(key_from_vk(vk(VK_INSERT)), Some(Key::Insert));
+    }
+
+    /// Escape 必须映射到 egui（2026-10-21 实机回归守卫）。
+    ///
+    /// 漏了这条映射时，`key_pressed(Key::Escape)` 在实机上恒为假——
+    /// 搜索面板的 Esc 收起（弹窗与主窗口两条路径都判 Escape）全部失效。
+    /// 单测之前拦不住：测试直接注入 `egui::Event::Key`，绕过本函数。
+    #[test]
+    fn escape_maps_to_egui_escape() {
+        assert_eq!(key_from_vk(vk(VK_ESCAPE)), Some(Key::Escape));
     }
 
     #[test]

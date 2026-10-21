@@ -342,13 +342,71 @@ pub fn icon_center(rect: Rect) -> egui::Pos2 {
     pos2(rect.center().x, rect.center().y)
 }
 
+/// Markdown 徽标的几何参数（**纯函数**：绘制与测试共用一条算式）。
+///
+/// 归一化坐标（0..1，相对传入的边长 `side`）。抽成结构体是为了
+/// 让测试能验证「墨迹在框内、框铺满 rect」而不必真的跑一帧——
+/// 手绘图标没有字体度量可依，几何即规格。
+///
+/// # 2026-10-20 重绘（用户反馈「MD 图标渲染效果差」）
+///
+/// 1. **铺满 rect**：旧版外框只占约 70%×74%，而同屏的字体图标
+///    （[`INK_FIT`] 0.98）几乎铺满 ⇒ Markdown 徽标在列表行与类型栏
+///    里肉眼小一圈。现在外框取 `0.02..0.98`（96% 边长），与字体
+///    图标观感一致；
+/// 2. **笔画收细**：旧版 `stroke = side × 0.10`，16pt 下 1.6px，
+///    M 的三根竖笔挤成一团。现在 0.085（16pt → 1.36px、32pt →
+///    2.72px），小尺寸下更透气，大尺寸下不飘；
+/// 3. **M 与箭头重新配比**：M 占左 55%（x 0.20~0.52），箭头占右
+///    （x 0.66~0.86）；两者**底缘严格对齐**（都在 y 0.78）——旧版
+///    箭头吊在 y 0.32~0.62、M 在 0.32~0.70，底缘差 8%，看着
+///    「箭头短一截」。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MdIconGeom {
+    /// 外框（归一化 `[x0, y0, x1, y1]`）。
+    pub box_rect: [f32; 4],
+    /// M 的折线（左竖 → 谷底 → 右竖）。
+    pub m: [(f32, f32); 5],
+    /// 下箭头的折线（竖线 + V，顶点重复一次以连通两翼）。
+    pub arrow: [(f32, f32); 5],
+    /// 描边宽度相对边长的比例。
+    pub stroke_ratio: f32,
+}
+
+/// 见 [`MdIconGeom`]。
+pub fn md_icon_geom(side: f32) -> MdIconGeom {
+    let _ = side;
+    MdIconGeom {
+        box_rect: [0.02, 0.02, 0.98, 0.98],
+        // x 0.20~0.52（左 55% 给 M），y 0.22~0.78（占框高 56%，
+        // 上下各留约 22%——与字体图标的视觉重心一致）。
+        m: [
+            (0.20, 0.78),
+            (0.20, 0.22),
+            (0.36, 0.50),
+            (0.52, 0.22),
+            (0.52, 0.78),
+        ],
+        // 竖线 x=0.76：y 0.22~0.78（与 M 竖笔同底缘）；V 顶点
+        // (0.76,0.78)，两翼 (0.66,0.66) 与 (0.86,0.66)（V 深 0.12，
+        // 小尺寸下仍可辨）。
+        arrow: [
+            (0.76, 0.22),
+            (0.76, 0.78),
+            (0.66, 0.66),
+            (0.76, 0.78),
+            (0.86, 0.66),
+        ],
+        stroke_ratio: 0.085,
+    }
+}
+
 /// 按内容类型画徽标图标（行内右下角 / 类型过滤栏共用）。
 ///
 /// Markdown 走**几何绘制**：图标字体的 PUA 码位（U+E000..E011）已占满，
 /// 加字形要重新生成 TTF；而「M + 下箭头」用几段线段就能表达清楚，
 /// 与 `paint.rs::draw_topbar_icon` 里那批几何图标同一套路。
-/// 归一化坐标（24  viewBox 同款）：
-///   方框 (0.10,0.08)-(0.90,0.92)；M 三点折线；下箭头 = 竖线 + V。
+/// 几何参数见 [`md_icon_geom`]（纯函数，测试直接断言铺满与包含关系）。
 pub fn paint_kind_icon(
     painter: &egui::Painter,
     kind: modular_clipboard_core::ClipKind,
@@ -364,25 +422,26 @@ pub fn paint_kind_icon(
     if side <= 0.0 || color == Color32::TRANSPARENT {
         return;
     }
-    let w = (side * 0.10).max(1.1);
+    let g = md_icon_geom(side);
+    let w = (side * g.stroke_ratio).max(1.0);
     let stroke = egui::Stroke::new(w, color);
-    let pad = side * 0.06;
-    let inner = side - pad * 2.0;
-    let u = |x: f32, y: f32| pos2(rect.min.x + pad + x * inner, rect.min.y + pad + y * inner);
+    let u = |x: f32, y: f32| pos2(rect.min.x + x * side, rect.min.y + y * side);
+    // 外框：描边朝内（`Inside`），不侵占外圈留白。
+    let [bx0, by0, bx1, by1] = g.box_rect;
     painter.rect_stroke(
-        Rect::from_min_max(u(0.10, 0.08), u(0.90, 0.92)),
+        Rect::from_min_max(u(bx0, by0), u(bx1, by1)),
         w,
         stroke,
         egui::StrokeKind::Inside,
     );
-    // M：左竖 → 谷底 → 右竖
+    // M 与箭头：顶点重复（箭头）让折线连通，epaint 的 miter join
+    // 在尖角处自然收边，不需要额外处理。
     painter.add(egui::Shape::line(
-        vec![u(0.26, 0.70), u(0.26, 0.32), u(0.40, 0.52), u(0.54, 0.32), u(0.54, 0.70)],
+        g.m.iter().map(|&(x, y)| u(x, y)).collect(),
         stroke,
     ));
-    // 下箭头：竖线 + V（「渲染/导出」的隐喻）
     painter.add(egui::Shape::line(
-        vec![u(0.70, 0.32), u(0.70, 0.62), u(0.63, 0.55), u(0.70, 0.62), u(0.77, 0.55)],
+        g.arrow.iter().map(|&(x, y)| u(x, y)).collect(),
         stroke,
     ));
 }
@@ -1058,5 +1117,87 @@ mod tests {
         let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(0.0));
         let verts = icon_vertices(&ctx, Icon::Trash, rect, Color32::WHITE);
         assert!(verts.is_empty(), "零尺寸矩形不应产生顶点");
+    }
+
+    // ---- Markdown 几何徽标（2026-10-20 重绘的守门测试）----
+
+    /// 外框必须**铺满 rect**（与字体图标的 INK_FIT 0.98 同量级）。
+    ///
+    /// 旧版外框只占约 70%×74% ⇒ 同屏的 Markdown 徽标肉眼小一圈。
+    /// 这条守的就是「别再把框缩回去」。
+    #[test]
+    fn md_icon_box_fills_its_rect_like_font_icons() {
+        let g = md_icon_geom(16.0);
+        let [x0, y0, x1, y1] = g.box_rect;
+        let (w, h) = (x1 - x0, y1 - y0);
+        assert!(
+            w >= 0.9 && h >= 0.9,
+            "外框应铺满 rect（≥90% 边长）：实测 {w:.2}×{h:.2}"
+        );
+        assert!(
+            (w - INK_FIT).abs() < 0.05 && (h - INK_FIT).abs() < 0.05,
+            "外框应与 INK_FIT({INK_FIT}) 同量级：实测 {w:.2}×{h:.2}"
+        );
+    }
+
+    /// M 与箭头的每一笔都必须在**外框之内**（含描边宽度）。
+    ///
+    /// 出框的笔画会被 `painter_at` 裁掉（类型栏按钮就是个小矩形），
+    /// 实机表现「M 的竖笔被切头」。
+    #[test]
+    fn md_icon_strokes_stay_inside_box() {
+        let g = md_icon_geom(16.0);
+        let [bx0, by0, bx1, by1] = g.box_rect;
+        // 描边是居中的，半宽会探出路径半个身位。
+        let half = g.stroke_ratio * 0.5;
+        for &(x, y) in g.m.iter().chain(g.arrow.iter()) {
+            assert!(
+                x >= bx0 + half && x <= bx1 - half,
+                "笔画 x={x} 越出外框 [{bx0}, {bx1}]（含半描边 {half}）"
+            );
+            assert!(
+                y >= by0 + half && y <= by1 - half,
+                "笔画 y={y} 越出外框 [{by0}, {by1}]（含半描边 {half}）"
+            );
+        }
+    }
+
+    /// M 与箭头底缘对齐（旧版箭头「吊在半空」的回归守卫）。
+    #[test]
+    fn md_icon_arrow_baseline_matches_m() {
+        let g = md_icon_geom(16.0);
+        let m_bottom = g.m.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+        let arrow_bottom = g.arrow.iter().map(|p| p.1).fold(f32::MIN, f32::max);
+        assert!(
+            (arrow_bottom - m_bottom).abs() < 0.05,
+            "箭头底缘 {arrow_bottom} 应与 M 底缘 {m_bottom} 对齐"
+        );
+        // 两者也不许互相重叠：M 的右缘应显著小于箭头的左翼。
+        let m_right = g.m.iter().map(|p| p.0).fold(f32::MIN, f32::max);
+        let arrow_left = g.arrow.iter().map(|p| p.0).fold(f32::MAX, f32::min);
+        assert!(
+            m_right < arrow_left - 0.05,
+            "M 右缘 {m_right} 应小于箭头左翼 {arrow_left}（左右分区）"
+        );
+    }
+
+    /// 描边比例必须在合理区间：太细小尺寸下消失，太粗糊成一团。
+    #[test]
+    fn md_icon_stroke_ratio_is_sane() {
+        let g = md_icon_geom(16.0);
+        assert!(
+            (0.05..=0.12).contains(&g.stroke_ratio),
+            "描边比例 {:.3} 应在 0.05~0.12：{}",
+            g.stroke_ratio,
+            "16pt 下 = 1.36px"
+        );
+        // 16pt 与 32pt 下的物理粗细都要落在 1.0~3.0px。
+        for side in [16.0_f32, 24.0, 32.0] {
+            let px = side * g.stroke_ratio;
+            assert!(
+                (1.0..=3.0).contains(&px),
+                "边长 {side} 的描边 {px:.2}px 不在 1~3px 区间"
+            );
+        }
     }
 }

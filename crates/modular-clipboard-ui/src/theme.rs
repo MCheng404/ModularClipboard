@@ -328,25 +328,33 @@ macro_rules! palette {
 
 palette! {
     // ---- 背景层 ----
+    //
+    // 2026-10-20 深色基底重调（基础主题，无二级主题时）：
+    // 旧值四层背景（#14161A / #1E2127 / #262A31 / #2E333B）层间只差
+    // 约 8/通道，整窗读成「一片灰」——亮卡片浮不浮出来全靠投影与
+    // 高光兜。现在把**层间梯度拉开**（bg 更深、raised 更亮），同时
+    // 保持冷蓝灰家族一致（R<G<B，与文字/描边同族）：
+    //   bg #121519 < list_bg #0E1014（列表容器再暗一档）
+    //   < surface #1D2128 < surface_variant #262B34 < surface_raised #2F3540
     /// 窗口最底层背景。
-    bg: color = egui::Color32::from_rgb(0x14, 0x16, 0x1A)
+    bg: color = egui::Color32::from_rgb(0x12, 0x15, 0x19)
               => egui::Color32::from_rgb(0xF2, 0xF4, 0xF7),
     /// 面板 / 卡片背景。
     ///
     /// 旧字段 `panel_bg` 是本令牌的别名，保留是为了不破坏调用点。
-    surface: color = egui::Color32::from_rgb(0x1E, 0x21, 0x27)
+    surface: color = egui::Color32::from_rgb(0x1D, 0x21, 0x28)
                 => egui::Color32::from_rgb(0xFA, 0xFB, 0xFC),
     /// 次级面板（嵌套容器）。
-    surface_variant: color = egui::Color32::from_rgb(0x26, 0x2A, 0x31)
+    surface_variant: color = egui::Color32::from_rgb(0x26, 0x2B, 0x34)
                        => egui::Color32::from_rgb(0xEC, 0xEF, 0xF3),
     /// 列表显示区域背景。比窗口底 `bg` **更暗一档**，把亮卡片衬托出来。
     ///
     /// 历史列表的整块可视区铺这一层（`draw_history_body` 开头），
     /// 卡片用 `surface_raised` 浮在它之上——「亮卡片、暗容器」。
-    list_bg: color = egui::Color32::from_rgb(0x10, 0x12, 0x15)
+    list_bg: color = egui::Color32::from_rgb(0x0E, 0x10, 0x14)
               => egui::Color32::from_rgb(0xE8, 0xEB, 0xF0),
     /// 浮层：菜单、气泡、可拖拽模块。
-    surface_raised: color = egui::Color32::from_rgb(0x2E, 0x33, 0x3B)
+    surface_raised: color = egui::Color32::from_rgb(0x2F, 0x35, 0x40)
                     => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
     /// 遮罩。半透明，压在 `bg` 之上。
     overlay_scrim: color = egui::Color32::from_black_alpha(170)
@@ -361,7 +369,11 @@ palette! {
                      => egui::Color32::from_rgb(0x4A, 0x55, 0x62),
     /// 弱分隔线。**不要求** 3:1：它不承载控件边界信息，
     /// 强求高对比会让面板之间全是硬边，视觉噪声大于收益。
-    border_subtle: color = egui::Color32::from_rgb(0x2A, 0x2F, 0x36)
+    ///
+    /// 2026-10-20 随基底重调微亮一档（#2A2F36 → #2A2F38）：新 bg
+    /// 更深之后旧值几乎看不见，分隔线要在「不抢戏」与「还看得见」
+    /// 之间重新找平衡。
+    border_subtle: color = egui::Color32::from_rgb(0x2A, 0x2F, 0x38)
                      => egui::Color32::from_rgb(0xDD, 0xE2, 0xE8),
     /// 卡片投影基色（列表卡片阴影，见 `draw_card_shadow`）。
     ///
@@ -370,7 +382,7 @@ palette! {
     /// 时按此 alpha 出图，滑块再线性缩放（默认 0.20 ≈ 1.25×）。
     ///
     /// 深色模式（1.00）比浅色（0.50）浓一倍：列表底 `list_bg`
-    /// 深色为 `#101215`、近黑，黑投影叠上去几乎没有明度差，
+    /// 深色为 `#0E1014`、近黑，黑投影叠上去几乎没有明度差，
     /// 这是物理必然，不是参数问题——Material 的深色 elevation
     /// 阴影同样靠提高 alpha 解决。2026-10-15 预览页验收后从
     /// 204/102 提到 255/128，深色主题阴影从此清晰可见。
@@ -394,7 +406,11 @@ palette! {
     text: color = egui::Color32::from_rgb(0xE3, 0xE6, 0xE8)
            => egui::Color32::from_rgb(0x24, 0x29, 0x2E),
     /// 次要文字。
-    text_dim: color = egui::Color32::from_rgb(0xC2, 0xC2, 0xC2)
+    ///
+    /// 2026-10-20 去掉纯中性灰：旧值 #C2C2C2 在冷蓝灰基底上略发
+    /// 「脏」，微调进家族色相（#BCC2CB）后与 bg/surface/描边同族，
+    /// 长段落读起来不再忽明忽暗。亮度基本不变，对比度守门不受影响。
+    text_dim: color = egui::Color32::from_rgb(0xBC, 0xC2, 0xCB)
                => egui::Color32::from_rgb(0x54, 0x54, 0x54),
     /// 强调文字：数值、标题。
     text_bright: color = egui::Color32::from_rgb(0xFC, 0xFC, 0xFC)

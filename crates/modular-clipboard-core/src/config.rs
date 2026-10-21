@@ -366,6 +366,17 @@ pub struct UiConfig {
     /// 与早期版本行为一致。
     #[serde(default = "default_true")]
     pub image_inline: bool,
+    /// 通知（操作反馈）以**独立弹窗**显示（默认关 = 窗口内 toast）。
+    ///
+    /// 同一则通知的两种呈现：
+    /// - `false`：画在主窗口内部顶部（toast），随窗口移动、被窗口
+    ///   裁剪——窗口很窄时文字空间受限；
+    /// - `true`：弹出一块独立小面板（与搜索面板同套弹窗机制），
+    ///   不占窗口内的列表空间，窄窗口下也能完整换行显示。
+    ///
+    /// 默认 `false`：既有观感不变，要弹窗的用户自己开。
+    #[serde(default = "default_notice_popup")]
+    pub notice_popup: bool,
     /// Markdown 条目按 Markdown 渲染（标题 / 列表 / 代码块等，默认开）。
     ///
     /// 关闭后按等宽纯文本显示源码。
@@ -378,6 +389,12 @@ pub struct UiConfig {
     /// 与 [`CardShadowConfig`] / [`RowMetaConfig`] 同一惯例。
     #[serde(default)]
     pub type_rail: TypeRailConfig,
+    /// 悬浮搜索面板（主窗口上/下方的搜索输入面板）。
+    ///
+    /// 与 [`TypeRailConfig`] 同款收拢：停靠位置与高度是一张轻量卡，
+    /// 关掉「显示」由 `search_expanded` 状态机决定，不设总开关。
+    #[serde(default)]
+    pub search_panel: SearchPanelConfig,
     /// 双击链接型条目时调用的浏览器路径。
     ///
     /// 空 = 系统默认浏览器（`ShellExecuteW` 的 `open` 动词）。
@@ -425,6 +442,19 @@ pub struct TypeRailConfig {
     /// 是否始终显示全部类型（默认关 = 仅有该类型记录时才出现）。
     #[serde(default)]
     pub always: bool,
+    /// 多选组合过滤（默认关 = 单选：再点一次取消）。
+    ///
+    /// 开启后类型栏按钮变成开关：可同时选中多个类型，列表显示
+    /// 任一所选类型的条目；取消过滤需点「全部」或逐个再点一次。
+    #[serde(default)]
+    pub multi: bool,
+    /// 按钮上显示类型名称文字（默认关 = 仅图标）。
+    ///
+    /// 图标对不熟悉的用户偏抽象（尤其 Markdown 的自绘徽标），
+    /// 文字标签把「点什么过滤什么」写明白；竖直停靠时文字在图标
+    /// 下方，水平停靠时在右侧。
+    #[serde(default)]
+    pub labels: bool,
     /// 停靠的主窗口边缘（默认右）。
     #[serde(default)]
     pub pos: TypeRailPos,
@@ -438,6 +468,8 @@ impl Default for TypeRailConfig {
         Self {
             visible: true,
             always: false,
+            multi: false,
+            labels: false,
             pos: TypeRailPos::Right,
             size: default_type_rail_size(),
         }
@@ -447,6 +479,75 @@ impl Default for TypeRailConfig {
 /// `image_inline` / `md_rendered` / [`TypeRailConfig::visible`] 的 serde 缺省值。
 fn default_true() -> bool {
     true
+}
+
+/// `notice_popup` 的 serde 缺省值（窗口内 toast，既有观感）。
+fn default_notice_popup() -> bool {
+    false
+}
+
+/// 悬浮搜索面板配置（第三轮原型移植项）。
+///
+/// 面板本体是一条搜索输入框（ historically 固定 30pt 高、贴在
+/// 主窗口上方通栏）。两个参数都收拢进来：停靠位置决定它从哪一侧
+/// 滑入，高度决定面板与输入框的呼吸空间。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SearchPanelConfig {
+    /// 停靠位置：主窗口上方（默认）/ 下方。
+    #[serde(default)]
+    pub pos: SearchPanelPos,
+    /// 面板高度（逻辑点，钳制 [`SEARCH_PANEL_H_MIN`]~[`SEARCH_PANEL_H_MAX`]）。
+    #[serde(default = "default_search_panel_height")]
+    pub height: f32,
+}
+
+impl Default for SearchPanelConfig {
+    fn default() -> Self {
+        Self {
+            pos: SearchPanelPos::Top,
+            height: default_search_panel_height(),
+        }
+    }
+}
+
+/// `search_panel_height` 的 serde 缺省值（与历史固定高度一致）。
+fn default_search_panel_height() -> f32 {
+    30.0
+}
+
+/// 搜索面板高度的合法区间（逻辑点）。与设置侧滑块范围一致。
+pub const SEARCH_PANEL_H_MIN: f32 = 30.0;
+/// 见 [`SEARCH_PANEL_H_MIN`]。
+pub const SEARCH_PANEL_H_MAX: f32 = 56.0;
+
+/// 把任意来源的高度值收敛到合法区间（非有限值回落 30.0）。
+pub fn clamp_search_panel_height(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(SEARCH_PANEL_H_MIN, SEARCH_PANEL_H_MAX)
+    } else {
+        default_search_panel_height()
+    }
+}
+
+/// 搜索面板停靠位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchPanelPos {
+    /// 主窗口上方（默认）。
+    #[default]
+    Top,
+    /// 主窗口下方。
+    Bottom,
+}
+
+impl SearchPanelPos {
+    /// 设置界面展示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchPanelPos::Top => "窗口上方",
+            SearchPanelPos::Bottom => "窗口下方",
+        }
+    }
 }
 
 /// `type_rail_size` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
@@ -1154,8 +1255,10 @@ impl Default for UiConfig {
             card_shadow: CardShadowConfig::default(),
             row_meta: RowMetaConfig::default(),
             image_inline: true,
+            notice_popup: false,
             md_rendered: true,
             type_rail: TypeRailConfig::default(),
+            search_panel: SearchPanelConfig::default(),
             browser_path: String::new(),
             explorer_path: String::new(),
             accent: None,
@@ -1988,6 +2091,8 @@ mod tests {
             type_rail: TypeRailConfig {
                 visible: false,
                 always: true,
+                multi: true,
+                labels: true,
                 pos: TypeRailPos::Top,
                 size: 44.0,
             },
@@ -2010,6 +2115,57 @@ mod tests {
         assert_eq!(clamp_type_rail_size(f32::NAN), 32.0);
         assert_eq!(clamp_type_rail_size(f32::INFINITY), 32.0);
         assert_eq!(clamp_type_rail_size(f32::NEG_INFINITY), 32.0);
+    }
+
+    /// 搜索面板高度钳制：同 type_rail 的纪律（手改配置是常态）。
+    #[test]
+    fn search_panel_height_clamps() {
+        assert_eq!(clamp_search_panel_height(30.0), 30.0);
+        assert_eq!(clamp_search_panel_height(10.0), SEARCH_PANEL_H_MIN);
+        assert_eq!(clamp_search_panel_height(999.0), SEARCH_PANEL_H_MAX);
+        assert_eq!(clamp_search_panel_height(f32::NAN), 30.0);
+        assert_eq!(clamp_search_panel_height(f32::INFINITY), 30.0);
+    }
+
+    /// 本轮新增字段的缺省值：旧 config.json 升级后观感不能变。
+    #[test]
+    fn notice_popup_and_search_panel_defaults() {
+        let d = UiConfig::default();
+        assert!(!d.notice_popup, "通知默认走窗口内 toast（既有观感）");
+        assert_eq!(d.search_panel, SearchPanelConfig::default());
+        assert_eq!(d.search_panel.pos, SearchPanelPos::Top);
+        assert_eq!(d.search_panel.height, 30.0, "与历史固定高度一致");
+        assert!(!d.type_rail.multi, "类型栏默认单选");
+        assert!(!d.type_rail.labels, "类型按钮默认仅图标");
+        // 整体键缺失时补默认（结构体级 serde(default)）。
+        let legacy: UiConfig = serde_json::from_str(r#"{"window_width":720.0}"#).unwrap();
+        assert!(!legacy.notice_popup);
+        assert_eq!(legacy.search_panel, SearchPanelConfig::default());
+        let legacy2: UiConfig = serde_json::from_str(r#"{"search_panel":{}}"#).unwrap();
+        assert_eq!(legacy2.search_panel, SearchPanelConfig::default());
+    }
+
+    /// 本轮新增字段无损往返（含枚举小写编码）。
+    #[test]
+    fn notice_and_search_panel_roundtrip() {
+        let custom = UiConfig {
+            notice_popup: true,
+            search_panel: SearchPanelConfig {
+                pos: SearchPanelPos::Bottom,
+                height: 44.0,
+            },
+            type_rail: TypeRailConfig {
+                multi: true,
+                labels: true,
+                ..TypeRailConfig::default()
+            },
+            ..UiConfig::default()
+        };
+        let text = serde_json::to_string(&custom).unwrap();
+        let back: UiConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(custom, back);
+        assert!(text.contains("\"pos\":\"bottom\""));
+        assert!(text.contains("\"notice_popup\":true"));
     }
 
     /// 位置解析：合法值逐一命中，无法识别回落右侧（cosmetic 设置

@@ -108,10 +108,16 @@ fn client_size_px(panel_size: egui::Vec2, scale: f32) -> (u32, u32) {
 /// 弹窗身份。既是内容分派的键，也是热区命名空间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PopupKind {
-    /// 悬浮搜索面板（主窗口上方，可激活）。
+    /// 悬浮搜索面板（主窗口上方/下方，可激活）。
     Search,
     /// 类型过滤栏（主窗口某一侧，不抢焦点）。
     Rail,
+    /// 通知弹窗（主窗口上方，不抢焦点；`ui.notice_popup` 开启时使用）。
+    ///
+    /// 与窗内 toast 是同一则通知的两种呈现（见
+    /// `paint::draw_notice_toast` 的说明）。尺寸随文字长度每帧变化
+    /// （`Popup::resize_to` 已支持动态尺寸）。
+    Notice,
 }
 
 impl PopupKind {
@@ -120,13 +126,14 @@ impl PopupKind {
         match self {
             PopupKind::Search => "ModularClipboard 搜索",
             PopupKind::Rail => "ModularClipboard 类型栏",
+            PopupKind::Notice => "ModularClipboard 通知",
         }
     }
 
     /// 是否允许点击时抢占键盘焦点。
     ///
-    /// 搜索面板要接收键盘（用户要打字）⇒ 可激活；类型栏只有按钮 ⇒
-    /// 用 `WS_EX_NOACTIVATE`，点它时前台程序不被抢走。
+    /// 搜索面板要接收键盘（用户要打字）⇒ 可激活；类型栏与通知都只有
+    /// 展示 ⇒ 用 `WS_EX_NOACTIVATE`，点它们时前台程序不被抢走。
     fn activatable(self) -> bool {
         matches!(self, PopupKind::Search)
     }
@@ -573,6 +580,7 @@ impl Drop for Popup<'_> {
 pub struct Popups<'a> {
     search: Option<Popup<'a>>,
     rail: Option<Popup<'a>>,
+    notice: Option<Popup<'a>>,
 }
 
 impl<'a> Popups<'a> {
@@ -693,6 +701,39 @@ impl<'a> Popups<'a> {
             Some(p) => (p.pointer_over(), p.input_focused(edit_id)),
             None => (false, false),
         }
+    }
+
+    /// 同步通知弹窗（`ui.notice_popup` 开启时的通知呈现）。
+    ///
+    /// 与另两个弹窗共用 `sync_one`：懒创建、隐藏保留、尺寸随布局。
+    /// `panel_rect` 来自 `UiState::notice_panel`（每帧由主窗口绘制层
+    /// 按文字长度算好，见 `paint::notice_panel_rect`）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn sync_notice(
+        &mut self,
+        app: &mut crate::app::App,
+        want_open: bool,
+        panel_rect: Option<egui::Rect>,
+        anchor_screen: egui::Vec2,
+        scale_factor: f32,
+        shared: &SharedGfx<'a>,
+        topmost: bool,
+        owner: Option<windows::Win32::Foundation::HWND>,
+    ) {
+        Self::sync_one(
+            &mut self.notice,
+            app,
+            PopupKind::Notice,
+            want_open,
+            panel_rect,
+            anchor_screen,
+            scale_factor,
+            shared,
+            topmost,
+            owner,
+            // 首帧兜底尺寸（拿到真实布局前的一帧）。
+            egui::vec2(200.0, 40.0),
+        );
     }
 }
 

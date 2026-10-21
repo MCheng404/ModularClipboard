@@ -1444,6 +1444,8 @@ fn drive_attach_windows<'a>(
             &app.svc.state.items,
             app.paint_state.search_expanded,
             area,
+            // 类型栏带文字标签时的实测尺寸（见 UiState::rail_panel_size）。
+            app.paint_state.rail_panel_size,
         );
         let anchor = window.screen_position_points();
         let s = window.scale_factor();
@@ -1476,6 +1478,19 @@ fn drive_attach_windows<'a>(
         if app.paint_state.search_expanded {
             let edit_id = app.paint_state.search_edit_id.unwrap_or(egui::Id::NULL);
             let (hover, focus) = popups.search_hover_focus(edit_id);
+            // 反馈翻转必须唤醒主窗口。
+            //
+            // IMPORTANT: 折叠判据（悬停面板 / 折叠倒计时）活在主窗口的
+            // `draw()`（状态机）里，而指针在弹窗与桌面之间移动时主窗口
+            // **收不到任何事件** ⇒ 渲染闸门（skip_render）把状态机冻结
+            // 在旧值上——「指针已经离开面板了但面板不收」（2026-10-21
+            // 用户反馈「无法自动关闭」的根因之一）。翻转时对主 ctx
+            // 请求一帧，让状态机有机会走一拍。
+            if hover != app.paint_state.search_popup_hover
+                || focus != app.paint_state.search_popup_focus
+            {
+                app.ctx.request_repaint();
+            }
             app.paint_state.search_popup_hover = hover;
             app.paint_state.search_popup_focus = focus;
         }
@@ -1493,6 +1508,37 @@ fn drive_attach_windows<'a>(
             // （实机表现：导航里冒出几个悬浮图标按钮，像「按钮错位」）。
             main_visible && floats.rail.is_some() && !app.paint_state.show_settings,
             floats.rail,
+            anchor,
+            s,
+            shared,
+            topmost,
+            owner,
+        );
+        // ---- 通知弹窗（`ui.notice_popup` 开启时的通知呈现）----
+        //
+        // 生命周期判据与另两个弹窗不同：它跟着**通知本身**存活
+        // （NOTICE_TTL），不是用户状态。因此：
+        // 1. 过期消费放在这里（每帧必到的路径）——弹窗模式下没人画
+        //    窗内 toast，`draw_notice_toast` 不再负责清 `notice`；
+        // 2. 主窗口隐藏时一起收（通知是主窗口操作的反馈，主窗不在
+        //    就没有「刚操作完」的语境）。
+        if app.svc.state.config.ui.notice_popup
+            && app
+                .svc
+                .state
+                .notice
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= crate::paint::NOTICE_TTL)
+        {
+            app.svc.state.notice = None;
+        }
+        let want_notice = main_visible
+            && app.svc.state.config.ui.notice_popup
+            && app.svc.state.notice.is_some();
+        popups.sync_notice(
+            app,
+            want_notice,
+            app.paint_state.notice_panel,
             anchor,
             s,
             shared,
@@ -2324,6 +2370,13 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     self.svc.state.config.ui.type_rail = m;
                     self.after_config_change();
                 }
+                Op::SetSearchPanel(m) => {
+                    // 搜索面板：停靠位置与高度只影响 FloatLayout 几何，
+                    // 下一帧即生效（弹窗 resize_to 会跟着改窗口尺寸）；
+                    // 高度在几何侧钳制，这里原样存。
+                    self.svc.state.config.ui.search_panel = m;
+                    self.after_config_change();
+                }
                 Op::SetThemeMode(mode) => {
                     // 主题必须**运行时立即生效**：记录选择 + 重灌调色板。
                     //
@@ -2489,8 +2542,14 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     }
                 }
                 Op::Copy(id) => {
-                    if let Err(e) = self.svc.copy_item(id) {
-                        self.svc.notify(format!("复制失败: {e}"));
+                    // 成功也要反馈：旧实现只在失败时 notify，用户点「复制」
+                    // 成功时界面**毫无变化」——剪贴板管理器最核心的动作
+                    // 反而最没有确认感（2026-10-20 用户反馈「复制没反应」，
+                    // 排查后发现是成功路径无反馈）。提示走 toast/弹窗通道
+                    // （`ui.notice_popup` 决定呈现），3 秒自消。
+                    match self.svc.copy_item(id) {
+                        Ok(()) => self.svc.notify("已复制".into()),
+                        Err(e) => self.svc.notify(format!("复制失败: {e}")),
                     }
                 }
                 Op::SetPinnedMode(mode) => {
@@ -2589,11 +2648,23 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         self.svc.notify(format!("打开资源管理器失败: {e}"));
                     }
                 }
-                Op::SetTypeFilter(kind) => {
+                Op::SetTypeFilterKind { kind, multi } => {
                     // 类型过滤是界面本地状态：只改 paint_state，列表由
-                    // 绘制层按它筛行。变化时清选中（见 loop 后的统一规则）。
-                    if self.paint_state.type_filter != kind {
-                        self.paint_state.type_filter = kind;
+                    // 绘制层按它筛行。切换规则（单选替换 / 多选增删 /
+                    // 两种模式互斥）收在 UiState::toggle_type_filter。
+                    let before = (
+                        self.paint_state.type_filter,
+                        self.paint_state.type_filter_multi.clone(),
+                    );
+                    self.paint_state.toggle_type_filter(kind, multi);
+                    let after = (
+                        self.paint_state.type_filter,
+                        self.paint_state.type_filter_multi.clone(),
+                    );
+                    // 真的变了才清选中（与「任意操作取消选中」同一语义：
+                    // 过滤让「哪一行被选中」失去意义）。多选模式下点一个
+                    // 已选项 = 取消它，也算变化。
+                    if before != after {
                         self.svc.state.selected = None;
                     }
                 }
@@ -2668,7 +2739,16 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
             let slide = (1.0 - k) * 6.0;
             let dir = match kind {
                 // 搜索面板贴在窗口**上方**：从更上方落下。
-                crate::popup::PopupKind::Search => egui::vec2(0.0, -slide),
+                // 停靠下方时从更下方升起（`search_panel.pos`）。
+                crate::popup::PopupKind::Search => {
+                    if self.svc.state.config.ui.search_panel.pos
+                        == modular_clipboard_core::config::SearchPanelPos::Top
+                    {
+                        egui::vec2(0.0, -slide)
+                    } else {
+                        egui::vec2(0.0, slide)
+                    }
+                }
                 // 类型栏按停靠边：从那一侧的外沿滑入。
                 crate::popup::PopupKind::Rail => match self.svc.state.config.ui.type_rail.pos {
                     TypeRailPos::Right => egui::vec2(slide, 0.0),
@@ -2676,6 +2756,8 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     TypeRailPos::Top => egui::vec2(0.0, -slide),
                     TypeRailPos::Bottom => egui::vec2(0.0, slide),
                 },
+                // 通知弹窗固定在窗口上方：与 toast 同向（上方落下）。
+                crate::popup::PopupKind::Notice => egui::vec2(0.0, -slide),
             };
             panel = panel.translate(dir);
         }
@@ -2723,6 +2805,11 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
             }
             crate::popup::PopupKind::Rail => {
                 crate::paint::draw_type_rail(&mut frame, panel, &rail_kinds);
+            }
+            crate::popup::PopupKind::Notice => {
+                // 通知弹窗：与窗内 toast 同一则通知、同一套节奏常量
+                // （见 `paint::draw_notice_panel`）。
+                crate::paint::draw_notice_panel(&mut frame, panel);
             }
         }
         // 弹窗里的操作（点类型栏按钮、清搜索、Esc）也要落地。
@@ -3066,6 +3153,8 @@ fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate::paint::Con
         // ---- 第三轮新增（图片直显 / Markdown 渲染） ----
         (G::Ui, "image_inline") => cfg.ui.image_inline = v,
         (G::Ui, "md_rendered") => cfg.ui.md_rendered = v,
+        // 通知呈现：弹窗（true）/ 窗口内 toast（false）。
+        (G::Ui, "notice_popup") => cfg.ui.notice_popup = v,
         // NOTE: type_rail 的参数走 `Op::SetTypeRail` 整包落地，
         // 没有按字段名的写入方。
     (G::Ui, "autostart") => cfg.ui.autostart = v,
