@@ -665,6 +665,9 @@ fn sanitize_scissor(mut r: vk::Rect2D, extent: vk::Extent2D) -> vk::Rect2D {
 
 #[cfg(test)]
 mod tests {
+    // NOTE: `is_null()` 来自 `ash::vk::Handle` trait——lib 目标不需要
+    // （方法调用全在 renderer 子模块），只有测试用，导入放 tests 内。
+    use ash::vk::Handle;
 
     // ---- scissor 纵深防御 ----
 

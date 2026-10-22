@@ -16,27 +16,30 @@ import re
 import sys
 
 SPEC = {
-    "path": "crates/modular-clipboard-gfx/src/frame.rs",
-    "subdir": "crates/modular-clipboard-gfx/src/frame",
+    "path": "crates/modular-clipboard-gfx/src/window.rs",
+    "subdir": "crates/modular-clipboard-gfx/src/window",
     "vis_mode": "keep",
     "mod_vis": "pub",
     "anchors": {
-        "renderer": "// FrameRenderer",
+        "event_loop": "pub struct EventLoop {",
+        "keys": "const LETTERS",
     },
-    "root_after_anchor": "fn create_command_pool",
-    "root_extra_items": [
-        "StagingArena", "StagingSlice", "ArenaPlan",
-        "DEFAULT_STAGING_CAPACITY", "MIN_STAGING_CAPACITY",
-    ],
-    "force_imports": {
-        "renderer": ["use ash::vk::Handle;"],
+    "root_after_anchor": None,
+    "pub_super_fields": {
+        "event_loop": ["EventLoop"],
+        "keys": ["CharDecoder"],
+    },
+    "extra_promote_methods": {
+        "event_loop": ["absorb"],
     },
     "tests_anchor": "mod tests {",
     "docs": {
-        "renderer": "//! `FrameRenderer`：交换链 + 在飞帧槽位 + 录制/呈现。\n"
-                    "//!\n"
-                    "//! 本文件只放 FrameRenderer 本体（含 `FrameSlot` / `Pending` /\n"
-                    "//! `Drop`）；类型定义、纯函数与辅助在根。",
+        "event_loop": "//! `EventLoop`：Win32 消息泵与事件缓冲。\n"
+                      "//!\n"
+                      "//! `poll` 写缓冲、`egui_input` 读缓冲——顺序反了本帧输入全丢\n"
+                      "//! （event_delivery 测试守这条接线）。",
+        "keys": "//! 键位翻译纯逻辑：VK -> egui::Key、修饰键、滚轮、鼠标键、\n"
+                "//! UTF-16 代理对解码。全部是无副作用函数，单测直接覆盖。",
     },
     "asserts": [],
 }
@@ -69,8 +72,11 @@ os.makedirs(SPEC["subdir"], exist_ok=True)
 
 names = list(SPEC["anchors"].keys())
 starts = [find_anchor(SPEC["anchors"][n]) for n in names]
-root_after = find_anchor(SPEC["root_after_anchor"])
 tests_at = find_anchor(SPEC["tests_anchor"])
+if SPEC.get("root_after_anchor"):
+    root_after = find_anchor(SPEC["root_after_anchor"])
+else:
+    root_after = tests_at
 
 moved = {}
 for i, name in enumerate(names):
@@ -101,9 +107,13 @@ def parse_imports(body_lines):
             base, group = m.group(1), m.group(2)
             for part in group.split(","):
                 part = part.strip()
-                if part:
-                    out.append((part.split(" as ")[0].strip(),
-                                "use %s::%s;" % (base, part)))
+                if not part:
+                    continue
+                if " as " in part:
+                    orig, alias = part.split(" as ")
+                    out.append((alias.strip(), "use %s::%s as %s;" % (base, orig.strip(), alias.strip())))
+                else:
+                    out.append((part, "use %s::%s;" % (base, part)))
         else:
             m2 = re.match(r"^use\s+([\w:]+);\s*$", stmt, re.S)
             if m2:
@@ -155,8 +165,10 @@ KEEP_PUB = set()
 def transform(name, body, needs_vis):
     promote_items = {it for kind, it in needs_vis.get(name, ()) if kind == "item"}
     promote_methods = {it for kind, it in needs_vis.get(name, ()) if kind == "method"}
+    promote_structs = set(SPEC.get("pub_super_fields", {}).get(name, []))
     out = []
     in_trait_impl = False
+    in_promo_struct = None
     for ln in body:
         # trait impl（impl X for Y）内的方法不许带可见性限定
         if re.match(r"^impl\b.*\bfor\b", ln):
@@ -165,6 +177,16 @@ def transform(name, body, needs_vis):
             in_trait_impl = False
         elif ln.startswith("}") and in_trait_impl:
             in_trait_impl = False
+        if in_promo_struct is not None:
+            if ln.startswith("}"):
+                in_promo_struct = None
+            elif re.match(r"^    (?:pub(?:\(super\))?\s+)?[A-Za-z_][A-Za-z0-9_]*\s*:", ln) \
+                    and not ln.lstrip().startswith("pub"):
+                out.append("    pub(super) " + ln[4:])
+                continue
+        mstruct = re.match(r"^(?:pub(?:\(super\))?\s+)?struct ([A-Za-z_][A-Za-z0-9_]*)", ln)
+        if mstruct and mstruct.group(1) in promote_structs:
+            in_promo_struct = mstruct.group(1)
         if SPEC.get("vis_mode") == "keep":
             m = ITEM_DEF.match(ln)
             if m and not m.group(1) and m.group(3) in promote_items:
@@ -212,6 +234,14 @@ for name in names:
         owner = type_owner.get(ty)
         if owner and owner != name:
             needs_vis[owner].add(("method", meth))
+# root 的 tests 也按同样规则提权（测试是 root 的后代，pub(super) 可见）
+tests_text = code_text(lines[tests_at:])
+for other in names:
+    for it in sorted(module_items[other]):
+        if it not in module_pubs[other] and uses(tests_text, it):
+            needs_vis[other].add(("item", it))
+    for meth in SPEC.get("extra_promote_methods", {}).get(other, []):
+        needs_vis[other].add(("method", meth))
 
 written = []
 reexports = []
