@@ -351,6 +351,13 @@ fn run_mode(
     // 标记临时覆盖（见 `App::new` 的说明）：远端模式下 `set_capture_override`
     // 只是界面侧的标记，真正落盘由常驻进程决定。
     svc.set_capture_override(capture_is_override);
+        // 界面语言：配置显式指定用配置，否则跟随系统（详见
+        // `core::i18n::resolve`）。要在**画任何东西之前**解析完——
+        // 首帧的全部文案都按这个语言取。
+        modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::resolve(
+            &config.ui.language,
+            modular_clipboard_core::i18n::from_system_langid(crate::presence::system_langid()),
+        ));
     let mut app = App::from_service(config, svc);
     let ctx = app.ctx.clone();
 
@@ -1923,13 +1930,6 @@ impl App {
 
     /// 用**已有的**服务实例构造界面（两种模式共用）。
     pub fn from_service(config: modular_clipboard_core::Config, mut svc: Service) -> Self {
-        // 界面语言：配置显式指定用配置，否则跟随系统（详见
-        // `core::i18n::resolve`）。要在**画任何东西之前**解析完——
-        // 首帧的全部文案都按这个语言取。
-        modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::resolve(
-            &config.ui.language,
-            modular_clipboard_core::i18n::from_system_langid(crate::presence::system_langid()),
-        ));
         let ctx = egui::Context::default();
         // 自启动的真相在**注册表**里，配置只是缓存。
         //
