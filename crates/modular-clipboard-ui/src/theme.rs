@@ -1083,7 +1083,7 @@ fn read_apps_use_light_theme() -> Option<bool> {
 ///
 /// 滚动条热区宽度（逻辑点）。
 ///
-/// 必须与 `paint.rs` 的 `SCROLLBAR_RESERVE` 一致 —— 两处各写一份的话，
+/// 必须与 `paint::list` 的 `SCROLLBAR_RESERVE` 一致 —— 两处各写一份的话，
 /// 改一处忘另一处就会让「已避开滚动条」的位置失准。
 pub const SCROLLBAR_WIDTH: f32 = 10.0;
 
@@ -1204,7 +1204,7 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
     // 而这必须是**全局**设置 —— 逐个 ScrollArea 设会漏。
     style.spacing.scroll = egui::style::ScrollStyle {
         // floating：滚动条浮在内容之上、**不占布局宽度**。
-        // `SCROLLBAR_RESERVE`(10) 与行内按钮的让位都按这个假设算。
+        // `paint::list::SCROLLBAR_RESERVE`(10) 与行内按钮的让位都按这个假设算。
         floating: true,
         // IMPORTANT: 这里**必须**是 10 —— 它是热区宽度，不是视觉宽度。
         // 改小会让「已避开滚动条」的位置仍落在滚动条下面，症状是

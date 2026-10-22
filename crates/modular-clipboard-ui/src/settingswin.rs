@@ -233,7 +233,7 @@ impl<'a> SettingsWindow<'a> {
         let (cw, ch) = self.window.inner_size_points();
         let title_h = 44.0f32;
         let close_zone_w = 40.0f32;
-        // 左挖到搜索列右缘：与 `paint::draw_settings` 的布局常量一致。
+        // 左挖到搜索列右缘：与 `paint::settings_win::draw_settings` 的布局常量一致。
         let drag_left = crate::paint::SETTINGS_NAV_W + crate::paint::SETTINGS_MARGIN;
         if cw > drag_left + close_zone_w && ch > 0.0 {
             self.window.set_drag_region(Some(egui::Rect::from_min_max(

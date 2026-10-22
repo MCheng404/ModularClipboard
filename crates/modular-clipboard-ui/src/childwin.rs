@@ -434,7 +434,7 @@ impl<'a> ChildWindow<'a> {
         // 主窗口（paint.rs 的 draw 入口）与设置窗口每帧都调
         // `theme::apply` 把 Palette 灌进 egui::Visuals，子窗口却用
         // egui 默认 visuals——后果是滚动条样式/tooltip 观感与主窗口
-        // 断裂，且 paint.rs 的 `SCROLLBAR_RESERVE` 假设的是主题改过
+        // 断裂，且 paint::list 的 `SCROLLBAR_RESERVE` 假设的是主题改过
         // 的 floating 滚动条宽度，默认样式下内容会被滚动条遮挡。
         crate::theme::apply(&self.ctx, app.palette());
         // 绘制委托给 `App::draw_child_frame`：它把私有字段的访问

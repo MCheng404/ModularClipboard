@@ -55,8 +55,8 @@ use crate::multiwindow::{SharedGfx, WindowGfx};
 /// # 由投影参数反推，别随手改小
 ///
 /// 必须 ≥「投影最外层可见外扩 + 垂直偏移」：
-/// `crate::paint::POPUP_SHADOW_BLUR`（10，σ=5）的最大可见 grow 是 11，
-/// 加 `POPUP_SHADOW_OFFSET_Y`（2）= 13，取 14 留 1pt 余量。
+/// `crate::paint::topbar::POPUP_SHADOW_BLUR`（10，σ=5）的最大可见 grow 是 11，
+/// 加 `crate::paint::topbar::POPUP_SHADOW_OFFSET_Y`（2）= 13，取 14 留 1pt 余量。
 ///
 /// 小于这个值 ⇒ 外层的层被**窗口边界硬切**，窗口最外圈像素留下一条
 /// 等浓度的黑框——实机就是「弹窗有一圈黑色描边」。有测试守着
@@ -115,7 +115,7 @@ pub enum PopupKind {
     /// 通知弹窗（主窗口上方，不抢焦点；`ui.notice_popup` 开启时使用）。
     ///
     /// 与窗内 toast 是同一则通知的两种呈现（见
-    /// `paint::draw_notice_toast` 的说明）。尺寸随文字长度每帧变化
+    /// `paint::notice::draw_notice_toast` 的说明）。尺寸随文字长度每帧变化
     /// （`Popup::resize_to` 已支持动态尺寸）。
     Notice,
 }
@@ -722,7 +722,7 @@ impl<'a> Popups<'a> {
     ///
     /// 与另两个弹窗共用 `sync_one`：懒创建、隐藏保留、尺寸随布局。
     /// `panel_rect` 来自 `UiState::notice_panel`（每帧由主窗口绘制层
-    /// 按文字长度算好，见 `paint::notice_panel_rect`）。
+    /// 按文字长度算好，见 `paint::notice::notice_panel_rect`）。
     #[allow(clippy::too_many_arguments)]
     pub fn sync_notice(
         &mut self,

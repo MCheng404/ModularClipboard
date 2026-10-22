@@ -3118,7 +3118,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
             }
             crate::popup::PopupKind::Notice => {
                 // 通知弹窗：与窗内 toast 同一则通知、同一套节奏常量
-                // （见 `paint::draw_notice_panel`）。
+                // （见 `paint::notice::draw_notice_panel`）。
                 crate::paint::draw_notice_panel(&mut frame, panel);
             }
         }
@@ -3233,7 +3233,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
 
     /// 本帧的上报拖动区。由外壳每帧读一次并转给窗口层。
     pub fn drag_regions(&self) -> &[egui::Rect] {
-        // 新架构的拖动区由 `paint::draw_topbar` 每帧写入。
+        // 新架构的拖动区由 `paint::topbar::draw_topbar` 每帧写入。
         // 旧的 `local.drag_region` 已不再更新——保留读旧字段会拿到
         // 永远为 None 的值，表现为「窗口拖不动」。
         //
