@@ -1455,6 +1455,32 @@ impl Default for McpConfig {
 /// 主题、快捷键、屏蔽名单**一次性全部归零**，且界面上没有任何提示
 /// （只有一行 `tracing::warn`）。有了它，缺失字段由各自结构的
 /// `Default` 补齐，其余字段**原样保留**。
+/// 「粘贴上一条」的行为模式。
+///
+/// 同一个热键的两种语义，按用户的工作流选：
+///
+/// | 模式 | 行为 | 适用 |
+/// |---|---|---|
+/// | `PasteAndType` | 写剪贴板 + 向目标窗口发 Ctrl+V | 单屏单窗口、目标明确 |
+/// | `NotifyOnly` | 只写剪贴板 + 通知，**不发按键** | 多屏/多窗口、目标程序对合成按键敏感 |
+///
+/// # 为什么默认是 `PasteAndType`
+///
+/// 那是本项目**既有行为**。默认值变保守等于用户升级后按同样热键
+/// 却不再粘贴——行为静默变化比多一个选项糟糕得多。想更稳的用户
+/// 自己切到 `NotifyOnly`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PastePreviousMode {
+    /// 写剪贴板并**自动输入**（向目标窗口发 Ctrl+V）。
+    ///
+    /// 目标窗口在写剪贴板那一刻抓（见 `copy_and_paste` 的说明）——
+    /// 猜错时会粘到别的窗口，这是这个模式固有的代价。
+    #[default]
+    PasteAndType,
+    /// 只写剪贴板并**提示**，粘到哪里由用户按 Ctrl+V 决定。
+    NotifyOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -1463,6 +1489,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub hotkey_toggle: Hotkey,
     pub hotkey_paste_previous: Hotkey,
+    /// 「粘贴上一条」的行为模式（见 [`PastePreviousMode`]）。
+    pub paste_previous_mode: PastePreviousMode,
     /// 「迷你快捷复制面板」：修饰键 + 鼠标右键唤出最近几条。
     pub mini_panel: MiniPanelConfig,
     pub rules: Vec<ActionRule>,
@@ -1491,12 +1519,22 @@ pub struct MiniPanelConfig {
     pub shift: bool,
     pub alt: bool,
     pub win: bool,
+    /// 预览文本最大字符数（控制面板宽度）。默认 48。
+    ///
+    /// 系统菜单不支持直接设像素宽度，字符数是唯一的宽度杠杆
+    /// （2026-10-22 用户要求「限制宽度」）。范围 10..=100。
+    pub preview_chars: usize,
 }
 
 impl MiniPanelConfig {
     /// 面板里实际显示的条数（已夹到 1..=10）。
     pub fn effective_count(&self) -> usize {
         self.count.clamp(1, 10)
+    }
+
+    /// 预览文本最大字符数（已夹到 10..=100）。
+    pub fn effective_preview_chars(&self) -> usize {
+        self.preview_chars.clamp(10, 100)
     }
 
     /// 修饰键的可读文本，如 `Ctrl+右键`。
@@ -1528,6 +1566,7 @@ impl Default for MiniPanelConfig {
             shift: false,
             alt: false,
             win: false,
+            preview_chars: 48,
         }
     }
 }
@@ -1553,6 +1592,7 @@ impl Default for Config {
                 alt: true,
                 win: false,
             },
+            paste_previous_mode: PastePreviousMode::default(),
             mini_panel: MiniPanelConfig::default(),
             rules: Vec::new(),
             mcp: McpConfig::default(),
@@ -2376,3 +2416,44 @@ mod tests {
         );
     }
 }
+    /// 默认必须是 `PasteAndType`——那是**既有行为**。
+    ///
+    /// 默认值变保守等于用户升级后按同样热键却不再粘贴，行为静默变化
+    /// 比多一个选项糟糕得多。这条钉死默认。
+    #[test]
+    fn paste_previous_mode_defaults_to_existing_behavior() {
+        assert_eq!(
+            PastePreviousMode::default(),
+            PastePreviousMode::PasteAndType,
+            "默认必须是「直接粘贴并输入」（既有行为），否则升级后热键不粘贴了"
+        );
+    }
+
+    /// 老配置文件没有 `paste_previous_mode` 字段时，反序列化必须**不报错**
+    /// 且补默认值——`#[serde(default)]` 是整个配置文件的最后一道防线，
+    /// 没有它任意新字段都会让用户的配置整份回退默认（窗口尺寸、主题、
+    /// 快捷键一次性归零）。
+    #[test]
+    fn paste_previous_mode_missing_field_falls_back_to_default() {
+        let json = r#"{"hotkey_paste_previous": {"key": "V", "ctrl": true, "shift": false, "alt": false, "win": true}}"#;
+        let cfg: Config = serde_json::from_str(json).expect("缺字段应按 default 补齐");
+        assert_eq!(
+            cfg.paste_previous_mode,
+            PastePreviousMode::PasteAndType,
+            "缺字段应落到默认，而不是报错回退整份配置"
+        );
+    }
+
+    /// 两种模式都要能往返序列化（用户改了要存得回去、读得回来）。
+    #[test]
+    fn paste_previous_mode_roundtrips() {
+        for m in [PastePreviousMode::NotifyOnly, PastePreviousMode::PasteAndType] {
+            let cfg = Config {
+                paste_previous_mode: m,
+                ..Config::default()
+            };
+            let s = serde_json::to_string(&cfg).unwrap();
+            let back: Config = serde_json::from_str(&s).unwrap();
+            assert_eq!(back.paste_previous_mode, m, "往返应保持不变：{m:?}");
+        }
+    }

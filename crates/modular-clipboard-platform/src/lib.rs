@@ -234,6 +234,52 @@ pub fn looks_like_path(s: &str) -> bool {
         && s[1..].starts_with(":\\")
 }
 
+/// 确保进程是 Per-Monitor DPI Aware V2。
+///
+/// # 为什么必须调
+///
+/// 常驻进程（daemon）从不建窗口，于是没人调过
+/// 。而 Windows 对 **DPI-unaware** 进程
+/// 会做坐标虚拟化：鼠标钩子拿到的**物理屏幕坐标**（如 1500, 800），
+/// 传给  时被当成虚拟化坐标（系统按 DPI 缩放后再
+/// 解读），在 150% 缩放下菜单会偏到光标的右下方约 1/3 屏——
+/// 「迷你面板大幅度偏移」的根因。
+///
+/// 与 [] 的建窗侧同一设置，只是这里
+/// 是常驻进程的入口（它不建窗，也就没人替它设）。
+///
+/// # 幂等
+///
+///  在进程已设定后返回失败（已生效），
+/// 重复调用无副作用。所以**每次启动调一次**即可，不需要记状态。
+pub fn ensure_dpi_awareness() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        // 失败 = 已经设置过 / 被清单文件强制，都是已生效，不必报错。
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// 确保当前线程有消息队列。
+///
+/// arboard 的 Windows 实现要创建隐藏窗口持有剪贴板，而窗口创建
+/// 要求线程有消息队列。daemon 主线程从不跑消息循环（事件走 mpsc
+/// channel），队列不存在会导致剪贴板写入静默失败。
+///
+/// PeekMessage(PM_NOREMOVE) 是 Win32 创建队列的标准手法：不取走
+/// 任何消息，只为让系统给线程分配队列。
+pub fn ensure_message_queue() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_NOREMOVE, PeekMessageW};
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+    }
+}
+
 /// 用系统默认方式打开（路径或 URL）。
 pub fn open_external(target: &str) -> Result<()> {
     #[cfg(windows)]

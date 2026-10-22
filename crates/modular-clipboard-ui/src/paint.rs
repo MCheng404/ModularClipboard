@@ -72,6 +72,8 @@ pub enum Op {
     Copy(modular_clipboard_core::EntryId),
     /// 置顶模式切换。
     SetPinnedMode(PinnedMode),
+    /// 「粘贴上一条」的行为模式。
+    SetPastePreviousMode(modular_clipboard_core::config::PastePreviousMode),
 
     // ---- 内容编辑（2026-10-21）----
     //
@@ -589,6 +591,26 @@ pub struct UiState {
     /// 建窗后数据归窗口自己持有，状态里不留第二份（几 MB 的图不该有
     /// 两个副本）。
     pub image_editor_src: Option<(Vec<u8>, u32, u32)>,
+    /// 开源协议悬浮面板是否打开（关于页「开源协议」行点击后）。
+    ///
+    /// 界面本地状态：不进配置、不进 IPC 快照，只在设置窗口这一帧
+    /// 起作用。滚动位置不单独存——面板关掉重开从头看起是合理的
+    /// （用户关掉就是「看完了」）。
+    pub license_popup: bool,
+    /// 「发现新版本」悬浮面板是否打开。
+    pub update_popup: bool,
+    /// 清空按钮**长按**的起始时刻（`None` = 没在长按）。
+    ///
+    /// 破坏性操作（清空全部历史）从「单击即触发」改成「长按 5 秒」，
+    /// 防误触。动画（摇晃 + 渐红）按 `elapsed() / 5s` 推进，
+    /// 见 [`draw_clear_button`]。
+    pub clear_hold_start: Option<std::time::Instant>,
+    /// 本次检查到的更新是否**已经弹过**面板。
+    ///
+    /// 没有它的话，状态停在 `Outdated` 就会每帧重开一次面板——用户
+    /// 点掉还会再弹回来。弹过就置位，下次「检查更新」拿到新的
+    /// `Outdated` 时由 [`draw_update_popup`] 的调用方重置。
+    pub update_popup_shown: bool,
     /// 类型栏**实测**面板尺寸（上一帧弹窗绘制时量的，逻辑点）。
     ///
     /// 为什么需要它：`labels`（按钮带文字）下面板尺寸取决于文字宽度，
@@ -2395,7 +2417,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
 
     let inner = bar.shrink2(vec2(pal.space_md, 0.0));
 
-    // ---- 右侧：窗口按钮 + 清空 + 设置（图标按钮）----------------------
+    // ---- 右侧：清空 + 置顶 + 设置（图标按钮）--------------------------
     //
     // 从底部状态栏搬上来的。按钮用**图标**而非文字：顶栏高度只有
     // 44pt，中文「清空」两个字排在那里会又高又挤；图标在小尺寸下
@@ -2404,7 +2426,7 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 尺寸取顶栏高度的 60%，留出上下呼吸空间。
     let btn = bar.height() * 0.62;
     let gap = pal.space_sm * 2.0;
-    // **四枚**按钮：关闭 / 清空 / 窗口置顶 / 设置。
+    // **三枚**按钮：清空 / 窗口置顶 / 设置。隐藏按钮独立在最左。
     //
     // IMPORTANT: 这个数字同时出现在 `draw_topbar_icons` 的
     // `step = r.width() / TOPBAR_BTN_COUNT`。两处各写一份的话，
@@ -2431,6 +2453,22 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 移出顶栏成为悬浮面板（贴卡片区顶部），顶栏结构因此简化——
     // 左侧拖动区不再需要随展开收缩。
     let sq = btn * 0.62;
+
+    // ---- 最左：隐藏窗口（2026-10-22 用户要求「移到最左边」）----------
+    //
+    // 独立于右侧功能组，放在顶栏最左缘（类似 macOS 红绿灯的位置直觉：
+    // 「把窗口收起来」是与内容无关的窗口操作，不该混进功能按钮里）。
+    // 语义仍是「收起到托盘」（不是退出），所以图标保持 `Minimize`
+    // 的横线——叉号在中文界面里更常被读成「删除/退出」。
+    let hide_r = Rect::from_center_size(
+        pos2(inner.min.x + sq * 0.5, bar.center().y),
+        vec2(sq, sq),
+    );
+    f.hit_insert("topbar_close", hide_r);
+    if icon_button(f, "topbar_close", hide_r, Icon::Minimize, t(("关闭到托盘", "Hide to tray")), false, false) {
+        f.state.push(Op::CloseWindow);
+    }
+
     let search_icon_r = Rect::from_center_size(
         pos2(btn_area.min.x - pal.space_md - sq * 0.5, bar.center().y),
         vec2(sq, sq),
@@ -2447,12 +2485,20 @@ fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 症状：整个顶栏（含齿轮、垃圾桶、搜索框）全都点不动，
     // 表现为「设置打不开 / 搜索框不能点」。
     let mut drag = Vec::new();
-    // 左段：窗口左缘 → 搜索图标左缘。
-    // **必须用左缘 - 2pt 收尾**：多出来的 2pt 与控件之间留缝，
+    // 左段：**隐藏按钮右缘** → 搜索图标左缘。
+    //
+    // 早前是「窗口左缘 → 搜索图标」，隐藏按钮移到最左后它整块压在
+    // 这段拖动区上——不改成从它的右缘起算，点隐藏按钮就变成拖窗口。
+    //
+    // **必须用右缘 + 2pt 起算**：多出来的 2pt 与控件之间留缝，
     // 避免亚像素重叠把控件边缘判成 Caption。
+    let left_start = hide_r.max.x;
     let left_end = search_icon_r.min.x;
-    if left_end - bar.min.x > 8.0 {
-        drag.push(Rect::from_min_max(bar.min, pos2(left_end - 2.0, bar.max.y)));
+    if left_end - left_start > 8.0 {
+        drag.push(Rect::from_min_max(
+            pos2(left_start + 2.0, bar.min.y),
+            pos2(left_end - 2.0, bar.max.y),
+        ));
     }
     // NOTE: 这里**不设**「两按钮之间」那一段。
     //
@@ -2911,6 +2957,32 @@ pub const POPUP_SHADOW_BLUR: f32 = 10.0;
 /// 「不越界」的约束。
 pub const POPUP_SHADOW_OFFSET_Y: f32 = 2.0;
 
+/// 弹层遮罩色：**跟随主题**（深色界面黑遮罩、浅色界面白遮罩）。
+///
+/// # 为什么浅色界面是白遮罩
+///
+/// 「压暗」不是唯一目的，**统一色相**才是：浅色界面整体偏亮，叠一层
+/// 黑色会把底图压成灰绿；白遮罩是「蒙一层光」，与浅色界面的观感一致。
+/// 这是 [`draw_recording_overlay`] 与 MCP 覆盖层既有的规范，新弹层
+/// 必须走同一套——四处遮罩各写各的，用户在弹层间切换就会看到压暗程度
+/// 或色相突变（2026-10-22 用户反馈「自绘面板要跟随主题」）。
+///
+/// alpha 取 96 而不是更重的 128：96 是「压暗但不糊死」，面板才是
+/// 视觉主体；糊太重会让背后的内容彻底消失，失去「这是个弹层」的感觉。
+///
+/// # 判据为什么是 `surface.r() < 128`
+///
+/// 取调色板背景色的亮度当深浅判据，不读 `is_dark`——`is_dark` 是
+/// `lerp` 中点才翻转的元信息，主题切换的 220ms 渐变里它会比颜色**晚**变，
+/// 遮罩跟着它走会出现「底色已变浅、遮罩还是黑的」的中间态。
+pub fn overlay_scrim(pal: &Palette) -> egui::Color32 {
+    if pal.surface.r() < 128 {
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 96)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 96)
+    }
+}
+
 /// 画悬浮弹窗的投影（面板外围那一圈 alpha）。
 ///
 /// 必须用**弹窗客户区级** painter（`ui.painter()`），不能用
@@ -3244,35 +3316,22 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
     let step = r.width() / TOPBAR_BTN_COUNT;
     let sq = step * 0.62;
 
-    // 自左向右：关闭 / 清空 / 窗口置顶 / 设置。
+    // 自左向右：清空 / 窗口置顶 / 设置。
     //
-    // NOTE: 「最小化」早前已去掉 —— 它与「关闭到托盘」的实际效果几乎相同
-    // （都让窗口消失），区别仅在任务栏是否留条目，而本程序常驻托盘。
-    // 两个近乎重复的按钮并排反而增加误点。
-    //
-    // 关闭按钮用 `Icon::Minimize`（横线）而非 `Icon::Close`（叉）：
-    // 它的语义是「收起」，与最小化同族；叉号在中文界面里更常被
-    // 理解成「删除/退出」，而这里并不是退出。
+    // **隐藏按钮不在这里**（2026-10-22 移到顶栏最左，见 `draw_topbar`）。
     let slot = |i: f32| Rect::from_center_size(pos2(r.min.x + step * (i + 0.5), center_y), vec2(sq, sq));
-    let r_close = slot(0.0);
-    let r_clear = slot(1.0);
-    let r_pin = slot(2.0);
-    let r_set = slot(3.0);
+    let r_clear = slot(0.0);
+    let r_pin = slot(1.0);
+    let r_set = slot(2.0);
 
     // 登记热区给测试用（见 `UiState::hit` 的说明）。**必须在点击判定
     // 之前登记**：`draw_topbar` 随后要读这张表来挖拖动区。
-    f.hit_insert("topbar_close", r_close);
     f.hit_insert("topbar_clear", r_clear);
     f.hit_insert("topbar_pin", r_pin);
     f.hit_insert("topbar_settings", r_set);
-
-    if icon_button(f, "topbar_close", r_close, Icon::Minimize, t(("关闭到托盘", "Hide to tray")), false, false) {
-        f.state.push(Op::CloseWindow);
-    }
-    // 破坏性操作（清空）用 danger 色，与「设置」区分开。
-    if icon_button(f, "topbar_clear", r_clear, Icon::Trash, t(("清空全部历史", "Clear all history")), true, false) {
-        f.state.push(Op::ClearAll);
-    }
+    // 破坏性操作（清空）：**长按 5 秒**才触发（2026-10-22 用户要求），
+    // 长按期间图标摇晃并渐红。误点一下不会再清空历史。
+    draw_clear_button(f, r_clear);
     // 窗口置顶：切换「始终显示在最上层、不被其它应用遮住」。
     //
     // 写配置即可 —— `App` 帧循环每帧比对 `always_on_top` 并调
@@ -3301,7 +3360,8 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
 
 /// 顶栏右侧的图标按钮数量。
 ///
-/// 关闭 / 清空 / 窗口置顶 / 设置。
+/// 清空 / 窗口置顶 / 设置。**隐藏按钮不在这里**——它独立放在顶栏
+/// 最左（2026-10-22 用户要求），所以不计入右侧组的宽度分母。
 ///
 /// # 为什么是常量而不是两处各写一个数字
 ///
@@ -3309,7 +3369,7 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
 /// `step`（槽位步距）。两处不一致 ⇒ 按钮区与实际按钮错位，表现为
 /// 「最右那枚被搜索框压住」或「点齿轮变成拖窗口」——都不是一眼能看出
 /// 原因的症状，所以直接共用一个常量，从根上杜绝。
-const TOPBAR_BTN_COUNT: f32 = 4.0;
+const TOPBAR_BTN_COUNT: f32 = 3.0;
 
 /// 一枚方形图标按钮；返回是否被点击。
 ///
@@ -3325,6 +3385,162 @@ const TOPBAR_BTN_COUNT: f32 = 4.0;
 ///
 /// `UiBuilder::max_rect` 才是绝对定位：子 `Ui` 的原点就是该矩形，
 /// 里面的 `Button` 落在矩形左上角，尺寸相同 ⇒ 两者完全重合。
+/// 清空按钮：长按 5 秒触发，长按期间图标有渐进动画（摇晃 + 渐红 + 脉冲）。
+///
+/// # 为什么破坏性操作要长按
+///
+/// 「清空全部历史」不可撤销，而它就贴在「设置」「置顶」旁边——
+/// 单击一误触就全没了。5 秒长按是这类操作的通行门槛（macOS 关机、
+/// 手机删除应用同款），配一个「越来越紧张」的动画告诉用户
+/// 「正在蓄力、松手就取消」。
+///
+/// # 动画三段（见文件头的表）
+///
+/// 进度 `p = elapsed / 5s` 驱动：摇晃幅度随 `p²` 上升（先礼后兵）、
+/// 颜色线性走向 `danger`、`p > 0.7` 加心跳式缩放脉冲。三段节奏
+/// 让「还剩多久」不用读秒也能感觉到。
+///
+/// # 松手/移开即取消
+///
+/// 破坏性操作宁可让用户多按一次，也不做「半途触发」——按到 4.9 秒
+/// 手一抖就清空，比多按 5 秒糟糕得多。
+fn draw_clear_button(f: &mut Frame<'_>, r: Rect) {
+    use std::time::Instant;
+    const HOLD: f32 = 5.0;
+
+    let pal = f.pal;
+    let resp = f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .scope_id(egui::Id::unique("topbar_clear"))
+            .max_rect(r)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
+    );
+    let resp = resp.inner;
+
+    // 悬停底（与 icon_button 同档补间）。
+    let hov = crate::anim::tween_f32(
+        f.ui.ctx(),
+        egui::Id::unique(("icon_btn_hover", "topbar_clear")),
+        if resp.hovered() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(110),
+        crate::anim::Ease::OutCubic,
+    );
+    if hov > 0.004 {
+        f.ui
+            .painter_at(r)
+            .rect_filled(r, pal.radius_sm, fade_color(pal.row_hover, hov));
+    }
+
+    // ---- 长按状态机 ----
+    //
+    // 按住：起表并推进；松开/移开：**立即归零**（不做半途保留）。
+    // 到 5 秒：触发 + 复位。
+    //
+    // CAUTION: `Op` 要等 `hold` 的借用**释放后**再 push——两者都在
+    // `f.state` 上，同时借会撞 E0499（`state` 不可拆字段同时可变）。
+    // 用 `trigger` 标志把触发挪到借用区之外。
+    // 长按判定：**悬停 + 主键按下**，不走 `Response::is_pointer_button_down_on`。
+    //
+    // CAUTION: 后者受 Button 的 sense 影响，松手那一帧容易变 false，
+    // 而触发条件 `pressed && p >= 1.0` 正好卡在那儿——症状是
+    // 「动画跑满、松手却不触发」（2026-10-22 用户反馈）。
+    // `hovered() && primary_down()` 语义直白，与控件种类无关。
+    // 长按状态机。**语义对齐手机长按**：
+    //
+    // - **开始**：指针在按钮上 + 主键**刚按下**（`primary_pressed`）；
+    // - **继续**：主键仍按住（**不要求 hover**）——按住后手指/指针
+    //   轻微移出按钮就归零是错的，那样 5 秒内一点抖动就前功尽弃，
+    //   表现为「动画一直在跑、却永远触发不了」（2026-10-22 反馈）；
+    // - **结束**：主键松开，此时若已蓄满仍要触发（按够了就该生效）。
+    //
+    // CAUTION: `Op` 要等 `hold` 的借用**释放后**再 push——两者都在
+    // `f.state` 上，同时借会撞 E0499。
+    let primary_down = f.ui.input(|i| i.pointer.primary_down());
+    let primary_pressed = f.ui.input(|i| i.pointer.primary_pressed());
+    let mut trigger = false;
+    let elapsed = {
+        let hold = &mut f.state.clear_hold_start;
+        // 开始：在按钮上按下。
+        if primary_pressed && resp.hovered() {
+            *hold = Some(Instant::now());
+        }
+        // 结束：松开。蓄满了就触发，然后清表。
+        if !primary_down {
+            if let Some(start) = hold
+                && start.elapsed().as_secs_f32() >= HOLD
+            {
+                trigger = true;
+            }
+            *hold = None;
+        }
+        // 按住期间的推进：**只看 hold 有没有**，不看 hover。
+        let elapsed = match hold {
+            Some(start) => start.elapsed().as_secs_f32(),
+            None => 0.0,
+        };
+        // 按住期间到点也触发一次（不用等松手）。
+        if hold.is_some() && primary_down && elapsed >= HOLD {
+            trigger = true;
+            *hold = None;
+        }
+        elapsed
+    };
+    if trigger {
+        f.state.push(Op::ClearAll);
+    }
+    let p = (elapsed / HOLD).clamp(0.0, 1.0);
+
+    // ---- 动画参数 ----
+    //
+    // 只看 `hold` 有没有（不要求 hover）——与状态机同一口径：
+    // 按住后指针移出按钮，动画要继续跑，否则用户一移开就以为「断了」。
+    let active = f.state.clear_hold_start.is_some();
+    let (shake_x, color, scale, tint) = if active {
+        // 摇晃：幅度随 p² 上升（先礼后兵），频率也随段位加。
+        let (amp, freq) = if p < 0.4 {
+            (1.5, 6.0)
+        } else if p < 0.7 {
+            (3.0, 10.0)
+        } else {
+            (4.5, 12.0)
+        };
+        let shake_x = (elapsed * freq * std::f32::consts::TAU).sin() * amp * (0.4 + p * 0.6);
+        // 颜色：文字色 → danger，线性。
+        let color = lerp_color(pal.text_dim, pal.danger, p);
+        // 心跳脉冲（p > 0.7）：让最后一段「有感觉」。
+        let scale = if p > 0.7 {
+            let k = (p - 0.7) / 0.3;
+            1.0 + 0.12 * k * (elapsed * 18.0).sin().abs()
+        } else {
+            1.0
+        };
+        // 底色渗 danger tint：与颜色同步，越接近触发越「红」。
+        let tint = p * 0.35;
+        (shake_x, color, scale, tint)
+    } else {
+        (0.0, pal.text_dim, 1.0, 0.0)
+    };
+
+    // 长按时底色渗 danger（叠在悬停底之上）。
+    if tint > 0.004 {
+        f.ui
+            .painter_at(r)
+            .rect_filled(r, pal.radius_sm, fade_color(pal.danger, tint));
+    }
+
+    // 图标：抖动位移 + 缩放脉冲。
+    let icon_rect = egui::Rect::from_center_size(
+        r.center() + egui::vec2(shake_x, 0.0),
+        r.size() * 0.78 * scale,
+    );
+    draw_topbar_icon(&f.ui.painter_at(r), Icon::Trash, icon_rect, color);
+
+    // 热区登记（拖动区挖空要用）。
+    f.hit_insert("topbar_clear", r);
+    resp.on_hover_text(t(("清空全部历史（长按 5 秒）", "Clear all history (hold 5s)")));
+}
+
 fn icon_button(
     f: &mut Frame<'_>,
     id: &'static str,
@@ -3493,6 +3709,14 @@ fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response {
 fn draw_topbar_icon(painter: &egui::Painter, icon: Icon, r: Rect, color: egui::Color32) {
     let side = r.width().min(r.height());
     if side <= 0.0 || color == egui::Color32::TRANSPARENT {
+        return;
+    }
+    // 自绘图标（设置/置顶/清空/复制）走 `Icon::paint` 的矢量覆盖——
+    // 那是唯一一份设计稿，行内与顶栏共用。**这里不能各画一份**：
+    // 早前顶栏在本函数里画旧版 Trash/Pinned/Settings，而 `Icon::paint`
+    // 里是新版，于是「行内换了新图标、顶栏还是旧的」（2026-10-22 反馈）。
+    if icon.is_vector() {
+        icon.paint(painter, r, color);
         return;
     }
     // **统一线宽**是「一排按钮协调」的关键：所有图标共用同一个值。
@@ -3749,6 +3973,552 @@ pub fn draw_settings(f: &mut Frame<'_>) {
         push_blur_split_marker(f, area);
         settings_mcp_overlay(f, area);
     }
+
+    // 开源协议悬浮面板（关于页「开源协议」行点击后）。
+    //
+    // 画在**最外层**、在 MCP 覆盖层之后：协议是独立的一层，要盖住
+    // 一切内容（用户点开它就是想看正文，不是看背后的设置项）。
+    // 不走 `push_blur_split_marker`——正文必须清晰，不需要模糊底图。
+    if f.state.license_popup {
+        draw_license_popup(f, area);
+    }
+
+    // 「发现新版本」悬浮面板。
+    //
+    // 检查到更新且本次还没弹过 ⇒ 自动弹一次。`update_popup_shown`
+    // 防止状态停在 `Outdated` 时每帧重开（用户点掉立刻又弹回来）；
+    // 点「检查更新」按钮时清掉它，让下次检查结果重新触发。
+    if matches!(
+        crate::about::current_state(),
+        crate::about::UpdateState::Outdated { .. }
+    ) && !f.state.update_popup_shown
+    {
+        f.state.update_popup_shown = true;
+        f.state.update_popup = true;
+    }
+    if f.state.update_popup {
+        draw_update_popup(f, area);
+    }
+
+    // 自更新已下载完毕、替换脚本已启动 ⇒ 退出本进程让它接手。
+    //
+    // 这是接力的最后一棒：脚本在等本进程退出才能动 exe
+    // （Windows 对运行中的映像有文件锁），不退就会卡在等待超时。
+    if matches!(
+        crate::about::current_state(),
+        crate::about::UpdateState::Applying
+    ) {
+        f.state.push(Op::Quit);
+    }
+}
+
+/// 开源协议悬浮面板：半透明遮罩 + 居中卡片 + 可滚动正文。
+///
+/// # 为什么要「悬浮界面」而不是开浏览器
+///
+/// 用户点「查看协议」的意图是**看**正文，不是被跳走。开浏览器会
+/// 丢掉当前上下文（设置页），离线时根本打不开。内嵌正文永远可用
+/// （`about::LICENSE_TEXT` 是编译期纳入的，见该常量的说明）。
+///
+/// # 正文用虚拟滚动
+///
+/// GPL 全文 ~35KB / 上千行。一次画完会让布局与绘制各卡一帧（egui
+/// 要排版所有字形）；`show_rows` 只画可视区那几十行，滚多久都是
+/// 常数开销。
+fn draw_license_popup(f: &mut Frame<'_>, area: Rect) {
+    let pal = f.pal;
+    let mut painter = f.ui.painter_at(area);
+
+    // 遮罩：压暗背后内容，注意力落到面板上。
+    painter.rect_filled(area, 0.0, overlay_scrim(pal));
+
+    // 面板：居中，**占窗口约 2/3**——协议是长时间阅读的文本，
+    // 满屏会压迫背后的设置页（用户 2026-10-22 要求「缩小一点」）。
+    // 下限 280×220：小窗口下也要保证标题栏 + 一两行正文看得见。
+    let panel = egui::Rect::from_center_size(
+        area.center(),
+        egui::vec2(
+            (area.width() * 0.68).max(280.0),
+            (area.height() * 0.76).max(220.0),
+        ),
+    );
+    // 投影与项目弹窗同一套（`draw_popup_shadow`）：投影是实心矩形外扩，
+    // 所以下面的面板**必须有不透明底**（`pal.surface` 已是），否则会
+    // 透出黑边——弹窗侧踩过的坑（见 `POPUP_SHADOW_STRENGTH` 的说明）。
+    draw_popup_shadow(&painter, panel, pal);
+
+    // 点击**面板外任意空白**即可退出（2026-10-22 用户要求）。
+    //
+    // 面板外的区域拆成上/下/左/右四块矩形注册点击：不能只对整个
+    // `area` 注册——面板内的滚动区、关闭按钮都要命中，而 egui 的
+    // hit-test 是「后注册的在上层」，整块 area 后注册会把面板内的
+    // 交互盖掉（点关闭按钮变成关面板，点正文变成关面板）。
+    //
+    // 四块矩形互不重叠、也不与 `panel` 重叠，注册顺序无关紧要。
+    let mask = [
+        // 上
+        egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, panel.min.y)),
+        // 下
+        egui::Rect::from_min_max(egui::pos2(area.min.x, panel.max.y), area.max),
+        // 左
+        egui::Rect::from_min_max(
+            egui::pos2(area.min.x, panel.min.y),
+            egui::pos2(panel.min.x, panel.max.y),
+        ),
+        // 右
+        egui::Rect::from_min_max(
+            egui::pos2(panel.max.x, panel.min.y),
+            egui::pos2(area.max.x, panel.max.y),
+        ),
+    ];
+    for (i, r) in mask.iter().enumerate() {
+        if r.width() <= 0.5 || r.height() <= 0.5 {
+            continue;
+        }
+        let resp = f
+            .ui
+            .interact(*r, egui::Id::unique(("license_mask", i)), egui::Sense::click());
+        if resp.clicked() {
+            f.state.license_popup = false;
+        }
+    }
+
+    painter.rect_filled(panel, pal.radius_lg, pal.surface);
+    painter.rect_stroke(
+        panel,
+        pal.radius_lg,
+        egui::Stroke::new(1.0, pal.border),
+        egui::StrokeKind::Inside,
+    );
+
+    // 标题栏：用 `surface_raised` 与正文区分层。
+    //
+    // # 圆角怎么处理
+    //
+    // 标题栏是直角矩形，直接填会把面板**顶部的圆角盖成方角**。egui 没有
+    // 「只圆上两角」的矩形，所以用 clip：把裁剪区限到标题栏内、用面板的
+    // 圆角半径画一次，结果就是「圆角矩形的上半部分」——顶部两角圆、
+    // 下沿是直的，正好是标题栏想要的形状。画完必须把 clip 复原，
+    // 否则后面正文会被裁掉。
+    let title_h = 38.0;
+    let title_r =
+        egui::Rect::from_min_max(panel.min, egui::pos2(panel.max.x, panel.min.y + title_h));
+    let old_clip = painter.clip_rect();
+    painter.set_clip_rect(title_r.intersect(old_clip));
+    painter.rect_filled(panel, pal.radius_lg, pal.surface_raised);
+    painter.set_clip_rect(old_clip);
+    // 标题栏下沿一条细分隔线，把「头」与「正文」切开。
+    painter.line_segment(
+        [
+            egui::pos2(title_r.min.x, title_r.max.y),
+            egui::pos2(title_r.max.x, title_r.max.y),
+        ],
+        egui::Stroke::new(1.0, pal.border),
+    );
+    painter.text(
+        egui::pos2(title_r.min.x + pal.space_lg, title_r.center().y),
+        egui::Align2::LEFT_CENTER,
+        t(("开源协议", "License")),
+        egui::FontId::proportional(pal.font_md),
+        pal.text,
+    );
+    // 副标题：协议名（小一号、弱化），让用户知道看的是哪一份。
+    painter.text(
+        egui::pos2(title_r.min.x + 88.0, title_r.center().y),
+        egui::Align2::LEFT_CENTER,
+        "GNU GPL v3.0",
+        egui::FontId::proportional(pal.font_sm),
+        pal.text_dim,
+    );
+
+    // 关闭按钮（右上角）。几何与图片编辑窗同一思路：绘制与交互共用
+    // 同一个矩形，别各算一份（两处漂移过一次，见 imgedit 的说明）。
+    let close_r = egui::Rect::from_center_size(
+        egui::pos2(title_r.max.x - 22.0, title_r.center().y),
+        egui::vec2(26.0, 26.0),
+    );
+    let close_resp =
+        f.ui.interact(close_r, egui::Id::unique("license_close"), egui::Sense::click());
+    if close_resp.hovered() {
+        // 悬停底：小图标按钮只有变色反馈太弱，加一层有可点的实体感
+        // （与列表行操作按钮同一处理）。
+        painter.rect_filled(close_r, pal.radius_sm, pal.row_hover);
+    }
+    crate::icons::Icon::Close.paint(
+        &f.ui.painter_at(close_r),
+        egui::Rect::from_center_size(close_r.center(), close_r.size() * 0.72),
+        if close_resp.hovered() {
+            pal.text_bright
+        } else {
+            pal.text_dim
+        },
+    );
+    // CAUTION: `clicked()` 必须在 `on_hover_text` 之前取——后者按值
+    // 消耗 `Response`（与列表行操作按钮同一个坑）。
+    let close_clicked = close_resp.clicked();
+    close_resp.on_hover_text(t(("关闭", "Close")));
+    if close_clicked {
+        f.state.license_popup = false;
+    }
+
+    // Esc 也关：与所有弹层（搜索面板、图片编辑窗）一致，「Esc = 退出
+    // 当前层」是用户跨窗口的通用预期。
+    if f.ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        f.state.license_popup = false;
+    }
+
+    // 正文：虚拟滚动（只排版可视行）。用 `surface_variant` 做底，
+    // 与标题栏的 `surface_raised` 形成三层（面板 → 头 → 正文）层次。
+    //
+    // 内边距压到最小（8/6pt）：用户要「内容渲染满显示区域」——早前
+    // 12+10 的双层缩进把正文挤到中间一窄条，法律条文的行长本身就长，
+    // 再被外边距吃掉宽度就更难读了。
+    let pad = pal.space_sm;
+    let body = egui::Rect::from_min_max(
+        egui::pos2(panel.min.x + pad, title_r.max.y + pad),
+        egui::pos2(panel.max.x - pad, panel.max.y - pad),
+    );
+    if body.width() <= 8.0 || body.height() <= 8.0 {
+        return;
+    }
+    painter.rect_filled(body, pal.radius_md, pal.surface_variant);
+    let inner = body.shrink(pal.space_xs);
+    let mut ui = f.ui.new_child(
+        egui::UiBuilder::new()
+            .scope_id(egui::Id::unique("license_body"))
+            .max_rect(inner)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    let lines: Vec<&str> = crate::about::LICENSE_TEXT.lines().collect();
+    // 等宽字体：协议是**法律文本**，缩进与对齐有含义（条款编号、
+    // 示例代码都靠缩进），比例字体会让它们对不齐。
+    // 字号取 `font_sm` 而不是 `font_xs`：法律条文要长时间阅读，太小
+    // 看着累（`font_xs` 适合 meta 小字，不适合正文）。
+    let font = egui::FontId::monospace(pal.font_sm);
+    let line_h = font.size * 1.45;
+    egui::ScrollArea::vertical()
+        .id_salt("license_scroll")
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .show_rows(&mut ui, line_h, lines.len(), |ui, range| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            for i in range {
+                // 空行给一行的空白（协议里的段落分隔），否则挤成一坨。
+                if lines[i].trim().is_empty() {
+                    ui.add_space(line_h * 0.5);
+                    continue;
+                }
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(lines[i]).font(font.clone()).color(pal.text),
+                    )
+                    .wrap(),
+                );
+            }
+        });
+}
+
+/// 「发现新版本」悬浮面板：版本号 + 更新内容预览 + 取消/更新按钮。
+///
+/// # 为什么是「打开下载页」而不是应用内自更新
+///
+/// 应用内替换自己的 exe 要处理：下载到临时目录、校验、备份旧文件、
+/// 提权（`Program Files` 下写不进去）、重启换文件——每一步都能把
+/// 用户的安装搞坏，而收益只是省一次「下载-双击安装」。桌面工具的
+/// 通行做法是把用户带到发布页（内容、校验和、变更说明都在那儿）。
+/// 所以「更新」按钮的语义是**去下载**，不是「后台换掉自己」。
+///
+/// # 没有 release 详情时的降级
+///
+/// `release` 为 `None`（网络不通 / curl 不可用 / 仓库还没有 release）
+/// 时正文显示「暂无更新说明」，按钮降级成「打开仓库」——功能不假死，
+/// 也不假装有更新说明。
+fn draw_update_popup(f: &mut Frame<'_>, area: Rect) {
+    let pal = f.pal;
+    // 状态被重新检查清空（或从未有过更新）时整层不画。
+    let (local, remote, notes, url, download_url) = match crate::about::current_state() {
+        crate::about::UpdateState::Outdated {
+            local,
+            remote,
+            release,
+        } => match release {
+            Some(r) => (local, remote, r.notes, r.url, r.download_url),
+            None => (
+                local,
+                remote,
+                String::new(),
+                crate::about::REPO_URL.to_string(),
+                None,
+            ),
+        },
+        _ => return,
+    };
+
+    let mut painter = f.ui.painter_at(area);
+    painter.rect_filled(area, 0.0, overlay_scrim(pal));
+
+    // 面板：比协议面板小一号——它是「一个决定」而不是「一段长文」，
+    // 太大会让背后设置页的上下文丢失（用户 2026-10-22 要求「缩小」）。
+    let panel = egui::Rect::from_center_size(
+        area.center(),
+        egui::vec2(
+            (area.width() * 0.46).clamp(320.0, 520.0),
+            (area.height() * 0.56).clamp(260.0, 420.0),
+        ),
+    );
+    draw_popup_shadow(&painter, panel, pal);
+    painter.rect_filled(panel, pal.radius_lg, pal.surface);
+    painter.rect_stroke(
+        panel,
+        pal.radius_lg,
+        egui::Stroke::new(1.0, pal.border),
+        egui::StrokeKind::Inside,
+    );
+
+    // 点击面板外任意空白退出（与协议面板同一交互）。
+    let mask = [
+        egui::Rect::from_min_max(area.min, egui::pos2(area.max.x, panel.min.y)),
+        egui::Rect::from_min_max(egui::pos2(area.min.x, panel.max.y), area.max),
+        egui::Rect::from_min_max(
+            egui::pos2(area.min.x, panel.min.y),
+            egui::pos2(panel.min.x, panel.max.y),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(panel.max.x, panel.min.y),
+            egui::pos2(area.max.x, panel.max.y),
+        ),
+    ];
+    for (i, r) in mask.iter().enumerate() {
+        if r.width() <= 0.5 || r.height() <= 0.5 {
+            continue;
+        }
+        let resp = f.ui.interact(
+            *r,
+            egui::Id::unique(("update_mask", i)),
+            egui::Sense::click(),
+        );
+        if resp.clicked() {
+            f.state.update_popup = false;
+        }
+    }
+
+    // 标题栏（clip 画圆角顶部，同协议面板）。
+    let title_h = 38.0;
+    let title_r =
+        egui::Rect::from_min_max(panel.min, egui::pos2(panel.max.x, panel.min.y + title_h));
+    let old_clip = painter.clip_rect();
+    painter.set_clip_rect(title_r.intersect(old_clip));
+    painter.rect_filled(panel, pal.radius_lg, pal.surface_raised);
+    painter.set_clip_rect(old_clip);
+    painter.line_segment(
+        [
+            egui::pos2(title_r.min.x, title_r.max.y),
+            egui::pos2(title_r.max.x, title_r.max.y),
+        ],
+        egui::Stroke::new(1.0, pal.border),
+    );
+    painter.text(
+        egui::pos2(title_r.min.x + 16.0, title_r.center().y),
+        egui::Align2::LEFT_CENTER,
+        t(("发现新版本", "Update available")),
+        egui::FontId::proportional(pal.font_md),
+        pal.text,
+    );
+
+    // 关闭按钮（右上角）。
+    let close_r = egui::Rect::from_center_size(
+        egui::pos2(title_r.max.x - 22.0, title_r.center().y),
+        egui::vec2(26.0, 26.0),
+    );
+    let close_resp = f
+        .ui
+        .interact(close_r, egui::Id::unique("update_close"), egui::Sense::click());
+    if close_resp.hovered() {
+        painter.rect_filled(close_r, pal.radius_sm, pal.row_hover);
+    }
+    crate::icons::Icon::Close.paint(
+        &f.ui.painter_at(close_r),
+        egui::Rect::from_center_size(close_r.center(), close_r.size() * 0.72),
+        if close_resp.hovered() {
+            pal.text_bright
+        } else {
+            pal.text_dim
+        },
+    );
+    let close_clicked = close_resp.clicked();
+    close_resp.on_hover_text(t(("关闭", "Close")));
+    if close_clicked || f.ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        f.state.update_popup = false;
+    }
+
+    // ---- 版本号 ----
+    let mut y = title_r.max.y + 16.0;
+    let x0 = panel.min.x + pal.space_lg;
+    // 「本地 → 远程」是用户判断「跳多远」的唯一信息，用主字号 + 强调色。
+    painter.text(
+        egui::pos2(x0, y),
+        egui::Align2::LEFT_TOP,
+        format!("{local}  →  v{remote}"),
+        egui::FontId::proportional(pal.font_md),
+        pal.accent,
+    );
+    y += pal.font_md + 14.0;
+
+    // ---- 更新内容预览 ----
+    painter.text(
+        egui::pos2(x0, y),
+        egui::Align2::LEFT_TOP,
+        t(("更新内容", "What's new")),
+        egui::FontId::proportional(pal.font_sm),
+        pal.text_dim,
+    );
+    y += pal.font_sm + 8.0;
+
+    // 按钮区固定在底部，预览区拿剩下的高度。
+    let btn_h = 34.0;
+    let btn_gap = 10.0;
+    let btn_y = panel.max.y - btn_h - 18.0;
+    let notes_r = egui::Rect::from_min_max(
+        egui::pos2(x0, y),
+        egui::pos2(panel.max.x - 16.0, btn_y - 12.0),
+    );
+    if notes_r.height() > 16.0 {
+        painter.rect_filled(notes_r, pal.radius_md, pal.surface_variant);
+        if notes.trim().is_empty() {
+            // 没有 release 详情：明说，而不是留一块空白让用户猜。
+            painter.text(
+                notes_r.center(),
+                egui::Align2::CENTER_CENTER,
+                t(("暂无更新说明", "No release notes available")),
+                egui::FontId::proportional(pal.font_sm),
+                pal.text_dim,
+            );
+        } else {
+            let inner = notes_r.shrink(pal.space_sm);
+            let mut ui = f.ui.new_child(
+                egui::UiBuilder::new()
+                    .scope_id(egui::Id::unique("update_notes"))
+                    .max_rect(inner)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            // release body 是 Markdown **源文**：原样按等宽显示，
+            // 不做渲染（渲染整套 Markdown 要一套解析器，而这些符号
+            // 用户本来也看得懂；真正要渲染的地方是发布页）。
+            let font = egui::FontId::monospace(pal.font_sm);
+            let line_h = font.size * 1.45;
+            let lines: Vec<&str> = notes.lines().collect();
+            egui::ScrollArea::vertical()
+                .id_salt("update_notes_scroll")
+                .auto_shrink([false, false])
+                .show_rows(&mut ui, line_h, lines.len(), |ui, range| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    for i in range {
+                        if lines[i].trim().is_empty() {
+                            ui.add_space(line_h * 0.5);
+                            continue;
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(lines[i]).font(font.clone()).color(pal.text),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
+        }
+    }
+
+    // ---- 底部按钮：取消 / 更新（圆角，右对齐）----
+    //
+    // 「更新」是主按钮（强调色填充），「取消」是次按钮（描边）。
+    // 两个都右对齐、更新在最右——这是用户预期的「下一步」位置。
+    let (m_left, m_right) = (panel.min.x + pal.space_lg, panel.max.x - pal.space_lg);
+    let cancel_w = 88.0;
+    let update_w = 108.0;
+    let cancel_r = egui::Rect::from_min_size(
+        egui::pos2(m_right - update_w - btn_gap - cancel_w, btn_y),
+        egui::vec2(cancel_w, btn_h),
+    );
+    let update_r = egui::Rect::from_min_size(
+        egui::pos2(m_right - update_w, btn_y),
+        egui::vec2(update_w, btn_h),
+    );
+
+    let cancel_resp = f
+        .ui
+        .interact(cancel_r, egui::Id::unique("update_cancel"), egui::Sense::click());
+    painter.rect_filled(
+        cancel_r,
+        pal.radius_md,
+        if cancel_resp.hovered() {
+            pal.row_hover
+        } else {
+            pal.surface_variant
+        },
+    );
+    painter.rect_stroke(
+        cancel_r,
+        pal.radius_md,
+        egui::Stroke::new(1.0, pal.border),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        cancel_r.center(),
+        egui::Align2::CENTER_CENTER,
+        t(("取消", "Cancel")),
+        egui::FontId::proportional(pal.font_sm),
+        pal.text,
+    );
+    if cancel_resp.clicked() {
+        f.state.update_popup = false;
+    }
+
+    let update_resp = f
+        .ui
+        .interact(update_r, egui::Id::unique("update_confirm"), egui::Sense::click());
+    painter.rect_filled(
+        update_r,
+        pal.radius_md,
+        if update_resp.hovered() {
+            pal.accent_hover
+        } else {
+            pal.accent
+        },
+    );
+    // 无 release 详情时按钮语义是「打开仓库」（那里同样能下载）。
+    let label = if notes.trim().is_empty() {
+        t(("打开仓库", "Open repo"))
+    } else {
+        t(("更新", "Update"))
+    };
+    painter.text(
+        update_r.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::proportional(pal.font_sm),
+        pal.text_on_accent,
+    );
+    if update_resp.clicked() {
+        // 去下载页：用户在那儿能看到完整变更说明、校验和、各平台包。
+        //
+        // CAUTION: 直接 `open_external` 而不是 `Op::OpenLink`——后者
+        // 只收 `&'static str`（静态表里的链接），而下载页 URL 是**运行时**
+        // 从 GitHub API 拿到的 `String`。开浏览器不改任何共享状态
+        // （就是 `platform::open_external` 那一下），不必绕道状态机
+        // 去改 `Op` 的签名影响所有既有调用点。
+        if download_url.is_some() {
+            // 应用内自更新：下载 + 起替换脚本，随后本进程退出
+            // （脚本等它退出后才动 exe，见 about::build_apply_script）。
+            crate::about::start_self_update();
+        } else {
+            // 该 release 没挂 exe 资产：只能打开下载页，让用户自己取。
+            if let Err(e) = modular_clipboard_platform::open_external(&url) {
+                tracing::warn!(%e, %url, "打开下载页失败");
+            }
+        }
+        f.state.update_popup = false;
+    }
+    let _ = m_left;
 }
 
 /// 放置一个「模糊分割」标记。
@@ -4061,6 +4831,15 @@ const NUMBER_MINI_COUNT: NumberSpec = NumberSpec {
     store: |v| v,
 };
 
+const NUMBER_MINI_PREVIEW: NumberSpec = NumberSpec {
+    min: 10.0,
+    max: 100.0,
+    step: 4.0,
+    unit: ("字符", " chars"),
+    display: |v| v,
+    store: |v| v,
+};
+
 const NUMBER_MAX_PAYLOAD_MB: NumberSpec = NumberSpec {
     min: 1.0,
     max: 4096.0,
@@ -4156,6 +4935,8 @@ enum ItemKind {
     Language,
     /// 快捷键绑定（只读展示）。
     Hotkey(HotkeySlot),
+    /// 「粘贴上一条」的行为模式（仅粘贴并提示 / 直接粘贴并输入）。
+    PastePreviousMode,
     /// 开机自启动开关（要写注册表，故单独一个变体）。
     Autostart,
     /// MCP 总开关行：右侧先画开关（最右），再画 ⓘ 详细按钮（开关左边），
@@ -4179,12 +4960,28 @@ enum ItemKind {
     /// 数据目录超链接行（关于页）：显示实际目录、点击在文件管理器
     /// 中打开（[`Op::OpenDataDir`]）。
     OpenDataDir,
-    /// 只读信息行（关于页）。
-    Info(Bi),
     /// 可点击的外部链接（关于页）：显示文本即 URL，点击用默认浏览器打开。
     Link(&'static str),
     /// 退出程序按钮（关于页）。
     Quit,
+    /// 版本行（关于页）：动态取，cl 版显示 commit、稳定版显示 `0.2`。
+    ///
+    /// 与静态只读行的区别：静态行的文本是编译期固定的
+    /// `&'static str`，而版本号要在**运行时**由
+    /// [`about::version_label`] 决定（两分支拼出来的字符串长度不同）。
+    Version,
+    /// 技术栈行（关于页）：一段可点击文字链，每段打开对应 GitHub 仓库。
+    ///
+    /// 拆成独立卡片（2026-10-22）：技术栈是「这个程序用什么做的」，
+    /// 与「版本 / 协议 / 作者」不是一类信息，且每个词条都要可点。
+    Stack,
+    /// 开源协议行（关于页）：点击弹出悬浮面板显示协议**全文**。
+    ///
+    /// 独立成变体：它要画一层覆盖界面（不是改配置、不是开浏览器），
+    /// 通用的只读行 / 外链行都表达不了。
+    LicenseView,
+    /// 版本检查（关于页）：点击后台拉取 git tag 并与本地比较。
+    UpdateCheck,
 }
 
 /// 字体缩放预设（百分比 → 档位名）。
@@ -4388,9 +5185,13 @@ impl SettingsItem {
             ItemKind::Language => cfg.ui.language != d.ui.language,
             ItemKind::Group
             | ItemKind::OpenDataDir
-            | ItemKind::Info(_)
             | ItemKind::Link(_)
-            | ItemKind::Quit => false,
+            | ItemKind::Quit
+            | ItemKind::Version
+            | ItemKind::Stack
+            | ItemKind::LicenseView
+            | ItemKind::UpdateCheck
+            | ItemKind::PastePreviousMode => false,
         }
     }
 
@@ -4469,9 +5270,13 @@ impl SettingsItem {
             }),
             ItemKind::Group
             | ItemKind::OpenDataDir
-            | ItemKind::Info(_)
             | ItemKind::Link(_)
-            | ItemKind::Quit => None,
+            | ItemKind::Quit
+            | ItemKind::Version
+            | ItemKind::Stack
+            | ItemKind::LicenseView
+            | ItemKind::UpdateCheck
+            | ItemKind::PastePreviousMode => None,
         }
     }
 }
@@ -4745,6 +5550,15 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 desc: ("把最近一条历史直接粘贴到当前输入处", "Paste the most recent entry into the focused app"),
                 kind: ItemKind::Hotkey(HotkeySlot::PastePrevious),
             },
+            SettingsItem {
+                key: "hotkey.paste_previous_mode",
+                label: ("粘贴方式", "Paste mode"),
+                desc: (
+                    "「仅粘贴并提示」只写剪贴板由你手动粘贴；「直接粘贴并输入」会向目标窗口发送 Ctrl+V",
+                    "'Copy & notify' only fills the clipboard; 'Copy & paste' also sends Ctrl+V to the target",
+                ),
+                kind: ItemKind::PastePreviousMode,
+            },
         ],
     },
     SettingsCard {
@@ -4762,6 +5576,12 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: ("显示条数", "Entry count"),
                 desc: ("面板中显示的最近条目数", "Number of recent entries shown in the panel"),
                 kind: ItemKind::Number(ConfigGroup::MiniPanel, "count", &NUMBER_MINI_COUNT),
+            },
+            SettingsItem {
+                key: "mini_panel.preview_chars",
+                label: ("预览长度", "Preview length"),
+                desc: ("每项显示的最大字符数（控制宽度）", "Max chars per item (controls width)"),
+                kind: ItemKind::Number(ConfigGroup::MiniPanel, "preview_chars", &NUMBER_MINI_PREVIEW),
             },
             SettingsItem {
                 key: "mini_panel.ctrl",
@@ -4833,19 +5653,19 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 key: "about.version",
                 label: ("版本", "Version"),
                 desc: ("", ""),
-                kind: ItemKind::Info((concat!("v", env!("CARGO_PKG_VERSION")), concat!("v", env!("CARGO_PKG_VERSION")))),
+                kind: ItemKind::Version,
             },
             SettingsItem {
-                key: "about.stack",
-                label: ("技术栈", "Built with"),
-                desc: ("", ""),
-                kind: ItemKind::Info(("Rust · egui · Vulkan (Win32)", "Rust · egui · Vulkan (Win32)")),
+                key: "about.update",
+                label: ("版本检查", "Check for updates"),
+                desc: ("从仓库拉取最新 tag 并与本地比较", "Fetch the latest tag and compare with local"),
+                kind: ItemKind::UpdateCheck,
             },
             SettingsItem {
                 key: "about.license",
                 label: ("开源协议", "License"),
-                desc: ("", ""),
-                kind: ItemKind::Info(("GNU GPL v3.0 or later", "GNU GPL v3.0 or later")),
+                desc: ("点击查看协议全文", "Click to view the full text"),
+                kind: ItemKind::LicenseView,
             },
             SettingsItem {
                 key: "about.group.project",
@@ -4884,6 +5704,20 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::Quit,
             },
         ],
+    },
+    // 技术栈单列一张卡（2026-10-22 用户要求）：它是「用什么做的」，
+    // 与「版本 / 协议 / 作者 / 数据目录」不同类，而且每个词条都要可点。
+    // 放在「关于」卡片**之后**：先看软件自身的事实（版本/协议/数据），
+    // 再看「它是怎么搭出来的」。
+    SettingsCard {
+        cat: SettingsCat::About,
+        title: ("技术栈", "Built with"),
+        items: &[SettingsItem {
+            key: "about.stack",
+            label: ("技术栈", "Built with"),
+            desc: ("点击任一名称打开它的官方仓库", "Click a name to open its repository"),
+            kind: ItemKind::Stack,
+        }],
     },
 ];
 
@@ -4973,11 +5807,30 @@ fn settings_content(f: &mut Frame<'_>, ui: &mut Ui) {
 }
 
 /// 当前分类的卡片组。
+///
+/// # CAUTION: 必须 `filter` 遍历全部，不能 `find` 只取第一张
+///
+/// 同一个 `SettingsCat` 可以有**多张**卡片（`About` 就有「关于」与
+/// 「技术栈」两张）。早前这里用 `find(...)`，于是第二张起永远不会被
+/// 画出来——表现为「技术栈卡片加了却看不见」（2026-10-22 用户反馈）。
+///
+/// 卡片之间留 12pt 间距：`Frame` 的圆角背景自带外缘，不留白的话
+/// 两张卡片会贴在一起，看不出是两块。
 fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
-    let Some(card) = SETTINGS_CARDS.iter().find(|c| c.cat == f.state.settings_cat) else {
-        return;
-    };
-    settings_card(f, ui, card);
+    // CAUTION: 必须先把 `settings_cat` **拷出来**再迭代。
+    //
+    // 闭包里读 `f.state.settings_cat` 会借住 `&f`，而循环体里
+    // `settings_card(f, ...)` 要 `&mut f`——两者同一作用域直接撞
+    // 借用检查（E0502）。`SettingsCat` 是 Copy 的小枚举，拷出来零成本。
+    let cat = f.state.settings_cat;
+    let mut first = true;
+    for card in SETTINGS_CARDS.iter().filter(|c| c.cat == cat) {
+        if !first {
+            ui.add_space(12.0);
+        }
+        first = false;
+        settings_card(f, ui, card);
+    }
 }
 
 /// 一张卡片：圆角背景 + 标题行（标题 + 条件重置按钮）+ 设置行。
@@ -5973,7 +6826,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     egui::Label::new(
                         egui::RichText::new(shown.as_str()).size(pal.font_sm).color(pal.accent),
                     )
-                    // 同 `ItemKind::Info`：不截断会向左溢出到导航列上。
+                    // 不截断会向左溢出到导航列上（见 Info 时期的教训）。
                     .truncate()
                     .sense(egui::Sense::click()),
                 );
@@ -5989,18 +6842,6 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 if resp.clicked() {
                     f.state.push(Op::OpenDataDir);
                 }
-                false
-            });
-        }
-        ItemKind::Info(text) => {
-            setting_row(ui, it.label, ("", ""), |ui| {
-                // CAUTION: 必须 `truncate()`。右对齐布局里宽度不够的控件
-                // 会**向左**无限生长（`Extend` 模式），长文本（如数据目录
-                // 那行）会压到左侧导航列上——实测 2× 字号下越出 130pt。
-                let r = ui.add(
-                    egui::Label::new(egui::RichText::new(t(*text)).color(pal.text_dim)).truncate(),
-                );
-                r.on_hover_text(t(*text));
                 false
             });
         }
@@ -6031,6 +6872,27 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 false
             });
         }
+        ItemKind::PastePreviousMode => {
+            use modular_clipboard_core::config::PastePreviousMode as PM;
+            let cur = f.svc.state.config.paste_previous_mode;
+            setting_row(ui, it.label, it.desc, |ui| {
+                let picked = draw_segmented(
+                    f,
+                    ui,
+                    "paste_previous_mode",
+                    &[
+                        (PM::NotifyOnly, ("仅粘贴并提示", "Copy & notify")),
+                        (PM::PasteAndType, ("直接粘贴并输入", "Copy & paste")),
+                    ],
+                    cur,
+                );
+                if let Some(m) = picked {
+                    f.state.push(Op::SetPastePreviousMode(m));
+                    record_recent(f, it.key);
+                }
+                picked.is_some()
+            });
+        }
         ItemKind::Quit => {
             ui.add_space(8.0);
             let (r, resp) = ui.allocate_exact_size(
@@ -6052,6 +6914,178 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             if resp.clicked() {
                 f.state.push(Op::Quit);
             }
+        }
+        ItemKind::Version => {
+            // 版本号**运行时**算：cl 版带 commit 短 hash（排障时用户
+            // 截图里的号能直接查到那次提交），稳定版显示 `0.2`。
+            // 与静态只读行的差别就是「文本不是静态的」。
+            let v = crate::about::version_label();
+            setting_row(ui, it.label, it.desc, |ui| {
+                let r = ui.add(
+                    egui::Label::new(egui::RichText::new(v.as_str()).color(pal.text_dim))
+                        .truncate(),
+                );
+                r.on_hover_text(v.as_str());
+                false
+            });
+        }
+        ItemKind::Stack => {
+            // 技术栈：一段**可换行**的链接串，每段点开对应仓库。
+            //
+            // 不用 `setting_row`：右侧控件列是右对齐且固定宽的，6 个
+            // 词条塞进去会被 truncate 到只剩第一个。整行铺开 + 换行，
+            // 名称与 `·` 分隔符按阅读顺序排。
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(6.0, 2.0);
+                for (i, (name, url)) in crate::about::STACK_LINKS.iter().enumerate() {
+                    if i > 0 {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("·").size(pal.font_sm).color(pal.text_dim),
+                        ));
+                    }
+                    let resp = ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(*name).size(pal.font_sm).color(pal.accent),
+                        )
+                        .sense(egui::Sense::click()),
+                    );
+                    f.hit_insert(url, resp.rect);
+                    if resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        let r = resp.rect;
+                        ui.painter_at(r).line_segment(
+                            [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
+                            egui::Stroke::new(1.0, pal.accent),
+                        );
+                    }
+                    if resp.clicked() {
+                        f.state.push(Op::OpenLink(url));
+                    }
+                }
+            });
+        }
+        ItemKind::LicenseView => {
+            setting_row(ui, it.label, it.desc, |ui| {
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("GNU GPL v3.0 or later")
+                            .size(pal.font_sm)
+                            .color(pal.accent),
+                    )
+                    .truncate()
+                    .sense(egui::Sense::click()),
+                );
+                f.hit_insert("settings_license", resp.rect);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    let r = resp.rect;
+                    ui.painter_at(r).line_segment(
+                        [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
+                        egui::Stroke::new(1.0, pal.accent),
+                    );
+                }
+                if resp.clicked() {
+                    // 打开协议悬浮面板（在设置窗口最上层画，见
+                    // `draw_license_popup`）。不是开浏览器——用户点这里
+                    // 就是想**看**协议，跳到网页反而多一跳。
+                    f.state.license_popup = true;
+                }
+                false
+            });
+        }
+        ItemKind::UpdateCheck => {
+            // 检查在**后台线程**跑（`about::start_check`），点击这一帧
+            // 立刻返回；结果由 `current_state()` 在后续帧里读到并显示。
+            // 同步跑 `git ls-remote` 会把 UI 卡住几百毫秒到几秒（网络慢
+            // 时更久），而主循环空转 ~125Hz，那一停顿非常显眼。
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = vec2(10.0, 0.0);
+                let resp = ui.add_sized(
+                    egui::vec2(88.0, 28.0),
+                    egui::Button::new(
+                        egui::RichText::new(t(("检查更新", "Check"))).color(pal.text),
+                    )
+                    .fill(pal.surface_variant),
+                );
+                f.hit_insert("settings_check_update", resp.rect);
+                if resp.clicked() {
+                    crate::about::start_check();
+                    // 重新检查 ⇒ 允许结果再次弹窗（否则用户点掉一次后
+                    // 永远不再弹，「检查更新」就成了只在行里显示一行字）。
+                    f.state.update_popup_shown = false;
+                }
+                use crate::about::UpdateState;
+                match crate::about::current_state() {
+                    UpdateState::Idle => {}
+                    UpdateState::Checking => {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(t(("检查中…", "Checking…"))).color(pal.text_dim),
+                        ));
+                    }
+                    UpdateState::UpToDate { remote } => {
+                        let s = if remote.is_empty() {
+                            t(("已是最新", "Up to date")).to_string()
+                        } else {
+                            format!("{}（v{remote}）", t(("已是最新", "Up to date")))
+                        };
+                        ui.add(egui::Label::new(egui::RichText::new(s).color(pal.accent)));
+                    }
+                    UpdateState::Outdated {
+                        local,
+                        remote,
+                        release,
+                    } => {
+                        // 有更新：除了那行文字，还要能点开详情弹窗。
+                        // 文字本身就是入口（与「开源协议」行同款交互）。
+                        let s = format!(
+                            "{} v{remote}（{} {local}）",
+                            t(("发现新版本", "Update available")),
+                            t(("本地", "local"))
+                        );
+                        let r = ui.add(
+                            egui::Label::new(egui::RichText::new(s).color(pal.accent))
+                                .sense(egui::Sense::click()),
+                        );
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            let rr = r.rect;
+                            ui.painter_at(rr).line_segment(
+                                [pos2(rr.left(), rr.bottom()), pos2(rr.right(), rr.bottom())],
+                                egui::Stroke::new(1.0, pal.accent),
+                            );
+                        }
+                        if r.clicked() {
+                            f.state.update_popup = true;
+                        }
+                        // 详情弹窗要能拿到下载页：没有 release 时按钮降级
+                        // 成「打开仓库」，见 `draw_update_popup`。
+                        let _ = release;
+                    }
+                    UpdateState::Failed(msg) => {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(msg).color(pal.danger).size(pal.font_sm),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(t(("远程不可达（网络/防火墙/git）", "Unreachable")));
+                    }
+                    UpdateState::Downloading => {
+                        // 后台下载中：只给状态，按钮不再可点（`start_self_update`
+                        // 里已做幂等，重复点也不会再起一个下载线程）。
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(t(("下载中…", "Downloading…")))
+                                .color(pal.text_dim),
+                        ));
+                    }
+                    UpdateState::Applying => {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(t(("即将重启…", "Restarting…")))
+                                .color(pal.accent),
+                        ));
+                    }
+                }
+            });
         }
     }
 }
@@ -7606,13 +8640,8 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     );
 
     // 遮罩：与 MCP 覆盖层同色同 alpha（96）——压暗但不糊死，
-    // 模糊本身才是「失焦」的主体。
-    let dark = pal.surface.r() < 128;
-    let shade = if dark {
-        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 96)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 96)
-    };
+    // 模糊本身才是「失焦」的主体。色值统一走 [`overlay_scrim`]。
+    let shade = overlay_scrim(pal);
     // 遮罩随入场淡入（预乘缩放，见 `fade_color`）。
     f.ui
         .painter_at(area)
@@ -7642,40 +8671,62 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     let p = f.ui.painter_at(panel);
     p.rect_filled(panel, pal.radius_lg, pal.surface);
 
-    let pad = 22.0;
-    let mut y = panel.min.y + pad;
-
-    // 标题。
-    p.text(
-        pos2(panel.center().x, y + 10.0),
-        egui::Align2::CENTER_TOP,
-        t(("正在录制快捷键", "Recording shortcut")),
-        egui::FontId::proportional(pal.font_md),
-        pal.text_bright,
-    );
-    y += 34.0;
-
-    // ---- 第二个圆角正方形们：键帽 ----
+    // ---- 布局：统一垂直节奏 + 两行等宽（2026-10-22 用户要求「对称对齐」）----
     //
-    // 修饰键 4 个一排（按下的高亮），主键一个大键帽居中。
-    // 「按下」的判据取**当前帧**的输入状态而非事件流：事件只在
-    // 按下的那一帧出现，而用户按住不动时键帽必须保持亮着。
-    let mods = f.ui.input(|i| i.modifiers);
-    let win = modular_clipboard_platform::win_key_down();
-    let caps: [(&str, bool); 4] = [
-        ("Ctrl", mods.ctrl),
-        ("Shift", mods.shift),
-        ("Alt", mods.alt),
-        ("Win", win),
-    ];
+    // 早前标题带 `y + 10` 的基线补偿、三段间距各不相等（34 / 46+16 /
+    // 72+18），肉眼看就是「一高一低」。现在每块等间距 `vgap` 排布，
+    // 块内文字/键帽一律按**垂直中心**放置，标题与提示也用
+    // CENTER_CENTER 而不是 CENTER_TOP——混合顶/中心对齐正是不齐的根源。
+    //
+    // 主键宽度取**修饰键行等宽**：两行左右边缘对齐，不是「上行一行宽、
+    // 下行一个小方块」的悬空感。
+    let pad = pal.space_lg * 1.4;
+    let vgap = 18.0_f32;
+
     let cap_w = 62.0_f32;
     let cap_h = 46.0_f32;
     let gap = 10.0_f32;
     let row_w = cap_w * 4.0 + gap * 3.0;
+
+    let mut y = panel.min.y + pad;
+
+    // 标题（块高按字号算，随 font_scale 缩放）。
+    let title_h = pal.font_md * 1.7;
+    p.text(
+        pos2(panel.center().x, y + title_h / 2.0),
+        egui::Align2::CENTER_CENTER,
+        t(("正在录制快捷键", "Recording shortcut")),
+        egui::FontId::proportional(pal.font_md),
+        pal.text_bright,
+    );
+    y += title_h + vgap;
+
+    // ---- 修饰键行：4 键等宽、行居中 ----
+    //
+    // 修饰键状态：**已确定主键就保持已录制的组合**，否则取实时按下。
+    // 用户口径（2026-10-22）：「在已经输入键后，修饰键录制状态保持
+    // 直至输入键再次更新后」——录完 Ctrl+V 松手，Ctrl 必须继续亮着，
+    // 否则界面上看不出刚录了什么。下一次输入主键会重写
+    // `recording_combo`，键帽随之更新。
+    let mods = f.ui.input(|i| i.modifiers);
+    let win_down = modular_clipboard_platform::win_key_down();
+    let (ctrl_on, shift_on, alt_on, win_on) = match &f.state.recording_combo {
+        Some(hk) => (hk.ctrl, hk.shift, hk.alt, hk.win),
+        None => (mods.ctrl, mods.shift, mods.alt, win_down),
+    };
+    let caps: [(&str, bool); 4] = [
+        ("Ctrl", ctrl_on),
+        ("Shift", shift_on),
+        ("Alt", alt_on),
+        ("Win", win_on),
+    ];
     let row_x0 = panel.center().x - row_w / 2.0;
     for (i, (name, down)) in caps.iter().copied().enumerate() {
-        let r = Rect::from_min_size(pos2(row_x0 + i as f32 * (cap_w + gap), y), vec2(cap_w, cap_h));
-        // 修饰键键帽：小圆角方块。按下 = accent 填充；未按 = 暗面。
+        let r = Rect::from_min_size(
+            pos2(row_x0 + i as f32 * (cap_w + gap), y),
+            vec2(cap_w, cap_h),
+        );
+        // 修饰键键帽：小圆角方块。亮 = accent 填充；暗 = surface_variant。
         let (fill, fg) = if down {
             (pal.accent, pal.text_on_accent)
         } else {
@@ -7690,12 +8741,14 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
             fg,
         );
     }
-    y += cap_h + 16.0;
+    y += cap_h + vgap;
 
-    // 主键键帽：大一号。没按主键时显示「？」占位。
-    let main_w = 104.0_f32;
-    let main_h = 72.0_f32;
-    let main = Rect::from_center_size(pos2(panel.center().x, y + main_h / 2.0), vec2(main_w, main_h));
+    // ---- 主键：与修饰键行**等宽**，左右边缘对齐 ----
+    //
+    // 早前 104pt 的方块悬在 278pt 的修饰键行下面，两边都空着，
+    // 看着「下盘不稳」。等宽后两行是一个整体。
+    let main_h = 64.0_f32;
+    let main = Rect::from_min_size(pos2(row_x0, y), vec2(row_w, main_h));
     let has_key = f.state.recording_combo.is_some();
     let (fill, fg) = if has_key {
         (pal.accent, pal.text_on_accent)
@@ -7718,12 +8771,13 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
         egui::FontId::proportional(pal.font_lg * 1.25),
         fg,
     );
-    y += main_h + 18.0;
+    y += main_h + vgap;
 
-    // 底部提示。
+    // 底部提示（与标题同款 CENTER_CENTER，不混用顶对齐）。
+    let hint_h = pal.font_sm * 1.6;
     p.text(
-        pos2(panel.center().x, y),
-        egui::Align2::CENTER_TOP,
+        pos2(panel.center().x, y + hint_h / 2.0),
+        egui::Align2::CENTER_CENTER,
         t(("录制完成后，点击任意位置停止录制", "Click anywhere to stop recording")),
         egui::FontId::proportional(pal.font_sm),
         pal.text_dim,
@@ -7743,14 +8797,10 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
 fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     let pal = f.pal;
 
-    // 遮罩色随主题：亮色界面用白、暗色界面用黑。
-    let dark = pal.surface.r() < 128;
-    let shade = if dark {
-        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 96)
-    } else {
-        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 96)
-    };
-    f.ui.painter_at(area).rect_filled(area, 0.0, shade);
+    // 遮罩色随主题：亮色界面用白、暗色界面用黑（[`overlay_scrim`]）。
+    f.ui
+        .painter_at(area)
+        .rect_filled(area, 0.0, overlay_scrim(pal));
 
     // 面板：居中，限制在窗口客户区内。
     let pw = 480.0_f32.min(area.width() * 0.92);
@@ -9576,6 +10626,25 @@ pub(crate) fn fade_color(c: egui::Color32, k: f32) -> egui::Color32 {
     egui::Color32::from_rgba_premultiplied(s(r), s(g), s(b), s(a))
 }
 
+/// 两色线性插值（`t ∈ [0,1]`）。
+///
+/// 用于「慢慢变红」这类渐变：比离散切换平滑，且 RGB 逐通道插值
+/// 在深浅主题下都不会穿过非法色域。纯函数，可单测。
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |x: u8, y: u8| -> u8 {
+        (x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgba_premultiplied(
+        ch(a.r(), b.r()),
+        ch(a.g(), b.g()),
+        ch(a.b(), b.b()),
+        ch(a.a(), b.a()),
+    )
+}
+
 /// 画一圈圆角描边：**两次填充**，而不是路径描边。
 ///
 /// # 为什么不用 `Painter::rect_stroke`
@@ -10283,7 +11352,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
             // 语义就是置顶 ↔ 取消置顶的开关，任何状态下都可点。
             true,
         ),
-        (crate::icons::Icon::File, Op::Copy(item.id), true),
+        (crate::icons::Icon::Copy, Op::Copy(item.id), true),
         (crate::icons::Icon::Close, Op::Delete(item.id), true),
     ];
 
@@ -11695,15 +12764,42 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// CAUTION: 清空是**破坏性**操作，所以必须真的能点出来——否则用户
     /// 想清空历史时只能去改配置文件。
     #[test]
-    fn clicking_trash_emits_clear_all() {
+    fn clicking_trash_does_not_clear() {
+        // 破坏性操作（清空全部历史）**单击不得触发**——行为已改为
+        // 长按 5 秒（2026-10-22 用户要求），误点一下就清空历史是
+        // 不可接受的。这条守门防的是有人图省事把长按改回单击。
+        //
+        // 长按路径本身依赖真实时钟（`Instant::elapsed`），在单测里
+        // 不好快进；这里只钉死「短按不触发」这条最重要的边界。
         let mut h = Harness::new("trash", vec2(600.0, 400.0));
         h.frame();
         let p = topbar_trash(&h).center();
-        let ops =
-        h.click_at(p);
+        let ops = h.click_at(p);
         assert!(
-            ops.contains(&Op::ClearAll),
-            "点垃圾桶应发出 ClearAll，实际={ops:?}"
+            !ops.contains(&Op::ClearAll),
+            "单击清空按钮不应触发 ClearAll（需长按 5 秒），实际={ops:?}"
+        );
+    }
+
+    /// 隐藏按钮在顶栏**最左**（2026-10-22 从右侧按钮组移出）。
+    ///
+    /// 它的位置错了会连带拖动区挖空算错——隐藏按钮压在拖动区上时
+    /// 「点隐藏 = 拖窗口」。用热区表的几何关系钉死相对位置。
+    #[test]
+    fn hide_button_is_leftmost_in_topbar() {
+        let mut h = Harness::new("hide-left", vec2(720.0, 420.0));
+        h.frame();
+        let hide = hit(&h, "topbar_close");
+        let clear = hit(&h, "topbar_clear");
+        let pin = hit(&h, "topbar_pin");
+        let set = hit(&h, "topbar_settings");
+        assert!(
+            hide.max.x < clear.min.x,
+            "隐藏按钮应在右侧功能组**之前**：hide={hide:?} clear={clear:?}"
+        );
+        assert!(
+            clear.min.x < pin.min.x && pin.min.x < set.min.x,
+            "右侧组顺序应为 清空/置顶/设置，实际 clear={clear:?} pin={pin:?} set={set:?}"
         );
     }
 
@@ -12113,6 +13209,29 @@ fn with_pinned(mut self, n: usize) -> Self {
             ops.iter().any(|o| matches!(o, Op::OpenLink(u) if *u == author)),
             "点作者主页应产生 OpenLink({author})，实际={ops:?}"
         );
+    }
+
+    /// 关于分类下**多张卡片都要绘制**（回归守门）。
+    ///
+    /// `SettingsCat::About` 有「关于」与「技术栈」两张卡片。早前
+    /// `settings_category_cards` 用 `find(...)` 只取第一张匹配的卡片，
+    /// 第二张永远不会被画出来——表现为「技术栈卡片加了却看不见」
+    /// （2026-10-22 用户反馈）。这里断言两张卡片的热区都在场：
+    /// 关于卡的「退出程序」与技术栈卡的某个词条链接。
+    #[test]
+    fn about_category_renders_every_card_not_just_first() {
+        let mut h = Harness::new("about-multi-cards", vec2(780.0, 820.0));
+        h.state.show_settings = true;
+        h.settings_frame();
+        let nav = settings_hit(&h, "settings_cat_about").center();
+        h.settings_click_at(nav);
+
+        // 第一张（关于）：退出按钮在场。
+        let _ = settings_hit(&h, "settings_quit");
+        // 第二张（技术栈）：词条链接的热区在场——它由 `ItemKind::Stack`
+        // 用 URL 当热区名登记，卡片没被绘制就查不到。
+        let stack_url = crate::about::STACK_LINKS[0].1;
+        let _ = settings_hit(&h, stack_url);
     }
 
     /// 关于页「数据目录」是超链接：点击产生 `Op::OpenDataDir`（进入
@@ -13815,13 +14934,18 @@ fn with_pinned(mut self, n: usize) -> Self {
             }
         }
 
-        // 搜索图标必须在按钮区左侧，且不得与任何按钮重叠。
+        // 搜索图标必须在**右侧功能组**左侧，且不得与任何按钮重叠。
+        //
+        // NOTE: 隐藏按钮 2026-10-22 移到顶栏**最左**，它在搜索图标
+        // 的左边——所以这里只跟右侧组（清空/置顶/设置）比，不再跟
+        // `rects[0]`（现在是隐藏按钮）比。
         let icon_r = hit(&h, "search_icon");
+        let right_group = hit(&h, "topbar_clear");
         assert!(
-            icon_r.max.x <= rects[0].1.min.x,
-            "搜索图标 {} 越过最左按钮 {}",
+            icon_r.max.x <= right_group.min.x,
+            "搜索图标 {} 越过右侧组最左按钮 {}",
             icon_r.max.x,
-            rects[0].1.min.x
+            right_group.min.x
         );
         for (name, r) in &rects {
             assert!(

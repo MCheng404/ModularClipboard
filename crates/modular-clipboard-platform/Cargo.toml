@@ -22,6 +22,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Registry",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    # lib.rs ensure_dpi_awareness：SetProcessDpiAwarenessContext。
+    # 缺了它迷你面板的屏幕坐标会被 DPI 虚拟化，菜单偏到右下角。
+    "Win32_UI_HiDpi",
     # tray.rs：Shell_NotifyIconW / NOTIFYICONDATAW
     "Win32_UI_Shell",
     # tray.rs：CreateDIBSection / CreateBitmap 构造程序化图标

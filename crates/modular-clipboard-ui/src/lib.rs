@@ -31,6 +31,7 @@
 //! 整体删除。`text` 是从 `titlebar` 拆出的文本度量/截断，因为卡片绘制
 //! 同样需要它，不该反向依赖标题栏模块。
 
+pub mod about;
 pub mod anim;
 pub mod app;
 pub mod card;

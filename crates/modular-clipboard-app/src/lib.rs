@@ -1031,6 +1031,22 @@ impl LocalBackend {
 
     fn copy_and_paste(&mut self, state: &mut AppState, id: EntryId) -> Result<()> {
         self.copy_item(state, id)?;
+        // 「仅粘贴并提示」：剪贴板写好就收工，**不发按键**——粘到哪里
+        // 由用户自己按 Ctrl+V 决定，绝不猜目标窗口（多屏/切窗口快时
+        // 猜错会把内容粘到无关程序里）。发通知让用户知道已经就绪。
+        if state.config.paste_previous_mode
+            == modular_clipboard_core::config::PastePreviousMode::NotifyOnly
+        {
+            set_notice(
+                state,
+                modular_clipboard_core::i18n::t((
+                    "已复制到剪贴板，按 Ctrl+V 粘贴",
+                    "Copied — press Ctrl+V to paste",
+                ))
+                .to_string(),
+            );
+            return Ok(());
+        }
         // 目标窗口在**写剪贴板的这一刻**抓住：此刻前台还是用户按热键时
         // 正在用的程序。等 250ms 延迟结束再查（auto_paste 内部的老做法）
         // 用户可能已经切走，按键会粘到错误的窗口上。

@@ -662,9 +662,20 @@ unsafe fn apply_custom_move(hwnd: HWND) {
 }
 
 /// 松开：清状态再释放捕获（ReleaseCapture 会同步触发 CAPTURECHANGED）。
+///
+/// # 为什么要主动恢复光标
+///
+/// 拖动期间光标是 resize 形（边/角）或箭头（标题栏）。松手后如果只
+/// 等下一次 `WM_SETCURSOR`（要鼠标动一下才来）或帧循环的
+/// [`shell_cursor_id`] 兜底（渲染闸门可能把它跳过），光标就会
+/// **卡在 resize 形不动**——用户反馈的「光标状态调整不过来」。
+/// 这里一锤定音恢复默认箭头，不依赖任何后续事件。
 unsafe fn end_custom_move(hwnd: HWND) {
     clear_moving(hwnd);
-    unsafe { let _ = ReleaseCapture(); }
+    unsafe {
+        let _ = ReleaseCapture();
+        set_system_cursor(IDC_ARROW.0 as u16);
+    }
 }
 
 // ---------------------------------------------------------------------------

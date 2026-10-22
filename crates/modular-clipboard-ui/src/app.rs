@@ -2804,6 +2804,15 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     self.paint_state.image_editor = None;
                     self.paint_state.image_editor_src = None;
                 }
+                Op::SetPastePreviousMode(m) => {
+                    // 与 SetPinnedMode 同款：重复点当前项不触发写入。
+                    if self.svc.state.config.paste_previous_mode != m {
+                        self.svc.state.config.paste_previous_mode = m;
+                        if let Err(e) = self.svc.save_config() {
+                            tracing::warn!(%e, "保存粘贴模式失败");
+                        }
+                    }
+                }
                 Op::SetPinnedMode(mode) => {
                     // 重复点当前已选项不触发任何调整（`draw_segmented`
                     // 对已选项也会上报 clicked）。不判这一下的话，
@@ -2861,6 +2870,13 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                             // 全清之后没有一条条目还在 ⇒ 编辑态整体作废
                             // （理由同 `Op::Delete` 分支）。
                             self.paint_state.clear_all_edit_state();
+                            // 成功也给通知：长按 5 秒是重操作，用户需要
+                            // 明确的「生效了」反馈——没有反馈时会以为
+                            // 「没反应」而反复重试（2026-10-22 反馈链）。
+                            self.svc.notify(modular_clipboard_core::i18n::t((
+                                "已清空全部历史",
+                                "All history cleared",
+                            )).to_string());
                         }
                         Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("清空失败:", "Clear failed:")))),
                     }
@@ -3534,6 +3550,9 @@ fn set_number_field(
         (G::Capture, "dedup_window_secs") => cfg.capture.dedup_window_secs = v.max(0.0) as i64,
         (G::Ui, "font_scale") => cfg.ui.font_scale = (v.clamp(0.75, 2.0)) as f32,
         (G::MiniPanel, "count") => cfg.mini_panel.count = (v.clamp(1.0, 10.0)) as usize,
+    (G::MiniPanel, "preview_chars") => {
+        cfg.mini_panel.preview_chars = (v.clamp(10.0, 100.0)) as usize
+    }
         (G::Storage, "max_bytes") => cfg.storage.max_bytes = v.max(1.0) as u64,
         (G::Storage, "max_payload_bytes") => cfg.storage.max_payload_bytes = v.max(1.0) as u64,
         (G::Mcp, "port") => cfg.mcp.port = v.clamp(0.0, 65535.0) as u16,

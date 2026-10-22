@@ -437,19 +437,37 @@ pub fn hide_window(hwnd: HWND) {    if !unsafe { IsWindow(Some(hwnd)) }.as_bool(
 ///    缩放光标由 `chrome` 模块（`WM_SETCURSOR` + [`shell_cursor_id`]）
 ///    决定，这里只负责把外壳没接管的客户区光标映射成 Win32 资源。
 ///
-/// 只在**形状变化时**才调 `SetCursor`：它是 Win32 全局状态，
-/// 每帧设一次既无必要也会和别的窗口抢光标。
+/// 设置窗口/主窗口的客户区光标（egui 形状 → Win32 资源 ID）。
+///
+/// # 为什么**不**用「上次设置值」去重
+///
+/// 早前这里有一个进程级 `LAST: AtomicU32`，形状没变就跳过 `SetCursor`。
+/// 那是**错的**，两条路都能把它绕过：
+///
+/// 1. **两条设置路径互不知情**：本函数（帧循环）与 chrome 的
+///    `WM_SETCURSOR`（resize 边/角）都在设光标，而 `LAST` 只追踪本函数
+///    的设置——chrome 设过的 `IDC_SIZEWE` 不在账上，本函数以为
+///    「上回就是箭头」就跳过恢复，光标卡在 resize 形；
+/// 2. **`LAST` 跨窗口共享**：主窗口与设置窗口是两个 HWND，却共用一个
+///    计数器。指针从主窗口 resize 边移进设置窗口时，若主窗口的帧循环
+///    恰被渲染闸门跳过（`skip_render`），`LAST` 还是旧值，设置窗口的
+///    恢复就被短路——用户反馈「移到设置窗口里光标状态没有恢复」。
+///
+/// 现在**无条件 `SetCursor`**。两道天然闸门已经够用，不会互相抢：
+///
+/// - [`chrome::pointer_is_over`]：指针不在本窗口上时本函数直接返回，
+///   不会碰全局光标（所以两个窗口的帧循环同时跑也不会打架）；
+/// - `SetCursor` 只是设置**线程光标句柄**，同值设置系统会立刻返回，
+///   125Hz 的调用没有实际开销。
 pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    // 上一次设置的光标。0 = 从未设过。
-    static LAST: AtomicU32 = AtomicU32::new(0);
-
     // 指针不在本窗口上：光标归别的窗口 / 系统管，这里绝不能碰。
     if !modular_clipboard_gfx::chrome::pointer_is_over(hwnd) {
         return;
     }
 
     // 指针在窗口外壳（resize 边/角、拖动区）或拖动中：由外壳决定。
+    // egui 0.36 没有 `Resize*` 变体，指针悬停在边缘时它报 `Default`，
+    // 直接套用下面的映射会把 resize 光标覆盖回箭头。
     let code: u16 = if let Some(shell) = modular_clipboard_gfx::chrome::shell_cursor_id(hwnd) {
         shell
     } else {
@@ -472,10 +490,6 @@ pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
             _ => IDC_ARROW.0 as u16,
         }
     };
-    let key = code as u32;
-    if LAST.swap(key, Ordering::Relaxed) == key {
-        return;
-    }
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return;
     }

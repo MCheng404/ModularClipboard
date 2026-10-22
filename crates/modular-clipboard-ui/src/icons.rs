@@ -58,7 +58,7 @@
 //! 屏幕空间光栅化口径）。改动 [`BASELINE_FACTOR`] 前先看它；
 //! 回归判据是 [`tests::glyph_ink_is_centred_in_its_box`]。
 
-use egui::{Align2, Color32, Rect, Ui, Vec2, pos2};
+use egui::{Align2, Color32, Pos2, Rect, Ui, Vec2, pos2};
 
 /// 图标字体的名字，注册进 [`egui::FontDefinitions`] 时用。
 pub const ICON_FONT_NAME: &str = "modular-clipboard-icons";
@@ -173,9 +173,24 @@ pub enum Icon {
     Mask,
     /// 清空。
     Trash,
+    /// 复制（行内操作）。
+    Copy,
 }
 
 impl Icon {
+    /// 是否走**自绘矢量**（`vector_icon`），不依赖字体字形。
+    ///
+    /// 4 枚常用图标（设置/置顶/清空/复制）由 painter 直绘，
+    /// [`Self::codepoint`] 对它们只是兜底。字形类测试
+    /// （`every_icon_codepoint_has_ink` 等）应跳过它们——
+    /// 自绘图标根本不去字体图集里取墨迹，检查码位没有意义。
+    pub fn is_vector(self) -> bool {
+        matches!(
+            self,
+            Icon::Settings | Icon::Pinned | Icon::Unpinned | Icon::Trash | Icon::Copy
+        )
+    }
+
     /// 全部变体。用于测试与穷举性检查。
     pub const ALL: &'static [Icon] = &[
         Icon::Close,
@@ -196,6 +211,7 @@ impl Icon {
         Icon::Table,
         Icon::Mask,
         Icon::Trash,
+        Icon::Copy,
     ];
 
     /// 该图标在字体中的码位（PUA区）。
@@ -222,6 +238,7 @@ impl Icon {
             Icon::Table => '\u{e00f}',   // table
             Icon::Mask => '\u{e010}',    // eye-slash
             Icon::Trash => '\u{e011}',   // trash
+            Icon::Copy => '\u{e012}',    // copy
         }
     }
 
@@ -274,6 +291,7 @@ impl Icon {
             Icon::Table => ("表格视图", "Table view"),
             Icon::Mask => ("密文视图", "Masked"),
             Icon::Trash => ("清空", "Clear"),
+            Icon::Copy => ("复制", "Copy"),
         }
     }
 
@@ -290,6 +308,18 @@ impl Icon {
         if size <= 0.0 || color == Color32::TRANSPARENT {
             return;
         }
+        // 四枚常用图标走**自绘矢量**（圆角简约风），其余回退字形。
+        //
+        // 为什么写在这里而不是各调用点：顶栏、行内操作、设置导航
+        // 都经 `Icon::paint`，在这儿覆盖一次全生效；散在各处则必然
+        // 改一漏一（顶栏换新了、行内还是旧字形）。
+        match self {
+            Icon::Settings | Icon::Pinned | Icon::Unpinned | Icon::Trash | Icon::Copy => {
+                vector_icon(painter, self, rect, color);
+                return;
+            }
+            _ => {}
+        }
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -298,6 +328,101 @@ impl Icon {
             self.font_id(size * INK_FIT),
             color,
         );
+    }
+}
+
+/// 圆头线段：线两端补一个圆，消除方头的尖角感。
+///
+/// 「圆角、简约」是图标风格的硬要求，而 egui 的 `line_segment` 只有
+/// 方头。两头补圆是成本最低的圆角做法（比整条胶囊网格轻得多）。
+fn round_line(painter: &egui::Painter, a: Pos2, b: Pos2, w: f32, color: Color32) {
+    painter.line_segment([a, b], egui::Stroke::new(w, color));
+    let r = w * 0.5;
+    painter.circle_filled(a, r, color);
+    painter.circle_filled(b, r, color);
+}
+
+/// 四枚自绘图标的实际绘制（圆角、简约风）。
+///
+/// 归一化坐标 0~1，`u()` 把它映射进 `rect` 的内接方框（`pad` 给描边
+/// 留余量，避免线宽的一半被包围盒裁掉）。线宽与顶栏图标同一口径
+/// （约边长 9.5%，下限 1.4 保证 1x 屏不出现断续）。
+fn vector_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
+    let side = rect.width().min(rect.height());
+    if side <= 0.0 {
+        return;
+    }
+    let w = (side * 0.095).max(1.4);
+    let pad = side * 0.09;
+    let inner = side - pad * 2.0;
+    let u = |x: f32, y: f32| Pos2::new(rect.min.x + pad + x * inner, rect.min.y + pad + y * inner);
+
+    match icon {
+        // 设置 = **左一条竖线 + 右三条横线**（用户指定的形状）。
+        //
+        // 三横线右端长短不一（长/短/中）形成节奏，比三根等长的更像
+        // 「调节器」而不是「列表」；都等长反而像汉堡菜单、与「设置」
+        // 的语义对不上。
+        Icon::Settings => {
+            round_line(painter, u(0.18, 0.14), u(0.18, 0.86), w, color);
+            round_line(painter, u(0.38, 0.22), u(0.92, 0.22), w, color);
+            round_line(painter, u(0.38, 0.50), u(0.74, 0.50), w, color);
+            round_line(painter, u(0.38, 0.78), u(0.86, 0.78), w, color);
+        }
+
+        // 置顶 = **圆头 + 直针**（`Pinned` 实心圆、`Unpinned` 描边圆）。
+        //
+        // 两态**形状完全相同**、只差填充，切换时不会有「换了个图标」
+        // 的跳变——用户分不清是「换图标了」还是「状态变了」。
+        // 比早前的「梯形身 + 矩形头」简约得多，16pt 下也糊不了。
+        Icon::Pinned | Icon::Unpinned => {
+            let filled = icon == Icon::Pinned;
+            let head_c = Pos2::new((u(0.0, 0.0).x + u(1.0, 0.0).x) * 0.5, u(0.0, 0.34).y);
+            let head_r = inner * 0.21;
+            if filled {
+                painter.circle_filled(head_c, head_r, color);
+            } else {
+                painter.circle_stroke(head_c, head_r, egui::Stroke::new(w, color));
+            }
+            // 针：从圆底伸到底部，圆头收尾。
+            round_line(
+                painter,
+                Pos2::new(head_c.x, u(0.0, 0.56).y),
+                Pos2::new(head_c.x, u(0.0, 0.94).y),
+                w,
+                color,
+            );
+        }
+
+        // 清空 = **圆角垃圾桶**（盖 + 小提手 + 梯形桶身），去掉早前的
+        // 两条内竖线——那是写实画法，16pt 下挤成一团，简约风不需要。
+        Icon::Trash => {
+            // 盖
+            round_line(painter, u(0.12, 0.28), u(0.88, 0.28), w, color);
+            // 提手：倒 U，坐在盖线上。
+            round_line(painter, u(0.38, 0.28), u(0.38, 0.12), w, color);
+            round_line(painter, u(0.38, 0.12), u(0.62, 0.12), w, color);
+            round_line(painter, u(0.62, 0.12), u(0.62, 0.28), w, color);
+            // 桶身：上宽下窄（开口朝上，由盖线闭合）。
+            round_line(painter, u(0.22, 0.40), u(0.30, 0.92), w, color);
+            round_line(painter, u(0.78, 0.40), u(0.70, 0.92), w, color);
+            round_line(painter, u(0.30, 0.92), u(0.70, 0.92), w, color);
+        }
+
+        // 复制 = **两枚重叠圆角矩形**（后层描边、前层实心）。
+        //
+        // 经典的「双文档」形状一眼可辨；前层实心让它在 16pt 下也有
+        // 明确的前后关系（两层都描边会糊成一个回）。
+        Icon::Copy => {
+            let radius = w * 1.1;
+            let back = Rect::from_min_max(u(0.36, 0.10), u(0.90, 0.64));
+            painter.rect_stroke(back, radius, egui::Stroke::new(w, color), egui::StrokeKind::Inside);
+            let front = Rect::from_min_max(u(0.10, 0.36), u(0.64, 0.90));
+            painter.rect_filled(front, radius, color);
+        }
+
+        // 其余图标不走这里（`Icon::paint` 已经拦截）。
+        _ => {}
     }
 }
 
@@ -503,6 +628,9 @@ mod tests {
         let font_id = egui::FontId::proportional(64.0);
         let mut checked = 0usize;
         for &icon in Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形，码位/墨迹检查无意义
+            }
             let cp = icon.codepoint();
             let (has, w) = ctx.fonts_mut(|f| {
                 (
@@ -518,7 +646,13 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 18, "变体数量变了？码位表需要重新生成");
+        // 不硬编码数量：自绘图标不走字形，它们不进 `checked`。
+        // 仍然守的是「每个非自绘变体都在码位表里」这条。
+        let expected = Icon::ALL.iter().filter(|i| !i.is_vector()).count();
+        assert_eq!(
+            checked, expected,
+            "非自绘变体数量与已检查数不符？码位表需要重新生成"
+        );
     }
 
     #[test]
@@ -526,6 +660,9 @@ mod tests {
         // 两个变体撞码位＝有一个图标显示成另一个。
         let mut seen = std::collections::BTreeSet::new();
         for &icon in Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形，码位/墨迹检查无意义
+            }
             assert!(
                 seen.insert(icon.codepoint()),
                 "{icon:?} 的码位与其它变体重复"
@@ -537,6 +674,9 @@ mod tests {
     fn codepoints_are_in_private_use_area() {
         // PUA 保证不与中英文正文冲突。
         for &icon in Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形，码位/墨迹检查无意义
+            }
             let cp = icon.codepoint();
             assert!(
                 ('\u{e000}'..='\u{f8ff}').contains(&cp),
@@ -661,6 +801,9 @@ mod tests {
         let font_size = side * INK_FIT;
 
         for &icon in Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形，码位/墨迹检查无意义
+            }
             let ink = glyph_ink_quad(&ctx, icon.codepoint(), font_size);
             // `layout_job` 返回的 galley 已按`Align2::CENTER_CENTER`
             // 对齐好，单字形 galley 宽度 = advance = em = font_size。
@@ -765,6 +908,9 @@ mod tests {
         let mut worst = 0.0f32;
         let mut worst_icon = Icon::Close;
         for &icon in Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形，码位/墨迹检查无意义
+            }
             let ink = glyph_ink_quad(&ctx, icon.codepoint(), side * INK_FIT);
             let adv = ctx.fonts_mut(|f| {
                 f.glyph_width(&egui::FontId::proportional(side * INK_FIT), icon.codepoint())
@@ -817,6 +963,9 @@ mod tests {
         let rect = Rect::from_min_size(pos2(0.0, 0.0), Vec2::splat(side));
         let mut out = Vec::new();
         for &icon in Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形，码位/墨迹检查无意义
+            }
             let (quad, uv_min, uv_max) = glyph_quad(ctx, icon, rect);
             let (ink_min, ink_max) = atlas_ink_bounds(ctx, uv_min, uv_max)
                 .unwrap_or_else(|| panic!("{icon:?} 在图集里没有墨迹"));
@@ -1014,6 +1163,9 @@ mod tests {
         let mut sigs: std::collections::BTreeMap<Vec<(u8, u8)>, Icon> =
             std::collections::BTreeMap::new();
         for &icon in Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形，码位/墨迹检查无意义
+            }
             let (_quad, uv_min, uv_max) = glyph_quad(&ctx, icon, rect);
             let img = ctx.fonts_mut(|f| f.image());
             let w = img.width();
@@ -1198,6 +1350,20 @@ mod tests {
                 (1.0..=3.0).contains(&px),
                 "边长 {side} 的描边 {px:.2}px 不在 1~3px 区间"
             );
+        }
+    }
+
+    /// 自绘图标必须正好是重绘的那 4 枚（设置/置顶两态/清空/复制）。
+    ///
+    /// 它们走 `vector_icon`，不依赖字体字形。清单变了要同步检查：
+    /// 1. `vector_icon` 里有对应分支；
+    /// 2. 字形类测试的跳过逻辑（`is_vector`）覆盖到新成员。
+    #[test]
+    fn vector_icons_are_exactly_the_redrawn_four() {
+        let vs: Vec<Icon> = Icon::ALL.iter().copied().filter(|i| i.is_vector()).collect();
+        assert_eq!(vs.len(), 5, "自绘应是 5 个变体（含置顶两态），实得 {vs:?}");
+        for need in [Icon::Settings, Icon::Pinned, Icon::Unpinned, Icon::Trash, Icon::Copy] {
+            assert!(vs.contains(&need), "{need:?} 应为自绘，实得 {vs:?}");
         }
     }
 }

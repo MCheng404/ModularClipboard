@@ -141,6 +141,22 @@ impl Core {
 /// `start_ui` 为 `true` 时启动后立即拉起界面（对应「双击图标」）；
 /// 单独以 `--daemon` 启动时传 `false`（只常驻、不弹窗）。
 pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::Result<()> {
+    // CAUTION: 必须最先调——鼠标钩子拿到的是**物理**屏幕坐标，
+    // 而 DPI-unaware 进程里的 TrackPopupMenu 会把它们当虚拟化坐标，
+    // 迷你面板就偏到光标右下方（见 platform::ensure_dpi_awareness）。
+    modular_clipboard_platform::ensure_dpi_awareness();
+
+    // CAUTION: daemon 主线程必须有消息队列，否则剪贴板写入会失败
+    // （迷你面板「点了没反应」的根因）。
+    //
+    // arboard 的 Windows 实现要创建一个隐藏窗口来持有剪贴板
+    // （`OpenClipboard` + `SetClipboardData` 需要线程有消息队列）。
+    // 而 daemon 主线程从不跑消息循环（事件走 mpsc channel），
+    // 队列不存在 ⇒ `Clipboard::new()` 或 `set_text` 静默失败
+    // ⇒ 复制出去是空的。
+    //
+    modular_clipboard_platform::ensure_message_queue();
+
     // 热键要从配置里来，而不是模块里的默认值——
     // 否则用户在设置里改了绑定，重启后又被改回去。
     let toggle = hotkey::spec_or_default(&config.hotkey_toggle);
@@ -366,31 +382,27 @@ fn set_hotkey_error(core: &Core, failed: Vec<String>) {
 /// 公开：单进程模式的界面进程也要维护同一份快照。
 pub fn sync_mini_items(service: &Service, cell: &tray::MiniItems) {
     let n = service.state.config.mini_panel.effective_count();
-    // 每项前缀「序号 + 置顶标记」：系统菜单是唯一能承载的元信息通道
-    // （菜单项只有一行文本，没有副标题/图标）。序号让用户知道第几项
-    // 对应第几条；置顶标记用 ASCII 的 `*` 而不是 `★`——后者依赖系统
-    // 字体是否带该字形，缺字形会显示成豆腐块。
+    // 只显示内容预览，**不带序号前缀**（2026-10-22 用户要求去掉
+    // `1.` / `2.` / `3.` 这类标记）。置顶项用 `*` 前缀标记——
+    // 这是识别置顶的唯一通道（菜单只有一行文本，没有图标/副标题）。
     //
-    // CAUTION: 前缀占了宽度，预览必须相应缩短，否则菜单项过宽会被
-    // 系统在屏幕边缘折行/截断（菜单不会省略号，只会难看）。
-    const PREVIEW_CHARS: usize = 40;
+    // 预览截断到 48 字符：系统菜单不会自己省略号，文本过长会被
+    // 在屏幕边缘折行或截断。48 是「一眼认出内容」与「不撑爆宽度」
+    // 的平衡点。
+    let preview_chars = service.state.config.mini_panel.effective_preview_chars();
     let snapshot: Vec<(i64, String)> = service
         .state
         .items
         .iter()
         .take(n)
-        .enumerate()
-        .map(|(idx, i)| {
-            let mark = if i.pinned { "*" } else { " " };
-            (
-                i.id,
-                format!(
-                    "{}{}. {}",
-                    mark,
-                    idx + 1,
-                    i.preview.chars().take(PREVIEW_CHARS).collect::<String>()
-                ),
-            )
+        .map(|i| {
+            let preview: String = i.preview.chars().take(preview_chars).collect();
+            let text = if i.pinned {
+                format!("* {preview}")
+            } else {
+                preview
+            };
+            (i.id, text)
         })
         .collect();
     if let Ok(mut g) = cell.lock() {

@@ -23,6 +23,9 @@ image = { workspace = true }
 # 与渲染桥直接交互的句柄类型；顶点数据用 bytemuck 投递给缓冲。
 ash = { workspace = true }
 bytemuck = { workspace = true }
+# 「检查更新」解析 GitHub releases API 的 JSON（拿 release notes 与
+# 下载页地址）。只在 `about.rs` 用，不扩散到其它模块。
+serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # presence.rs 直接操作 HWND（唤起/隐藏窗口）。

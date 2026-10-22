@@ -2685,6 +2685,9 @@ mod tests {
         out.textures_delta.clear();
 
         for icon in crate::icons::Icon::ALL {
+            if icon.is_vector() {
+                continue; // 自绘图标不走字形
+            }
             let cp = icon.codepoint();
             // 排版 + 取图集。epaint 0.36 的 `layout` 收 4 个参数，
             // 字形在 `galley.rows[].row.glyphs[]`（不是 `galley.glyphs`）。
