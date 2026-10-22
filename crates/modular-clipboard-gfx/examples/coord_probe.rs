@@ -209,7 +209,7 @@ fn measure_click(ppp: f32) -> (bool, Pos2) {
     let ctx = egui::Context::default();
     install_cjk_font(&ctx);
     let logical_size = vec2(PHYS_W / SCALE, PHYS_H / SCALE);
-    let id = Id::new("probe_search");
+    let id = Id::unique("probe_search");
 
     let target = SEARCH_RECT.center();
     let mut down_on = false;

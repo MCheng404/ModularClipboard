@@ -203,7 +203,7 @@ impl<'a> SettingsWindow<'a> {
             // 清主窗口的 Context 对设置窗口毫无作用——早前就是这么
             // 写的，等于没写。
             self.ctx
-                .memory_mut(|m| m.data.remove::<egui::Id>(egui::Id::new("settings_scroll")));
+                .memory_mut(|m| m.data.remove::<egui::Id>(egui::Id::unique("settings_scroll")));
             // 设置界面状态归零：每次打开都从「常规」分类、空搜索、
             // 非最近修改视图开始。
             //

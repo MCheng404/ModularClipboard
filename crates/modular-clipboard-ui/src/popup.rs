@@ -435,7 +435,7 @@ impl<'a> Popup<'a> {
             // `anim::fade_in_once` 判「首次出现」不再成立，之后每次展开
             // 都没有滑入动效。这里显式清掉，让每次展开都重播一遍。
             // （绘制侧的同名 id 见 `App::draw_popup`。）
-            crate::anim::clear(&self.ctx, egui::Id::new(("popup_in", kind)));
+            crate::anim::clear(&self.ctx, egui::Id::unique(("popup_in", kind)));
             self.raise_to_top();
             if kind.activatable() {
                 crate::presence::focus_window(self.window.hwnd());
@@ -886,7 +886,7 @@ mod tests {
         g.note_drawn(idle_query(t), IDLE);
 
         let mut q = idle_query(t + Duration::from_millis(1));
-        q.focused = Some(egui::Id::new("search_edit"));
+        q.focused = Some(egui::Id::unique("search_edit"));
         assert!(g.needs_redraw(q), "获得焦点必须重绘");
 
         g.note_drawn(q, IDLE);

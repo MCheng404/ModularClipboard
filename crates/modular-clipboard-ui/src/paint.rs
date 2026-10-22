@@ -1508,7 +1508,7 @@ fn draw_cursor_glow(f: &mut Frame<'_>) {
     // 冻结在最后位置（目标取当前显示值 ⇒ 补间不动）。
     let a = crate::anim::tween_f32(
         ctx,
-        egui::Id::new("glow_a"),
+        egui::Id::unique("glow_a"),
         if target.is_some() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(160),
         crate::anim::Ease::OutCubic,
@@ -1519,14 +1519,14 @@ fn draw_cursor_glow(f: &mut Frame<'_>) {
     };
     let cx = crate::anim::tween_f32(
         ctx,
-        egui::Id::new("glow_cx"),
+        egui::Id::unique("glow_cx"),
         tx,
         std::time::Duration::from_millis(90),
         crate::anim::Ease::OutCubic,
     );
     let cy = crate::anim::tween_f32(
         ctx,
-        egui::Id::new("glow_cy"),
+        egui::Id::unique("glow_cy"),
         ty,
         std::time::Duration::from_millis(90),
         crate::anim::Ease::OutCubic,
@@ -2693,14 +2693,14 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     // 后注册的 interact 在重叠区胜出，面板整体盖过拖动区。
     let panel_resp = f
         .ui
-        .interact(r, egui::Id::new("card_search_box"), Sense::click());
+        .interact(r, egui::Id::unique("card_search_box"), Sense::click());
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
             // IMPORTANT: **必须给显式 id**。不给的话 egui 按调用位置自动生成，
             // 于是：焦点断言没法稳定地指向它（只能退化成
             // 「有没有任何控件获得焦点」这种恒真判断），且任何调整
             // 布局的改动都可能悄悄换掉 id。
-            .id(egui::Id::new("search_edit"))
+            .scope_id(egui::Id::unique("search_edit"))
             .max_rect(edit_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
         |ui| {
@@ -2754,7 +2754,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     // 弹窗 ctx 的补间由 `draw_popup` 末尾的 busy 检查续帧。
     let focus_k = crate::anim::tween_f32(
         f.ui.ctx(),
-        egui::Id::new("search_panel_focus"),
+        egui::Id::unique("search_panel_focus"),
         if edit_resp.has_focus() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(130),
         crate::anim::Ease::OutCubic,
@@ -2762,7 +2762,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     if focus_k > 0.004 {
         let ring = crate::anim::tween_color(
             f.ui.ctx(),
-            egui::Id::new("search_panel_focus_color"),
+            egui::Id::unique("search_panel_focus_color"),
             pal.accent,
             std::time::Duration::from_millis(130),
         );
@@ -2783,12 +2783,12 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         );
         let cr = f
             .ui
-            .interact(clear, egui::Id::new("card_search_clear"), Sense::click());
+            .interact(clear, egui::Id::unique("card_search_clear"), Sense::click());
         // 悬停圆角底 + 图标颜色补间（110ms）：与行内操作按钮同一套。
         // 弹窗 ctx 里的补间要靠末尾的 busy 续帧（见本函数结尾）。
         let chov = crate::anim::tween_f32(
             f.ui.ctx(),
-            egui::Id::new("search_clear_hover"),
+            egui::Id::unique("search_clear_hover"),
             if cr.hovered() { 1.0 } else { 0.0 },
             std::time::Duration::from_millis(110),
             crate::anim::Ease::OutCubic,
@@ -2800,7 +2800,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         }
         let clear_icon_color = crate::anim::tween_color(
             f.ui.ctx(),
-            egui::Id::new("search_clear_icon"),
+            egui::Id::unique("search_clear_icon"),
             if cr.hovered() { pal.text_bright } else { pal.text_dim },
             std::time::Duration::from_millis(110),
         );
@@ -2825,7 +2825,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         && let Some(id) = f.state.search_edit_id
     {
         // CAUTION: 必须是自报的**真实 id**。拿上层猜的
-        // `Id::new("search_edit")` 请求焦点会打水漂——那个 id 与
+        // `Id::unique("search_edit")` 请求焦点会打水漂——那个 id 与
         // TextEdit 实际用的 id 不相等（`UiBuilder::id` 只是容器 id）。
         f.ui.memory_mut(|m| m.request_focus(id));
         f.state.search_focus_pending = false;
@@ -3066,7 +3066,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // 一直是 `ui.interact`，本函数与它保持一致。
         let resp = f
             .ui
-            .interact(slot, egui::Id::new(("rail", kind)), Sense::click());
+            .interact(slot, egui::Id::unique(("rail", kind)), Sense::click());
         // 底色：激活 accent / 常态 surface_raised（磨砂模式降 alpha）。
         //
         // CAUTION: `row_hover` 是**半透明**令牌（`from_white_alpha(30)`），
@@ -3082,7 +3082,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // 取消时反向；描边随激活淡出，图标颜色同步补间。
         let act = crate::anim::tween_f32(
             f.ui.ctx(),
-            egui::Id::new(("rail_active", kind)),
+            egui::Id::unique(("rail_active", kind)),
             if active { 1.0 } else { 0.0 },
             std::time::Duration::from_millis(160),
             crate::anim::Ease::OutCubic,
@@ -3104,7 +3104,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         }
         let base = crate::anim::tween_color(
             f.ui.ctx(),
-            egui::Id::new(("rail_base", kind)),
+            egui::Id::unique(("rail_base", kind)),
             base_target,
             std::time::Duration::from_millis(160),
         );
@@ -3119,7 +3119,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
             // 提亮；alpha 走预乘缩放（`fade_color`），不用 raw row_hover。
             let hov = crate::anim::tween_f32(
                 f.ui.ctx(),
-                egui::Id::new(("rail_hover", kind)),
+                egui::Id::unique(("rail_hover", kind)),
                 if resp.hovered() { 1.0 } else { 0.0 },
                 std::time::Duration::from_millis(110),
                 crate::anim::Ease::OutCubic,
@@ -3146,7 +3146,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         };
         let icon_color = crate::anim::tween_color(
             f.ui.ctx(),
-            egui::Id::new(("rail_icon", kind)),
+            egui::Id::unique(("rail_icon", kind)),
             icon_target,
             std::time::Duration::from_millis(130),
         );
@@ -3331,7 +3331,7 @@ fn icon_button(
     // 写反了会报 E0308。
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
-            .id(egui::Id::new(id))
+            .scope_id(egui::Id::unique(id))
             .max_rect(r)
             .layout(egui::Layout::top_down(egui::Align::Min)),
         |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
@@ -3342,7 +3342,7 @@ fn icon_button(
     // 「硬没」，与列表行的平滑悬停观感不一致。id 用按钮名（每帧稳定）。
     let hov = crate::anim::tween_f32(
         f.ui.ctx(),
-        egui::Id::new(("icon_btn_hover", id)),
+        egui::Id::unique(("icon_btn_hover", id)),
         if resp.hovered() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(110),
         crate::anim::Ease::OutCubic,
@@ -3400,7 +3400,7 @@ fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response {
     let pal = f.pal;
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
-            .id(egui::Id::new("search_icon"))
+            .scope_id(egui::Id::unique("search_icon"))
             .max_rect(r)
             .layout(egui::Layout::top_down(egui::Align::Min)),
         |ui| ui.add_sized(r.size(), egui::Button::new("").frame(false)),
@@ -3409,7 +3409,7 @@ fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response {
     // 悬停底色补间：与 [`icon_button`] 同一套（110ms OutCubic）。
     let hov = crate::anim::tween_f32(
         f.ui.ctx(),
-        egui::Id::new("search_icon_hover"),
+        egui::Id::unique("search_icon_hover"),
         if resp.hovered() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(110),
         crate::anim::Ease::OutCubic,
@@ -3701,7 +3701,7 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     }
     let mut ui = f.ui.new_child(
         egui::UiBuilder::new()
-            .id(egui::Id::new("settings"))
+            .scope_id(egui::Id::unique("settings"))
             .max_rect(content)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
@@ -3726,7 +3726,7 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     // 录制结束 ⇒ 清掉入场补间条目：`fade_in_once` 判「首次出现」，
     // 不清的话只有程序生命周期内**第一次**录制有淡入动效，第二次起
     // 硬现（与弹窗 `just_opened` 清 `("popup_in", kind)` 同一个道理）。
-    crate::anim::clear(f.ui.ctx(), egui::Id::new("recording_overlay_in"));
+    crate::anim::clear(f.ui.ctx(), egui::Id::unique("recording_overlay_in"));
 
     // MCP 调用设置覆盖层（限制在本窗口客户区内，不遮桌面）。
     //
@@ -3765,7 +3765,7 @@ fn draw_settings_close(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     let btn = f.ui.scope_builder(
         egui::UiBuilder::new()
-            .id(egui::Id::new("settings_close"))
+            .scope_id(egui::Id::unique("settings_close"))
             .max_rect(r)
             .layout(egui::Layout::top_down(egui::Align::Min)),
         |u| u.add_sized(r.size(), egui::Button::new("").frame(false)),
@@ -3794,7 +3794,7 @@ fn draw_settings_search(f: &mut Frame<'_>, search_rect: Rect) {
     let mut q = f.state.settings_query.clone();
     let resp = f.ui.scope_builder(
         egui::UiBuilder::new()
-            .id(egui::Id::new("settings_search"))
+            .scope_id(egui::Id::unique("settings_search"))
             .max_rect(search_rect),
         |u| {
             u.painter().rect_filled(search_rect, pal.radius_md, pal.surface_variant);
@@ -3912,7 +3912,7 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         .unwrap_or(0) as f32;
     let pill_idx = crate::anim::tween_f32(
         f.ui.ctx(),
-        egui::Id::new("nav_pill"),
+        egui::Id::unique("nav_pill"),
         sel_idx,
         std::time::Duration::from_millis(220),
         crate::anim::Ease::OutCubic,
@@ -3929,7 +3929,7 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         let selected = f.state.settings_cat == *cat;
         let resp = f
             .ui
-            .interact(r, egui::Id::new(("settings_cat", *cat)), egui::Sense::click());
+            .interact(r, egui::Id::unique(("settings_cat", *cat)), egui::Sense::click());
         // ---- 悬停底（110ms）：只在未选中时叠 -----------------------------
         //
         // 选中态由上面那块**平移的**选中底表达，这里不再各画一份——
@@ -3937,7 +3937,7 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         if !selected {
             let hov_t = crate::anim::tween_f32(
                 f.ui.ctx(),
-                egui::Id::new(("nav_hover", *cat)),
+                egui::Id::unique(("nav_hover", *cat)),
                 if resp.hovered() { 1.0 } else { 0.0 },
                 std::time::Duration::from_millis(110),
                 crate::anim::Ease::OutCubic,
@@ -3957,13 +3957,13 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         // 与选中底同步。首帧落目标（`tween_color` 惰性插入）。
         let icon_color = crate::anim::tween_color(
             f.ui.ctx(),
-            egui::Id::new(("nav_icon", *cat)),
+            egui::Id::unique(("nav_icon", *cat)),
             if selected { pal.accent } else { pal.text_dim },
             std::time::Duration::from_millis(130),
         );
         let text_color = crate::anim::tween_color(
             f.ui.ctx(),
-            egui::Id::new(("nav_text", *cat)),
+            egui::Id::unique(("nav_text", *cat)),
             if selected { pal.text_bright } else { pal.text_dim },
             std::time::Duration::from_millis(130),
         );
@@ -5015,7 +5015,7 @@ fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     let chip_gap = 6.0;
 
     // 拖拽态跨帧记忆：当前正被拖动的元素。
-    let drag_id = ui.id().with("row_meta_drag");
+    let drag_id = ui.scope_id().with("row_meta_drag");
     let dragged: Option<RowMetaPart> = ui.data(|d| d.get_temp(drag_id));
 
     ui.horizontal(|ui| {
@@ -5025,7 +5025,7 @@ fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         for &part in cfg.order.iter() {
             let w = crate::text::measure_text(ui, part.label(), &font) + chip_pad_x * 2.0;
             let (rect, _) = ui.allocate_exact_size(vec2(w, chip_h), egui::Sense::hover());
-            let id = ui.id().with(("rowmeta_chip", part.label()));
+            let id = ui.scope_id().with(("rowmeta_chip", part.label()));
             let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
             cells.push((part, rect, resp));
         }
@@ -6204,7 +6204,7 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // NOTE: 同一个矩形只准注册**一次**交互。
     //
     // 早前这里写的是 `allocate_exact_size(size, Sense::click())`
-    // 紧接着又 `interact(rect, Id::new(("switch", …)), Sense::click())`
+    // 紧接着又 `interact(rect, Id::unique(("switch", …)), Sense::click())`
     // ——同一块区域注册了两个不同 Id 的交互区，靠「后注册者优先」
     // 侥幸正确：一旦有人在中间插一个控件，或者 egui 改了同层交互区
     // 的优先级规则，点击就会落到那个被忽略的 `_alloc` 上，开关直接
@@ -6214,7 +6214,7 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // 纯粹向后推游标），点击交互由下面那条显式 `interact` 承担——
     // 它的 Id 绑定字段名，跨帧稳定。
     let (rect, _alloc) = ui.allocate_exact_size(egui::vec2(w, h), Sense::empty());
-    let resp = ui.interact(rect, egui::Id::new(("switch", id_suffix)), Sense::click());
+    let resp = ui.interact(rect, egui::Id::unique(("switch", id_suffix)), Sense::click());
 
     let track = Rect::from_center_size(rect.center(), vec2(w, h));
     let p = ui.painter_at(rect);
@@ -6237,7 +6237,7 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     };
     let track_color = crate::anim::tween_color(
         ui.ctx(),
-        egui::Id::new(("switch_track", id_suffix)),
+        egui::Id::unique(("switch_track", id_suffix)),
         track_target,
         std::time::Duration::from_millis(130),
     );
@@ -6246,7 +6246,7 @@ fn draw_switch(f: &mut Frame<'_>, ui: &mut Ui, id_suffix: &'static str, v: &mut 
     // 滑块位置：平滑动画（egui 按帧插值），不再硬切。
     let anim = ui
         .ctx()
-        .animate_bool(egui::Id::new(("switch_anim", id_suffix)), on);
+        .animate_bool(egui::Id::unique(("switch_anim", id_suffix)), on);
     let knob_r = h * 0.5 - 3.0;
     let left_x = track.min.x + h * 0.5;
     let right_x = track.max.x - h * 0.5;
@@ -6324,7 +6324,7 @@ fn draw_slider(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
     let resp = ui.interact(
         rect,
-        egui::Id::new(("slider", id_suffix, variant)),
+        egui::Id::unique(("slider", id_suffix, variant)),
         if enabled {
             Sense::click_and_drag()
         } else {
@@ -6409,7 +6409,7 @@ fn draw_step_slider(
     let (rect, _) = ui.allocate_exact_size(egui::vec2(track_w, cell_h), Sense::empty());
     let resp = ui.interact(
         rect,
-        egui::Id::new(("step_slider", id_suffix)),
+        egui::Id::unique(("step_slider", id_suffix)),
         if enabled {
             Sense::click_and_drag()
         } else {
@@ -6542,7 +6542,7 @@ fn draw_segmented<T: Copy + PartialEq>(
         .unwrap_or(0) as f32;
     let pill_idx = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("seg_pill", id_suffix)),
+        egui::Id::unique(("seg_pill", id_suffix)),
         sel_idx,
         std::time::Duration::from_millis(160),
         crate::anim::Ease::OutCubic,
@@ -6559,7 +6559,7 @@ fn draw_segmented<T: Copy + PartialEq>(
             pos2(r.min.x + seg_w * i as f32, r.min.y),
             pos2(r.min.x + seg_w * (i + 1) as f32, r.max.y),
         );
-        let resp = ui.interact(seg, egui::Id::new(("seg", i, label)), egui::Sense::click());
+        let resp = ui.interact(seg, egui::Id::unique(("seg", i, label)), egui::Sense::click());
         // 文字放不下时按**段宽**省略：`draw_text` 不裁剪，直接画会
         // 越到相邻段上（视觉上两段文字叠在一起）。
         let text = elide_to_width(ui, label, &font, seg.width() - 8.0);
@@ -6575,7 +6575,7 @@ fn draw_segmented<T: Copy + PartialEq>(
         };
         let color = crate::anim::tween_color(
             ui.ctx(),
-            egui::Id::new(("seg_text", id_suffix, label)),
+            egui::Id::unique(("seg_text", id_suffix, label)),
             target_color,
             std::time::Duration::from_millis(130),
         );
@@ -6683,7 +6683,7 @@ fn draw_text_field(
     // 「亮点一下又缩回去」的硬切。设置窗口每帧驱动，无需续帧请求。
     let focus_k = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("field_focus", id_suffix)),
+        egui::Id::unique(("field_focus", id_suffix)),
         if resp.has_focus() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(130),
         crate::anim::Ease::OutCubic,
@@ -6691,7 +6691,7 @@ fn draw_text_field(
     if focus_k > 0.004 {
         let ring = crate::anim::tween_color(
             ui.ctx(),
-            egui::Id::new(("field_focus_color", id_suffix)),
+            egui::Id::unique(("field_focus_color", id_suffix)),
             pal.accent,
             std::time::Duration::from_millis(130),
         );
@@ -6738,12 +6738,12 @@ fn draw_mini_button(
         .width();
     let size = vec2(text_w + 16.0, pal.control_height * 0.82);
     let (r, _) = ui.allocate_exact_size(size, egui::Sense::empty());
-    let resp = ui.interact(r, egui::Id::new(("mini_btn", id_suffix)), Sense::click());
+    let resp = ui.interact(r, egui::Id::unique(("mini_btn", id_suffix)), Sense::click());
     let p = ui.painter_at(r);
     // 悬停补间（110ms OutCubic）：目标值由本帧是否悬停给出。
     let hover = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("mini_btn_hover", id_suffix)),
+        egui::Id::unique(("mini_btn_hover", id_suffix)),
         if resp.hovered() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(110),
         crate::anim::Ease::OutCubic,
@@ -6819,7 +6819,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         for (i, (name, prgb)) in crate::theme::ACCENT_PRESETS.iter().enumerate() {
             let s = 20.0;
             let (r, _) = ui.allocate_exact_size(vec2(s, s), Sense::empty());
-            let resp = ui.interact(r, egui::Id::new(("accent_preset", i)), Sense::click());
+            let resp = ui.interact(r, egui::Id::unique(("accent_preset", i)), Sense::click());
             let selected = cur.is_some_and(|c| c.to_rgb() == *prgb);
             let p = ui.painter_at(r);
             p.rect_filled(
@@ -6907,7 +6907,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 草稿同步的焦点感知：无焦点时每帧覆写为当前色（点预设 / 拖滑条
         // 后输入框跟着变），有焦点时保留用户输入（ rationale 见
         // `UiState::accent_hex`）。非法半截输入不清除已选颜色。
-        let editing = ui.ctx().memory(|m| m.has_focus(egui::Id::new("accent_hex_edit")));
+        let editing = ui.ctx().memory(|m| m.has_focus(egui::Id::unique("accent_hex_edit")));
         if !editing {
             f.state.accent_hex = shown.to_hex();
         }
@@ -6932,7 +6932,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         );
         let resp = child.add(
             egui::TextEdit::singleline(&mut f.state.accent_hex)
-                .id(egui::Id::new("accent_hex_edit"))
+                .id(egui::Id::unique("accent_hex_edit"))
                 .hint_text("#RRGGBB")
                 .frame(egui::Frame::NONE)
                 .text_color(pal.text)
@@ -6942,14 +6942,14 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
             // 聚焦描边补间（130ms）：与设置页其它输入框同一套。
             let focus_k = crate::anim::tween_f32(
                 ui.ctx(),
-                egui::Id::new("accent_hex_focus"),
+                egui::Id::unique("accent_hex_focus"),
                 1.0,
                 std::time::Duration::from_millis(130),
                 crate::anim::Ease::OutCubic,
             );
             let ring = crate::anim::tween_color(
                 ui.ctx(),
-                egui::Id::new("accent_hex_focus_color"),
+                egui::Id::unique("accent_hex_focus_color"),
                 pal.accent,
                 std::time::Duration::from_millis(130),
             );
@@ -7380,7 +7380,7 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     // 的 else 分支），每次开始录制都重播一遍。
     let k = crate::anim::fade_in_once(
         f.ui.ctx(),
-        egui::Id::new("recording_overlay_in"),
+        egui::Id::unique("recording_overlay_in"),
         std::time::Duration::from_millis(200),
         crate::anim::Ease::OutCubic,
     );
@@ -7414,7 +7414,7 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
 
     // 全屏交互：录制态下**任意位置**（含面板内）的点击都算确认。
     // 子内容全部 painter 直绘、不注册交互区，点击自然落到这层。
-    let bg = f.ui.interact(area, egui::Id::new("recording_overlay"), egui::Sense::click());
+    let bg = f.ui.interact(area, egui::Id::unique("recording_overlay"), egui::Sense::click());
     if bg.clicked() {
         f.state.push(Op::FinishRecording);
     }
@@ -7538,7 +7538,7 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     let panel = Rect::from_center_size(area.center(), vec2(pw, ph));
 
     // 点击面板外关闭。
-    let bg = f.ui.interact(area, egui::Id::new("mcp_overlay_bg"), egui::Sense::click());
+    let bg = f.ui.interact(area, egui::Id::unique("mcp_overlay_bg"), egui::Sense::click());
     if bg.clicked() && bg.interact_pointer_pos().is_some_and(|p| !panel.contains(p)) {
         f.state.mcp_overlay_open = false;
     }
@@ -7548,7 +7548,7 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
 
     let mut ui = f.ui.new_child(
         egui::UiBuilder::new()
-            .id(egui::Id::new("mcp_overlay"))
+            .scope_id(egui::Id::unique("mcp_overlay"))
             .max_rect(panel.shrink2(vec2(16.0, 14.0)))
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
@@ -7651,7 +7651,7 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     if list_bottom > list_top + 8.0 {
         let mut lu = f.ui.new_child(
             egui::UiBuilder::new()
-                .id(egui::Id::new("mcp_overlay_list"))
+                .scope_id(egui::Id::unique("mcp_overlay_list"))
                 .max_rect(list_rect)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
         );
@@ -7669,7 +7669,7 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     // 底部：取消 / 完成。
     let mut bu = f.ui.new_child(
         egui::UiBuilder::new()
-            .id(egui::Id::new("mcp_overlay_bottom"))
+            .scope_id(egui::Id::unique("mcp_overlay_bottom"))
             .max_rect(Rect::from_min_max(
                 pos2(panel.min.x + 16.0, list_bottom),
                 pos2(panel.max.x - 16.0, panel.max.y - 10.0),
@@ -8299,7 +8299,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 现在交给 egui 按真实内容高算。
     let mut list_ui = f.ui.new_child(
         egui::UiBuilder::new()
-            .id(egui::Id::new(("list", only_pinned.unwrap_or(false))))
+            .scope_id(egui::Id::unique(("list", only_pinned.unwrap_or(false))))
             .max_rect(content)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
@@ -8439,7 +8439,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
             if play_entry {
                 crate::anim::restart(
                     ui.ctx(),
-                    egui::Id::new(("list_row_in", pinned_slot)),
+                    egui::Id::unique(("list_row_in", pinned_slot)),
                     0.0,
                     1.0,
                     std::time::Duration::from_millis(200),
@@ -8461,7 +8461,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
                 let y = if i == 0 {
                     let k_in = crate::anim::tween_f32(
                         ui.ctx(),
-                        egui::Id::new(("list_row_in", pinned_slot)),
+                        egui::Id::unique(("list_row_in", pinned_slot)),
                         1.0,
                         std::time::Duration::from_millis(200),
                         crate::anim::Ease::OutCubic,
@@ -8556,7 +8556,7 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     //
     // 回读后两者就一致了：滚轮、拖条、触屏都由 egui 处理，我们只
     // 是把结果镜像一份，供**下一帧**的虚拟化使用。
-    let reported = out.state.offset.y;
+    let reported = out.state.clamped_offset().y;
     f.state.set_list_scroll(pinned_slot, reported.clamp(0.0, max_scroll));
 }
 
@@ -8999,7 +8999,7 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     // 因此可以与 `&mut f` 并存。
     let preview_ui = f.ui.new_child(
         egui::UiBuilder::new()
-            .id(egui::Id::new("detail_preview"))
+            .scope_id(egui::Id::unique("detail_preview"))
             .max_rect(content_band)
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
@@ -9096,7 +9096,7 @@ fn draw_zoom_button(f: &mut Frame<'_>, pal: &Palette, item: &ClipItem) {
     // 用 `ui.interact` 而**不是**直接 push Op：每帧都画按钮，
     // 直接 push 等于「每帧推同一个 Op」，会让 IPC 通讯爆炸；
     // `clicked` 仅在用户真正点击时为 true。
-    let id = egui::Id::new(("detail_image_zoom", item.id));
+    let id = egui::Id::unique(("detail_image_zoom", item.id));
     let resp = f.ui.interact(btn_rect, id, Sense::click());
     let painter = f.ui.painter_at(btn_rect);
     // 底色补间（110ms）：悬停时 surface_variant → surface，与行内按钮
@@ -9257,7 +9257,7 @@ fn draw_detail_image_zoom(f: &mut Frame<'_>, body: Rect, item: &ClipItem) {
         ),
         vec2(back_size, back_size),
     );
-    let back_id = egui::Id::new(("detail_image_back", item.id));
+    let back_id = egui::Id::unique(("detail_image_back", item.id));
     let back_resp = f.ui.interact(back_rect, back_id, Sense::click());
     Icon::Close.paint(&f.ui.painter_at(back_rect), back_rect, pal.text_dim);
     if back_resp.clicked() {
@@ -9309,7 +9309,7 @@ fn draw_empty(f: &mut Frame<'_>, body: Rect, msg: &str) {
     // 各的；同一消息重复出现（清了搜索又回到空列表）不重播，可接受。
     let k = crate::anim::fade_in_once(
         f.ui.ctx(),
-        egui::Id::new(("empty_in", msg)),
+        egui::Id::unique(("empty_in", msg)),
         std::time::Duration::from_millis(200),
         crate::anim::Ease::OutCubic,
     );
@@ -9556,7 +9556,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     //
     // `ScrollArea` 的内容 `ui` 裁剪到视口，越界的行自动不可交互，
     // 与「看得见才点得到」一致。
-    let resp = ui.interact(r, egui::Id::new(("row", item.id)), Sense::click());
+    let resp = ui.interact(r, egui::Id::unique(("row", item.id)), Sense::click());
     // 自报行本体热区：测试与 MCP 自动化需要「点这一行」的坐标，
     // 不该各自重算行矩形。CAUTION: 多行共用同一个 key，HashMap 后者
     // 覆盖前者 ⇒ 读到的是**最后绘制的那一行**（可见行里最靠下的）。
@@ -9643,7 +9643,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 「整块实心 border 填充」，被 0 触发的后果是整行刷成 accent。
     let sel = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("row_sel", item.id)),
+        egui::Id::unique(("row_sel", item.id)),
         if selected { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(140),
         crate::anim::Ease::OutCubic,
@@ -9665,7 +9665,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 需要更紧的宿主可在列表刷新时按 id 调 `anim::clear`。
     let hover = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("row_hover", item.id)),
+        egui::Id::unique(("row_hover", item.id)),
         if resp.hovered() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(110),
         crate::anim::Ease::OutCubic,
@@ -9682,7 +9682,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 「按住了」，也让点击到选中的衔接有 intermediate 状态。
     let press = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("row_press", item.id)),
+        egui::Id::unique(("row_press", item.id)),
         if resp.is_pointer_button_down_on() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(90),
         crate::anim::Ease::OutCubic,
@@ -9881,10 +9881,10 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
             // 而不重算公式。CAUTION: 多行都会登记同一个 key，HashMap 后者
             // 覆盖前者——单条目夹具里无歧义，多条目场景请用显隐判据。
             f.hit_insert("row_undo", b);
-            let rr = ui.interact(b, egui::Id::new(("row_undo", item.id)), Sense::click());
+            let rr = ui.interact(b, egui::Id::unique(("row_undo", item.id)), Sense::click());
             let bh = crate::anim::tween_f32(
                 ui.ctx(),
-                egui::Id::new(("row_undo_hover", item.id)),
+                egui::Id::unique(("row_undo_hover", item.id)),
                 if rr.hovered() { 1.0 } else { 0.0 },
                 std::time::Duration::from_millis(110),
                 crate::anim::Ease::OutCubic,
@@ -9903,10 +9903,10 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         }
         let b = Rect::from_center_size(pos2(bx + badge_side * 0.5, bcy), vec2(badge_side, badge_side));
         f.hit_insert("row_edit", b);
-        let rr = ui.interact(b, egui::Id::new(("row_edit", item.id)), Sense::click());
+        let rr = ui.interact(b, egui::Id::unique(("row_edit", item.id)), Sense::click());
         let bh = crate::anim::tween_f32(
             ui.ctx(),
-            egui::Id::new(("row_edit_hover", item.id)),
+            egui::Id::unique(("row_edit_hover", item.id)),
             if rr.hovered() { 1.0 } else { 0.0 },
             std::time::Duration::from_millis(110),
             crate::anim::Ease::OutCubic,
@@ -10099,13 +10099,13 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         if b.min.x < text_x1 {
             break; // 卡片太窄，放不下就不画操作
         }
-        let rr = ui.interact(b, egui::Id::new(("row_act", item.id, i)), Sense::click());
+        let rr = ui.interact(b, egui::Id::unique(("row_act", item.id, i)), Sense::click());
         // 悬停圆角底（110ms OutCubic 补间）：小图标按钮只有「图标变色」
         // 时反馈太弱，加一层 `row_hover` 底让按钮有可点的实体感。底色先
         // 画、图标后画，顺序不能反。id 带条目与槽位，三个按钮各自独立。
         let bh = crate::anim::tween_f32(
             ui.ctx(),
-            egui::Id::new(("row_act_hover", item.id, i)),
+            egui::Id::unique(("row_act_hover", item.id, i)),
             if rr.hovered() { 1.0 } else { 0.0 },
             std::time::Duration::from_millis(110),
             crate::anim::Ease::OutCubic,
@@ -10218,12 +10218,12 @@ fn draw_inline_editor(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipI
     let mut resp_opt = None;
     f.ui.scope_builder(
         egui::UiBuilder::new()
-            .id(egui::Id::new(("inline_editor_scope", item.id)))
+            .scope_id(egui::Id::unique(("inline_editor_scope", item.id)))
             .max_rect(text_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
         |ui| {
             let te = egui::TextEdit::multiline(&mut f.state.edit_buf)
-                .id(egui::Id::new(("inline_editor", item.id)))
+                .id(egui::Id::unique(("inline_editor", item.id)))
                 .hint_text("输入内容…")
                 .font(egui::FontId::proportional(pal.font_md))
                 .desired_width(text_rect.width())
@@ -10264,10 +10264,10 @@ fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &Clip
     // （后者按值消耗 `Response`）。
     f.hit_insert("editor_ok", ok_r);
     f.hit_insert("editor_no", no_r);
-    let rr = ui.interact(ok_r, egui::Id::new(("editor_ok", item.id)), Sense::click());
+    let rr = ui.interact(ok_r, egui::Id::unique(("editor_ok", item.id)), Sense::click());
     let bh = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("editor_ok_hover", item.id)),
+        egui::Id::unique(("editor_ok_hover", item.id)),
         if rr.hovered() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(110),
         crate::anim::Ease::OutCubic,
@@ -10292,10 +10292,10 @@ fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &Clip
     }
 
     // ✕ 取消。图标用 Close 字体字形（PUA 码位里有现成的，不必几何画）。
-    let rr = ui.interact(no_r, egui::Id::new(("editor_no", item.id)), Sense::click());
+    let rr = ui.interact(no_r, egui::Id::unique(("editor_no", item.id)), Sense::click());
     let bh = crate::anim::tween_f32(
         ui.ctx(),
-        egui::Id::new(("editor_no_hover", item.id)),
+        egui::Id::unique(("editor_no_hover", item.id)),
         if rr.hovered() { 1.0 } else { 0.0 },
         std::time::Duration::from_millis(110),
         crate::anim::Ease::OutCubic,

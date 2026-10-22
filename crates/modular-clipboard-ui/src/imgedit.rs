@@ -776,7 +776,7 @@ impl<'a> ImageEditor<'a> {
             pal.text,
         );
         let close_r = close_button_rect(rect.width());
-        let cr = ui.interact(close_r, egui::Id::new("imgedit_close"), egui::Sense::click());
+        let cr = ui.interact(close_r, egui::Id::unique("imgedit_close"), egui::Sense::click());
         let close_clicked = cr.clicked();
         let close_hovered = cr.hovered();
         cr.on_hover_text("关闭（不保存）");
@@ -883,7 +883,7 @@ impl<'a> ImageEditor<'a> {
         let interactive = matches!(self.tool, ToolTab::Crop | ToolTab::Brush);
         let resp = ui.interact(
             r,
-            egui::Id::new("imgedit_canvas"),
+            egui::Id::unique("imgedit_canvas"),
             if interactive {
                 egui::Sense::click_and_drag()
             } else {

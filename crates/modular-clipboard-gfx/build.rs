@@ -81,11 +81,19 @@ fn compile(source: &str, origin: &str) -> Vec<u32> {
 
     let info = match naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        // PUSH_CONSTANT：`blur.wgsl` 的合成阶段用 push constant 传
-        // 「磨砂底图的 UV 位移」（自研磨砂移动预测，见 blur.rs）。
-        // 不用该 capability 时 naga 会以 UnsupportedCapability 拒绝
-        // 整个模块——错误发生在编译期，正好逼着后来者看见这里。
-        naga::valid::Capabilities::PUSH_CONSTANT,
+        // naga 30 把 push constant 改造成了 `immediate` 地址空间
+        // （WGSL 语法 `var<immediate>`，SPIR-V 后端仍映射
+        // `StorageClass::PushConstant`，运行时管线不用改），
+        // 对应 capability 位是 `IMMEDIATES`。旧版的
+        // `Capabilities::PUSH_CONSTANT` 已不存在。
+        //
+        // `blur.wgsl` 的合成阶段用它传「磨砂底图的 UV 位移」
+        // （自研磨砂移动预测，见 blur.rs）。除它以外不用任何扩展
+        // 能力 ⇒ 只声明这一位。将来要用 FLOAT64 / binding array
+        // 之类，必须在这里显式加位——漏加会在**编译期**报
+        // UnsupportedCapability，正好逼着后来者看见，而不是带病
+        // 进运行时。
+        naga::valid::Capabilities::IMMEDIATES,
     )
     .validate(&module)
     {

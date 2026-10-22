@@ -1080,7 +1080,7 @@ mod tests {
             // `Ui::new` 只产出我们显式画的东西。
             let mut ui = egui::Ui::new(
                 ctx.clone(),
-                egui::Id::new("icon_probe"),
+                egui::Id::unique("icon_probe"),
                 egui::UiBuilder::new().max_rect(rect),
             );
             let (r, _) = ui.allocate_exact_size(rect.size(), egui::Sense::hover());

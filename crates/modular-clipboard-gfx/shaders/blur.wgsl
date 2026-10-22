@@ -58,7 +58,7 @@ struct CopyOffset {
     offset: vec2<f32>,
 };
 
-var<push_constant> copy_pc: CopyOffset;
+var<immediate> copy_pc: CopyOffset;
 
 @group(0) @binding(0) var<uniform> u: BlurUniforms;
 @group(0) @binding(1) var blur_sampler: sampler;

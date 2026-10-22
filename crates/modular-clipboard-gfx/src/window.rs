@@ -67,7 +67,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use egui::emath::{Pos2, Rect, Vec2};
-use egui::{Event as EguiEvent, Key, Modifiers, MouseWheelUnit, PointerButton, TouchPhase};
+use egui::{Event as EguiEvent, Key, Modifiers, MouseWheelSource, MouseWheelUnit, PointerButton, TouchPhase};
 use windows::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
@@ -1605,6 +1605,8 @@ impl EventLoop {
                         // 由它按 line_scroll_speed 换算成点。
                         unit: MouseWheelUnit::Line,
                         delta: Vec2::new(0.0, *lines),
+                        // Win32 WM_MOUSEWHEEL 只来自物理滚轮。
+                        source: MouseWheelSource::Wheel,
                         // 鼠标滚轮不是触摸。用 Move 让 egui 进入
                         // Status::Smoothing（跨帧平滑）；若误用 Start
                         // 会被当成触摸，修饰键会被锁住直到抬手。

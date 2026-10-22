@@ -2053,7 +2053,7 @@ impl App {
         // 因此共用 `theme::PALETTE_TWEEN`。
         let pal_mix = crate::anim::tween_f32(
             &self.ctx,
-            egui::Id::new("pal_mix"),
+            egui::Id::unique("pal_mix"),
             1.0,
             crate::theme::PALETTE_TWEEN,
             crate::anim::Ease::InOutCubic,
@@ -3036,7 +3036,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         // 面板用同一个矩形，两者同步位移。
         let k = crate::anim::fade_in_once(
             ui.ctx(),
-            egui::Id::new(("popup_in", kind)),
+            egui::Id::unique(("popup_in", kind)),
             std::time::Duration::from_millis(160),
             crate::anim::Ease::OutCubic,
         );
@@ -3280,7 +3280,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         self.pal = self.pal_base.with_font_scale(self.font_scale());
         self.pal_from = self.pal.clone();
         self.pal_to = self.pal.clone();
-        crate::anim::clear(&self.ctx, egui::Id::new("pal_mix"));
+        crate::anim::clear(&self.ctx, egui::Id::unique("pal_mix"));
         crate::theme::apply(&self.ctx, &self.pal);
         tracing::info!(font_scale = self.font_scale(), "字体缩放已应用");
     }
@@ -3387,7 +3387,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         // 修法：切换时显式 `anim::restart` 把进度重置为 0→1。
         crate::anim::restart(
             &self.ctx,
-            egui::Id::new("pal_mix"),
+            egui::Id::unique("pal_mix"),
             0.0,
             1.0,
             crate::theme::PALETTE_TWEEN,

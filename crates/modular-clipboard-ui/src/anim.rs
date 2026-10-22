@@ -107,13 +107,13 @@ struct AnimStore {
 
 /// data store 的键。一个 Context 一份，随 Context 生命周期。
 fn store_id() -> Id {
-    Id::new("mcb_anim_store")
+    Id::unique("mcb_anim_store")
 }
 
 /// 取 `id` 对应的补间当前值；`target` 变化时从当前显示值续接。
 ///
 /// `id` 由调用方构造，必须**稳定**（同一控件每帧同一个 id）且**互异**
-/// （不同控件不同 id）——例如 `Id::new(("row_hover", item_id))`。
+/// （不同控件不同 id）——例如 `Id::unique(("row_hover", item_id))`。
 pub fn tween_f32(ctx: &Context, id: Id, target: f32, dur: Duration, ease: Ease) -> f32 {
     let now = ctx.input(|i| i.time);
     // CAUTION: 全部逻辑必须在闭包**内**完成。从 `data_mut` 的闭包里
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn tween_settles_exactly_on_target() {
         let (ctx, mut input) = ctx_with_time(0.0);
-        let id = Id::new("settle");
+        let id = Id::unique("settle");
         // 首帧插入：直接从目标值开始（不做「从虚空飞入」——控件第一次
         // 出现就应该在它的目标状态上）。
         assert_eq!(
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn retarget_continues_from_current_value() {
         let (ctx, mut input) = ctx_with_time(0.0);
-        let id = Id::new("retarget");
+        let id = Id::unique("retarget");
         // 首帧插入即目标 0（未悬停态）。
         assert_eq!(
             tween_f32(&ctx, id, 0.0, Duration::from_millis(100), Ease::Linear),
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn clear_removes_state() {
         let (ctx, _input) = ctx_with_time(0.0);
-        let id = Id::new("clear-me");
+        let id = Id::unique("clear-me");
         tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear);
         clear(&ctx, id);
         // 清掉后下一次调用以新目标为起点重新开始（而不是从旧状态续接）。
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn restart_replays_a_fixed_animation() {
         let (ctx, mut input) = ctx_with_time(0.0);
-        let id = Id::new("pal_mix_like");
+        let id = Id::unique("pal_mix_like");
         // 首次调用（惰性）：直接落在目标 1.0 上。
         assert_eq!(
             tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear),
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn restart_overrides_previous_state() {
         let (ctx, mut input) = ctx_with_time(0.0);
-        let id = Id::new("override");
+        let id = Id::unique("override");
         tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear);
         input.time = Some(0.05);
         let mut out = ctx.run_ui(input, |_| {});
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn restart_marks_animation_busy() {
         let (ctx, _input) = ctx_with_time(0.0);
-        let id = Id::new("busy-restart");
+        let id = Id::unique("busy-restart");
         tween_f32(&ctx, id, 1.0, Duration::from_millis(100), Ease::Linear);
         assert!(!busy(&ctx), "已完成（惰性 1.0）时不该算在飞");
         restart(&ctx, id, 0.0, 1.0, Duration::from_millis(100), Ease::Linear);
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn fade_in_once_plays_once_then_settles() {
         let (ctx, mut input) = ctx_with_time(0.0);
-        let id = Id::new("empty-in");
+        let id = Id::unique("empty-in");
         // 首现：从 0 起播（与 tween_f32 的「直接落目标」相反）。
         assert_eq!(
             fade_in_once(&ctx, id, Duration::from_millis(100), Ease::Linear),
