@@ -16,30 +16,37 @@ import re
 import sys
 
 SPEC = {
-    "path": "crates/modular-clipboard-gfx/src/window.rs",
-    "subdir": "crates/modular-clipboard-gfx/src/window",
-    "vis_mode": "keep",
-    "mod_vis": "pub",
+    "path": "crates/modular-clipboard-app/src/lib.rs",
+    "subdir": "crates/modular-clipboard-app/src",
+    "vis_mode": "pub_super",
+    "mod_vis": "",
     "anchors": {
-        "event_loop": "pub struct EventLoop {",
-        "keys": "const LETTERS",
+        "ingest": "fn set_notice",
+        "paths": "const PAGE_LIMIT",
     },
-    "root_after_anchor": None,
-    "pub_super_fields": {
-        "event_loop": ["EventLoop"],
-        "keys": ["CharDecoder"],
+    # ingest 段跨两段（paths 段之后还有 preview 助手），用显式 extra ranges 表达：
+    # 引擎按 anchors 顺序切节；这里借助 anchors 的顺序 + 一个附加节实现。
+    "root_after_anchor": "mod tests {",
+    "section_extra_ranges": {
+        "ingest": [("pub const PREVIEW_MAX_CHARS", "mod tests {")],
     },
-    "extra_promote_methods": {
-        "event_loop": ["absorb"],
-    },
+    "root_extra": [
+        "use ingest::*;",
+        "use paths::*;",
+    ],
+    "root_reexport": [
+        "pub use ingest::format_time;",
+        "pub use paths::{CONFIG_FILE_NAME, PREVIEW_MAX_CHARS, config_path_in};",
+    ],
     "tests_anchor": "mod tests {",
     "docs": {
-        "event_loop": "//! `EventLoop`：Win32 消息泵与事件缓冲。\n"
-                      "//!\n"
-                      "//! `poll` 写缓冲、`egui_input` 读缓冲——顺序反了本帧输入全丢\n"
-                      "//! （event_delivery 测试守这条接线）。",
-        "keys": "//! 键位翻译纯逻辑：VK -> egui::Key、修饰键、滚轮、鼠标键、\n"
-                "//! UTF-16 代理对解码。全部是无副作用函数，单测直接覆盖。",
+        "ingest": "//! 捕获入库管线：自写抑制、序列号闸门、预览生成、图片尺寸。\n"
+                  "//!\n"
+                  "//! `capture_should_read` 是「这次剪贴板变更要不要读」的唯一\n"
+                  "//! 判据；`build_preview` 截断到 [`PREVIEW_MAX_CHARS`]。",
+        "paths": "//! 数据目录与配置路径推导、分页与事件队列容量。\n"
+                 "//!\n"
+                 "//! 路径推导历史上三处并存导致过「读 A 写 B」，收敛到此处。",
     },
     "asserts": [],
 }
@@ -79,10 +86,33 @@ else:
     root_after = tests_at
 
 moved = {}
+primary = {}
 for i, name in enumerate(names):
     s = starts[i]
     e = starts[i + 1] if i + 1 < len(starts) else root_after
+    primary[name] = (s, e)
+
+# 附加区间：同一模块的第二段（如 ingest 的 preview 助手在 paths 之后）。
+# 先解析所有附加区间，再把被其起点切开的主区间截断，避免内容重复。
+extras = []
+for name, ranges in SPEC.get("section_extra_ranges", {}).items():
+    for start_anchor, end_anchor in ranges:
+        s = find_anchor(start_anchor)
+        e = find_anchor(end_anchor)
+        extras.append((name, s, e))
+for name, s, e in extras:
+    for other in names:
+        if other == name:
+            continue
+        os_, oe_ = primary[other]
+        if os_ < s < oe_:
+            primary[other] = (os_, s)
+
+for name in names:
+    s, e = primary[name]
     moved[name] = lines[s:e]
+for name, s, e in extras:
+    moved[name] = moved[name] + [""] + lines[s:e]
 
 root = lines[:starts[0]] + lines[root_after:]
 
@@ -291,6 +321,7 @@ for name in names:
     block.append("%smod %s;" % (mod_vis, name))
 block.append("")
 block.extend(reexports)
+block.extend(SPEC.get("root_reexport", []))
 block.extend(SPEC.get("root_extra", []))
 if len(block) > 2:
     block.append("")
