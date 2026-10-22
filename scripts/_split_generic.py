@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""通用 rs 拆分器：foo.rs -> foo.rs(root) + foo/<name>.rs。
+"""通用 rs 拆分器（锚点驱动版）：foo.rs -> foo.rs(root) + foo/<name>.rs。
 
-用法：改下面 SPEC 后运行。行界须先人工核验（带断言）。
-特性：
-- 分区可为多个不相邻区间；
+用法：改下面 SPEC 后运行。特性：
+- anchors 模式：按顺序给出各节锚点（结构体/函数定义行），自动上吸文档注释；
+  节的结束 = 下一节锚点起点；root_after_anchor 之后到 tests_anchor 留 root。
+- vis_mode: "pub_super"（ui crate 内部模块，默认降为 pub(super)）
+            | "keep"（公共 API 不降级，配 mod_vis=pub + 自动再导出）
 - 按顶层 use 块 + 名称出现精确计算每个子文件的导入；
-- 跨子模块引用自动生成 use super::other::item;
-- 可见性：fn/struct/enum/const/static 默认 pub(super)，KEEP_PUB 保持 pub；
-- recording 式「方法段」可用 METHOD_VIS 包进 impl super::RootType；
+- 跨子模块 / root 私有项引用自动生成 use super::...;
 - root 追加 mod 声明 / 再导出 / 自用导入；tests 补子模块 glob。
 """
 import io
@@ -15,71 +15,42 @@ import os
 import re
 import sys
 
-# ---------------------------------------------------------------------- SPEC
 SPEC = {
-    "path": "crates/modular-clipboard-ui/src/theme.rs",
-    "subdir": "crates/modular-clipboard-ui/src/theme",
-    "sections": {
-        "secondary": {
-            "ranges": [(688, 913)],
-            "doc": "//! 二级主题：纸质 / 护眼绿 / 星空紫 / OLED 的取色。\n"
-                   "//!\n"
-                   "//! 一级主题决定「骨架色」，二级主题在其上按浓度 `k` 混向目标色；\n"
-                   "//! `tint_tokens!` 用宏逐个令牌混色——手写漏字段不会有编译提示，\n"
-                   "//! 而症状是「某个控件不跟着变」。",
-        },
-        "accent": {
-            "ranges": [(915, 998)],
-            "doc": "//! 强调色：预设色板、HSV 派生与覆盖层。\n"
-                   "//!\n"
-                   "//! 派生只微调明度不重建——同一个色要同时服务深浅两套主题。",
-        },
-        "system": {
-            "ranges": [(1000, 1064)],
-            "doc": "//! 系统主题探测（Windows 注册表 `AppsUseLightTheme`）。\n"
-                   "//!\n"
-                   "//! 只在启动时调一次；读不到回退深色并告警，不 panic。",
-        },
-        "visuals": {
-            "ranges": [(1066, 1272)],
-            "doc": "//! 把调色板灌进 egui `Visuals` 的入口（`apply` / `set_theme`）。\n"
-                   "//!\n"
-                   "//! 深浅两套都从 `Theme::Dark` 克隆后逐项全量覆盖：只设\n"
-                   "//! `bg_fill` 漏掉 `fg_stroke` 会重现「白底白字」。",
-        },
-        "fonts": {
-            "ranges": [(1274, 1489)],
-            "doc": "//! 字体：中文字体加载、图标字体与字号助手。\n"
-                   "//!\n"
-                   "//! 中文字体字节进程级共享（`shared_font_data`）——每个\n"
-                   "//! `egui::Context` 各装一份会是 35MB × 窗口数。",
-        },
+    "path": "crates/modular-clipboard-core/src/config.rs",
+    "subdir": "crates/modular-clipboard-core/src/config",
+    "vis_mode": "keep",
+    "mod_vis": "pub",
+    "anchors": {
+        "hotkey": "pub struct Hotkey {",
+        "storage": "pub struct StorageConfig {",
+        "layout": "pub struct LayoutConfig {",
+        "ui": "pub struct UiConfig {",
+        "panels": "pub struct TypeRailConfig {",
+        "card_row": "pub struct CardShadowConfig {",
+        "window": "pub enum WindowBackdrop {",
+        "secondary": "pub enum SecondaryTheme {",
+        "theme_params": "pub struct ThemeKnob {",
+        "accent": "pub struct AccentColor {",
+        "mcp": "pub struct ActionRule {",
     },
-    "root_parts": [(1, 686), (1490, 99999)],
-    "root_extra": [
-        "use accent::{apply_overrides, derive_accent};",
-        "use secondary::apply_secondary;",
-    ],
-    "root_reexport": [
-        "pub(crate) use accent::ACCENT_PRESETS;",
-        "pub(crate) use fonts::{install_cjk_font, install_icon_font, sized};",
-        "pub(crate) use system::detect_system_theme;",
-        "pub(crate) use visuals::{SCROLLBAR_WIDTH, apply, composite, set_theme};",
-    ],
-    "root_extra_items": ["Palette"],
-    "tests_marker": "mod tests {",
-    "asserts": [
-        (680, "fn mix_straight"),
-        (688, "把一个令牌混向目标色"),
-        (915, "强调色预设色板"),
-        (1000, "探测系统主题"),
-        (1066, "把令牌灌进 egui"),
-        (1274, "候选中文字体"),
-        (1490, "#[cfg(test)]"),
-    ],
+    "root_after_anchor": "pub struct Config {",
+    "tests_anchor": "mod tests {",
+    "docs": {
+        "hotkey": "//! 全局热键绑定（两个槽位共用这一结构）与键名规范化。",
+        "storage": "//! 存储与保留策略、剪贴板捕获参数。",
+        "layout": "//! 旧四面板架构的持久化格式（遗留 DTO，仅迁移用）。",
+        "ui": "//! 界面配置主体（窗口 / 主题开关 / 各类子配置的挂载点）。",
+        "panels": "//! 悬浮面板配置：类型过滤栏、搜索面板、停靠位置与几何钳制。",
+        "card_row": "//! 列表卡片阴影与行内元信息（类型 / 大小）配置。",
+        "window": "//! 窗口背景效果（不透明 / 自研磨砂 / 半透明）与窗口位置。",
+        "secondary": "//! 二级主题（纸质 / 护眼绿 / 星空紫 / OLED）及其可调参数。",
+        "theme_params": "//! 二级主题的参数面（旋钮定义 + 取值 + 钳制）。",
+        "accent": "//! 强调色（HSV / 十六进制）与主题令牌覆盖。",
+        "mcp": "//! MCP 服务配置、联动动作规则与「粘贴上一条」模式。",
+    },
+    "asserts": [],
 }
 
-# ---------------------------------------------------------------------- 引擎
 path = SPEC["path"]
 src = io.open(path, encoding="utf-8", newline="").read()
 lines = src.split("\n")
@@ -89,30 +60,40 @@ def L(n):
     return lines[n - 1]
 
 
-for n, needle in SPEC["asserts"]:
+for n, needle in SPEC.get("asserts", []):
     assert needle in L(n), "assert failed at %d: %r not in %r" % (n, needle, L(n)[:60])
+
+
+def find_anchor(needle):
+    """找锚点行并上吸连续的文档注释与属性行。返回 0-based 索引。"""
+    for i, ln in enumerate(lines):
+        if needle in ln:
+            while i > 0 and (lines[i - 1].lstrip().startswith("//")
+                             or lines[i - 1].lstrip().startswith("#[")):
+                i -= 1
+            return i
+    sys.exit("anchor not found: %r" % needle[:60])
+
 
 os.makedirs(SPEC["subdir"], exist_ok=True)
 
+names = list(SPEC["anchors"].keys())
+starts = [find_anchor(SPEC["anchors"][n]) for n in names]
+root_after = find_anchor(SPEC["root_after_anchor"])
+tests_at = find_anchor(SPEC["tests_anchor"])
+
 moved = {}
-for name, spec in SPEC["sections"].items():
-    body = []
-    for i, (s, e) in enumerate(spec["ranges"]):
-        if i:
-            body.append("")
-        body.extend(lines[s - 1:e])
-    moved[name] = body
+for i, name in enumerate(names):
+    s = starts[i]
+    e = starts[i + 1] if i + 1 < len(starts) else root_after
+    moved[name] = lines[s:e]
 
-root = []
-for s, e in SPEC["root_parts"]:
-    root.extend(lines[s - 1:e])
+root = lines[:starts[0]] + lines[root_after:]
 
-# ---- 顶层导入清单（支持多行 use 块）----
+
 def parse_imports(body_lines):
-    """把一段源码里的 use 语句解析成 [(name, stmt)]，支持多行花括号组。"""
     out = []
-    i = 0
-    n = len(body_lines)
+    i, n = 0, len(body_lines)
     while i < n:
         ln = body_lines[i]
         if not re.match(r"^use\s", ln):
@@ -138,32 +119,22 @@ def parse_imports(body_lines):
             if m2:
                 base = m2.group(1)
                 out.append((base.split("::")[-1], "use %s;" % base))
-            else:
-                # use a::{b as c, d}; 的别名等形态：整条保留，按别名词登记
-                m3 = re.match(r"^use\s+([\w:]+)::\{([^}]*)\};\s*$", stmt, re.S)
-                if m3:
-                    base = m3.group(1)
-                    for part in m3.group(2).split(","):
-                        part = part.strip()
-                        if part:
-                            nm = part.split(" as ")[-1].strip()
-                            out.append((nm, "use %s::%s;" % (base, part)))
         i += 1
     return out
 
 
-top_imports = parse_imports(lines[:120])
+top_imports = parse_imports(lines[:150])
 
-ITEM_DEF = re.compile(r"^(?:pub(?:\(crate\))?\s+)?(?:pub\(super\)\s+)?(const fn|fn|struct|enum|const|static|type)\s+([A-Za-z_][A-Za-z0-9_]*)")
+ITEM_DEF = re.compile(r"^(pub(?:\(crate\))?\s+)?(const fn|fn|struct|enum|const|static|type)\s+([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def code_text(body):
-    out = []
-    for ln in body:
-        if ln.strip().startswith("//"):
-            continue
-        out.append(re.sub(r'"(?:[^"\\]|\\.)*"', '""', ln))
-    return "\n".join(out)
+    """去掉注释行后的代码文本。
+
+    CAUTION: 不剥字符串字面量——`#[serde(default = "fn_name")]` 的名字
+    只在字符串里出现，剥了就找不到跨模块引用。
+    """
+    return "\n".join(ln for ln in body if not ln.strip().startswith("//"))
 
 
 def uses(text, name):
@@ -171,75 +142,105 @@ def uses(text, name):
 
 
 def top_items(body):
-    names = set()
+    alln, pubs = set(), set()
     for ln in body:
         m = ITEM_DEF.match(ln)
         if m:
-            names.add(m.group(2))
-    return names
+            alln.add(m.group(3))
+            if m.group(1):
+                pubs.add(m.group(3))
+    return alln, pubs
 
 
-module_items = {n: top_items(b) for n, b in moved.items()}
+module_items, module_pubs = {}, {}
+for n, b in moved.items():
+    module_items[n], module_pubs[n] = top_items(b)
+root_all, _ = top_items(lines[root_after:])
+root_all |= top_items(lines[:starts[0]])[0]
 
-# root 段里的顶层项名（子模块可能引用 root 的私有项——通过 super:: 不行，
-# 子模块本就能访问父模块私有项，无需导入；只有跨子模块才要 import）
-root_item_names = set()
-for s, e in SPEC["root_parts"]:
-    root_item_names |= top_items(lines[s - 1:e])
-root_item_names |= set(SPEC.get("root_extra_items", []))
+KEEP_PUB = set()
 
 
-def transform(name, body, spec):
-    keep_pub = spec.get("keep_pub", set())
-    method_vis = spec.get("method_vis", {})
-    mode = spec.get("mode", "free")
+def transform(name, body, needs_vis):
+    promote_items = {it for kind, it in needs_vis.get(name, ()) if kind == "item"}
+    promote_methods = {it for kind, it in needs_vis.get(name, ()) if kind == "method"}
     out = []
+    in_trait_impl = False
     for ln in body:
-        if mode == "methods":
-            m = re.match(r"^(\s*)fn ([A-Za-z_][A-Za-z0-9_]*)\(", ln)
-            if m and m.group(2) in method_vis:
-                vis = method_vis[m.group(2)]
-                out.append(("%s%s %s" % (m.group(1), vis, ln.lstrip())) if vis else ln)
+        # trait impl（impl X for Y）内的方法不许带可见性限定
+        if re.match(r"^impl\b.*\bfor\b", ln):
+            in_trait_impl = True
+        elif re.match(r"^impl\b", ln):
+            in_trait_impl = False
+        elif ln.startswith("}") and in_trait_impl:
+            in_trait_impl = False
+        if SPEC.get("vis_mode") == "keep":
+            m = ITEM_DEF.match(ln)
+            if m and not m.group(1) and m.group(3) in promote_items:
+                out.append("pub(super) " + ln)
+                continue
+            mm = re.match(r"^(\s*)(?:const\s+)?fn ([A-Za-z_][A-Za-z0-9_]*)\s*\(", ln)
+            if (mm and not in_trait_impl and mm.group(2) in promote_methods
+                    and not ln.lstrip().startswith("pub")):
+                out.append(mm.group(1) + "pub(super) " + ln.lstrip())
                 continue
             out.append(ln)
             continue
         if ln.startswith("pub"):
             out.append(ln)
             continue
-        m = re.match(r"^(?:const fn|fn|struct|enum|const|static|type)\s+([A-Za-z_][A-Za-z0-9_]*)", ln)
-        nm = m.group(1) if m else None
-        vis = "pub" if (nm and nm in keep_pub) else "pub(super)"
-        if re.match(r"^const fn ", ln) or re.match(r"^fn ", ln) or re.match(r"^struct ", ln) \
-                or re.match(r"^enum ", ln) or re.match(r"^const ", ln) \
-                or re.match(r"^static ", ln) or re.match(r"^type ", ln):
+        m = re.match(r"^(const fn|fn|struct|enum|const|static|type)\s+([A-Za-z_][A-Za-z0-9_]*)", ln)
+        nm = m.group(2) if m else None
+        vis = "pub" if (nm and nm in KEEP_PUB) else "pub(super)"
+        if m:
             out.append(vis + " " + ln)
         else:
             out.append(ln)
     return out
 
 
+# ---- 第一遍：计算跨模块引用，得出各模块需要提权的项 ----
+# needs_vis[name] = {(kind, item)}，kind: "item" | "method"
+ASSOC_CALL = re.compile(r"\b([A-Z][A-Za-z0-9_]*)::([a-z_][A-Za-z0-9_]*)\s*\(")
+type_owner = {}
+for n in names:
+    for it in module_items[n]:
+        type_owner[it] = n
+
+needs_vis = {n: set() for n in names}
+for name in names:
+    text = code_text(moved[name])
+    for other in names:
+        if other == name:
+            continue
+        for it in sorted(module_items[other]):
+            if uses(text, it) and it not in module_pubs[other]:
+                needs_vis[other].add(("item", it))
+    # 关联方法调用：Type::method( ，Type 属于别的模块
+    for ty, meth in ASSOC_CALL.findall(text):
+        owner = type_owner.get(ty)
+        if owner and owner != name:
+            needs_vis[owner].add(("method", meth))
+
 written = []
-for name, spec in SPEC["sections"].items():
-    body = transform(name, moved[name], spec)
-    if spec.get("mode") == "methods":
-        body = ["impl super::%s {" % spec["impl_target"]] + body + ["}"]
+reexports = []
+for name in names:
+    body = transform(name, moved[name], needs_vis)
     while body and body[0].strip() == "":
         body.pop(0)
     while body and body[-1].strip() == "":
         body.pop()
     text = code_text(body)
-    imps = [stmt for nm, stmt in top_imports if uses(text, nm)]
-    imps.sort()
+    imps = sorted(stmt for nm, stmt in top_imports if uses(text, nm))
+    supers = sorted(n for n in root_all if uses(text, n) and n not in module_items[name])
     cross = []
-    for other, items in module_items.items():
+    for other in names:
         if other == name:
             continue
-        for it in sorted(items):
+        for it in sorted(module_items[other]):
             if uses(text, it):
                 cross.append((other, it))
-    # root 私有项：子模块经 use super::X 引用
-    supers = sorted(n for n in root_item_names if uses(text, n))
-    header = [spec["doc"], ""]
+    header = [SPEC["docs"][name], ""]
     if imps:
         header.extend(imps)
         header.append("")
@@ -253,35 +254,37 @@ for name, spec in SPEC["sections"].items():
     out = "\n".join(header + body) + "\n"
     io.open("%s/%s.rs" % (SPEC["subdir"], name), "w", encoding="utf-8", newline="").write(out)
     written.append((name, len(body), len(imps), len(cross)))
+    if SPEC.get("vis_mode") == "keep":
+        for it in sorted(module_pubs[name]):
+            reexports.append("pub use %s::%s;" % (name, it))
 
-# ---- root ----
 insert_at = None
 for i, ln in enumerate(root):
     if re.match(r"^use ", ln):
         insert_at = i + 1
 assert insert_at is not None, "root use block not found"
+mod_vis = (SPEC.get("mod_vis", "") + " ") if SPEC.get("mod_vis") else ""
 block = [""]
-for name in SPEC["sections"]:
-    block.append("mod %s;" % name)
+for name in names:
+    block.append("%smod %s;" % (mod_vis, name))
 block.append("")
-block.extend(SPEC["root_reexport"])
-block.extend(SPEC["root_extra"])
+block.extend(reexports)
+block.extend(SPEC.get("root_extra", []))
 if len(block) > 2:
     block.append("")
 root[insert_at:insert_at] = block
 
-# tests glob
-if SPEC.get("tests_marker"):
+if SPEC.get("tests_anchor"):
     for i, ln in enumerate(root):
-        if ln.strip() == SPEC["tests_marker"]:
+        if ln.strip() == SPEC["tests_anchor"]:
             globs = ["    use super::{"]
-            for name in SPEC["sections"]:
+            for name in names:
                 globs.append("        %s::*," % name)
             globs.append("    };")
             root[i + 1:i + 1] = globs
             break
 
 io.open(path, "w", encoding="utf-8", newline="").write("\n".join(root))
-print("root: %d lines" % len(root))
+print("root: %d lines, reexports: %d" % (len(root), len(reexports)))
 for name, n, ni, nc in written:
     print("  %-14s %5d lines, imports=%d cross=%d" % (name, n, ni, nc))
