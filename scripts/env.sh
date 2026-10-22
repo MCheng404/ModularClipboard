@@ -44,10 +44,18 @@ if command -v cl.exe >/dev/null 2>&1; then
     # ---- 路径 1：上游已注入 MSVC（CI / vcvars）------------------------
     #
     # `ilammy/msvc-dev-cmd` 之类已经把 cl.exe 放进 PATH 并设好
-    # INCLUDE/LIB；这里什么都不用补。SDK_VER 只服务于路径 2 的
-    # 注入，此处记一个标记供 --print 区分来源。
+    # INCLUDE/LIB；INCLUDE/LIB 保持上游值不动。SDK_VER 只服务于
+    # 路径 2 的注入，此处记一个标记供 --print 区分来源。
+    #
+    # CAUTION: 必须把 cl.exe 所在目录**前置**进 PATH（2026-10-22 CI 实跑
+    # 踩坑）：Git Bash 的 /usr/bin 里有一个 GNU coreutils 的 `link.exe`
+    # （硬链接工具），排在 MSVC 的 `link.exe` 前面时，rustc 链接阶段
+    # 会拿它当链接器，报 "/usr/bin/link: extra operand" 且 exit 101。
+    # cl.exe / link.exe / lib.exe 同目录，前置一次全部归位。
     MSVC_KIND="ambient"
     SDK_VER="ambient"
+    _cl_dir="$(dirname "$(command -v cl.exe)")"
+    export PATH="${_cl_dir}:${PATH}"
 else
     # ---- 路径 2：本机非常规路径，手工注入 ----------------------------
     MSVC_ROOT='D:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Tools\MSVC\14.52.36629'

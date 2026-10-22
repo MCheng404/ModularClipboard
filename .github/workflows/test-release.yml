@@ -39,7 +39,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: ilammy/msvc-dev-cmd@v1
 
@@ -58,7 +58,7 @@ jobs:
         run: ./scripts/build.sh --package
 
       # 万一 release 步骤失败，也保留 90 天的 run 内产物可下载。
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: modular-clipboard-${{ github.sha }}
           path: dist/

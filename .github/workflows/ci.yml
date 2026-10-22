@@ -20,7 +20,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # MSVC 环境（cl.exe / INCLUDE / LIB）。之后 scripts/env.sh 检测到
       # cl.exe 已在 PATH 就走「ambient」路径，不再手工注入本机路径。
