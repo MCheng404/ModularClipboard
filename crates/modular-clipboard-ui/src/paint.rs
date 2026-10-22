@@ -10963,6 +10963,12 @@ mod tests {
         ///
         /// `size` 是客户区的**逻辑点**尺寸。
         fn new(tag: &str, size: egui::Vec2) -> Self {
+            // 钉死中文：断言与热区 key 都按中文文案写。全局语言是跨测试
+            // 共享的（`App::from_service` 在 CI 英文系统上会解析成英文），
+            // 每个夹具开局先归位，杜绝串扰。
+            modular_clipboard_core::i18n::set_locale(
+                modular_clipboard_core::i18n::Locale::ZhCn,
+            );
             let dir = tempdir::TempDir::new(tag);
             let cfg = modular_clipboard_core::Config::default();
             let svc =

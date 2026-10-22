@@ -1923,6 +1923,13 @@ impl App {
 
     /// 用**已有的**服务实例构造界面（两种模式共用）。
     pub fn from_service(config: modular_clipboard_core::Config, mut svc: Service) -> Self {
+        // 界面语言：配置显式指定用配置，否则跟随系统（详见
+        // `core::i18n::resolve`）。要在**画任何东西之前**解析完——
+        // 首帧的全部文案都按这个语言取。
+        modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::resolve(
+            &config.ui.language,
+            modular_clipboard_core::i18n::from_system_langid(crate::presence::system_langid()),
+        ));
         let ctx = egui::Context::default();
         // 自启动的真相在**注册表**里，配置只是缓存。
         //
@@ -1939,13 +1946,6 @@ impl App {
             svc.state.config.ui.autostart = actual;
         }
         let _ = config;
-        // 界面语言：配置显式指定用配置，否则跟随系统（详见
-        // `core::i18n::resolve`）。要在**画任何东西之前**解析完——
-        // 首帧的全部文案都按这个语言取。
-        modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::resolve(
-            &config.ui.language,
-            modular_clipboard_core::i18n::from_system_langid(crate::presence::system_langid()),
-        ));
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
         // 图标字体必须排在 CJK 之后：`install_cjk_font` 用 `set_fonts`
         // 整体替换 `FontDefinitions`，先装图标会被它冲掉。
