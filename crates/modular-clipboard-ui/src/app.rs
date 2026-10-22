@@ -104,7 +104,7 @@ impl Drop for DeltaGuard {
 /// 放在标题后面而非直接用 `WINDOW_TITLE`：托盘提示要告诉用户
 /// 「东西还在后台跑着」，而不只是产品名——这是托盘常驻类程序
 /// 与普通窗口程序的体感差别。
-const TRAY_TOOLTIP: &str = "模块化剪切板 — 正在后台记录剪贴板";
+const TRAY_TOOLTIP: &str = "ModularClipboard"; // 托盘悬停提示（简短：tooltip 空间有限）
 
 /// 环境开关查询（带缓存，PF-10）。
 ///
@@ -737,7 +737,7 @@ fn run_mode(
             if f.clear_history {
                 if let Err(e) = app.clear_history() {
                     tracing::warn!(%e, "托盘清空历史失败");
-                    app.svc.notify(format!("清空失败: {e}"));
+                    app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("清空失败:", "Clear failed:"))));
                 }
                 // IMPORTANT: 必须请求重绘。
                 //
@@ -757,7 +757,7 @@ fn run_mode(
                 if let Some(id) = app.svc.state.items.first().map(|i| i.id) {
                     if let Err(e) = app.svc.copy_and_paste(id) {
                         tracing::warn!(%e, "粘贴上一条失败");
-                        app.svc.notify(format!("粘贴失败: {e}"));
+                        app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("粘贴失败:", "Paste failed:"))));
                     }
                 } else {
                     tracing::debug!("历史为空，忽略「粘贴上一条」");
@@ -768,7 +768,7 @@ fn run_mode(
             if let Some(id) = f.mini_pick {
                 if let Err(e) = app.svc.copy_item(id) {
                     tracing::warn!(%e, "迷你面板复制条目失败");
-                    app.svc.notify(format!("复制失败: {e}"));
+                    app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("复制失败:", "Copy failed:"))));
                 }
                 // 复制可能改变列表顺序（最近使用），请求重绘。
                 ctx.request_repaint();
@@ -1716,7 +1716,7 @@ Ok(w) => {
                     Err(e) => {
                         // 建窗失败：状态置回 None，否则每帧重试刷日志。
                         app.paint_state.image_editor = None;
-                        app.svc.notify(format!("无法打开图片编辑窗口: {e}"));
+                        app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("无法打开图片编辑窗口:", "Cannot open the image editor:"))));
                     }
                 }
             }
@@ -1939,6 +1939,13 @@ impl App {
             svc.state.config.ui.autostart = actual;
         }
         let _ = config;
+        // 界面语言：配置显式指定用配置，否则跟随系统（详见
+        // `core::i18n::resolve`）。要在**画任何东西之前**解析完——
+        // 首帧的全部文案都按这个语言取。
+        modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::resolve(
+            &config.ui.language,
+            modular_clipboard_core::i18n::from_system_langid(crate::presence::system_langid()),
+        ));
         theme::install_cjk_font(&ctx, config.ui.font_path.as_deref());
         // 图标字体必须排在 CJK 之后：`install_cjk_font` 用 `set_fonts`
         // 整体替换 `FontDefinitions`，先装图标会被它冲掉。
@@ -2260,7 +2267,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         let mut chars = name.chars();
         let _first = chars.next();
         if chars.next().is_some() && !name.starts_with('F') {
-            self.svc.notify(format!("不支持把 {name} 设为快捷键"));
+            self.svc.notify(modular_clipboard_core::i18n::t(("不支持把 {name} 设为快捷键", "{name} is not a supported shortcut")).replace("{name}", name));
             return;
         }
         let hotkey = modular_clipboard_core::config::Hotkey {
@@ -2273,7 +2280,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
             win: modular_clipboard_platform::win_key_down(),
         };
         if !hotkey.ctrl && !hotkey.shift && !hotkey.alt && !hotkey.win {
-            self.svc.notify("至少按住一个修饰键（Ctrl/Shift/Alt/Win）".into());
+            self.svc.notify(modular_clipboard_core::i18n::t(("至少按住一个修饰键（Ctrl/Shift/Alt/Win）", "Hold at least one modifier (Ctrl/Shift/Alt/Win)")).into());
             return;
         }
         // 后按的覆盖先按的：用户改主意就再按一次新的。
@@ -2419,6 +2426,20 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     set_text_field(&mut self.svc.state.config, group, field, &value);
                     self.after_config_change();
                 }
+                Op::SetLanguage(lang) => {
+                    // 写配置 + 立即生效（`set_locale` 是全局原子量，
+                    // 下一帧所有 `t()` 取的就是新语言）。
+                    self.svc.state.config.ui.language = lang.to_string();
+                    modular_clipboard_core::i18n::set_locale(
+                        modular_clipboard_core::i18n::resolve(
+                            lang,
+                            modular_clipboard_core::i18n::from_system_langid(
+                                crate::presence::system_langid(),
+                            ),
+                        ),
+                    );
+                    self.after_config_change();
+                }
                 Op::CopyMcpPairPrompt => {
                     // 把按当前 MCP 配置动态拼接的接入说明复制到剪贴板。
                     //
@@ -2426,8 +2447,8 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // （同 `copy_item` 规则），防止捕获线程把自己写的内容再记一条。
                     let prompt = crate::paint::mcp_pair_prompt(&self.svc.state.config);
                     match self.svc.write_clipboard_text(&prompt) {
-                        Ok(()) => self.svc.notify("已复制 AI 配对提示词".into()),
-                        Err(e) => self.svc.notify(format!("复制配对提示词失败: {e}")),
+                        Ok(()) => self.svc.notify(modular_clipboard_core::i18n::t(("已复制 AI 配对提示词", "AI pairing prompt copied")).into()),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("复制配对提示词失败:", "Failed to copy the pairing prompt:")))),
                     }
                 }
                 Op::SetOptNumber { group, field, value } => {
@@ -2611,12 +2632,12 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                             }
                             slot.draft_mut(&mut self.paint_state).clear();
                             self.after_config_change();
-                            self.svc.notify(format!("已设为 {text}"));
+                            self.svc.notify(format!("{} {text}", modular_clipboard_core::i18n::t(("已设为", "Set to"))));
                         }
                         Err(e) => {
                             // 解析失败要说清楚**为什么**：只提示「无效」
                             // 用户就得自己猜是不是键名写错了。
-                            self.svc.notify(format!("快捷键无效：{e}"));
+                            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("快捷键无效：", "Invalid shortcut:"))));
                         }
                     }
                 }
@@ -2637,7 +2658,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         }
                         Err(e) => {
                             tracing::error!(%e, "设置开机自启动失败");
-                            self.svc.notify(format!("设置失败：{e}"));
+                            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("设置失败：", "Failed to apply:"))));
                         }
                     }
                 }
@@ -2650,7 +2671,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 }
                 Op::TogglePin(id) => {
                     if let Err(e) = self.svc.toggle_pin(id) {
-                        self.svc.notify(format!("置顶失败: {e}"));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("置顶失败:", "Pin failed:"))));
                     }
                 }
                 Op::Delete(id) => {
@@ -2663,7 +2684,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                             // 用户以为自己刚改的字保存过了。
                             self.paint_state.clear_edit_state(id);
                         }
-                        Err(e) => self.svc.notify(format!("删除失败: {e}")),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("删除失败:", "Delete failed:")))),
                     }
                 }
                 Op::Copy(id) => {
@@ -2673,8 +2694,8 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 排查后发现是成功路径无反馈）。提示走 toast/弹窗通道
                     // （`ui.notice_popup` 决定呈现），3 秒自消。
                     match self.svc.copy_item(id) {
-                        Ok(()) => self.svc.notify("已复制".into()),
-                        Err(e) => self.svc.notify(format!("复制失败: {e}")),
+                        Ok(()) => self.svc.notify(modular_clipboard_core::i18n::t(("已复制", "Copied")).into()),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("复制失败:", "Copy failed:")))),
                     }
                 }
                 // ---- 内容编辑（2026-10-21）----
@@ -2694,7 +2715,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         }
                         Err(e) => {
                             self.svc
-                                .notify(format!("无法编辑：内容已被淘汰（{e}）"));
+                                .notify(modular_clipboard_core::i18n::t(("无法编辑：内容已被淘汰（{e}）", "Cannot edit: content was evicted ({e})")).replace("{e}", &e.to_string()));
                         }
                     }
                 }
@@ -2711,7 +2732,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 字要么按 Esc 退出——直接关掉会让他以为保存成功了。
                     // 真要删条目请走行上的删除按钮（那里有明确反馈）。
                     if text.trim().is_empty() {
-                        self.svc.notify("内容为空，未保存".into());
+                        self.svc.notify(modular_clipboard_core::i18n::t(("内容为空，未保存", "Empty content, not saved")).into());
                     } else {
                         self.commit_edit(id, text.into_bytes(), None);
                     }
@@ -2741,7 +2762,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                             self.paint_state.edit_backup = None;
                         }
                         _ => {
-                            self.svc.notify("没有可撤销的修改".into());
+                            self.svc.notify(modular_clipboard_core::i18n::t(("没有可撤销的修改", "Nothing to undo")).into());
                         }
                     }
                 }
@@ -2771,11 +2792,11 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         }
                         (Ok(_), _) => {
                             self.svc
-                                .notify("无法编辑图片：缺少尺寸信息".into());
+                                .notify(modular_clipboard_core::i18n::t(("无法编辑图片：缺少尺寸信息", "Cannot edit image: missing dimensions")).into());
                         }
                         (Err(e), _) => {
                             self.svc
-                                .notify(format!("无法编辑图片：内容已被淘汰（{e}）"));
+                                .notify(modular_clipboard_core::i18n::t(("无法编辑图片：内容已被淘汰（{e}）", "Cannot edit image: content was evicted ({e})")).replace("{e}", &e.to_string()));
                         }
                     }
                 }
@@ -2841,7 +2862,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                             // （理由同 `Op::Delete` 分支）。
                             self.paint_state.clear_all_edit_state();
                         }
-                        Err(e) => self.svc.notify(format!("清空失败: {e}")),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("清空失败:", "Clear failed:")))),
                     }
                 }
                 Op::Quit => {
@@ -2864,7 +2885,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 恰恰是用户最需要知道的那类。
                     if let Err(e) = modular_clipboard_platform::open_url(url) {
                         tracing::warn!("打开链接失败 {url}: {e}");
-                        self.svc.notify(format!("打开链接失败: {e}"));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开链接失败:", "Failed to open link:"))));
                     }
                 }
                 Op::OpenUrl(url) => {
@@ -2873,7 +2894,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // 双击没反应是最难自查的一类故障。
                     let custom = self.svc.state.config.ui.browser_path.trim();
                     if let Err(e) = modular_clipboard_platform::open_url_with(&url, custom) {
-                        self.svc.notify(format!("打开链接失败: {e}"));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开链接失败:", "Failed to open link:"))));
                     }
                 }
                 Op::RevealPath(path) => {
@@ -2881,7 +2902,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     // （留空 = 系统 explorer /select 定位）。
                     let custom = self.svc.state.config.ui.explorer_path.trim();
                     if let Err(e) = modular_clipboard_platform::reveal_with(&path, custom) {
-                        self.svc.notify(format!("打开资源管理器失败: {e}"));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开资源管理器失败:", "Failed to open the file manager:"))));
                     }
                 }
                 Op::SetTypeFilterKind { kind, multi } => {
@@ -3002,10 +3023,10 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                 self.paint_state.edit_focus_pending = false;
                 self.paint_state.image_editor = None;
                 self.paint_state.image_editor_src = None;
-                self.svc.notify("已保存修改".into());
+                self.svc.notify(modular_clipboard_core::i18n::t(("已保存修改", "Changes saved")).into());
             }
             Err(e) => {
-                self.svc.notify(format!("保存失败: {e}"));
+                self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("保存失败:", "Save failed:"))));
             }
         }
     }
@@ -3342,7 +3363,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
     fn after_config_change(&mut self) {
         if let Err(e) = self.svc.save_config() {
             tracing::warn!(%e, "保存配置失败");
-            self.svc.notify(format!("保存设置失败: {e}"));
+            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("保存设置失败:", "Failed to save settings:"))));
         }
     }
 

@@ -20,6 +20,7 @@ use modular_clipboard_platform::hotkey;
 use modular_clipboard_platform::tray::{self, TrayEvent};
 use modular_clipboard_core::config::WindowBackdrop;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowPos,
@@ -37,6 +38,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// 用途：磨砂光晕（`ui.glow`）要「光标靠近窗口时在光标位置渲染」，
 /// 而 egui 的 `pointer.hover_pos()` 只在光标**位于本窗口内**时有效——
 /// 靠近但尚未进入的那一段窗口收不到任何鼠标事件，只能自己查。
+/// 系统 UI 语言的完整 LANGID（`GetUserDefaultUILanguage`）。
+///
+/// 供 [`modular_clipboard_core::i18n::from_system_langid`] 判定
+/// 「跟随系统」时该用中文还是英文。取 UI 语言而不是区域设置：
+/// 用户把系统显示语言切成 English 时，界面跟着切才是「跟随系统」。
+pub fn system_langid() -> u16 {
+    // SAFETY: 纯查询，无入参，无未定义行为。
+    unsafe { GetUserDefaultUILanguage() }
+}
+
 pub fn cursor_pos() -> Option<(i32, i32)> {
     let mut pt = windows::Win32::Foundation::POINT::default();
     // SAFETY: `pt` 是栈上有效的可写内存。CAUTION: `GetCursorPos` 在

@@ -253,27 +253,27 @@ impl Icon {
         }
     }
 
-    /// 无障碍标签。屏幕阅读器会读出这个。
-    pub fn label(self) -> &'static str {
+    /// 无障碍标签（双语对）。屏幕阅读器会读出这个。
+    pub fn label(self) -> modular_clipboard_core::i18n::Bi {
         match self {
-            Icon::Close => "关闭",
-            Icon::Pinned => "已置顶",
-            Icon::Unpinned => "置顶",
-            Icon::Search => "搜索",
-            Icon::Settings => "设置",
-            Icon::Text => "文本",
-            Icon::Code => "HTML",
-            Icon::Image => "图片",
-            Icon::File => "文件",
-            Icon::Minimize => "最小化",
-            Icon::Collapse => "折叠",
-            Icon::Expand => "展开",
-            Icon::Drag => "拖拽",
-            Icon::Lock => "已固定",
-            Icon::Unlock => "固定",
-            Icon::Table => "表格视图",
-            Icon::Mask => "密文视图",
-            Icon::Trash => "清空",
+            Icon::Close => ("关闭", "Close"),
+            Icon::Pinned => ("已置顶", "Pinned"),
+            Icon::Unpinned => ("置顶", "Pin"),
+            Icon::Search => ("搜索", "Search"),
+            Icon::Settings => ("设置", "Settings"),
+            Icon::Text => ("文本", "Text"),
+            Icon::Code => ("HTML", "HTML"),
+            Icon::Image => ("图片", "Image"),
+            Icon::File => ("文件", "Files"),
+            Icon::Minimize => ("最小化", "Minimize"),
+            Icon::Collapse => ("折叠", "Collapse"),
+            Icon::Expand => ("展开", "Expand"),
+            Icon::Drag => ("拖拽", "Drag"),
+            Icon::Lock => ("已固定", "Locked"),
+            Icon::Unlock => ("固定", "Pin"),
+            Icon::Table => ("表格视图", "Table view"),
+            Icon::Mask => ("密文视图", "Masked"),
+            Icon::Trash => ("清空", "Clear"),
         }
     }
 
@@ -565,7 +565,7 @@ mod tests {
     fn every_icon_has_a_label() {
         // 空标签会让屏幕阅读器静默，这是可访问性缺陷。
         for &i in Icon::ALL {
-            assert!(!i.label().is_empty(), "{i:?} 缺少无障碍标签");
+            assert!(!i.label().0.is_empty() && !i.label().1.is_empty(), "{i:?} 缺少无障碍标签");
         }
     }
 

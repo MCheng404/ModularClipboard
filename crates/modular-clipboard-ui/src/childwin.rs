@@ -204,7 +204,7 @@ impl<'a> ChildWindows<'a> {
                 let ppp = if scale_factor > 0.01 { scale_factor } else { 1.0 };
                 (
                     c.id,
-                    c.kind.title().to_string(),
+                    modular_clipboard_core::i18n::t(c.kind.title()).to_string(),
                     (c.window_size.x * ppp).round().max(160.0) as u32,
                     (c.window_size.y * ppp).round().max(120.0) as u32,
                     // 置顶窗要摆到主窗左边；其它卡片用自己记录的位置。

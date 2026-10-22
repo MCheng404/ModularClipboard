@@ -1,4 +1,5 @@
 pub mod config;
+pub mod i18n;
 pub mod event;
 pub mod item;
 pub mod media;

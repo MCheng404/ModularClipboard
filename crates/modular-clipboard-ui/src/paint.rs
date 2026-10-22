@@ -28,6 +28,7 @@ use egui::{Align2, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2, po
 use modular_clipboard_app::Service;
 use modular_clipboard_core::ClipItem;
 use modular_clipboard_core::item::EntryId;
+use modular_clipboard_core::i18n::{t, Bi};
 use modular_clipboard_core::config::{RowMetaPart, WindowBackdrop};
 
 use crate::card::{Card, CardHost, CardKind, PinnedMode};
@@ -245,6 +246,11 @@ pub enum Op {
     /// 与 [`Op::SetBool`] 分开：它不只是改配置，还要**真的去写注册表**，
     /// 而且失败要告诉用户（权限/路径问题都可能导致写不进去）。
     SetAutostart(bool),
+    /// 改界面语言（`"system"` / `"zh-CN"` / `"en-US"`）。
+    ///
+    /// 由 `App::apply_ops` 落地：写配置 + 立即 `i18n::set_locale`
+    /// （界面语言是全局状态，不等下一帧）。
+    SetLanguage(&'static str),
     /// 改一个文本配置字段（MCP 服务地址 / 密钥）。
     SetText {
         group: ConfigGroup,
@@ -425,17 +431,17 @@ impl SettingsCat {
         SettingsCat::About,
     ];
 
-    /// 导航标题。
-    pub fn title(self) -> &'static str {
+    /// 导航标题（双语对）。
+    pub fn title(self) -> Bi {
         match self {
-            SettingsCat::General => "常规",
-            SettingsCat::Theme => "主题",
-            SettingsCat::Appearance => "外观",
-            SettingsCat::Capture => "捕获",
-            SettingsCat::Storage => "存储",
-            SettingsCat::Shortcuts => "快捷键",
-            SettingsCat::Comm => "通信",
-            SettingsCat::About => "关于",
+            SettingsCat::General => ("常规", "General"),
+            SettingsCat::Theme => ("主题", "Theme"),
+            SettingsCat::Appearance => ("外观", "Appearance"),
+            SettingsCat::Capture => ("捕获", "Capture"),
+            SettingsCat::Storage => ("存储", "Storage"),
+            SettingsCat::Shortcuts => ("快捷键", "Shortcuts"),
+            SettingsCat::Comm => ("通信", "Connection"),
+            SettingsCat::About => ("关于", "About"),
         }
     }
 
@@ -2706,7 +2712,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut f.state.query)
-                    .hint_text("搜索历史…")
+                    .hint_text(t(("搜索历史…", "Search history…")))
                     .desired_width(f32::INFINITY)
                     // IMPORTANT: 字号必须给**不带scale 的逻辑字号**。
                     //
@@ -2817,7 +2823,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
             // 清空后主动交还焦点：否则用户还得再点一次才能继续打字。
             f.ui.memory_mut(|m| m.request_focus(edit_resp.id));
         }
-        cr.on_hover_text("清空搜索");
+        cr.on_hover_text(t(("清空搜索", "Clear search")));
     }
 
     // 焦点请求在**画完之后**发：id 刚自报出来，此刻才有效。
@@ -2984,7 +2990,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     let mut max_label_w = 0.0_f32;
     if labels {
         for kind in kinds {
-            let w = crate::text::measure_text(f.ui, kind.label(), &label_font);
+            let w = crate::text::measure_text(f.ui, t(kind.label()), &label_font);
             max_label_w = max_label_w.max(w);
         }
     }
@@ -2993,7 +2999,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     if vertical {
         let total: f32 = kinds
             .iter()
-            .map(|k| cell_len(if labels { crate::text::measure_text(f.ui, k.label(), &label_font) } else { 0.0 }))
+            .map(|k| cell_len(if labels { crate::text::measure_text(f.ui, t(k.label()), &label_font) } else { 0.0 }))
             .sum::<f32>()
             + gap * (n as f32 - 1.0)
             + RAIL_PAD * 2.0;
@@ -3002,7 +3008,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     } else {
         let total: f32 = kinds
             .iter()
-            .map(|k| cell_len(if labels { crate::text::measure_text(f.ui, k.label(), &label_font) } else { 0.0 }))
+            .map(|k| cell_len(if labels { crate::text::measure_text(f.ui, t(k.label()), &label_font) } else { 0.0 }))
             .sum::<f32>()
             + gap * (n as f32 - 1.0)
             + RAIL_PAD * 2.0;
@@ -3030,7 +3036,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
 
     for &kind in kinds {
         let label_w = if labels {
-            crate::text::measure_text(f.ui, kind.label(), &label_font)
+            crate::text::measure_text(f.ui, t(kind.label()), &label_font)
         } else {
             0.0
         };
@@ -3176,7 +3182,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
             };
             f.ui
                 .painter_at(slot)
-                .text(anchor, align, kind.label(), label_font.clone(), text_color);
+                .text(anchor, align, t(kind.label()), label_font.clone(), text_color);
         }
         // 提示带计数：用户能看出点下去会过滤出多少条。
         let count = f.svc.state.items.iter().filter(|it| it.kind == kind).count();
@@ -3184,9 +3190,9 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // `Response`（`icon_button` 里踩过同一个坑，E0382）。
         let clicked = resp.clicked();
         let tip = if multi {
-            format!("{} · {} 条（可多选）", kind.label(), count)
+            format!("{} · {}{}", t(kind.label()), count, t((" 条（可多选）", " entries (multi-select)")))
         } else {
-            format!("{} · {} 条", kind.label(), count)
+            format!("{} · {}{}", t(kind.label()), count, t((" 条", " entries")))
         };
         resp.on_hover_text(tip);
         if clicked {
@@ -3254,11 +3260,11 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
     f.hit_insert("topbar_pin", r_pin);
     f.hit_insert("topbar_settings", r_set);
 
-    if icon_button(f, "topbar_close", r_close, Icon::Minimize, "关闭到托盘", false, false) {
+    if icon_button(f, "topbar_close", r_close, Icon::Minimize, t(("关闭到托盘", "Hide to tray")), false, false) {
         f.state.push(Op::CloseWindow);
     }
     // 破坏性操作（清空）用 danger 色，与「设置」区分开。
-    if icon_button(f, "topbar_clear", r_clear, Icon::Trash, "清空全部历史", true, false) {
+    if icon_button(f, "topbar_clear", r_clear, Icon::Trash, t(("清空全部历史", "Clear all history")), true, false) {
         f.state.push(Op::ClearAll);
     }
     // 窗口置顶：切换「始终显示在最上层、不被其它应用遮住」。
@@ -3272,7 +3278,7 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
         "topbar_pin",
         r_pin,
         if pinned { Icon::Pinned } else { Icon::Unpinned },
-        if pinned { "取消窗口置顶" } else { "窗口置顶" },
+        if pinned { t(("取消窗口置顶", "Unpin window")) } else { t(("窗口置顶", "Pin window")) },
         false,
         pinned,
     ) {
@@ -3282,7 +3288,7 @@ fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
             value: !pinned,
         });
     }
-    if icon_button(f, "topbar_settings", r_set, Icon::Settings, "设置", false, false) {
+    if icon_button(f, "topbar_settings", r_set, Icon::Settings, t(("设置", "Settings")), false, false) {
         f.state.push(Op::ToggleSettings);
     }
 }
@@ -3434,9 +3440,9 @@ fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response {
         },
     );
     resp.on_hover_text(if f.state.search_expanded {
-        "搜索（展开中）"
+        t(("搜索（展开中）", "Search (expanded)"))
     } else if !f.state.query.is_empty() {
-        "搜索（过滤生效中，点击查看）"
+        t(("搜索（过滤生效中，点击查看）", "Search (filter active, click to view)"))
     } else {
         "搜索"
     })
@@ -3810,7 +3816,7 @@ fn draw_settings_search(f: &mut Frame<'_>, search_rect: Rect) {
             );
             let r = child.add(
                 egui::TextEdit::singleline(&mut q)
-                    .hint_text("搜索设置")
+                    .hint_text(t(("搜索设置", "Search settings")))
                     .frame(egui::Frame::NONE)
                     .desired_width(text_rect.width()),
             );
@@ -3980,7 +3986,7 @@ fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         painter.text(
             pos2(icon_r.max.x + 8.0, r.center().y),
             egui::Align2::LEFT_CENTER,
-            cat.title(),
+            t(cat.title()),
             egui::FontId::proportional(pal.font_sm),
             text_color,
         );
@@ -4007,7 +4013,7 @@ struct NumberSpec {
     min: f64,
     max: f64,
     step: f64,
-    unit: &'static str,
+    unit: Bi,
     /// 存储值 → 显示值。
     display: fn(f64) -> f64,
     /// 显示值 → 存储值。
@@ -4018,7 +4024,7 @@ struct NumberSpec {
 struct OptNumberSpec {
     default: f64,
     step: f64,
-    unit: &'static str,
+    unit: Bi,
 }
 
 const fn identity_num(v: f64) -> f64 {
@@ -4035,7 +4041,7 @@ const NUMBER_POLL_MS: NumberSpec = NumberSpec {
     min: 50.0,
     max: 2000.0,
     step: 50.0,
-    unit: " ms",
+    unit: (" ms", " ms"),
     display: identity_num,
     store: identity_num,
 };
@@ -4044,7 +4050,7 @@ const NUMBER_MINI_COUNT: NumberSpec = NumberSpec {
     min: 1.0,
     max: 10.0,
     step: 1.0,
-    unit: "条",
+    unit: ("条", " items"),
     display: |v| v,
     store: |v| v,
 };
@@ -4053,14 +4059,14 @@ const NUMBER_MAX_PAYLOAD_MB: NumberSpec = NumberSpec {
     min: 1.0,
     max: 4096.0,
     step: 1.0,
-    unit: " MB",
+    unit: (" MB", " MB"),
     display: bytes_to_mb,
     store: mb_to_bytes,
 };
 const OPTN_MAX_ITEMS: OptNumberSpec = OptNumberSpec {
     default: 1000.0,
     step: 100.0,
-    unit: " 条",
+    unit: (" 条", " entries"),
 };
 
 /// 设置项类型。
@@ -4140,6 +4146,8 @@ enum ItemKind {
     /// 预设档位一次到位、可预期、可回归测试（点第 N 段必得第 N 个倍率）。
     /// 值不在预设上时（手工改过配置文件）显示为「自定义」，不假装选中。
     FontScale,
+    /// 界面语言单选（跟随系统 / 中文 / English）。
+    Language,
     /// 快捷键绑定（只读展示）。
     Hotkey(HotkeySlot),
     /// 开机自启动开关（要写注册表，故单独一个变体）。
@@ -4153,13 +4161,13 @@ enum ItemKind {
     Text {
         group: ConfigGroup,
         field: &'static str,
-        ph: &'static str,
+        ph: Bi,
         secret: bool,
     },
     /// MCP 端口（数字输入，留空 = 未设置）。
     McpPort,
     /// 只读信息行（关于页）。
-    Info(&'static str),
+    Info(Bi),
     /// 可点击的外部链接（关于页）：显示文本即 URL，点击用默认浏览器打开。
     Link(&'static str),
     /// 退出程序按钮（关于页）。
@@ -4175,12 +4183,12 @@ enum ItemKind {
 ///
 /// 档位覆盖 [`crate::theme::FONT_SCALE_MIN`]~[`crate::theme::FONT_SCALE_MAX`]
 /// 区间内的常用档：标准 100% 是默认值，两侧各两档。
-pub const FONT_SCALE_PRESETS: &[(u8, &str)] = &[
-    (85, "小"),
-    (100, "标准"),
-    (115, "大"),
-    (130, "特大"),
-    (150, "超大"),
+pub const FONT_SCALE_PRESETS: &[(u8, Bi)] = &[
+    (85, ("小", "Small")),
+    (100, ("标准", "Default")),
+    (115, ("大", "Large")),
+    (130, ("特大", "X-Large")),
+    (150, ("超大", "XX-Large")),
 ];
 
 /// 配置里的 `font_scale` 倍率 → 预设百分比（取最接近的一档）。
@@ -4211,23 +4219,23 @@ fn font_scale_is_preset(scale: f32) -> bool {
 /// MCP 可调用能力清单（叠加层内展示，顺序即显示顺序）。
 struct McpCap {
     field: &'static str,
-    name: &'static str,
-    desc: &'static str,
+    name: Bi,
+    desc: Bi,
     ready: bool,
 }
 
 /// 全部 MCP 可调用能力（与 `config::McpConfig` 字段一一对应）。
 static MCP_CAPS: &[McpCap] = &[
-    McpCap { field: "resize_window", name: "调节窗口大小", desc: "调整任意窗口的尺寸与位置", ready: true },
-    McpCap { field: "read_layout", name: "获取元素布局", desc: "读取界面元素的几何与层级信息", ready: true },
-    McpCap { field: "click_element", name: "点击界面元素", desc: "在任意位置点击或激活元素", ready: true },
-    McpCap { field: "type_text", name: "输入文本", desc: "向焦点控件键入文字与快捷键", ready: true },
-    McpCap { field: "scroll_view", name: "滚动视图", desc: "滚动页面与列表到目标位置", ready: true },
-    McpCap { field: "screen_capture", name: "屏幕截图", desc: "截取屏幕或窗口画面", ready: true },
-    McpCap { field: "window_focus", name: "切换焦点窗口", desc: "激活指定窗口或应用", ready: false },
-    McpCap { field: "drag_drop", name: "拖拽操作", desc: "拖拽元素或执行拖放", ready: false },
-    McpCap { field: "key_press", name: "按键模拟", desc: "按下组合键与功能键（快捷键、确认/取消）", ready: true },
-    McpCap { field: "clipboard", name: "剪贴板读写", desc: "读取或写入系统剪贴板文本", ready: true },
+    McpCap { field: "resize_window", name: ("调节窗口大小", "Resize windows"), desc: ("调整任意窗口的尺寸与位置", "Resize and move any window"), ready: true },
+    McpCap { field: "read_layout", name: ("获取元素布局", "Read UI layout"), desc: ("读取界面元素的几何与层级信息", "Read geometry and hierarchy of UI elements"), ready: true },
+    McpCap { field: "click_element", name: ("点击界面元素", "Click UI elements"), desc: ("在任意位置点击或激活元素", "Click or activate elements anywhere"), ready: true },
+    McpCap { field: "type_text", name: ("输入文本", "Type text"), desc: ("向焦点控件键入文字与快捷键", "Type text and shortcuts into the focused control"), ready: true },
+    McpCap { field: "scroll_view", name: ("滚动视图", "Scroll views"), desc: ("滚动页面与列表到目标位置", "Scroll pages and lists to a target position"), ready: true },
+    McpCap { field: "screen_capture", name: ("屏幕截图", "Screen capture"), desc: ("截取屏幕或窗口画面", "Capture the screen or a window"), ready: true },
+    McpCap { field: "window_focus", name: ("切换焦点窗口", "Focus windows"), desc: ("激活指定窗口或应用", "Activate a given window or app"), ready: false },
+    McpCap { field: "drag_drop", name: ("拖拽操作", "Drag and drop"), desc: ("拖拽元素或执行拖放", "Drag elements or perform drag-and-drop"), ready: false },
+    McpCap { field: "key_press", name: ("按键模拟", "Keystrokes"), desc: ("按下组合键与功能键（快捷键、确认/取消）", "Press key combos and function keys (shortcuts, confirm/cancel)"), ready: true },
+    McpCap { field: "clipboard", name: ("剪贴板读写", "Clipboard access"), desc: ("读取或写入系统剪贴板文本", "Read or write system clipboard text"), ready: true },
 ];
 
 /// 读一个 MCP 能力开关。
@@ -4252,18 +4260,25 @@ fn get_mcp_cap(cfg: &modular_clipboard_core::config::Config, field: &str) -> boo
 ///
 /// `pub`：`App::apply_ops` 的 `CopyMcpPairPrompt` 分支读取它写入剪贴板。
 pub fn mcp_pair_prompt(cfg: &modular_clipboard_core::config::Config) -> String {
-    let mut s = String::from("【modular-clipboard · MCP 服务配对】\nmodular-clipboard 提供 Model Context Protocol（MCP）服务，可对本机执行界面自动化操作。\n\n可调用工具（10 项）：\n");
+    let mut s = String::from(t((
+        "【modular-clipboard · MCP 服务配对】\nmodular-clipboard 提供 Model Context Protocol（MCP）服务，可对本机执行界面自动化操作。\n\n可调用工具（10 项）：\n",
+        "【modular-clipboard · MCP pairing】\nmodular-clipboard exposes a Model Context Protocol (MCP) service that can run UI automation on this machine.\n\nAvailable tools (10):\n",
+    )));
     for cap in MCP_CAPS {
-        s.push_str(&format!("- {}：{}\n", cap.name, cap.desc));
+        s.push_str(&format!("- {}：{}\n", t(cap.name), t(cap.desc)));
     }
 
     // 当前 exe 完整路径（stdio 配置里 command 用）；取不到时用占位。
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "<modular-clipboard.exe 的完整路径>".into());
+        .unwrap_or_else(|_| t(("<modular-clipboard.exe 的完整路径>", "<full path to modular-clipboard.exe>")).into());
 
+    s.push_str(t((
+        "\n=== 方式一：stdio（本地，推荐） ===\n适用于 Claude Desktop / Cursor 等本地客户端，在 MCP 配置中加入：\n",
+        "\n=== Option 1: stdio (local, recommended) ===\nFor local clients such as Claude Desktop / Cursor, add this to your MCP config:\n",
+    )));
     s.push_str(&format!(
-        "\n=== 方式一：stdio（本地，推荐） ===\n适用于 Claude Desktop / Cursor 等本地客户端，在 MCP 配置中加入：\n{{\n  \"mcpServers\": {{\n    \"modular-clipboard\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"--mcp-server\"]\n    }}\n  }}\n}}\n"
+        "{{\n  \"mcpServers\": {{\n    \"modular-clipboard\": {{\n      \"command\": \"{exe}\",\n      \"args\": [\"--mcp-server\"]\n    }}\n  }}\n}}\n"
     ));
 
     // HTTP 段：地址、端口、认证。
@@ -4274,20 +4289,37 @@ pub fn mcp_pair_prompt(cfg: &modular_clipboard_core::config::Config) -> String {
     };
     let port = if cfg.mcp.port == 0 { 9123 } else { cfg.mcp.port };
     let auth = if cfg.mcp.token.is_empty() {
-        "无".to_string()
+        t(("无", "None")).to_string()
     } else {
-        "Bearer Token（已在设置中配置）".to_string()
+        t(("Bearer Token（已在设置中配置）", "Bearer token (configured in settings)")).to_string()
     };
+    s.push_str(
+        &t((
+            "\n=== 方式二：HTTP（远程 / 自定义地址） ===\n服务地址：http://{host}:{port}/mcp\n认证：{auth}\n配置：\n",
+            "\n=== Option 2: HTTP (remote / custom address) ===\nService URL: http://{host}:{port}/mcp\nAuth: {auth}\nConfig:\n",
+        ))
+        .replace("{host}", &host)
+        .replace("{port}", &port.to_string())
+        .replace("{auth}", &auth),
+    );
     s.push_str(&format!(
-        "\n=== 方式二：HTTP（远程 / 自定义地址） ===\n服务地址：http://{host}:{port}/mcp\n认证：{auth}\n配置：\n{{\n  \"mcpServers\": {{\n    \"modular-clipboard\": {{\n      \"url\": \"http://{host}:{port}/mcp\"\n    }}\n  }}\n}}\n启动 HTTP 服务：modular-clipboard.exe --mcp-http\n"
+        "{{\n  \"mcpServers\": {{\n    \"modular-clipboard\": {{\n      \"url\": \"http://{host}:{port}/mcp\"\n    }}\n  }}\n}}\n"
     ));
+    s.push_str(t((
+        "启动 HTTP 服务：modular-clipboard.exe --mcp-http\n",
+        "Start the HTTP service: modular-clipboard.exe --mcp-http\n",
+    )));
     s
 }
 
 /// 一个设置项。
+///
+/// `key` 是**稳定标识**（搜索「最近修改」的去重键、复位时的匹配键）：
+/// 文案会随界面语言变，不能当身份用（见 [`crate::i18n`] 模块注释）。
 struct SettingsItem {
-    label: &'static str,
-    desc: &'static str,
+    key: &'static str,
+    label: Bi,
+    desc: Bi,
     kind: ItemKind,
 }
 
@@ -4340,6 +4372,7 @@ impl SettingsItem {
             ItemKind::McpPort => {
                 get_number(cfg, ConfigGroup::Mcp, "port") != get_number(&d, ConfigGroup::Mcp, "port")
             }
+            ItemKind::Language => cfg.ui.language != d.ui.language,
             ItemKind::Info(_) | ItemKind::Link(_) | ItemKind::Quit => false,
         }
     }
@@ -4363,6 +4396,9 @@ impl SettingsItem {
                 field: f,
                 value: get_opt_number(&d, *g, f),
             }),
+            ItemKind::Language => Some(Op::SetLanguage(
+                modular_clipboard_core::i18n::LANG_SYSTEM,
+            )),
             ItemKind::PinnedMode => Some(Op::SetPinnedMode(PinnedMode::SharedColumn)),
             ItemKind::Theme => Some(Op::SetThemeMode(crate::theme::ThemeMode::FollowSystem)),
             ItemKind::Accent => Some(Op::SetAccent(None)),
@@ -4422,7 +4458,7 @@ impl SettingsItem {
 /// 一张设置卡片。
 struct SettingsCard {
     cat: SettingsCat,
-    title: &'static str,
+    title: Bi,
     items: &'static [SettingsItem],
 }
 
@@ -4430,55 +4466,69 @@ struct SettingsCard {
 static SETTINGS_CARDS: &[SettingsCard] = &[
     SettingsCard {
         cat: SettingsCat::General,
-        title: "常规",
+        title: ("常规", "General"),
         items: &[
             SettingsItem {
-                label: "窗口置顶",
-                desc: "始终显示在其它窗口之上",
+                key: "ui.language",
+                label: ("界面语言", "Interface language"),
+                desc: ("显示语言：跟随系统，或固定中文 / English", "Display language: follow the system, or force Chinese / English"),
+                kind: ItemKind::Language,
+            },
+            SettingsItem {
+                key: "ui.always_on_top",
+                label: ("窗口置顶", "Always on top"),
+                desc: ("主窗口始终显示在其它窗口之上", "Keep the main window above other windows"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "always_on_top"),
             },
             SettingsItem {
-                label: "失焦时隐藏",
-                desc: "切换到别的程序后隐藏窗口",
+                key: "ui.hide_on_focus_lost",
+                label: ("失焦时隐藏", "Hide on focus loss"),
+                desc: ("切换到其它程序时自动隐藏主窗口", "Hide the main window when another app gains focus"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "hide_on_focus_lost"),
             },
             SettingsItem {
-                label: "显示托盘图标",
-                desc: "后台常驻，保留右键菜单入口",
+                key: "ui.show_tray",
+                label: ("显示托盘图标", "Show tray icon"),
+                desc: ("后台常驻时在系统托盘显示图标与菜单", "Show an icon and menu in the system tray while running"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "show_tray"),
             },
             SettingsItem {
-                label: "启动时最小化",
-                desc: "启动后隐藏到托盘",
+                key: "ui.start_minimized",
+                label: ("启动时最小化", "Start minimized"),
+                desc: ("启动后不显示主窗口，直接驻留托盘", "Start hidden in the tray instead of opening the window"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "start_minimized"),
             },
             SettingsItem {
-                label: "置顶模式",
-                desc: "共用单栏与历史同列，独立分栏可拖出",
+                key: "ui.pinned_mode",
+                label: ("置顶布局", "Pinned layout"),
+                desc: ("置顶条目与历史同栏混排，或独立成可拖出的分栏", "Pin entries in the same list, or in a separate draggable column"),
                 kind: ItemKind::PinnedMode,
             },
             SettingsItem {
-                label: "开机自启动",
-                desc: "开机后只启动后台记录，界面从托盘唤起",
+                key: "ui.autostart",
+                label: ("开机自启动", "Launch at startup"),
+                desc: ("登录后仅启动后台记录，界面从托盘唤起", "Start recording in the background at sign-in; open the window from the tray"),
                 kind: ItemKind::Autostart,
             },
             SettingsItem {
-                label: "浏览器路径",
-                desc: "双击链接型条目时调用的程序；留空用系统默认浏览器",
+                key: "ui.browser_path",
+                label: ("浏览器路径", "Browser path"),
+                desc: ("打开链接条目用的程序；留空则用系统默认浏览器", "App used to open link entries; empty = system default browser"),
                 kind: ItemKind::Text {
                     group: ConfigGroup::Ui,
                     field: "browser_path",
-                    ph: "默认（系统默认浏览器）",
+                    ph: ("默认（系统默认浏览器）", "Default (system browser)"),
                     secret: false,
                 },
             },
             SettingsItem {
-                label: "资源管理器路径",
-                desc: "双击文件型条目时调用的程序；留空用系统资源管理器",
+                key: "ui.explorer_path",
+                label: ("文件管理器路径", "File manager path"),
+                desc: ("打开文件条目用的程序；留空则用系统资源管理器", "App used to open file entries; empty = system file manager"),
                 kind: ItemKind::Text {
                     group: ConfigGroup::Ui,
                     field: "explorer_path",
-                    ph: "默认（explorer.exe）",
+                    ph: ("默认（explorer.exe）", "Default (explorer.exe)"),
                     secret: false,
                 },
             },
@@ -4486,268 +4536,315 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
     },
     SettingsCard {
         cat: SettingsCat::Theme,
-        title: "主题",
+        title: ("主题", "Theme"),
         items: &[
             SettingsItem {
-                label: "明暗模式",
-                desc: "跟随系统 / 深色 / 浅色",
+                key: "ui.dark_mode",
+                label: ("明暗模式", "Light / dark mode"),
+                desc: ("跟随系统，或强制深色 / 浅色", "Follow the system, or force dark / light"),
                 kind: ItemKind::Theme,
             },
             SettingsItem {
-                label: "主题色",
-                desc: "强调色：预设色板 / 色相滑块 / 十六进制，三种方式任选",
+                key: "ui.accent",
+                label: ("主题色", "Accent color"),
+                desc: ("界面强调色：色板、色相滑块或十六进制任选", "Accent color: pick from swatches, sliders, or a hex value"),
                 kind: ItemKind::Accent,
             },
             SettingsItem {
-                label: "二级主题",
-                desc: "叠加在深浅模式上的风格层：纸质纹理 / 护眼绿 / 星空紫 / OLED",
+                key: "ui.secondary_theme",
+                label: ("风格主题", "Style theme"),
+                desc: ("叠加在明暗模式上的风格层：纸纹 / 护眼绿 / 星空紫 / OLED", "A style layer on top of light / dark: paper, eye-care green, starfield purple, OLED"),
                 kind: ItemKind::SecondaryTheme,
             },
             SettingsItem {
-                label: "二级主题参数",
-                desc: "当前二级主题的浓度与效果强度",
+                key: "ui.secondary_theme_params",
+                label: ("风格参数", "Style parameters"),
+                desc: ("当前风格主题的浓度与效果强度", "Intensity and strength of the current style theme"),
                 kind: ItemKind::ThemeParams,
             },
             SettingsItem {
-                label: "高级微调",
-                desc: "逐个令牌覆盖主题取值（任何元素、任何参数）",
+                key: "ui.token_overrides",
+                label: ("令牌微调", "Token overrides"),
+                desc: ("逐项覆盖主题取值：任何元素、任何参数", "Override individual theme tokens: any element, any value"),
                 kind: ItemKind::TokenOverrides,
             },
         ],
     },
     SettingsCard {
         cat: SettingsCat::Appearance,
-        title: "外观",
+        title: ("外观", "Appearance"),
         items: &[
             SettingsItem {
-                label: "字体缩放",
-                desc: "界面文字大小（预设档位，即改即生效）",
+                key: "ui.font_scale",
+                label: ("字体缩放", "Font scale"),
+                desc: ("界面文字大小；预设档位即改即生效", "Text size; presets apply instantly"),
                 kind: ItemKind::FontScale,
             },
             SettingsItem {
-                label: "背景效果",
-                desc: "无 / 磨砂（实时模糊） / 半透明",
+                key: "ui.window_backdrop",
+                label: ("背景效果", "Background effect"),
+                desc: ("无、磨砂（实时模糊）或半透明", "None, frosted blur, or translucent"),
                 kind: ItemKind::Backdrop,
             },
             SettingsItem {
-                label: "磨砂强度",
-                desc: "磨砂模式下的模糊程度（1~10 档）",
+                key: "ui.blur_strength",
+                label: ("磨砂强度", "Blur strength"),
+                desc: ("磨砂模式下的模糊程度", "Blur intensity in frosted mode"),
                 kind: ItemKind::BlurStrength,
             },
             SettingsItem {
-                label: "背景不透明度",
-                desc: "背景层强度，文字始终不透明",
+                key: "ui.window_opacity",
+                label: ("背景不透明度", "Background opacity"),
+                desc: ("背景层的透明程度；文字始终不透明", "Transparency of the background layer; text stays opaque"),
                 kind: ItemKind::Opacity,
             },
             SettingsItem {
-                label: "光标光晕",
-                desc: "磨砂模式下，光标靠近主窗口时在光标位置渲染一团径向光晕，像窗口被光标照亮；半径与浓度可调（默认关闭，仅磨砂模式可开）",
+                key: "ui.glow",
+                label: ("光标光晕", "Cursor glow"),
+                desc: ("磨砂模式下光标靠近时照亮窗口；半径与浓度可调", "Light up the window around the cursor in frosted mode; radius and strength adjustable"),
                 kind: ItemKind::Glow,
             },
             SettingsItem {
-                label: "卡片不透明度",
-                desc: "磨砂 / 半透明模式下条目卡片的实度：调低让模糊底图透过卡片（仅这两种模式可调）",
+                key: "ui.card_opacity",
+                label: ("卡片不透明度", "Card opacity"),
+                desc: ("条目卡片的实度；调低可透出模糊背景（磨砂 / 半透明下可调）", "Opacity of entry cards; lower it to reveal the blurred background"),
                 kind: ItemKind::CardOpacity,
             },
             SettingsItem {
-                label: "卡片阴影",
-                desc: "条目卡片的高斯投影；浓度 20% 为默认（16% = 1.0× 主题强度），深色主题自动加浓；开启后行间距自动适配，投影不被下一张卡片遮挡",
+                key: "ui.card_shadow",
+                label: ("卡片阴影", "Card shadow"),
+                desc: ("条目卡片的投影；深色模式下自动加深", "Drop shadow under entry cards; dark mode deepens it automatically"),
                 kind: ItemKind::CardShadow,
             },
             SettingsItem {
-                label: "右下角信息",
-                desc: "列表卡片右下角的图标 / 类型 / 大小：单击元素切换显示（灰色 = 隐藏），按住拖动可调整前后顺序",
+                key: "ui.row_meta",
+                label: ("卡片角标", "Card meta badges"),
+                desc: ("卡片右下角的图标、类型与大小：单击显隐，拖动排序", "Icon, type and size at the card's corner: click to toggle, drag to reorder"),
                 kind: ItemKind::RowMeta,
             },
             SettingsItem {
-                label: "图片内容直接显示",
-                desc: "图片类型的条目在列表里直接显示缩略图；关闭后只显示尺寸描述",
+                key: "ui.image_inline",
+                label: ("图片缩略图", "Image thumbnails"),
+                desc: ("图片条目直接显示缩略图；关闭后仅显示尺寸", "Show image entries as thumbnails; off = size text only"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "image_inline"),
             },
             SettingsItem {
-                label: "Markdown 渲染显示",
-                desc: "Markdown 类型按标题 / 列表 / 代码块排版；关闭后显示等宽源码",
+                key: "ui.md_rendered",
+                label: ("Markdown 渲染", "Render Markdown"),
+                desc: ("按标题、列表与代码块排版；关闭后显示等宽源码", "Lay out headings, lists and code blocks; off = monospaced source"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "md_rendered"),
             },
             SettingsItem {
-                label: "类型过滤栏",
-                desc: "主窗口边缘的悬浮类型按钮：单击按类型过滤、再点取消；可多选组合过滤、显示类型名称，位置与大小可调",
+                key: "ui.type_rail",
+                label: ("类型过滤栏", "Type filter bar"),
+                desc: ("窗口边缘的悬浮类型按钮：单击过滤，可多选、可调位置与大小", "Floating type buttons at the window edge: click to filter; multi-select, adjustable position and size"),
                 kind: ItemKind::TypeRail,
             },
             SettingsItem {
-                label: "搜索面板",
-                desc: "主窗口上方 / 下方的悬浮搜索面板：停靠位置与高度可调",
+                key: "ui.search_panel",
+                label: ("搜索面板", "Search panel"),
+                desc: ("悬浮搜索面板：停靠位置与高度可调", "Floating search panel; dock position and height adjustable"),
                 kind: ItemKind::SearchPanel,
             },
             SettingsItem {
-                label: "通知样式",
-                desc: "操作反馈（复制成功 / 失败提示等）的显示方式：窗口内顶部提示，或独立弹窗（不占列表空间）",
+                key: "ui.notice_popup",
+                label: ("通知方式", "Notifications"),
+                desc: ("操作反馈的显示：窗口内提示或独立弹窗", "How feedback appears: in-window toasts or a separate popup"),
                 kind: ItemKind::NoticeMode,
             },
         ],
     },
     SettingsCard {
         cat: SettingsCat::Capture,
-        title: "捕获",
+        title: ("捕获", "Capture"),
         items: &[
             SettingsItem {
-                label: "记录剪贴板",
-                desc: "关闭后不再新增历史",
+                key: "capture.enabled",
+                label: ("记录剪贴板", "Record clipboard"),
+                desc: ("关闭后不再新增历史条目", "Stop adding new entries when off"),
                 kind: ItemKind::Bool(ConfigGroup::Capture, "enabled"),
             },
             SettingsItem {
-                label: "跳过密码字段",
-                desc: "疑似输入密码时不记录",
+                key: "capture.skip_password_fields",
+                label: ("跳过密码字段", "Skip password fields"),
+                desc: ("疑似输入密码时不记录剪贴内容", "Skip clipboard content while passwords are being typed"),
                 kind: ItemKind::Bool(ConfigGroup::Capture, "skip_password_fields"),
             },
             SettingsItem {
-                label: "复制去重",
-                desc: "相同内容不再新增，自动置顶更新",
+                key: "capture.dedup",
+                label: ("复制去重", "Deduplicate copies"),
+                desc: ("内容相同时不新增，改为置顶更新", "Identical content is bumped to the top instead of duplicated"),
                 kind: ItemKind::Bool(ConfigGroup::Capture, "dedup"),
             },
             SettingsItem {
-                label: "监听间隔",
-                desc: "越小越灵敏、越耗电",
+                key: "capture.poll_interval_ms",
+                label: ("监听间隔", "Polling interval"),
+                desc: ("剪贴板检查间隔；越小越灵敏、越耗资源", "How often the clipboard is checked; lower is faster but heavier"),
                 kind: ItemKind::Number(ConfigGroup::Capture, "poll_interval_ms", &NUMBER_POLL_MS),
             },
         ],
     },
     SettingsCard {
         cat: SettingsCat::Storage,
-        title: "存储",
+        title: ("存储", "Storage"),
         items: &[
             SettingsItem {
-                label: "历史条数上限",
-                desc: "留空表示只按容量淘汰",
+                key: "storage.max_items",
+                label: ("历史条数上限", "Max entries"),
+                desc: ("保留的条目数量；留空则只按容量淘汰", "How many entries to keep; empty = size-based eviction only"),
                 kind: ItemKind::OptNumber(ConfigGroup::Storage, "max_items", &OPTN_MAX_ITEMS),
             },
             SettingsItem {
-                label: "单条大小上限",
-                desc: "超出该大小的内容不记录",
+                key: "storage.max_payload_bytes",
+                label: ("单条大小上限", "Max entry size"),
+                desc: ("超出该大小的剪贴内容不记录", "Clipboard content larger than this is not recorded"),
                 kind: ItemKind::Number(ConfigGroup::Storage, "max_payload_bytes", &NUMBER_MAX_PAYLOAD_MB),
             },
             SettingsItem {
-                label: "启动时清理临时文件",
-                desc: "删除上次退出遗留的临时文件",
+                key: "storage.cleanup_on_start",
+                label: ("清理临时文件", "Clean up temp files"),
+                desc: ("启动时删除上次退出遗留的临时文件", "Remove temp files left over from the previous run on startup"),
                 kind: ItemKind::Bool(ConfigGroup::Storage, "cleanup_on_start"),
             },
         ],
     },
     SettingsCard {
         cat: SettingsCat::Shortcuts,
-        title: "快捷键",
+        title: ("快捷键", "Shortcuts"),
         items: &[
             SettingsItem {
-                label: "显示/隐藏主窗口",
-                desc: "全局唤起",
+                key: "hotkey.toggle",
+                label: ("显示 / 隐藏主窗口", "Show / hide main window"),
+                desc: ("全局唤起或隐藏主窗口", "Toggle the main window from anywhere"),
                 kind: ItemKind::Hotkey(HotkeySlot::Toggle),
             },
             SettingsItem {
-                label: "粘贴上一个条目",
-                desc: "直接粘贴最近复制的条目",
+                key: "hotkey.paste_previous",
+                label: ("粘贴上一条", "Paste previous entry"),
+                desc: ("把最近一条历史直接粘贴到当前输入处", "Paste the most recent entry into the focused app"),
                 kind: ItemKind::Hotkey(HotkeySlot::PastePrevious),
             },
         ],
     },
     SettingsCard {
         cat: SettingsCat::Shortcuts,
-        title: "迷你快捷复制面板",
+        title: ("迷你面板", "Mini panel"),
         items: &[
             SettingsItem {
-                label: "启用",
-                desc: "按住修饰键点鼠标右键，在光标处弹出最近几条",
+                key: "mini_panel.enabled",
+                label: ("启用", "Enable"),
+                desc: ("按住修饰键右键点击，在光标处弹出最近几条", "Right-click with a modifier to pop up recent entries at the cursor"),
                 kind: ItemKind::Bool(ConfigGroup::MiniPanel, "enabled"),
             },
             SettingsItem {
-                label: "显示条数",
-                desc: "1 ~ 10 条",
+                key: "mini_panel.count",
+                label: ("显示条数", "Entry count"),
+                desc: ("面板中显示的最近条目数", "Number of recent entries shown in the panel"),
                 kind: ItemKind::Number(ConfigGroup::MiniPanel, "count", &NUMBER_MINI_COUNT),
             },
             SettingsItem {
-                label: "Ctrl + 右键",
-                desc: "与下面几项可叠加，至少留一个",
+                key: "mini_panel.ctrl",
+                label: ("Ctrl + 右键", "Ctrl + right-click"),
+                desc: ("触发修饰键，可叠加；至少保留一个", "Trigger modifier; these can stack, keep at least one"),
                 kind: ItemKind::Bool(ConfigGroup::MiniPanel, "ctrl"),
             },
             SettingsItem {
-                label: "Shift + 右键",
-                desc: "",
+                key: "mini_panel.shift",
+                label: ("Shift + 右键", "Shift + right-click"),
+                desc: ("", ""),
                 kind: ItemKind::Bool(ConfigGroup::MiniPanel, "shift"),
             },
             SettingsItem {
-                label: "Alt + 右键",
-                desc: "",
+                key: "mini_panel.alt",
+                label: ("Alt + 右键", "Alt + right-click"),
+                desc: ("", ""),
                 kind: ItemKind::Bool(ConfigGroup::MiniPanel, "alt"),
             },
             SettingsItem {
-                label: "Win + 右键",
-                desc: "",
+                key: "mini_panel.win",
+                label: ("Win + 右键", "Win + right-click"),
+                desc: ("", ""),
                 kind: ItemKind::Bool(ConfigGroup::MiniPanel, "win"),
             },
         ],
     },
     SettingsCard {
         cat: SettingsCat::Comm,
-        title: "MCP 服务",
+        title: ("MCP 服务", "MCP service"),
         items: &[
             SettingsItem {
-                label: "MCP 服务",
-                desc: "关闭后所有 MCP 调用不可用",
+                key: "mcp.enabled",
+                label: ("MCP 服务", "MCP service"),
+                desc: ("关闭后所有 MCP 调用不可用", "Turn off to disable all MCP calls"),
                 kind: ItemKind::McpToggle,
             },
             SettingsItem {
-                label: "服务地址",
-                desc: "MCP 服务监听地址",
-                kind: ItemKind::Text { group: ConfigGroup::Mcp, field: "host", ph: "127.0.0.1", secret: false },
+                key: "mcp.host",
+                label: ("监听地址", "Listen address"),
+                desc: ("MCP 服务监听的地址", "Address the MCP service listens on"),
+                kind: ItemKind::Text { group: ConfigGroup::Mcp, field: "host", ph: ("127.0.0.1", "127.0.0.1"), secret: false },
             },
             SettingsItem {
-                label: "端口",
-                desc: "MCP 服务端口，留空不设置",
+                key: "mcp.port",
+                label: ("端口", "Port"),
+                desc: ("MCP 服务端口；留空则不启用", "Port for the MCP service; empty = disabled"),
                 kind: ItemKind::McpPort,
             },
             SettingsItem {
-                label: "密钥",
-                desc: "默认无，留空表示无需认证",
-                kind: ItemKind::Text { group: ConfigGroup::Mcp, field: "token", ph: "无", secret: true },
+                key: "mcp.token",
+                label: ("访问密钥", "Access token"),
+                desc: ("访问密钥；留空表示无需认证", "Access token; empty = no authentication"),
+                kind: ItemKind::Text { group: ConfigGroup::Mcp, field: "token", ph: ("无", "None"), secret: true },
             },
         ],
     },
     SettingsCard {
         cat: SettingsCat::About,
-        title: "关于",
+        title: ("关于", "About"),
         items: &[
             SettingsItem {
-                label: "版本",
-                desc: "",
-                kind: ItemKind::Info(concat!("v", env!("CARGO_PKG_VERSION"))),
+                key: "about.version",
+                label: ("版本", "Version"),
+                desc: ("", ""),
+                kind: ItemKind::Info((concat!("v", env!("CARGO_PKG_VERSION")), concat!("v", env!("CARGO_PKG_VERSION")))),
             },
             SettingsItem {
-                label: "项目主页",
-                desc: "源代码、问题反馈与发布版本，点击在浏览器打开",
+                key: "about.repo",
+                label: ("项目主页", "Project page"),
+                desc: ("源代码、问题反馈与发布版本", "Source code, issue tracker and releases"),
                 kind: ItemKind::Link("https://github.com/MCheng404/ModularClipboard"),
             },
             SettingsItem {
-                label: "作者主页",
-                desc: "GitHub 主页，点击在浏览器打开",
+                key: "about.author",
+                label: ("作者主页", "Author page"),
+                desc: ("开发者的 GitHub 主页", "The developer's GitHub profile"),
                 kind: ItemKind::Link("https://github.com/MCheng404"),
             },
             SettingsItem {
-                label: "开源协议",
-                desc: "",
-                kind: ItemKind::Info("MIT License"),
+                key: "about.license",
+                label: ("开源协议", "License"),
+                desc: ("", ""),
+                kind: ItemKind::Info(("MIT License", "MIT License")),
             },
             SettingsItem {
-                label: "技术栈",
-                desc: "",
-                kind: ItemKind::Info("Rust · egui · Vulkan (Win32)"),
+                key: "about.stack",
+                label: ("技术栈", "Built with"),
+                desc: ("", ""),
+                kind: ItemKind::Info(("Rust · egui · Vulkan (Win32)", "Rust · egui · Vulkan (Win32)")),
             },
             SettingsItem {
-                label: "数据目录",
-                desc: "",
-                kind: ItemKind::Info("系统应用数据目录（%APPDATA%\\modular-clipboard）"),
+                key: "about.data_dir",
+                label: ("数据目录", "Data directory"),
+                desc: ("", ""),
+                kind: ItemKind::Info((
+                    "系统应用数据目录（%APPDATA%\\modular-clipboard）",
+                    "Per-user app data (%APPDATA%\\modular-clipboard)",
+                )),
             },
             SettingsItem {
-                label: "退出程序",
-                desc: "",
+                key: "about.quit",
+                label: ("退出程序", "Quit"),
+                desc: ("退出程序并停止后台记录", "Quit the app and stop recording"),
                 kind: ItemKind::Quit,
             },
         ],
@@ -4883,13 +4980,13 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let resp = ui.add(
                             egui::Button::new(
-                                egui::RichText::new("重置").size(pal.font_sm).color(pal.text_dim),
+                                egui::RichText::new(t(("重置", "Reset"))).size(pal.font_sm).color(pal.text_dim),
                             )
                             .frame(false),
                         );
                         let rect = resp.rect;
                         let clicked = resp.clicked();
-                        resp.on_hover_text("恢复该卡片默认值");
+                        resp.on_hover_text(t(("恢复该卡片默认值", "Restore this card to defaults")));
                         f.hit_insert(card.cat.reset_key(), rect);
                         if clicked {
                             for it in card.items {
@@ -4911,7 +5008,7 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
                             // 该卡片全部项从「最近修改」里移除。
                             f.state
                                 .settings_recent
-                                .retain(|(l, _)| !card.items.iter().any(|it| it.label == *l));
+                                .retain(|(l, _)| !card.items.iter().any(|it| it.key == *l));
                         }
                     });
                 });
@@ -4936,7 +5033,7 @@ fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
                 p.text(
                     bb.center(),
                     egui::Align2::CENTER_CENTER,
-                    "一键 AI 配对提示词",
+                    t(("一键 AI 配对提示词", "Copy AI pairing prompt")),
                     egui::FontId::proportional(pal.font_sm),
                     pal.text_on_accent,
                 );
@@ -5023,7 +5120,7 @@ fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 先布局所有 chip 并登记交互、收集 rect（拖拽时需要彼此的位置）。
         let mut cells: Vec<(RowMetaPart, Rect, egui::Response)> = Vec::with_capacity(3);
         for &part in cfg.order.iter() {
-            let w = crate::text::measure_text(ui, part.label(), &font) + chip_pad_x * 2.0;
+            let w = crate::text::measure_text(ui, t(part.label()), &font) + chip_pad_x * 2.0;
             let (rect, _) = ui.allocate_exact_size(vec2(w, chip_h), egui::Sense::hover());
             let id = ui.scope_id().with(("rowmeta_chip", part.label()));
             let resp = ui.interact(rect, id, egui::Sense::click_and_drag());
@@ -5066,7 +5163,7 @@ fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                part.label(),
+                t(part.label()),
                 font.clone(),
                 fg,
             );
@@ -5112,7 +5209,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             let mut v = get_bool(&f.svc.state.config, *g, field);
             if setting_row(ui, it.label, it.desc, |ui| draw_switch(f, ui, field, &mut v)) {
                 f.state.push(Op::SetBool { group: *g, field, value: v });
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::Number(g, field, spec) => {
@@ -5123,7 +5220,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     egui::DragValue::new(&mut val)
                         .range(spec.min..=spec.max)
                         .speed(spec.step)
-                        .suffix(spec.unit),
+                        .suffix(t(spec.unit)),
                 )
                 .changed()
             });
@@ -5133,7 +5230,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     field,
                     value: (spec.store)(val),
                 });
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::OptNumber(g, field, spec) => {
@@ -5144,14 +5241,14 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     egui::DragValue::new(&mut val)
                         .range(spec.default..=1_000_000.0)
                         .speed(spec.step)
-                        .suffix(spec.unit),
+                        .suffix(t(spec.unit)),
                 )
                 .changed()
             });
             if changed {
                 let next = if val <= spec.default { None } else { Some(val) };
                 f.state.push(Op::SetOptNumber { group: *g, field, value: next });
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::PinnedMode => {
@@ -5161,14 +5258,14 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     ui,
                     "pinned_mode",
                     &[
-                        (PinnedMode::SharedColumn, "共用单栏"),
-                        (PinnedMode::OwnCard, "独立分栏"),
+                        (PinnedMode::SharedColumn, ("共用单栏", "Shared column")),
+                        (PinnedMode::OwnCard, ("独立分栏", "Own column")),
                     ],
                     f.ws.pinned_mode(),
                 );
                 if let Some(m) = picked {
                     f.state.push(Op::SetPinnedMode(m));
-                    record_recent(f, it.label);
+                    record_recent(f, it.key);
                 }
                 picked.is_some()
             });
@@ -5182,7 +5279,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 let readout = if font_scale_is_preset(cur) {
                     format!("{pct}%")
                 } else {
-                    format!("{pct}%（自定义）")
+                    format!("{pct}%{}", t(("（自定义）", " (custom)")))
                 };
                 ui.add(egui::Label::new(
                     egui::RichText::new(readout).color(pal.text_dim),
@@ -5195,9 +5292,42 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                         field: "font_scale",
                         value: f64::from(p) / 100.0,
                     });
-                    record_recent(f, it.label);
+                    record_recent(f, it.key);
                 }
                 picked.is_some()
+            });
+        }
+        ItemKind::Language => {
+            setting_row(ui, it.label, it.desc, |ui| {
+                let cur = f.svc.state.config.ui.language.as_str();
+                let sel = if cur.eq_ignore_ascii_case("zh-CN") || cur.eq_ignore_ascii_case("zh") {
+                    1u8
+                } else if cur.eq_ignore_ascii_case("en-US") || cur.eq_ignore_ascii_case("en") {
+                    2u8
+                } else {
+                    0u8 // system / 未知写法都显示「跟随系统」
+                };
+                let picked = draw_segmented(
+                    f,
+                    ui,
+                    "ui_language",
+                    &[
+                        (0u8, ("跟随系统", "Follow system")),
+                        (1u8, ("中文", "Chinese")),
+                        (2u8, ("English", "English")),
+                    ],
+                    sel,
+                );
+                if let Some(v) = picked {
+                    f.state.push(Op::SetLanguage(match v {
+                        1 => "zh-CN",
+                        2 => "en-US",
+                        _ => modular_clipboard_core::i18n::LANG_SYSTEM,
+                    }));
+                    true
+                } else {
+                    false
+                }
             });
         }
         ItemKind::Theme => {
@@ -5207,22 +5337,22 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     ui,
                     "theme_mode",
                     &[
-                        (crate::theme::ThemeMode::FollowSystem, "跟随系统"),
-                        (crate::theme::ThemeMode::Dark, "深色"),
-                        (crate::theme::ThemeMode::Light, "浅色"),
+                        (crate::theme::ThemeMode::FollowSystem, ("跟随系统", "Follow system")),
+                        (crate::theme::ThemeMode::Dark, ("深色", "Dark")),
+                        (crate::theme::ThemeMode::Light, ("浅色", "Light")),
                     ],
                     crate::theme::ThemeMode::from_dark_mode(f.svc.state.config.ui.dark_mode),
                 );
                 if let Some(m) = picked {
                     f.state.push(Op::SetThemeMode(m));
-                    record_recent(f, it.label);
+                    record_recent(f, it.key);
                 }
                 picked.is_some()
             });
         }
         ItemKind::Accent => {
             if draw_accent_editor(f, ui) {
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::SecondaryTheme => {
@@ -5233,17 +5363,17 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     ui,
                     "secondary_theme",
                     &[
-                        (SecondaryTheme::None, "无"),
-                        (SecondaryTheme::Paper, "纸质"),
-                        (SecondaryTheme::Green, "护眼"),
-                        (SecondaryTheme::Purple, "星空"),
-                        (SecondaryTheme::Oled, "OLED"),
+                        (SecondaryTheme::None, ("无", "None")),
+                        (SecondaryTheme::Paper, ("纸纹", "Paper")),
+                        (SecondaryTheme::Green, ("护眼绿", "Eye-care green")),
+                        (SecondaryTheme::Purple, ("星空紫", "Starfield purple")),
+                        (SecondaryTheme::Oled, ("OLED", "OLED")),
                     ],
                     f.svc.state.config.ui.secondary_theme,
                 );
                 if let Some(t) = picked {
                     f.state.push(Op::SetSecondaryTheme(t));
-                    record_recent(f, it.label);
+                    record_recent(f, it.key);
                 }
                 picked.is_some()
             });
@@ -5257,7 +5387,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // 禁用的处理一致——「关着还能调」会让用户以为参数没保存）。
                 let _ = setting_row(ui, it.label, it.desc, |ui| {
                     ui.add(egui::Label::new(
-                        egui::RichText::new("先选择一个二级主题").color(f.pal.text_dim),
+                        egui::RichText::new(t(("先选择一个风格主题", "Select a style theme first"))).color(f.pal.text_dim),
                     ));
                     false
                 });
@@ -5265,7 +5395,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // 摘要行：右侧显示当前主题名（参数归属一眼可见）。
                 let _ = setting_row(ui, it.label, it.desc, |ui| {
                     ui.add(egui::Label::new(
-                        egui::RichText::new(theme.label()).color(f.pal.text_dim),
+                        egui::RichText::new(t(theme.label())).color(f.pal.text_dim),
                     ));
                     false
                 });
@@ -5278,7 +5408,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                         f,
                         ui,
                         knob.key,
-                        knob.label,
+                        t(knob.label),
                         format!("{}%", (v * 100.0).round() as i32),
                         &mut v,
                         0.0..=1.0,
@@ -5292,7 +5422,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             if changed {
                 // 整包替换：两个旋钮可能同帧连改（见 Op::SetThemeParams）。
                 f.state.push(Op::SetThemeParams(params));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::TokenOverrides => {
@@ -5307,15 +5437,15 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     ui,
                     "window_backdrop",
                     &[
-                        (WindowBackdrop::None, "无"),
-                        (WindowBackdrop::Acrylic, "磨砂"),
-                        (WindowBackdrop::Translucent, "半透明"),
+                        (WindowBackdrop::None, ("无", "None")),
+                        (WindowBackdrop::Acrylic, ("磨砂", "Frosted")),
+                        (WindowBackdrop::Translucent, ("半透明", "Translucent")),
                     ],
                     f.svc.state.config.ui.window_backdrop,
                 );
                 if let Some(m) = picked {
                     f.state.push(Op::SetBackdrop(m));
-                    record_recent(f, it.label);
+                    record_recent(f, it.key);
                 }
                 picked.is_some()
             });
@@ -5334,7 +5464,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             });
             if changed && enabled {
                 f.state.push(Op::SetOpacity(op));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::CardOpacity => {
@@ -5361,7 +5491,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             });
             if changed && enabled {
                 f.state.push(Op::SetCardOpacity(op));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::BlurStrength => {
@@ -5386,7 +5516,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             });
             if changed && enabled {
                 f.state.push(Op::SetBlurStrength(level));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::CardShadow => {
@@ -5406,7 +5536,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     f,
                     ui,
                     "card_shadow_blur",
-                    "模糊",
+                    t(("模糊", "Blur")),
                     format!("{}", cfg.blur.round() as i32),
                     &mut cfg.blur,
                     0.0..=24.0,
@@ -5415,7 +5545,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     f,
                     ui,
                     "card_shadow_opacity",
-                    "浓度",
+                    t(("浓度", "Opacity")),
                     format!("{}%", (cfg.opacity * 100.0).round() as i32),
                     &mut cfg.opacity,
                     0.0..=0.6,
@@ -5424,7 +5554,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     f,
                     ui,
                     "card_shadow_offset_y",
-                    "偏移",
+                    t(("偏移", "Offset")),
                     format!("{}", cfg.offset_y.round() as i32),
                     &mut cfg.offset_y,
                     -8.0..=16.0,
@@ -5435,13 +5565,13 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // 整包替换：三个滑块 + 开关可能在同一帧连续改，一个 Op
                 // 就够（见 `Op::SetCardShadow` 的说明）。
                 f.state.push(Op::SetCardShadow(cfg));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::RowMeta => {
             // 编辑器内部自己 push Op（单击 / 拖拽可能一帧内多次改）。
             if draw_row_meta_editor(f, ui) {
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::TypeRail => {
@@ -5454,32 +5584,32 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             });
             if cfg.visible {
                 ui.add_space(2.0);
-                changed |= setting_row(ui, "始终显示全部类型", "关闭时仅显示已有记录的类型", |ui| {
+                changed |= setting_row(ui, ("始终显示全部类型", "Show all types"), ("关闭时仅显示已有记录的类型", "When off, only types present in history are shown"), |ui| {
                     draw_switch(f, ui, "type_rail_always", &mut cfg.always)
                 });
                 ui.add_space(2.0);
                 // 多选：按钮变开关，可同时点亮多个类型（2026-10-20 新增）。
-                changed |= setting_row(ui, "多选组合过滤", "开启后可同时选择多个类型，列表显示任一所选类型的条目", |ui| {
+                changed |= setting_row(ui, ("多选组合过滤", "Multi-select"), ("开启后可同时选择多个类型，列表显示任一所选类型的条目", "Select several types at once; the list shows entries matching any of them"), |ui| {
                     draw_switch(f, ui, "type_rail_multi", &mut cfg.multi)
                 });
                 ui.add_space(2.0);
                 // 文字标签：图标旁显示类型名称（2026-10-20 新增）。
-                changed |= setting_row(ui, "显示类型名称", "在图标旁显示文字标签；竖直停靠时在图标下方，水平停靠时在右侧", |ui| {
+                changed |= setting_row(ui, ("显示类型名称", "Show type names"), ("在图标旁显示文字标签；竖直停靠时在图标下方，水平停靠时在右侧", "Text labels next to the icons: below them when vertical, to the right when horizontal"), |ui| {
                     draw_switch(f, ui, "type_rail_labels", &mut cfg.labels)
                 });
                 ui.add_space(2.0);
                 // 位置：四向分段控件（与「背景效果」同一控件）。
-                changed |= setting_row(ui, "停靠位置", "类型栏贴在主窗口的哪一侧", |ui| {
+                changed |= setting_row(ui, ("停靠位置", "Dock position"), ("类型栏贴在主窗口的哪一侧", "Which edge of the main window the bar sticks to"), |ui| {
                     use modular_clipboard_core::config::TypeRailPos;
                     let picked = draw_segmented(
                         f,
                         ui,
                         "type_rail_pos",
                         &[
-                            (TypeRailPos::Right, "右"),
-                            (TypeRailPos::Left, "左"),
-                            (TypeRailPos::Top, "上"),
-                            (TypeRailPos::Bottom, "下"),
+                            (TypeRailPos::Right, ("右", "Right")),
+                            (TypeRailPos::Left, ("左", "Left")),
+                            (TypeRailPos::Top, ("上", "Top")),
+                            (TypeRailPos::Bottom, ("下", "Bottom")),
                         ],
                         cfg.pos,
                     );
@@ -5492,7 +5622,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // 大小：24~48pt 滑块（步进由滑块天然连续，绘制侧钳制）。
                 let mut size = modular_clipboard_core::config::clamp_type_rail_size(cfg.size);
                 let pal = f.pal;
-                changed |= setting_row(ui, "图标大小", "类型按钮的边长（24~48pt）", |ui| {
+                changed |= setting_row(ui, ("图标大小", "Icon size"), ("类型按钮的边长（24~48pt）", "Side length of each type button (24-48 pt)"), |ui| {
                     ui.add(egui::Label::new(
                         egui::RichText::new(format!("{}", size.round() as i32)).color(pal.text_dim),
                     ));
@@ -5512,22 +5642,22 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             }
             if changed {
                 f.state.push(Op::SetTypeRail(cfg));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::SearchPanel => {
             // 悬浮搜索面板：停靠位置（窗口上/下）+ 高度。整包替换。
             let mut cfg = f.svc.state.config.ui.search_panel;
             let mut changed = false;
-            changed |= setting_row(ui, "停靠位置", "搜索面板贴在主窗口的上方还是下方", |ui| {
+            changed |= setting_row(ui, ("停靠位置", "Dock position"), ("搜索面板贴在主窗口的上方还是下方", "Whether the panel docks above or below the main window"), |ui| {
                 use modular_clipboard_core::config::SearchPanelPos;
                 let picked = draw_segmented(
                     f,
                     ui,
                     "search_panel_pos",
                     &[
-                        (SearchPanelPos::Top, "上方"),
-                        (SearchPanelPos::Bottom, "下方"),
+                        (SearchPanelPos::Top, ("上方", "Top")),
+                        (SearchPanelPos::Bottom, ("下方", "Bottom")),
                     ],
                     cfg.pos,
                 );
@@ -5539,7 +5669,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             ui.add_space(2.0);
             let mut height = modular_clipboard_core::config::clamp_search_panel_height(cfg.height);
             let pal = f.pal;
-            changed |= setting_row(ui, "面板高度", "搜索面板的高度（30~56pt）", |ui| {
+            changed |= setting_row(ui, ("面板高度", "Panel height"), ("搜索面板的高度（30~56pt）", "Height of the search panel (30-56 pt)"), |ui| {
                 ui.add(egui::Label::new(
                     egui::RichText::new(format!("{}", height.round() as i32)).color(pal.text_dim),
                 ));
@@ -5558,7 +5688,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             cfg.height = modular_clipboard_core::config::clamp_search_panel_height(height);
             if changed {
                 f.state.push(Op::SetSearchPanel(cfg));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::Glow => {
@@ -5580,7 +5710,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 let pal = f.pal;
                 let _ = setting_row(ui, it.label, it.desc, |ui| {
                     ui.add(egui::Label::new(
-                        egui::RichText::new("需先开启磨砂背景").color(pal.text_dim),
+                        egui::RichText::new(t(("需先开启磨砂背景", "Requires the frosted background"))).color(pal.text_dim),
                     ));
                     false
                 });
@@ -5589,7 +5719,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 ui.add_space(2.0);
                 let mut radius = modular_clipboard_core::config::clamp_glow_radius(cfg.radius);
                 let pal = f.pal;
-                changed |= setting_row(ui, "光晕半径", "径向渐变的边缘半径（60~320pt）", |ui| {
+                changed |= setting_row(ui, ("光晕半径", "Glow radius"), ("径向渐变的边缘半径（60~320pt）", "Radius of the radial gradient (60-320 pt)"), |ui| {
                     ui.add(egui::Label::new(
                         egui::RichText::new(format!("{}", radius.round() as i32)).color(pal.text_dim),
                     ));
@@ -5608,7 +5738,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 cfg.radius = modular_clipboard_core::config::clamp_glow_radius(radius);
                 ui.add_space(2.0);
                 let mut strength = modular_clipboard_core::config::clamp_glow_strength(cfg.strength);
-                changed |= setting_row(ui, "光晕浓度", "光晕中心颜色的透明度（0~100%）", |ui| {
+                changed |= setting_row(ui, ("光晕浓度", "Glow strength"), ("光晕中心颜色的透明度（0~100%）", "Opacity of the glow center (0-100%)"), |ui| {
                     ui.add(egui::Label::new(
                         egui::RichText::new(format!("{}%", (strength * 100.0).round() as i32))
                             .color(pal.text_dim),
@@ -5629,7 +5759,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             }
             if changed {
                 f.state.push(Op::SetGlow(cfg));
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::NoticeMode => {
@@ -5640,7 +5770,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     f,
                     ui,
                     "notice_popup",
-                    &[(false, "窗口内提示"), (true, "独立弹窗")],
+                    &[(false, ("窗口内提示", "In-window toast")), (true, ("独立弹窗", "Separate popup"))],
                     popup,
                 );
                 if let Some(p) = picked {
@@ -5654,7 +5784,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     field: "notice_popup",
                     value: popup,
                 });
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::Hotkey(slot) => {
@@ -5688,7 +5818,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // `item_spacing.x` 归了 0（行与行才够呼吸），
                 // 同行控件零间距会挤成一团（用户实测反馈）。
                 ui.add_space(8.0);
-                if ui.small_button("录制").clicked() {
+                if ui.small_button(t(("录制", "Record"))).clicked() {
                     f.state.push(Op::StartRecording(*slot));
                 }
                 changed
@@ -5745,7 +5875,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     field: "enabled",
                     value: v,
                 });
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::Text {
@@ -5760,7 +5890,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 // 宽度随字号缩放（基准 170 / 230 @ font_sm 15），
                 // 否则 2× 字号下框里只显示得下 4~5 个字。
                 let w = pal.font_sm * if *secret { 11.3 } else { 15.3 };
-                draw_text_field(f, ui, field, &mut buf, ph, *secret, w)
+                draw_text_field(f, ui, field, &mut buf, t(*ph), *secret, w)
             });
             if changed {
                 f.state.push(Op::SetText {
@@ -5768,7 +5898,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     field,
                     value: buf,
                 });
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::McpPort => {
@@ -5789,18 +5919,18 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                     field: "port",
                     value: v as f64,
                 });
-                record_recent(f, it.label);
+                record_recent(f, it.key);
             }
         }
         ItemKind::Info(text) => {
-            setting_row(ui, it.label, "", |ui| {
+            setting_row(ui, it.label, ("", ""), |ui| {
                 // CAUTION: 必须 `truncate()`。右对齐布局里宽度不够的控件
                 // 会**向左**无限生长（`Extend` 模式），长文本（如数据目录
                 // 那行）会压到左侧导航列上——实测 2× 字号下越出 130pt。
                 let r = ui.add(
-                    egui::Label::new(egui::RichText::new(*text).color(pal.text_dim)).truncate(),
+                    egui::Label::new(egui::RichText::new(t(*text)).color(pal.text_dim)).truncate(),
                 );
-                r.on_hover_text(*text);
+                r.on_hover_text(t(*text));
                 false
             });
         }
@@ -5844,7 +5974,7 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             p.text(
                 pos2(r.min.x + 4.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
-                "退出程序",
+                t(("退出程序", "Quit")),
                 egui::FontId::proportional(pal.font_md),
                 pal.danger,
             );
@@ -5864,13 +5994,21 @@ fn settings_search_results(f: &mut Frame<'_>, ui: &mut Ui, q: &str) {
         let hits: Vec<&SettingsItem> = card
             .items
             .iter()
-            .filter(|it| it.label.contains(q) || it.desc.contains(q))
+            .filter(|it| {
+                // 搜索对**两种语言**的名称与介绍、以及稳定 key 全匹配：
+                // 界面切到英文时用中文词也能搜到，反之亦然。
+                it.label.0.contains(q)
+                    || it.label.1.contains(q)
+                    || it.desc.0.contains(q)
+                    || it.desc.1.contains(q)
+                    || it.key.contains(q)
+            })
             .collect();
         if hits.is_empty() {
             continue;
         }
         total += hits.len();
-        section(ui, card.title, f.pal);
+        section(ui, t(card.title), f.pal);
         for it in hits {
             let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::click());
             if resp.hovered() {
@@ -5879,14 +6017,14 @@ fn settings_search_results(f: &mut Frame<'_>, ui: &mut Ui, q: &str) {
             ui.painter_at(rect).text(
                 rect.min + vec2(8.0, 8.0),
                 egui::Align2::LEFT_TOP,
-                it.label,
+                t(it.label),
                 egui::FontId::proportional(pal.font_sm),
                 pal.text,
             );
             ui.painter_at(rect).text(
                 rect.max - vec2(8.0, 8.0),
                 egui::Align2::RIGHT_BOTTOM,
-                card.title,
+                t(card.title),
                 egui::FontId::proportional(pal.font_xs),
                 pal.text_dim,
             );
@@ -5906,16 +6044,21 @@ fn settings_search_results(f: &mut Frame<'_>, ui: &mut Ui, q: &str) {
 fn settings_recent_view(f: &mut Frame<'_>, ui: &mut Ui) {
     let pal = f.pal;
     if f.state.settings_recent.is_empty() {
-        ui.label(egui::RichText::new("暂无最近修改的设置").color(pal.text_dim));
+        ui.label(egui::RichText::new(t(("暂无最近修改的设置", "No recently changed settings"))).color(pal.text_dim));
         return;
     }
-    section(ui, "最近修改", f.pal);
-    for (label, _ts) in f.state.settings_recent.iter().rev() {
-        let cat_title = SETTINGS_CARDS
+    section(ui, t(("最近修改", "Recently changed")), f.pal);
+    for (key, _ts) in f.state.settings_recent.iter().rev() {
+        // 稳定 key → 当前语言的名称；找不到就显示 key（只可能是
+        // 版本升级删掉了该设置项，留个可辨认的痕迹比空白好）。
+        let item = SETTINGS_CARDS
             .iter()
-            .find(|c| c.items.iter().any(|it| it.label == *label))
-            .map(|c| c.title)
-            .unwrap_or("");
+            .flat_map(|c| c.items.iter().map(move |it| (c, it)))
+            .find(|(_, it)| it.key == *key);
+        let (label, cat_title) = match item {
+            Some((c, it)) => (t(it.label), t(c.title)),
+            None => (key.as_str(), ""),
+        };
         let (rect, _resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.0), egui::Sense::hover());
         ui.painter_at(rect).text(
             rect.min + vec2(8.0, 8.0),
@@ -6092,10 +6235,12 @@ const CTRL_MIN_H: f32 = 24.0;
 /// 卡片外」的成因）。控件宽从 `min_rect` 取实际值，不靠猜。
 fn setting_row(
     ui: &mut Ui,
-    label: &'static str,
-    desc: &'static str,
+    label: Bi,
+    desc: Bi,
     control: impl FnOnce(&mut Ui) -> bool,
 ) -> bool {
+    let label = t(label);
+    let desc = t(desc);
     let mut changed = false;
     if row_font_scale(ui) > ROW_STACK_SCALE {
         // ---- 大字号：上下堆叠 ----
@@ -6498,7 +6643,7 @@ fn draw_segmented<T: Copy + PartialEq>(
     // 补间键前缀——交互 Id 用 `("seg", i, label)`（选项文字全局唯一），
     // 补间 Id 必须再叠一层本实例名，否则两个控件会共享同一段补间。
     id_suffix: &'static str,
-    options: &[(T, &'static str)],
+    options: &[(T, Bi)],
     cur: T,
 ) -> Option<T> {
     let pal = f.pal;
@@ -6510,6 +6655,7 @@ fn draw_segmented<T: Copy + PartialEq>(
     let font = egui::FontId::proportional(pal.font_sm);
     let mut seg_w = 0.0_f32;
     for (_, label) in options {
+        let label = t(*label);
         let w = ui
             .painter()
             .layout_no_wrap(label.to_string(), font.clone(), pal.text)
@@ -6555,6 +6701,7 @@ fn draw_segmented<T: Copy + PartialEq>(
     painter.rect_filled(pill, pal.radius_sm, pal.surface);
     let mut picked = None;
     for (i, (value, label)) in options.iter().enumerate() {
+        let label = t(*label);
         let seg = egui::Rect::from_min_max(
             pos2(r.min.x + seg_w * i as f32, r.min.y),
             pos2(r.min.x + seg_w * (i + 1) as f32, r.max.y),
@@ -6798,14 +6945,14 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 来源标注：预设 / 自定义 / 默认。比只显示颜色多一分确定性
         // （用户看得知道自己用的是哪一个预设）。
         let source = if cur.is_none() {
-            "默认"
+            t(("默认", "Default"))
         } else if crate::theme::ACCENT_PRESETS
             .iter()
             .any(|(_, p)| AccentColor::from_rgb(*p).to_rgb() == rgb)
         {
-            "预设"
+            t(("预设", "Preset"))
         } else {
-            "自定义"
+            t(("自定义", "Custom"))
         };
         ui.add(egui::Label::new(
             egui::RichText::new(format!("{source}  {}", shown.to_hex())).color(pal.text_dim),
@@ -6817,6 +6964,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     ui.horizontal(|ui| {
         ui.add_space(1.0);
         for (i, (name, prgb)) in crate::theme::ACCENT_PRESETS.iter().enumerate() {
+        let name = t(*name);
             let s = 20.0;
             let (r, _) = ui.allocate_exact_size(vec2(s, s), Sense::empty());
             let resp = ui.interact(r, egui::Id::unique(("accent_preset", i)), Sense::click());
@@ -6861,7 +7009,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         f,
         ui,
         "accent_hue",
-        "色相",
+        t(("色相", "Hue")),
         format!("{:.0}°", h),
         &mut h,
         0.0..=360.0,
@@ -6875,7 +7023,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         f,
         ui,
         "accent_sat",
-        "饱和度",
+        t(("饱和度", "Saturation")),
         format!("{}%", (s * 100.0).round() as i32),
         &mut s,
         0.0..=1.0,
@@ -6889,7 +7037,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         f,
         ui,
         "accent_val",
-        "明度",
+        t(("明度", "Lightness")),
         format!("{}%", (v * 100.0).round() as i32),
         &mut v,
         0.0..=1.0,
@@ -6902,7 +7050,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     // ---- 十六进制输入 + 恢复默认 ----
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        ui.add(egui::Label::new("十六进制"));
+        ui.add(egui::Label::new(t(("十六进制", "Hex"))));
         ui.add_space(8.0);
         // 草稿同步的焦点感知：无焦点时每帧覆写为当前色（点预设 / 拖滑条
         // 后输入框跟着变），有焦点时保留用户输入（ rationale 见
@@ -6969,7 +7117,7 @@ fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 恢复默认：仅在用户改过时出现（默认态放个按钮是噪声）。
         if cur.is_some() {
             ui.add_space(8.0);
-            if draw_mini_button(f, ui, "accent_reset_default", "恢复默认", Some("accent_reset_default")) {
+            if draw_mini_button(f, ui, "accent_reset_default", t(("恢复默认", "Restore default")), Some("accent_reset_default")) {
                 next = None;
                 changed = true;
             }
@@ -7020,9 +7168,10 @@ fn draw_token_entry(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
 
     // 入口行本身做成一个可点条目：标签 + 摘要 + 「调整」。
     let label = if n_over > 0 {
-        format!("高级微调 · 已覆盖 {n_over} 个令牌")
+        t(("高级微调 · 已覆盖 {n} 个令牌", "Token overrides · {n} overridden"))
+            .replace("{n}", &n_over.to_string())
     } else {
-        "高级微调".to_string()
+        t(("高级微调", "Token overrides")).to_string()
     };
     let (r, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), pal.control_height),
@@ -7122,7 +7271,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
         ui.add_space(6.0);
         ui.add(
             egui::Label::new(
-                egui::RichText::new("高级微调").color(pal.text).size(pal.font_lg),
+                egui::RichText::new(t(("高级微调", "Token overrides"))).color(pal.text).size(pal.font_lg),
             ),
         );
     });
@@ -7130,7 +7279,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(
-                "全部主题令牌的当前生效值。拖动即写入覆盖，优先于二级主题与强调色的派生值。",
+                t(("全部主题令牌的当前生效值。拖动即写入覆盖，优先于风格主题与强调色的派生值。", "Effective values of all theme tokens. Dragging writes an override, which wins over values derived from the style theme and accent color.")),
             )
             .color(pal.text_dim),
         )
@@ -7143,12 +7292,13 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     // 摘要 + 全部重置（仅在有覆盖时出现——默认态放个按钮是噪声）。
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
-            egui::RichText::new(format!("已覆盖 {n_over} 个令牌")).color(pal.text_dim),
+            egui::RichText::new(t(("已覆盖 {n} 个令牌", "{n} overridden"))
+                .replace("{n}", &n_over.to_string())).color(pal.text_dim),
         ));
         if n_over > 0 {
             ui.add_space(8.0);
             let reset_all =
-                draw_mini_button(f, ui, "token_reset_all", "全部重置", Some("token_reset_all"));
+                draw_mini_button(f, ui, "token_reset_all", t(("全部重置", "Reset all")), Some("token_reset_all"));
             if reset_all {
                 f.state.push(Op::ClearAllTokenOverrides);
             }
@@ -7167,9 +7317,9 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     for (name, value) in pal.tokens() {
         // 组标题：只在分组变化时画一次。
         let g = match value {
-            TokenValue::Color(_) => "颜色",
-            TokenValue::Num(_) => "数值",
-            TokenValue::Dur(_) => "时长（只读）",
+            TokenValue::Color(_) => t(("颜色", "Colors")),
+            TokenValue::Num(_) => t(("数值", "Numbers")),
+            TokenValue::Dur(_) => t(("时长（只读）", "Durations (read-only)")),
         };
         if g != group {
             group = g;
@@ -7230,7 +7380,7 @@ fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                             ui.painter_at(lr2).text(
                                 pos2(lr2.min.x + 20.0, lr2.center().y),
                                 Align2::LEFT_CENTER,
-                                "└ 透明度",
+                                t(("└ 透明度", "└ Opacity")),
                                 egui::FontId::proportional(pal.font_xs),
                                 pal.text_dim,
                             );
@@ -7429,7 +7579,7 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     p.text(
         pos2(panel.center().x, y + 10.0),
         egui::Align2::CENTER_TOP,
-        "正在录制快捷键",
+        t(("正在录制快捷键", "Recording shortcut")),
         egui::FontId::proportional(pal.font_md),
         pal.text_bright,
     );
@@ -7504,7 +7654,7 @@ fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     p.text(
         pos2(panel.center().x, y),
         egui::Align2::CENTER_TOP,
-        "录制完成后，点击任意位置停止录制",
+        t(("录制完成后，点击任意位置停止录制", "Click anywhere to stop recording")),
         egui::FontId::proportional(pal.font_sm),
         pal.text_dim,
     );
@@ -7558,7 +7708,7 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     let total_on = MCP_CAPS.iter().filter(|c| get_mcp_cap(&f.svc.state.config, c.field)).count();
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new("MCP 调用设置")
+            egui::RichText::new(t(("MCP 调用设置", "MCP tool access")))
                 .strong()
                 .size(pal.font_md)
                 .color(pal.text_bright),
@@ -7589,11 +7739,17 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
 
     // 副标题：能力总数 / 当前可调用数。
     ui.label(
-        egui::RichText::new(format!(
-            "共 {} 个能力 · {} 个可调用 · 关闭后全部不可用",
-            MCP_CAPS.len(),
-            if f.svc.state.config.mcp.enabled { total_on } else { 0 }
-        ))
+        egui::RichText::new(
+            t((
+                "共 {a} 个能力 · {b} 个可调用 · 关闭后全部不可用",
+                "{a} tools · {b} callable · all disabled when off",
+            ))
+            .replace("{a}", &MCP_CAPS.len().to_string())
+            .replace(
+                "{b}",
+                &if f.svc.state.config.mcp.enabled { total_on } else { 0 }.to_string(),
+            ),
+        )
         .size(pal.font_xs)
         .color(pal.text_dim),
     );
@@ -7623,13 +7779,13 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
             let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter_at(dot).circle_filled(dot.center(), 3.5, color);
             ui.label(
-                egui::RichText::new(format!("MCP 服务：{}", conn.label()))
+                egui::RichText::new(format!("{}{}", t(("MCP 服务：", "MCP service: ")), t(conn.label())))
                     .size(pal.font_xs)
                     .color(color),
             );
         });
         ui.label(
-            egui::RichText::new(conn.detail())
+            egui::RichText::new(t(conn.detail()))
                 .size(pal.font_xs)
                 .color(pal.text_dim),
         );
@@ -7677,8 +7833,8 @@ fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     bu.spacing_mut().item_spacing = vec2(8.0, 0.0);
-    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_done", "完成", true);
-    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_cancel", "取消", false);
+    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_done", t(("完成", "Done")), true);
+    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_cancel", t(("取消", "Cancel")), false);
 }
 
 /// 覆盖层底部按钮（自绘小按钮：圆角 + 文字，右对齐顺序）。
@@ -7757,7 +7913,7 @@ fn settings_mcp_overlay_row(f: &mut Frame<'_>, ui: &mut Ui, cap: &McpCap) {
             field: cap.field,
             value: v,
         });
-        record_recent(f, cap.name);
+        record_recent(f, cap.field);
     }
 }
 
@@ -7765,9 +7921,9 @@ fn settings_mcp_overlay_row(f: &mut Frame<'_>, ui: &mut Ui, cap: &McpCap) {
 fn draw_mcp_badge(f: &mut Frame<'_>, ui: &mut Ui, ready: bool) {
     let pal = f.pal;
     let (text, fg) = if ready {
-        ("已连接", pal.accent)
+        (t(("已连接", "Connected")), pal.accent)
     } else {
-        ("未连接", pal.text_dim)
+        (t(("未连接", "Not connected")), pal.text_dim)
     };
     // 宽度 = 三个全角字 + 8pt 内边距，随字号缩放：固定 50pt 时
     // 1.5× 字号（三字约 63pt）会把文字顶出徽标。
@@ -7797,7 +7953,7 @@ fn draw_mcp_badge_disabled(f: &mut Frame<'_>, ui: &mut Ui) {
     p.text(
         r.center(),
         egui::Align2::CENTER_CENTER,
-        "已禁用",
+        t(("已禁用", "Disabled")),
         egui::FontId::proportional(pal.font_xs),
         pal.text_dim,
     );
@@ -7993,7 +8149,7 @@ fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
     f.ui.painter_at(head).text(
         head.left_center(),
         Align2::LEFT_CENTER,
-        card.kind.title(),
+        t(card.kind.title()),
         font,
         pal.text_bright,
     );
@@ -8158,11 +8314,11 @@ fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
 
     if rows.is_empty() {
         let msg = match only_pinned {
-            Some(true) => "还没有置顶条目",
+            Some(true) => t(("还没有置顶条目", "No pinned entries yet")),
             // 有查询词**或类型过滤**生效 ⇒ 「没有匹配的结果」；
             // 两者都空才是「还没有剪贴板记录」（从没复制过东西）。
-            _ if !f.state.query.is_empty() || !type_kinds.is_empty() => "没有匹配的结果",
-            _ => "还没有剪贴板记录",
+            _ if !f.state.query.is_empty() || !type_kinds.is_empty() => t(("没有匹配的结果", "No matching results")),
+            _ => t(("还没有剪贴板记录", "No clipboard history yet")),
         };
         draw_empty(f, body, msg);
         return;
@@ -8941,7 +9097,7 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     let Some(id) = f.svc.state.selected else {
         // 选中丢失：原图缓存随之丢弃。
         clear_detail_image_zoom(f);
-        draw_empty(f, body, "选中一条记录查看详情");
+        draw_empty(f, body, t(("选中一条记录查看详情", "Select an entry to see details")));
         return;
     };
     // 先把选中的 item 拷一份：原图模式分支与三分支都需要
@@ -8950,7 +9106,7 @@ fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     let Some(item) = f.svc.state.items.iter().find(|it| it.id == id).cloned() else {
         // 选中条目已不存在：原图缓存同样失效。
         clear_detail_image_zoom(f);
-        draw_empty(f, body, "该记录已不存在");
+        draw_empty(f, body, t(("该记录已不存在", "This entry no longer exists")));
         return;
     };
 
@@ -9228,10 +9384,10 @@ fn draw_detail_image_zoom(f: &mut Frame<'_>, body: Rect, item: &ClipItem) {
                 egui::StrokeKind::Inside,
             );
         } else {
-            draw_empty(f, content_band, "原图尺寸未知");
+            draw_empty(f, content_band, t(("原图尺寸未知", "Original size unknown")));
         }
     } else {
-        draw_empty(f, content_band, "原图加载失败");
+        draw_empty(f, content_band, t(("原图加载失败", "Failed to load the original image")));
     }
 
     // 来源 · 时间：给返回按钮留 80pt 空间。
@@ -9269,7 +9425,7 @@ fn draw_rail_body(f: &mut Frame<'_>, body: Rect) {
     let pal = f.pal;
     let total = f.svc.state.items.len();
     if total == 0 {
-        draw_empty(f, body, "暂无数据");
+        draw_empty(f, body, t(("暂无数据", "No data")));
         return;
     }
     let font = sized(pal.font_xs, f.scale);
@@ -9898,7 +10054,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
             if rr.clicked() {
                 f.state.push(Op::UndoEdit(item.id));
             }
-            rr.on_hover_text("撤销修改");
+            rr.on_hover_text(t(("撤销修改", "Undo edit")));
             bx += badge_side + 5.0;
         }
         let b = Rect::from_center_size(pos2(bx + badge_side * 0.5, bcy), vec2(badge_side, badge_side));
@@ -9921,9 +10077,9 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         // 消耗 `Response`，与行内三个操作按钮同一个坑）。
         let clicked = rr.clicked();
         rr.on_hover_text(if item.kind == modular_clipboard_core::ClipKind::Image {
-            "编辑图片"
+            t(("编辑图片", "Edit image"))
         } else {
-            "修改内容"
+            t(("修改内容", "Edit content"))
         });
         if clicked {
             if item.kind == modular_clipboard_core::ClipKind::Image {
@@ -10133,13 +10289,13 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         let tip = match i {
             0 => {
                 if item.pinned {
-                    "取消置顶"
+                    t(("取消置顶", "Unpin"))
                 } else {
-                    "置顶"
+                    t(("置顶", "Pin"))
                 }
             }
-            1 => "复制",
-            _ => "删除",
+            1 => t(("复制", "Copy")),
+            _ => t(("删除", "Delete")),
         };
         if rr.clicked() && *enabled {
             f.state.push(op.clone());
@@ -10224,7 +10380,7 @@ fn draw_inline_editor(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipI
         |ui| {
             let te = egui::TextEdit::multiline(&mut f.state.edit_buf)
                 .id(egui::Id::unique(("inline_editor", item.id)))
-                .hint_text("输入内容…")
+                .hint_text(t(("输入内容…", "Type content…")))
                 .font(egui::FontId::proportional(pal.font_md))
                 .desired_width(text_rect.width())
                 .frame(egui::Frame::NONE);
@@ -10283,7 +10439,7 @@ fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &Clip
         color,
     );
     let ok_clicked = rr.clicked();
-    rr.on_hover_text("确认修改（Ctrl+Enter）");
+    rr.on_hover_text(t(("确认修改（Ctrl+Enter）", "Save (Ctrl+Enter)")));
     if ok_clicked {
         f.state.push(Op::CommitEditText {
             id: item.id,
@@ -10311,7 +10467,7 @@ fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &Clip
         color,
     );
     let no_clicked = rr.clicked();
-    rr.on_hover_text("取消修改（Esc）");
+    rr.on_hover_text(t(("取消修改（Esc）", "Cancel (Esc)")));
     if no_clicked {
         f.state.push(Op::CancelEdit);
     }
@@ -10690,7 +10846,7 @@ fn format_meta(ts_ms: i64) -> String {
 /// 单一数据源在 [`modular_clipboard_core::ClipKind::label`]：
 /// 类型过滤栏的 tooltip、设置界面、捕获层提示都读同一份。
 fn kind_label(kind: modular_clipboard_core::ClipKind) -> &'static str {
-    kind.label()
+    t(kind.label())
 }
 
 /// 字节数 → 自适应单位（B / KB / MB / GB）。
@@ -14834,7 +14990,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
         let mut prev = 0u8;
         for (pct, name) in FONT_SCALE_PRESETS {
-            assert!(!name.is_empty(), "预设 {pct}% 缺少档位名");
+            assert!(!name.0.is_empty() && !name.1.is_empty(), "预设 {pct}% 缺少档位名");
             assert!(*pct > prev, "预设必须严格升序：{prev} → {pct}");
             prev = *pct;
             let scale = f64::from(*pct) / 100.0;
@@ -14883,8 +15039,10 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         // 五个预设段都应登记热区（key = 选项文字）。
         for (_, name) in FONT_SCALE_PRESETS {
-            let seg = settings_hit(&h, name);
-            assert!(seg.width() > 0.0, "预设「{name}」应有热区");
+            // 热区 key = **显示文字**（draw_segmented 用 t(name) 登记），
+            // 测试默认中文语言环境 ⇒ 取中文半。
+            let seg = settings_hit(&h, name.0);
+            assert!(seg.width() > 0.0, "预设「{}」应有热区", name.0);
         }
         // 点「大」（115%）。
         let big = settings_hit(&h, "大");
@@ -15220,7 +15378,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         cfg.mcp.token = "sk-123".into();
         let p = mcp_pair_prompt(&cfg);
         for cap in MCP_CAPS {
-            assert!(p.contains(cap.name), "提示词应含能力「{}」", cap.name);
+            assert!(p.contains(t(cap.name)), "提示词应含能力「{}」", t(cap.name));
         }
         assert!(p.contains("192.168.1.10"), "提示词应含自定义服务地址");
         assert!(p.contains("9123"), "提示词应含自定义端口");
@@ -15341,8 +15499,9 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         // 10 个预设都应有热区（key = 预设名）。
         for (name, _) in crate::theme::ACCENT_PRESETS {
-            let sw = settings_hit(&h, name);
-            assert!(sw.width() > 0.0, "预设「{name}」应有热区");
+            // 热区 key = 显示文字（中文环境测试 ⇒ 取中文半）。
+            let sw = settings_hit(&h, name.0);
+            assert!(sw.width() > 0.0, "预设「{}」应有热区", name.0);
         }
         // 点「翠绿」⇒ SetAccent(Some(绿))。
         let green = settings_hit(&h, "翠绿");
@@ -15365,13 +15524,13 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Theme;
         h.settings_frame();
-        for name in ["无", "纸质", "护眼", "星空", "OLED"] {
+        for name in ["无", "纸纹", "护眼绿", "星空紫", "OLED"] {
             assert!(
                 settings_hit(&h, name).width() > 0.0,
                 "二级主题选项「{name}」应有热区"
             );
         }
-        let paper = settings_hit(&h, "纸质");
+        let paper = settings_hit(&h, "纸纹");
         let ops = h.settings_click_at(paper.center());
         let hit = ops.iter().any(|o| {
             matches!(
@@ -15379,7 +15538,7 @@ fn with_pinned(mut self, n: usize) -> Self {
                 Op::SetSecondaryTheme(modular_clipboard_core::config::SecondaryTheme::Paper)
             )
         });
-        assert!(hit, "点「纸质」应推出 SetSecondaryTheme(Paper)，实际={ops:?}");
+        assert!(hit, "点「纸纹」应推出 SetSecondaryTheme(Paper)，实际={ops:?}");
     }
 
     /// 二级主题选「无」时，参数项显示禁用提示（不画旋钮）。
@@ -15613,14 +15772,14 @@ fn with_pinned(mut self, n: usize) -> Self {
             McpConn::Disconnected,
         ] {
             // 第一行：圆点 + 「MCP 服务：xx」。横向布局 ⇒ 必须放得下。
-            let line1 = format!("MCP 服务：{}", conn.label());
+            let line1 = format!("MCP 服务：{}", t(conn.label()));
             let w1 = dot_w + measure_w(&h.ctx, &line1, size);
             assert!(
                 w1 <= inner,
                 "{conn:?} 状态行宽 {w1} 超过面板内缘 {inner}"
             );
             // 第二行：detail。纵向布局会换行，但正常字体下也不该超宽。
-            let w2 = measure_w(&h.ctx, conn.detail(), size);
+            let w2 = measure_w(&h.ctx, t(conn.detail()), size);
             assert!(
                 w2 <= inner,
                 "{conn:?} 说明文字宽 {w2} 超过面板内缘 {inner}"
@@ -15631,8 +15790,8 @@ fn with_pinned(mut self, n: usize) -> Self {
         // 否则这个测试锁不住「拆两行」这个回归。
         let old = format!(
             "MCP 服务：{} · {}",
-            McpConn::Unconfigured.label(),
-            McpConn::Unconfigured.detail()
+            t(McpConn::Unconfigured.label()),
+            t(McpConn::Unconfigured.detail())
         );
         let old_w = dot_w + measure_w(&h.ctx, &old, size);
         assert!(

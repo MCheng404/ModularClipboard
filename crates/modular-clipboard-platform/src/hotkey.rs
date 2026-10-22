@@ -168,10 +168,10 @@ impl Slot {
     /// 「某个快捷键注册失败」不告诉用户是哪一个，等于没说。
     ///
     /// 与设置界面的行标题保持一致（`paint.rs` 的快捷键卡片）。
-    pub const fn label(self) -> &'static str {
+    pub const fn label(self) -> modular_clipboard_core::i18n::Bi {
         match self {
-            Slot::Toggle => "显示主窗口",
-            Slot::PastePrevious => "粘贴上一个条目",
+            Slot::Toggle => ("显示主窗口", "Show main window"),
+            Slot::PastePrevious => ("粘贴上一个条目", "Paste previous entry"),
         }
     }
 }
@@ -184,7 +184,7 @@ impl Slot {
 pub fn failed_message(slot: Slot, spec: HotkeySpec) -> String {
     format!(
         "{}：{} 注册失败（可能已被其它程序占用）",
-        slot.label(),
+        modular_clipboard_core::i18n::t(slot.label()),
         describe(spec)
     )
 }
@@ -440,7 +440,7 @@ mod tests {
         // 格式是**契约**：设置界面靠「信息里包含该行当前组合文本」
         // 定位是哪一行注册失败了（paint.rs 的 Hotkey 渲染）。
         let msg = failed_message(Slot::Toggle, DEFAULT_HOTKEY);
-        assert!(msg.contains("显示主窗口"), "应含槽位名: {msg}");
+        assert!(msg.contains("显示主窗口"), "应含槽位名: {msg}"); // 默认中文环境
         assert!(msg.contains("Win+V"), "应含组合文本: {msg}");
         assert!(msg.contains("占用"), "应说明可能的原因: {msg}");
 
@@ -448,7 +448,7 @@ mod tests {
             Slot::PastePrevious,
             HotkeySpec::new(MOD_CONTROL, 0x56),
         );
-        assert!(msg2.contains("粘贴上一个条目"), "{msg2}");
+        assert!(msg2.contains("粘贴上一个条目"), "{msg2}"); // 默认中文环境
         assert!(msg2.contains("Ctrl+V"), "{msg2}");
     }
 }

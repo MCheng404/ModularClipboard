@@ -803,7 +803,7 @@ impl LocalBackend {
             });
 
         if spawned.is_err() {
-            set_notice(state, "无法创建捕获线程".into());
+            set_notice(state, modular_clipboard_core::i18n::t(("无法创建捕获线程", "Failed to start the capture thread")).into());
             return;
         }
 
@@ -930,7 +930,7 @@ impl LocalBackend {
             }
             Err(e) => {
                 tracing::error!(%e, "入库失败");
-                set_notice(state, format!("保存失败: {e}"));
+                set_notice(state, format!("{} {e}", modular_clipboard_core::i18n::t(("保存失败:", "Save failed:"))));
                 false
             }
         }
@@ -1050,7 +1050,7 @@ impl LocalBackend {
     ) -> Result<()> {
         action::dispatch(&proposal.plan)?;
         self.store.touch(item.id).ok();
-        set_notice(state, format!("已执行：{}", proposal.label));
+        set_notice(state, format!("{}{}", modular_clipboard_core::i18n::t(("已执行：", "Done: ")), proposal.label));
         Ok(())
         }
 
@@ -1405,7 +1405,9 @@ fn build_preview(payload: &CapturedPayload) -> String {
             if names.len() == 1 {
                 names[0].clone()
             } else {
-                format!("{} 等 {} 个文件", names[0], names.len())
+                modular_clipboard_core::i18n::t(("{a} 等 {b} 个文件", "{a} + {b} more files"))
+                    .replace("{a}", &names[0])
+                    .replace("{b}", &names.len().to_string())
             }
         }
         ClipKind::Image => {
@@ -1417,8 +1419,16 @@ fn build_preview(payload: &CapturedPayload) -> String {
                 .filter(|(w, h)| *w > 0 && *h > 0)
                 .or_else(|| image_dimensions(&payload.bytes));
             match dims {
-                Some((w, h)) => format!("图片 {w}×{h}"),
-                None => format!("图片 {} 字节", payload.bytes.len()),
+                Some((w, h)) => format!(
+                    "{} {w}×{h}",
+                    modular_clipboard_core::i18n::t(("图片", "Image"))
+                ),
+                None => format!(
+                    "{} {} {}",
+                    modular_clipboard_core::i18n::t(("图片", "Image")),
+                    payload.bytes.len(),
+                    modular_clipboard_core::i18n::t(("字节", "bytes"))
+                ),
             }
         }
     }
@@ -1503,11 +1513,11 @@ fn decode_to_rgba(item: &ClipItem, bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> 
 pub fn format_time(ts_ms: i64, now_ms: i64) -> String {
     let diff = now_ms - ts_ms;
     if diff < 60_000 {
-        "刚刚".to_string()
+        modular_clipboard_core::i18n::t(("刚刚", "Just now")).to_string()
     } else if diff < 3_600_000 {
-        format!("{} 分钟前", diff / 60_000)
+        format!("{} {}", diff / 60_000, modular_clipboard_core::i18n::t(("分钟前", "min ago")))
     } else if diff < 86_400_000 {
-        format!("{} 小时前", diff / 3_600_000)
+        format!("{} {}", diff / 3_600_000, modular_clipboard_core::i18n::t(("小时前", "hours ago")))
     } else {
         format!("{} 天前", diff / 86_400_000)
     }

@@ -409,7 +409,7 @@ fn paint_inline_image(
     // - src 简化成「线上 / 内嵌 / 无路径」+ 短文件名 / 域名。
     let text_x = icon_x + icon_size + IMG_PLACEHOLDER_PAD;
     let text_w = (bg.max.x - IMG_PLACEHOLDER_PAD - text_x).max(20.0);
-    let alt_text = if alt.is_empty() { "图片" } else { alt };
+    let alt_text = if alt.is_empty() { modular_clipboard_core::i18n::t(("图片", "Image")) } else { alt };
     let (src_kind, src_label) = classify_src(src);
     let alt_font = egui::FontId::proportional(pal.font_sm * scale);
     let src_font = egui::FontId::proportional(pal.font_xs * scale);
@@ -467,7 +467,7 @@ fn paint_inline_image(
 fn classify_src(src: &str) -> (&'static str, String) {
     let s = src.trim();
     if s.is_empty() {
-        return ("无路径", String::new());
+        return (modular_clipboard_core::i18n::t(("无路径", "No path")), String::new());
     }
     if s.starts_with("http://") || s.starts_with("https://") {
         // 域名或末段路径。
@@ -478,14 +478,14 @@ fn classify_src(src: &str) -> (&'static str, String) {
         return ("URL", host.to_string());
     }
     if s.starts_with("data:") {
-        return ("内嵌", "data URL".into()); // 简化：永远显示 data URL 标签
+        return (modular_clipboard_core::i18n::t(("内嵌", "Embedded")), "data URL".into()); // 简化：永远显示 data URL 标签
     }
     // 本地路径：取末段（Win / Unix 都以 `/` 或 `\` 分隔）。
     let last = s
         .rsplit_once(['/', '\\'])
         .map(|(_, name)| name)
         .unwrap_or(s);
-    ("本地", last.to_string())
+    (modular_clipboard_core::i18n::t(("本地", "Local")), last.to_string())
 }
 
 /// 一段相邻的文字或图片。`![alt](src)` 强制独占一行，**不**与正文同行。

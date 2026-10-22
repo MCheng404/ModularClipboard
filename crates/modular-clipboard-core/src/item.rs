@@ -42,14 +42,14 @@ impl ClipKind {
         }
     }
 
-    /// 界面展示名（列表行右下角标签 / 类型过滤栏 tooltip）。
-    pub fn label(self) -> &'static str {
+    /// 界面展示名（双语对；列表行右下角标签 / 类型过滤栏 tooltip）。
+    pub fn label(self) -> crate::i18n::Bi {
         match self {
-            ClipKind::Text => "文本",
-            ClipKind::Html => "HTML",
-            ClipKind::Image => "图片",
-            ClipKind::Files => "文件",
-            ClipKind::Markdown => "Markdown",
+            ClipKind::Text => ("文本", "Text"),
+            ClipKind::Html => ("HTML", "HTML"),
+            ClipKind::Image => ("图片", "Image"),
+            ClipKind::Files => ("文件", "Files"),
+            ClipKind::Markdown => ("Markdown", "Markdown"),
         }
     }
 }
@@ -204,6 +204,6 @@ mod tests {
     fn markdown_kind_serializes_as_lowercase() {
         assert_eq!(serde_json::to_string(&ClipKind::Markdown).unwrap(), "\"markdown\"");
         assert_eq!(ClipKind::Markdown.as_str(), "markdown");
-        assert_eq!(ClipKind::Markdown.label(), "Markdown");
+        assert_eq!(ClipKind::Markdown.label().0, "Markdown");
     }
 }

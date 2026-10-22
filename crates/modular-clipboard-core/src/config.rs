@@ -295,6 +295,11 @@ pub struct UiConfig {
     /// 自定义中文字体路径，`None` 时自动探测系统字体。
     pub font_path: Option<String>,
     pub font_scale: f32,
+    /// 界面语言：`"system"`（跟随系统）/ `"zh-CN"` / `"en-US"`。
+    ///
+    /// 用字符串而不是枚举：配置文件是用户可手改的，宽松解析 + 明确
+    /// 兜底比「写错一个值整个配置回退」友好（见 [`crate::i18n::parse_lang`]）。
+    pub language: String,
     /// 面板布局（停靠 / 折叠 / 浮动位置）。`None` 表示用布局默认值。
     ///
     /// NOTE: `#[serde(default)]` 不是可选的：没有它，serde 会要求这个
@@ -548,11 +553,11 @@ pub enum SearchPanelPos {
 }
 
 impl SearchPanelPos {
-    /// 设置界面展示名。
-    pub fn label(self) -> &'static str {
+    /// 设置界面展示名（双语对）。
+    pub fn label(self) -> crate::i18n::Bi {
         match self {
-            SearchPanelPos::Top => "窗口上方",
-            SearchPanelPos::Bottom => "窗口下方",
+            SearchPanelPos::Top => ("窗口上方", "Top"),
+            SearchPanelPos::Bottom => ("窗口下方", "Bottom"),
         }
     }
 }
@@ -670,13 +675,13 @@ pub enum TypeRailPos {
 }
 
 impl TypeRailPos {
-    /// 设置界面下拉框展示名。
-    pub fn label(self) -> &'static str {
+    /// 设置界面下拉框展示名（双语对）。
+    pub fn label(self) -> crate::i18n::Bi {
         match self {
-            TypeRailPos::Right => "右侧",
-            TypeRailPos::Left => "左侧",
-            TypeRailPos::Top => "顶部",
-            TypeRailPos::Bottom => "底部",
+            TypeRailPos::Right => ("右侧", "Right"),
+            TypeRailPos::Left => ("左侧", "Left"),
+            TypeRailPos::Top => ("顶部", "Top"),
+            TypeRailPos::Bottom => ("底部", "Bottom"),
         }
     }
 
@@ -769,12 +774,12 @@ impl RowMetaPart {
     /// 全部三个元素（自然顺序），供设置编辑器与渲染侧遍历。
     pub const ALL: [RowMetaPart; 3] = [RowMetaPart::Icon, RowMetaPart::Type, RowMetaPart::Size];
 
-    /// 元素在设置编辑器中的中文名称。
-    pub fn label(self) -> &'static str {
+    /// 元素在设置编辑器中的名称（双语对）。
+    pub fn label(self) -> crate::i18n::Bi {
         match self {
-            RowMetaPart::Icon => "图标",
-            RowMetaPart::Type => "类型",
-            RowMetaPart::Size => "大小",
+            RowMetaPart::Icon => ("图标", "Icon"),
+            RowMetaPart::Type => ("类型", "Type"),
+            RowMetaPart::Size => ("大小", "Size"),
         }
     }
 }
@@ -931,14 +936,14 @@ pub enum SecondaryTheme {
 }
 
 impl SecondaryTheme {
-    /// 设置界面展示名。
-    pub fn label(self) -> &'static str {
+    /// 设置界面展示名（双语对）。
+    pub fn label(self) -> crate::i18n::Bi {
         match self {
-            SecondaryTheme::None => "无",
-            SecondaryTheme::Paper => "纸质纹理",
-            SecondaryTheme::Green => "护眼绿",
-            SecondaryTheme::Purple => "星空紫",
-            SecondaryTheme::Oled => "OLED",
+            SecondaryTheme::None => ("无", "None"),
+            SecondaryTheme::Paper => ("纸纹", "Paper"),
+            SecondaryTheme::Green => ("护眼绿", "Eye-care green"),
+            SecondaryTheme::Purple => ("星空紫", "Starfield purple"),
+            SecondaryTheme::Oled => ("OLED", "OLED"),
         }
     }
 
@@ -983,30 +988,30 @@ impl SecondaryTheme {
 
 /// 纸质主题的旋钮（[`SecondaryTheme::Paper`]）。
 static PAPER_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("paper_tint", "纸基浓度", "暖色纸基的混合比例"),
-    ThemeKnob::new("paper_texture", "纹理强度", "纤维与噪点的明显程度"),
+    ThemeKnob::new("paper_tint", ("纸基浓度", "Paper tint"), ("暖色纸基的混合比例", "How strongly the warm paper base mixes in")),
+    ThemeKnob::new("paper_texture", ("纹理强度", "Texture strength"), ("纤维与噪点的明显程度", "How visible the fibers and grain are")),
 ];
 
 /// 护眼绿主题的旋钮（[`SecondaryTheme::Green`]）。
 static GREEN_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("green_tint", "绿意浓度", "绿色基调的混合比例"),
-    ThemeKnob::new("green_warmth", "色温", "偏青（冷）到偏黄（暖）"),
+    ThemeKnob::new("green_tint", ("绿意浓度", "Green tint"), ("绿色基调的混合比例", "How strongly the green base mixes in")),
+    ThemeKnob::new("green_warmth", ("色温", "Warmth"), ("偏青（冷）到偏黄（暖）", "From cyan (cool) to yellow (warm)")),
 ];
 
 /// 星空紫主题的旋钮（[`SecondaryTheme::Purple`]）。
 static PURPLE_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("purple_tint", "紫度", "紫色基调的混合比例"),
-    ThemeKnob::new("purple_stars", "星点密度", "背景星点的明显程度"),
-    ThemeKnob::new("star_random", "分布随机化", "0 = 固定一片星空，1 = 每次重建换一片"),
-    ThemeKnob::new("star_twinkle", "闪烁", "星点缓慢明暗呼吸的强度"),
-    ThemeKnob::new("star_size_var", "大小不规则", "星点半径的差异程度"),
-    ThemeKnob::new("star_cursor", "光标互动", "星点随光标位置反向偏移（视差）"),
+    ThemeKnob::new("purple_tint", ("紫度", "Purple tint"), ("紫色基调的混合比例", "How strongly the purple base mixes in")),
+    ThemeKnob::new("purple_stars", ("星点密度", "Star density"), ("背景星点的明显程度", "How visible the background stars are")),
+    ThemeKnob::new("star_random", ("分布随机化", "Randomize layout"), ("0 = 固定一片星空，1 = 每次重建换一片", "0 = one fixed sky, 1 = reshuffle on every rebuild")),
+    ThemeKnob::new("star_twinkle", ("闪烁", "Twinkle"), ("星点缓慢明暗呼吸的强度", "How strongly stars breathe between bright and dim")),
+    ThemeKnob::new("star_size_var", ("大小不规则", "Size variation"), ("星点半径的差异程度", "How much star radii vary")),
+    ThemeKnob::new("star_cursor", ("光标互动", "Cursor parallax"), ("星点随光标位置反向偏移（视差）", "Stars shift opposite to the cursor (parallax)")),
 ];
 
 /// OLED 主题的旋钮（[`SecondaryTheme::Oled`]）。
 static OLED_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("oled_black", "纯黑程度", "背景压向纯黑的比例"),
-    ThemeKnob::new("oled_borders", "分隔提亮", "纯黑下靠描边区分层级"),
+    ThemeKnob::new("oled_black", ("纯黑程度", "Black level"), ("背景压向纯黑的比例", "How far the background is pushed toward pure black")),
+    ThemeKnob::new("oled_borders", ("分隔提亮", "Borders"), ("纯黑下靠描边区分层级", "Separate layers with brighter borders on pure black")),
 ];
 
 /// 二级主题的一个可调参数（[`SecondaryTheme::knobs`] 的元素）。
@@ -1014,14 +1019,14 @@ static OLED_KNOBS: &[ThemeKnob] = &[
 pub struct ThemeKnob {
     /// [`ThemeParams`] 里的字段名（稳定键）。
     pub key: &'static str,
-    /// 设置界面展示名。
-    pub label: &'static str,
-    /// 一句话说明。
-    pub desc: &'static str,
+    /// 设置界面展示名（双语对）。
+    pub label: crate::i18n::Bi,
+    /// 一句话说明（双语对）。
+    pub desc: crate::i18n::Bi,
 }
 
 impl ThemeKnob {
-    const fn new(key: &'static str, label: &'static str, desc: &'static str) -> Self {
+    const fn new(key: &'static str, label: crate::i18n::Bi, desc: crate::i18n::Bi) -> Self {
         Self { key, label, desc }
     }
 }
@@ -1327,6 +1332,7 @@ impl Default for UiConfig {
             autostart: false,
             font_path: None,
             font_scale: 1.0,
+            language: crate::i18n::LANG_SYSTEM.to_string(),
             layout: None,
             window_pos: None,
             pinned_window_pos: None,
@@ -2286,7 +2292,7 @@ mod tests {
         assert_eq!(TypeRailPos::from_str_opt("diagonal"), TypeRailPos::Right);
         for p in [TypeRailPos::Right, TypeRailPos::Left, TypeRailPos::Top, TypeRailPos::Bottom] {
             assert_eq!(TypeRailPos::from_str_opt(p.as_str()), p);
-            assert!(!p.label().is_empty());
+            assert!(!p.label().0.is_empty() && !p.label().1.is_empty());
         }
     }
 

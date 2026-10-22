@@ -486,12 +486,12 @@ pub enum ToolTab {
 
 impl ToolTab {
     pub const ALL: [ToolTab; 4] = [Self::Adjust, Self::Color, Self::Crop, Self::Brush];
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> modular_clipboard_core::i18n::Bi {
         match self {
-            Self::Adjust => "调整",
-            Self::Color => "调色",
-            Self::Crop => "裁剪",
-            Self::Brush => "画笔",
+            Self::Adjust => ("调整", "Adjust"),
+            Self::Color => ("调色", "Color"),
+            Self::Crop => ("裁剪", "Crop"),
+            Self::Brush => ("画笔", "Brush"),
         }
     }
 }
@@ -510,7 +510,7 @@ impl<'a> ImageEditor<'a> {
         shared: &SharedGfx<'a>,
     ) -> anyhow::Result<Self> {
         let s = if scale_factor > 0.01 { scale_factor } else { 1.0 };
-        let mut window = Window::new("编辑图片", (WIN_W * s).round() as u32, (WIN_H * s).round() as u32)?;
+        let mut window = Window::new(modular_clipboard_core::i18n::t(("编辑图片", "Edit image")), (WIN_W * s).round() as u32, (WIN_H * s).round() as u32)?;
         window.set_max_texture_side(shared.gpu.properties.limits.max_image_dimension2_d);
         // 混合 DPI 多屏：按本窗口真实 scale 复核尺寸（与 ChildWindow 同款）。
         let real_s = window.scale_factor();
@@ -771,7 +771,7 @@ impl<'a> ImageEditor<'a> {
         ui.painter_at(title_r).text(
             egui::pos2(title_r.min.x + 14.0, title_r.center().y),
             egui::Align2::LEFT_CENTER,
-            "编辑图片",
+            modular_clipboard_core::i18n::t(("编辑图片", "Edit image")),
             egui::FontId::proportional(pal.font_md),
             pal.text,
         );
@@ -779,7 +779,7 @@ impl<'a> ImageEditor<'a> {
         let cr = ui.interact(close_r, egui::Id::unique("imgedit_close"), egui::Sense::click());
         let close_clicked = cr.clicked();
         let close_hovered = cr.hovered();
-        cr.on_hover_text("关闭（不保存）");
+        cr.on_hover_text(modular_clipboard_core::i18n::t(("关闭（不保存）", "Close without saving")));
         crate::icons::Icon::Close.paint(
             &ui.painter_at(close_r),
             close_r,
@@ -851,7 +851,7 @@ impl<'a> ImageEditor<'a> {
             ui.painter_at(canvas).text(
                 canvas.center(),
                 egui::Align2::CENTER_CENTER,
-                "无法预览",
+                modular_clipboard_core::i18n::t(("无法预览", "Preview unavailable")),
                 egui::FontId::proportional(pal.font_sm),
                 pal.text_dim,
             );
@@ -1032,7 +1032,7 @@ impl<'a> ImageEditor<'a> {
                         let b = ui.add_sized(
                             egui::vec2(58.0, 24.0),
                             egui::Button::new(
-                                egui::RichText::new(tab.label())
+                                egui::RichText::new(modular_clipboard_core::i18n::t(tab.label()))
                                     .color(if on { pal.text_on_accent } else { pal.text }),
                             )
                             .fill(if on { pal.accent } else { pal.surface_variant }),
@@ -1053,26 +1053,26 @@ impl<'a> ImageEditor<'a> {
                     ToolTab::Adjust => {
                         // ---- 旋转 / 翻转 ----
                         ui.horizontal(|ui| {
-                            if self.tool_button(ui, "↺ 左转", pal) {
+                            if self.tool_button(ui, modular_clipboard_core::i18n::t(("↺ 左转", "↺ Rotate left")), pal) {
                                 self.t.quarter = (self.t.quarter + 3) % 4;
                                 self.dirty = true;
                             }
-                            if self.tool_button(ui, "↻ 右转", pal) {
+                            if self.tool_button(ui, modular_clipboard_core::i18n::t(("↻ 右转", "↻ Rotate right")), pal) {
                                 self.t.quarter = (self.t.quarter + 1) % 4;
                                 self.dirty = true;
                             }
-                            if self.tool_button(ui, "⇋ 水平", pal) {
+                            if self.tool_button(ui, modular_clipboard_core::i18n::t(("⇋ 水平", "⇋ Flip horizontal")), pal) {
                                 self.t.flip_h = !self.t.flip_h;
                                 self.dirty = true;
                             }
-                            if self.tool_button(ui, "⇅ 垂直", pal) {
+                            if self.tool_button(ui, modular_clipboard_core::i18n::t(("⇅ 垂直", "⇅ Flip vertical")), pal) {
                                 self.t.flip_v = !self.t.flip_v;
                                 self.dirty = true;
                             }
                         });
                         // ---- 亮度 / 对比度 ----
                         ui.horizontal(|ui| {
-                            ui.label("亮度");
+                            ui.label(modular_clipboard_core::i18n::t(("亮度", "Brightness")));
                             let mut b = self.t.brightness;
                             if ui
                                 .add(
@@ -1086,7 +1086,7 @@ impl<'a> ImageEditor<'a> {
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("对比");
+                            ui.label(modular_clipboard_core::i18n::t(("对比", "Contrast")));
                             let mut c = self.t.contrast;
                             if ui
                                 .add(
@@ -1103,7 +1103,7 @@ impl<'a> ImageEditor<'a> {
                     ToolTab::Color => {
                         // ---- 饱和度 / 色温 / 伽马 ----
                         ui.horizontal(|ui| {
-                            ui.label("饱和");
+                            ui.label(modular_clipboard_core::i18n::t(("饱和", "Saturation")));
                             let mut v = self.t.saturation;
                             if ui
                                 .add(
@@ -1117,7 +1117,7 @@ impl<'a> ImageEditor<'a> {
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("色温");
+                            ui.label(modular_clipboard_core::i18n::t(("色温", "Temperature")));
                             let mut v = self.t.temperature;
                             if ui
                                 .add(
@@ -1131,7 +1131,7 @@ impl<'a> ImageEditor<'a> {
                             }
                         });
                         ui.horizontal(|ui| {
-                            ui.label("伽马");
+                            ui.label(modular_clipboard_core::i18n::t(("伽马", "Gamma")));
                             let mut v = self.t.gamma;
                             if ui
                                 .add(
@@ -1144,7 +1144,7 @@ impl<'a> ImageEditor<'a> {
                                 self.dirty = true;
                             }
                         });
-                        if self.tool_button(ui, "全部复位", pal) {
+                        if self.tool_button(ui, modular_clipboard_core::i18n::t(("全部复位", "Reset all")), pal) {
                             self.t.saturation = 0.0;
                             self.t.temperature = 0.0;
                             self.t.gamma = 1.0;
@@ -1153,7 +1153,7 @@ impl<'a> ImageEditor<'a> {
                     }
                     ToolTab::Crop => {
                         ui.label(
-                            egui::RichText::new("在图上拖出一个框，松手即裁剪")
+                            egui::RichText::new(modular_clipboard_core::i18n::t(("在图上拖出一个框，松手即裁剪", "Drag a box on the image; release to crop")))
                                 .color(pal.text_dim)
                                 .size(pal.font_sm),
                         );
@@ -1162,7 +1162,7 @@ impl<'a> ImageEditor<'a> {
                             let b = ui.add_enabled(
                                 has,
                                 egui::Button::new(
-                                    egui::RichText::new("撤销裁剪").color(pal.text),
+                                    egui::RichText::new(modular_clipboard_core::i18n::t(("撤销裁剪", "Undo crop"))).color(pal.text),
                                 ),
                             );
                             if b.clicked() {
@@ -1174,7 +1174,7 @@ impl<'a> ImageEditor<'a> {
                     ToolTab::Brush => {
                         // ---- 颜色 ----
                         ui.horizontal(|ui| {
-                            ui.label("颜色");
+                            ui.label(modular_clipboard_core::i18n::t(("颜色", "Color")));
                             for c in BRUSH_PRESETS {
                                 let col = egui::Color32::from_rgba_unmultiplied(
                                     c[0], c[1], c[2], c[3],
@@ -1201,7 +1201,7 @@ impl<'a> ImageEditor<'a> {
                         });
                         // ---- 粗细 ----
                         ui.horizontal(|ui| {
-                            ui.label("粗细");
+                            ui.label(modular_clipboard_core::i18n::t(("粗细", "Width")));
                             let mut v = self.brush_width;
                             if ui
                                 .add(
@@ -1214,11 +1214,11 @@ impl<'a> ImageEditor<'a> {
                             }
                         });
                         ui.horizontal(|ui| {
-                            if self.tool_button(ui, "撤销一笔", pal) {
+                            if self.tool_button(ui, modular_clipboard_core::i18n::t(("撤销一笔", "Undo stroke")), pal) {
                                 self.strokes.pop();
                                 self.dirty = true;
                             }
-                            if self.tool_button(ui, "清空", pal) {
+                            if self.tool_button(ui, modular_clipboard_core::i18n::t(("清空", "Clear")), pal) {
                                 self.strokes.clear();
                                 self.dirty = true;
                             }
@@ -1231,7 +1231,7 @@ impl<'a> ImageEditor<'a> {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let save = ui.add_sized(
                             egui::vec2(96.0, 30.0),
-                            egui::Button::new(egui::RichText::new("保存").color(pal.text_on_accent))
+                            egui::Button::new(egui::RichText::new(modular_clipboard_core::i18n::t(("保存", "Save"))).color(pal.text_on_accent))
                                 .fill(pal.accent),
                         );
                         if save.clicked() {
@@ -1248,7 +1248,7 @@ impl<'a> ImageEditor<'a> {
                         }
                         let cancel = ui.add_sized(
                             egui::vec2(80.0, 30.0),
-                            egui::Button::new(egui::RichText::new("取消").color(pal.text)),
+                            egui::Button::new(egui::RichText::new(modular_clipboard_core::i18n::t(("取消", "Cancel"))).color(pal.text)),
                         );
                         if cancel.clicked() {
                             ops.push(crate::paint::Op::CloseImageEditor);
@@ -1258,7 +1258,7 @@ impl<'a> ImageEditor<'a> {
             },
         );
         if save_failed {
-            app.notify("保存失败：图像数据异常".into());
+            app.notify(modular_clipboard_core::i18n::t(("保存失败：图像数据异常", "Save failed: invalid image data")).into());
         }
         for op in ops {
             app.paint_state.push(op);
