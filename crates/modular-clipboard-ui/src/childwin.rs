@@ -459,7 +459,10 @@ impl<'a> ChildWindow<'a> {
         self.gfx.rebuild_if_needed((cw, ch))?;
 
         let Some(acquired) = self.gfx.fr.acquire()? else {
-            self.gfx.fr.rebuild_swapchain(Default::default())?;
+            self.gfx.fr.rebuild_swapchain(ash::vk::Extent2D {
+                width: cw,
+                height: ch,
+            })?;
             return Ok(());
         };
         if let Err(e) = self

@@ -164,7 +164,23 @@ pub struct WindowGfx<'a> {
     pub fr: FrameRenderer<'a>,
     /// 该窗口的画笔（顶点/纹理/描述符）。
     pub painter: Painter<'a>,
+    /// 上次 `rebuild_if_needed` 的目标尺寸（重建风暴判据）。
+    ///
+    /// 只认「同一个目标」的连续重建才算风暴：窗口正常 resize 时目标
+    /// 每次都不同，不该被兜底逻辑拦下。
+    last_want: Option<(u32, u32)>,
+    /// 同一目标尺寸的连续重建次数（见 [`WindowGfx::rebuild_if_needed`]）。
+    rebuild_streak: u32,
 }
+
+/// 同一目标尺寸允许的最大连续重建次数。
+///
+/// 超过就停手并告警。取值权衡：正常路径下交换链尺寸**一次**就该收敛
+/// （`resolve_extent` 在 `current_extent` 有效时直接采用它），留 4 次
+/// 是给「窗口刚创建、驱动 caps 尚未稳定」那一两帧的余量；再往上只
+/// 可能是驱动持续返回错误数据，继续重试的代价是每帧一次全局
+/// `device_wait_idle`。
+const REBUILD_STREAK_LIMIT: u32 = 4;
 
 impl<'a> WindowGfx<'a> {
     /// 从共享资源派生一个窗口的渲染器。
@@ -181,6 +197,12 @@ impl<'a> WindowGfx<'a> {
     /// CAUTION: 不能对子窗口调 [`Self::new`]：它用 `gpu.surface()`，
     /// 那是主窗口的表面。`vk::SurfaceKHR` 与 `hwnd` 一一对应，
     /// 复用会撞上 `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`（实测必现）。
+    ///
+    /// NOTE: 这里拿不到窗口句柄，因此首建只能用零尺寸（`resolve_extent`
+    /// 依赖 `caps.current_extent`）。**运行时新建的窗口**（编辑窗、弹窗）
+    /// 首次查询时该值常常还是 0 ⇒ 交换链先被建成 `FALLBACK_EXTENT`，
+    /// 随后由 [`Self::rebuild_if_needed`] 按真实客户区纠正一次——
+    /// 那条路径**必须**传入目标尺寸，否则纠正不到正确值而无限重建。
     pub fn new_for(shared: &SharedGfx<'a>, surface: ash::vk::SurfaceKHR) -> anyhow::Result<Self> {
         let mut fr = FrameRenderer::new_for_surface(shared.gpu, shared.pipeline, surface)?;
         fr.rebuild_swapchain(Default::default())?;
@@ -194,6 +216,8 @@ impl<'a> WindowGfx<'a> {
             gpu: shared.gpu,
             fr,
             painter,
+            last_want: None,
+            rebuild_streak: 0,
         })
     }
 
@@ -212,11 +236,60 @@ impl<'a> WindowGfx<'a> {
     }
 
     /// 交换链尺寸与目标不符时重建。
+    ///
+    /// # CAUTION: 重建**必须带上目标尺寸**（2026-10-22 修复）
+    ///
+    /// 早前这里传 `Default::default()`（零尺寸），`rebuild_swapchain`
+    /// 于是走 `FALLBACK_EXTENT`（1280×800）分支——只有
+    /// `caps.current_extent` 有效时才碰巧等于窗口真实尺寸。
+    ///
+    /// 而**运行时新建**的窗口（图片编辑窗、搜索面板弹窗）在首次查询
+    /// 表面能力时 `current_extent` 常常还是 0：
+    ///
+    /// 1. 交换链被建成 1280×800，与真实客户区（编辑窗 840×1020）不符；
+    /// 2. 下一帧 `self.extent() != want` 再次成立 ⇒ 再重建；
+    /// 3. 重建又传零尺寸 ⇒ 又建成 1280×800 ⇒ **无限循环**。
+    ///
+    /// 每次 `rebuild_swapchain` 都带一次 `device_wait_idle`（全局同步，
+    /// 排空**所有**窗口的在途 GPU 工作）⇒ 表现就是「新建的窗口一打开，
+    /// 它自己与主窗口一起闪烁」，直到驱动某次报告出有效的
+    /// `current_extent` 才停下——这也解释了「打开设置窗口后闪烁消失」
+    /// （设置窗在建窗早期 caps 已稳定，且它会收起类型栏弹窗这个
+    /// 同类重建源）。
     pub fn rebuild_if_needed(&mut self, want: (u32, u32)) -> anyhow::Result<bool> {
         if self.extent() == want {
+            self.rebuild_streak = 0;
             return Ok(false);
         }
-        self.fr.rebuild_swapchain(Default::default())?;
+        // 重建风暴兜底：目标尺寸没变却反复重建，说明驱动持续给出与
+        // 请求值不符的 `current_extent`（越界的 caps、异常驱动）。
+        // 此时再重建只是在**每帧**付一次全局 `wait_idle`——把整个界面
+        // 拖成幻灯片。超过阈值就停手并告警，让窗口停留在上一次的
+        // 交换链上（画面可能被拉伸，但不再每帧同步整台设备）。
+        if self.last_want == Some(want) && self.rebuild_streak >= REBUILD_STREAK_LIMIT {
+            if self.rebuild_streak == REBUILD_STREAK_LIMIT {
+                tracing::warn!(
+                    want = ?want,
+                    got = ?self.extent(),
+                    "交换链重建 {} 次仍未收敛到目标尺寸，停止重试（画面可能拉伸）",
+                    REBUILD_STREAK_LIMIT
+                );
+            }
+            self.rebuild_streak += 1;
+            return Ok(false);
+        }
+        if self.last_want == Some(want) {
+            self.rebuild_streak += 1;
+        } else {
+            self.last_want = Some(want);
+            self.rebuild_streak = 1;
+        }
+        // IMPORTANT: **必须**把目标尺寸传下去——它是 `resolve_extent`
+        // 在 `current_extent` 无效时唯一的正确输入。
+        self.fr.rebuild_swapchain(ash::vk::Extent2D {
+            width: want.0,
+            height: want.1,
+        })?;
         // `on_swapchain_rebuilt` 要 `&mut FrameRenderer`（它会重读
         // slot 数来调整在飞帧缓冲），所以放在 `rebuild` 之后单独调用。
         self.painter.on_swapchain_rebuilt(&mut self.fr)?;

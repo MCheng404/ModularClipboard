@@ -348,6 +348,13 @@ pub struct UiConfig {
     /// 半径 8，因此旧用户升级后观感不变。
     #[serde(default = "default_window_blur_strength")]
     pub window_blur_strength: u8,
+    /// 磨砂光标光晕（磨砂模式下光标靠近主窗口时的径向光晕）。
+    ///
+    /// 默认关：见 [`GlowConfig`] 的说明（装饰性 + 持续重绘成本）。
+    /// 仅在 `window_backdrop == Acrylic` 时生效——普通不透明背景下
+    /// 一团光晕没有「照亮磨砂」的语义。
+    #[serde(default)]
+    pub glow: GlowConfig,
     /// 列表卡片阴影（历史列表里每条条目卡片的投影）。
     ///
     /// 颜色由主题令牌 `Palette::shadow` 提供（深色主题自动加浓，
@@ -553,6 +560,81 @@ impl SearchPanelPos {
 /// `type_rail_size` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
 fn default_type_rail_size() -> f32 {
     32.0
+}
+
+/// 磨砂**光标光晕**配置（2026-10-21 新增）。
+///
+/// 语义：磨砂（`WindowBackdrop::Acrylic`）模式下，光标**靠近**主窗口时，
+/// 在光标位置渲染一团径向渐变光晕，像「窗口被光标照亮」。三个参数
+/// 收拢成一个结构体（同 [`CardShadowConfig`] / [`TypeRailConfig`] 惯例）：
+/// 关掉总开关后半径与浓度一起失效，设置界面是一张卡。
+///
+/// 默认**关闭**：它是装饰性效果，且开启后主窗口会以 ~30fps 跟随光标
+/// 重绘（空闲时也有成本），按需开启。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GlowConfig {
+    /// 总开关（默认关）。
+    pub enabled: bool,
+    /// 光晕半径（逻辑点，钳制 [`GLOW_RADIUS_MIN`]~[`GLOW_RADIUS_MAX`]）。
+    ///
+    /// 径向渐变的边缘半径；窗口外的「靠近」判定带另有一个固定值
+    /// （见 ui 侧 `GLOW_NEAR`），两者独立。
+    #[serde(default = "default_glow_radius")]
+    pub radius: f32,
+    /// 光晕浓度（0.0 ~ 1.0，钳制 [`GLOW_STRENGTH_MIN`]~[`GLOW_STRENGTH_MAX`]）。
+    ///
+    /// 映射为光晕中心颜色的 alpha 倍率。0 = 不可见，1 = 最浓。
+    #[serde(default = "default_glow_strength")]
+    pub strength: f32,
+}
+
+impl Default for GlowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            radius: default_glow_radius(),
+            strength: default_glow_strength(),
+        }
+    }
+}
+
+/// `glow.radius` 的 serde 缺省值。
+fn default_glow_radius() -> f32 {
+    160.0
+}
+
+/// `glow.strength` 的 serde 缺省值。
+fn default_glow_strength() -> f32 {
+    0.35
+}
+
+/// 光晕半径合法区间（逻辑点）。与设置侧滑块范围一致。
+pub const GLOW_RADIUS_MIN: f32 = 60.0;
+/// 见 [`GLOW_RADIUS_MIN`]。
+pub const GLOW_RADIUS_MAX: f32 = 320.0;
+
+/// 光晕浓度合法区间。
+pub const GLOW_STRENGTH_MIN: f32 = 0.0;
+/// 见 [`GLOW_STRENGTH_MIN`]。
+pub const GLOW_STRENGTH_MAX: f32 = 1.0;
+
+/// 把任意来源的半径值收敛到合法区间（非有限值回落默认）。
+pub fn clamp_glow_radius(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(GLOW_RADIUS_MIN, GLOW_RADIUS_MAX)
+    } else {
+        default_glow_radius()
+    }
+}
+
+/// 把任意来源的浓度值收敛到合法区间（非有限值回落默认）。
+pub fn clamp_glow_strength(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(GLOW_STRENGTH_MIN, GLOW_STRENGTH_MAX)
+    } else {
+        default_glow_strength()
+    }
 }
 
 /// `type_rail_size` 的合法区间（逻辑点）。与设置侧滑块范围一致。
@@ -1252,6 +1334,7 @@ impl Default for UiConfig {
             window_opacity: 1.0,
             card_opacity: 1.0,
             window_blur_strength: default_window_blur_strength(),
+            glow: GlowConfig::default(),
             card_shadow: CardShadowConfig::default(),
             row_meta: RowMetaConfig::default(),
             image_inline: true,
@@ -2115,6 +2198,29 @@ mod tests {
         assert_eq!(clamp_type_rail_size(f32::NAN), 32.0);
         assert_eq!(clamp_type_rail_size(f32::INFINITY), 32.0);
         assert_eq!(clamp_type_rail_size(f32::NEG_INFINITY), 32.0);
+    }
+
+    /// 光晕两个参数的钳制（手改 config.json 是常态）。
+    #[test]
+    fn glow_params_clamp() {
+        assert_eq!(clamp_glow_radius(160.0), 160.0);
+        assert_eq!(clamp_glow_radius(10.0), GLOW_RADIUS_MIN);
+        assert_eq!(clamp_glow_radius(9999.0), GLOW_RADIUS_MAX);
+        assert_eq!(clamp_glow_radius(f32::NAN), default_glow_radius());
+        assert_eq!(clamp_glow_strength(0.5), 0.5);
+        assert_eq!(clamp_glow_strength(-1.0), GLOW_STRENGTH_MIN);
+        assert_eq!(clamp_glow_strength(2.0), GLOW_STRENGTH_MAX);
+        assert_eq!(clamp_glow_strength(f32::NAN), default_glow_strength());
+    }
+
+    /// 旧版 config.json 没有 `glow` 字段：必须解析为「关闭」而不是
+    /// 整个配置回退默认（那会抹掉用户的全部设置）。
+    #[test]
+    fn missing_glow_field_defaults_off() {
+        let cfg: Config = serde_json::from_str(r#"{"ui":{"dark_mode":false}}"#).unwrap();
+        assert!(!cfg.ui.glow.enabled, "缺省必须关闭");
+        assert_eq!(cfg.ui.glow.radius, default_glow_radius());
+        assert_eq!(cfg.ui.glow.strength, default_glow_strength());
     }
 
     /// 搜索面板高度钳制：同 type_rail 的纪律（手改配置是常态）。

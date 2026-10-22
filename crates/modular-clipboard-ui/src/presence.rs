@@ -23,7 +23,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowPos,
-    ShowWindow, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SW_HIDE, SW_MINIMIZE,
+    ShowWindow, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SW_HIDE, SW_MINIMIZE,
     SW_RESTORE, IDC_ARROW, IDC_IBEAM, IDC_HAND,
 };
 use windows::core::PCWSTR;
@@ -31,6 +31,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, LoadCursorW, SetCursor, SetWindowDisplayAffinity, SetWindowLongPtrW,
     GWL_EXSTYLE, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_LAYERED,
 };
+
+/// 查询光标当前**屏幕坐标**（物理像素）。失败返回 `None`。
+///
+/// 用途：磨砂光晕（`ui.glow`）要「光标靠近窗口时在光标位置渲染」，
+/// 而 egui 的 `pointer.hover_pos()` 只在光标**位于本窗口内**时有效——
+/// 靠近但尚未进入的那一段窗口收不到任何鼠标事件，只能自己查。
+pub fn cursor_pos() -> Option<(i32, i32)> {
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    // SAFETY: `pt` 是栈上有效的可写内存。CAUTION: `GetCursorPos` 在
+    // `WindowsAndMessaging` 而不是 `Input::KeyboardAndMouse`（容易找错模块）。
+    let ok = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
+    ok.is_ok().then_some((pt.x, pt.y))
+}
 
 /// 窗口隐藏时的轮询间隔。
 ///
@@ -471,14 +484,33 @@ pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
 /// ——「设置窗口被主窗口遮住」。本函数用 `SetWindowPos(HWND_TOPMOST,
 /// SWP_NOACTIVATE)` 把目标窗口重新提回最上，**不抢焦点**（键盘/鼠标
 /// 焦点仍归当前操作窗口），只保证目标窗口不被其它置顶窗口遮住。
-pub fn raise_to_top(hwnd: HWND) {
+/// 把窗口抬到其所在 Z 序 band 的顶部。
+///
+/// `topmost` = 目标窗口应处的 band：
+/// - `true`：抬进**置顶组**最上（`HWND_TOPMOST`）；
+/// - `false`：抬进**普通组**最上（`HWND_TOP`）。
+///
+/// # 为什么必须带这个参数（2026-10-21 用户反馈修复）
+///
+/// 早前本函数**无条件**用 `HWND_TOPMOST`。弹窗/设置窗口的打开流程是
+/// 「先 `apply_topmost(配置值)` → 再 `sync_and_render`（内部 `just_opened`
+/// 调本函数）」：主窗口没开置顶时，第一歩是无操作（簿记已是 false），
+/// 第二歩却把窗口按进置顶组，而 `topmost` 簿记仍为 false ⇒ 之后每次
+/// `apply_topmost(false)` 都因「无变化」被幂等去重跳过 ⇒ **弹窗永远
+/// 置顶**（用户取消「始终置顶」后搜索面板/类型栏/通知/设置窗口仍压在
+/// 所有窗口之上）。
+///
+/// `HWND_TOP` 对**属主窗口**是安全的：被拥有的顶层窗口本来就恒定叠在
+/// 属主之上，抬到普通组顶部不会让它掉到主窗口底下。
+pub fn raise_to_top(hwnd: HWND, topmost: bool) {
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return;
     }
     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-    // SAFETY: hwnd 已由上面的 IsWindow 校验；HWND_TOPMOST 只调整
-    // Z 序与置顶标志，flags 不移动、不缩放、不激活。
-    let _ = unsafe { SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags) };
+    let after = if topmost { HWND_TOPMOST } else { HWND_TOP };
+    // SAFETY: hwnd 已由上面的 IsWindow 校验；只调整 Z 序与置顶标志，
+    // flags 不移动、不缩放、不激活。
+    let _ = unsafe { SetWindowPos(hwnd, Some(after), 0, 0, 0, 0, flags) };
 }
 
 /// 查询主显示器**工作区**（不含任务栏，物理像素）。

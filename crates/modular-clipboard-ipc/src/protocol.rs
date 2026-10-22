@@ -23,7 +23,7 @@
 //! [`PROTOCOL_VERSION`] 参与握手：不匹配时服务端直接拒绝，
 //! 避免「升级了 exe 但旧 daemon 还在」时两侧按不同字段解析出乱码。
 
-use modular_clipboard_core::{CapturedPayload, ClipItem, Config, DropStats, EntryId, Group};
+use modular_clipboard_core::{CapturedPayload, ClipItem, ClipKind, Config, DropStats, EntryId, Group};
 use serde::{Deserialize, Serialize};
 
 /// 协议版本。结构不兼容变更时必须 +1。
@@ -97,6 +97,17 @@ pub enum Command {
     DeleteItem(EntryId),
     /// 切换置顶。
     TogglePin(EntryId),
+    /// 就地更新条目内容（编辑落地，2026-10-21）。
+    ///
+    /// 保留 id / 置顶 / 分组 / 使用计数，只换 kind / 载荷 / 预览 / 索引。
+    /// `bytes` 是新载荷（文本类为 UTF-8 原文，图片类为裸 RGBA8），
+    /// `dims` 仅图片类需要（arboard 链路的尺寸无法从字节嗅探）。
+    UpdateContent {
+        id: EntryId,
+        kind: ClipKind,
+        bytes: Vec<u8>,
+        dims: Option<(u32, u32)>,
+    },
     /// 清空历史。
     ClearAll,
     /// 把界面侧的持久配置落盘。
@@ -178,6 +189,18 @@ mod tests {
             Command::CopyItem(1),
             Command::DeleteItem(2),
             Command::TogglePin(3),
+            Command::UpdateContent {
+                id: 4,
+                kind: ClipKind::Text,
+                bytes: b"edited".to_vec(),
+                dims: None,
+            },
+            Command::UpdateContent {
+                id: 5,
+                kind: ClipKind::Image,
+                bytes: vec![0u8; 16],
+                dims: Some((4, 4)),
+            },
             Command::ClearAll,
             Command::SaveConfig(Config::default()),
             Command::SetCaptureEnabled(true),

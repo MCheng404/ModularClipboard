@@ -504,6 +504,12 @@ fn handle_cmd(core: &Core, svc: &mut Service, cmd: Command) -> Response {
             Ok(()) => changed!(),
             Err(e) => Response::Error(e.to_string()),
         },
+        Command::UpdateContent { id, kind, bytes, dims } => {
+            match svc.update_content(id, kind, bytes, dims) {
+                Ok(()) => changed!(),
+                Err(e) => Response::Error(e.to_string()),
+            }
+        }
         Command::ClearAll => match svc.clear_all() {
             Ok(()) => changed!(),
             Err(e) => Response::Error(e.to_string()),

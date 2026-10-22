@@ -486,6 +486,10 @@ fn run_mode(
     //
     // 失败也不致命——设置打不开不该让主程序起不来（降级为无设置）。
     let mut settings_win: Option<crate::settingswin::SettingsWindow<'_>> = None;
+    // 图片编辑窗口（懒创建，2026-10-21）：与设置窗口同款「即关即毁」。
+    // `paint_state.image_editor` 决定它该不该存在，原图字节在
+    // `paint_state.image_editor_src`（由 `Op::OpenImageEditor` 备好）。
+    let mut img_edit: Option<crate::imgedit::ImageEditor<'_>> = None;
     // 窗口隐藏到托盘后仍在跑帧循环（要继续接收托盘事件），
     // 但不再渲染。`GetClientRect` 对隐藏窗口仍返回原尺寸，
     // 靠尺寸判断不出隐藏态，必须显式记这个标志。
@@ -572,7 +576,7 @@ fn run_mode(
             // 尺寸可能已变（最大化/还原切换），与托盘唤起同理立刻同步，
             // 避免用旧 framebuffer present 一帧。
             hidden = false;
-            rebuild(&mut fr, &mut painter)?;
+            rebuild(&mut fr, &mut painter, window.inner_size_physical())?;
             ctx.request_repaint();
         } else if !hidden && !visible_now {
             // 被外部隐藏：转入隐藏态（不渲染，只轮询等下一次唤起）。
@@ -684,7 +688,7 @@ fn run_mode(
                     if !min {
                         // 恢复时客户区尺寸可能变了（最大化/还原切换），
                         // 与托盘唤起同理，立刻同步一次避免用旧尺寸 present。
-                        rebuild(&mut fr, &mut painter)?;
+                        rebuild(&mut fr, &mut painter, window.inner_size_physical())?;
                         ctx.request_repaint();
                     }
                     minimized = min;
@@ -710,7 +714,7 @@ fn run_mode(
         if resize_pending {
             let (cw, ch) = window.inner_size_physical();
             if cw > 0 && ch > 0 && (cw, ch) != (fr.extent().width, fr.extent().height) {
-                rebuild(&mut fr, &mut painter)?;
+                rebuild(&mut fr, &mut painter, (cw, ch))?;
             }
         }
 
@@ -774,7 +778,7 @@ fn run_mode(
                 hidden = false;
                 // 窗口刚恢复，尺寸可能已变（最大化/还原切换）。
                 // 立刻同步一次，避免用旧尺寸 present 一帧。
-                rebuild(&mut fr, &mut painter)?;
+                rebuild(&mut fr, &mut painter, window.inner_size_physical())?;
                 ctx.request_repaint();
             }
             if f.quit {
@@ -795,7 +799,7 @@ fn run_mode(
         if saw_show {
             presence::focus_window(window.hwnd());
             hidden = false;
-            rebuild(&mut fr, &mut painter)?;
+            rebuild(&mut fr, &mut painter, window.inner_size_physical())?;
             ctx.request_repaint();
         }
 
@@ -860,6 +864,39 @@ fn run_mode(
         ));
         children.sync_with(&mut app.ws, &shared, window.scale_factor(), main_rect);
 
+        // ---- 1.85 磨砂光晕：光标位置 → 客户区坐标 ----
+        //
+        // 放在闸门**之前**（跳过路径也经过这里）：光晕的唯一输入是
+        // 「光标此刻在哪」，而光标在**窗口外**移动时本窗口收不到任何
+        // 事件——不在这里每轮查一次，光晕就会在光标穿过靠近带时毫无
+        // 反应（要等光标进入窗口、来了鼠标事件才补演，位置已经错了）。
+        //
+        // 判据齐了才查（GetCursorPos + 两次窗口查询 ≈ 3 个系统调用）：
+        // 关闭时零开销。窗口隐藏 / 最小化也不查——看不见的东西不跟踪。
+        let glow_cfg = &app.svc.state.config.ui.glow;
+        let glow_wanted = glow_cfg.enabled
+            && app.svc.state.config.ui.window_backdrop
+                == modular_clipboard_core::config::WindowBackdrop::Acrylic
+            && !hidden
+            && !window.is_minimized();
+        let glow_target = if glow_wanted {
+            crate::paint::glow_target_client(
+                main_pos,
+                egui::vec2(mw, mh),
+                window.scale_factor(),
+                crate::presence::cursor_pos(),
+            )
+        } else {
+            None
+        };
+        if glow_target != app.paint_state.glow_target {
+            app.paint_state.glow_target = glow_target;
+            // 目标变了（进入/离开靠近带、或在带内移动）⇒ 唤醒一帧。
+            // 没有这条，窗口外的那段移动没有任何事件源，闸门会一直
+            // 跳过，光晕停在原处（光标都走远了它还亮在老位置）。
+            ctx.request_repaint();
+        }
+
         // ---- 1.9 渲染闸门（PF-4）----
         //
         // 空闲时整套 `run_ui + tessellate + acquire/paint/present` 产出
@@ -895,6 +932,7 @@ fn run_mode(
                 &mut children,
                 &mut settings_win,
                 &mut popups,
+                &mut img_edit,
                 &shared,
                 &window,
                 frame_no,
@@ -1049,6 +1087,7 @@ fn run_mode(
                 &mut children,
                 &mut settings_win,
                 &mut popups,
+                &mut img_edit,
                 &shared,
                 &window,
                 frame_no,
@@ -1093,6 +1132,7 @@ fn run_mode(
                 &mut children,
                 &mut settings_win,
                 &mut popups,
+                &mut img_edit,
                 &shared,
                 &window,
                 frame_no,
@@ -1104,7 +1144,7 @@ fn run_mode(
         if (cw, ch) != (fr.extent().width, fr.extent().height) {
             // Resized 事件已处理过；这里兜住「尺寸查询与事件不一致」的情况
             // （例如 SetWindowPos 引起的多消息合并）。
-            rebuild(&mut fr, &mut painter)?;
+            rebuild(&mut fr, &mut painter, (cw, ch))?;
         }
 
         // ---- 4. 帧渲染 ----
@@ -1115,7 +1155,7 @@ fn run_mode(
         let primitives = ctx.tessellate(std::mem::take(&mut output.shapes), ppp);
         drop(output);
 
-        let Some(acquired) = fr.acquire()? else {            rebuild(&mut fr, &mut painter)?;
+        let Some(acquired) = fr.acquire()? else {            rebuild(&mut fr, &mut painter, (cw, ch))?;
             tracing::debug!("acquire 返回过期，已重建交换链");
             // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
             // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
@@ -1125,6 +1165,7 @@ fn run_mode(
                 &mut children,
                 &mut settings_win,
                 &mut popups,
+                &mut img_edit,
                 &shared,
                 &window,
                 frame_no,
@@ -1241,6 +1282,7 @@ fn run_mode(
             &mut children,
             &mut settings_win,
             &mut popups,
+            &mut img_edit,
             &shared,
             &window,
             frame_no,
@@ -1424,6 +1466,7 @@ fn drive_attach_windows<'a>(
     children: &mut crate::childwin::ChildWindows<'a>,
     settings_win: &mut Option<crate::settingswin::SettingsWindow<'a>>,
     popups: &mut crate::popup::Popups<'a>,
+    img_edit: &mut Option<crate::imgedit::ImageEditor<'a>>,
     shared: &crate::multiwindow::SharedGfx<'a>,
     window: &Window,
     frame_no: u64,
@@ -1639,6 +1682,60 @@ Ok(w) => {
         tracing::debug!("设置窗口资源已释放");
     }
 
+    // 图片编辑窗口（2026-10-21）------------------------------------------
+    //
+    // 生命周期与设置窗口同款「即关即毁」：编辑是一次性动作，关掉不该
+    // 留着一套交换链 + 字体图集（实测同类窗口 65MB 量级）。
+    //
+    // 原图字节由 `Op::OpenImageEditor` 备在 `image_editor_src` 里，
+    // 建窗时取走——状态里不留第二份（几 MB 的图不该有两个副本）。
+    let want_img_edit = app.paint_state.image_editor.is_some();
+    if !want_img_edit {
+        *img_edit = None;
+    } else if img_edit.is_none()
+        && let Some(id) = app.paint_state.image_editor
+    {
+        match app.paint_state.image_editor_src.take() {
+            Some((bytes, w, h)) => {
+                // 摆在主窗口**右侧**并顶部对齐：编辑时要能同时看到
+                // 原图（主窗口仍在），左右并排而非叠放。
+                let (mw, _mh) = window.inner_size_points();
+                let pos = window.screen_position_points() + egui::vec2(mw + 12.0, 0.0);
+                match crate::imgedit::ImageEditor::create(
+                    id,
+                    bytes,
+                    (w, h),
+                    pos,
+                    window.scale_factor(),
+                    shared,
+                ) {
+                    Ok(w2) => {
+                        tracing::info!(id, "图片编辑窗口已创建");
+                        *img_edit = Some(w2);
+                    }
+                    Err(e) => {
+                        // 建窗失败：状态置回 None，否则每帧重试刷日志。
+                        app.paint_state.image_editor = None;
+                        app.svc.notify(format!("无法打开图片编辑窗口: {e}"));
+                    }
+                }
+            }
+            None => {
+                // 有 id 没有字节（OpenImageEditor 失败过 / 已被取走）：
+                // 没有数据建不出窗口，直接收意图。
+                app.paint_state.image_editor = None;
+            }
+        }
+    }
+    if let Some(ed) = img_edit.as_mut() {
+        // 置顶跟随主窗口（幂等）。主窗口隐藏时编辑窗口也一起收——
+        // 它是主窗口操作的延伸，主窗不在就没有「正在编辑」的语境。
+        let want_open = main_visible && app.paint_state.image_editor.is_some();
+        ed.apply_topmost(topmost);
+        if let Err(e) = ed.sync_and_render(&mut *app, want_open) {
+            tracing::warn!(%e, "图片编辑窗口渲染失败，跳过本帧");
+        }
+    }
 }
 
 /// 单格式时按规范原样采用。真实的一致性由 `FrameRenderer::new` 校验。
@@ -1672,8 +1769,19 @@ pub(crate) fn pick_surface_format(gpu: &Gpu) -> anyhow::Result<ash::vk::Format> 
 fn rebuild<'a>(
     fr: &mut FrameRenderer<'a>,
     painter: &mut Painter<'a>,
+    extent: (u32, u32),
 ) -> anyhow::Result<()> {
-    fr.rebuild_swapchain(Default::default())?;
+    // IMPORTANT: **必须**传目标尺寸（2026-10-22 修复）。
+    //
+    // 早前这里传 `Default::default()`（零尺寸），`rebuild_swapchain`
+    // 于是走 `FALLBACK_EXTENT`(1280x800) 分支——只有 `caps.current_extent`
+    // 碰巧有效时才会等于真实客户区。一旦驱动对当前表面报告 0/越界的
+    // current_extent，交换链就被建成一个与窗口不符的尺寸，下一帧
+    // “尺寸不符”再次成立 ⇒ 无限重建，每帧一次全局 `device_wait_idle`。
+    fr.rebuild_swapchain(ash::vk::Extent2D {
+        width: extent.0,
+        height: extent.1,
+    })?;
     painter.on_swapchain_rebuilt(fr)
 }
 
@@ -2377,6 +2485,15 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     self.svc.state.config.ui.search_panel = m;
                     self.after_config_change();
                 }
+                Op::SetGlow(g) => {
+                    // 磨碎光标光晕：只改配置。绘制层每帧现读
+                    // （`draw_cursor_glow`），帧循环靠「光标目标变化 ⇒
+                    // request_repaint」与补间 busy 续帧，无需额外唤醒。
+                    // 半径/浓度在绘制侧钳制，这里原样存（配置被手工
+                    // 改超界时绘制侧兜底）。
+                    self.svc.state.config.ui.glow = g;
+                    self.after_config_change();
+                }
                 Op::SetThemeMode(mode) => {
                     // 主题必须**运行时立即生效**：记录选择 + 重灌调色板。
                     //
@@ -2537,8 +2654,16 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     }
                 }
                 Op::Delete(id) => {
-                    if let Err(e) = self.svc.delete_item(id) {
-                        self.svc.notify(format!("删除失败: {e}"));
+                    match self.svc.delete_item(id) {
+                        Ok(()) => {
+                            // 条目没了 ⇒ 挂在它上面的编辑态必须一起收
+                            // （内联编辑器 / 图片编辑窗口 / 撤销备份）。
+                            // 不收的话「切行提交」会拿残留缓冲去写一个
+                            // 已经不存在的 id：store 静默 0 行变更，
+                            // 用户以为自己刚改的字保存过了。
+                            self.paint_state.clear_edit_state(id);
+                        }
+                        Err(e) => self.svc.notify(format!("删除失败: {e}")),
                     }
                 }
                 Op::Copy(id) => {
@@ -2551,6 +2676,112 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         Ok(()) => self.svc.notify("已复制".into()),
                         Err(e) => self.svc.notify(format!("复制失败: {e}")),
                     }
+                }
+                // ---- 内容编辑（2026-10-21）----
+                Op::BeginEdit(id) => {
+                    // 读**完整载荷**（不是 preview——那最多 512 字符），
+                    // 编辑器里要看到并能改全文。失败（载荷被淘汰 / IPC
+                    // 故障）时不进入编辑态：开一个空编辑器比打不开更糟。
+                    match self.svc.load_payload_bytes(id) {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes).to_string();
+                            self.paint_state.editing = Some(id);
+                            self.paint_state.edit_buf = text;
+                            self.paint_state.edit_focus_pending = true;
+                            // 选中它：编辑中的行应保持选中态（否则行内
+                            // Enter 复制等键盘流的对象是别的条目）。
+                            self.svc.state.selected = Some(id);
+                        }
+                        Err(e) => {
+                            self.svc
+                                .notify(format!("无法编辑：内容已被淘汰（{e}）"));
+                        }
+                    }
+                }
+                Op::CommitEditText { id, text } => {
+                    // 空内容**拒绝保存**而不是落一条空条目：清空后回车
+                    // 是最容易误触的一条路径（全选 + 删除 + Enter），
+                    // 存进去的是一个既没有预览也复制不出东西的占位行，
+                    // 而用户真正的意图多数是「删掉这条」。
+                    //
+                    // 判据用 `trim()`：纯空白同样没有内容（换行/制表符
+                    // 会被预览折叠成看不见的东西，比空还难排查）。
+                    //
+                    // 拒绝时**保留编辑态**：编辑器继续开着，用户要么补
+                    // 字要么按 Esc 退出——直接关掉会让他以为保存成功了。
+                    // 真要删条目请走行上的删除按钮（那里有明确反馈）。
+                    if text.trim().is_empty() {
+                        self.svc.notify("内容为空，未保存".into());
+                    } else {
+                        self.commit_edit(id, text.into_bytes(), None);
+                    }
+                }
+                Op::CommitEditImage { id, bytes, dims } => {
+                    self.commit_edit(id, bytes, Some(dims));
+                }
+                Op::CancelEdit => {
+                    self.paint_state.editing = None;
+                    self.paint_state.edit_buf.clear();
+                    self.paint_state.edit_focus_pending = false;
+                }
+                Op::UndoEdit(id) => {
+                    // 单级撤销：用编辑前的备份再走一次落地。备份不存在
+                    // （原文已被淘汰 / 从未编辑过）时忽略并通知——
+                    // 静默失败会让用户以为撤销过了。
+                    //
+                    // CAUTION: 不能 `return`——`apply_ops` 返回 bool
+                    // （本帧是否有变化），提前返回会把它后面的搜索同步
+                    // 等收尾逻辑整段跳过。用 if/else 结构表达。
+                    let backup = self.paint_state.edit_backup.clone();
+                    match backup {
+                        Some(bk) if bk.id == id => {
+                            self.commit_edit(id, bk.payload, bk.dims);
+                            // 撤销后清掉备份：按钮随之消失（再点一次
+                            // 没有意义——备份已是当前内容）。
+                            self.paint_state.edit_backup = None;
+                        }
+                        _ => {
+                            self.svc.notify("没有可撤销的修改".into());
+                        }
+                    }
+                }
+                Op::OpenImageEditor(id) => {
+                    // 读载荷 → 开编辑窗口。尺寸取自内存条目（`payload.dims`）：
+                    // 载荷是裸 RGBA8，字节里没有宽高（arboard 链路的老问题）。
+                    let dims = self
+                        .svc
+                        .state
+                        .items
+                        .iter()
+                        .find(|it| it.id == id)
+                        .and_then(|it| it.payload.as_ref().and_then(|p| p.dims));
+                    match (self.svc.load_payload_bytes(id), dims) {
+                        (Ok(bytes), Some(d)) if d.0 > 0 && d.1 > 0 => {
+                            self.paint_state.image_editor = Some(id);
+                            // 原图交给帧循环建窗（建窗即取走）。
+                            self.paint_state.image_editor_src = Some((bytes.clone(), d.0, d.1));
+                            // 顺手记下原文备份：窗口保存时直接用，不必
+                            // 再读一次盘（编辑窗口本来就持有原图）。
+                            self.paint_state.edit_backup = Some(crate::paint::EditBackup {
+                                id,
+                                kind: modular_clipboard_core::ClipKind::Image,
+                                payload: bytes,
+                                dims: Some(d),
+                            });
+                        }
+                        (Ok(_), _) => {
+                            self.svc
+                                .notify("无法编辑图片：缺少尺寸信息".into());
+                        }
+                        (Err(e), _) => {
+                            self.svc
+                                .notify(format!("无法编辑图片：内容已被淘汰（{e}）"));
+                        }
+                    }
+                }
+                Op::CloseImageEditor => {
+                    self.paint_state.image_editor = None;
+                    self.paint_state.image_editor_src = None;
                 }
                 Op::SetPinnedMode(mode) => {
                     // 重复点当前已选项不触发任何调整（`draw_segmented`
@@ -2604,8 +2835,13 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     self.paint_state.detail_image_orig = None;
                 }
                 Op::ClearAll => {
-                    if let Err(e) = self.svc.clear_all() {
-                        self.svc.notify(format!("清空失败: {e}"));
+                    match self.svc.clear_all() {
+                        Ok(()) => {
+                            // 全清之后没有一条条目还在 ⇒ 编辑态整体作废
+                            // （理由同 `Op::Delete` 分支）。
+                            self.paint_state.clear_all_edit_state();
+                        }
+                        Err(e) => self.svc.notify(format!("清空失败: {e}")),
                     }
                 }
                 Op::Quit => {
@@ -2703,11 +2939,81 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
         changed
     }
 
+    /// 编辑落地：备份原文 → 写新内容 → 关编辑器 → 通知（2026-10-21）。
+    ///
+    /// # 为什么备份放在这里而不是调用方
+    ///
+    /// 「撤销」需要的是**改之前**的载荷，而备份动作与落地动作必须严格
+    /// 先读后写。三个入口（内联文本 / 图片窗口 / 撤销还原）都走本方法，
+    /// 备份逻辑只有一份——分散到三处必然有一处漏掉读旧值，撤销时
+    /// 还原出来的是编辑后的内容（「撤销了但没变化」）。
+    ///
+    /// # 备份失败不阻断编辑
+    ///
+    /// 原文载荷可能已被淘汰（`load_payload_bytes` 失败）：此时用户改的
+    /// 字照样保存，只是没有撤销可用（左下角不出现撤销按钮）。为一个
+    /// 已丢失原文的条目拒绝保存更糟。
+    ///
+    /// 备份已存在且同 id 时**不重读**（图片编辑窗口打开时已备份过）：
+    /// 少一次 IPC 往返，也保证备份的一定是「本次编辑前」那一份。
+    fn commit_edit(&mut self, id: modular_clipboard_core::EntryId, payload: Vec<u8>, dims: Option<(u32, u32)>) {
+        // kind：图片编辑（带 dims）⇒ Image；文本编辑沿用条目当前 kind
+        // （Html / Markdown 编辑后仍是那一类，只是内容变了）。
+        let kind = if dims.is_some() {
+            modular_clipboard_core::ClipKind::Image
+        } else {
+            self.svc
+                .state
+                .items
+                .iter()
+                .find(|it| it.id == id)
+                .map(|it| it.kind)
+                .unwrap_or(modular_clipboard_core::ClipKind::Text)
+        };
+        let has_fresh_backup = self
+            .paint_state
+            .edit_backup
+            .as_ref()
+            .is_some_and(|b| b.id == id);
+        if !has_fresh_backup {
+            // 先读后写：此刻库里还是**旧**内容。
+            if let Ok(old_bytes) = self.svc.load_payload_bytes(id) {
+                let (old_kind, old_dims) = self
+                    .svc
+                    .state
+                    .items
+                    .iter()
+                    .find(|it| it.id == id)
+                    .map(|it| (it.kind, it.payload.as_ref().and_then(|p| p.dims)))
+                    .unwrap_or((kind, None));
+                self.paint_state.edit_backup = Some(crate::paint::EditBackup {
+                    id,
+                    kind: old_kind,
+                    payload: old_bytes,
+                    dims: old_dims,
+                });
+            }
+        }
+        match self.svc.update_content(id, kind, payload, dims) {
+            Ok(()) => {
+                // 关掉一切编辑态：内联编辑器、图片编辑窗口。
+                self.paint_state.editing = None;
+                self.paint_state.edit_buf.clear();
+                self.paint_state.edit_focus_pending = false;
+                self.paint_state.image_editor = None;
+                self.paint_state.image_editor_src = None;
+                self.svc.notify("已保存修改".into());
+            }
+            Err(e) => {
+                self.svc.notify(format!("保存失败: {e}"));
+            }
+        }
+    }
+
     /// 画一个悬浮弹窗的内容（`crate::popup` 调用）。
     ///
     /// 与 [`Self::draw_child_frame`] 同一套路：把 `paint::Frame` 的字段
-    /// 组装收敛在 app.rs，`popup` 不需要知道 `App` 的内部结构。
-    ///
+    /// 组装收敛在 app.rs，`popup` 不需要知道 `App` 的内部结构。    ///
     /// 弹窗客户区 = 面板 + 四周一圈投影边距（`popup::SHADOW_MARGIN`），
     /// 面板矩形取中央那块；投影由 `paint` 画在边距里（alpha=0 处即桌面）。
     pub fn draw_popup(&mut self, ui: &mut egui::Ui, kind: crate::popup::PopupKind) {
@@ -3095,6 +3401,15 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
     /// 有独立的 `egui::Context`，`set_theme` 只灌主窗口那份。
     pub(crate) fn palette(&self) -> &theme::Palette {
         &self.pal
+    }
+
+    /// 发一条通知（toast / 弹窗，由 `ui.notice_popup` 决定呈现）。
+    ///
+    /// `pub(crate)` 是给**编辑窗口**（`imgedit`）用的：它有自己的绘制
+    /// 代码但够不到 `App::svc`（私有）。失败反馈必须走与主窗口同一通道
+    /// ——「保存失败只在日志里」对用户等于没有反馈。
+    pub(crate) fn notify(&mut self, msg: String) {
+        self.svc.notify(msg);
     }
 
     /// MCP 调用设置覆盖层是否打开。
@@ -3762,6 +4077,145 @@ mod tests {
             "切主题后目标调色板的字号必须仍带 1.3× 缩放，实际 {}",
             app.pal_to.font_md
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 提交**空内容**必须被拒绝：库里原文不动、编辑态保留、给出提示。
+    ///
+    /// 守的是最容易误触的一条路径——全选 + 删除 + Enter。若照单全收，
+    /// 落库的是一个既没有预览也复制不出东西的空条目，而用户真正的意图
+    /// 多半是「删掉这条」。
+    #[test]
+    fn empty_edit_text_is_refused_and_keeps_editor_open() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-empty-edit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        // `ingest` 的第一道闸是 `capture.enabled`（关着就不再记录），
+        // 但开着的 cfg 会让 `App::new` 起一条捕获线程去**真的读系统
+        // 剪贴板**（测试里会往列表塞进不可控的条目）。故建完再开：
+        // 只为让 ingest 落库，不启动线程。
+        app.svc.state.config.capture.enabled = true;
+
+        // 塞一条真实记录：走 `ingest` 才有可读回的载荷。
+        let text = "编辑前的原文";
+        app.svc.ingest(modular_clipboard_core::CapturedPayload {
+            kind: modular_clipboard_core::ClipKind::Text,
+            bytes: text.as_bytes().to_vec(),
+            html: None,
+            text: Some(text.into()),
+            source_app: "test".into(),
+            files: Vec::new(),
+            dims: None,
+        });
+        app.svc.reload_list();
+        let id = app.svc.state.items[0].id;
+
+        // 纯空白也算空（换行/制表符会被预览折成看不见的东西）。
+        let blank = "  \n\t ".to_string();
+        app.paint_state.editing = Some(id);
+        app.paint_state.edit_buf = blank.clone();
+        app.paint_state.ops.push(crate::paint::Op::CommitEditText {
+            id,
+            text: blank,
+        });
+        app.apply_ops();
+
+        assert!(
+            app.svc
+                .state
+                .notice
+                .as_ref()
+                .is_some_and(|(m, _)| m.contains("内容为空")),
+            "空内容必须给出提示，实际 {:?}",
+            app.svc.state.notice.as_ref().map(|(m, _)| m)
+        );
+        assert_eq!(
+            app.paint_state.editing,
+            Some(id),
+            "拒绝保存时编辑器应继续开着（关掉会让用户以为保存成功了）"
+        );
+        let still = app
+            .svc
+            .load_payload_bytes(id)
+            .expect("条目还在，应能读回原文");
+        assert_eq!(still, text.as_bytes().to_vec(), "原文不应被空内容覆盖");
+
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删除条目必须把它身上的编辑态一起收掉。
+    ///
+    /// 不收的后果是「切行提交」拿残留缓冲去写一个已经被删掉的 id：
+    /// store 静默 0 行变更，界面没有任何报错，用户以为刚改的字存住了。
+    #[test]
+    fn deleting_item_clears_its_edit_state() {
+        let dir = std::env::temp_dir().join(format!("mc-ui-del-edit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut cfg = modular_clipboard_core::Config::default();
+        cfg.capture.enabled = false;
+        let mut app = App::new(cfg, false, Some(&dir));
+        // 同 `empty_edit_text_is_refused_and_keeps_editor_open`：只为让
+        // ingest 落库而开，不起捕获线程（见那里的说明）。
+        app.svc.state.config.capture.enabled = true;
+
+        let payload = |s: &str| modular_clipboard_core::CapturedPayload {
+            kind: modular_clipboard_core::ClipKind::Text,
+            bytes: s.as_bytes().to_vec(),
+            html: None,
+            text: Some(s.into()),
+            source_app: "test".into(),
+            files: Vec::new(),
+            dims: None,
+        };
+        app.svc.ingest(payload("第一条"));
+        app.svc.ingest(payload("第二条"));
+        app.svc.reload_list();
+        let ids: Vec<_> = app.svc.state.items.iter().map(|it| it.id).collect();
+        let (victim, keeper) = (ids[0], ids[1]);
+
+        // victim 正在被编辑（含撤销备份），keeper 也在编辑中。
+        app.paint_state.editing = Some(keeper);
+        app.paint_state.edit_buf = "第二条改过了".into();
+        app.paint_state.image_editor = Some(victim);
+        app.paint_state.image_editor_src = Some((vec![1, 2, 3], 2, 2));
+        app.paint_state.edit_backup = Some(crate::paint::EditBackup {
+            id: victim,
+            kind: modular_clipboard_core::ClipKind::Text,
+            payload: "第一条".as_bytes().to_vec(),
+            dims: None,
+        });
+
+        app.paint_state.ops.push(crate::paint::Op::Delete(victim));
+        app.apply_ops();
+
+        assert!(
+            app.svc.state.items.iter().all(|it| it.id != victim),
+            "条目应已被删除"
+        );
+        assert!(
+            app.paint_state.image_editor.is_none(),
+            "被删条目的图片编辑窗口必须关掉"
+        );
+        assert!(
+            app.paint_state.image_editor_src.is_none(),
+            "被删条目的原图副本必须释放"
+        );
+        assert!(
+            app.paint_state.edit_backup.is_none(),
+            "被删条目的撤销备份必须丢弃"
+        );
+        // 另一条的编辑不受影响。
+        assert_eq!(
+            app.paint_state.editing,
+            Some(keeper),
+            "删 A 不该打断正在编辑的 B"
+        );
+        assert_eq!(app.paint_state.edit_buf, "第二条改过了");
+
+        app.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

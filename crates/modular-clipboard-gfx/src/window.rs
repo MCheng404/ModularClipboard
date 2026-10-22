@@ -412,6 +412,13 @@ pub struct Window {
     /// 默认 2048 是「没拿到设备信息」时的安全值；拿到 `Gpu` 后调用
     /// [`Self::set_max_texture_side`] 换成设备的真实上限。
     max_texture_side: usize,
+    /// 本结构**自己认为**的可见状态（供 [`Self::set_visible`] 去重）。
+    ///
+    /// `None` = 建窗后尚未同步过（首次调用必定下发）。
+    /// 不用 `IsWindowVisible` 查询代替：那要多一次系统调用，且外部
+    /// （系统、别的模块）也可能改过窗口状态，簿记反而更贴近「我们
+    /// 上次想让它是什么样」。
+    visible: std::cell::Cell<Option<bool>>,
 }
 
 impl Window {
@@ -471,9 +478,32 @@ impl Window {
     /// 那套 PostMessage——`ShowWindow` 会阻塞等待目标线程泵消息，
     /// 而界面线程可能正卡在等 IPC（见 `request_show_main_window` 的注释）。
     /// 弹窗与主窗口同在界面线程，用本函数安全。
+    /// 显示 / 隐藏窗口。
+    ///
+    /// # CAUTION: 必须幂等（2026-10-22 修复）
+    ///
+    /// 早前这里无条件 `ShowWindow`，而调用方（弹窗、编辑窗、设置窗）都是
+    /// **每帧**调 `set_visible(true)`——主循环空转约 125Hz，等于每秒一百
+    /// 多次 `SW_SHOWNA`。
+    ///
+    /// 对已可见窗口反复 `ShowWindow` 不只是「浪费一次系统调用」：系统会
+    /// 借这次调用**重新应用属主（owner）约束**，把属主连带推到置顶组前
+    /// 面。类型栏弹窗的 owner 是主窗口 ⇒ 主窗口被反复抬到编辑窗口之上
+    /// ⇒ 两个窗口以几百毫秒的间隔反复互换上下层，表现为**闪烁**
+    /// （2026-10-22 用户反馈，实测 6 秒内 46 次 Z 序翻转）。
+    ///
+    /// 「打开设置窗口后不闪」正是因为它会收起类型栏，那条每帧
+    /// `ShowWindow` 没了；「搜索框打开后也闪」是因为搜索面板同属主于
+    /// 主窗口，也每帧 `ShowWindow`。
+    ///
+    /// 加簿记去重后，只有状态**真的变化**时才下发一次。
     pub fn set_visible(&self, visible: bool) {
+        if self.visible.get() == Some(visible) {
+            return;
+        }
         // SAFETY: hwnd 由本结构持有且有效。
         let _ = unsafe { ShowWindow(self.hwnd, if visible { SW_SHOWNA } else { SW_HIDE }) };
+        self.visible.set(Some(visible));
     }
 
     /// 构造主体：`new` 与 `new_popup` 共用，差异全在 [`WindowOpts`]。
@@ -558,6 +588,7 @@ impl Window {
             hwnd,
             hinstance,
             max_texture_side: 2048,
+            visible: std::cell::Cell::new(None),
         })
     }
 

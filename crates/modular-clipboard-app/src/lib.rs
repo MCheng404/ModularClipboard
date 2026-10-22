@@ -596,6 +596,48 @@ impl Service {
     }
 
 
+    /// 就地更新条目内容（编辑落地，2026-10-21）。
+    ///
+    /// 文本类：`bytes` = UTF-8 原文，`dims` 传 `None`；
+    /// 图片类：`bytes` = 裸 RGBA8 像素，`dims` 必须给（arboard 链路的
+    /// 尺寸无法从字节嗅探，见 [`CapturedPayload::dims`]）。
+    ///
+    /// 预览文案由本方法按 [`build_preview`] 同款规则重建（与捕获入库
+    /// 完全同源）——调用方（界面）只交字节，不交文案，避免两处各写
+    /// 一份截断规则后漂移。
+    ///
+    /// 远端模式下走 IPC：常驻进程持有存储，编辑必须落在那边的库里。
+    pub fn update_content(
+        &mut self,
+        id: EntryId,
+        kind: ClipKind,
+        bytes: Vec<u8>,
+        dims: Option<(u32, u32)>,
+    ) -> Result<()> {
+        match &mut self.backend {
+            Backend::Local(l) => {
+                let preview = build_preview(&CapturedPayload {
+                    kind,
+                    bytes: bytes.clone(),
+                    dims,
+                    html: None,
+                    text: None,
+                    source_app: String::new(),
+                    files: Vec::new(),
+                });
+                l.store.update_content(id, kind, preview, bytes, dims)?;
+                l.reload_list(&mut self.state);
+                Ok(())
+            }
+            Backend::Remote(r) => {
+                r.unit(modular_clipboard_ipc::Command::UpdateContent { id, kind, bytes, dims })?;
+                r.reload_list(&mut self.state);
+                Ok(())
+            }
+        }
+    }
+
+
     pub fn move_to_group(&mut self, id: EntryId, group: Option<i64>) -> Result<()> {
         match &mut self.backend {
             Backend::Local(l) => l.move_to_group(&mut self.state, id, group),

@@ -44,6 +44,7 @@ pub mod solver;
 pub mod text;
 pub mod workspace;
 pub mod icons;
+pub mod imgedit;
 pub mod mem;
 pub mod presence;
 pub mod settingswin;

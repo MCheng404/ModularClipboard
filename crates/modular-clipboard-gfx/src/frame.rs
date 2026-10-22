@@ -1818,12 +1818,28 @@ impl<'a> FrameRenderer<'a> {
             return;
         }
         tracing::debug!("放弃未present 的帧，恢复 acquire 能力");
-        self.gpu.wait_idle();
+        // 同样只等本窗口（理由见 `wait_own_inflight`）：本函数是**每帧
+        // 可达**的路径（纹理上传失败就会走到），用 `device_wait_idle`
+        // 会让一次上传失败把主窗口的管线一起排空 ⇒ 界面整体顿一下。
+        // 而它要保护的只是本窗口的命令缓冲不被重录时冲突。
+        let _ = self.wait_own_inflight();
     }
 
     pub fn rebuild_swapchain(&mut self, desired_extent: vk::Extent2D) -> anyhow::Result<()> {
-        // 必须先等 GPU 空闲：旧交换链的 framebuffer 还在被在飞命令引用。
-        self.gpu.wait_idle();
+        // 必须先等**本窗口**的 GPU 工作结束：旧交换链的 framebuffer、
+        // 命令缓冲与 staging 都还被在飞命令引用。
+        //
+        // # CAUTION: **不能**用 `gpu.wait_idle()`（2026-10-22 修复）
+        //
+        // 那是 `device_wait_idle`，**设备级**同步——排空所有窗口的在途
+        // GPU 工作。多窗口共享一台设备（见 `ui::multiwindow`），于是
+        // 任何一个窗口重建交换链都会把主窗口的管线一并排空 ⇒
+        // 表现为「某个附属窗口一动，主窗口跟着卡/闪」。
+        //
+        // 而重建真正需要的只是「本窗口的资源不再被引用」，引用它们的
+        // 也只有本窗口提交的那些命令 —— 等本窗口各槽位的 `submit_fence`
+        // 就足够，且不波及其他窗口。
+        self.wait_own_inflight()?;
 
         // IMPORTANT: 重建后**必须清掉 `pending`**。
         //
@@ -1836,7 +1852,7 @@ impl<'a> FrameRenderer<'a> {
         // 错误只在首帧出现一次，后续全是这句与真实原因毫无关系的
         // 报错，排查时极难定位。
         //
-        // 这里已经 `wait_idle()`，在飞命令全部完成，清 `pending` 是安全的。
+        // 这里已经等完**本窗口**的全部在飞命令，清 `pending` 是安全的。
         self.pending = None;
 
         // IMPORTANT: 必须查**本窗口自己的**表面。
@@ -1913,7 +1929,7 @@ impl<'a> FrameRenderer<'a> {
 
         // 槽位数可能变化，arena 的块数必须跟着变（块数须≥ 在飞帧数，
         // 额外留 `EXTRA_CHUNKS` 块余量）。
-        // 本函数开头已 wait_idle，因此销毁旧 staging 是安全的。
+        // 本函数开头已等完本窗口的在途帧，因此销毁旧 staging 是安全的。
         self.staging.destroy();
         self.staging =
             StagingArena::new(self.gpu, crate::staging::chunk_count_for(self.slots.len()))?;
@@ -1929,6 +1945,42 @@ impl<'a> FrameRenderer<'a> {
     }
 
     // -- 内部 ------------------------------------------------------------
+
+    /// 等待**本渲染器**所有在途提交完成。
+    ///
+    /// # 为什么要这个入口（而不是 `device_wait_idle`）
+    ///
+    /// `vkDeviceWaitIdle` 是设备级同步，多窗口共享设备时会把**所有**
+    /// 窗口的在途工作一起排空。而本渲染器要销毁的资源（framebuffer、
+    /// 命令缓冲、staging、描述符集）只可能被**自己**提交的命令引用，
+    /// 等自己的 `submit_fence` 既是充分的、也是最小代价的。
+    ///
+    /// 只等 `in_flight` 的槽位：从未提交过的栅栏处于 unsignaled 状态，
+    /// 把它们混进 `wait_all=true` 的等待会**永久阻塞**（该栅栏永远不会
+    /// 被 signal）。这是本函数唯一需要小心的地方。
+    fn wait_own_inflight(&mut self) -> anyhow::Result<()> {
+        let fences: Vec<vk::Fence> = self
+            .slots
+            .iter()
+            .filter(|s| s.in_flight)
+            .map(|s| s.submit_fence)
+            .collect();
+        if fences.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: 句柄由本结构持有且尚未销毁（调用方都在
+        // `destroy_frame_resources` 之前调用本函数）。
+        // NOTE: `vk::Result` 不实现 `std::error::Error`，不能用
+        // `anyhow::Context`，手工包一层。
+        unsafe { self.gpu.device.wait_for_fences(&fences, true, FENCE_TIMEOUT) }
+            .map_err(|e| anyhow::anyhow!("等待本窗口在途帧完成失败: {e:?}"))?;
+        // 等待成功后清标记：GPU 已读完这些槽位的资源，后续无论是销毁
+        // 重建还是继续复用，状态都是自洽的。
+        for s in self.slots.iter_mut() {
+            s.in_flight = false;
+        }
+        Ok(())
+    }
 
     /// 开启本帧的命令录制：清空命令缓冲、布局转换、开渲染通道、绑管线。
     fn open_command_buffer(&mut self, slot: usize, frame: &AcquiredFrame) -> anyhow::Result<()> {

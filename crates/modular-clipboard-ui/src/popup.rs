@@ -170,7 +170,7 @@ impl PopupKind {
 /// 内往返的变化会被记成「没变化」而丢掉那一帧。
 /// （实践中进出都会产生 `MouseMoved`，但闸门不该依赖这个前提。）
 #[derive(Debug, Default)]
-struct RedrawGate {
+pub(crate) struct RedrawGate {
     /// 上次真正绘制的时刻。
     last_draw: Option<Instant>,
     /// egui 请求的下次重绘时刻（由 `repaint_delay` 换算）。
@@ -183,7 +183,7 @@ struct RedrawGate {
 
 impl RedrawGate {
     /// 本帧是否需要重绘。`now` 由调用方传入（测试可注入）。
-    fn needs_redraw(&self, q: RedrawQuery) -> bool {
+    pub(crate) fn needs_redraw(&self, q: RedrawQuery) -> bool {
         if q.forced || q.has_events {
             return true;
         }
@@ -208,7 +208,7 @@ impl RedrawGate {
     ///
     /// 收 `Option<Duration>` 而不是 `&FullOutput`：闸门因此是**纯逻辑**，
     /// 测试不必真的跑一遍 egui（那要建 `Context`、代价不小且不稳）。
-    fn note_drawn(&mut self, q: RedrawQuery, repaint_delay: Option<Duration>) {
+    pub(crate) fn note_drawn(&mut self, q: RedrawQuery, repaint_delay: Option<Duration>) {
         self.last_draw = Some(q.now);
         self.last_pointer_over = q.pointer_over;
         self.last_focused = q.focused;
@@ -220,17 +220,17 @@ impl RedrawGate {
 
 /// 一次闸门判定的输入（打包成结构体，避免 7 个位置参数）。
 #[derive(Debug, Clone, Copy)]
-struct RedrawQuery {
-    now: Instant,
+pub(crate) struct RedrawQuery {
+    pub(crate) now: Instant,
     /// 强制重绘（刚打开 / 移动过 / 尺寸变过）。
-    forced: bool,
-    has_events: bool,
-    pointer_over: bool,
+    pub(crate) forced: bool,
+    pub(crate) has_events: bool,
+    pub(crate) pointer_over: bool,
     /// egui 当前持有焦点的控件 id。
-    focused: Option<egui::Id>,
-    scale: f32,
+    pub(crate) focused: Option<egui::Id>,
+    pub(crate) scale: f32,
     /// 物理客户区尺寸。
-    extent: (u32, u32),
+    pub(crate) extent: (u32, u32),
 }
 
 /// 一个弹窗窗口。
@@ -357,6 +357,18 @@ impl<'a> Popup<'a> {
         }
     }
 
+    /// 把弹窗抬到 Z 序顶部（按**当前簿记的置顶状态**选 band）。
+    ///
+    /// CAUTION: 必须传 `self.topmost` 而不是写死置顶组——调用方
+    /// （`sync_one`）在本函数之前已经跑过 `apply_topmost(配置值)`，
+    /// 簿记是最新的。写死 `HWND_TOPMOST` 会让「主窗口没开置顶」的
+    /// 弹窗在打开那一帧被按进置顶组，而簿记仍是 false ⇒ 之后每次
+    /// `apply_topmost(false)` 都被幂等去重跳过 ⇒ 弹窗永远置顶
+    /// （2026-10-21 用户反馈，见 `presence::raise_to_top` 的说明）。
+    fn raise_to_top(&self) {
+        crate::presence::raise_to_top(self.window.hwnd(), self.topmost);
+    }
+
     /// 指针是否在本弹窗上（用于「悬停钉住」判定）。
     pub fn pointer_over(&self) -> bool {
         modular_clipboard_gfx::chrome::pointer_is_over(self.window.hwnd())
@@ -424,7 +436,7 @@ impl<'a> Popup<'a> {
             // 都没有滑入动效。这里显式清掉，让每次展开都重播一遍。
             // （绘制侧的同名 id 见 `App::draw_popup`。）
             crate::anim::clear(&self.ctx, egui::Id::new(("popup_in", kind)));
-            crate::presence::raise_to_top(self.window.hwnd());
+            self.raise_to_top();
             if kind.activatable() {
                 crate::presence::focus_window(self.window.hwnd());
             }
@@ -501,7 +513,10 @@ impl<'a> Popup<'a> {
 
         self.gfx.rebuild_if_needed((cw, ch))?;
         let Some(acquired) = self.gfx.fr.acquire()? else {
-            self.gfx.fr.rebuild_swapchain(Default::default())?;
+            self.gfx.fr.rebuild_swapchain(ash::vk::Extent2D {
+                width: cw,
+                height: ch,
+            })?;
             // 交换链刚重建、本帧又没画成 ⇒ 图像内容是**未定义的**
             // （新分配的交换链图像不保证已清零）。闸门若按「刚画过」
             // 跳过下一帧，窗口会黑着/花着最多一个心跳间隔。

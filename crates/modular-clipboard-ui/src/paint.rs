@@ -24,9 +24,10 @@
 //! 文字，其批次裁剪矩形就是**整屏**——裁剪等于没裁。要真正限制在
 //! 卡片内，必须显式传对应矩形给 `painter_at`。
 
-use egui::{Align2, CornerRadius, FontId, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{Align2, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use modular_clipboard_app::Service;
 use modular_clipboard_core::ClipItem;
+use modular_clipboard_core::item::EntryId;
 use modular_clipboard_core::config::{RowMetaPart, WindowBackdrop};
 
 use crate::card::{Card, CardHost, CardKind, PinnedMode};
@@ -70,6 +71,44 @@ pub enum Op {
     Copy(modular_clipboard_core::EntryId),
     /// 置顶模式切换。
     SetPinnedMode(PinnedMode),
+
+    // ---- 内容编辑（2026-10-21）----
+    //
+    // 三个入口一个闭环：BeginEdit 读载荷开编辑器 → CommitEdit 落地
+    // （落地前由 App 负责备份原文）→ UndoEdit 用备份还原。
+    // CancelEdit 只是关编辑器（无存储副作用）。
+
+    /// 进入内联编辑（读条目载荷开编辑器）。
+    ///
+    /// 载荷读取可能失败（条目被淘汰 / IPC 故障），失败时 App 发通知，
+    /// **不**进入编辑态——「打开一个空编辑器」比打不开更糟。
+    BeginEdit(modular_clipboard_core::EntryId),
+    /// 提交内联编辑的文本（`text` = 编辑后的完整内容）。
+    ///
+    /// 文本类专用：载荷 = `text` 的 UTF-8 字节，kind 不变。
+    CommitEditText {
+        id: modular_clipboard_core::EntryId,
+        text: String,
+    },
+    /// 提交图片编辑（`bytes` = 变换后的裸 RGBA8，`dims` = 新尺寸）。
+    ///
+    /// 旋转 90°/270° 会交换宽高，`dims` 必须按变换后的给——store 与
+    /// 行高都认它（arboard 链路的尺寸无法从字节嗅探）。
+    CommitEditImage {
+        id: modular_clipboard_core::EntryId,
+        bytes: Vec<u8>,
+        dims: (u32, u32),
+    },
+    /// 取消内联编辑（关闭编辑器，不动存储）。
+    CancelEdit,
+    /// 撤销最近一次编辑（用 [`UiState::edit_backup`] 还原）。
+    ///
+    /// 备份不存在（原文已被淘汰 / 从未编辑过）时 App 忽略并通知。
+    UndoEdit(modular_clipboard_core::EntryId),
+    /// 打开图片编辑窗口（读载荷 → `UiState::image_editor`）。
+    OpenImageEditor(modular_clipboard_core::EntryId),
+    /// 关闭图片编辑窗口（不保存）。
+    CloseImageEditor,
 
     // ---- 详情面板：图片原图查看 ----
     /// 进入「原图模式」：详情面板渲染全尺寸原图而非缩略图。
@@ -134,6 +173,12 @@ pub enum Op {
     ///
     /// 同 [`Op::SetTypeRail`]：两个参数一张轻量卡，整包替换。
     SetSearchPanel(modular_clipboard_core::config::SearchPanelConfig),
+    /// 设置磨砂光标光晕（开关 + 半径 + 浓度）。
+    ///
+    /// 同 [`Op::SetCardShadow`]：一张互相牵连的卡，整包替换。
+    /// 落地只需重存配置——绘制层每帧现读（`draw_cursor_glow`），
+    /// 帧循环的闸门由「目标变化 ⇒ request_repaint」与补间busy 唤醒。
+    SetGlow(modular_clipboard_core::config::GlowConfig),
     /// 切换主题（跟随系统 / 深色 / 浅色）。
     ///
     /// 由 `App::apply_ops` 落地：更新 `App.pal` 并重灌主窗口 `Visuals`；
@@ -449,6 +494,24 @@ pub enum SearchOpenCause {
     Click,
 }
 
+/// 编辑前的**原文备份**（撤销按钮的数据源，单级）。
+///
+/// 只存「还原所需的最小集」：kind + 载荷字节 + 尺寸。预览文案在
+/// 还原时由 `Service::update_content` 按 [`build_preview`] 同款规则
+/// 重建，不备份——两处各存一份文案必然漂移。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditBackup {
+    /// 被编辑的条目。
+    pub id: EntryId,
+    /// 编辑前的 kind（文本编辑不改 kind；图片编辑也不改，但备份时
+    /// 一并记下，还原时不依赖「当前是什么类型」的猜测）。
+    pub kind: modular_clipboard_core::ClipKind,
+    /// 编辑前的载荷字节（文本 = UTF-8 原文，图片 = 裸 RGBA8）。
+    pub payload: Vec<u8>,
+    /// 编辑前的图片尺寸（文本类为 `None`）。
+    pub dims: Option<(u32, u32)>,
+}
+
 /// 绘制上下文：跨帧保留的界面状态。
 #[derive(Default)]
 pub struct UiState {
@@ -476,6 +539,44 @@ pub struct UiState {
     /// painter）。两个模式都算：toast 模式算了不用（成本一次文本排版，
     /// 仅通知存续期间发生），换来切换设置的那一帧几何就是对的。
     pub notice_panel: Option<Rect>,
+    /// 磨砂光晕的**目标中心**（主窗口客户区逻辑坐标；`None` = 光标
+    /// 不在窗口内或其「靠近带」内）。
+    ///
+    /// 由帧循环每轮用 `GetCursorPos` 现算后写入（绘制层没有窗口句柄，
+    /// 拿不到屏幕坐标；egui 的 `hover_pos` 又只覆盖窗口内）。
+    /// 绘制层对它做补间（中心跟随 + 淡入淡出），见 [`draw_cursor_glow`]。
+    pub glow_target: Option<Pos2>,
+    /// 光晕的**显示中心**（补间中的值，逻辑点）。目标消失（光标离开）
+    /// 时补间不再更新它 ⇒ 淡出期间光晕冻结在最后位置。
+    pub glow_center: Pos2,
+    /// 正在**内联编辑**的条目（`Some(id)` = 该行的预览带换成编辑器）。
+    ///
+    /// 界面本地状态：不进配置、不进 IPC 快照。编辑中的文字在
+    /// [`Self::edit_buf`]，落地走 `Op::CommitEdit`。
+    pub editing: Option<EntryId>,
+    /// 内联编辑器的文本缓冲（`editing` 为 `Some` 时有效）。
+    pub edit_buf: String,
+    /// 打开内联编辑器后**请求一次焦点**（TextEdit 要跨帧才拿得到）。
+    pub edit_focus_pending: bool,
+    /// 最近一次编辑的**原文备份**（撤销用，单级）。
+    ///
+    /// `payload` 是编辑前的载荷字节（文本 = UTF-8 原文，图片 = 裸
+    /// RGBA8）。撤销 = 用这份备份再走一次 `update_content`——
+    /// store 侧无历史表，撤销深度固定为 1（与「左下角一个撤销按钮」
+    /// 的产品形态一致）。下一次编辑会覆盖它。
+    pub edit_backup: Option<EditBackup>,
+    /// 图片编辑窗口正在编辑的条目（`Some(id)` = 窗口应存在）。
+    ///
+    /// 窗口本体在 `app.rs` 的 `ImageEditor`（与设置窗口同款懒创建/
+    /// 即关即毁），这里只存「用户点了哪个条目的编辑按钮」。
+    pub image_editor: Option<EntryId>,
+    /// 图片编辑窗口的**原图数据**（`(RGBA8 字节, 宽, 高)`）。
+    ///
+    /// 由 `Op::OpenImageEditor` 从 store 读出后放在这里，帧循环取出
+    /// 建窗（`ImageEditor::create` 需要字节）。取出即清（`take`）——
+    /// 建窗后数据归窗口自己持有，状态里不留第二份（几 MB 的图不该有
+    /// 两个副本）。
+    pub image_editor_src: Option<(Vec<u8>, u32, u32)>,
     /// 类型栏**实测**面板尺寸（上一帧弹窗绘制时量的，逻辑点）。
     ///
     /// 为什么需要它：`labels`（按钮带文字）下面板尺寸取决于文字宽度，
@@ -918,7 +1019,11 @@ impl UiState {
         std::mem::take(&mut self.ops)
     }
 
-    fn push(&mut self, op: Op) {
+    /// 登记一个待执行操作（本帧收集，`App::apply_ops` 统一落地）。
+    ///
+    /// `pub(crate)`：编辑窗口（`imgedit`）也要 push Op——它不在本模块，
+    /// 但「只识别操作、不改布局」的纪律对全 crate 的绘制层一致适用。
+    pub(crate) fn push(&mut self, op: Op) {
         self.ops.push(op);
     }
 
@@ -964,6 +1069,52 @@ impl UiState {
             self.type_filter_multi.clear();
             self.type_filter = (self.type_filter != Some(kind)).then_some(kind);
         }
+    }
+
+    /// 清掉**针对某个条目**的一切编辑态（该条目已从库里消失时调用）。
+    ///
+    /// 收在这里而不是散在 `app.rs` 的删除分支里：编辑态一共六个字段
+    /// （内联三件 + 图片窗口两件 + 撤销备份），漏清任何一个都会留下
+    /// 「指向已不存在条目」的悬挂状态——
+    ///
+    /// - 留 `editing`：下一帧 `draw_item_row` 找不到该行，编辑器不画，
+    ///   但 `edit_buf` 里的字还在；用户再点别的行编辑时「切行提交」
+    ///   会拿这份缓冲去写**已被删除**的 id（store 返回 0 行变更，
+    ///   界面静默无反馈，用户以为保存过了）。
+    /// - 留 `image_editor`：帧循环每帧尝试为一个不存在的条目建窗，
+    ///   `image_editor_src` 已被 `take` 走 ⇒ 走「有 id 没有字节」分支，
+    ///   窗口建不起来但状态永远不清（每帧重试）。
+    /// - 留 `edit_backup`：撤销按钮继续挂在**别的行**上（按钮判据是
+    ///   `edit_backup.id == 本行 id`，所以实际是悬挂在列表里找不到的
+    ///   行上），等下次同 id 复用（EntryId 单调不复用，故永不命中）。
+    ///
+    /// `id` 不匹配的字段**不动**：删 A 不该打断正在编辑的 B。
+    pub fn clear_edit_state(&mut self, id: modular_clipboard_core::EntryId) {
+        if self.editing == Some(id) {
+            self.editing = None;
+            self.edit_buf.clear();
+            self.edit_focus_pending = false;
+        }
+        if self.image_editor == Some(id) {
+            self.image_editor = None;
+            self.image_editor_src = None;
+        }
+        if self.edit_backup.as_ref().is_some_and(|b| b.id == id) {
+            self.edit_backup = None;
+        }
+    }
+
+    /// 无条件清掉**所有**编辑态（条目被批量清空时调用）。
+    ///
+    /// 与 [`Self::clear_edit_state`] 的分工：那个按 id 精确清（删一条），
+    /// 这个清空（列表整体没了，没有什么可精确匹配的）。
+    pub fn clear_all_edit_state(&mut self) {
+        self.editing = None;
+        self.edit_buf.clear();
+        self.edit_focus_pending = false;
+        self.image_editor = None;
+        self.image_editor_src = None;
+        self.edit_backup = None;
     }
 
     // ---- 热区（`Frame` 的便捷方法转到这儿来）----
@@ -1132,6 +1283,332 @@ pub fn draw_child(f: &mut Frame<'_>) {
     }
 }
 
+/// 磨砂光晕的「靠近带」宽度（逻辑点）：光标进入窗口矩形外扩这一圈
+/// 就算「靠近」，光晕开始显示（位置钳到窗口边缘）。
+///
+/// 取 40pt ≈ 光标进入窗口前两三个身位：再小的话「靠近」几乎等于
+/// 「已进入」，特性感知不到；再大则在远离的窗口旁也会亮，误触发。
+const GLOW_NEAR: f32 = 40.0;
+
+// ---------------------------------------------------------------- 编辑图标
+//
+// 三个几何图标（铅笔 / 撤销 / 对勾）。为什么不用图标字体：PUA 码位
+// U+E000..U+E011 已分配完毕（见 `icons::Icon` 的 ALL），加字形要重新
+// 生成 TTF；而这三个形状用几段线段/三角形就能表达，与 Markdown 徽标
+// 同款处理（见 `icons::paint_kind_icon` 的说明）。
+//
+// 全部按**归一化**坐标（0..1 盒）定义，绘制时映射到目标矩形——
+// 与 `icons.rs` 的自绘徽标同一套口径，改尺寸只改传入矩形。
+
+/// 「编辑」图标：斜置铅笔（三角笔尖 + 杆 + 笔尾平口）。
+///
+/// # 形状为什么是三段（2026-10-22 重画）
+///
+/// 早前只有「杆 + 笔尖」两段，斜杆末端直接断在半空，16pt 下读起来像
+/// 一支**箭**而不是笔——杆与笔尖同向、末端无收口，缺少「这是一支有
+/// 尾端的书写工具」的视觉锚点。
+///
+/// 补上**笔尾平口**（垂直于轴的一小段）后，形状变成
+/// 「尖 → 杆 → 尾」三段，这是铅笔最容易辨识的剪影；平口同时把杆的
+/// 末端收住，小尺寸下不再显得毛糙。
+///
+/// 几何全部由**轴向/法向单位向量**推导（而不是写死四组坐标）：改倾角
+/// 只改 `ax/ay/bx/by` 两个端点，笔尖与尾口自动跟着走，不会各歪一边。
+pub fn paint_pencil_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
+    let side = r.width().min(r.height());
+    if side <= 0.0 || color.a() == 0 {
+        return;
+    }
+    let u = |x: f32, y: f32| pos2(r.min.x + x * side, r.min.y + y * side);
+    let w = (side * 0.17).max(1.2);
+    let stroke = Stroke::new(w, color);
+
+    // 主轴：笔尖侧 (0.26,0.74) → 笔尾侧 (0.72,0.28)（笔尖在左下）。
+    let (ax, ay) = (0.26f32, 0.74f32);
+    let (bx, by) = (0.72f32, 0.28f32);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= f32::EPSILON {
+        return;
+    }
+    let (ux, uy) = (dx / len, dy / len); // 轴向
+    let (nx, ny) = (-uy, ux); // 法向
+
+    // 笔杆。
+    painter.add(egui::Shape::line(vec![u(ax, ay), u(bx, by)], stroke));
+
+    // 笔尖（实心三角）：尖端沿轴向前伸出，底边跨在杆的笔尖端上。
+    let tip_l = 0.19;
+    let shoulder = 0.10;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            u(ax + nx * shoulder, ay + ny * shoulder),
+            u(ax - ux * tip_l, ay - uy * tip_l),
+            u(ax - nx * shoulder, ay - ny * shoulder),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+
+    // 笔尾平口：垂直于轴、跨过杆末端的一小段。
+    let tail = 0.12;
+    painter.add(egui::Shape::line(
+        vec![
+            u(bx + nx * tail, by + ny * tail),
+            u(bx - nx * tail, by - ny * tail),
+        ],
+        Stroke::new((w * 0.92).max(1.2), color),
+    ));
+}
+
+/// 「撤销」图标：回旋箭头（弧线 + 箭头）。
+///
+/// 弧从右侧起、越过顶部、收到左上；箭头在弧的**左上端**、沿切线指向
+/// 左下——「转回去」的读法。数学标准角（y 向上）参数化，映射时翻转 y。
+pub fn paint_undo_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
+    let side = r.width().min(r.height());
+    if side <= 0.0 || color.a() == 0 {
+        return;
+    }
+    let cx = r.min.x + 0.5 * side;
+    let cy = r.min.y + 0.52 * side;
+    let rad = 0.34 * side;
+    // 弧：θ ∈ [-32°, 196°]（2026-10-22 加长）。
+    //
+    // 早前只跨 180°，两端都收在圆的**上半部**，剪影接近一个「C」；
+    // 拉到约 228° 后末端明显绕到左下，读起来才是「转回去」的回旋箭头，
+    // 与铅笔的斜置笔杆也能一眼区分（此前两者在 16pt 下都像斜线）。
+    let a0 = -32.0f32;
+    let a1 = 196.0f32;
+    let steps = 30usize;
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let th = a0.to_radians() + t * (a1 - a0).to_radians();
+        pts.push(pos2(cx + th.cos() * rad, cy - th.sin() * rad));
+    }
+    painter.add(egui::Shape::line(
+        pts,
+        Stroke::new((side * 0.15).max(1.2), color),
+    ));
+    // 箭头：尖 = 弧终点；两翼 = 尖 - 切线×l ± 法线×h。
+    let th = a1.to_radians();
+    let tip = pos2(cx + th.cos() * rad, cy - th.sin() * rad);
+    let tan = pos2(-th.sin(), -th.cos()); // d/dθ（已含 y 翻转）
+    let nrm = pos2(-tan.y, tan.x);
+    // 箭头略微加大：小尺寸下三角太小会与弧线糊成一团。
+    let l = 0.23 * side;
+    let h = 0.13 * side;
+    let base = pos2(tip.x - tan.x * l, tip.y - tan.y * l);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            pos2(base.x + nrm.x * h, base.y + nrm.y * h),
+            pos2(base.x - nrm.x * h, base.y - nrm.y * h),
+        ],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// 「确认」图标：对勾（两段线）。
+pub fn paint_check_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) {
+    let side = r.width().min(r.height());
+    if side <= 0.0 || color.a() == 0 {
+        return;
+    }
+    let u = |x: f32, y: f32| pos2(r.min.x + x * side, r.min.y + y * side);
+    painter.add(egui::Shape::line(
+        vec![u(0.18, 0.55), u(0.42, 0.78), u(0.84, 0.24)],
+        Stroke::new((side * 0.16).max(1.2), color),
+    ));
+}
+
+/// 把光标屏幕位置换算成光晕的**目标中心**（主窗口客户区逻辑坐标）。
+///
+/// # 语义
+///
+/// - 光标在窗口内 ⇒ 光标位置本身；
+/// - 光标在窗口外但进入[`GLOW_NEAR`] 靠近带 ⇒ **钳到窗口边缘**（光晕
+///   从那一侧探进来，符合「靠近时在光标位置渲染」的直觉）；
+/// - 更远 ⇒ `None`（不亮）。
+///
+/// # 为什么是纯函数
+///
+/// 输入全部由帧循环现算后传入（绘制层没有窗口句柄，`GetCursorPos` 在
+/// app.rs）。抽成纯函数才能对「钳制 / 靠近带 / 缩放」三个分支写单测——
+/// 这三个分支恰好是几何错误的高发区（DPI 缩放漏除、钳制方向反了都会
+/// 让光晕跑到窗口外或干脆不显示，而实机上很难看出是换算错还是没触发）。
+pub fn glow_target_client(
+    win_pos: Vec2,
+    win_size: Vec2,
+    scale: f32,
+    cursor: Option<(i32, i32)>,
+) -> Option<Pos2> {
+    let (cx, cy) = cursor?;
+    // 缩放必须 > 0：窗口刚创建 / 已销毁时 `GetDpiForWindow` 可能给 0，
+    // 拿它除会把坐标放大到无穷（光晕画到天边）。
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    // 光标物理像素 → 逻辑点，再减掉窗口左上角得到客户区坐标。
+    let v = pos2(cx as f32 / s - win_pos.x, cy as f32 / s - win_pos.y);
+    let near = Rect::from_min_max(
+        pos2(-GLOW_NEAR, -GLOW_NEAR),
+        pos2(win_size.x + GLOW_NEAR, win_size.y + GLOW_NEAR),
+    );
+    if !near.contains(v) {
+        return None;
+    }
+    Some(pos2(
+        v.x.clamp(0.0, win_size.x.max(0.0)),
+        v.y.clamp(0.0, win_size.y.max(0.0)),
+    ))
+}
+
+/// 磨砂**光标光晕**（2026-10-21）：磨砂模式下光标靠近主窗口时，在光标
+/// 位置画一团径向渐变，像「窗口被光标照亮」。
+///
+/// # 层次
+///
+/// 画在背景（`bg` + 二级主题纹理）之上、卡片与顶栏**之下**——它是
+/// 背景效果的一部分，不该盖住内容。磨砂的模糊底图在 GPU 层，本层画在
+/// 其上前景侧，视觉上就是「光照亮了磨砂」。
+///
+/// # 动效与续帧
+///
+/// 中心跟随（90ms）与淡入淡出（160ms）都走 [`crate::anim::tween_f32`]：
+/// 补间在飞时 `anim::busy` 为真，帧循环的渲染闸门会持续放行——不需要
+/// 在这里手动 `request_repaint`。真正需要唤醒的是「光标在窗口外移动」
+/// （无事件源），那由帧循环比对目标变化后 `request_repaint` 完成
+/// （见 app.rs 1.85 节）。
+///
+/// # 为什么默认关闭还有成本意识
+///
+/// 关闭时本函数第一行就返回，不碰动画注册表；只有开启后才有
+/// 「光标靠近 ⇒ 30fps 级跟随重绘」的成本，且仅限磨砂模式。
+fn draw_cursor_glow(f: &mut Frame<'_>) {
+    let cfg = f.svc.state.config.ui.glow;
+    if !cfg.enabled {
+        return;
+    }
+    // 只在磨砂模式生效：不透明背景下「照亮磨砂」没有语义，且那会让
+    // 一个默认关闭的特性和普通模式的观感纠缠在一起。
+    if f.svc.state.config.ui.window_backdrop
+        != modular_clipboard_core::config::WindowBackdrop::Acrylic
+    {
+        return;
+    }
+    let pal = f.pal;
+    let ctx = f.ui.ctx();
+    let target = f.state.glow_target;
+    // 淡入淡出（160ms OutCubic）：目标有无决定方向；中心在淡出期间
+    // 冻结在最后位置（目标取当前显示值 ⇒ 补间不动）。
+    let a = crate::anim::tween_f32(
+        ctx,
+        egui::Id::new("glow_a"),
+        if target.is_some() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(160),
+        crate::anim::Ease::OutCubic,
+    );
+    let (tx, ty) = match target {
+        Some(p) => (p.x, p.y),
+        None => (f.state.glow_center.x, f.state.glow_center.y),
+    };
+    let cx = crate::anim::tween_f32(
+        ctx,
+        egui::Id::new("glow_cx"),
+        tx,
+        std::time::Duration::from_millis(90),
+        crate::anim::Ease::OutCubic,
+    );
+    let cy = crate::anim::tween_f32(
+        ctx,
+        egui::Id::new("glow_cy"),
+        ty,
+        std::time::Duration::from_millis(90),
+        crate::anim::Ease::OutCubic,
+    );
+    f.state.glow_center = pos2(cx, cy);
+    // 完全透明（从未亮过 / 已淡出完毕）：不画，也无需下面的一切。
+    if a <= 0.004 {
+        return;
+    }
+    let radius = modular_clipboard_core::config::clamp_glow_radius(cfg.radius);
+    let strength = modular_clipboard_core::config::clamp_glow_strength(cfg.strength);
+    if radius <= 0.0 || strength <= 0.0 {
+        return;
+    }
+    // 用色按主题：深色下近白（经典「光照亮磨砂」），浅色下白光照不出来，
+    // 换强调色（两套主题下都保证与底色有可感知的差）。
+    let base = if pal.is_dark {
+        egui::Color32::WHITE
+    } else {
+        pal.accent
+    };
+    let alpha = (strength * a * 255.0).round().clamp(0.0, 255.0) as u8;
+    let center_color = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha);
+    paint_radial_glow(f.ui.painter(), f.state.glow_center, radius, center_color);
+}
+
+/// 画一团**径向渐变**光晕（中心 `color` → 边缘同色 alpha 0）。
+///
+/// # 为什么手工搓 mesh 而不是叠 N 个圆
+///
+/// 叠圆会留下同心环（每层一道硬边）；mesh 按顶点色插值是真渐变。
+/// 顶点色用**预乘**分量构造（[`egui::Color32`] 内部即预乘，`to_array`
+/// 取出的就是预乘值），GPU 在预乘空间线性插值——正好是 alpha 渐变的
+/// 正确插值空间，边缘不会出现「透明黑」暗晕。
+///
+/// 调用方传根 painter（其裁剪矩形即整个客户区）：中心贴在窗口边缘时
+/// mesh 有一半在窗外，由 painter 的裁剪收走，不会画到邻窗上去。
+fn paint_radial_glow(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    color: egui::Color32,
+) {
+    if radius <= 0.0 || color.a() == 0 {
+        return;
+    }
+    // 分段数：48 段在 320pt 最大半径下每段弧长约 42pt，肉眼无棱角；
+    // 半径很窄时降段数（小圆多段是浪费）。
+    let steps = ((radius / 4.0).round().clamp(16.0, 48.0)) as usize;
+    // 边缘色：同 RGB、alpha 0（预乘空间即 (r, g, b, 0)）。
+    let [r, g, b, _] = color.to_array();
+    let edge = egui::Color32::from_rgba_premultiplied(r, g, b, 0);
+    let mut mesh = egui::Mesh::default();
+    // 纯色几何的约定：默认纹理（字体图集 Managed(0)）+ WHITE_UV，
+    // 最终颜色 = 图集白像素 × 顶点色。CAUTION: `WHITE_UV` 只在
+    // `egui::epaint` 下，egui 根命名空间没有 re-export 它。
+    let center_idx = mesh.vertices.len() as u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: egui::epaint::WHITE_UV,
+        color,
+    });
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let ang = t * std::f32::consts::TAU;
+        let p = pos2(
+            center.x + ang.cos() * radius,
+            center.y + ang.sin() * radius,
+        );
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: p,
+            uv: egui::epaint::WHITE_UV,
+            color: edge,
+        });
+        if i < steps {
+            let outer = center_idx + 1 + i as u32;
+            mesh.indices.extend_from_slice(&[center_idx, outer, outer + 1]);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 /// 画一帧。
 ///
 /// 流程：背景 → 悬浮装饰布局 → 顶栏（搜索图标）→ 搜索状态机 →
@@ -1160,6 +1637,10 @@ pub fn draw(f: &mut Frame<'_>) {
     // 不会盖住底图。且本层**不参与**磨砂的抓图（磨砂抓的是窗口
     // 身后的桌面，不是自己画的内容），不存在反馈回路。
     draw_theme_texture(f);
+
+    // 磨砂光标光晕：在背景之上、内容之下（它是背景效果的一部分）。
+    // 关闭 / 非磨砂模式时首行即返回，零成本。
+    draw_cursor_glow(f);
 
     let top = Rect::from_min_max(
         pos2(area.min.x, area.min.y),
@@ -1222,7 +1703,13 @@ pub fn draw(f: &mut Frame<'_>) {
     //
     // CAUTION: 录制热键时除外——那时每个键都有意义（`capture_recording`
     // 正在等一个组合键）， Enter 复制会把它录进去。
-    if f.state.hotkey_recording.is_none()
+    //
+    // CAUTION 2: **内联编辑中除外**（2026-10-21）。编辑器是主窗口里的
+    // 第一个 TextEdit，Enter 归它（多行换行）；不排除的话「改内容按
+    // 回车换行」会顺带把条目复制一遍，两个动作缠在一起。
+    // Esc 同理：编辑中 = 取消编辑，不往外传。
+    if f.state.editing.is_none()
+        && f.state.hotkey_recording.is_none()
         && let Some(id) = f.svc.state.selected
     {
         let enter = f
@@ -1230,6 +1717,15 @@ pub fn draw(f: &mut Frame<'_>) {
             .input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.any());
         if enter {
             f.state.push(Op::Copy(id));
+        }
+    }
+    // Esc 取消内联编辑（2026-10-21）。放在 Enter 分支之后：两者互斥，
+    // 但分开写读得清楚。弹窗里的 Esc 走弹窗自己的 Context（见
+    // `draw_search_panel`），这里是主窗口 Context 的那一半。
+    if f.state.editing.is_some() && f.state.hotkey_recording.is_none() {
+        let esc = f.ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if esc {
+            f.state.push(Op::CancelEdit);
         }
     }
 
@@ -3603,6 +4099,12 @@ enum ItemKind {
     CardOpacity,
     /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
     BlurStrength,
+    /// 磨砂光标光晕：总开关 + （开启时）半径 / 浓度两个滑条。
+    ///
+    /// 独立成变体（同 [`ItemKind::CardShadow`]）：关掉总开关后两个
+    /// 参数一起失效。仅在磨砂模式下有意义——非磨砂时整项禁用压暗
+    /// （与 [`ItemKind::BlurStrength`] 同一处理）。
+    Glow,
     /// 卡片阴影：开关行 + （开启时）模糊 / 浓度 / 垂直偏移三个滑条。
     ///
     /// 与 [`ItemKind::Opacity`] 同理独立成变体——参数不止一个，
@@ -3820,6 +4322,7 @@ impl SettingsItem {
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::CardOpacity => (cfg.ui.card_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
+            ItemKind::Glow => cfg.ui.glow != d.ui.glow,
             ItemKind::CardShadow => cfg.ui.card_shadow != d.ui.card_shadow,
             ItemKind::RowMeta => cfg.ui.row_meta != d.ui.row_meta,
             ItemKind::TypeRail => cfg.ui.type_rail != d.ui.type_rail,
@@ -3874,6 +4377,7 @@ impl SettingsItem {
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
             ItemKind::CardOpacity => Some(Op::SetCardOpacity(d.ui.card_opacity)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
+            ItemKind::Glow => Some(Op::SetGlow(d.ui.glow)),
             ItemKind::CardShadow => Some(Op::SetCardShadow(d.ui.card_shadow)),
             ItemKind::RowMeta => Some(Op::SetRowMeta(d.ui.row_meta)),
             ItemKind::TypeRail => Some(Op::SetTypeRail(d.ui.type_rail)),
@@ -4034,6 +4538,11 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: "背景不透明度",
                 desc: "背景层强度，文字始终不透明",
                 kind: ItemKind::Opacity,
+            },
+            SettingsItem {
+                label: "光标光晕",
+                desc: "磨砂模式下，光标靠近主窗口时在光标位置渲染一团径向光晕，像窗口被光标照亮；半径与浓度可调（默认关闭，仅磨砂模式可开）",
+                kind: ItemKind::Glow,
             },
             SettingsItem {
                 label: "卡片不透明度",
@@ -5049,6 +5558,77 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             cfg.height = modular_clipboard_core::config::clamp_search_panel_height(height);
             if changed {
                 f.state.push(Op::SetSearchPanel(cfg));
+                record_recent(f, it.label);
+            }
+        }
+        ItemKind::Glow => {
+            // 磨砂光标光晕：总开关 + （开启时）半径 / 浓度。整包替换。
+            //
+            // 非磨砂模式下整项**不可交互**（开关槽位换成提示文字）：
+            // 光晕的语义是「照亮磨砂」，不透明背景下没有承载它的东西
+            // ——与 BlurStrength 在非磨砂时禁用同一处理，但那个只禁
+            // 滑条，这个连开关一起禁（否则「能开但没效果」更难排查）。
+            let acrylic =
+                f.svc.state.config.ui.window_backdrop == WindowBackdrop::Acrylic;
+            let mut cfg = f.svc.state.config.ui.glow;
+            let mut changed = false;
+            if acrylic {
+                changed |= setting_row(ui, it.label, it.desc, |ui| {
+                    draw_switch(f, ui, "glow_enabled", &mut cfg.enabled)
+                });
+            } else {
+                let pal = f.pal;
+                let _ = setting_row(ui, it.label, it.desc, |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("需先开启磨砂背景").color(pal.text_dim),
+                    ));
+                    false
+                });
+            }
+            if cfg.enabled && acrylic {
+                ui.add_space(2.0);
+                let mut radius = modular_clipboard_core::config::clamp_glow_radius(cfg.radius);
+                let pal = f.pal;
+                changed |= setting_row(ui, "光晕半径", "径向渐变的边缘半径（60~320pt）", |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(format!("{}", radius.round() as i32)).color(pal.text_dim),
+                    ));
+                    draw_slider(
+                        f,
+                        ui,
+                        "glow_radius",
+                        "",
+                        &mut radius,
+                        modular_clipboard_core::config::GLOW_RADIUS_MIN
+                            ..=modular_clipboard_core::config::GLOW_RADIUS_MAX,
+                        true,
+                        0.0,
+                    )
+                });
+                cfg.radius = modular_clipboard_core::config::clamp_glow_radius(radius);
+                ui.add_space(2.0);
+                let mut strength = modular_clipboard_core::config::clamp_glow_strength(cfg.strength);
+                changed |= setting_row(ui, "光晕浓度", "光晕中心颜色的透明度（0~100%）", |ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(format!("{}%", (strength * 100.0).round() as i32))
+                            .color(pal.text_dim),
+                    ));
+                    draw_slider(
+                        f,
+                        ui,
+                        "glow_strength",
+                        "",
+                        &mut strength,
+                        modular_clipboard_core::config::GLOW_STRENGTH_MIN
+                            ..=modular_clipboard_core::config::GLOW_STRENGTH_MAX,
+                        true,
+                        0.0,
+                    )
+                });
+                cfg.strength = modular_clipboard_core::config::clamp_glow_strength(strength);
+            }
+            if changed {
+                f.state.push(Op::SetGlow(cfg));
                 record_recent(f, it.label);
             }
         }
@@ -8977,6 +9557,11 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // `ScrollArea` 的内容 `ui` 裁剪到视口，越界的行自动不可交互，
     // 与「看得见才点得到」一致。
     let resp = ui.interact(r, egui::Id::new(("row", item.id)), Sense::click());
+    // 自报行本体热区：测试与 MCP 自动化需要「点这一行」的坐标，
+    // 不该各自重算行矩形。CAUTION: 多行共用同一个 key，HashMap 后者
+    // 覆盖前者 ⇒ 读到的是**最后绘制的那一行**（可见行里最靠下的）。
+    // 单行夹具无歧义；多行测试请按「末行」使用。
+    f.hit_insert("row_body", r);
     let painter = ui.painter_at(r);
 
     // 卡片样式：每条历史是一张圆角小卡。
@@ -9024,6 +9609,15 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // Stroke 单位就是逻辑点，乘 ppp 会让 150% DPI 下画成 3pt，与注释
     // 承诺的「2pt」不符，也和其他 1.0 逻辑点的描边不成体系。
     //
+    // 本行是否正处于**内联编辑态**（编辑模式的所有让位判据都靠它）。
+    //
+    // CAUTION: 必须算在**最前面**——卡片分层（悬停/按下/高光）就在这
+    // 下面，它们也要按编辑态让位。
+    //
+    // 判据必须是 `editing == Some(本行 id)`：`editing` 是**全局单编辑器**
+    // （同一时刻只有一条在改），别的行照常画预览。
+    let editing_this = f.state.editing == Some(item.id);
+
     // ---- 卡片分层：底 → 置顶 → 选中 → 悬停 → 按下 ---------------------
     //
     // 每层都是一层半透明矩形往上叠；除置顶（静态数据标记）外全部走补间
@@ -9077,7 +9671,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         crate::anim::Ease::OutCubic,
     );
     // 阈值跳过：淡出完成后再画一层 alpha≈0 的矩形是纯浪费。
-    if hover > 0.004 {
+    if hover > 0.004 && !editing_this {
         // CAUTION: 必须整体缩放预乘分量（`fade_color`）——`to_array()`
         // 拿到的就是预乘后的 rgb，若用 `from_rgba_unmultiplied` 重组
         // 会二次预乘，把 11.8% 的悬停提亮压暗成 ~1.6%（几乎看不见）。
@@ -9093,7 +9687,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         std::time::Duration::from_millis(90),
         crate::anim::Ease::OutCubic,
     );
-    if press > 0.004 {
+    if press > 0.004 && !editing_this {
         painter.rect_filled(r, radius, fade_color(pal.row_active, press));
     }
 
@@ -9104,7 +9698,7 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 另一半；近投影在 `draw_card_shadow` 里画）。浅色主题高光透明。
     let hl_top = pal.card_highlight;
     let [hl_r, hl_g, hl_b, _] = hl_top.to_array();
-    if hl_top.a() > 0 {
+    if hl_top.a() > 0 && !editing_this {
         // 高光只覆盖直边段（左右各让开 ROW_RADIUS），避免在卡片圆角外
         // 露出直角亮角；gradient_rect 是直角渐变，圆角处自然留空。
         //
@@ -9206,8 +9800,14 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     let is_image = preview_is_image(item);
     let is_markdown = item.kind == modular_clipboard_core::ClipKind::Markdown;
 
+    // 编辑态优先于一切预览形态：这条正在被改，预览没有意义。
+    //
+    // CAUTION: 判据必须是 `editing == Some(本行 id)`——`editing` 是
+    // **全局单编辑器**（同一时刻只有一条在改），别的行照常画预览。
     if preview_band.height() > 4.0 {
-        if is_image && image_inline {
+        if editing_this {
+            draw_inline_editor(f, ui, preview_band, item);
+        } else if is_image && image_inline {
             draw_image_preview(f, ui, preview_band, item, IMG_MAX_H_LIST);
         } else if is_markdown && md_rendered {
             draw_markdown_preview(f, ui, preview_band, item);
@@ -9233,6 +9833,107 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
         );
     }
 
+    // ---- 左下角：编辑 / 撤销（2026-10-21）----
+    //
+    // 位置选在底部 meta 行的**左端空白**：预览带在它上方、右侧是
+    // 右对齐的类型/大小文字——两者都不与它重叠，因此它**不占用显示
+    // 区域**（卡片内容一点没少，只是用上了原本空着的一角）。
+    //
+    // 可编辑判据：文本三兄弟（Text / Html / Markdown）走**内联编辑**
+    // （预览带就地换成输入框）；图片走**编辑窗口**（简单图像变换）；
+    // 文件类不画按钮——它的载荷是路径清单，「改内容」没有意义。
+    //
+    // 撤销按钮只在这条**被编辑过**时出现（`edit_backup.id == item.id`），
+    // 画在编辑按钮左边——「先撤销再编辑」的阅读顺序。
+    let editable = matches!(
+        item.kind,
+        modular_clipboard_core::ClipKind::Text
+            | modular_clipboard_core::ClipKind::Html
+            | modular_clipboard_core::ClipKind::Markdown
+            | modular_clipboard_core::ClipKind::Image
+    );
+    let has_backup = f
+        .state
+        .edit_backup
+        .as_ref()
+        .is_some_and(|b| b.id == item.id);
+    // 与右下角类型徽标同尺寸（16pt）：左下角这组按钮在视觉上才是一套。
+    let badge_side = pal.icon_size;
+    // 按钮块总宽（供下面的 meta 文字让位，防止窄卡片上文字压按钮）。
+    let edit_btns_w = if editable && bot_band.width() > 64.0 {
+        let mut w = badge_side + 5.0;
+        if has_backup {
+            w += badge_side + 5.0;
+        }
+        w
+    } else {
+        0.0
+    };
+
+    // 画按钮块（在 meta 之前画：meta 右对齐，两者不重叠，顺序无所谓；
+    // 但按钮的交互注册要早于行本体的 `resp.clicked()` 判定）。
+    if edit_btns_w > 0.0 {
+        let bcy = bot_band.center().y;
+        let mut bx = bot_band.min.x;
+        if has_backup {
+            let b = Rect::from_center_size(pos2(bx + badge_side * 0.5, bcy), vec2(badge_side, badge_side));
+            // 自报热区（与其它命名区域同一套路）：测试与 MCP 自动化读坐标
+            // 而不重算公式。CAUTION: 多行都会登记同一个 key，HashMap 后者
+            // 覆盖前者——单条目夹具里无歧义，多条目场景请用显隐判据。
+            f.hit_insert("row_undo", b);
+            let rr = ui.interact(b, egui::Id::new(("row_undo", item.id)), Sense::click());
+            let bh = crate::anim::tween_f32(
+                ui.ctx(),
+                egui::Id::new(("row_undo_hover", item.id)),
+                if rr.hovered() { 1.0 } else { 0.0 },
+                std::time::Duration::from_millis(110),
+                crate::anim::Ease::OutCubic,
+            );
+            if bh > 0.004 {
+                ui.painter_at(b)
+                    .rect_filled(b, pal.radius_sm, fade_color(pal.row_hover, bh));
+            }
+            let color = if rr.hovered() { pal.text_bright } else { pal.text_dim };
+            paint_undo_icon(&ui.painter_at(b), b, color);
+            if rr.clicked() {
+                f.state.push(Op::UndoEdit(item.id));
+            }
+            rr.on_hover_text("撤销修改");
+            bx += badge_side + 5.0;
+        }
+        let b = Rect::from_center_size(pos2(bx + badge_side * 0.5, bcy), vec2(badge_side, badge_side));
+        f.hit_insert("row_edit", b);
+        let rr = ui.interact(b, egui::Id::new(("row_edit", item.id)), Sense::click());
+        let bh = crate::anim::tween_f32(
+            ui.ctx(),
+            egui::Id::new(("row_edit_hover", item.id)),
+            if rr.hovered() { 1.0 } else { 0.0 },
+            std::time::Duration::from_millis(110),
+            crate::anim::Ease::OutCubic,
+        );
+        if bh > 0.004 {
+            ui.painter_at(b)
+                .rect_filled(b, pal.radius_sm, fade_color(pal.row_hover, bh));
+        }
+        let color = if rr.hovered() { pal.text_bright } else { pal.text_dim };
+        paint_pencil_icon(&ui.painter_at(b), b, color);
+        // CAUTION: `clicked()` 必须在 `on_hover_text` 之前取（后者按值
+        // 消耗 `Response`，与行内三个操作按钮同一个坑）。
+        let clicked = rr.clicked();
+        rr.on_hover_text(if item.kind == modular_clipboard_core::ClipKind::Image {
+            "编辑图片"
+        } else {
+            "修改内容"
+        });
+        if clicked {
+            if item.kind == modular_clipboard_core::ClipKind::Image {
+                f.state.push(Op::OpenImageEditor(item.id));
+            } else {
+                f.state.push(Op::BeginEdit(item.id));
+            }
+        }
+    }
+
     // 右下：可配置的信息组合（类型徽标 / 类型文字 / 大小文字）。
     //
     // 三个元素的**显隐与前后顺序**由 [`RowMetaConfig`] 决定（设置中
@@ -9242,18 +9943,27 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     // 大小来自 `PayloadRef::len`（字节数），`format_size` 自适应
     // B/KB/MB/GB；载荷被淘汰（`payload = None`）时大小元素自动缺席。
     // 宽度不足时优先保住短的「大小」，「类型」elide 截断。
+    //
+    // CAUTION: 左缘要让出左下角编辑/撤销按钮块（`edit_btns_w`）——
+    // 右对齐的文字在窄卡片上会一路伸到左边，不让位就会压住按钮
+    // （按钮变透明文字区，点不动）。
     let meta_cfg = &f.svc.state.config.ui.row_meta;
     let type_text = kind_label(item.kind).to_string();
     let size_text = item.payload.as_ref().map(|p| format_size(p.len));
-    let badge_side = pal.icon_size; // 16pt
     let badge_radius = 4.0;
     let meta_gap = 6.0;
+    let bot_band = Rect::from_min_max(
+        pos2(bot_band.min.x + edit_btns_w, bot_band.min.y),
+        bot_band.max,
+    );
 
     let icon_on = meta_cfg.visible(RowMetaPart::Icon);
     let type_on = meta_cfg.visible(RowMetaPart::Type) && !type_text.is_empty();
     let size_on = meta_cfg.visible(RowMetaPart::Size) && size_text.is_some();
     let n = icon_on as u32 + type_on as u32 + size_on as u32;
-    if n > 0 {
+    // 编辑模式下整组隐去：编辑时这些元信息没有意义（内容正在被改），
+    // 且右端要为编辑器让出空间（2026-10-22 用户要求）。
+    if n > 0 && !editing_this {
         // 固定占位（徽标宽 + 元素间 gap）；余下全部给文字。
         let fixed = if icon_on { badge_side } else { 0.0 }
             + if n > 1 { meta_gap * (n - 1) as f32 } else { 0.0 };
@@ -9352,6 +10062,12 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     ];
 
     for (i, (icon, op, enabled)) in acts.iter().enumerate() {
+        // 编辑模式下让位：这三个按钮（置顶/复制/删除）在编辑时会与
+        // 编辑器抢右上角空间，且「改到一半去删除」是误操作温床
+        // （2026-10-22 用户要求）。
+        if editing_this {
+            break;
+        }
         // 三个操作按钮排**卡片右上角**（小图标）：从右缘向左排，
         // 纵向比来源行再下移 `ROW_ACTS_DROP`（避开字形上沿）。
         //
@@ -9433,12 +10149,171 @@ fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &ClipItem) {
     }
 
     if resp.clicked() {
+        // 正在编辑**别的**行时点这一行 ⇒ 先提交正在编辑的内容，再选中
+        // 本行（「改完点下一条」的连续编辑流；不提交的话缓冲会跟着
+        // `editing` 一起被下一行覆盖，用户改的字凭空蒸发）。
+        //
+        // CAUTION: 只能 commit **当前 buffer**——此时 draw 还没走到
+        // 目标行，`editing` 仍是旧 id；这里 push 的 Op 带旧 id 与旧
+        // buffer，落地由 apply_ops 一并处理（先 commit 后 select）。
+        if let Some(editing_id) = f.state.editing
+            && editing_id != item.id
+        {
+            f.state.push(Op::CommitEditText {
+                id: editing_id,
+                text: f.state.edit_buf.clone(),
+            });
+        }
         f.state.push(Op::Select(item.id));
     }
     if resp.double_clicked() {
         // 同窄行分支：先算后 push（避免 `f.state` 与 `&mut f` 同帧共存）。
         let op = double_click_op(f, item);
         f.state.push(op);
+    }
+}
+
+// ---------------------------------------------------------------- 内联编辑
+
+/// 内联编辑器：预览带**就地**换成多行输入框 + 确认 / 取消（2026-10-21）。
+///
+/// # 交互契约
+///
+/// - ✓ 或 `Ctrl+Enter` 提交；✕ 或 `Esc` 取消；
+/// - **Enter 不提交**——多行文本里 Enter 是换行（剪贴板内容天然
+///   多行，与文件管理器的单行重命名不同）；
+/// - 点**别的行**自动提交（由 `draw_item_row` 的行点击分支负责）——
+///   「改完点下一条」是最自然的连续编辑流。
+///
+/// # CAUTION: 字号必须用**逻辑值**
+///
+/// `FontId::proportional(pal.font_md)` 不乘 `f.scale`：egui 计算可用
+/// 高度时会再乘一次 `pixels_per_point`，传乘过的值会把行高放大到
+/// 远超框高、文字被裁成半截（搜索面板 2026-10-17 踩过，见
+/// `draw_search_panel` 的注释）。
+fn draw_inline_editor(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
+    let pal = f.pal;
+    // 两枚按钮（✓ / ✕）横排竖居中在带右端；文字区让出它们的宽。
+    let btn = (pal.control_height * 0.62).clamp(16.0, 24.0);
+    let gap = 4.0;
+    let text_rect =
+        Rect::from_min_max(band.min, pos2((band.max.x - btn * 2.0 - gap).max(band.min.x), band.max.y));
+    if text_rect.width() <= 8.0 {
+        // 窄到放不下输入框：仍要能退出编辑态，只画按钮。
+        draw_editor_buttons(f, ui, band, item, btn, gap);
+        return;
+    }
+    // 输入框底：实底 + 1px 弱描边——「这里是可编辑的」要有实体感。
+    // 磨砂模式下用 surface_variant（与列表底拉开一档），常态模式同色
+    // 也成立（它在 surface_raised 的卡片上，稍暗一档）。
+    ui.painter_at(text_rect)
+        .rect_filled(text_rect, pal.radius_sm, pal.surface_variant);
+    ui.painter_at(text_rect).rect_stroke(
+        text_rect,
+        pal.radius_sm,
+        Stroke::new(1.0, pal.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+    f.hit_insert("edit_box", text_rect);
+    let mut resp_opt = None;
+    f.ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new(("inline_editor_scope", item.id)))
+            .max_rect(text_rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| {
+            let te = egui::TextEdit::multiline(&mut f.state.edit_buf)
+                .id(egui::Id::new(("inline_editor", item.id)))
+                .hint_text("输入内容…")
+                .font(egui::FontId::proportional(pal.font_md))
+                .desired_width(text_rect.width())
+                .frame(egui::Frame::NONE);
+            resp_opt = Some(ui.add(te));
+        },
+    );
+    let Some(resp) = resp_opt else { return };
+    // 打开后的第一帧把焦点交给输入框（要跨帧：控件刚注册，本帧请求
+    // 下一帧才生效——与搜索弹窗的 `search_focus_pending` 同一套路）。
+    if f.state.edit_focus_pending {
+        resp.request_focus();
+        f.state.edit_focus_pending = false;
+    }
+    // Ctrl+Enter 提交。判据带 `has_focus()`：没焦点时组合键不属于编辑
+    // 器，不该被它吞掉。
+    let ctrl_enter = resp.has_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+    draw_editor_buttons(f, ui, band, item, btn, gap);
+    if ctrl_enter {
+        f.state.push(Op::CommitEditText {
+            id: item.id,
+            text: f.state.edit_buf.clone(),
+        });
+    }
+}
+
+/// 编辑器的 ✓ / ✕ 两枚按钮（横排、带右端、竖居中）。
+fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem, btn: f32, gap: f32) {
+    let pal = f.pal;
+    let cy = band.center().y;
+    let x1 = band.max.x - btn * 0.5;
+    let x0 = x1 - btn - gap;
+    let ok_r = Rect::from_center_size(pos2(x0, cy), vec2(btn, btn));
+    let no_r = Rect::from_center_size(pos2(x1, cy), vec2(btn, btn));
+
+    // ✓ 确认。CAUTION: `clicked()` 必须在 `on_hover_text` 之前取
+    // （后者按值消耗 `Response`）。
+    f.hit_insert("editor_ok", ok_r);
+    f.hit_insert("editor_no", no_r);
+    let rr = ui.interact(ok_r, egui::Id::new(("editor_ok", item.id)), Sense::click());
+    let bh = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("editor_ok_hover", item.id)),
+        if rr.hovered() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(110),
+        crate::anim::Ease::OutCubic,
+    );
+    if bh > 0.004 {
+        ui.painter_at(ok_r)
+            .rect_filled(ok_r, pal.radius_sm, fade_color(pal.row_hover, bh));
+    }
+    let color = if rr.hovered() { pal.accent } else { pal.text_dim };
+    paint_check_icon(
+        &ui.painter_at(ok_r),
+        Rect::from_center_size(ok_r.center(), vec2(btn * 0.72, btn * 0.72)),
+        color,
+    );
+    let ok_clicked = rr.clicked();
+    rr.on_hover_text("确认修改（Ctrl+Enter）");
+    if ok_clicked {
+        f.state.push(Op::CommitEditText {
+            id: item.id,
+            text: f.state.edit_buf.clone(),
+        });
+    }
+
+    // ✕ 取消。图标用 Close 字体字形（PUA 码位里有现成的，不必几何画）。
+    let rr = ui.interact(no_r, egui::Id::new(("editor_no", item.id)), Sense::click());
+    let bh = crate::anim::tween_f32(
+        ui.ctx(),
+        egui::Id::new(("editor_no_hover", item.id)),
+        if rr.hovered() { 1.0 } else { 0.0 },
+        std::time::Duration::from_millis(110),
+        crate::anim::Ease::OutCubic,
+    );
+    if bh > 0.004 {
+        ui.painter_at(no_r)
+            .rect_filled(no_r, pal.radius_sm, fade_color(pal.row_hover, bh));
+    }
+    let color = if rr.hovered() { pal.text_bright } else { pal.text_dim };
+    crate::icons::Icon::Close.paint(
+        &ui.painter_at(no_r),
+        Rect::from_center_size(no_r.center(), vec2(btn * 0.62, btn * 0.62)),
+        color,
+    );
+    let no_clicked = rr.clicked();
+    rr.on_hover_text("取消修改（Esc）");
+    if no_clicked {
+        f.state.push(Op::CancelEdit);
     }
 }
 
@@ -11374,6 +12249,74 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!((r.min.x - area.min.x).abs() < 0.01 && (r.max.x - area.max.x).abs() < 0.01);
     }
 
+    /// 光晕目标换算：窗口内取光标位、靠近带内钳到边缘、带外不亮。
+    ///
+    /// 这三个分支是几何错误高发区（DPI 缩放漏除会让光晕跑到天边；
+    /// 钳制方向反了会让它在窗口外「飘」），且实机上「没亮」与
+    /// 「亮错位置」都很难归因，必须用纯函数锁住。
+    #[test]
+    fn glow_target_client_geometry() {
+        let win_pos = vec2(100.0, 50.0);
+        let win_size = vec2(480.0, 533.0);
+        // 窗口内（1.0 缩放，屏幕坐标 = 窗口坐标 + 偏移）。
+        let inside = glow_target_client(win_pos, win_size, 1.0, Some((340, 300)));
+        assert_eq!(inside, Some(pos2(240.0, 250.0)), "窗口内应取光标位");
+
+        // 1.5 缩放：光标物理 (610, 425) → 逻辑 (406.7, 283.3) → 客户区
+        // (306.7, 233.3)。漏除缩放会把光晕放到 1.5 倍远的位置。
+        let scaled = glow_target_client(win_pos, win_size, 1.5, Some((610, 425)));
+        let p = scaled.expect("应命中");
+        assert!((p.x - 306.67).abs() < 0.1 && (p.y - 233.33).abs() < 0.1, "缩放换算错：{p:?}");
+
+        // 靠近带内（窗口左侧外 20pt）：钳到左缘 x=0，y 保持。
+        let near_left = glow_target_client(win_pos, win_size, 1.0, Some((80, 300)));
+        assert_eq!(near_left, Some(pos2(0.0, 250.0)), "带内应钳到边缘");
+
+        // 右下角外 10pt：钳到右下角。
+        let near_corner = glow_target_client(win_pos, win_size, 1.0, Some((590, 590)));
+        assert_eq!(near_corner, Some(pos2(480.0, 533.0)));
+
+        // 带外（距左缘 60pt > GLOW_NEAR=40）：不亮。
+        assert_eq!(glow_target_client(win_pos, win_size, 1.0, Some((30, 300))), None);
+        // 无光标（查询失败）：不亮。
+        assert_eq!(glow_target_client(win_pos, win_size, 1.0, None), None);
+        // 缩放为 0（窗口刚创建）：必须回落 1.0 而不是除零爆炸。
+        let degenerate = glow_target_client(win_pos, win_size, 0.0, Some((340, 300)));
+        assert_eq!(degenerate, Some(pos2(240.0, 250.0)), "零缩放应回落 1.0");
+    }
+
+    /// 光晕配置的设置卡片：关闭时两个参数行不出现，开启才出现。
+    ///
+    /// 走 Harness 开设置窗口点开卡片不现实（设置是独立窗口），这里
+    /// 直接验「渲染分支的输入依赖」：`draw_settings_item` 对 Glow 的
+    /// 分支只在 `cfg.enabled && acrylic` 时画参数行——用配置矩阵锁住
+    /// 这个依赖不被无意改掉。
+    #[test]
+    fn glow_settings_rows_depend_on_enabled_and_acrylic() {
+        use modular_clipboard_core::config::{GlowConfig, WindowBackdrop};
+        // 依赖矩阵（与 paint.rs 的 ItemKind::Glow 分支一致）：
+        //   acrylic=false ⇒ 开关行都没有（提示文字替代）；
+        //   acrylic=true, enabled=false ⇒ 只有开关行；
+        //   acrylic=true, enabled=true  ⇒ 开关 + 半径 + 浓度。
+        let off = GlowConfig::default();
+        assert!(!off.enabled, "默认必须关闭");
+        let on = GlowConfig {
+            enabled: true,
+            ..off
+        };
+        // 两个参数的钳制区间互不为空（滑块区间反转会让 egui panic）。
+        // 常量比较放编译期：运行期 assert 会被 clippy 判「恒真」报警。
+        const {
+            assert!(modular_clipboard_core::config::GLOW_RADIUS_MIN
+                < modular_clipboard_core::config::GLOW_RADIUS_MAX);
+            assert!(modular_clipboard_core::config::GLOW_STRENGTH_MIN
+                <= modular_clipboard_core::config::GLOW_STRENGTH_MAX);
+        }
+        // 磨砂才生效：与绘制侧判据同源。
+        assert_eq!(WindowBackdrop::default(), WindowBackdrop::None);
+        let _ = on;
+    }
+
     /// 类型栏带文字标签时：无实测值用**估算**（宁大勿小），有实测值
     /// （`UiState::rail_panel_size`）必须被采用。
     #[test]
@@ -11417,6 +12360,296 @@ fn with_pinned(mut self, n: usize) -> Self {
             .expect("...");
         assert!(right.min.x >= area.max.x + RAIL_GAP - 0.01);
     }
+
+    /// 卡片左下角有编辑按钮：文本条目点它 ⇒ `BeginEdit`；图片条目
+    /// 点它 ⇒ `OpenImageEditor`（走编辑窗口，不内联）。
+    ///
+    /// 单条目夹具：热区 `row_edit` 无覆盖歧义（见登记处的 CAUTION）。
+    #[test]
+    fn row_edit_button_pushes_begin_or_open_editor() {
+        // 文本条目。
+        let mut h = Harness::new("row-edit-text", vec2(700.0, 600.0)).with_items(1);
+        h.frame();
+        let edit = h
+            .state
+            .hit_get_from(HitNs::Main, "row_edit")
+            .expect("文本行应有编辑按钮热区");
+        // 位置在卡片**左下角**：x 靠近行左缘（ROW_PAD_H 内），不占预览带。
+        assert!(
+            edit.min.x < 40.0,
+            "编辑按钮应在卡片左下角附近，实测 x={:.1}",
+            edit.min.x
+        );
+        let id = h.svc.state.items[0].id;
+        let ops = h.click_at(edit.center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::BeginEdit(x) if *x == id)),
+            "点文本行的编辑按钮应 BeginEdit，实际 {ops:?}"
+        );
+
+        // 图片条目：载荷是裸 RGBA8 + 显式尺寸（arboard 链路的规范形态）。
+        let mut h = Harness::new("row-edit-img", vec2(700.0, 600.0));
+        let px = vec![128u8; 8 * 8 * 4];
+        assert!(h.svc.ingest(modular_clipboard_core::CapturedPayload {
+            kind: modular_clipboard_core::ClipKind::Image,
+            bytes: px,
+            html: None,
+            text: None,
+            source_app: "img".into(),
+            files: Vec::new(),
+            dims: Some((8, 8)),
+        }));
+        h.svc.reload_list();
+        h.frame();
+        let edit = h
+            .state
+            .hit_get_from(HitNs::Main, "row_edit")
+            .expect("图片行应有编辑按钮热区");
+        let id = h.svc.state.items[0].id;
+        let ops = h.click_at(edit.center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::OpenImageEditor(x) if *x == id)),
+            "点图片行的编辑按钮应开编辑窗口，实际 {ops:?}"
+        );
+    }
+
+    /// 进入编辑态后：预览带换成编辑器（`edit_box` 热区出现），
+    /// 点 ✓ ⇒ `CommitEditText` 带**编辑后的文本**；点 ✕ ⇒ `CancelEdit`。
+    #[test]
+    fn inline_editor_commits_and_cancels() {
+        let mut h = Harness::new("inline-editor", vec2(700.0, 600.0)).with_items(1);
+        h.frame();
+        let id = h.svc.state.items[0].id;
+        // 落地 BeginEdit（生产由 App 做：读载荷 + 置 editing）。夹具直接
+        // 置状态等价——editing 是纯界面状态，App 那半是 IO。
+        h.state.editing = Some(id);
+        h.state.edit_buf = "改过的内容".into();
+        h.state.edit_focus_pending = true;
+        let ops = h.frame();
+        assert!(
+            h.state
+                .hit_get_from(HitNs::Main, "edit_box")
+                .is_some(),
+            "编辑态应出现输入框热区"
+        );
+        // 编辑态下**不该**再画预览（预览带被编辑器占用）——用「通知
+        // 无关的判据」：编辑态的 ops 里没有 BeginEdit 的重复触发。
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::BeginEdit(_))),
+            "编辑态不应再触发 BeginEdit"
+        );
+
+        let ok = h
+            .state
+            .hit_get_from(HitNs::Main, "editor_ok")
+            .expect("应有确认按钮");
+        let ops = h.click_at(ok.center());
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, Op::CommitEditText { id: x, text } if *x == id && text == "改过的内容")),
+            "点 ✓ 应提交编辑后的文本，实际 {ops:?}"
+        );
+
+        // 取消路径：重新进入编辑态，点 ✕。
+        h.state.editing = Some(id);
+        h.state.edit_buf = "又改了".into();
+        h.frame();
+        let no = h
+            .state
+            .hit_get_from(HitNs::Main, "editor_no")
+            .expect("应有取消按钮");
+        let ops = h.click_at(no.center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::CancelEdit)),
+            "点 ✕ 应取消编辑，实际 {ops:?}"
+        );
+    }
+
+    /// 编辑态下 Enter **不复制**（那是换行），Esc **取消编辑**。
+    ///
+    /// 回归守卫：Enter 复制（2026-10-20 加）早于内联编辑存在，两者
+    /// 会在「改内容按回车」时同时触发——复制一条没保存的文字。
+    #[test]
+    fn enter_and_esc_belong_to_editor_while_editing() {
+        let mut h = Harness::new("editor-keys", vec2(700.0, 600.0)).with_items(1);
+        h.frame();
+        let id = h.svc.state.items[0].id;
+        h.svc.state.selected = Some(id);
+        h.state.editing = Some(id);
+        h.state.edit_buf = "x".into();
+        h.frame();
+        let enter = vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        let ops = h.frame_with(enter);
+        assert!(
+            !ops.iter().any(|o| matches!(o, Op::Copy(_))),
+            "编辑态按 Enter 不应复制（它是换行），实际 {ops:?}"
+        );
+        let esc = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: Some(egui::Key::Escape),
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        let ops = h.frame_with(esc);
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::CancelEdit)),
+            "编辑态按 Esc 应取消编辑，实际 {ops:?}"
+        );
+    }
+
+    /// 有备份时左下角出现撤销按钮，点它 ⇒ `UndoEdit(该条目)`；
+    /// 没有备份时不画（没有可撤销的东西）。
+    #[test]
+    fn undo_button_appears_only_with_backup() {
+        let mut h = Harness::new("undo-btn", vec2(700.0, 600.0)).with_items(1);
+        h.frame();
+        let id = h.svc.state.items[0].id;
+        assert!(
+            h.state.hit_get_from(HitNs::Main, "row_undo").is_none(),
+            "没有备份时不应出现撤销按钮"
+        );
+        // 造一份备份（生产由 commit_edit 写）。
+        h.state.edit_backup = Some(crate::paint::EditBackup {
+            id,
+            kind: modular_clipboard_core::ClipKind::Text,
+            payload: "旧内容".as_bytes().to_vec(),
+            dims: None,
+        });
+        h.frame();
+        let undo = h
+            .state
+            .hit_get_from(HitNs::Main, "row_undo")
+            .expect("有备份应出现撤销按钮");
+        let ops = h.click_at(undo.center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::UndoEdit(x) if *x == id)),
+            "点撤销应 UndoEdit，实际 {ops:?}"
+        );
+    }
+
+    /// 删除正在编辑的条目时，编辑态必须**一起**收干净。
+    ///
+    /// 守的是「六个字段漏一个」这类悬挂状态：留下来的 `editing` /
+    /// `image_editor` / `edit_backup` 会指向一个已不存在的条目，
+    /// 表现为「改完的字没保存却也没有任何报错」。
+    #[test]
+    fn clearing_edit_state_for_deleted_item_drops_every_field() {
+        let mut st = UiState::default();
+        let id: modular_clipboard_core::EntryId = 4242;
+        st.editing = Some(id);
+        st.edit_buf = "还没保存的字".into();
+        st.edit_focus_pending = true;
+        st.image_editor = Some(id);
+        st.image_editor_src = Some((vec![1, 2, 3], 2, 2));
+        st.edit_backup = Some(EditBackup {
+            id,
+            kind: modular_clipboard_core::ClipKind::Text,
+            payload: b"old".to_vec(),
+            dims: None,
+        });
+
+        st.clear_edit_state(id);
+
+        assert!(st.editing.is_none(), "内联编辑态应清除");
+        assert!(st.edit_buf.is_empty(), "编辑缓冲应清空");
+        assert!(!st.edit_focus_pending, "焦点请求应清掉");
+        assert!(st.image_editor.is_none(), "图片编辑窗口应关");
+        assert!(st.image_editor_src.is_none(), "原图副本应释放");
+        assert!(st.edit_backup.is_none(), "撤销备份应丢弃");
+    }
+
+    /// 删 A 不能打断正在编辑的 B：不匹配的字段一律不动。
+    #[test]
+    fn clearing_edit_state_leaves_other_items_alone() {
+        let mut st = UiState::default();
+        let a: modular_clipboard_core::EntryId = 1;
+        let b: modular_clipboard_core::EntryId = 2;
+        st.editing = Some(b);
+        st.edit_buf = "B 的内容".into();
+        st.edit_focus_pending = true;
+        st.image_editor = Some(b);
+        st.edit_backup = Some(EditBackup {
+            id: b,
+            kind: modular_clipboard_core::ClipKind::Text,
+            payload: b"B".to_vec(),
+            dims: None,
+        });
+
+        st.clear_edit_state(a);
+
+        assert_eq!(st.editing, Some(b), "删 A 不该关掉 B 的编辑器");
+        assert_eq!(st.edit_buf, "B 的内容", "B 的缓冲必须原样保留");
+        assert!(st.edit_focus_pending, "B 的焦点请求不该被清");
+        assert_eq!(st.image_editor, Some(b), "B 的图片窗口不该被关");
+        assert!(
+            st.edit_backup.as_ref().is_some_and(|x| x.id == b),
+            "B 的撤销备份必须留着"
+        );
+    }
+
+    /// 全清（清空全部记录）后编辑态整体作废，一个字段都不留。
+    #[test]
+    fn clear_all_edit_state_drops_everything() {
+        let mut st = UiState::default();
+        let id: modular_clipboard_core::EntryId = 7;
+        st.editing = Some(id);
+        st.edit_buf = "字".into();
+        st.edit_focus_pending = true;
+        st.image_editor = Some(id);
+        st.image_editor_src = Some((vec![9], 1, 1));
+        st.edit_backup = Some(EditBackup {
+            id,
+            kind: modular_clipboard_core::ClipKind::Image,
+            payload: vec![0],
+            dims: Some((1, 1)),
+        });
+
+        st.clear_all_edit_state();
+
+        assert!(st.editing.is_none() && st.image_editor.is_none());
+        assert!(st.edit_buf.is_empty() && !st.edit_focus_pending);
+        assert!(st.image_editor_src.is_none() && st.edit_backup.is_none());
+    }
+
+    /// 编辑**别的**行时点这一行：先提交正在编辑的内容，再选中本行
+    /// （「改完点下一条」的连续编辑流；不提交则缓冲被覆盖、文字蒸发）。
+    #[test]
+    fn clicking_other_row_commits_pending_edit() {
+        let mut h = Harness::new("edit-switch", vec2(700.0, 600.0)).with_items(3);
+        h.frame();
+        let ids: Vec<_> = h.svc.state.items.iter().map(|it| it.id).collect();
+        assert!(ids.len() >= 2, "夹具应有多条");
+        // 第一行正在编辑。
+        h.state.editing = Some(ids[0]);
+        h.state.edit_buf = "第一行的新内容".into();
+        h.frame();
+        // 点击目标取 `row_body` 热区——多行共用 key，读到的是**最后一行**
+        // （与绘制顺序一致），而编辑在第一行 ⇒ 必然是「点别的行」。
+        let row = h
+            .state
+            .hit_get_from(HitNs::Main, "row_body")
+            .expect("应有行本体热区");
+        let target = egui::pos2(row.center().x, row.center().y);
+        let ops = h.click_at(target);
+        assert!(
+            ops.iter().any(
+                |o| matches!(o, Op::CommitEditText { id, text } if *id == ids[0] && text == "第一行的新内容")
+            ),
+            "点别的行应先提交在途编辑，实际 {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::Select(x) if *x != ids[0])),
+            "提交后还应选中被点的行，实际 {ops:?}"
+        );
+    }
+
 
     /// Enter 复制选中条目（2026-10-20 键盘流）：选中一行后按 Enter
     /// 必须发出 `Op::Copy`——与行内复制按钮、双击复制同一落地。

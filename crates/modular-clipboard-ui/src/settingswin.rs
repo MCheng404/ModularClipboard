@@ -187,9 +187,14 @@ impl<'a> SettingsWindow<'a> {
         }
 
         if just_opened {
-            // 先确保 Z 序在置顶组最上（即使抢焦点失败也不被主窗口遮），
-            // 再尝试把前台焦点给设置窗口。
-            crate::presence::raise_to_top(self.window.hwnd());
+            // 先确保 Z 序在**对应 band** 最上（即使抢焦点失败也不被主窗口
+            // 遮），再尝试把前台焦点给设置窗口。
+            //
+            // CAUTION: 按 `self.topmost`（本帧 `apply_topmost` 刚更新的
+            // 簿记）选 band，不能写死置顶组——否则主窗口没开置顶时，设置
+            // 窗口会在打开瞬间被按进置顶组且簿记不认，之后永远置顶
+            // （2026-10-21 用户反馈，见 `presence::raise_to_top`）。
+            crate::presence::raise_to_top(self.window.hwnd(), self.topmost);
             crate::presence::focus_window(self.window.hwnd());
             // 新开时滚动归零：上次停在半截的设置项不该出现在顶部。
             //
@@ -300,7 +305,10 @@ impl<'a> SettingsWindow<'a> {
 
         let Some(acquired) = self.gfx.fr.acquire()? else {
             // 拿不到图像（正在最小化/被遮挡）⇒ 重建交换链，下帧重试。
-            self.gfx.fr.rebuild_swapchain(Default::default())?;
+            self.gfx.fr.rebuild_swapchain(ash::vk::Extent2D {
+                width: cw,
+                height: ch,
+            })?;
             return Ok(false);
         };
         // 覆盖层打开时走**自研 GPU 模糊**路径：设置窗口自身的内容先

@@ -651,6 +651,129 @@ impl Store {
         Ok(())
     }
 
+    /// 就地更新条目内容（编辑落地，2026-10-21）。
+    ///
+    /// 保留 `id` / `created_at` / `pinned` / `group_id` / `use_count` /
+    /// `last_used_at`——「修改内容」不是「删旧建新」：置顶状态、分组、
+    /// 使用计数、以及在列表里的位置都应该留着，否则用户编辑一次文字
+    /// 就被悄悄踢出置顶。
+    ///
+    /// 换掉的是 `kind` / `hash` / `preview` / 载荷文件 / `dims` / FTS 文本。
+    /// 载荷按 [`Self::insert_with_dims`] 同款规则落盘（超限只存元数据），
+    /// 旧载荷文件按引用计数清理（同哈希多条目共享 `{hash}.bin`）。
+    ///
+    /// # FTS 的delete-then-insert
+    ///
+    /// contentless FTS5 表不支持 SQL DELETE，更新索引必须先把**原文**
+    /// 交给 `'delete'` 命令再插入新文本（与 [`Self::delete`] 同一规矩）。
+    /// 两步在同一个事务里，不会出现「索引空了但行还在」的中间态。
+    pub fn update_content(
+        &mut self,
+        id: EntryId,
+        kind: ClipKind,
+        preview: String,
+        payload: Vec<u8>,
+        dims: Option<(u32, u32)>,
+    ) -> Result<()> {
+        // 先读旧行：旧载荷文件名（清理用）与旧 FTS 原文（delete 用）。
+        let old: Option<(Option<String>, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT i.blob_file,
+                        (SELECT i2.preview FROM items i2
+                         JOIN items_fts_map m ON m.item_id = i2.id
+                         WHERE i2.id = i.id)
+                 FROM items i WHERE i.id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((old_file, old_text)) = old else {
+            anyhow::bail!("条目不存在：{id}");
+        };
+
+        let cfg_max = self.current_payload_limit();
+        let hash = fingerprint(&payload);
+        // 新载荷：超限时只存元数据（blob_file = NULL），与 insert 一致。
+        let payload_ref = if payload.len() as u64 <= cfg_max {
+            let dims = dims
+                .filter(|(w, h)| *w > 0 && *h > 0)
+                .or_else(|| compute_dims(&kind, &payload));
+            let name = format!("{hash}.bin");
+            write_blob_atomic(&self.blob_dir, &name, &payload)?;
+            Some((name, payload.len() as u64, dims))
+        } else {
+            None
+        };
+        let text_for_fts = match kind {
+            ClipKind::Text | ClipKind::Html | ClipKind::Markdown => Some(preview.clone()),
+            _ => None,
+        };
+
+        {
+            let tx = self.conn.transaction()?;
+            // 1) 旧索引先删（原文必须来自库里那份，不是调用方传的）。
+            if let Some(text) = old_text {
+                tx.execute(
+                    "INSERT INTO items_fts(items_fts, rowid, text) VALUES('delete', ?1, ?2)",
+                    params![id, text],
+                )?;
+                tx.execute("DELETE FROM items_fts_map WHERE item_id = ?1", params![id])?;
+            }
+            // 2) 主行更新（保留 id 与全部统计字段）。
+            tx.execute(
+                "UPDATE items SET kind = ?1, hash = ?2, preview = ?3,
+                    blob_file = ?4, blob_len = ?5, img_w = ?6, img_h = ?7
+                 WHERE id = ?8",
+                params![
+                    kind.as_str(),
+                    hash,
+                    preview,
+                    payload_ref.as_ref().map(|p| p.0.as_str()),
+                    payload_ref.as_ref().map(|p| p.1 as i64).unwrap_or(0),
+                    payload_ref.as_ref().and_then(|p| p.2).map(|d| d.0 as i64),
+                    payload_ref.as_ref().and_then(|p| p.2).map(|d| d.1 as i64),
+                    id,
+                ],
+            )?;
+            // 3) 新索引（文本类）。rowid 仍为 items.id，与 insert 的约定一致。
+            if let Some(text) = text_for_fts {
+                tx.execute(
+                    "INSERT INTO items_fts(rowid, text) VALUES (?1, ?2)",
+                    params![id, text],
+                )?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO items_fts_map(rowid, item_id) VALUES (?1, ?2)",
+                    params![id, id],
+                )?;
+            }
+            tx.commit()?;
+        }
+
+        // 旧载荷文件：与任何现存条目都不共享时才删（DF-01 同款引用计数）。
+        // 注意顺序——DB 已提交，这里的 COUNT 看到的是更新后的世界；
+        // 若新旧同名（内容哈希未变），本行仍引用它，计数 ≥ 1，不会误删。
+        if let Some(f) = old_file {
+            let Some(path) = safe_blob_path(&self.blob_dir, &f) else {
+                tracing::warn!(file = %f, "载荷文件名不合法，跳过删除");
+                return Ok(());
+            };
+            let remaining: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
+                    params![f],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if remaining == 0 && path.exists() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Ok(())
+    }
+
     /// 批量删除（PF-7）：N 次 [`Self::delete`] 是 N 个独立事务（各带一次
     /// WAL 提交），保留策略一次淘汰上百条时成串同步 IO。这里合并为
     /// **单事务**——contentless FTS 的 `'delete'` 命令仍需逐条提供原文，
@@ -1253,6 +1376,90 @@ mod tests {
         assert!(saved.payload.is_none(), "超限载荷不应落盘");
         // 元数据仍可查询
         assert_eq!(store.get(saved.id).unwrap().unwrap().preview, "0123456789");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// `update_content` 是「编辑内容」的落地：换文本、换载荷、换索引，
+    /// 但**不动** id / pinned / group / use_count（用户编辑一次文字不该
+    /// 被踢出置顶，也不该丢使用计数）。
+    #[test]
+    fn update_content_swaps_text_and_keeps_identity() {
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let item = ClipItem::new(ClipKind::Text, "h0".into(), "旧内容".into(), "app".into());
+        let saved = store.insert(item, "旧内容".as_bytes().to_vec()).unwrap();
+        // 置顶 + 用几次，制造「不该被编辑冲掉」的身份信息。
+        store.set_pinned(saved.id, true).unwrap();
+        store.touch(saved.id).unwrap();
+        store.touch(saved.id).unwrap();
+
+        store
+            .update_content(saved.id, ClipKind::Text, "新内容".into(), "新内容".as_bytes().to_vec(), None)
+            .unwrap();
+
+        let got = store.get(saved.id).unwrap().unwrap();
+        assert_eq!(got.id, saved.id, "id 不能变");
+        assert_eq!(got.preview, "新内容");
+        assert!(got.pinned, "置顶状态必须保留");
+        assert_eq!(got.use_count, 2, "使用计数必须保留");
+        // 载荷已换成新文本（复制出去应是新内容）。
+        let bytes = store.load_payload(&got).unwrap();
+        assert_eq!(bytes, "新内容".as_bytes());
+        // FTS 跟着换：搜旧的搜不到，搜新的命中。
+        assert!(store.search("旧内容", 10).unwrap().is_empty(), "旧索引必须被删");
+        assert_eq!(store.search("新内容", 10).unwrap().len(), 1);
+
+        // 旧载荷文件按引用计数清掉（无其他条目共享）。
+        let old_file = format!("{}.bin", fingerprint("旧内容".as_bytes()));
+        assert!(!store.blob_dir.join(old_file).exists(), "旧载荷应被清理");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 编辑成**另一条已存在条目的同款内容**时，新载荷文件与那条共享
+    /// （`{hash}.bin` 同名）——本行仍引用它，清理逻辑不能把文件删了
+    /// （否则那条历史瞬间失去载荷，且毫无报错）。
+    #[test]
+    fn update_content_keeps_shared_blob_alive() {
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let a = ClipItem::new(ClipKind::Text, "h1".into(), "共享内容".into(), "app".into());
+        let saved_a = store.insert(a, "共享内容".as_bytes().to_vec()).unwrap();
+        let b = ClipItem::new(ClipKind::Text, "h2".into(), "另一条".into(), "app".into());
+        let saved_b = store.insert(b, "另一条".as_bytes().to_vec()).unwrap();
+
+        // 把 B 编辑成与 A 相同的内容：哈希相同 ⇒ 同一个载荷文件。
+        store
+            .update_content(saved_b.id, ClipKind::Text, "共享内容".into(), "共享内容".as_bytes().to_vec(), None)
+            .unwrap();
+
+        let file = format!("{}.bin", fingerprint("共享内容".as_bytes()));
+        assert!(store.blob_dir.join(&file).exists(), "共享载荷不能被清掉");
+        // A 的载荷仍然读得出来。
+        let got_a = store.get(saved_a.id).unwrap().unwrap();
+        assert_eq!(store.load_payload(&got_a).unwrap(), "共享内容".as_bytes());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 图片类更新：kind 从 Text 换成 Image 时 FTS 索引必须**消失**
+    /// （图片不进索引），否则搜得到一条「没有文字」的图片条目。
+    #[test]
+    fn update_content_drops_fts_when_kind_leaves_text() {
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let item = ClipItem::new(ClipKind::Text, "h3".into(), "可搜索的文字".into(), "app".into());
+        let saved = store.insert(item, "可搜索的文字".as_bytes().to_vec()).unwrap();
+        assert_eq!(store.search("可搜索", 10).unwrap().len(), 1);
+
+        // 载荷换成 4×2 裸 RGBA8（16 字节），kind 换成 Image。
+        let px = vec![255u8; 4 * 2 * 4];
+        store
+            .update_content(saved.id, ClipKind::Image, "图片 4×2".into(), px, Some((4, 2)))
+            .unwrap();
+
+        assert!(store.search("可搜索", 10).unwrap().is_empty(), "换类后旧索引必须删");
+        let got = store.get(saved.id).unwrap().unwrap();
+        assert_eq!(got.kind, ClipKind::Image);
+        assert_eq!(got.payload.unwrap().dims, Some((4, 2)), "尺寸必须落到行");
         let _ = std::fs::remove_dir_all(base);
     }
 
