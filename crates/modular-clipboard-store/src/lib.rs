@@ -110,6 +110,16 @@ impl Store {
     ///
     /// 目录不存在时创建；路径为空白直接报错——静默回退到默认目录会让
     /// 用户以为数据写进了 `--data-dir` 指定的位置，实际却在 `%APPDATA%`。
+    /// 数据目录（db 文件所在目录）。
+    ///
+    /// 关于页「数据目录」超链接要展示并打开它；`--data-dir` 自定义
+    /// 目录时也以这里为准（不是写死的 `%APPDATA%`）。
+    pub fn data_dir(&self) -> &Path {
+        self.db_path
+            .parent()
+            .expect("db_path 总带文件名，parent 恒存在")
+    }
+
     pub fn open_in(data_dir: &Path) -> Result<Self> {
         let raw = data_dir.to_string_lossy();
         if raw.trim().is_empty() {

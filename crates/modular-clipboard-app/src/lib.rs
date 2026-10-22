@@ -324,6 +324,19 @@ impl Service {
     ///
     /// 界面侧**不应**用它——那等于绕开常驻进程直接读写数据库，
     /// 拆进程就白拆了。保留它是给常驻进程与测试用。
+    /// 实际数据目录（关于页展示与「打开目录」用）。
+    ///
+    /// 本地后端问 store（`--data-dir` 也算数）；远端后端够不到常驻
+    /// 进程的自定义目录，退回默认目录——两进程同机，默认值几乎总是
+    /// 对的，错也只是展示错，不影响数据。
+    pub fn data_dir(&self) -> std::path::PathBuf {
+        match &self.backend {
+            Backend::Local(b) => b.store.data_dir().to_path_buf(),
+            Backend::Remote(_) => modular_clipboard_store::default_data_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        }
+    }
+
     pub fn store(&mut self) -> Option<&mut Store> {
         match &mut self.backend {
             Backend::Local(l) => Some(&mut l.store),

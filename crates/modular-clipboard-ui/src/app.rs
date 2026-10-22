@@ -2897,6 +2897,14 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                         self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开链接失败:", "Failed to open link:"))));
                     }
                 }
+                Op::OpenDataDir => {
+                    // 关于页「数据目录」超链接：进入目录（不是定位选中）。
+                    let dir = self.svc.data_dir().display().to_string();
+                    let custom = self.svc.state.config.ui.explorer_path.trim();
+                    if let Err(e) = modular_clipboard_platform::open_dir_with(&dir, custom) {
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开资源管理器失败:", "Failed to open the file manager:"))));
+                    }
+                }
                 Op::RevealPath(path) => {
                     // 双击文件型条目：尊重设置里的自定义资源管理器路径
                     // （留空 = 系统 explorer /select 定位）。

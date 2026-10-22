@@ -381,6 +381,33 @@ pub fn reveal_with(path: &str, custom: &str) -> Result<()> {
     }
 }
 
+/// **打开**一个目录（在文件管理器里进入它，而不是定位并选中它）。
+///
+/// 与 [`reveal_with`] 的区别是语义：`reveal` 是「找到这个文件」（父目录加
+/// 选中），本函数是「进到这个目录里」——关于页「数据目录」点超链接要的是
+/// 后者。
+///
+/// `custom` 为空 = 系统关联（`ShellExecuteW` open，目录默认关联到
+/// explorer）；非空 = 启动自定义文件管理器并把目录作为参数。
+pub fn open_dir_with(path: &str, custom: &str) -> Result<()> {
+    let custom = custom.trim();
+    if !custom.is_empty() {
+        validate_custom_program("资源管理器", custom)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const DETACHED: u32 = 0x0000_0008 | 0x0000_0020;
+            std::process::Command::new(custom)
+                .arg(path)
+                .creation_flags(DETACHED)
+                .spawn()?;
+            return Ok(());
+        }
+    }
+    // 系统关联：对目录用 open 动作即「进入目录」。
+    open_url(path)
+}
+
 /// 执行外部命令（联动规则入口）。
 ///
 /// `arg` 中的 `{selection}` 会被替换为选中文本。

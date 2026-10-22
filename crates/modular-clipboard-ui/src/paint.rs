@@ -278,6 +278,12 @@ pub enum Op {
     /// 由 `App::apply_ops` 走平台层 `ShellExecuteW` 用默认浏览器打开，
     /// 绘制层不直接碰 shell。
     OpenLink(&'static str),
+    /// 在文件管理器中**打开**数据目录（关于页「数据目录」超链接）。
+    ///
+    /// 与 [`Op::RevealPath`] 的区别：那是「定位并选中文件」（父目录 +
+    /// 选中），这是「进入目录」。路径在落地时从 `Service::data_dir()`
+    /// 取——目录可能是 `--data-dir` 的自定义值，不能在 Op 里存死。
+    OpenDataDir,
     /// 双击链接型条目：用浏览器打开 URL。
     ///
     /// 与 [`Op::OpenLink`] 的区别是**内容来自剪贴板**（动态字符串），
@@ -4166,6 +4172,13 @@ enum ItemKind {
     },
     /// MCP 端口（数字输入，留空 = 未设置）。
     McpPort,
+    /// 分组小标题（关于页的排布分节）。
+    ///
+    /// 不是设置项：无值、不可改、无重置。标题文字走 [`SettingsItem::label`]。
+    Group,
+    /// 数据目录超链接行（关于页）：显示实际目录、点击在文件管理器
+    /// 中打开（[`Op::OpenDataDir`]）。
+    OpenDataDir,
     /// 只读信息行（关于页）。
     Info(Bi),
     /// 可点击的外部链接（关于页）：显示文本即 URL，点击用默认浏览器打开。
@@ -4373,7 +4386,11 @@ impl SettingsItem {
                 get_number(cfg, ConfigGroup::Mcp, "port") != get_number(&d, ConfigGroup::Mcp, "port")
             }
             ItemKind::Language => cfg.ui.language != d.ui.language,
-            ItemKind::Info(_) | ItemKind::Link(_) | ItemKind::Quit => false,
+            ItemKind::Group
+            | ItemKind::OpenDataDir
+            | ItemKind::Info(_)
+            | ItemKind::Link(_)
+            | ItemKind::Quit => false,
         }
     }
 
@@ -4450,7 +4467,11 @@ impl SettingsItem {
                 field: "port",
                 value: get_number(&d, ConfigGroup::Mcp, "port"),
             }),
-            ItemKind::Info(_) | ItemKind::Link(_) | ItemKind::Quit => None,
+            ItemKind::Group
+            | ItemKind::OpenDataDir
+            | ItemKind::Info(_)
+            | ItemKind::Link(_)
+            | ItemKind::Quit => None,
         }
     }
 }
@@ -4803,10 +4824,34 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
         title: ("关于", "About"),
         items: &[
             SettingsItem {
+                key: "about.group.app",
+                label: ("软件信息", "App info"),
+                desc: ("", ""),
+                kind: ItemKind::Group,
+            },
+            SettingsItem {
                 key: "about.version",
                 label: ("版本", "Version"),
                 desc: ("", ""),
                 kind: ItemKind::Info((concat!("v", env!("CARGO_PKG_VERSION")), concat!("v", env!("CARGO_PKG_VERSION")))),
+            },
+            SettingsItem {
+                key: "about.stack",
+                label: ("技术栈", "Built with"),
+                desc: ("", ""),
+                kind: ItemKind::Info(("Rust · egui · Vulkan (Win32)", "Rust · egui · Vulkan (Win32)")),
+            },
+            SettingsItem {
+                key: "about.license",
+                label: ("开源协议", "License"),
+                desc: ("", ""),
+                kind: ItemKind::Info(("GNU GPL v3.0 or later", "GNU GPL v3.0 or later")),
+            },
+            SettingsItem {
+                key: "about.group.project",
+                label: ("项目", "Project"),
+                desc: ("", ""),
+                kind: ItemKind::Group,
             },
             SettingsItem {
                 key: "about.repo",
@@ -4821,25 +4866,16 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::Link("https://github.com/MCheng404"),
             },
             SettingsItem {
-                key: "about.license",
-                label: ("开源协议", "License"),
+                key: "about.group.data",
+                label: ("数据", "Data"),
                 desc: ("", ""),
-                kind: ItemKind::Info(("MIT License", "MIT License")),
-            },
-            SettingsItem {
-                key: "about.stack",
-                label: ("技术栈", "Built with"),
-                desc: ("", ""),
-                kind: ItemKind::Info(("Rust · egui · Vulkan (Win32)", "Rust · egui · Vulkan (Win32)")),
+                kind: ItemKind::Group,
             },
             SettingsItem {
                 key: "about.data_dir",
                 label: ("数据目录", "Data directory"),
-                desc: ("", ""),
-                kind: ItemKind::Info((
-                    "系统应用数据目录（%APPDATA%\\modular-clipboard）",
-                    "Per-user app data (%APPDATA%\\modular-clipboard)",
-                )),
+                desc: ("点击在文件管理器中打开", "Click to open in the file manager"),
+                kind: ItemKind::OpenDataDir,
             },
             SettingsItem {
                 key: "about.quit",
@@ -5921,6 +5957,40 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
                 });
                 record_recent(f, it.key);
             }
+        }
+        ItemKind::Group => {
+            // 分组小标题：给「关于」这种元信息页切出节奏，与搜索结果
+            // 里的 `section()` 同一视觉语言（更轻一号）。
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(t(it.label)).size(pal.font_sm).color(pal.text_dim));
+        }
+        ItemKind::OpenDataDir => {
+            // 数据目录**超链接**：路径是运行期事实（可能被 --data-dir
+            // 改写），不在目录表里存；展示与打开都问 `Service`。
+            let shown = f.svc.data_dir().display().to_string();
+            setting_row(ui, it.label, it.desc, |ui| {
+                let resp = ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(shown.as_str()).size(pal.font_sm).color(pal.accent),
+                    )
+                    // 同 `ItemKind::Info`：不截断会向左溢出到导航列上。
+                    .truncate()
+                    .sense(egui::Sense::click()),
+                );
+                f.hit_insert("settings_data_dir", resp.rect);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    let r = resp.rect;
+                    ui.painter_at(r).line_segment(
+                        [pos2(r.left(), r.bottom()), pos2(r.right(), r.bottom())],
+                        egui::Stroke::new(1.0, pal.accent),
+                    );
+                }
+                if resp.clicked() {
+                    f.state.push(Op::OpenDataDir);
+                }
+                false
+            });
         }
         ItemKind::Info(text) => {
             setting_row(ui, it.label, ("", ""), |ui| {
@@ -12042,6 +12112,24 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             ops.iter().any(|o| matches!(o, Op::OpenLink(u) if *u == author)),
             "点作者主页应产生 OpenLink({author})，实际={ops:?}"
+        );
+    }
+
+    /// 关于页「数据目录」是超链接：点击产生 `Op::OpenDataDir`（进入
+    /// 目录，而不是像 `RevealPath` 那样在父目录里选中它）。
+    #[test]
+    fn about_data_dir_link_opens_directory() {
+        let mut h = Harness::new("about-datadir", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.settings_frame();
+        // 切到「关于」分类。
+        let nav = settings_hit(&h, "settings_cat_about").center();
+        h.settings_click_at(nav);
+
+        let ops = h.settings_click_at(settings_hit(&h, "settings_data_dir").center());
+        assert!(
+            ops.iter().any(|o| matches!(o, Op::OpenDataDir)),
+            "点数据目录应产生 OpenDataDir，实际={ops:?}"
         );
     }
 
