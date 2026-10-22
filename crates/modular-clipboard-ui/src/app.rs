@@ -4241,6 +4241,24 @@ mod tests {
     }
 
     #[test]
+    fn app_construction_does_not_touch_locale() {
+        // 守门（2026-10-22 连翻两次车）：App 构造链里绝不能解析/设置
+        // 全局语言。CI runner 是英文系统，构造时一翻转，所有假定中文
+        // 断言/热区 key 的并行测试全线阵亡——而本机中文系统永远复现不到。
+        // 语言只允许在生产 UI 入口 `run()` 与 `Op::SetLanguage` 里改。
+        modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::Locale::ZhCn);
+        let dir = std::env::temp_dir().join(format!("mc-ui-locale-guard-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let _app = App::new(modular_clipboard_core::Config::default(), false, Some(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            modular_clipboard_core::i18n::locale(),
+            modular_clipboard_core::i18n::Locale::ZhCn,
+            "App 构造动了全局语言"
+        );
+    }
+
+    #[test]
     fn capture_enabled_switch_restarts_thread_at_runtime() {
         let dir = std::env::temp_dir().join(format!("mc-ui-capture-switch-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
