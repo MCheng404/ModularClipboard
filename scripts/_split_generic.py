@@ -17,30 +17,65 @@ import sys
 
 # ---------------------------------------------------------------------- SPEC
 SPEC = {
-    "path": "crates/modular-clipboard-ui/src/renderer.rs",
-    "subdir": "crates/modular-clipboard-ui/src/renderer",
+    "path": "crates/modular-clipboard-ui/src/theme.rs",
+    "subdir": "crates/modular-clipboard-ui/src/theme",
     "sections": {
-        # name: {"ranges": [(s,e)...], "doc": "...", "mode": "free"|"methods",
-        #        "method_vis": {...}, "keep_pub": {...}}
-        "painter": {
-            "ranges": [(397, 1961)],
-            "doc": "//! `Painter`：一帧的绘制上下文。\n"
+        "secondary": {
+            "ranges": [(688, 913)],
+            "doc": "//! 二级主题：纸质 / 护眼绿 / 星空紫 / OLED 的取色。\n"
                    "//!\n"
-                   "//! 持有字体图集、用户纹理表、离屏模糊链与磨砂背景资源；\n"
-                   "//! `Drop` 按「描述符引用者 -> 被引用者」逆序释放。\n"
-                   "//! 本文件只放 Painter 本体；批次与纯函数在根，槽位缓冲在根。",
-            "mode": "free",
+                   "//! 一级主题决定「骨架色」，二级主题在其上按浓度 `k` 混向目标色；\n"
+                   "//! `tint_tokens!` 用宏逐个令牌混色——手写漏字段不会有编译提示，\n"
+                   "//! 而症状是「某个控件不跟着变」。",
+        },
+        "accent": {
+            "ranges": [(915, 998)],
+            "doc": "//! 强调色：预设色板、HSV 派生与覆盖层。\n"
+                   "//!\n"
+                   "//! 派生只微调明度不重建——同一个色要同时服务深浅两套主题。",
+        },
+        "system": {
+            "ranges": [(1000, 1064)],
+            "doc": "//! 系统主题探测（Windows 注册表 `AppsUseLightTheme`）。\n"
+                   "//!\n"
+                   "//! 只在启动时调一次；读不到回退深色并告警，不 panic。",
+        },
+        "visuals": {
+            "ranges": [(1066, 1272)],
+            "doc": "//! 把调色板灌进 egui `Visuals` 的入口（`apply` / `set_theme`）。\n"
+                   "//!\n"
+                   "//! 深浅两套都从 `Theme::Dark` 克隆后逐项全量覆盖：只设\n"
+                   "//! `bg_fill` 漏掉 `fg_stroke` 会重现「白底白字」。",
+        },
+        "fonts": {
+            "ranges": [(1274, 1489)],
+            "doc": "//! 字体：中文字体加载、图标字体与字号助手。\n"
+                   "//!\n"
+                   "//! 中文字体字节进程级共享（`shared_font_data`）——每个\n"
+                   "//! `egui::Context` 各装一份会是 35MB × 窗口数。",
         },
     },
-    "root_parts": [(1, 396), (1962, 3145)],
-    "root_extra": [],
-    "root_reexport": ["pub(crate) use painter::Painter;"],
+    "root_parts": [(1, 686), (1490, 99999)],
+    "root_extra": [
+        "use accent::{apply_overrides, derive_accent};",
+        "use secondary::apply_secondary;",
+    ],
+    "root_reexport": [
+        "pub(crate) use accent::ACCENT_PRESETS;",
+        "pub(crate) use fonts::{install_cjk_font, install_icon_font, sized};",
+        "pub(crate) use system::detect_system_theme;",
+        "pub(crate) use visuals::{SCROLLBAR_WIDTH, apply, composite, set_theme};",
+    ],
+    "root_extra_items": ["Palette"],
     "tests_marker": "mod tests {",
     "asserts": [
-        (398, "// Painter"),
-        (1964, "顶点/索引缓冲"),
-        (106, "pub struct Batch"),
-        (2134, "mod tests {"),
+        (680, "fn mix_straight"),
+        (688, "把一个令牌混向目标色"),
+        (915, "强调色预设色板"),
+        (1000, "探测系统主题"),
+        (1066, "把令牌灌进 egui"),
+        (1274, "候选中文字体"),
+        (1490, "#[cfg(test)]"),
     ],
 }
 
@@ -151,6 +186,7 @@ module_items = {n: top_items(b) for n, b in moved.items()}
 root_item_names = set()
 for s, e in SPEC["root_parts"]:
     root_item_names |= top_items(lines[s - 1:e])
+root_item_names |= set(SPEC.get("root_extra_items", []))
 
 
 def transform(name, body, spec):
