@@ -18,14 +18,28 @@
 
 use std::path::Path;
 
-/// `app.rs` 的路径（相对本测试文件）。
-fn app_rs() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs")
-}
-
+/// `app` 模块家族的源文本（`app.rs` + `app/*.rs`，按名字序拼接）。
+///
+/// NOTE: 2026-10-22 app.rs 拆成模块家族后，本测试从「读单文件」改为
+/// 「读整个家族」——断言的对象是**接线**（谁调 take_pending / 谁喂
+/// egui_input），与代码放在哪个文件里无关。这与 qa-arch AR-17 的
+/// 预警同源：文本断言要对重构稳健，否则每次拆分都得到一批假失败。
 fn source() -> String {
-    std::fs::read_to_string(app_rs())
-        .unwrap_or_else(|e| panic!("读不到 {}: {e}", app_rs().display()))
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![dir.join("app.rs")];
+    let mut subs: Vec<std::path::PathBuf> = std::fs::read_dir(dir.join("app"))
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    subs.sort();
+    files.extend(subs);
+    let mut out = String::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f)
+            .unwrap_or_else(|e| panic!("读不到 {}: {e}", f.display()));
+        out.push_str(&text);
+        out.push('\n');
+    }
+    out
 }
 
 /// 取含 `needle` 的那一行。
