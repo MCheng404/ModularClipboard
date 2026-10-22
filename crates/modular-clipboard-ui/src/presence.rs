@@ -48,14 +48,6 @@ pub fn system_langid() -> u16 {
     unsafe { GetUserDefaultUILanguage() }
 }
 
-pub fn cursor_pos() -> Option<(i32, i32)> {
-    let mut pt = windows::Win32::Foundation::POINT::default();
-    // SAFETY: `pt` 是栈上有效的可写内存。CAUTION: `GetCursorPos` 在
-    // `WindowsAndMessaging` 而不是 `Input::KeyboardAndMouse`（容易找错模块）。
-    let ok = unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) };
-    ok.is_ok().then_some((pt.x, pt.y))
-}
-
 /// 窗口隐藏时的轮询间隔。
 ///
 /// 隐藏后不再渲染，但**必须继续醒来查托盘事件**，否则永远唤不回来。

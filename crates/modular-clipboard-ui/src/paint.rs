@@ -24,7 +24,7 @@
 //! 文字，其批次裁剪矩形就是**整屏**——裁剪等于没裁。要真正限制在
 //! 卡片内，必须显式传对应矩形给 `painter_at`。
 
-use egui::{Align2, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use egui::{Align2, CornerRadius, FontId, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use modular_clipboard_app::Service;
 use modular_clipboard_core::ClipItem;
 use modular_clipboard_core::item::EntryId;
@@ -176,12 +176,6 @@ pub enum Op {
     ///
     /// 同 [`Op::SetTypeRail`]：两个参数一张轻量卡，整包替换。
     SetSearchPanel(modular_clipboard_core::config::SearchPanelConfig),
-    /// 设置磨砂光标光晕（开关 + 半径 + 浓度）。
-    ///
-    /// 同 [`Op::SetCardShadow`]：一张互相牵连的卡，整包替换。
-    /// 落地只需重存配置——绘制层每帧现读（`draw_cursor_glow`），
-    /// 帧循环的闸门由「目标变化 ⇒ request_repaint」与补间busy 唤醒。
-    SetGlow(modular_clipboard_core::config::GlowConfig),
     /// 切换主题（跟随系统 / 深色 / 浅色）。
     ///
     /// 由 `App::apply_ops` 落地：更新 `App.pal` 并重灌主窗口 `Visuals`；
@@ -553,16 +547,6 @@ pub struct UiState {
     /// painter）。两个模式都算：toast 模式算了不用（成本一次文本排版，
     /// 仅通知存续期间发生），换来切换设置的那一帧几何就是对的。
     pub notice_panel: Option<Rect>,
-    /// 磨砂光晕的**目标中心**（主窗口客户区逻辑坐标；`None` = 光标
-    /// 不在窗口内或其「靠近带」内）。
-    ///
-    /// 由帧循环每轮用 `GetCursorPos` 现算后写入（绘制层没有窗口句柄，
-    /// 拿不到屏幕坐标；egui 的 `hover_pos` 又只覆盖窗口内）。
-    /// 绘制层对它做补间（中心跟随 + 淡入淡出），见 [`draw_cursor_glow`]。
-    pub glow_target: Option<Pos2>,
-    /// 光晕的**显示中心**（补间中的值，逻辑点）。目标消失（光标离开）
-    /// 时补间不再更新它 ⇒ 淡出期间光晕冻结在最后位置。
-    pub glow_center: Pos2,
     /// 正在**内联编辑**的条目（`Some(id)` = 该行的预览带换成编辑器）。
     ///
     /// 界面本地状态：不进配置、不进 IPC 快照。编辑中的文字在
@@ -1317,13 +1301,6 @@ pub fn draw_child(f: &mut Frame<'_>) {
     }
 }
 
-/// 磨砂光晕的「靠近带」宽度（逻辑点）：光标进入窗口矩形外扩这一圈
-/// 就算「靠近」，光晕开始显示（位置钳到窗口边缘）。
-///
-/// 取 40pt ≈ 光标进入窗口前两三个身位：再小的话「靠近」几乎等于
-/// 「已进入」，特性感知不到；再大则在远离的窗口旁也会亮，误触发。
-const GLOW_NEAR: f32 = 40.0;
-
 // ---------------------------------------------------------------- 编辑图标
 //
 // 三个几何图标（铅笔 / 撤销 / 对勾）。为什么不用图标字体：PUA 码位
@@ -1458,191 +1435,6 @@ pub fn paint_check_icon(painter: &egui::Painter, r: Rect, color: egui::Color32) 
     ));
 }
 
-/// 把光标屏幕位置换算成光晕的**目标中心**（主窗口客户区逻辑坐标）。
-///
-/// # 语义
-///
-/// - 光标在窗口内 ⇒ 光标位置本身；
-/// - 光标在窗口外但进入[`GLOW_NEAR`] 靠近带 ⇒ **钳到窗口边缘**（光晕
-///   从那一侧探进来，符合「靠近时在光标位置渲染」的直觉）；
-/// - 更远 ⇒ `None`（不亮）。
-///
-/// # 为什么是纯函数
-///
-/// 输入全部由帧循环现算后传入（绘制层没有窗口句柄，`GetCursorPos` 在
-/// app.rs）。抽成纯函数才能对「钳制 / 靠近带 / 缩放」三个分支写单测——
-/// 这三个分支恰好是几何错误的高发区（DPI 缩放漏除、钳制方向反了都会
-/// 让光晕跑到窗口外或干脆不显示，而实机上很难看出是换算错还是没触发）。
-pub fn glow_target_client(
-    win_pos: Vec2,
-    win_size: Vec2,
-    scale: f32,
-    cursor: Option<(i32, i32)>,
-) -> Option<Pos2> {
-    let (cx, cy) = cursor?;
-    // 缩放必须 > 0：窗口刚创建 / 已销毁时 `GetDpiForWindow` 可能给 0，
-    // 拿它除会把坐标放大到无穷（光晕画到天边）。
-    let s = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
-    // 光标物理像素 → 逻辑点，再减掉窗口左上角得到客户区坐标。
-    let v = pos2(cx as f32 / s - win_pos.x, cy as f32 / s - win_pos.y);
-    let near = Rect::from_min_max(
-        pos2(-GLOW_NEAR, -GLOW_NEAR),
-        pos2(win_size.x + GLOW_NEAR, win_size.y + GLOW_NEAR),
-    );
-    if !near.contains(v) {
-        return None;
-    }
-    Some(pos2(
-        v.x.clamp(0.0, win_size.x.max(0.0)),
-        v.y.clamp(0.0, win_size.y.max(0.0)),
-    ))
-}
-
-/// 磨砂**光标光晕**（2026-10-21）：磨砂模式下光标靠近主窗口时，在光标
-/// 位置画一团径向渐变，像「窗口被光标照亮」。
-///
-/// # 层次
-///
-/// 画在背景（`bg` + 二级主题纹理）之上、卡片与顶栏**之下**——它是
-/// 背景效果的一部分，不该盖住内容。磨砂的模糊底图在 GPU 层，本层画在
-/// 其上前景侧，视觉上就是「光照亮了磨砂」。
-///
-/// # 动效与续帧
-///
-/// 中心跟随（90ms）与淡入淡出（160ms）都走 [`crate::anim::tween_f32`]：
-/// 补间在飞时 `anim::busy` 为真，帧循环的渲染闸门会持续放行——不需要
-/// 在这里手动 `request_repaint`。真正需要唤醒的是「光标在窗口外移动」
-/// （无事件源），那由帧循环比对目标变化后 `request_repaint` 完成
-/// （见 app.rs 1.85 节）。
-///
-/// # 为什么默认关闭还有成本意识
-///
-/// 关闭时本函数第一行就返回，不碰动画注册表；只有开启后才有
-/// 「光标靠近 ⇒ 30fps 级跟随重绘」的成本，且仅限磨砂模式。
-fn draw_cursor_glow(f: &mut Frame<'_>) {
-    let cfg = f.svc.state.config.ui.glow;
-    if !cfg.enabled {
-        return;
-    }
-    // 只在磨砂模式生效：不透明背景下「照亮磨砂」没有语义，且那会让
-    // 一个默认关闭的特性和普通模式的观感纠缠在一起。
-    if f.svc.state.config.ui.window_backdrop
-        != modular_clipboard_core::config::WindowBackdrop::Acrylic
-    {
-        return;
-    }
-    let pal = f.pal;
-    let ctx = f.ui.ctx();
-    let target = f.state.glow_target;
-    // 淡入淡出（160ms OutCubic）：目标有无决定方向；中心在淡出期间
-    // 冻结在最后位置（目标取当前显示值 ⇒ 补间不动）。
-    let a = crate::anim::tween_f32(
-        ctx,
-        egui::Id::unique("glow_a"),
-        if target.is_some() { 1.0 } else { 0.0 },
-        std::time::Duration::from_millis(160),
-        crate::anim::Ease::OutCubic,
-    );
-    let (tx, ty) = match target {
-        Some(p) => (p.x, p.y),
-        None => (f.state.glow_center.x, f.state.glow_center.y),
-    };
-    let cx = crate::anim::tween_f32(
-        ctx,
-        egui::Id::unique("glow_cx"),
-        tx,
-        std::time::Duration::from_millis(90),
-        crate::anim::Ease::OutCubic,
-    );
-    let cy = crate::anim::tween_f32(
-        ctx,
-        egui::Id::unique("glow_cy"),
-        ty,
-        std::time::Duration::from_millis(90),
-        crate::anim::Ease::OutCubic,
-    );
-    f.state.glow_center = pos2(cx, cy);
-    // 完全透明（从未亮过 / 已淡出完毕）：不画，也无需下面的一切。
-    if a <= 0.004 {
-        return;
-    }
-    let radius = modular_clipboard_core::config::clamp_glow_radius(cfg.radius);
-    let strength = modular_clipboard_core::config::clamp_glow_strength(cfg.strength);
-    if radius <= 0.0 || strength <= 0.0 {
-        return;
-    }
-    // 用色按主题：深色下近白（经典「光照亮磨砂」），浅色下白光照不出来，
-    // 换强调色（两套主题下都保证与底色有可感知的差）。
-    let base = if pal.is_dark {
-        egui::Color32::WHITE
-    } else {
-        pal.accent
-    };
-    let alpha = (strength * a * 255.0).round().clamp(0.0, 255.0) as u8;
-    let center_color = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha);
-    paint_radial_glow(f.ui.painter(), f.state.glow_center, radius, center_color);
-}
-
-/// 画一团**径向渐变**光晕（中心 `color` → 边缘同色 alpha 0）。
-///
-/// # 为什么手工搓 mesh 而不是叠 N 个圆
-///
-/// 叠圆会留下同心环（每层一道硬边）；mesh 按顶点色插值是真渐变。
-/// 顶点色用**预乘**分量构造（[`egui::Color32`] 内部即预乘，`to_array`
-/// 取出的就是预乘值），GPU 在预乘空间线性插值——正好是 alpha 渐变的
-/// 正确插值空间，边缘不会出现「透明黑」暗晕。
-///
-/// 调用方传根 painter（其裁剪矩形即整个客户区）：中心贴在窗口边缘时
-/// mesh 有一半在窗外，由 painter 的裁剪收走，不会画到邻窗上去。
-fn paint_radial_glow(
-    painter: &egui::Painter,
-    center: egui::Pos2,
-    radius: f32,
-    color: egui::Color32,
-) {
-    if radius <= 0.0 || color.a() == 0 {
-        return;
-    }
-    // 分段数：48 段在 320pt 最大半径下每段弧长约 42pt，肉眼无棱角；
-    // 半径很窄时降段数（小圆多段是浪费）。
-    let steps = ((radius / 4.0).round().clamp(16.0, 48.0)) as usize;
-    // 边缘色：同 RGB、alpha 0（预乘空间即 (r, g, b, 0)）。
-    let [r, g, b, _] = color.to_array();
-    let edge = egui::Color32::from_rgba_premultiplied(r, g, b, 0);
-    let mut mesh = egui::Mesh::default();
-    // 纯色几何的约定：默认纹理（字体图集 Managed(0)）+ WHITE_UV，
-    // 最终颜色 = 图集白像素 × 顶点色。CAUTION: `WHITE_UV` 只在
-    // `egui::epaint` 下，egui 根命名空间没有 re-export 它。
-    let center_idx = mesh.vertices.len() as u32;
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: center,
-        uv: egui::epaint::WHITE_UV,
-        color,
-    });
-    for i in 0..=steps {
-        let t = i as f32 / steps as f32;
-        let ang = t * std::f32::consts::TAU;
-        let p = pos2(
-            center.x + ang.cos() * radius,
-            center.y + ang.sin() * radius,
-        );
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: p,
-            uv: egui::epaint::WHITE_UV,
-            color: edge,
-        });
-        if i < steps {
-            let outer = center_idx + 1 + i as u32;
-            mesh.indices.extend_from_slice(&[center_idx, outer, outer + 1]);
-        }
-    }
-    painter.add(egui::Shape::mesh(mesh));
-}
-
 /// 画一帧。
 ///
 /// 流程：背景 → 悬浮装饰布局 → 顶栏（搜索图标）→ 搜索状态机 →
@@ -1671,10 +1463,6 @@ pub fn draw(f: &mut Frame<'_>) {
     // 不会盖住底图。且本层**不参与**磨砂的抓图（磨砂抓的是窗口
     // 身后的桌面，不是自己画的内容），不存在反馈回路。
     draw_theme_texture(f);
-
-    // 磨砂光标光晕：在背景之上、内容之下（它是背景效果的一部分）。
-    // 关闭 / 非磨砂模式时首行即返回，零成本。
-    draw_cursor_glow(f);
 
     let top = Rect::from_min_max(
         pos2(area.min.x, area.min.y),
@@ -4890,12 +4678,6 @@ enum ItemKind {
     CardOpacity,
     /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
     BlurStrength,
-    /// 磨砂光标光晕：总开关 + （开启时）半径 / 浓度两个滑条。
-    ///
-    /// 独立成变体（同 [`ItemKind::CardShadow`]）：关掉总开关后两个
-    /// 参数一起失效。仅在磨砂模式下有意义——非磨砂时整项禁用压暗
-    /// （与 [`ItemKind::BlurStrength`] 同一处理）。
-    Glow,
     /// 卡片阴影：开关行 + （开启时）模糊 / 浓度 / 垂直偏移三个滑条。
     ///
     /// 与 [`ItemKind::Opacity`] 同理独立成变体——参数不止一个，
@@ -5164,7 +4946,6 @@ impl SettingsItem {
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::CardOpacity => (cfg.ui.card_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
-            ItemKind::Glow => cfg.ui.glow != d.ui.glow,
             ItemKind::CardShadow => cfg.ui.card_shadow != d.ui.card_shadow,
             ItemKind::RowMeta => cfg.ui.row_meta != d.ui.row_meta,
             ItemKind::TypeRail => cfg.ui.type_rail != d.ui.type_rail,
@@ -5231,16 +5012,6 @@ impl SettingsItem {
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
             ItemKind::CardOpacity => Some(Op::SetCardOpacity(d.ui.card_opacity)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
-            ItemKind::Glow => Some(Op::SetGlow(d.ui.glow)),
-            ItemKind::CardShadow => Some(Op::SetCardShadow(d.ui.card_shadow)),
-            ItemKind::RowMeta => Some(Op::SetRowMeta(d.ui.row_meta)),
-            ItemKind::TypeRail => Some(Op::SetTypeRail(d.ui.type_rail)),
-            ItemKind::SearchPanel => Some(Op::SetSearchPanel(d.ui.search_panel)),
-            ItemKind::NoticeMode => Some(Op::SetBool {
-                group: ConfigGroup::Ui,
-                field: "notice_popup",
-                value: d.ui.notice_popup,
-            }),
             // 字体缩放：恢复默认倍率（1.0×）。走 SetNumber 而非专用 Op——
             // 应用侧的即时生效钩子正是按 (Ui, "font_scale") 匹配的。
             ItemKind::FontScale => Some(Op::SetNumber {
@@ -5267,6 +5038,15 @@ impl SettingsItem {
                 group: ConfigGroup::Mcp,
                 field: "port",
                 value: get_number(&d, ConfigGroup::Mcp, "port"),
+            }),
+            ItemKind::CardShadow => Some(Op::SetCardShadow(d.ui.card_shadow)),
+            ItemKind::RowMeta => Some(Op::SetRowMeta(d.ui.row_meta)),
+            ItemKind::TypeRail => Some(Op::SetTypeRail(d.ui.type_rail)),
+            ItemKind::SearchPanel => Some(Op::SetSearchPanel(d.ui.search_panel)),
+            ItemKind::NoticeMode => Some(Op::SetBool {
+                group: ConfigGroup::Ui,
+                field: "notice_popup",
+                value: d.ui.notice_popup,
             }),
             ItemKind::Group
             | ItemKind::OpenDataDir
@@ -5423,12 +5203,6 @@ static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: ("背景不透明度", "Background opacity"),
                 desc: ("背景层的透明程度；文字始终不透明", "Transparency of the background layer; text stays opaque"),
                 kind: ItemKind::Opacity,
-            },
-            SettingsItem {
-                key: "ui.glow",
-                label: ("光标光晕", "Cursor glow"),
-                desc: ("磨砂模式下光标靠近时照亮窗口；半径与浓度可调", "Light up the window around the cursor in frosted mode; radius and strength adjustable"),
-                kind: ItemKind::Glow,
             },
             SettingsItem {
                 key: "ui.card_opacity",
@@ -6577,77 +6351,6 @@ fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
             cfg.height = modular_clipboard_core::config::clamp_search_panel_height(height);
             if changed {
                 f.state.push(Op::SetSearchPanel(cfg));
-                record_recent(f, it.key);
-            }
-        }
-        ItemKind::Glow => {
-            // 磨砂光标光晕：总开关 + （开启时）半径 / 浓度。整包替换。
-            //
-            // 非磨砂模式下整项**不可交互**（开关槽位换成提示文字）：
-            // 光晕的语义是「照亮磨砂」，不透明背景下没有承载它的东西
-            // ——与 BlurStrength 在非磨砂时禁用同一处理，但那个只禁
-            // 滑条，这个连开关一起禁（否则「能开但没效果」更难排查）。
-            let acrylic =
-                f.svc.state.config.ui.window_backdrop == WindowBackdrop::Acrylic;
-            let mut cfg = f.svc.state.config.ui.glow;
-            let mut changed = false;
-            if acrylic {
-                changed |= setting_row(ui, it.label, it.desc, |ui| {
-                    draw_switch(f, ui, "glow_enabled", &mut cfg.enabled)
-                });
-            } else {
-                let pal = f.pal;
-                let _ = setting_row(ui, it.label, it.desc, |ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(t(("需先开启磨砂背景", "Requires the frosted background"))).color(pal.text_dim),
-                    ));
-                    false
-                });
-            }
-            if cfg.enabled && acrylic {
-                ui.add_space(2.0);
-                let mut radius = modular_clipboard_core::config::clamp_glow_radius(cfg.radius);
-                let pal = f.pal;
-                changed |= setting_row(ui, ("光晕半径", "Glow radius"), ("径向渐变的边缘半径（60~320pt）", "Radius of the radial gradient (60-320 pt)"), |ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(format!("{}", radius.round() as i32)).color(pal.text_dim),
-                    ));
-                    draw_slider(
-                        f,
-                        ui,
-                        "glow_radius",
-                        "",
-                        &mut radius,
-                        modular_clipboard_core::config::GLOW_RADIUS_MIN
-                            ..=modular_clipboard_core::config::GLOW_RADIUS_MAX,
-                        true,
-                        0.0,
-                    )
-                });
-                cfg.radius = modular_clipboard_core::config::clamp_glow_radius(radius);
-                ui.add_space(2.0);
-                let mut strength = modular_clipboard_core::config::clamp_glow_strength(cfg.strength);
-                changed |= setting_row(ui, ("光晕浓度", "Glow strength"), ("光晕中心颜色的透明度（0~100%）", "Opacity of the glow center (0-100%)"), |ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(format!("{}%", (strength * 100.0).round() as i32))
-                            .color(pal.text_dim),
-                    ));
-                    draw_slider(
-                        f,
-                        ui,
-                        "glow_strength",
-                        "",
-                        &mut strength,
-                        modular_clipboard_core::config::GLOW_STRENGTH_MIN
-                            ..=modular_clipboard_core::config::GLOW_STRENGTH_MAX,
-                        true,
-                        0.0,
-                    )
-                });
-                cfg.strength = modular_clipboard_core::config::clamp_glow_strength(strength);
-            }
-            if changed {
-                f.state.push(Op::SetGlow(cfg));
                 record_recent(f, it.key);
             }
         }
@@ -13616,74 +13319,6 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
         // 通栏：左右缘仍与窗口对齐。
         assert!((r.min.x - area.min.x).abs() < 0.01 && (r.max.x - area.max.x).abs() < 0.01);
-    }
-
-    /// 光晕目标换算：窗口内取光标位、靠近带内钳到边缘、带外不亮。
-    ///
-    /// 这三个分支是几何错误高发区（DPI 缩放漏除会让光晕跑到天边；
-    /// 钳制方向反了会让它在窗口外「飘」），且实机上「没亮」与
-    /// 「亮错位置」都很难归因，必须用纯函数锁住。
-    #[test]
-    fn glow_target_client_geometry() {
-        let win_pos = vec2(100.0, 50.0);
-        let win_size = vec2(480.0, 533.0);
-        // 窗口内（1.0 缩放，屏幕坐标 = 窗口坐标 + 偏移）。
-        let inside = glow_target_client(win_pos, win_size, 1.0, Some((340, 300)));
-        assert_eq!(inside, Some(pos2(240.0, 250.0)), "窗口内应取光标位");
-
-        // 1.5 缩放：光标物理 (610, 425) → 逻辑 (406.7, 283.3) → 客户区
-        // (306.7, 233.3)。漏除缩放会把光晕放到 1.5 倍远的位置。
-        let scaled = glow_target_client(win_pos, win_size, 1.5, Some((610, 425)));
-        let p = scaled.expect("应命中");
-        assert!((p.x - 306.67).abs() < 0.1 && (p.y - 233.33).abs() < 0.1, "缩放换算错：{p:?}");
-
-        // 靠近带内（窗口左侧外 20pt）：钳到左缘 x=0，y 保持。
-        let near_left = glow_target_client(win_pos, win_size, 1.0, Some((80, 300)));
-        assert_eq!(near_left, Some(pos2(0.0, 250.0)), "带内应钳到边缘");
-
-        // 右下角外 10pt：钳到右下角。
-        let near_corner = glow_target_client(win_pos, win_size, 1.0, Some((590, 590)));
-        assert_eq!(near_corner, Some(pos2(480.0, 533.0)));
-
-        // 带外（距左缘 60pt > GLOW_NEAR=40）：不亮。
-        assert_eq!(glow_target_client(win_pos, win_size, 1.0, Some((30, 300))), None);
-        // 无光标（查询失败）：不亮。
-        assert_eq!(glow_target_client(win_pos, win_size, 1.0, None), None);
-        // 缩放为 0（窗口刚创建）：必须回落 1.0 而不是除零爆炸。
-        let degenerate = glow_target_client(win_pos, win_size, 0.0, Some((340, 300)));
-        assert_eq!(degenerate, Some(pos2(240.0, 250.0)), "零缩放应回落 1.0");
-    }
-
-    /// 光晕配置的设置卡片：关闭时两个参数行不出现，开启才出现。
-    ///
-    /// 走 Harness 开设置窗口点开卡片不现实（设置是独立窗口），这里
-    /// 直接验「渲染分支的输入依赖」：`draw_settings_item` 对 Glow 的
-    /// 分支只在 `cfg.enabled && acrylic` 时画参数行——用配置矩阵锁住
-    /// 这个依赖不被无意改掉。
-    #[test]
-    fn glow_settings_rows_depend_on_enabled_and_acrylic() {
-        use modular_clipboard_core::config::{GlowConfig, WindowBackdrop};
-        // 依赖矩阵（与 paint.rs 的 ItemKind::Glow 分支一致）：
-        //   acrylic=false ⇒ 开关行都没有（提示文字替代）；
-        //   acrylic=true, enabled=false ⇒ 只有开关行；
-        //   acrylic=true, enabled=true  ⇒ 开关 + 半径 + 浓度。
-        let off = GlowConfig::default();
-        assert!(!off.enabled, "默认必须关闭");
-        let on = GlowConfig {
-            enabled: true,
-            ..off
-        };
-        // 两个参数的钳制区间互不为空（滑块区间反转会让 egui panic）。
-        // 常量比较放编译期：运行期 assert 会被 clippy 判「恒真」报警。
-        const {
-            assert!(modular_clipboard_core::config::GLOW_RADIUS_MIN
-                < modular_clipboard_core::config::GLOW_RADIUS_MAX);
-            assert!(modular_clipboard_core::config::GLOW_STRENGTH_MIN
-                <= modular_clipboard_core::config::GLOW_STRENGTH_MAX);
-        }
-        // 磨砂才生效：与绘制侧判据同源。
-        assert_eq!(WindowBackdrop::default(), WindowBackdrop::None);
-        let _ = on;
     }
 
     /// 类型栏带文字标签时：无实测值用**估算**（宁大勿小），有实测值

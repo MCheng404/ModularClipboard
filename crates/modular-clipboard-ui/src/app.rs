@@ -871,39 +871,6 @@ fn run_mode(
         ));
         children.sync_with(&mut app.ws, &shared, window.scale_factor(), main_rect);
 
-        // ---- 1.85 磨砂光晕：光标位置 → 客户区坐标 ----
-        //
-        // 放在闸门**之前**（跳过路径也经过这里）：光晕的唯一输入是
-        // 「光标此刻在哪」，而光标在**窗口外**移动时本窗口收不到任何
-        // 事件——不在这里每轮查一次，光晕就会在光标穿过靠近带时毫无
-        // 反应（要等光标进入窗口、来了鼠标事件才补演，位置已经错了）。
-        //
-        // 判据齐了才查（GetCursorPos + 两次窗口查询 ≈ 3 个系统调用）：
-        // 关闭时零开销。窗口隐藏 / 最小化也不查——看不见的东西不跟踪。
-        let glow_cfg = &app.svc.state.config.ui.glow;
-        let glow_wanted = glow_cfg.enabled
-            && app.svc.state.config.ui.window_backdrop
-                == modular_clipboard_core::config::WindowBackdrop::Acrylic
-            && !hidden
-            && !window.is_minimized();
-        let glow_target = if glow_wanted {
-            crate::paint::glow_target_client(
-                main_pos,
-                egui::vec2(mw, mh),
-                window.scale_factor(),
-                crate::presence::cursor_pos(),
-            )
-        } else {
-            None
-        };
-        if glow_target != app.paint_state.glow_target {
-            app.paint_state.glow_target = glow_target;
-            // 目标变了（进入/离开靠近带、或在带内移动）⇒ 唤醒一帧。
-            // 没有这条，窗口外的那段移动没有任何事件源，闸门会一直
-            // 跳过，光晕停在原处（光标都走远了它还亮在老位置）。
-            ctx.request_repaint();
-        }
-
         // ---- 1.9 渲染闸门（PF-4）----
         //
         // 空闲时整套 `run_ui + tessellate + acquire/paint/present` 产出
@@ -2506,15 +2473,7 @@ fn capture_recording(&mut self, ctx: &egui::Context) {
                     self.svc.state.config.ui.search_panel = m;
                     self.after_config_change();
                 }
-                Op::SetGlow(g) => {
-                    // 磨碎光标光晕：只改配置。绘制层每帧现读
-                    // （`draw_cursor_glow`），帧循环靠「光标目标变化 ⇒
-                    // request_repaint」与补间 busy 续帧，无需额外唤醒。
-                    // 半径/浓度在绘制侧钳制，这里原样存（配置被手工
-                    // 改超界时绘制侧兜底）。
-                    self.svc.state.config.ui.glow = g;
-                    self.after_config_change();
-                }
+                
                 Op::SetThemeMode(mode) => {
                     // 主题必须**运行时立即生效**：记录选择 + 重灌调色板。
                     //
