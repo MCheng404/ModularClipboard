@@ -114,7 +114,7 @@ unsafe fn bits_to_png(
         anyhow::bail!("GetDIBits 未返回任何扫描行");
     }
     // 32 位 DIB 内存序是 BGRA，PNG 需要 RGBA：交换 R/B。
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     let img = image::RgbaImage::from_raw(w32, h32, buf)

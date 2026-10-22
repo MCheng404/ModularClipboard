@@ -317,7 +317,7 @@ fn main() {
 
     let buf = tray::icon_rgba().expect("内置托盘图标应能解码");
     assert_eq!(buf.len(), tray::ICON_SIZE * tray::ICON_SIZE * 4);
-    let opaque = buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+    let opaque = buf.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
     assert!(opaque > 100, "内置图标应有可见像素，实际 {opaque}");
     println!(
         "[6] 内置图标 {}x{}，可见像素 {opaque} 个（非emoji/字符）",

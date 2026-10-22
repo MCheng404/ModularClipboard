@@ -465,7 +465,7 @@ mod tests {
         let a = paper_pixels();
         let b = paper_pixels();
         assert_eq!(a, b, "同种子必须生成同一份纹理");
-        let alphas: Vec<u8> = a.chunks_exact(4).map(|p| p[3]).collect();
+        let alphas: Vec<u8> = a.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
         assert!(!alphas.iter().all(|&x| x == 0), "不能全透明");
         assert!(!alphas.iter().all(|&x| x == 255), "不能全不透明");
         let mean: f32 = alphas.iter().map(|&x| x as f32).sum::<f32>() / alphas.len() as f32;
@@ -478,7 +478,7 @@ mod tests {
             "应有纤维级峰值（>60）"
         );
         // RGB 恒白（tint 在上色时乘入，见 `paint_tiled` 的说明）。
-        assert!(a.chunks_exact(4).all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255));
+        assert!(a.as_chunks::<4>().0.iter().all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255));
     }
 
     /// 星点精灵：确定性 + 中心亮、边缘透明（径向核的形状判据）。
@@ -496,7 +496,7 @@ mod tests {
             assert_eq!(a[(y * n + x) * 4 + 3], 0, "角点 ({x},{y}) 应全透明");
         }
         // RGB 恒白（闪烁只调 tint alpha）。
-        assert!(a.chunks_exact(4).all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255));
+        assert!(a.as_chunks::<4>().0.iter().all(|p| p[0] == 255 && p[1] == 255 && p[2] == 255));
     }
 
     /// 精灵尺寸与常量一致（CPU 侧按半径放大它，两者必须对上）。

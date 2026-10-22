@@ -517,7 +517,7 @@ fn move_window(window: &Window, x: i32, y: i32, client_w: u32, client_h: u32) ->
 /// 统计「与背景色不同」的像素数。字节序 R,G,B,A（见 [`TARGET_FORMAT`]）。
 fn count_non_background(bytes: &[u8]) -> usize {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .filter(|p| {
             let d = |i: usize| (i32::from(p[i]) - i32::from(BG[i])).abs();
             d(0) > BG_TOLERANCE || d(1) > BG_TOLERANCE || d(2) > BG_TOLERANCE
@@ -1727,7 +1727,7 @@ mod tests {
         let n = (PLACEHOLDER_USER_TEX * PLACEHOLDER_USER_TEX * 4) as usize;
         assert_eq!(bytes.len(), n);
         assert!(
-            bytes.chunks_exact(4).all(|p| p[3] == 255),
+            bytes.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
             "占位纹理必须不透明：半透明会让描述符布局测试失真"
         );
     }
@@ -1929,7 +1929,7 @@ mod tests {
         let n = (PLACEHOLDER_USER_TEX * PLACEHOLDER_USER_TEX * 4) as usize;
         assert_eq!(bytes.len(), n);
         assert!(
-            bytes.chunks_exact(4).all(|p| p[3] == 255),
+            bytes.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
             "占位纹理必须不透明：半透明会让描述符布局测试失真"
         );
     }

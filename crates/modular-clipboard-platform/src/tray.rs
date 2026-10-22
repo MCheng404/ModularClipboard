@@ -109,7 +109,10 @@ pub fn icon_rgba() -> Result<Vec<u8>> {
         );
     }
     let mut buf = img.into_raw();
-    for px in buf.chunks_exact_mut(4) {
+    // `as_chunks_mut` 而非 `chunks_exact_mut`：常量 4 用它才是惯用法
+    // （clippy::chunks_exact_to_as_chunks，CI 的新 clippy 会 -D 拒绝）。
+    let (pxs, _) = buf.as_chunks_mut::<4>();
+    for px in pxs {
         px.swap(0, 2); // RGBA -> BGRA
     }
     Ok(buf)
@@ -1573,7 +1576,7 @@ mod tests {
     #[test]
     fn icon_has_visible_pixels() {
         let buf = icon_rgba().unwrap();
-        let opaque = buf.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let opaque = buf.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(opaque > 100, "图标应有可见像素，实际 {opaque}");
         assert!(opaque < ICON_SIZE * ICON_SIZE, "四角应透明，不应铺满");
     }

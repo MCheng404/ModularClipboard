@@ -167,7 +167,7 @@ impl Thumbnail {
             source_size: egui::vec2(self.width as f32, self.height as f32),
             pixels: self
                 .pixels
-                .chunks_exact(4)
+                .as_chunks::<4>().0.iter()
                 .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
                 .collect(),
         }

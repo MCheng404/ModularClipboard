@@ -1135,7 +1135,7 @@ fn pack_color(c: egui::Color32) -> u32 {
 /// 蓝的 `b` 是最大通道，而红/绿的 `b` 是最小通道。
 fn count_thumbnail_like(px: &[u8]) -> usize {
     let mut n = 0usize;
-    for c in px.chunks_exact(4) {
+    for c in px.as_chunks::<4>().0.iter() {
         let (r, g, b) = (c[0] as i32, c[1] as i32, c[2] as i32);
         // 红主导或绿主导，且 `b` 不是最大通道。
         // 阈值 60 容忍驱动的量化偏差（1~2LSB）。
@@ -1176,7 +1176,7 @@ fn classify_dominant(px: &[u8]) -> &'static str {
     }
     let mut blue = 0usize;
     let mut white = 0usize;
-    for c in px.chunks_exact(4) {
+    for c in px.as_chunks::<4>().0.iter() {
         let (r, g, b) = (c[0] as i32, c[1] as i32, c[2] as i32);
         if b > 120 && r < 90 && g < 90 {
             blue += 1;

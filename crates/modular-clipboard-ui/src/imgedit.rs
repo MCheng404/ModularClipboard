@@ -238,7 +238,7 @@ fn apply_color(buf: &mut [u8], t: &ImgTransform) {
         None
     };
 
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0 {
         let (r, g2, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
         // 亮度
         let (mut r, mut g2, mut b) = (
@@ -830,7 +830,7 @@ impl<'a> ImageEditor<'a> {
                     size: [w as usize, h as usize],
                     source_size: egui::vec2(w as f32, h as f32),
                     pixels: px
-                        .chunks_exact(4)
+                        .as_chunks::<4>().0.iter()
                         .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
                         .collect(),
                 };
@@ -1442,7 +1442,7 @@ mod tests {
         // 全部失去意义（"没变"可能只是因为两边都错了）。
         let (px, w, h) = gray8();
         assert_eq!((w, h), (8, 8));
-        assert!(px.chunks_exact(4).all(|p| p == [128, 128, 128, 255]));
+        assert!(px.as_chunks::<4>().0.iter().all(|p| *p == [128u8, 128, 128, 255]));
     }
 
     #[test]
@@ -1477,7 +1477,7 @@ mod tests {
             apply_transforms(&px, w, h, &ImgTransform { saturation: -100.0, ..Default::default() })
                 .unwrap();
         // 完全去色后 R=G=B。
-        for p in out.chunks_exact(4) {
+        for p in out.as_chunks::<4>().0.iter() {
             let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
             assert!(
                 (r - g).abs() <= 1 && (g - b).abs() <= 1,

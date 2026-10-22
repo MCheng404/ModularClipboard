@@ -99,7 +99,9 @@ pub fn capture_due(last: Option<Instant>, now: Instant, interval: Duration) -> b
 /// 把 BitBlt 读回的 BGRA 像素修成可上传形态（纯逻辑）：
 /// alpha 强制 255；`swap_rb` 时顺带交换 R/B（DIB 恒 BGRA → RGBA）。
 pub fn fixup_pixels(buf: &mut [u8], swap_rb: bool) {
-    for px in buf.chunks_exact_mut(4) {
+    // `as_chunks_mut` 而非 `chunks_exact_mut`：常量 4 用它是 clippy 惯用法
+    // （clippy::chunks_exact_to_as_chunks）。两者都丢尾部余数，语义等价。
+    for px in buf.as_chunks_mut::<4>().0 {
         if swap_rb {
             px.swap(0, 2);
         }
