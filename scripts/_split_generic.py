@@ -16,37 +16,27 @@ import re
 import sys
 
 SPEC = {
-    "path": "crates/modular-clipboard-core/src/config.rs",
-    "subdir": "crates/modular-clipboard-core/src/config",
+    "path": "crates/modular-clipboard-gfx/src/frame.rs",
+    "subdir": "crates/modular-clipboard-gfx/src/frame",
     "vis_mode": "keep",
     "mod_vis": "pub",
     "anchors": {
-        "hotkey": "pub struct Hotkey {",
-        "storage": "pub struct StorageConfig {",
-        "layout": "pub struct LayoutConfig {",
-        "ui": "pub struct UiConfig {",
-        "panels": "pub struct TypeRailConfig {",
-        "card_row": "pub struct CardShadowConfig {",
-        "window": "pub enum WindowBackdrop {",
-        "secondary": "pub enum SecondaryTheme {",
-        "theme_params": "pub struct ThemeKnob {",
-        "accent": "pub struct AccentColor {",
-        "mcp": "pub struct ActionRule {",
+        "renderer": "// FrameRenderer",
     },
-    "root_after_anchor": "pub struct Config {",
+    "root_after_anchor": "fn create_command_pool",
+    "root_extra_items": [
+        "StagingArena", "StagingSlice", "ArenaPlan",
+        "DEFAULT_STAGING_CAPACITY", "MIN_STAGING_CAPACITY",
+    ],
+    "force_imports": {
+        "renderer": ["use ash::vk::Handle;"],
+    },
     "tests_anchor": "mod tests {",
     "docs": {
-        "hotkey": "//! 全局热键绑定（两个槽位共用这一结构）与键名规范化。",
-        "storage": "//! 存储与保留策略、剪贴板捕获参数。",
-        "layout": "//! 旧四面板架构的持久化格式（遗留 DTO，仅迁移用）。",
-        "ui": "//! 界面配置主体（窗口 / 主题开关 / 各类子配置的挂载点）。",
-        "panels": "//! 悬浮面板配置：类型过滤栏、搜索面板、停靠位置与几何钳制。",
-        "card_row": "//! 列表卡片阴影与行内元信息（类型 / 大小）配置。",
-        "window": "//! 窗口背景效果（不透明 / 自研磨砂 / 半透明）与窗口位置。",
-        "secondary": "//! 二级主题（纸质 / 护眼绿 / 星空紫 / OLED）及其可调参数。",
-        "theme_params": "//! 二级主题的参数面（旋钮定义 + 取值 + 钳制）。",
-        "accent": "//! 强调色（HSV / 十六进制）与主题令牌覆盖。",
-        "mcp": "//! MCP 服务配置、联动动作规则与「粘贴上一条」模式。",
+        "renderer": "//! `FrameRenderer`：交换链 + 在飞帧槽位 + 录制/呈现。\n"
+                    "//!\n"
+                    "//! 本文件只放 FrameRenderer 本体（含 `FrameSlot` / `Pending` /\n"
+                    "//! `Drop`）；类型定义、纯函数与辅助在根。",
     },
     "asserts": [],
 }
@@ -157,6 +147,7 @@ for n, b in moved.items():
     module_items[n], module_pubs[n] = top_items(b)
 root_all, _ = top_items(lines[root_after:])
 root_all |= top_items(lines[:starts[0]])[0]
+root_all |= set(SPEC.get("root_extra_items", []))
 
 KEEP_PUB = set()
 
@@ -241,6 +232,7 @@ for name in names:
             if uses(text, it):
                 cross.append((other, it))
     header = [SPEC["docs"][name], ""]
+    imps.extend(SPEC.get("force_imports", {}).get(name, []))
     if imps:
         header.extend(imps)
         header.append("")
