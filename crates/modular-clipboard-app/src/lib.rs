@@ -56,13 +56,6 @@ pub struct AppState {
     pub hotkey_error: Option<String>,
 }
 
-impl AppState {
-    /// 展示中的条目数量。
-    pub fn visible_count(&self) -> usize {
-        self.items.len()
-    }
-}
-
 /// 后台捕获线程句柄。
 pub struct CaptureHandle {
     running: Arc<AtomicBool>,
@@ -317,14 +310,6 @@ impl Service {
     pub fn request_quit(&mut self) -> Result<()> {
         if let Backend::Remote(r) = &mut self.backend {
             r.client.command(modular_clipboard_ipc::Command::Quit)?;
-        }
-        Ok(())
-    }
-
-    /// 请求唤起界面进程（用户重复双击图标时由第二个进程转发）。
-    pub fn request_show_window(&mut self) -> Result<()> {
-        if let Backend::Remote(r) = &mut self.backend {
-            r.client.command(modular_clipboard_ipc::Command::ShowWindow)?;
         }
         Ok(())
     }

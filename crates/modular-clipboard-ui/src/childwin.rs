@@ -25,8 +25,10 @@
 //! 一个附属面板起不来不该让整个程序不可用。
 
 use modular_clipboard_gfx::window::{Window, WindowEvent};
+use std::time::Instant;
 
 use crate::card::{Card, CardHost, CardId, CardKind};
+use crate::popup::{RedrawGate, RedrawQuery};
 use crate::workspace::Workspace;
 
 /// 一张卡片对应的独立窗口。
@@ -94,6 +96,12 @@ pub struct ChildWindow<'a> {
     /// 已应用到 Win32 的置顶状态。置顶只在主窗口置顶开关变化或本窗口
     /// 新建时需要调整，用该字段避免每帧重复 `SetWindowPos`。
     topmost: bool,
+    /// 重绘闸门（GFX-02）。
+    ///
+    /// 卡片内容是静态的：用户不操作时主循环仍以 ~125Hz 驱动它，
+    /// 每帧走全量 acquire + paint + present。判据与 `Popup` /
+    /// `SettingsWindow` 完全一致（见 `RedrawGate` 文档）。
+    gate: RedrawGate,
 }
 
 impl<'a> ChildWindow<'a> {
@@ -383,7 +391,13 @@ impl<'a> ChildWindow<'a> {
             ctx,
             title: title.to_string(),
             topmost: false,
+            gate: RedrawGate::default(),
         })
+    }
+
+    /// 指针是否悬停在本窗口上（本项目没有鼠标离开事件，只能轮询）。
+    fn pointer_over(&self) -> bool {
+        modular_clipboard_gfx::chrome::pointer_is_over(self.window.hwnd())
     }
 
     /// 画这个子窗口的一帧。
@@ -428,6 +442,36 @@ impl<'a> ChildWindow<'a> {
             }
         }
 
+        // ---- 重绘闸门（GFX-02）----
+        //
+        // 卡片内容是静态的：用户不操作时，主循环仍以 ~125Hz 驱动到这里，
+        // 每帧走全量 acquire + paint + present。闸门把静止帧整帧跳过。
+        //
+        // 判据与 `Popup` / `SettingsWindow` 一致（见 `RedrawGate` 文档）。
+        // 两个本项目特有的点：
+        // 1. `has_events` 用**排空后**的 `frame_events`——上面已经处理过
+        //    `CloseRequested`，走到这里若有事件就一定要画；
+        // 2. 指针进出靠 `pointer_is_over` 轮询（没有鼠标离开事件），
+        //    少了这条鼠标移出后按钮会一直停在悬停态。
+        //
+        // 新建窗口的 `last_draw` 是 `None` ⇒ 第一帧必定画，不需要额外的
+        // `forced` 标志。
+        //
+        // 跳过时**不更新任何簿记**（`needs_redraw` 只读不写），因此
+        // 「指针离开又回来」这类在一次心跳内往返的变化不会丢帧。
+        let q = RedrawQuery {
+            now: Instant::now(),
+            forced: false,
+            has_events: !frame_events.is_empty(),
+            pointer_over: self.pointer_over(),
+            focused: self.ctx.memory(|m| m.focused()),
+            scale: self.window.scale_factor(),
+            extent: (cw, ch),
+        };
+        if !self.gate.needs_redraw(q) {
+            return Ok(());
+        }
+
         let raw_input = self.events.egui_input(&self.ctx, &frame_events);
         // 子窗口的 Context 也要灌主题（F-33 / UI-P1-1）。
         //
@@ -451,8 +495,18 @@ impl<'a> ChildWindow<'a> {
         // 不上报 HTCAPTION 区鼠标就无法移动窗口。
         let drag = app.drag_regions().to_vec();
         self.window.set_drag_region_multi(&drag);
-        let mut textures_delta = std::mem::take(&mut out.textures_delta);
+        // CAUTION: 用 `DeltaGuard` 而不是手工 `clear()`。
+        //
+        // 早前这里只在**成功路径**末尾 `textures_delta.clear()`，paint
+        // 出错路径直接 `return Err(e)` 漏清。release 下不漏清不 panic，
+        // 而是那一帧的字体图集增量被静默丢弃 ⇒ 子窗口缺字形且**不自愈**
+        // （egui 认为已经传过）。popup / settingswin 都改用守卫兜住所有
+        // 早退路径，这里补齐（三处同一套顺序）。
+        let mut textures_delta = crate::app::DeltaGuard(std::mem::take(&mut out.textures_delta));
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
+        // 记账紧挨「跑完 UI」：`repaint_delay` 取自 `viewport_output`，
+        // 拆走 `shapes`/`textures_delta` 后该字段仍在，顺序无所谓。
+        self.gate.note_drawn(q, crate::renderer::repaint_delay(&out));
         drop(out);
 
         // 尺寸变了先重建，避免用旧 framebuffer 呈现。
@@ -463,6 +517,9 @@ impl<'a> ChildWindow<'a> {
                 width: cw,
                 height: ch,
             })?;
+            // 交换链刚重建、本帧又没画成 ⇒ 图像内容未定义。清掉记账
+            // ⇒ 下一帧必定重绘（同 `Popup` / `SettingsWindow`）。
+            self.gate = RedrawGate::default();
             return Ok(());
         };
         if let Err(e) = self
@@ -473,17 +530,18 @@ impl<'a> ChildWindow<'a> {
                 &primitives,
                 ppp,
                 self.window.scale_factor(),
-                &mut textures_delta,
+                &mut textures_delta.0,
             )
         {
             // CAUTION: 出错必须放弃本帧：否则 `pending` 一直是 `Some`，之后
             // 每次 `acquire()` 都 bail ⇒ **该窗口永久死掉**（黑屏 +
             // 报「上一帧尚未 present」，与真实原因毫无关系）。
+            // `textures_delta` 由 `DeltaGuard` 在返回时清空。
             self.gfx.fr.abandon_frame();
             return Err(e);
         }
         let _ = self.gfx.fr.present(acquired)?;
-        textures_delta.clear();
+        // `textures_delta` 由 `DeltaGuard` 在作用域结束时清空，这里不再手工 clear。
         Ok(())
     }
 

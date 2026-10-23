@@ -48,19 +48,6 @@ pub enum ActionPlan {
     Notice(String),
 }
 
-impl ActionPlan {
-    /// 提取该计划涉及的文本（用于展示与日志）。
-    pub fn payload_text(&self) -> Option<&str> {
-        match self {
-            ActionPlan::OpenExternal(s)
-            | ActionPlan::OpenUrl(s)
-            | ActionPlan::RevealInExplorer(s) => Some(s),
-            ActionPlan::RunCommand { arg, .. } => Some(arg),
-            _ => None,
-        }
-    }
-}
-
 // ---------- 内置动作 ----------
 
 /// 用默认程序打开。适用于文件路径与可打开的文件。
@@ -391,38 +378,6 @@ pub fn dispatch(plan: &ActionPlan) -> anyhow::Result<()> {
     }
 }
 
-/// 内置规则模板，供设置页「一键添加」。
-///
-/// 元组为（名称, 关键词, 动作 id, 命令行模板）。URL 模板一律用
-/// `{selection_urlencoded}`：剪贴板文本进入 URL 前必须 percent-encode。
-pub fn builtin_rule_templates() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
-    vec![
-        (
-            "在浏览器搜索",
-            "",
-            "run_command",
-            "https://www.bing.com/search?q={selection_urlencoded}",
-        ),
-        (
-            "翻译成中文",
-            "",
-            "translate_deepl",
-            "https://www.deepl.com/translator#en/zh/{selection_urlencoded}",
-        ),
-        (
-            "查 GitHub 代码",
-            "",
-            "run_command",
-            "https://github.com/search?q={selection_urlencoded}",
-        ),
-        (
-            "翻译（Google）",
-            "",
-            "run_command",
-            "https://translate.google.com/?sl=auto&tl=zh-CN&text={selection_urlencoded}&op=translate",
-        ),
-    ]
-}
 
 #[cfg(test)]
 mod tests {

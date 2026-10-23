@@ -850,6 +850,7 @@ mod tests {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VIRTUAL_KEY,
         VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_INSERT,
         VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_NEXT, VK_OEM_1, VK_OEM_2,
         VK_OEM_3, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR,
@@ -1136,6 +1137,65 @@ mod tests {
     #[test]
     fn escape_maps_to_egui_escape() {
         assert_eq!(key_from_vk(vk(VK_ESCAPE)), Some(Key::Escape));
+    }
+
+    /// 守门测试：上面 `use` 里导入的**每一个** VK 都必须有映射。
+    ///
+    /// # 为什么单测拦不住漏映射
+    ///
+    /// `key_from_vk` 漏一个 VK，那个键在实机上恒无效；而单测直接注入
+    /// `egui::Event::Key` 会**绕过本函数**，照常绿。逐个 assert 只能覆盖
+    /// 「已经想到的键」，挡不住「以后新增一个 VK 常量却忘了加映射」——
+    /// 那时新键只是静默不工作，没有任何测试会红。
+    ///
+    /// 这个测试把清单本身变成断言对象：往上面的 `use` 里加 VK 时，
+    /// 同步加进下面的数组，否则立刻失败。
+    ///
+    /// CAUTION: 数组必须与 `use` 导入清单**逐项对应**。加导入不加数组，
+    /// 这个测试依然绿——它是约定守门，不是反射。
+    #[test]
+    fn every_imported_vk_has_a_mapping() {
+        let all: [(VIRTUAL_KEY, &str); 32] = [
+            (VK_BACK, "Backspace"),
+            (VK_DELETE, "Delete"),
+            (VK_DOWN, "ArrowDown"),
+            (VK_END, "End"),
+            (VK_ESCAPE, "Escape"),
+            (VK_F1, "F1"),
+            (VK_F24, "F24"),
+            (VK_HOME, "Home"),
+            (VK_INSERT, "Insert"),
+            (VK_LCONTROL, "ControlLeft"),
+            (VK_LEFT, "ArrowLeft"),
+            (VK_LMENU, "AltLeft"),
+            (VK_LSHIFT, "ShiftLeft"),
+            (VK_LWIN, "SuperLeft"),
+            (VK_NEXT, "PageDown"),
+            (VK_OEM_1, ";"),
+            (VK_OEM_2, "/"),
+            (VK_OEM_3, "`"),
+            (VK_OEM_COMMA, ","),
+            (VK_OEM_MINUS, "-"),
+            (VK_OEM_PERIOD, "."),
+            (VK_OEM_PLUS, "="),
+            (VK_PRIOR, "PageUp"),
+            (VK_RCONTROL, "ControlRight"),
+            (VK_RETURN, "Enter"),
+            (VK_RIGHT, "ArrowRight"),
+            (VK_RMENU, "AltRight"),
+            (VK_RSHIFT, "ShiftRight"),
+            (VK_RWIN, "SuperRight"),
+            (VK_SPACE, "Space"),
+            (VK_TAB, "Tab"),
+            (VK_UP, "ArrowUp"),
+        ];
+        for (code, name) in all {
+            assert!(
+                key_from_vk(vk(code)).is_some(),
+                "{name} (VK 0x{:X}) 没有映射：实机上该键会静默失效",
+                vk(code)
+            );
+        }
     }
 
     #[test]

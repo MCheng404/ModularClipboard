@@ -205,14 +205,4 @@ impl Store {
         std::fs::read(path).map_err(Into::into)
     }
 
-    /// 存储统计，用于设置页展示。
-    pub fn stats(&self) -> Result<(i64, i64)> {
-        let (count, bytes): (i64, i64) = self.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(blob_len),0) FROM items",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok((count, bytes))
-    }
-
 }

@@ -22,6 +22,9 @@
 //! - 生命周期由 `UiState::show_settings` 决定，而不是 `Card::host`。
 
 use modular_clipboard_gfx::window::{EventLoop, Window, WindowEvent};
+use std::time::Instant;
+
+use crate::popup::{RedrawGate, RedrawQuery};
 
 /// 设置窗口的标题（同时是类名）。
 const TITLE: &str = "剪贴板设置";
@@ -52,6 +55,13 @@ pub struct SettingsWindow<'a> {
     close_requested: bool,
     /// 已应用到 Win32 的置顶状态（幂等去重，见 [`Self::apply_topmost`]）。
     topmost: bool,
+    /// 重绘闸门（GFX-02）。
+    ///
+    /// 设置窗口是静态界面：开着不动时主循环仍以 ~125Hz 驱动它，
+    /// 每帧走全量 acquire + paint + present。闸门按 popup 同款判据
+    /// （事件 / 指针进出 / 焦点 / 尺寸 DPI / egui 自请重绘 / 心跳）
+    /// 把静止帧整帧跳过。
+    gate: RedrawGate,
 }
 
 impl<'a> SettingsWindow<'a> {
@@ -135,7 +145,16 @@ impl<'a> SettingsWindow<'a> {
             was_open: false,
             close_requested: false,
             topmost: false,
+            gate: RedrawGate::default(),
         })
+    }
+
+    /// 指针是否悬停在本窗口上。
+    ///
+    /// 本项目没有「鼠标离开」事件，悬停只能靠轮询（同
+    /// [`crate::popup::Popup::pointer_over`]）。
+    fn pointer_over(&self) -> bool {
+        modular_clipboard_gfx::chrome::pointer_is_over(self.window.hwnd())
     }
 
     /// 应用置顶状态。幂等：状态没变就不调 `SetWindowPos`。
@@ -280,6 +299,31 @@ impl<'a> SettingsWindow<'a> {
             self.close_requested = true;
         }
 
+        // ---- 重绘闸门（GFX-02）----
+        //
+        // 判据与 `Popup` 完全一致（见 `RedrawGate` 的文档）。两条本项目
+        // 特有的注意点：
+        //
+        // 1. `has_events` 必须用**排空后**的 `frame_events`——空则表示本帧
+        //    没有任何用户输入；
+        // 2. 指针进出只能靠 `pointer_is_over` 轮询（没有鼠标离开事件），
+        //    少了这条，鼠标移出后按钮会一直停在悬停态。
+        //
+        // 跳过时**不更新任何簿记**（`needs_redraw` 只读不写），因此
+        // 「指针离开又回来」这类在一次心跳内往返的变化不会丢帧。
+        let q = RedrawQuery {
+            now: Instant::now(),
+            forced: just_opened,
+            has_events: !frame_events.is_empty(),
+            pointer_over: self.pointer_over(),
+            focused: self.ctx.memory(|m| m.focused()),
+            scale: self.window.scale_factor(),
+            extent: (cw, ch),
+        };
+        if !self.gate.needs_redraw(q) {
+            return Ok(false);
+        }
+
         let raw_input = self.events.egui_input(&self.ctx, &frame_events);
         // 每帧把主窗口的调色板同步到设置窗口自己的 `egui::Context`。
         //
@@ -298,6 +342,9 @@ impl<'a> SettingsWindow<'a> {
         // 而是字体图集增量被静默丢弃 ⇒ 设置窗空白/缺字形且不自愈）。
         let mut textures_delta = crate::app::DeltaGuard(std::mem::take(&mut out.textures_delta));
         let primitives = self.ctx.tessellate(std::mem::take(&mut out.shapes), ppp);
+        // 记账紧挨「跑完 UI」：`repaint_delay` 取自 `viewport_output`，
+        // 拆走 `shapes`/`textures_delta` 后该字段仍在，顺序其实无所谓。
+        self.gate.note_drawn(q, crate::renderer::repaint_delay(&out));
         drop(out);
 
         // 尺寸变了先重建，否则会用旧 framebuffer 呈现。
@@ -309,6 +356,10 @@ impl<'a> SettingsWindow<'a> {
                 width: cw,
                 height: ch,
             })?;
+            // 交换链刚重建、本帧又没画成 ⇒ 图像内容是**未定义的**。
+            // 闸门若按「刚画过」跳过下一帧，窗口会黑着/花着最多一个
+            // 心跳间隔。清掉记账 ⇒ 下一帧必定重绘（同 `Popup`）。
+            self.gate = RedrawGate::default();
             return Ok(false);
         };
         // 覆盖层打开时走**自研 GPU 模糊**路径：设置窗口自身的内容先

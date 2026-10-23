@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use egui::{Color32, Context, Id, Rect, emath::lerp};
+use egui::{Color32, Context, Id, emath::lerp};
 
 /// 缓动函数。
 ///
@@ -190,15 +190,6 @@ pub fn tween_color(ctx: &Context, id: Id, target: Color32, dur: Duration) -> Col
     let b = tween_f32(ctx, id.with("b"), b as f32, dur, Ease::OutCubic) as u8;
     let a = tween_f32(ctx, id.with("a"), a as f32, dur, Ease::OutCubic) as u8;
     Color32::from_rgba_premultiplied(r, g, b, a)
-}
-
-/// 矩形补间：四边各自补间。用于面板滑入、选中块位移。
-pub fn tween_rect(ctx: &Context, id: Id, target: Rect, dur: Duration, ease: Ease) -> Rect {
-    let x0 = tween_f32(ctx, id.with("x0"), target.min.x, dur, ease);
-    let y0 = tween_f32(ctx, id.with("y0"), target.min.y, dur, ease);
-    let x1 = tween_f32(ctx, id.with("x1"), target.max.x, dur, ease);
-    let y1 = tween_f32(ctx, id.with("y1"), target.max.y, dur, ease);
-    Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
 }
 
 /// 清空某 id 的补间状态（控件销毁时调用，避免注册表无限增长）。

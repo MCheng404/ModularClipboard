@@ -43,13 +43,6 @@ impl Store {
     }
 
 
-    pub fn rename_group(&self, id: i64, name: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE groups SET name = ?2 WHERE id = ?1", params![id, name])?;
-        Ok(())
-    }
-
-
     /// 删除分组。组内条目不删除，`group_id` 被置空（外键 ON DELETE SET NULL）。
     pub fn delete_group(&mut self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM groups WHERE id = ?1", params![id])?;
