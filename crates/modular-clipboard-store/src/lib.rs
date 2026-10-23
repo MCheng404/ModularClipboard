@@ -4,8 +4,11 @@
 //! 1. 大载荷（图片、大段文本）不进数据库，单独存文件，库中只留引用。
 //!    这让 SQLite 始终保持在几十 MB 量级，查询不会因大 blob 变慢。
 //! 2. 文本类条目同步写入 FTS5 虚表，支持中文全文检索与前缀匹配。
-//! 3. 所有写操作走单连接，由上层保证串行；连接本身不开WAL，
-//!    因为剪贴板写入本身是低频操作，WAL 的收益不足以抵消复杂度。
+//! 3. 所有写操作走单连接，由上层保证串行。
+//!    落盘连接的 `journal_mode=WAL` + `synchronous=NORMAL`（见
+//!    `open.rs` 的 `open()`）：WAL 让读不被写阻塞，`NORMAL` 在 WAL 下
+//!    只丢「最后一次事务」而不丢一致性，对剪贴板这种可重建数据够用。
+//!    `open_in_memory()` 走内存库，两者都不该被这条影响。
 //!
 //! # 模块地图
 //!
@@ -711,6 +714,36 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|i| i.pinned), "置顶条目必须保留");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 巨大的 `max_items` 必须被理解为「不限制」，而不是删光全部条目。
+    ///
+    /// `max_items` 是 `usize`（64 位），直接 `as i64` 在 ≥ 2^63 时回绕成
+    /// 负数，`unpinned_keep` 被 `.max(0)` 兜成 0 ⇒「保留 0 条」。
+    /// 用户手填一个大数（或未来配置项改宽）就会静默丢光未置顶历史。
+    #[test]
+    fn retention_does_not_wipe_when_max_items_overflows_i64() {
+        for huge in [usize::MAX, 1usize << 63, (1usize << 63) + 12345] {
+            let (mut store, base) = temp_store();
+            store.set_payload_limit(1 << 20);
+            for i in 0..5 {
+                let item = ClipItem::new(
+                    ClipKind::Text,
+                    format!("h{i}"),
+                    format!("item {i}"),
+                    "a".into(),
+                );
+                store.insert(item, vec![0u8; 4]).unwrap();
+            }
+            let cfg = StorageConfig {
+                max_items: Some(huge),
+                ..Default::default()
+            };
+            store.enforce_retention(&cfg).unwrap();
+            let all = store.list(100, 0, None).unwrap();
+            assert_eq!(all.len(), 5, "max_items={huge} 应视为不限制，却只剩 {} 条", all.len());
+            let _ = std::fs::remove_dir_all(base);
+        }
     }
 
     #[test]

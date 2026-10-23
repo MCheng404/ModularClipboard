@@ -43,7 +43,6 @@ impl Store {
         Ok(id)
     }
 
-
     fn row_to_item(row: &Row<'_>) -> rusqlite::Result<ClipItem> {
         let kind_str: String = row.get(1)?;
         let blob_file: Option<String> = row.get(4)?;
@@ -72,11 +71,9 @@ impl Store {
         })
     }
 
-
     const SELECT_COLS: &'static str =
         "id, kind, hash, preview, blob_file, blob_len, img_w, img_h,
          source_app, created_at, pinned, group_id, use_count, last_used_at";
-
 
     pub fn get(&self, id: EntryId) -> Result<Option<ClipItem>> {
         let sql = format!("SELECT {} FROM items WHERE id = ?1", Self::SELECT_COLS);
@@ -86,7 +83,6 @@ impl Store {
             .optional()?;
         Ok(item)
     }
-
 
     /// 分页读取。`group` 为 `None` 时取全部（含未分组）。
     pub fn list(&self, limit: usize, offset: usize, group: Option<GroupFilter>) -> Result<Vec<ClipItem>> {
@@ -116,7 +112,6 @@ impl Store {
         let rows = stmt.query_map(params_from_iter(args.iter().map(|b| b.as_ref())), Self::row_to_item)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
-
 
     /// 全文搜索。空查询返回按时间倒序的列表。
     ///
@@ -161,21 +156,22 @@ impl Store {
         }
     }
 
-
     /// LIKE 回退查询。中文场景下 FTS 失效时的兜底。
     pub(crate) fn like_search(&self, q: &str, limit: usize) -> Result<Vec<ClipItem>> {
         let pattern = format!("%{}%", Self::escape_like(q));
         let sql = format!(
+            // `id DESC` 是并列兜底，与 `list()` / FTS 路径保持一致：
+            // `created_at` 只到毫秒，同一毫秒插入的多条时间戳完全相同，
+            // 不加兜底时排序结果未定义（同一查询两次调用可能给不同顺序）。
             "SELECT {} FROM items
              WHERE preview LIKE ?1 ESCAPE '\\'
-             ORDER BY pinned DESC, created_at DESC LIMIT ?2",
+             ORDER BY pinned DESC, created_at DESC, id DESC LIMIT ?2",
             Self::SELECT_COLS
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![pattern, limit as i64], Self::row_to_item)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
-
 
     /// LIKE 查询里匹配「字面量」而不是「通配符」。
     ///
@@ -198,7 +194,6 @@ impl Store {
         out
     }
 
-
     /// 读取载荷字节。
     pub fn load_payload(&self, item: &ClipItem) -> Result<Vec<u8>> {
         let p = item
@@ -209,9 +204,6 @@ impl Store {
             .ok_or_else(|| anyhow::anyhow!("载荷文件名不合法：{}", p.file))?;
         std::fs::read(path).map_err(Into::into)
     }
-
-    // ---------- 更新与删除 ----------
-
 
     /// 存储统计，用于设置页展示。
     pub fn stats(&self) -> Result<(i64, i64)> {

@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, RegisterClassExW, SendMessageW,
     SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_COMMAND, WM_HOTKEY, WM_NULL, WM_QUIT, WNDCLASSEXW, HWND_MESSAGE, WS_EX_TOOLWINDOW,
+    WM_HOTKEY, WM_NULL, WM_QUIT, WNDCLASSEXW, HWND_MESSAGE, WS_EX_TOOLWINDOW,
     WS_POPUP,
 };
 use windows::core::{HSTRING, PCWSTR};
@@ -419,12 +419,23 @@ unsafe extern "system" fn tray_wnd_proc(
             }
             LRESULT(1)
         }
-        WM_COMMAND => {
-            if let Some(ev) = command_to_event(wparam.0) {
-                emit(ev);
-            }
-            LRESULT(0)
-        }
+        // CAUTION: 这里**不处理** `WM_COMMAND`。
+        //
+        // 两条菜单路径（托盘右键 `show_context_menu` 与迷你面板
+        // `show_mini_menu`）都用 `TPM_RETURNCMD` 让菜单**直接返回**命令
+        // id，命令根本不会以 `WM_COMMAND` 的形式投递到本窗口（见
+        // `show_context_menu` 里对 TPM_RETURNCMD 的注释）。
+        //
+        // 因此处理 `WM_COMMAND` 对合法流量是死分支，却给同完整性进程
+        // 开了一道门：类名是编译期固定串，任何进程 `FindWindowW` 拿到
+        // 句柄后 `PostMessageW(WM_COMMAND, 0x1003)` 就能让常驻进程退出、
+        // `0x1002` 清空历史、`0x1001` 弹窗口。`WM_COMMAND`(0x0111) 低于
+        // `WM_USER`，UIPI 也不过滤它（SEC-04）。
+        //
+        // 删掉这个分支不改变任何正常行为，只是让「控制平面」不再暴露在
+        // 桌面全局命名空间里。`command_to_event` 仍被 TPM_RETURNCMD 路径
+        // 使用，不是死代码。
+        //
         // 必须原样转发 DefWindowProcW：改动消息流会导致
         // CreateWindowExW 报0x8007007E（MEMORY.md 第 26 条）。
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },

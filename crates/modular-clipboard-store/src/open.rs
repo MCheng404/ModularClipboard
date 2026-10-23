@@ -18,7 +18,6 @@ impl Store {
         )
     }
 
-
     /// 在**指定**数据目录下打开或创建库。
     ///
     /// 这是 `--data-dir` 真正落地的地方：数据库与载荷目录都由传入的
@@ -37,7 +36,6 @@ impl Store {
         )
     }
 
-
     /// 数据目录（db 文件所在目录）。
     ///
     /// 关于页「数据目录」超链接要展示并打开它；`--data-dir` 自定义
@@ -47,7 +45,6 @@ impl Store {
             .parent()
             .expect("db_path 总带文件名，parent 恒存在")
     }
-
 
     /// 在内存中打开，仅用于降级模式与测试。
     ///
@@ -90,7 +87,6 @@ impl Store {
         Ok(store)
     }
 
-
     /// 指定路径打开。父目录会自动创建。
     pub fn open(db_path: &Path, blob_dir: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
@@ -115,7 +111,6 @@ impl Store {
         store.migrate()?;
         Ok(store)
     }
-
 
     /// 建表与索引。幂等：重复调用安全。
     fn migrate(&self) -> Result<()> {
@@ -182,9 +177,6 @@ impl Store {
         )?;
         Ok(())
     }
-
-    // ---------- 条目写入 ----------
-
 
     pub fn path(&self) -> &Path {
         self.db_path.as_path()

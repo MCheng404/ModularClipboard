@@ -35,9 +35,6 @@ impl Store {
         Ok(())
     }
 
-    // ---------- 保留策略 ----------
-
-
     /// 按数量与容量双重上限淘汰。置顶条目永不淘汰。
     /// 返回被删除的条目数。
     pub fn enforce_retention(&mut self, cfg: &StorageConfig) -> Result<usize> {
@@ -49,7 +46,12 @@ impl Store {
             let pinned_count: i64 =
                 self.conn
                     .query_row("SELECT COUNT(*) FROM items WHERE pinned = 1", [], |r| r.get(0))?;
-            let unpinned_keep = (max_items as i64 - pinned_count).max(0);
+            // CAUTION: 不能直接 `max_items as i64`。`max_items` 是 `usize`
+            // （64 位宽），配置里填 ≥ 2^63 时强转会回绕成**负数**，
+            // `unpinned_keep` 被 `.max(0)` 兜成 0，于是「保留 0 条」⇒
+            // 删光全部未置顶条目。`i64::MAX` 在这里的语义就是「不限制」。
+            let cap = i64::try_from(max_items).unwrap_or(i64::MAX);
+            let unpinned_keep = (cap - pinned_count).max(0);
 
             let ids: Vec<EntryId> = {
                 let mut stmt = self.conn.prepare(
@@ -104,7 +106,6 @@ impl Store {
         Ok(removed)
     }
 
-
     /// 启动时清理孤儿载荷文件（主库中无对应记录）。
     pub fn gc_orphan_blobs(&self) -> Result<usize> {
         let mut referenced: std::collections::HashSet<String> =
@@ -130,7 +131,5 @@ impl Store {
         }
         Ok(removed)
     }
-
-    // ---------- 分组 ----------
 
 }

@@ -29,7 +29,6 @@ impl Store {
         self.insert_with_dims(item, payload, None)
     }
 
-
     /// 同 [`Self::insert`]，但由调用方提供图片尺寸。
     ///
     /// # 为什么需要这个入口
@@ -81,8 +80,13 @@ impl Store {
             _ => None,
         };
 
-        // DB 事务失败时清掉刚写的载荷文件：否则它成为孤儿，要等下次启动的
-        // gc_orphan_blobs 才回收（期间反复失败会累积）。
+        // DB 事务失败时尽量清掉刚写的载荷文件，免得它成为孤儿、等下次启动的
+        // gc_orphan_blobs 才回收（反复失败会累积）。
+        //
+        // CAUTION: 载荷名是 `{hash}.bin`，与同哈希的其它条目**共享**。
+        // 早先这里无条件 `remove_file`，等于「insert 失败就连带摧毁别人的
+        // 载荷」——曾表现为「某次插入失败后，另一条历史读到 Err(2)」的假失败
+        // （DL-02）。现在按引用计数删，与 [`Self::delete`] 同一规矩。
         let written_file = payload_ref.as_ref().map(|p| p.file.clone());
         let inserted = (|| -> Result<EntryId> {
             let tx = self.conn.transaction()?;
@@ -129,7 +133,21 @@ impl Store {
             Ok(id) => id,
             Err(e) => {
                 if let Some(f) = written_file {
-                    let _ = std::fs::remove_file(self.blob_dir.join(f));
+                    // 只有**确认没有其它条目引用**时才删（DF-01 同款引用计数）。
+                    // 查询本身失败 ⇒ 保守不删，留给 gc_orphan_blobs 回收；
+                    // 反过来「查不到就删」会重复 DL-02 那个坑。
+                    let remaining: Option<i64> = self
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
+                            params![f],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .unwrap_or(None);
+                    if remaining == Some(0) {
+                        let _ = std::fs::remove_file(self.blob_dir.join(f));
+                    }
                 }
                 return Err(e);
             }
@@ -139,7 +157,6 @@ impl Store {
         item.payload = payload_ref;
         Ok(item)
     }
-
 
     /// 标记条目被再次使用：置顶时间戳回移但不新增条目。
     pub fn touch(&self, id: EntryId) -> Result<()> {
@@ -151,7 +168,6 @@ impl Store {
         Ok(())
     }
 
-
     /// 刷新条目的时间戳，让它回到列表顶部（重复内容复用时使用）。
     pub fn bump_to_top(&self, id: EntryId) -> Result<()> {
         self.conn.execute(
@@ -162,22 +178,17 @@ impl Store {
         Ok(())
     }
 
-    // ---------- 条目读取 ----------
-
-
     pub fn set_pinned(&self, id: EntryId, pinned: bool) -> Result<()> {
         self.conn
             .execute("UPDATE items SET pinned = ?2 WHERE id = ?1", params![id, pinned as i64])?;
         Ok(())
     }
 
-
     pub fn move_to_group(&self, id: EntryId, group: Option<i64>) -> Result<()> {
         self.conn
             .execute("UPDATE items SET group_id = ?2 WHERE id = ?1", params![id, group])?;
         Ok(())
     }
-
 
     /// 删除条目，同时清理 FTS 与载荷文件。
     pub fn delete(&mut self, id: EntryId) -> Result<()> {
@@ -235,7 +246,6 @@ impl Store {
         }
         Ok(())
     }
-
 
     /// 就地更新条目内容（编辑落地，2026-10-21）。
     ///
@@ -359,7 +369,6 @@ impl Store {
         }
         Ok(())
     }
-
 
     /// 批量删除（PF-7）：N 次 [`Self::delete`] 是 N 个独立事务（各带一次
     /// WAL 提交），保留策略一次淘汰上百条时成串同步 IO。这里合并为
