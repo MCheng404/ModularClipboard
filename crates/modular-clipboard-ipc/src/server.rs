@@ -15,10 +15,19 @@ pub struct Server {
 impl Server {
     /// 绑定默认管道名。
     pub fn bind() -> anyhow::Result<Self> {
+        Self::bind_named(&transport::pipe_name())
+    }
+
+    /// 绑定**指定**管道名。
+    ///
+    /// 默认名是固定串（`ModularClipboard.Daemon.v1`），真实常驻进程会占住它；
+    /// 集成测试要起一个自己的服务端，就必须换名字，否则必然撞车
+    /// （表现为 `WIN32_ERROR(5)` 拒绝访问 + 客户端 `ERROR_PIPE_BUSY`）。
+    pub fn bind_named(name: &str) -> anyhow::Result<Self> {
         #[cfg(windows)]
         {
             Ok(Self {
-                inner: transport::PipeServer::bind(&transport::pipe_name())?,
+                inner: transport::PipeServer::bind(name)?,
             })
         }
         #[cfg(not(windows))]

@@ -21,11 +21,17 @@ impl Client {
     /// 连接常驻进程。`timeout` 是给对方的启动缓冲（见
     /// [`transport::connect_retry`]）。
     pub fn connect(timeout: std::time::Duration) -> anyhow::Result<Self> {
+        Self::connect_named(&transport::pipe_name(), timeout)
+    }
+
+    /// 连接**指定**管道名的服务端（与 `Server::bind_named` 配对，
+    /// 供集成测试起一个不与真实常驻进程抢名字的实例）。
+    pub fn connect_named(name: &str, timeout: std::time::Duration) -> anyhow::Result<Self> {
         #[cfg(windows)]
-        let stream = transport::connect_retry(&transport::pipe_name(), timeout)?;
+        let stream = transport::connect_retry(name, timeout)?;
         #[cfg(not(windows))]
         let stream = {
-            let _ = timeout;
+            let _ = (name, timeout);
             anyhow::bail!("命名管道仅在 Windows 上可用")
         };
         Ok(Self { stream })

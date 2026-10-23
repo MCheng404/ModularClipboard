@@ -12,6 +12,21 @@ use modular_clipboard_core::{ClipItem, Config, DropStats};
 use modular_clipboard_ipc::protocol::{Command, DataVersion, Request, Response, Snapshot};
 use modular_clipboard_ipc::{Client, Server};
 
+/// 每次运行独占的管道名。
+///
+/// CAUTION: 不能用默认名 `ModularClipboard.Daemon.v1`——那是**真实常驻
+/// 进程**占着的固定串。测试进程去 bind 会拿到 `WIN32_ERROR(5)`（拒绝访问），
+/// 客户端连过去则是 `ERROR_PIPE_BUSY`，于是这条测试在「开发机上开着
+/// 常驻进程」时必然假失败。名字带 pid + 原子序号 + 随机分量（同
+/// `store::open_in_memory` 的 SEC-005 做法），并行跑多个测试实例也不撞。
+fn unique_pipe_name() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    use std::hash::{BuildHasher, RandomState};
+    let rand = RandomState::new().hash_one((std::process::id(), n));
+    format!(r"\\.\pipe\ModularClipboard.Test.{}-{n}-{rand:016x}", std::process::id())
+}
+
 fn snapshot(version: DataVersion) -> Snapshot {
     Snapshot {
         version,
@@ -33,7 +48,8 @@ fn snapshot(version: DataVersion) -> Snapshot {
 /// 一次完整的「界面连上来、握手、同步、下命令、断开」。
 #[test]
 fn client_and_server_talk_over_a_real_pipe() {
-    let server = Server::bind().expect("绑定管道");
+    let pipe = unique_pipe_name();
+    let server = Server::bind_named(&pipe).expect("绑定管道");
     let handle = std::thread::spawn(move || {
         let mut conn = server.accept().expect("接受连接");
         loop {
@@ -61,7 +77,8 @@ fn client_and_server_talk_over_a_real_pipe() {
         }
     });
 
-    let mut client = Client::connect(std::time::Duration::from_secs(5)).expect("连接常驻进程");
+    let mut client = Client::connect_named(&pipe, std::time::Duration::from_secs(5))
+        .expect("连接常驻进程");
     let snap = client.hello().expect("握手");
     assert_eq!(snap.version, 1);
     assert_eq!(snap.items.len(), 1);

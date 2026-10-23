@@ -847,7 +847,8 @@ mod tests {
     use egui::emath::Vec2;
     use egui::{MouseWheelUnit, TouchPhase};
     use std::time::{Duration, Instant};
-    use windows::Win32::Foundation::{POINT, GetCursorPos};
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_INSERT,
         VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_NEXT, VK_OEM_1, VK_OEM_2,
