@@ -910,4 +910,67 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&base);
     }
+    /// DL-01：超限只存元数据的条目，必须能在上限调大后**补回**载荷。
+    ///
+    /// 这是去重链路的一环：用户把「单条载荷上限」调大后再次复制同样内容，
+    /// 去重会命中旧条目而不是新插入一条。若旧条目的 `blob_file` 还是 NULL，
+    /// 它会永远停在「看得见、复制必败」——没有自愈路径。
+    #[test]
+    fn backfill_payload_repairs_an_over_limit_entry() {
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(4);
+        // hash 必须用**载荷的真指纹**——真实调用方（去重命中）传的就是它，
+        // `backfill_payload` 也会校验这一点（防止污染同哈希共享文件）。
+        let h = fingerprint(b"0123456789");
+        let item = ClipItem::new(ClipKind::Text, h, "0123456789".into(), "app".into());
+        let saved = store.insert(item, b"0123456789".to_vec()).unwrap();
+        assert!(saved.payload.is_none(), "前置条件：超限载荷未落盘");
+        // 补之前，读载荷必须失败（这正是用户遇到的「复制必败」）。
+        assert!(store.load_payload(&saved).is_err(), "无载荷时读应失败");
+
+        // 上限调大 ⇒ 可以补。
+        store.set_payload_limit(1 << 20);
+        let did = store.backfill_payload(saved.id, b"0123456789", None).unwrap();
+        assert!(did, "上限已放宽，应当补回载荷");
+        // CAUTION: 必须重新 get——`saved` 是 insert 返回的本地副本，
+        // 它的 `payload` 字段不会随后端的 UPDATE 变化。
+        let fresh = store.get(saved.id).unwrap().unwrap();
+        assert_eq!(
+            store.load_payload(&fresh).unwrap(),
+            b"0123456789".to_vec(),
+            "补回后必须读得到"
+        );
+
+        // 幂等：第二次补应报告「没做事」，且不破坏已有载荷。
+        let again = store.backfill_payload(saved.id, b"9999999999", None).unwrap();
+        assert!(!again, "已有载荷时不应重复补");
+        let fresh2 = store.get(saved.id).unwrap().unwrap();
+        assert_eq!(store.load_payload(&fresh2).unwrap(), b"0123456789".to_vec());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// DL-01 的另一半：上限**仍然太小**时不许补。
+    /// 补数据不能成为绕过配置的旁路。
+    #[test]
+    fn backfill_payload_respects_the_current_limit() {
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(4);
+        let item = ClipItem::new(ClipKind::Text, "h3".into(), "abcdefghij".into(), "app".into());
+        let saved = store.insert(item, b"abcdefghij".to_vec()).unwrap();
+        assert!(saved.payload.is_none());
+
+        // 上限仍是 4 ⇒ 不补，且不能留下没人引用的载荷文件。
+        let did = store.backfill_payload(saved.id, b"abcdefghij", None).unwrap();
+        assert!(!did, "上限未放宽时不得补");
+        assert!(store.load_payload(&saved).is_err());
+        let leftover: Vec<_> = std::fs::read_dir(base.join(BLOB_DIR_NAME))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "bin").unwrap_or(false))
+            .collect();
+        assert!(leftover.is_empty(), "不补时不应写出 .bin，实际 {:?}", leftover.len());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
 }

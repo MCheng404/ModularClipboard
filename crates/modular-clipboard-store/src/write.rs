@@ -15,7 +15,7 @@ use rusqlite::params;
 use rusqlite::params_from_iter;
 
 use super::Store;
-use super::{fingerprint};
+use super::{fingerprint, parse_kind};
 
 use super::blobs::{compute_dims, safe_blob_path, write_blob_atomic};
 
@@ -368,6 +368,82 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// 给「当年因超限只存了元数据」的条目**补上载荷**（DL-01）。
+    ///
+    /// # 为什么需要这个入口
+    ///
+    /// 去重命中时只调 [`Self::bump_to_top`] 是不够的：若原条目插入时
+    /// 载荷超过**当时**的上限，它的 `blob_file` 恒为 `NULL`——列表里
+    /// 看得见（有 preview），但 [`Self::load_payload`] 必失败。更糟的是
+    /// 用户把上限调大后再次复制同样内容**也修不好它**：去重挡住了新插入，
+    /// 这条条目会永远停在「看得到、复制必败」的状态，且没有任何自愈路径。
+    ///
+    /// # 为什么用 `WHERE blob_file IS NULL` 而不是先读后写
+    ///
+    /// 条件由 SQL 自己保证，省掉一次读；重复调用（多次复制同一内容）
+    /// 天然幂等——第二起 `execute` 影响 0 行，直接返回 `false`。
+    ///
+    /// # 写文件但不被采纳时为什么不删文件
+    ///
+    /// 文件名是 `{hash}.bin`，与同哈希的其它条目**共享**。删它可能摧毁
+    /// 别人的载荷（DL-02 同款坑），所以留给 `gc_orphan_blobs` 回收。
+    pub fn backfill_payload(
+        &mut self,
+        id: EntryId,
+        bytes: &[u8],
+        dims: Option<(u32, u32)>,
+    ) -> Result<bool> {
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        // 上限仍是硬闸：不因为「补数据」就绕过配置。
+        if bytes.len() as u64 > self.current_payload_limit() {
+            return Ok(false);
+        }
+        // 文件名必须由库里的 hash 决定，而不是调用方给的——否则会写出一个
+        // 谁也不引用的文件，还可能撞上别人的 `{hash}.bin`。
+        // kind 也一并读出来：尺寸嗅探只对图片有意义（见 `compute_dims`）。
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT hash, kind FROM items WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((hash, kind_str)) = row else { return Ok(false) };
+        // CAUTION: 文件名是 `{hash}.bin`，与同哈希的其它条目**共享**。
+        // 若传入内容与库里的 hash 不符，写进去会同时摧毁所有这些条目的
+        // 载荷（DF-01 同款污染）。正常调用方（去重命中）传的必然是同一份
+        // 内容，但这里不信任调用方——先算指纹再决定写不写。
+        if fingerprint(bytes) != hash {
+            tracing::warn!(
+                id,
+                "回填载荷与条目 hash 不一致，拒绝写入（会污染同哈希共享文件）"
+            );
+            return Ok(false);
+        }
+        // 与 insert 同款：显式尺寸优先，缺失才嗅探（图片载荷是裸 RGBA8，
+        // 嗅探必然失败，尺寸只能由捕获侧给）。
+        let dims = dims
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .or_else(|| compute_dims(&parse_kind(&kind_str), bytes));
+        let name = format!("{hash}.bin");
+        write_blob_atomic(&self.blob_dir, &name, bytes)?;
+        let n = self.conn.execute(
+            "UPDATE items SET blob_file = ?2, blob_len = ?3, img_w = ?4, img_h = ?5
+             WHERE id = ?1 AND blob_file IS NULL",
+            params![
+                id,
+                name,
+                bytes.len() as i64,
+                dims.map(|d| d.0 as i64),
+                dims.map(|d| d.1 as i64),
+            ],
+        )?;
+        Ok(n > 0)
     }
 
     /// 批量删除（PF-7）：N 次 [`Self::delete`] 是 N 个独立事务（各带一次

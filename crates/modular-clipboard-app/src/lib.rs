@@ -901,15 +901,47 @@ impl LocalBackend {
         // 就地算好后转调本函数。
         let preview = build_preview(&payload);
 
+        // 图片尺寸透传：载荷是裸 RGBA8（arboard 解码 CF_DIBV5 的产物），
+        // store 侧的格式嗅探对它无效，只能由捕获侧给（见 CapturedPayload::dims）。
+        //
+        // 文件型条目（`ClipKind::Files`）走不了这条链路——它的载荷是
+        // **路径列表**，图在磁盘上。若第一个文件是图片，这里顺手读一下
+        // 文件头补上尺寸：UI 的列表行高（`row_height_for`）只认
+        // `payload.dims`，缺了它图片行会先按文本行排、解码出真实尺寸后
+        // 又跳一次高度（列表抖动）。
+        //
+        // 算在去重判断**之前**：去重命中的载荷回填（DL-01）也要用同一份
+        // dims。这里只借 `payload.dims` / `payload.files`，不移动 `bytes`，
+        // 所以后面 `insert_with_dims(item, payload.bytes, dims)` 仍成立。
+        let dims = payload
+            .dims
+            .filter(|(w, h)| *w > 0 && *h > 0)
+            .or_else(|| first_image_file_dims(&payload.files));
+
         // 去重：历史中已有相同内容（无论何时复制的）就不再新增，
         // 只把原条目刷新时间、顶到列表顶部——「复制相同内容」不应
         // 产生一条又一条的重复记录。
         if cfg.capture.dedup {
             match self.store.find_by_hash(&hash) {
                 Ok(Some(existing)) => {
+                    // DL-01：只 `bump_to_top` 是不够的。原条目可能在插入时
+                    // 因**当时**的上限太小而 `blob_file = NULL`——列表里看得见
+                    // （有 preview），但 `load_payload` 必失败。去重又挡住了
+                    // 新插入，于是用户把上限调大后再次复制同样内容也修不好它，
+                    // 这条条目会永远停在「看得到、复制必败」。这里主动补一次。
+                    //
+                    // 补失败不影响去重本身（bump_to_top 照做）：补不上只是
+                    // 维持原状，比丢掉「刷新到顶部」这个用户可感知的行为好。
+                    let backfilled = self
+                        .store
+                        .backfill_payload(existing, &payload.bytes, dims)
+                        .unwrap_or(false);
                     if self.store.bump_to_top(existing).is_ok() {
                         self.reload_list(state);
                         state.stats.duplicate += 1;
+                        if backfilled {
+                            tracing::debug!(id = existing, "去重命中：补回缺失的载荷（DL-01）");
+                        }
                         return true;
                     }
                 }
@@ -926,19 +958,7 @@ impl LocalBackend {
 
         let item = ClipItem::new(payload.kind, hash, preview, source_app);
 
-        // 图片尺寸透传：载荷是裸 RGBA8（arboard 解码 CF_DIBV5 的产物），
-        // store 侧的格式嗅探对它无效，只能由捕获侧给（见 CapturedPayload::dims）。
-        //
-        // 文件型条目（`ClipKind::Files`）走不了这条链路——它的载荷是
-        // **路径列表**，图在磁盘上。若第一个文件是图片，这里顺手读一下
-        // 文件头补上尺寸：UI 的列表行高（`row_height_for`）只认
-        // `payload.dims`，缺了它图片行会先按文本行排、解码出真实尺寸后
-        // 又跳一次高度（列表抖动）。
-        // 先取字段再移动 bytes，避免部分移动。
-        let dims = payload
-            .dims
-            .filter(|(w, h)| *w > 0 && *h > 0)
-            .or_else(|| first_image_file_dims(&payload.files));
+        // dims 已在上面算好（去重回滚路径也要用），这里直接用。
         match self.store.insert_with_dims(item, payload.bytes, dims) {
             Ok(saved) => {
                 tracing::debug!(id = saved.id, kind = ?saved.kind, "新条目已入库");
