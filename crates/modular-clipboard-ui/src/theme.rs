@@ -298,22 +298,28 @@ macro_rules! palette {
                 }
             }
 
-            /// 卡片透明变体：只把「行卡片底色」（`surface_raised`）降 alpha，
+            /// 卡片透明变体：只把「行卡片底色」（`card_bg`）降 alpha，
             /// 其余令牌原样。
             ///
-            /// # 为什么单独一个方法
+            /// # 为什么不能改 `surface_raised`
             ///
-            /// [`Palette::with_backdrop_alpha`] 处理的是**窗口背景层**
-            /// （`bg` / `surface` / `surface_variant` / `list_bg`）；行卡片
-            /// 用的是 `surface_raised`，它不在那份名单里——因为卡片底色
-            /// 在弹窗、气泡、类型徽标上也被复用，全局降 alpha 会把那些
-            /// 浮层一起变透。所以卡片透明度必须是一个**独立的、只作用于
-            /// 列表行卡片**的派生，由调用方按配置值显式选择。
+            /// `surface_raised` 是**浮层**令牌：通知气泡、设置窗口面板、
+            /// 类型徽标都在用它。早前本方法改的是它，于是「把列表卡片调
+            /// 透」会连带把那些浮层一起弄透——它们身后没有磨砂底图，
+            /// 透出来的只有窗口底色，观感是「整片界面一起变暗」。
+            ///
+            /// 现在改的是行卡片专用的 `card_bg`，浮层不受影响。
+            ///
+            /// # 为什么用 `gamma_multiply`
+            ///
+            /// egui 的 `Color32` 是**预乘**存储，`gamma_multiply` 四个
+            /// 通道同比例缩放（rgb 与 alpha 一起降）——这正是「同色更淡」
+            /// 而不是「变暗」的语义。只降 rgb 或只降 alpha 都会偏色。
             ///
             /// `alpha` 取值 0-255，255 等于原色（不透明）。
-            pub fn with_card_alpha(&self, alpha: u8) -> Palette {
+            pub fn with_card_opacity(&self, alpha: u8) -> Palette {
                 let mut p = self.clone();
-                p.surface_raised = p.surface_raised.gamma_multiply(alpha as f32 / 255.0);
+                p.card_bg = p.card_bg.gamma_multiply(alpha as f32 / 255.0);
                 p
             }
 
@@ -370,6 +376,20 @@ palette! {
     /// 浮层：菜单、气泡、可拖拽模块。
     surface_raised: color = egui::Color32::from_rgb(0x2F, 0x35, 0x40)
                     => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+    /// 列表行卡片底色。**只被列表行卡片读取**。
+    ///
+    /// # 为什么必须单独一个令牌
+    ///
+    /// 「卡片透明度」设置早前改的是 `surface_raised`，而那个令牌还被
+    /// 通知气泡、设置窗口面板、类型徽标复用——于是把卡片调透会**连带
+    /// 把那些浮层一起弄透**。它们身后没有磨砂底图可透，透出来的只有
+    /// 窗口底色，观感就是「整片界面一起变暗」（2026-10-23 用户反馈
+    /// 「卡片整体都变暗而不是变透明」）。
+    ///
+    /// 浮层的透明度是**另一件事**：它们要有可读的底，不该跟着列表卡片
+    /// 的观感设置走。所以卡片透明度必须是只作用于行卡片的派生。
+    card_bg: color = egui::Color32::from_rgb(0x2F, 0x35, 0x40)
+             => egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
     /// 遮罩。半透明，压在 `bg` 之上。
     overlay_scrim: color = egui::Color32::from_black_alpha(170)
                      => egui::Color32::from_rgba_unmultiplied(0x10, 0x14, 0x1A, 110),
@@ -1204,6 +1224,9 @@ mod tests {
     const EXPECTED_COLOR_TOKENS: &[&str] = &[
         // 背景层
         "bg", "surface", "surface_variant", "surface_raised", "list_bg", "overlay_scrim",
+        // 行卡片专用底（`surface_raised` 的「卡片透明度」派生，
+        // 与浮层令牌分开的理由见 `Palette::with_card_opacity`）
+        "card_bg",
         // 描边层
         "border", "border_strong", "border_subtle",
         // 投影

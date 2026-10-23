@@ -116,7 +116,9 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // 顺序上选中在悬停/按下**之下**：accent 环是稳定骨架，指针反馈叠在
     // 它上面——悬停一个已选中的行仍然看得到反应（旧实现选中与悬停互斥，
     // 选中行对指针毫无反馈）。
-    painter.rect_filled(r, radius, pal.surface_raised);
+    // 行卡片底色用 `card_bg` 而不是 `surface_raised`：前者是「卡片透明度」
+    // 设置的作用对象，后者是浮层令牌（见 `Palette::with_card_opacity`）。
+    painter.rect_filled(r, radius, pal.card_bg);
     // 置顶标记：底色微亮。置顶条目就在同一个列表里，靠这个区分。
     //
     // NOTE: 只靠色差是不够的 —— 实测 7% 透明叠加几乎看不出差别。
@@ -139,7 +141,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     );
     if sel > 0.004 {
         fill_rounded_border(&painter, r, radius, 2.0 * sel, pal.accent, |p, inner, inner_r| {
-            p.rect_filled(inner, inner_r, pal.surface_raised);
+            p.rect_filled(inner, inner_r, pal.card_bg);
             p.rect_filled(inner, inner_r, fade_color(pal.row_selected, sel));
         });
     }

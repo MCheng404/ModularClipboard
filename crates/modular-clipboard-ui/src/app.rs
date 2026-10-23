@@ -394,7 +394,7 @@ impl App {
                 backdrop_pal = self
                     .pal
                     .with_backdrop_alpha(alpha)
-                    .with_card_alpha(card_alpha);
+                    .with_card_opacity(card_alpha);
                 &backdrop_pal
             }
             modular_clipboard_core::config::WindowBackdrop::Translucent => {
@@ -403,7 +403,7 @@ impl App {
                 backdrop_pal = self
                     .pal
                     .with_backdrop_alpha(alpha)
-                    .with_card_alpha(card_alpha);
+                    .with_card_opacity(card_alpha);
                 &backdrop_pal
             }
             modular_clipboard_core::config::WindowBackdrop::None => &self.pal,
