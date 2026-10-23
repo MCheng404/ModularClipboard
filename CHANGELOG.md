@@ -41,6 +41,22 @@
 
 ### 修复
 
+- **托盘右键菜单永远显示英文**：`i18n::set_locale` 是**进程级**全局量，
+  而本项目有两个进程。此前只在界面进程设置（首帧之前 + 设置里改语言时），
+  **常驻进程一次都没设**——托盘菜单、热键注册失败提示都在那边用 `t()`
+  取文案，于是无论用户选什么语言都显示主语言。
+  现在常驻进程在启动时按 `ui.language` 解析一次，`Command::SaveConfig`
+  时再同步一次（菜单每次右键重新拼文案，所以下一次右键即生效）。
+  顺带把这段「resolve + set_locale」收成 `app::apply_language`——界面侧
+  本来抄了两份，常驻侧漏了一份，正是重复代码漂移的典型。
+- **托盘悬停提示硬编码中文**（`"ModularClipboard 剪贴板"`）：与界面进程的
+  `"ModularClipboard"` 不一致，且在日/俄界面下仍是中文。tooltip 只在托盘
+  创建时写进 `NOTIFYICONDATAW` 一次，本地化它就会变成「切了语言、tooltip
+  还是旧语言」的半生效状态，故统一为语言中立的品牌名。
+- **`platform` 缺 `Win32_Globalization` feature**：`system_langid()` 挪到
+  platform 后，靠工作区的 feature 统一才编得过；单独
+  `cargo test -p modular-clipboard-app` 会报「找不到 Globalization」。
+
 - **`1 hours ago` / `1 days ago` / `1 entries` 等英文单数错形**：计数短语
   此前不管 n 是几都套同一串，现在按 n 选形。
 

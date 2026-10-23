@@ -38,6 +38,28 @@ pub fn win_key_down() -> bool {
     false
 }
 
+/// 系统 UI 语言的完整 LANGID（`GetUserDefaultUILanguage`）。
+///
+/// 供 `modular_clipboard_core::i18n::from_system_langid` 判定「跟随系统」
+/// 时该用哪门语言。取**UI 语言**而不是区域设置：用户把系统显示语言切成
+/// English 时，界面跟着切才是「跟随系统」。
+///
+/// 放在 platform 而不是 ui：**常驻进程也要解析语言**（托盘菜单、热键
+/// 失败提示都在那个进程里取文案），而 ui 依赖 app，app 不能反向依赖 ui。
+#[cfg(windows)]
+pub fn system_langid() -> u16 {
+    use windows::Win32::Globalization::GetUserDefaultUILanguage;
+    // SAFETY: 纯查询，无入参，无未定义行为。
+    unsafe { GetUserDefaultUILanguage() }
+}
+
+/// 非 Windows：无系统 UI 语言可查。返回 0 会被
+/// `from_system_langid` 判成「识别不出」⇒ 回落主语言（英文）。
+#[cfg(not(windows))]
+pub fn system_langid() -> u16 {
+    0
+}
+
 /// 自动粘贴到前台窗口。
 ///
 /// 原理：先把内容写入剪贴板，等待目标应用完成 OLE 数据握手后，

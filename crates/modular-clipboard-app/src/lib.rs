@@ -26,6 +26,27 @@ mod paths;
 
 pub use ingest::{PREVIEW_MAX_CHARS, format_time};
 pub use paths::{CONFIG_FILE_NAME, config_path_in};
+
+/// 按配置里的 `ui.language` + 系统 UI 语言设定**本进程**的界面语言。
+///
+/// # 为什么要有这个函数
+///
+/// `i18n::set_locale` 是**进程级**全局量。本项目有两个进程，各自都要设：
+///
+/// - 界面进程：首帧之前（`frame_loop`）与设置里改语言时（`Op::SetLanguage`）；
+/// - 常驻进程：托盘右键菜单、热键注册失败提示都在那边用 `t()` 取文案。
+///
+/// 早先这段表达式在界面侧抄了两份、常驻侧一份都没写——于是托盘菜单
+/// 无论选什么语言都显示英文。收成一个函数，谁要设就调它，改语义
+/// （比如以后 `resolve` 的规则变了）不用满仓找。
+pub fn apply_language(cfg_lang: &str) {
+    modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::resolve(
+        cfg_lang,
+        modular_clipboard_core::i18n::from_system_langid(
+            modular_clipboard_platform::system_langid(),
+        ),
+    ));
+}
 use ingest::*;
 use paths::*;
 

@@ -190,10 +190,7 @@ pub(super) fn run_mode(
         // 界面语言：配置显式指定用配置，否则跟随系统（详见
         // `core::i18n::resolve`）。要在**画任何东西之前**解析完——
         // 首帧的全部文案都按这个语言取。
-        modular_clipboard_core::i18n::set_locale(modular_clipboard_core::i18n::resolve(
-            &config.ui.language,
-            modular_clipboard_core::i18n::from_system_langid(crate::presence::system_langid()),
-        ));
+        modular_clipboard_app::apply_language(&config.ui.language);
     let mut app = App::from_service(config, svc);
     let ctx = app.ctx.clone();
 

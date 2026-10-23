@@ -37,7 +37,13 @@ use modular_clipboard_platform::tray::{self, TrayEvent};
 use crate::Service;
 
 /// 托盘提示文本。
-const TRAY_TOOLTIP: &str = "ModularClipboard 剪贴板";
+/// 托盘悬停提示。
+///
+/// **只有品牌名，不做翻译**：tooltip 只在托盘创建时写进 `NOTIFYICONDATAW`
+/// 一次，之后要改得走 `NIM_MODIFY`，而语言是可以在运行期切换的——
+/// 本地化它就意味着「切了语言、tooltip 还是旧语言」这种半生效状态。
+/// 品牌名在任何语言下都成立，界面进程的 `boot::TRAY_TOOLTIP` 用的也是它。
+const TRAY_TOOLTIP: &str = "ModularClipboard";
 
 /// 空闲时的轮询间隔。
 ///
@@ -156,6 +162,10 @@ pub fn run(config: Config, data_dir: Option<&Path>, start_ui: bool) -> anyhow::R
     // ⇒ 复制出去是空的。
     //
     modular_clipboard_platform::ensure_message_queue();
+
+    // 界面语言：必须在托盘创建、任何 `t()` 之前定下来。
+    // `config` 随后会被 `Service::with_data_dir` move 走，所以放在这里。
+    crate::apply_language(&config.ui.language);
 
     // 热键要从配置里来，而不是模块里的默认值——
     // 否则用户在设置里改了绑定，重启后又被改回去。
@@ -564,6 +574,9 @@ fn handle_cmd(core: &Core, svc: &mut Service, cmd: Command) -> Response {
         }
         Command::SaveConfig(cfg) => {
             svc.state.config = cfg;
+            // 语言可能刚被改过：托盘菜单每次右键都重新用 `t()` 拼文案，
+            // 所以只要同步这个全局量，下一次右键就是新语言。
+            crate::apply_language(&svc.state.config.ui.language);
             // 用户可能刚改了快捷键：注册必须跟着变，否则界面上显示
             // 新绑定、实际按旧键才有效。失败结果回传界面（hotkey_error）。
             let failed = rebind_hotkeys(&svc.state.config);
@@ -804,7 +817,11 @@ mod tests {
     #[test]
     fn save_config_surfaces_hotkey_registration_failure() {
         let mut f = fixture("save-cfg-hotkey");
-        let cfg = f.svc.state.config.clone();
+        let mut cfg = f.svc.state.config.clone();
+        // 钉住语言：`SaveConfig` 会按 `ui.language` 重设本进程语言。
+        // 默认是 "system"，在中文 Windows 上解析成中文——直接断言英文
+        // 会随机器语言随机。显式给 "en-US"，断言才是确定的。
+        cfg.ui.language = "en-US".to_string();
         let resp = handle(&f.core, &mut f.svc, Request::Cmd(Command::SaveConfig(cfg)));
         let Response::Snapshot(snap) = resp else {
             panic!("期望 Snapshot，实得 {resp:?}");

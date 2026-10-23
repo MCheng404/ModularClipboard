@@ -521,14 +521,7 @@ impl App {
                     // 写配置 + 立即生效（`set_locale` 是全局原子量，
                     // 下一帧所有 `t()` 取的就是新语言）。
                     self.svc.state.config.ui.language = lang.to_string();
-                    modular_clipboard_core::i18n::set_locale(
-                        modular_clipboard_core::i18n::resolve(
-                            lang,
-                            modular_clipboard_core::i18n::from_system_langid(
-                                crate::presence::system_langid(),
-                            ),
-                        ),
-                    );
+                    modular_clipboard_app::apply_language(lang);
                     self.after_config_change();
                 }
                 Op::CopyMcpPairPrompt => {

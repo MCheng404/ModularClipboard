@@ -20,7 +20,6 @@ use modular_clipboard_platform::hotkey;
 use modular_clipboard_platform::tray::{self, TrayEvent};
 use modular_clipboard_core::config::WindowBackdrop;
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowPos,
@@ -44,8 +43,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// 「跟随系统」时该用中文还是英文。取 UI 语言而不是区域设置：
 /// 用户把系统显示语言切成 English 时，界面跟着切才是「跟随系统」。
 pub fn system_langid() -> u16 {
-    // SAFETY: 纯查询，无入参，无未定义行为。
-    unsafe { GetUserDefaultUILanguage() }
+    // 实现在 platform（Win32 边界层）——常驻进程同样要用它，
+    // 而 ui 依赖 app，app 不能反向依赖 ui。
+    modular_clipboard_platform::system_langid()
 }
 
 /// 窗口隐藏时的轮询间隔。
