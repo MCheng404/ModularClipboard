@@ -108,9 +108,16 @@ pub(super) fn build_preview(payload: &CapturedPayload) -> String {
             if names.len() == 1 {
                 names[0].clone()
             } else {
-                modular_clipboard_core::i18n::t(("{a} 等 {b} 个文件", "{a} + {b} more files"))
-                    .replace("{a}", &names[0])
-                    .replace("{b}", &names.len().to_string())
+                // `{b}` 是文件总数，跟随它选形：英文 `2 more files` 对、
+                // `1 more file` 对；俄语 2–4 个要 `файла` 不是 `файлов`。
+                // 单文件走上面的分支，所以 one 形态实际到不了。
+                modular_clipboard_core::i18n::tp(
+                    names.len() as i64,
+                    "{a} + {b} more file",
+                    ("{a} 等 {b} 个文件", "{a} + {b} more files"),
+                )
+                .replace("{a}", &names[0])
+                .replace("{b}", &names.len().to_string())
             }
         }
         ClipKind::Image => {
@@ -213,15 +220,23 @@ pub(super) fn decode_to_rgba(item: &ClipItem, bytes: &[u8]) -> Result<(Vec<u8>, 
 }
 
 /// 时间格式化，用于界面显示。
+///
+/// 计数短语一律走 [`tp`]：英文要 `1 hour ago` 而不是 `1 hours ago`，
+/// 俄语要 `1 час назад / 2 часа назад / 5 часов назад` 三种形态。
 pub fn format_time(ts_ms: i64, now_ms: i64) -> String {
+    use modular_clipboard_core::i18n::tp;
     let diff = now_ms - ts_ms;
     if diff < 60_000 {
         modular_clipboard_core::i18n::t(("刚刚", "Just now")).to_string()
     } else if diff < 3_600_000 {
-        format!("{} {}", diff / 60_000, modular_clipboard_core::i18n::t(("分钟前", "min ago")))
+        // 「min」是缩写，英文单复数同形；俄语仍要按 CLDR 选形。
+        let n = diff / 60_000;
+        format!("{} {}", n, tp(n, "min ago", ("分钟前", "min ago")))
     } else if diff < 86_400_000 {
-        format!("{} {}", diff / 3_600_000, modular_clipboard_core::i18n::t(("小时前", "hours ago")))
+        let n = diff / 3_600_000;
+        format!("{} {}", n, tp(n, "hour ago", ("小时前", "hours ago")))
     } else {
-        format!("{} {}", diff / 86_400_000, modular_clipboard_core::i18n::t(("天前", "days ago")))
+        let n = diff / 86_400_000;
+        format!("{} {}", n, tp(n, "day ago", ("天前", "days ago")))
     }
 }

@@ -10,7 +10,7 @@ use egui::pos2;
 use egui::vec2;
 use modular_clipboard_core::config::WindowBackdrop;
 use modular_clipboard_core::i18n::Bi;
-use modular_clipboard_core::i18n::t;
+use modular_clipboard_core::i18n::{t, tp};
 use crate::card::PinnedMode;
 use crate::theme::Palette;
 
@@ -122,11 +122,15 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             let cur = (spec.display)(get_number(&f.svc.state.config, *g, field));
             let mut val = cur;
             let changed = setting_row(ui, it.label, it.desc, |ui| {
+                // CAUTION: 后缀要在 `DragValue::new(&mut val)` **之前**算——
+                // 建好之后 `val` 处在可变借用里，再读它就 E0503。
+                // 后缀随下一帧的数值重算，切换即时。
+                let suffix = tp(val as i64, spec.unit_one, spec.unit);
                 ui.add(
                     egui::DragValue::new(&mut val)
                         .range(spec.min..=spec.max)
                         .speed(spec.step)
-                        .suffix(t(spec.unit)),
+                        .suffix(suffix),
                 )
                 .changed()
             });
@@ -143,11 +147,13 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             let cur = get_opt_number(&f.svc.state.config, *g, field);
             let mut val = cur.unwrap_or(spec.default);
             let changed = setting_row(ui, it.label, it.desc, |ui| {
+                // 同上：后缀必须在建 `DragValue` 之前算好。
+                let suffix = tp(val as i64, spec.unit_one, spec.unit);
                 ui.add(
                     egui::DragValue::new(&mut val)
                         .range(spec.default..=1_000_000.0)
                         .speed(spec.step)
-                        .suffix(t(spec.unit)),
+                        .suffix(suffix),
                 )
                 .changed()
             });

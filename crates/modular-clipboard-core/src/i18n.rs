@@ -127,6 +127,24 @@ impl Locale {
             other => other.overlay(bi.1).unwrap_or(bi.1),
         }
     }
+
+    /// 查该语言的复数子表：`en_key` 是英文**复数形**（`tp` 的 `other.1`），
+    /// `cat` 决定取四形态中的哪一个。
+    ///
+    /// 没有收录该短语时返回 `None`，由 [`tp`] 回落 [`Self::pick`]——
+    /// 不分单复数的语言（中/日）天然走那条路，不用在这里铺空表。
+    fn plural_form(self, en_key: &str, cat: Plural) -> Option<&'static str> {
+        let table = match self {
+            Locale::ZhTw => zh_hant::PLURALS,
+            Locale::Ja => ja::PLURALS,
+            Locale::Ru => ru::PLURALS,
+            Locale::ZhCn | Locale::EnUs => return None,
+        };
+        table
+            .iter()
+            .find(|(k, _)| *k == en_key)
+            .map(|(_, forms)| forms[cat.index()])
+    }
 }
 
 /// 配置文件里 `ui.language` 的「跟随系统」取值。
@@ -175,6 +193,111 @@ pub fn locale() -> Locale {
 #[inline]
 pub fn t(bi: Bi) -> &'static str {
     locale().pick(bi)
+}
+
+/// CLDR 复数类别。整数场景里英文只用 One/Other，俄语用 One/Few/Many
+/// （见 <https://www.unicode.org/cldr/charts/latest/supplemental/language_plural_rules.html>）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plural {
+    /// 一（en: n==1；ru: 个位 1 且不是 11）。
+    One,
+    /// 少（ru: 个位 2–4 且不是 12–14）。
+    Few,
+    /// 多（ru: 其余整数）。
+    Many,
+    /// 其余（小数等；整数场景里中/日语恒为它）。
+    Other,
+}
+
+impl Plural {
+    /// 在 `PLURALS` 四元组里的下标（`[one, few, many, other]`）。
+    pub fn index(self) -> usize {
+        match self {
+            Plural::One => 0,
+            Plural::Few => 1,
+            Plural::Many => 2,
+            Plural::Other => 3,
+        }
+    }
+}
+
+/// 按**当前语言**给出 `n` 的 CLDR 复数类别。
+#[inline]
+pub fn plural(n: i64) -> Plural {
+    plural_for(locale(), n)
+}
+
+/// [`plural`] 的显式语言版（供测试逐语言断言）。
+pub fn plural_for(l: Locale, n: i64) -> Plural {
+    match l {
+        // 中文/日文不分单复数：`1 个文件` / `5 个文件` 同形。
+        Locale::ZhCn | Locale::ZhTw | Locale::Ja => Plural::Other,
+        // 英文只有 n==1 是单数。
+        Locale::EnUs => {
+            if n == 1 {
+                Plural::One
+            } else {
+                Plural::Other
+            }
+        }
+        // 俄语三类。整数不产生 Other，所以 Many 承担「其余全部」。
+        //
+        // 取绝对值：CLDR 的规则按数的**绝对值**算（负数的符号不参与
+        // 词形选择）。本项目的计数都是非负，这里只是不让负值走进
+        // 奇怪的分支。
+        Locale::Ru => {
+            let n = n.unsigned_abs();
+            let (n10, n100) = (n % 10, n % 100);
+            if n10 == 1 && n100 != 11 {
+                Plural::One
+            } else if (2..=4).contains(&n10) && !(12..=14).contains(&n100) {
+                Plural::Few
+            } else {
+                Plural::Many
+            }
+        }
+    }
+}
+
+/// 计数短语：`n` 决定形态。
+///
+/// - `en_one` 是**英文单数**形态（`"day ago"`）——英文是主语言，
+///   单数形态本身就是英文，**不进译文表**，也不该进（进了就是「译文
+///   等于英文」的无操作条目）。
+/// - `other` 是复数/通用形态的 (中文, 英文) 对，查表用它的英文那一半。
+///
+/// 形态选择与本地化是两步：先按 `n` 选出该显示哪一种**英文形态**，
+/// 再本地化。中/日文不分单复数 ⇒ 一律取 `other` 的本地化半；
+/// 繁中/日/俄先查 [`Locale::plural_form`]（各语言的 `PLURALS` 子表），
+/// 没有再回落普通覆盖表，最后回落英文。
+///
+/// # 为什么表键是 `other` 的英文而不是每个形态一个键
+///
+/// 俄语一/少/多三种形态对应英文**同一个**复数形（"files"），给每个
+/// 形态一个键必然撞键。所以复数子表按「英文复数形」聚合，值是该语言
+/// 四个 CLDR 形态的数组。
+#[inline]
+pub fn tp(n: i64, en_one: &'static str, other: Bi) -> &'static str {
+    tp_for(locale(), n, en_one, other)
+}
+
+/// [`tp`] 的显式语言版。**纯函数**——测试用它逐语言断言，不必去翻转
+/// 进程级的 [`set_locale`]（那是全局原子量，并行测试会互相踩）。
+pub fn tp_for(l: Locale, n: i64, en_one: &'static str, other: Bi) -> &'static str {
+    match l {
+        Locale::ZhCn => other.0,
+        Locale::EnUs => {
+            if plural_for(l, n) == Plural::One {
+                en_one
+            } else {
+                other.1
+            }
+        }
+        _ => {
+            let cat = plural_for(l, n);
+            l.plural_form(other.1, cat).unwrap_or_else(|| l.pick(other))
+        }
+    }
 }
 
 /// 解析配置里的语言字符串（`"system"` / `"zh-CN"` / `"zh-TW"` / `"en-US"` /
@@ -444,5 +567,448 @@ mod tests {
                 assert!(!cjk(k), "{name} 表的键 {k:?} 含中文——键应为英文");
             }
         }
+    }
+
+    // ---- CLDR 复数选形 ----
+
+    /// 俄语三类的边界必须逐个钉住。
+    ///
+    /// CLDR 俄语按**个位**与**十位**联合判断：`21` 与 `11` 同个位却分属
+    /// 「一」与「多」。这种边界写错不编译报错，只会让俄语用户看到
+    /// `21 файлов`（应为 `21 файл`）。
+    #[test]
+    fn russian_plural_categories() {
+        use Plural::{Few, Many, One};
+        for (n, want) in [
+            (0, Many),
+            (1, One),
+            (2, Few),
+            (3, Few),
+            (4, Few),
+            (5, Many),
+            (11, Many), // 11 不是「一」
+            (12, Many),
+            (14, Many),
+            (21, One), // 21 回到「一」
+            (22, Few),
+            (25, Many),
+            (101, One),
+            (102, Few),
+            (111, Many), // 111 的十位仍是 11
+            (1000, Many),
+        ] {
+            assert_eq!(plural_for(Locale::Ru, n), want, "n={n}");
+        }
+    }
+
+    #[test]
+    fn english_plural_categories() {
+        use Plural::{One, Other};
+        assert_eq!(plural_for(Locale::EnUs, 1), One);
+        assert_eq!(plural_for(Locale::EnUs, 0), Other);
+        assert_eq!(plural_for(Locale::EnUs, 2), Other);
+        assert_eq!(plural_for(Locale::EnUs, 11), Other);
+    }
+
+    /// 中/日文不分单复数：任何 n 都是 Other，`tp` 因此恒取通用形。
+    #[test]
+    fn chinese_and_japanese_have_a_single_form() {
+        for l in [Locale::ZhCn, Locale::ZhTw, Locale::Ja] {
+            for n in [0_i64, 1, 2, 5, 11, 21, 100] {
+                assert_eq!(plural_for(l, n), Plural::Other, "{l:?} n={n}");
+            }
+        }
+    }
+
+    /// 计数短语的端到端选形。**不**翻转全局语言——那是进程级原子量，
+    /// 并行测试会互踩（`BOLD_READY` 踩过的坑）。[`tp_for`] 是纯函数。
+    #[test]
+    fn tp_selects_the_right_form_per_language() {
+        // 用「hours ago」这条真实词条：它在 ru::PLURALS 里有四形态。
+        let phrase = ("小时前", "hours ago");
+        // 英文：单数走 en_one，复数走 other 的英文半。
+        assert_eq!(tp_for(Locale::EnUs, 1, "hour ago", phrase), "hour ago");
+        assert_eq!(tp_for(Locale::EnUs, 2, "hour ago", phrase), "hours ago");
+        assert_eq!(tp_for(Locale::EnUs, 0, "hour ago", phrase), "hours ago");
+        // 简体中文：一律取中文那一半。
+        assert_eq!(tp_for(Locale::ZhCn, 1, "hour ago", phrase), "小时前");
+        assert_eq!(tp_for(Locale::ZhCn, 5, "hour ago", phrase), "小时前");
+        // 俄语：CLDR 三形态各自不同。
+        assert_eq!(tp_for(Locale::Ru, 1, "hour ago", phrase), "час назад");
+        assert_eq!(tp_for(Locale::Ru, 2, "hour ago", phrase), "часа назад");
+        assert_eq!(tp_for(Locale::Ru, 5, "hour ago", phrase), "часов назад");
+        assert_eq!(tp_for(Locale::Ru, 21, "hour ago", phrase), "час назад");
+        // 繁中/日语：复数子表是空的 ⇒ 回落普通覆盖表，与 `pick` 一致。
+        assert_eq!(tp_for(Locale::ZhTw, 7, "hour ago", phrase), Locale::ZhTw.pick(phrase));
+        assert_eq!(tp_for(Locale::Ja, 7, "hour ago", phrase), Locale::Ja.pick(phrase));
+    }
+
+    /// 表里没有的计数短语必须回落 `pick`（通用形），不能崩、不能显示空串。
+    #[test]
+    fn tp_falls_back_when_a_phrase_is_not_in_the_plural_table() {
+        let phrase = ("某条", "NoSuchPluralPhraseXyz");
+        // 俄语：PLURALS 无此键 ⇒ 走 `pick` ⇒ 表里也没有 ⇒ 回落英文。
+        assert_eq!(tp_for(Locale::Ru, 2, "NoSuchPluralPhraseXyz", phrase), "NoSuchPluralPhraseXyz");
+        // 英文单复数仍然正确——回落不影响主语言。
+        assert_eq!(tp_for(Locale::EnUs, 1, "Xyz", phrase), "Xyz");
+        assert_eq!(tp_for(Locale::EnUs, 3, "Xyz", phrase), "NoSuchPluralPhraseXyz");
+    }
+
+    /// 复数子表的不变量：四形态都非空，且键必须在 [`TABLE`] 里。
+    ///
+    /// 后者是 `tp` 的回落链要求的：PLURALS 没覆盖到某个类别时走
+    /// `pick`，若 TABLE 也没有这个键就只剩英文——对俄语用户是静默缺译。
+    #[test]
+    fn plural_tables_are_well_formed() {
+        for (name, plurals, table) in [
+            ("zh-TW", zh_hant::PLURALS, zh_hant::TABLE),
+            ("ja", ja::PLURALS, ja::TABLE),
+            ("ru", ru::PLURALS, ru::TABLE),
+        ] {
+            for (key, forms) in plurals {
+                for (i, f) in forms.iter().enumerate() {
+                    assert!(!f.trim().is_empty(), "{name} 的 {key:?} 第 {i} 形态为空");
+                }
+                assert!(
+                    table.iter().any(|(k, _)| k == key),
+                    "{name} 的复数键 {key:?} 不在 TABLE 里——`tp` 的回落拿不到通用形"
+                );
+            }
+        }
+    }
+
+    // ---- 源码 ↔ 译文表覆盖守门 ----
+    //
+    // 抽取/核验脚本是一次性的，用完即删。没有这道测试时，加一条新文案
+    // 或改一个英文措辞，译文表就静默缺条，直到有人把界面切到日语才发现
+    // 那一段是英文。这里把「覆盖」从「记得跑脚本」变成 `cargo test` 的一部分。
+
+    /// 剥掉注释与字符字面量，只留可扫描的代码与字符串字面量。
+    ///
+    /// CAUTION: 字符串必须在注释**之前**判——`"https://…"` 里的 `//`
+    /// 不是注释。反过来会把大半行吃掉，进而误判「该文案已不存在」而漏查。
+    fn strip_noise(src: &str) -> String {
+        let v: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < v.len() {
+            // 字符字面量：`'x'` / `'\n'`。生命周期 `'a` 不是字面量，原样放过。
+            if v[i] == '\'' {
+                let mut j = i + 1;
+                if j < v.len() && v[j] == '\\' {
+                    j += 1;
+                }
+                if j < v.len() {
+                    j += 1;
+                }
+                if j < v.len() && v[j] == '\'' {
+                    for c in &v[i..=j] {
+                        out.push(*c);
+                    }
+                    i = j + 1;
+                } else {
+                    out.push(v[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            // 字符串字面量：原样保留（含转义），内部的 `//` 与 `/*` 不当注释。
+            if v[i] == '"' {
+                out.push('"');
+                i += 1;
+                while i < v.len() {
+                    if v[i] == '\\' {
+                        out.push('\\');
+                        i += 1;
+                        if i < v.len() {
+                            out.push(v[i]);
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    let c = v[i];
+                    out.push(c);
+                    i += 1;
+                    if c == '"' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // 行注释
+            if v[i] == '/' && i + 1 < v.len() && v[i + 1] == '/' {
+                while i < v.len() && v[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            // 块注释（Rust 允许嵌套）
+            if v[i] == '/' && i + 1 < v.len() && v[i + 1] == '*' {
+                let mut depth = 1usize;
+                i += 2;
+                while i < v.len() && depth > 0 {
+                    if v[i] == '/' && i + 1 < v.len() && v[i + 1] == '*' {
+                        depth += 1;
+                        i += 2;
+                    } else if v[i] == '*' && i + 1 < v.len() && v[i + 1] == '/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            out.push(v[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// 砍掉 `mod tests { … }` 整块（含 `#[cfg(test)]`）。
+    /// 测试里的假词条（`NoSuchEntryXyz` 之类）不是界面文案，不该被查覆盖。
+    fn strip_test_modules(src: &str) -> String {
+        let mut out = String::from(src);
+        while let Some(pos) = out.find("mod tests") {
+            // 花括号配对砍掉整个模块体；找不到 `{` 就只删标记本身。
+            let Some(brace) = out[pos..].find('{') else {
+                out.replace_range(pos..pos + "mod tests".len(), "         ");
+                continue;
+            };
+            let start = pos + brace;
+            let mut depth = 0usize;
+            let mut end = start;
+            let bytes: Vec<char> = out.chars().collect();
+            // 用字符下标重新定位 `start` 在字符向量里的位置。
+            let start_idx = out[..start].chars().count();
+            for (k, c) in bytes.iter().enumerate().skip(start_idx) {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = out
+                                .char_indices()
+                                .nth(k)
+                                .map(|(b, _)| b + c.len_utf8())
+                                .unwrap_or(out.len());
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.replace_range(pos..end, " ");
+        }
+        out
+    }
+
+    /// 从（已剥注释/测试的）源码里提取 `(中文, 英文)` 二元组字面量。
+    ///
+    /// 只认 `( "…" , "…" ,? )` 这一种形状：排除 `("a", "b", "c")` 三元组
+    /// 与函数调用的 `f("a", &other)`——后者第二个参数不是字面量。
+    fn bi_pairs(clean: &str) -> Vec<(String, String)> {
+        fn skip_ws(v: &[char], mut i: usize) -> usize {
+            while i < v.len() && v[i].is_whitespace() {
+                i += 1;
+            }
+            i
+        }
+        /// 解析 `"…"`（含转义），返回 (内容, 闭引号之后的下标)。
+        fn parse_string(v: &[char], i: usize) -> Option<(String, usize)> {
+            if i >= v.len() || v[i] != '"' {
+                return None;
+            }
+            let mut s = String::new();
+            let mut j = i + 1;
+            while j < v.len() {
+                if v[j] == '\\' {
+                    j += 1;
+                    if j >= v.len() {
+                        return None;
+                    }
+                    s.push(match v[j] {
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        other => other,
+                    });
+                    j += 1;
+                    continue;
+                }
+                if v[j] == '"' {
+                    return Some((s, j + 1));
+                }
+                s.push(v[j]);
+                j += 1;
+            }
+            None
+        }
+
+        let v: Vec<char> = clean.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < v.len() {
+            if v[i] != '(' {
+                i += 1;
+                continue;
+            }
+            // CAUTION: `(` 前面若紧挨标识符字符，那是**函数/方法调用**的
+            // 参数表（`s.replace("&lt;", "<")`），不是元组字面量。不挡的话，
+            // `.replace()` 调用链里的相邻两个字符串会被配成假二元组——
+            // HTML 实体表（`"&lt;", "<"`）就是这么被误报成待译文案的。
+            if i > 0 && (v[i - 1].is_alphanumeric() || v[i - 1] == '_' || v[i - 1] == ':' || v[i - 1] == '>' || v[i - 1] == '.') {
+                i += 1;
+                continue;
+            }
+            let mut j = skip_ws(&v, i + 1);
+            let Some((a, after_a)) = parse_string(&v, j) else {
+                i += 1;
+                continue;
+            };
+            j = skip_ws(&v, after_a);
+            if j >= v.len() || v[j] != ',' {
+                i += 1;
+                continue;
+            }
+            j = skip_ws(&v, j + 1);
+            let Some((b, after_b)) = parse_string(&v, j) else {
+                i += 1;
+                continue;
+            };
+            j = skip_ws(&v, after_b);
+            if j < v.len() && v[j] == ',' {
+                j = skip_ws(&v, j + 1);
+            }
+            if j < v.len() && v[j] == ')' {
+                // CAUTION: `(字符串, 字符串)` 元组不都是文案——egui 的 Id
+                // 元组（`("icon_btn_hover", "topbar_clear")`）、关于页的
+                // (名称, 链接) 表都是。判据两条满足其一：
+                //
+                // 1. 首半含 CJK——[`Bi`] 的定义就是 (中文, English)；
+                // 2. 两半全同——自称词（`("日本語", "日本語")`）与不变单位
+                //    （`(" MB", " MB")`）的中文半就是符号本身，不含 CJK，
+                //    但它们是真文案（俄语要写 `МБ`）。
+                //
+                // 另外英文半是 URL 的不收——链接里的字符不能动。
+                let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+                let is_url = b.starts_with("http://") || b.starts_with("https://");
+                if (cjk(&a) || a == b) && !is_url {
+                    out.push((a, b));
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// 递归收集 `*.rs`。跳过 i18n 表目录（表自身就是 `(en, 译文)` 对，
+    /// 扫它等于自己证明自己）与集成测试目录（那是断言界面文案的地方）。
+    fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name == "target" || name == "tests" || name == "i18n" {
+                continue;
+            }
+            if p.is_dir() {
+                collect_rs(&p, out);
+            } else if name.ends_with(".rs") && name != "i18n.rs" {
+                out.push(p);
+            }
+        }
+    }
+
+    /// 扫全部源码拿到的 `(中文, 英文)` 对，按英文键去重。
+    fn source_pairs() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let mut files = Vec::new();
+        collect_rs(&root.join("crates"), &mut files);
+        assert!(
+            files.len() > 50,
+            "只扫到 {} 个源码文件，路径可能不对（root = {}）",
+            files.len(),
+            root.display()
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap_or_default();
+            let clean = strip_test_modules(&strip_noise(&src));
+            for pair in bi_pairs(&clean) {
+                if seen.insert(pair.1.clone()) {
+                    out.push(pair);
+                }
+            }
+        }
+        out
+    }
+
+    /// 源码里的每条用户可见文案，三张表都必须有译文（自称词除外）。
+    ///
+    /// # 自称词豁免
+    ///
+    /// `zh == en` 的二元组是**自称词**（`("日本語", "日本語")`）：任何语言下
+    /// 显示的都是它自己，回落英文即得正确结果，进表反而是「译文 == 英文」
+    /// 的无操作条目（2026-10-23 刚清掉一批）。
+    #[test]
+    fn every_source_string_is_translated() {
+        let mut missing: Vec<String> = Vec::new();
+        for (zh, en) in source_pairs() {
+            if zh == en {
+                continue;
+            }
+            for (name, t) in all_tables() {
+                if !t.iter().any(|(k, _)| *k == en) {
+                    missing.push(format!("  [{name}] 缺 {en:?}（源码中文 {zh:?}）"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "译文表覆盖不全，共 {} 处（加文案时要同时补三张表）:\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+    }
+
+    /// 表里不许有源码里已经不存在的条目。
+    ///
+    /// 它抓的是**改英文措辞**：键就是英文，改一个词就等于换了键——旧键
+    /// 留在表里是垃圾，新键没人译。两侧都查才能把这种改动暴露出来。
+    #[test]
+    fn no_orphan_translations() {
+        let src: std::collections::BTreeSet<String> =
+            source_pairs().into_iter().map(|(_, en)| en).collect();
+        let mut orphans: Vec<String> = Vec::new();
+        for (name, t) in all_tables() {
+            for (k, _) in t {
+                if !src.contains(*k) {
+                    orphans.push(format!("  [{name}] {k:?}"));
+                }
+            }
+        }
+        // 复数子表的键也必须还在源码里——同理会随英文措辞改动而失效。
+        for (name, plurals, _) in [
+            ("zh-TW", zh_hant::PLURALS, zh_hant::TABLE),
+            ("ja", ja::PLURALS, ja::TABLE),
+            ("ru", ru::PLURALS, ru::TABLE),
+        ] {
+            for (k, _) in plurals {
+                if !src.contains(*k) {
+                    orphans.push(format!("  [{name}/PLURALS] {k:?}"));
+                }
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "表里有源码已不用的条目（多半是英文措辞改了没同步）:\n{}",
+            orphans.join("\n")
+        );
     }
 }

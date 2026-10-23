@@ -38,6 +38,9 @@ pub(super) struct NumberSpec {
     pub(super) max: f64,
     pub(super) step: f64,
     pub(super) unit: Bi,
+    /// 英文单数形态（`unit.1` 的单数，如 `" item"`）——复数选形用。
+    /// 不进译文表：英文是主语言，它本身就是英文。
+    pub(super) unit_one: &'static str,
     /// 存储值 → 显示值。
     pub(super) display: fn(f64) -> f64,
     /// 显示值 → 存储值。
@@ -49,6 +52,8 @@ pub(super) struct OptNumberSpec {
     pub(super) default: f64,
     pub(super) step: f64,
     pub(super) unit: Bi,
+    /// 英文单数形态，同 [`NumberSpec::unit_one`]。
+    pub(super) unit_one: &'static str,
 }
 
 pub(super) const fn identity_num(v: f64) -> f64 {
@@ -66,6 +71,7 @@ pub(super) const NUMBER_POLL_MS: NumberSpec = NumberSpec {
     max: 2000.0,
     step: 50.0,
     unit: (" ms", " ms"),
+    unit_one: " ms",
     display: identity_num,
     store: identity_num,
 };
@@ -75,6 +81,7 @@ pub(super) const NUMBER_MINI_COUNT: NumberSpec = NumberSpec {
     max: 10.0,
     step: 1.0,
     unit: ("条", " items"),
+    unit_one: " item",
     display: |v| v,
     store: |v| v,
 };
@@ -84,6 +91,7 @@ pub(super) const NUMBER_MINI_PREVIEW: NumberSpec = NumberSpec {
     max: 100.0,
     step: 4.0,
     unit: ("字符", " chars"),
+    unit_one: " char",
     display: |v| v,
     store: |v| v,
 };
@@ -93,6 +101,7 @@ pub(super) const NUMBER_MAX_PAYLOAD_MB: NumberSpec = NumberSpec {
     max: 4096.0,
     step: 1.0,
     unit: (" MB", " MB"),
+    unit_one: " MB",
     display: bytes_to_mb,
     store: mb_to_bytes,
 };
@@ -100,6 +109,7 @@ pub(super) const OPTN_MAX_ITEMS: OptNumberSpec = OptNumberSpec {
     default: 1000.0,
     step: 100.0,
     unit: (" 条", " entries"),
+    unit_one: " entry",
 };
 
 /// 设置项类型。

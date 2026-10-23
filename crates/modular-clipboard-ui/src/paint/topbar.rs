@@ -10,7 +10,7 @@ use egui::Sense;
 use egui::Stroke;
 use egui::pos2;
 use egui::vec2;
-use modular_clipboard_core::i18n::t;
+use modular_clipboard_core::i18n::{t, tp};
 use crate::icons::Icon;
 use crate::theme::Palette;
 use crate::theme::sized;
@@ -904,9 +904,24 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // `Response`（`icon_button` 里踩过同一个坑，E0382）。
         let clicked = resp.clicked();
         let tip = if multi {
-            format!("{} · {}{}", t(kind.label()), count, t((" 条（可多选）", " entries (multi-select)")))
+            // 计数短语走 `tp`：`1 entry (multi-select)` vs `5 entries (...)`。
+            format!(
+                "{} · {}{}",
+                t(kind.label()),
+                count,
+                tp(
+                    count as i64,
+                    " entry (multi-select)",
+                    (" 条（可多选）", " entries (multi-select)")
+                )
+            )
         } else {
-            format!("{} · {}{}", t(kind.label()), count, t((" 条", " entries")))
+            format!(
+                "{} · {}{}",
+                t(kind.label()),
+                count,
+                tp(count as i64, " entry", (" 条", " entries"))
+            )
         };
         resp.on_hover_text(tip);
         if clicked {

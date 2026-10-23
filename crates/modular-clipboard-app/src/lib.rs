@@ -1433,6 +1433,9 @@ mod tests {
         assert_eq!(format_time(now - 300_000, now), "5 min ago");
         assert_eq!(format_time(now - 7_200_000, now), "2 hours ago");
         assert_eq!(format_time(now - 172_800_000, now), "2 days ago");
+        // 单数形态：这两条曾恒显 `1 hours ago` / `1 days ago`。
+        assert_eq!(format_time(now - 3_600_000, now), "1 hour ago");
+        assert_eq!(format_time(now - 86_400_000, now), "1 day ago");
     }
 
     #[test]

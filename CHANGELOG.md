@@ -8,17 +8,33 @@
 
 ### 新增
 
+- **CLDR 复数选形**：新增 `i18n::tp(n, en_one, other)`，按 CLDR 复数规则
+  为计数短语选形态——英文 one/other、俄语 one/few/many、中日文不分。
+  覆盖相对时间（`1 hour ago` 不再显成 `1 hours ago`）、多文件预览
+  （俄语 2–4 个要 `файла` 不是 `файлов`）、类型栏计数、设置项单位后缀。
+  各语言表新增 `PLURALS` 复数子表（键是英文复数形，值是四形态数组）。
+
+- **源码 ↔ 译文表覆盖守门**：`cargo test` 现在扫描全部源码的双语对，
+  断言「每条用户可见文案三张表都有译文」与「表里无孤儿条目」。
+  一次性核验脚本的职责就此固化——加文案或改英文措辞漏同步会当场红，
+  而不是等有人切到日语才发现那一段是英文。
+
+- **译者上下文注释**：21 个易混条目（`Above`/`Top edge`、`Stroke color`、
+  `Pinned card`/`Lock` 等消歧后的词）在三张表里都写了上下文说明，
+  是 gettext `msgctxt` 的穷人版。
+
 - **界面语言扩充到五种**：在简体中文 / 英文之外新增**繁体中文、日语、俄语**。
   中英仍是唯一的内联双语源（`t(("中文","English"))`，写在调用点上），
-  另外三种语言放在 `core/src/i18n/catalog.rs` 的覆盖表里，以中文为键查找、
-  缺项回落英文——这样 158 个调用点不用改成五元组，新语言也可以增量补齐。
-  覆盖 **398 条**文案（含设置界面的标签/说明、分段控件选项、图标提示、
-  MCP 能力名），三张表各 388 条有效条目、零死条目。
+  另外三种语言放在 `core/src/i18n/{zh_hant,ja,ru}.rs` 的覆盖表里，以英文为键
+  查找、缺项回落英文——这样 158 个调用点不用改成五元组，新语言也可以增量补齐。
+  覆盖约 **400 条**文案（含设置界面的标签/说明、分段控件选项、图标提示、
+  MCP 能力名），三张表各约 396 条有效条目、零死条目。
   语言选项改用**下拉框 + 语言自称**（`日本語` / `Русский` / `繁體中文`），
   避免「用 A 语言写 B 语言名字」的循环；6 个选项挤分段控件会把说明列
   压成窄条，这是换控件的原因。
   系统语言识别补上子语言判别（`SUBLANG_CHINESE_TRADITIONAL/SIMPLIFIED/
   HONGKONG/SINGAPORE/MACAU` → 简/繁），`LANG_JAPANESE` / `LANG_RUSSIAN`。
+
 - **字体字重**：加载 CJK 字体的**独立粗体伴随字体**（`msyhbd.ttc` 等），
   注册为独立族 `cjk_bold`，新增 `theme::emphasis(size)` 助手。设置窗导航
   的**选中项**改用粗体。没有粗体文件的机器（等线 / 宋体 / 自定义字体）
@@ -26,20 +42,53 @@
 
 ### 修复
 
+- **`1 hours ago` / `1 days ago` / `1 entries` 等英文单数错形**：计数短语
+  此前不管 n 是几都套同一串，现在按 n 选形。
+
+- **15 条漏译**：`Colors` / `Temperature` / `Pin window` / `Pinned card` /
+  `All history cleared` / MCP 配对说明等此前不在任何译文表里，英文键一改
+  就没人译。守门测试把它们全找了出来。
+
 - **设置界面「重置」按钮没有按钮背景**：该按钮用了 `.frame(false)`，
   观感是一段说明文字而不是可点的控件。改为与「检查更新」按钮同一画法
   （`surface_variant` 填充 + 圆角），文字色从 `text_dim` 提到 `text`。
-
-### 修复
 
 - **语言下拉框选了不生效，永远是「跟随系统」**：`ComboBox::show_ui` 返回的
   `.response` 是**按钮**的 response，在菜单里点选不会把它标记为 `changed`
   ⇒ `Op::SetLanguage` 永远不推送。改为收**选项自己**的 `changed()`。
   界面上看不出异常（下拉框确实划过、确实高亮了），只是没落地。
+
 - **英文/日/俄界面下热键注册失败提示仍是中文**：`failed_message` 的格式串
   是硬编码中文。改为走 `t()`，占位符改成命名形式（`{a}`/`{b}`）。
+
 - **英文/日/俄界面下「N 天前」仍是中文**：`format_time` 的天分支硬编码
   `" 天前"` 不走 `t()`。同上改走 `t()`，并补 `days ago` 译文。
+
+- **`max_items` 溢出导致删光历史**：配置值 ≥ 2^63 时 `as i64` 回绕成负数，
+  「保留数」被 `.max(0)` 兜成 0，下一次复制即删光全部未置顶条目。
+
+- **去重命中不补载荷**：原条目若插入时因当时上限太小而 `blob_file = NULL`，
+  会永远停在「看得见、复制必败」——用户调大上限后再次复制同样内容也修不好，
+  因为去重挡住了新插入。新增 `Store::backfill_payload` 在去重命中时补回。
+
+- **`insert` 失败回滚摧毁他人载荷**：原先无条件删 `{hash}.bin`，而该文件
+  与同哈希条目共享。改为按引用计数删。
+
+- **`like_search` 排序不确定**：`ORDER BY` 缺 `id DESC` 并列兜底，
+  同一毫秒插入的多条两次查询可能给不同顺序。
+
+- **`wait_own_inflight` 不复位 fence**：`abandon_frame` 走过后，槽位轮回转回时
+  `acquire` 的 reset 被 `in_flight` 门控跳过 ⇒ 每帧提交已 signal 未 reset 的
+  fence（`VUID-vkQueueSubmit-fence-00063`），直到交换链重建才自愈。
+
+- **设置窗/卡片子窗没有重绘闸门**：空闲时仍 ~125Hz 全量 acquire+paint+present。
+
+- **卡片子窗 `textures_delta` 漏清**：只在成功路径 `clear()`，paint 出错路径
+  直接返回，release 下不 panic 而是字体图集增量被静默丢弃、缺字形且不自愈。
+
+- **删除 7 处零引用死代码**：`Store::rename_group`、`Store::stats`、
+  `ActionPlan::payload_text`、`builtin_rule_templates`、`AppState::visible_count`、
+  `Service::request_show_window`、`anim::tween_rect`。
 
 ### 变更
 
@@ -60,12 +109,15 @@
   - 新增守门测试：`Locale` 全变体 `parse_lang` 往返、下拉框覆盖全部
     `Locale`、非中英语言绝不显示源码那一半中文、键必须是英文、各表
     无重复键/空译文/占位符错位。
+
 - **语言菜单过滤已选中项**：当前语言再列一遍没有意义，只多占一行、
   也让「点它是没反应」成为可能的误操作。
+
 - **语言菜单一体化（无分界线）**：下拉项用的 `Button::selectable` 默认
   `.frame(true)`，每项各画一圈描边就成了「一格一格」。用
   `egui::containers::menu::menu_style` 清掉各态描边与 inactive 填充，
   再把条目间距与圆角归零，整列读作一块连续面板。
+
 
 ### 移除
 
@@ -73,6 +125,7 @@
   浓度三个设置项）整体移除。该效果为装饰性且常驻持续重绘成本，权衡后
   决定不做。配置字段 `ui.glow` 随之删除；旧 `config.json` 里的该字段
   被 serde 忽略（不报错、不影响其余设置）。
+
 
 ### 重构
 
@@ -84,12 +137,15 @@
   - `ui/icons.rs` 1369 → root 1096 + `icons/{font,draw,md}`
   - 另含早前的 `paint`（16 子模块）、`app`（5）、`theme`（5）、
     `config`（11）、`frame`、`window`、app-crate `lib`
+
 - **文档重整**：三份审查清单合并为 `docs/reviews.md`；四份历史类文档
   （并行开发黑板 / UI 重构设计稿 / 项目报告 / 旧 README）合并为
   `docs/history.md`；根级 md 收敛为 README / ARCHITECTURE / BUILD / CHANGELOG。
+
 - **仓库瘦身**：设计原型（`settings-proto` / `shadow-preview` / `main-proto`）、
   实机探针与诊断脚本清除；`main` 只保留构建环境、文档、源代码、协议四类，
   完整历史移至 `old` 分支。
+
 
 ### 安全
 
@@ -98,42 +154,23 @@
   `text/plain` 简单请求（免 CORS 预检）即可驱动。现改为空 token 仅许
   loopback 对端；绑非 loopback 且无 token 直接拒绝启动；`Host` 头白名单
   （`127.0.0.1` / `localhost` / `::1`）防 DNS rebinding。
+
 - **MCP HTTP 传输层加上限**：`Content-Length` 此前完全由请求方决定，
   一个头即可 OOM。现加请求体上限 8MB、请求行/头行 8KB、头行数 64、
   读超时 30s。
+
 - **托盘窗口不再处理 `WM_COMMAND`**：两条菜单路径都用 `TPM_RETURNCMD`
   直接取返回值，该分支对合法流量是死代码，却让同完整性进程可
   `PostMessageW` 伪造退出 / 清空历史 / 弹窗口。
 
-### 修复
-
-- **`max_items` 溢出导致删光历史**：配置值 ≥ 2^63 时 `as i64` 回绕成负数，
-  「保留数」被 `.max(0)` 兜成 0，下一次复制即删光全部未置顶条目。
-- **去重命中不补载荷**：原条目若插入时因当时上限太小而 `blob_file = NULL`，
-  会永远停在「看得见、复制必败」——用户调大上限后再次复制同样内容也修不好，
-  因为去重挡住了新插入。新增 `Store::backfill_payload` 在去重命中时补回。
-- **`insert` 失败回滚摧毁他人载荷**：原先无条件删 `{hash}.bin`，而该文件
-  与同哈希条目共享。改为按引用计数删。
-- **`like_search` 排序不确定**：`ORDER BY` 缺 `id DESC` 并列兜底，
-  同一毫秒插入的多条两次查询可能给不同顺序。
-- **`wait_own_inflight` 不复位 fence**：`abandon_frame` 走过后，槽位轮回转回时
-  `acquire` 的 reset 被 `in_flight` 门控跳过 ⇒ 每帧提交已 signal 未 reset 的
-  fence（`VUID-vkQueueSubmit-fence-00063`），直到交换链重建才自愈。
-- **设置窗/卡片子窗没有重绘闸门**：空闲时仍 ~125Hz 全量 acquire+paint+present。
-- **卡片子窗 `textures_delta` 漏清**：只在成功路径 `clear()`，paint 出错路径
-  直接返回，release 下不 panic 而是字体图集增量被静默丢弃、缺字形且不自愈。
-- **删除 7 处零引用死代码**：`Store::rename_group`、`Store::stats`、
-  `ActionPlan::payload_text`、`builtin_rule_templates`、`AppState::visible_count`、
-  `Service::request_show_window`、`anim::tween_rect`。
 
 ### 测试
 
 - 新增守门测试：MCP 的 `Host` 白名单与行长度封顶（5 项）、
   `max_items` 溢出不误删（1 项）、`backfill_payload` 补回与幂等（2 项）、
   窗口模块导入的 32 个 VK 必须全部有映射（1 项）。
-- 基线：**961 项通过 / 23 个测试二进制 / clippy 零警告**。
 
----
+- 基线：**969 项通过 / 23 个测试二进制 / clippy 零警告**。
 
 ## [0.2.1] — 2026-10-22
 
