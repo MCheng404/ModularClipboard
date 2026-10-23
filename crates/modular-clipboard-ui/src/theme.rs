@@ -38,6 +38,7 @@ mod fonts;
 
 pub use accent::ACCENT_PRESETS;
 pub use fonts::{install_cjk_font, install_icon_font, sized};
+pub use fonts::emphasis;
 pub use system::detect_system_theme;
 pub use visuals::{SCROLLBAR_WIDTH, apply, composite, set_theme};
 use accent::{apply_overrides, derive_accent};

@@ -28,6 +28,9 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
     if std::env::var_os("TIEZ_NO_CJK_FONT").is_some() {
         tracing::warn!("TIEZ_NO_CJK_FONT 已设置，跳过中文字体加载");
         ctx.set_fonts(FontDefinitions::default());
+        // 整套字体被换成 egui 默认（无 CJK 族）⇒ 粗体族也不存在了，
+        // 必须复位，否则 `emphasis()` 会去构造一个没有的族而 panic。
+        BOLD_READY.store(false, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
 
@@ -37,6 +40,8 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
     if let Some(p) = custom_path
         && let Some(data) = shared_font_data(p, 0)
         && insert_font(&mut defs, "custom_cjk", data) {
+            // 自定义字体没有已知的粗体伴随文件（用户给什么用什么），
+            // 因此这里不装粗体——`emphasis()` 会回落常规字重。
             log_font_loaded(ctx, &mut defs, "自定义字体");
             return true;
         }
@@ -46,6 +51,10 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
             continue;
         };
         if insert_font(&mut defs, name, data) {
+            // CAUTION: 粗体必须在 `set_fonts` **之前**装进同一份 defs。
+            // `log_font_loaded` 内部是 `ctx.set_fonts(take(defs))`——整体
+            // 替换，装晚了会被冲掉（且不报错，只是粗体静默失效）。
+            install_bold_companion(&mut defs, name);
             log_font_loaded(ctx, &mut defs, path);
             return true;
         }
@@ -54,7 +63,75 @@ pub fn install_cjk_font(ctx: &egui::Context, custom_path: Option<&str>) -> bool 
 
     tracing::warn!("未找到中文字体，界面中文将显示为方块");
     ctx.set_fonts(defs);
+    // 同上：没装上中文字体，粗体族自然也没注册。
+    BOLD_READY.store(false, std::sync::atomic::Ordering::Relaxed);
     false
+}
+
+/// 粗体 CJK 字体在 `FontDefinitions::families` 里的族名。
+///
+/// [`emphasis`] 用 `FontFamily::Name(这个)` 取它。
+///
+/// CAUTION: 这个名字必须在 `families` 里有键——egui 的
+/// `FontsImpl::family_key` 对不在表里的族会 **panic**
+/// （"Panics if the family is not in the FontDefinitions"）。
+/// 因此 [`install_bold_companion`] 失败（没找到粗体文件）时，
+/// 任何代码都不能构造这个族的 [`FontId`]——[`emphasis`] 正是因此
+/// 在无粗体时回落 [`FontFamily::Proportional`]。
+pub const CJK_BOLD_FAMILY: &str = "cjk_bold";
+
+/// 取某个 CJK 候选字体对应的**独立粗体文件**路径。
+///
+/// 用 `match` 而不是与 [`CJK_CANDIDATES`] 平行的下标数组：平行数组
+/// 要求两处索引永远对齐，加一个候选字体时漏改一处就会**静默取错**
+/// （把 A 的粗体配给 B）。`match` 漏写编译期就报错。
+///
+/// 返回 `None` 表示该字体没有独立的粗体文件——此时粗体回落常规字重，
+/// 而不是伪造加粗（见 [`emphasis`]）。
+fn bold_companion(cjk_name: &str) -> Option<&'static str> {
+    match cjk_name {
+        // 微软雅黑：粗体是独立的 msyhbd.ttc（雅黑本身不是可变字体）。
+        "msyh" => Some("C:/Windows/Fonts/msyhbd.ttc"),
+        // 等线（Deng）/ 宋体（simsun）/ Noto SC（可变字体，另有机制）/
+        // Linux 文泉驿 / macOS PingFang 均无独立粗体文件。
+        _ => None,
+    }
+}
+
+/// 把粗体伴随字体注册成**独立的族**（[`CJK_BOLD_FAMILY`]）。
+///
+/// # 为什么必须独立成族，而不是塞进 Proportional 族
+///
+/// `insert_font` 把字体插到 `Proportional` / `Monospace` 族首位的做法
+/// 在这里是错的：那会让**所有**文字都用粗体。粗体只能通过「单独一个族
+/// 名 + 显式 `FontFamily::Name(..)`」来选用。
+///
+/// # 为什么不给这个族挂图标字体回退
+///
+/// 族的字体列表里可以挂多个名字做回退，但图标字体是 `install_icon_font`
+/// 用 `add_font` **之后**追加的，且只声明进 `Proportional` 族。这里提前
+/// 挂上它的名字，等真要用时才发现没注册——那时已经不是 panic 而是缺字形。
+/// 因此约定：**`emphasis()` 只用于纯文本**，不要把图标字形放进强调文本
+/// （本项目图标都是独立 `painter` 绘制，本就不走文字通路，详见
+/// `settings_win::draw_settings_nav` 的用法）。
+fn install_bold_companion(defs: &mut FontDefinitions, cjk_name: &str) -> bool {
+    let Some(path) = bold_companion(cjk_name) else {
+        return false;
+    };
+    let Some(data) = shared_font_data(path, 0) else {
+        tracing::debug!(path, "粗体伴随字体不存在，强调文本将回落常规字重");
+        return false;
+    };
+    defs.font_data
+        .insert(CJK_BOLD_FAMILY.to_string(), data);
+    defs.families.insert(
+        FontFamily::Name(CJK_BOLD_FAMILY.into()),
+        vec![CJK_BOLD_FAMILY.to_string()],
+    );
+    // 置位后 `emphasis()` 才敢构造这个族——顺序不能反（见 `BOLD_READY`）。
+    BOLD_READY.store(true, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(path, "粗体伴随字体已注册");
+    true
 }
 
 /// 安装图标字体。返回是否成功。
@@ -217,4 +294,102 @@ pub(super) fn log_font_loaded(ctx: &egui::Context, defs: &mut FontDefinitions, p
 /// 留着一个「传了但没用」的参数本身就是误导，故改名为 `_scale`。
 pub fn sized(size: f32, _scale: f32) -> FontId {
     FontId::proportional(size)
+}
+
+/// 粗体族（[`CJK_BOLD_FAMILY`]）是否已注册。
+///
+/// `emphasis()` 必须据此回落——向一个**没注册**的族构造 `FontId` 不会
+/// 编译报错，而是在 egui 首次给该族建 fallback 链时 **panic**
+/// （`FontsImpl::family_key`： "Panics if the family is not in the
+/// FontDefinitions"）。用户机器上没有 `msyhbd.ttc` 时若不看这个标志，
+/// 一打开设置窗口就崩。
+static BOLD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 返回指定**逻辑字号**的强调（粗体）[`FontId`]。
+///
+/// # 何时用
+///
+/// 只用于**纯文本**的标题类文字（设置窗导航选中项等）。不要把图标字形
+/// 放进强调文本——粗体族没有挂图标字体回退，理由见
+/// [`install_bold_companion`] 的文档。
+///
+/// # 没有粗体字体时
+///
+/// 回落 [`FontId::proportional`]（常规字重）。不伪造加粗：egui 没有
+/// synthetic bold，硬凑只能靠描边，观感脏且字宽变化不可预期。
+pub fn emphasis(size: f32, _scale: f32) -> FontId {
+    if BOLD_READY.load(std::sync::atomic::Ordering::Relaxed) {
+        FontId::new(size, FontFamily::Name(CJK_BOLD_FAMILY.into()))
+    } else {
+        FontId::proportional(size)
+    }
+}
+
+/// 粗体是否可用（测试与诊断用）。
+#[cfg(test)]
+pub(crate) fn bold_ready() -> bool {
+    BOLD_READY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 粗体伴随字体只对「有独立粗体文件」的 CJK 候选项给出路径。
+    ///
+    /// 用 `match` 而不是平行数组就是为了这个：加候选时漏写臂，
+    /// 编译期就报错，不会静默取错字体。
+    #[test]
+    fn bold_companion_only_for_fonts_with_a_bold_file() {
+        assert_eq!(bold_companion("msyh"), Some("C:/Windows/Fonts/msyhbd.ttc"));
+        for name in [
+            "deng",
+            "simsun",
+            "noto_sc",
+            "linux_noto",
+            "linux_wqy",
+            "mac_pingfang",
+            "custom_cjk",
+            "不存在的字体",
+        ] {
+            assert_eq!(
+                bold_companion(name),
+                None,
+                "{name} 没有独立粗体文件，却给了路径"
+            );
+        }
+    }
+
+    /// `emphasis()` 只能返回两种族：`Proportional`（回落）或
+    /// `Name(CJK_BOLD_FAMILY)`（真粗体）。
+    ///
+    /// 这道断言防的是「返回一个没注册过的族名」——那种情况编译期毫无提示，
+    /// 运行期在 egui 首次给该族建 fallback 链时 **panic**
+    /// （`FontsImpl::family_key` 的文档原话）。
+    ///
+    /// 测试**不主动翻转** `BOLD_READY`：它是进程级全局，与并行测试互踩
+    /// 会让本测试时红时绿。
+    #[test]
+    fn emphasis_never_returns_an_unregistered_family() {
+        for size in [8.0_f32, 12.0, 24.0] {
+            let id = emphasis(size, 1.0);
+            assert_eq!(id.size, size, "字号必须原样透传");
+            match &id.family {
+                FontFamily::Proportional => {}
+                FontFamily::Name(n) => assert_eq!(&**n, CJK_BOLD_FAMILY, "族名必须是约定的那个"),
+                FontFamily::Monospace => panic!("emphasis 不该返回等宽族"),
+            }
+        }
+    }
+
+    /// 未装粗体时必须真的回落常规字重。
+    ///
+    /// 单测进程不调用 `install_cjk_font`，因此 `BOLD_READY` 恒为 false——
+    /// 这条断言在该环境下是确定的。真正的安装路径要靠实机验证。
+    #[test]
+    fn emphasis_falls_back_to_proportional_when_no_bold_font() {
+        if !bold_ready() {
+            assert_eq!(emphasis(12.0, 1.0).family, FontFamily::Proportional);
+        }
+    }
 }

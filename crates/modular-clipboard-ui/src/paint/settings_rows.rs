@@ -17,6 +17,33 @@ use crate::theme::Palette;
 use super::{Frame, Op, ConfigGroup};
 
 use super::settings_items::FONT_SCALE_PRESETS;
+
+/// 界面语言下拉框的固定宽度（逻辑点）。
+///
+/// 定值而不是自适应：右侧控件宽度一定，左侧说明文字列才能拿到稳定宽度
+/// （`setting_row` 按控件实测宽度反推标签列宽度，控件忽宽忽窄会让说明
+/// 折行数跳变、行高抖动）。最长选项 `Русский` 也放得下。
+const LANG_COMBO_W: f32 = 132.0;
+
+/// 界面语言可选项：配置值 + 显示名。
+///
+/// # 为什么显示名用「语言自称」
+///
+/// 若按当前语言翻译，会出现「用 A 语言写 B 语言的名字」的循环——当前是
+/// 日语时，`English` 该显示成「英語」还是 `English`？两种都有用户看不懂。
+/// 自称（autonym）没有这个问题：`日本語`、`繁體中文`、`Русский` 在任何
+/// 语言下都自解释，这也是各操作系统语言列表的标准做法。
+///
+/// 唯一例外是第一项「跟随系统」——它没有自称，只能随当前语言翻译
+/// （走 [`t`]，三种新语言的译项在 `core::i18n::catalog`）。
+const LANG_CHOICES: &[(&str, Bi)] = &[
+    (modular_clipboard_core::i18n::LANG_SYSTEM, ("跟随系统", "Follow system")),
+    ("zh-CN", ("简体中文", "简体中文")),
+    ("zh-TW", ("繁體中文", "繁體中文")),
+    ("en-US", ("English", "English")),
+    ("ja-JP", ("日本語", "日本語")),
+    ("ru-RU", ("Русский", "Русский")),
+];
 use super::settings_items::ItemKind;
 use super::settings_items::SETTINGS_CARDS;
 use super::settings_items::SettingsItem;
@@ -136,30 +163,31 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
         ItemKind::Language => {
             setting_row(ui, it.label, it.desc, |ui| {
                 let cur = f.svc.state.config.ui.language.as_str();
-                let sel = if cur.eq_ignore_ascii_case("zh-CN") || cur.eq_ignore_ascii_case("zh") {
-                    1u8
-                } else if cur.eq_ignore_ascii_case("en-US") || cur.eq_ignore_ascii_case("en") {
-                    2u8
-                } else {
-                    0u8 // system / 未知写法都显示「跟随系统」
-                };
-                let picked = draw_segmented(
-                    f,
-                    ui,
-                    "ui_language",
-                    &[
-                        (0u8, ("跟随系统", "Follow system")),
-                        (1u8, ("中文", "Chinese")),
-                        (2u8, ("English", "English")),
-                    ],
-                    sel,
-                );
-                if let Some(v) = picked {
-                    f.state.push(Op::SetLanguage(match v {
-                        1 => "zh-CN",
-                        2 => "en-US",
-                        _ => modular_clipboard_core::i18n::LANG_SYSTEM,
-                    }));
+                // 下标与 `LANG_CHOICES` 对齐；未知写法一律落到 0（跟随系统）。
+                let mut sel = LANG_CHOICES
+                    .iter()
+                    .position(|(v, _)| v.eq_ignore_ascii_case(cur))
+                    .unwrap_or(0);
+                // CAUTION: 用下拉框而不是分段控件。
+                //
+                // 6 个语言选项挤进分段控件，每段只剩 avail/6——「跟随系统」
+                // 这类四字词会被压成不可辨认的窄条，而 `draw_segmented` 为了
+                // 自保会把整个控件撑宽，反过来把左侧说明文字挤进几十点的
+                // 窄列（说明折成七八行）。下拉框宽度固定，列表里再展开全部
+                // 选项，两者互不挤压。
+                //
+                // 显示名一律用**语言自称**（见 `LANG_CHOICES` 的说明），
+                // 因此列表在任何当前语言下都自解释。
+                let resp = egui::ComboBox::from_id_salt("ui_language")
+                    .selected_text(t(LANG_CHOICES[sel].1))
+                    .width(LANG_COMBO_W)
+                    .show_ui(ui, |ui| {
+                        for (i, (_, label)) in LANG_CHOICES.iter().enumerate() {
+                            ui.selectable_value(&mut sel, i, t(*label));
+                        }
+                    });
+                if resp.response.changed() {
+                    f.state.push(Op::SetLanguage(LANG_CHOICES[sel].0));
                     true
                 } else {
                     false
@@ -1304,4 +1332,51 @@ pub(super) fn setting_row(
         r.on_hover_text(desc);
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use modular_clipboard_core::i18n::Locale;
+
+    /// 下拉框必须覆盖**每一个** `Locale` 变体（外加「跟随系统」）。
+    ///
+    /// 漏一个的后果是「该语言在设置里根本选不到」——而 `Locale` 的变体
+    /// 与这张表分散在两个 crate，编译器不会提醒。
+    #[test]
+    fn lang_choices_cover_every_locale() {
+        let values: Vec<&str> = LANG_CHOICES.iter().map(|(v, _)| *v).collect();
+        for l in [
+            Locale::ZhCn,
+            Locale::ZhTw,
+            Locale::EnUs,
+            Locale::Ja,
+            Locale::Ru,
+        ] {
+            assert!(
+                values.contains(&l.as_str()),
+                "语言 {:?}（{}）不在界面语言下拉框里，用户选不到",
+                l,
+                l.as_str(),
+            );
+        }
+        // 「跟随系统」必须占据第一项。
+        assert_eq!(
+            LANG_CHOICES[0].0,
+            modular_clipboard_core::i18n::LANG_SYSTEM,
+            "第一项应是「跟随系统」"
+        );
+    }
+
+    /// 每个选项的显示名都不能为空，且中英两半都得有值。
+    ///
+    /// 自称词（日本語 / Русский）两半相同，这是有意的——见
+    /// [`LANG_CHOICES`] 的说明；此处只挡「漏写一半」。
+    #[test]
+    fn lang_choice_labels_are_non_empty() {
+        for (v, (zh, en)) in LANG_CHOICES {
+            assert!(!zh.trim().is_empty(), "{v} 的中文显示名为空");
+            assert!(!en.trim().is_empty(), "{v} 的英文显示名为空");
+        }
+    }
 }

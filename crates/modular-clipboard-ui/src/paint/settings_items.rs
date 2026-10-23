@@ -537,7 +537,10 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             SettingsItem {
                 key: "ui.language",
                 label: ("界面语言", "Interface language"),
-                desc: ("显示语言：跟随系统，或固定中文 / English", "Display language: follow the system, or force Chinese / English"),
+                desc: (
+                    "显示语言：跟随系统，或固定为列表中的一种",
+                    "Display language: follow the system, or pin one from the list",
+                ),
                 kind: ItemKind::Language,
             },
             SettingsItem {
@@ -1101,11 +1104,26 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
             if changed_any {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // 带按钮背景：与「检查更新」按钮（`settings_rows.rs`）
+                        // 同一画法——`surface_variant` 填充 + `text` 文字色。
+                        //
+                        // CAUTION: 早前这里是 `.frame(false)`（纯文字、无背景），
+                        // 在卡片标题行里读起来像一段说明文字而不是可点的控件：
+                        // 用户反馈「重置按钮没有按钮背景」。`.frame(false)` 只该
+                        // 用于「刻意做成文字链接」的场合（如工具栏图标按钮），
+                        // 一个会清掉整卡设置的动作不该长成那样。
+                        //
+                        // 文字色从 `text_dim` 提到 `text`：有了填充之后再用次要
+                        // 文字色，在浅色主题（surface_variant #ECEFF3）上对比度
+                        // 偏低，且与「检查更新」不一致。
                         let resp = ui.add(
                             egui::Button::new(
-                                egui::RichText::new(t(("重置", "Reset"))).size(pal.font_sm).color(pal.text_dim),
+                                egui::RichText::new(t(("重置", "Reset")))
+                                    .size(pal.font_sm)
+                                    .color(pal.text),
                             )
-                            .frame(false),
+                            .fill(pal.surface_variant)
+                            .corner_radius(pal.radius_md),
                         );
                         let rect = resp.rect;
                         let clicked = resp.clicked();

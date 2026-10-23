@@ -943,11 +943,27 @@ pub(super) fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         } else {
             cat.icon().paint(&painter, icon_r, icon_color);
         }
+        // 选中项用**粗体**（`emphasis`），未选中用常规。
+        //
+        // 2026-10-23 用户要求「优化字体字重」。粗体来自独立的粗体伴随
+        // 字体（`msyhbd.ttc` 等，见 `theme::fonts::install_bold_companion`），
+        // 机器上没有该文件时 `emphasis` 自动回落常规字重，不会崩也不会
+        // 伪造加粗。
+        //
+        // CAUTION: 这里安全是因为**图标是独立 `painter` 绘制**的
+        // （上面 `cat.icon().paint(...)`），不走文字通路——粗体族没有挂
+        // 图标字体回退，若把图标字形写进这段文字就会缺字形。同类用法
+        // 请沿用这个前提。
+        let font = if selected {
+            crate::theme::emphasis(pal.font_sm, f.scale)
+        } else {
+            egui::FontId::proportional(pal.font_sm)
+        };
         painter.text(
             pos2(icon_r.max.x + 8.0, r.center().y),
             egui::Align2::LEFT_CENTER,
             t(cat.title()),
-            egui::FontId::proportional(pal.font_sm),
+            font,
             text_color,
         );
         f.hit_insert(cat.hot_key(), r);
