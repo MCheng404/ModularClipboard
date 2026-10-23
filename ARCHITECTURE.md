@@ -168,9 +168,47 @@ registry.register(Box::new(SendToPhoneAction))?;
 
 ## 安全与隐私
 
+两道信任边界，都要显式设防（2026-10-23 审查后加固，详见 `docs/reviews.md` 第三轮）：
+
+1. **命名管道** `\\.\pipe\ModularClipboard.Daemon.v1`（常驻 ⇄ 界面）。
+   现状：`FILE_FLAG_FIRST_PIPE_INSTANCE` 只防第二个 daemon 抢名，**不校验客户端身份**——
+   同会话任意进程连上即可驱动全部 `Command`（含 `LoadPayload` 读走全部历史载荷）。
+   这是已知缺口，推荐修法是随机管道名 + 启动参数传递。
+2. **MCP HTTP** `http://{host}:{port}/mcp`（AI 客户端 ⇄ 自动化服务）。
+   该服务能合成键鼠、截屏、读写剪贴板，因此：
+   - **token 为空 ⇒ 仅 loopback**。空 token 曾被当作「无需认证」，恶意网页一个
+     `text/plain` 简单请求（免 CORS 预检）即可驱动；
+   - **`Host` 头白名单**（`127.0.0.1` / `localhost` / `::1`）防 DNS rebinding；
+   - **绑非 loopback 且无 token 直接拒绝启动**；
+   - 传输层上限：请求体 8MB、单行 8KB、头行 64、读超时 30s。
+
+其余措施：
+
 - **密码管理器屏蔽**：`blocked_apps` 默认含 1Password、Bitwarden、KeePass、KeePassXC，按前缀不区分大小写匹配。
 - **密码框启发式**：检查前台窗口类名是否含 `Credential` / `Password` / `Logon` / `Security` / `Consent`。这是**尽力而为**，Windows 无公开 API 直接查询，因此默认还需配合进程黑名单。
+- **载荷文件路径闸门**（SEC-006）：DB 行内容不可信，`safe_blob_path` 把 `blob_file` 收敛为「blobs 目录下的纯文件名」，挡掉任意文件读/删原语；覆盖 store 侧全部读删入口。
+- **临时目录防 junction**（SEC-005）：`open_in_memory` 的载荷目录名带 pid + 原子序号 + 每进程随机分量，不可预测。
 - **加密存储**：未实现。载荷以明文存于 `%APPDATA%/modular-clipboard/blobs/`。这是已知缺口。
+
+## 文档布局
+
+| 文件 | 职责 |
+|---|---|
+| `README.md` | 项目是什么、怎么跑、文档地图 |
+| `ARCHITECTURE.md` | 本文件：架构、进程模型、模块地图、安全边界 |
+| `BUILD.md` | 构建环境、MSVC 注入、测试规范、注释标记规范 |
+| `CHANGELOG.md` | 逐版本变更 |
+| `docs/dpi-conventions.md` | DPI 三层量纲约定（代码注释大量引用） |
+| `docs/reviews.md` | 历三轮代码审查发现与处置 |
+| `docs/history.md` | 开发史存档（并行开发黑板、UI 重构设计稿、项目报告、旧 README） |
+| `docs/修复记录-2026-10-14.md` | 该日修复记录 |
+| `docs/内存分析-2026-10-12.md` | 双进程拆分的内存依据 |
+| `docs/渲染管线审查与GPU模糊.md` | 渲染管线与磨砂实现 |
+| `docs/编译卡死排查.md` | 构建卡死的排查记录 |
+| `docs/agents/*.md` | 第二轮 6 路 Agent 审查的原始报告 |
+
+`main` 分支只保留构建环境、文档、源代码、协议四类内容；
+设计原型与实机探针脚本已清除，完整历史在 `old` 分支。
 
 ## 构建环境说明
 

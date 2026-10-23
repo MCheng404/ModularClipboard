@@ -511,7 +511,7 @@ fn device_kind(t: vk::PhysicalDeviceType) -> &'static str {
 /// 把「`in_flight` 分支在当前 API 下不可达」这件事打印出来。
 ///
 /// 不是为了报错，而是让读输出的人知道：**这里有一个观察到的结构问题，
-/// 属于库代码（已冻结），报告在PROGRESS.md 的待决区。**
+/// 属于库代码（已冻结），报告在 docs/history.md 的并行开发黑板一节。**
 fn print_in_flight_is_unreachable() {
     match modular_clipboard_gfx::frame::can_record_upload(true, true) {
         Err(e) => println!("OK can_record_upload(in_flight=true) 正确拒绝：{e}"),

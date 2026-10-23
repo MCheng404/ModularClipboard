@@ -68,6 +68,11 @@
   - **stdio**（本地推荐）：`--mcp-server`，由 MCP 客户端 spawn，每行一个 JSON
   - **Streamable HTTP**（远程 / 自定义）：`--mcp-http`，监听 `http://{host}:{port}/mcp`，
     支持 Bearer token 鉴权
+- 安全边界（2026-10-23 加固）：这个服务能**合成键鼠、截屏、读写剪贴板**，
+  因此 **token 为空时仅允许本机（loopback）访问**，且 `Host` 头不在白名单内
+  （`127.0.0.1` / `localhost` / `::1`）一律拒绝——防 DNS rebinding。
+  绑到非 loopback 地址（如 `0.0.0.0`）却未配 token 时**直接拒绝启动**。
+  请求体上限 8MB、单行 8KB、读超时 30s
 - 10 个可单独开关的界面自动化工具：屏幕截图、读取元素布局、鼠标点击 / 滚动 / 拖拽、
   文本键入、组合键、调整窗口大小、切换窗口焦点、剪贴板读写
 - 设置 →「通信」：总开关 + 「ⓘ」覆盖层逐项授权，服务地址 / 端口 / 密钥可自定义；
@@ -167,7 +172,7 @@ modular-clipboard (bin)
 ## 测试
 
 ```bash
-cargo test --workspace      # 925 项（23 个测试二进制）
+cargo test --workspace      # 934 项（23 个测试二进制）
 cargo clippy --workspace --all-targets   # 零警告
 ```
 
@@ -178,6 +183,28 @@ cargo run --example tray_probe          # 托盘图标 + 事件链路 + 热键�
 cargo run --example tray_interact_probe # 真实子进程：关窗口≠退出 的四条链路
 cargo run --example backdrop_probe      # 自研磨砂合成路径回归（漏 configure 即全透明）
 ```
+
+## 文档地图
+
+| 想知道什么 | 读这个 |
+|---|---|
+| 项目是什么、怎么跑 | 本文件 |
+| 架构分层、进程模型、**模块地图** | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| 构建环境、MSVC 注入、图标资源 | [BUILD.md](BUILD.md) |
+| 逐版本变更 | [CHANGELOG.md](CHANGELOG.md) |
+| DPI 三层量纲（逻辑点/物理像素/归一化） | [docs/dpi-conventions.md](docs/dpi-conventions.md) |
+| 历轮代码审查发现与处置 | [docs/reviews.md](docs/reviews.md) |
+| 开发史存档（并行开发黑板、UI 重构设计稿） | [docs/history.md](docs/history.md) |
+| 内存分析 / 渲染管线 / 编译卡死排查 | [docs/内存分析-2026-10-12.md](docs/内存分析-2026-10-12.md) 等 |
+| 第三方许可 | [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) |
+
+## 仓库布局
+
+`main` 只保留四类内容：**构建环境**（`Cargo.*`、`scripts/`、`.github/`）、
+**文档**（根级 4 份 md + `docs/`）、**源代码**（`crates/`）、**协议**（`LICENSE` 等）。
+设计原型、截图、实机探针脚本等中间产物已清除。
+
+完整开发历史（含被清除的文件与全部提交记录）在 **`old`** 分支。
 
 ## 路线图
 

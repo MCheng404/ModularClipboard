@@ -1,4 +1,390 @@
-# 审查发现清单（2026-10-23）
+# 代码审查发现清单（历轮合并）
+
+> 本文档合并了项目全部三轮系统性代码审查。每轮独立编号、互不影响，
+> 查阅时按日期定位。状态含义：`✅ 已修` / `⬜ 待修` / `⚠️ 待确认`。
+>
+> **不要**把不同轮次的编号混用——`DF-01`（第二轮）与 `DL-01`（第三轮）
+> 是不同的东西。
+
+## 索引
+
+| 轮次 | 日期 | 规模 | 状态 |
+|---|---|---|---|
+| 第一轮 | 2026-10-08/09 | 4 Agent，46 条 | 全部闭环 |
+| 第二轮 | 2026-10-12 | 6 Agent，分批修复 | 大部分闭环，未修项附理由 |
+| 第三轮 | 2026-10-23 | 3 Agent + 手动 UI 审查，23 条 | P0/P1 已修 8 条，其余列后续 |
+
+---
+
+## 第一轮：2026-10-08/09（4 Agent 并行）
+
+> 46 条发现，全部闭环。含窗口/渲染、测试质量自省、明确不做的项。
+
+4 个 Agent 并行审查，共 **46 条**发现，**已全部闭环**。本文档记录全部条目与处置状态，
+避免遗漏。状态含义：`✅ 已修` / `⬜ 待修` / `⚠️ 待确认`。
+
+---
+
+## 一、已修（本轮）
+
+### 窗口/渲染层（gfx）
+
+| # | 问题 | 根因 | 状态 |
+|---|---|---|---|
+| G1 | 拖动区与边框是**进程级全局**，多窗口互相串味 | `chrome.rs` 三个全局原子量；文档里写着「一个进程只有一个主窗口」，加了子窗口后前提不成立 | ✅ 改 per-HWND（`CHROME` 表按 HWND 索引） |
+| G2 | 设置窗口**按主窗口的表面能力**建交换链 | `frame.rs:1444` 用 `gpu.surface()`（主窗口）查 caps，而 `create_swapchain` 用 `self.surface`。字段注释说早前已修，实际只修了一半 | ✅ 改 `self.surface` |
+| G3 | `PeekMessageW` **无 hwnd 过滤**，多窗口抢同一条消息队列 | 传 `None` = 取整个线程的消息，谁先 poll 谁抢走全部 | ✅ 改 `Some(self.hwnd)`，`WM_QUIT` 单独 peek |
+| G4 | 附属窗口 `poll_for(Some(16ms))` 阻塞主循环 | `poll_for` 带超时会真的睡等 | ✅ 改 `poll_for(None)` |
+| G5 | 子窗口 `VkSurfaceKHR` 永不销毁 | `Gpu` 无 `destroy_surface`；`ChildWindow`/`SettingsWindow` 无 `Drop` | ✅ 已修 |
+| G6 | acquire 之后出错会**永久卡死**该渲染器 | `pending` 只在 `present` 清除，错误路径不恢复 | ✅ 已修 |
+| G7 | `new_for_surface` 的格式校验用主窗口的 formats | `swapchain_format_of(gpu)` 走主窗口快照 | ✅ 已修 |
+| G8 | `Swapchain::new_for_surface` 的 `clamp` 在 `min>max` 时 panic | 与 `frame.rs::clamp_axis` 不一致 | ✅ 已修 |
+| G9 | `EventLoop::poll` 每轮清零 `modifiers` | 与「累积事件缓冲」语义冲突 | ✅ 已修 |
+| G10 | `record()` 对 `DrawBatch.clip` 无兜底钳制 | 裁剪合法性全靠调用方 | ✅ 已修 |
+| G附A | `Painter::drop` **漏销毁** `user_tex` 与 `placeholder` | 每窗口泄漏一份 Vulkan 对象 | ✅ 已修 |
+| G附B | `TextureStore::update_user` 用 `FONT_FORMAT` 建用户纹理 | RGBA 会被压成灰度；好在全仓无调用者 | ✅ 已修（建议删除） |
+| G附C | `staging_size` 对未支持格式 `panic!` | 库函数不该 panic | ✅ 已修 |
+| G附D | `select_device` 只用主窗口表面查呈现支持 | 双显卡 + 跨屏拖子窗口有风险 | ⚠️ 待实机验证 |
+
+### 主循环与生命周期（app / childwin / settingswin / presence）
+
+| # | 问题 | 根因 | 状态 |
+|---|---|---|---|
+| F1 | 多个 `EventLoop` 抢同一条消息队列 | 与 G3 同源 | ✅ |
+| F2 | 隐藏/最小化/acquire 失败三条 `continue` 都不驱动附属窗口 | 子窗口留在屏幕上但不渲染不 poll | ✅ 已修 |
+| F3 | 设置窗关闭态**只 poll 不排空**，重开时被旧事件引爆 | 用户体感「点齿轮没反应 / 一闪就没」 | ✅ 改 `take_pending()` |
+| F4 | 每帧被附属窗 `poll_for(16ms)` 阻塞 | 与 G4 同源 | ✅ |
+| F5 | 最小化时写回窗口坐标 → 下次启动跑到屏幕外 | `GetWindowRect` 对最小化窗口返回 `-32000` | ✅ 已修 |
+| F6 | 三个 UI 配置项只写不读（`always_on_top`/`hide_on_focus_lost`/`start_minimized`） | 开关能改、能落盘、重启无效 | ✅ 已修 |
+| F7 | `App::should_quit` 是死状态，UI 无退出入口 | 无 `Op::Quit`，没人置 true | ✅ 已修 |
+| F8 | `reset_settings_scroll` 改的是**主窗口的 Context** | 滚动位置存在各自 Context 里，等于没写 | ✅ 改用 `self.ctx` |
+| F9 | 托盘「清空历史」不请求重绘 | 列表与计数显示旧数据 | ✅ 已修 |
+| F10 | `SettingsWindow::skip_frames` 恒为 0 的死字段 | 唯一使用点从不进分支 | ✅ 删除 |
+| F11 | `ChildWindows::Drop` 空实现 + `close_all` 重复销毁 | 语义重复（幂等，不致错） | ✅ 已修 |
+| F12 | `PlatformOutput` 全仓无人消费 | Ctrl+C 复制、光标形状失效 | 部分修复（光标已接，CopyText 故意不接） |
+
+### 绘制层（paint.rs）
+
+| # | 问题 | 根因 | 状态 |
+|---|---|---|---|
+| P0-1 | 列表行画到窗口左上角（`pos2(0.0, …)`） | **egui 的 Rect 永远是全局坐标**，`ScrollArea` 的 `content_max_rect` 只是可用区域偏移，不做坐标变换 | ✅ 改回绝对坐标 |
+| P0-2 | 行的点击注册在根 `Ui` 上，绕过裁剪 | — | ✅ 此前已用 `ui.interact` |
+| P0-3 | 内嵌置顶区与历史栏**整块重叠** | `draw_embedded_pinned` 事后叠画 | ✅ 已修（`embedded_pinned_height` 先切分 body） |
+| P1-4 | 两个列表共用一个 `scroll_offset` 字段 | 有置顶条目时历史列表滚不动 | ✅ 已修（早前已修） |
+| P1-5 | `vertical_scroll_offset` 每帧强制回写 ⇒ 拖滚动条无效 | 不读回 `ScrollAreaOutput` | ✅ 已修（早前已修） |
+| P1-6 | `meta_area` 的 `max.y` 多叠加 `text_area.min.y` | 「来源 · 时间」跑到卡片外 | ✅ |
+| P2-7 | 拖动区伸进搜索框左侧约 22pt | `left_end` 读 `edit_rect.min.x` 而非外框左缘 | ✅ |
+| P2-8 | 字号被 DPI **乘了两次**（`sized()` × egui 的 ppp） | `FontId` 应给逻辑字号 | ✅ 已修（改动面大，需重过视觉） |
+| P2-9 | `row_height_for` 测量宽度比渲染宽度窄 8pt | 两处各写一份算式 | ✅ 已修 |
+| P附1 | 窄卡片提前 return 跳过 `clicked()` | 整行不可点但仍画 hover | ✅ 已修 |
+| P附2 | `draw_switch` 同矩形注册两次 interact | 靠「后注册者优先」侥幸正确 | ✅ 占位用 `Sense::empty()`，只保留一条显式 `interact`（结构清理，无行为差异） |
+| P附3 | `hit.clear()` 只在 `draw()` 做 | 设置窗/子窗与主窗共用 `UiState`，热区互相清、关窗后残留 | ✅ 改 `HitTable` 按 `HitNs{Main,Child,Settings}` 分命名空间 |
+| P附4 | `search_box_accepts_typed_text` 焦点断言恒真 | `|| focused().is_some()` 恒成立 | ✅ 已修 |
+
+### 布局求解（solver / workspace / card）
+
+| # | 问题 | 根因 | 状态 |
+|---|---|---|---|
+| S1 | `PinnedMode::OwnCard` 是死开关，「独立分栏」完全无效 | `pinned_is_embedded()` 只看 `host`，从不读 `pinned_mode` | ✅ 已修 |
+| S2 | 宽度为 0 的卡被静默排除 ⇒ `n` 少算 ⇒ `avail` 反而变大 | 布局对窗口宽度**非单调** | ✅ `.max(1.0)` |
+| S3 | `apply()` 用 `zip` 静默截断 | 多出的卡保留上一帧 rect，照画 | ✅ 长度不等则拒绝 |
+| S4 | 三套宽度需求口径并存 | `solve` / `layout_width` / `required_width` 判据不同 | ✅ 合并为 `solver::layout_demand` 单一口径，`Card::layout_width` 删除 |
+| S5 | 极窄窗口下宽度可缩到亚 1pt | 无下限 | ✅ `avail` 下限 = `n` |
+| S6 | 负 `gap` 把卡片画到窗口外 | 无 `max(0.0)` | ✅ |
+| S7 | 落位不对齐像素栅格、不钳右边界 | ppp=1.5 时描边发虚 | ✅ 已修 |
+| S8 | 模块文档描述已删除的折叠行为（含 broken link） | 与当前契约字面相反 | ✅ |
+| S9 | 不变式 3「`is_visible()` 为真则 rect 非零」是假的 | 内嵌置顶 `is_visible()==true` 但 rect 为 0 | ✅ 已修 |
+| S10 | 0 宽矩形这条最易复现的回归测不到 | `check` 的 `continue` 把 0 宽当无罪 | ✅ 已修 |
+| S附 | `empty()` 的 `gap: 6.0` 与 `default()` 的 `0.0` 不一致 | 与 S6 同源 | ✅ 已修 |
+
+---
+
+## 二、测试质量问题（自省）
+
+本轮最值得记录的不是某个 bug，而是**同一个 bug 反复逃脱测试**的模式：
+
+1. **列表渲染路径零覆盖** —— `Harness::new` 建空列表，`draw_history_body`
+   走 `draw_empty` 直接 return，`draw_item_row` 从未执行。505 条测试全绿，
+   没有一条真的画过一行。→ 新增 `Harness::with_items(n)`。
+2. **假守卫（一）** —— 我为 P0-1 写的第一版判据是「滚动后下半部分点得到
+   条目」。注入 bug 实测**仍然绿**：60 条记录整体平移 200px 不留空白，
+   任意位置都还有行，「点得到」恒真。→ 改成断言**身份**（滚到底必须是
+   最旧那条）。
+3. **假守卫（二）** —— 为 P2-7 把拖动区测试从「中心点」加强到「四角」，
+   注入后**仍然绿**：拖动区终点与输入区左缘只差 2pt，四角全在区外。
+   → 补登记 `search_box`（外框）热区，把真正会出事的那 22pt 纳入探测。
+
+**结论**：
+- 判据必须落在**真正会出事的区域**上，不是「差不多的地方」。
+- 断言必须能区分「有东西」与「是哪个东西」。
+- **任何修复都要注入 bug 验证测试会红**，否则就是自欺。
+
+---
+
+## 三、建议的修复顺序
+
+| 优先 | 条目 | 理由 |
+|---|---|---|
+| P0 | P0-3 内嵌置顶区重叠 | 唯一「界面明显错乱」的未修项 |
+| P0 | F2 隐藏时附属窗口冻结 | 主窗口隐藏后子窗留在屏幕上无响应 |
+| P0 | G5 surface 泄漏 | 长期运行的显存/Vulkan 对象泄漏 |
+| P1 | F6 三个配置项只写不读 | 用户可见的「开关没用」 |
+| P1 | F9 托盘清空不刷新 | 用户可见 |
+| P1 | P1-4 / P1-5 滚动相关 | 用户可见 |
+| P1 | G6 acquire 错误后永久卡死 | 一次异常即窗口报废 |
+| P2 | F7 退出入口、S1 死开关、F5 窗口坐标 | 功能缺失 |
+| — |~~P2-8 字号双倍缩放~~ 已修 | — |
+| P3 | 其余文档、死代码、防御性钳制 | 技术债 |
+
+---
+
+## 四、明确**不做**的（附理由）
+
+### `OutputCommand::CopyText`（egui 里 Ctrl+C 复制选中文本）
+
+接线本身很简单（`ClipboardReader::write_text` 已在 `Service::copy_item`
+里用着），**但本程序会自己监听剪贴板**：写进去的内容会触发自己的捕获
+钩子，于是「在搜索框里选中几个字按 Ctrl+C」会**多出一条历史记录**。
+
+capture 层目前**没有自写防护**——既没有「忽略自己刚写的内容」的时间窗，
+也没有内容比对。要接必须先补那层，否则回环。
+
+**宁可功能缺失，也不要让用户每按一次 Ctrl+C 就多一条垃圾记录。**
+已在 `app.rs` 里留日志与说明，标记为待后续处理。
+
+---
+
+## 五、最终状态：46 条中已修 **41 条**
+
+剩余 **4 条**及不修的理由（F11 已修，G附D 是「需实机验证」类，单独列在表里）：
+
+| 条目 | 为什么留着 |
+|---|---|
+| **P附2** | `draw_switch` 在同一矩形注册两次 interact，逻辑上冗余，但靠「后注册者优先」结果正确。不影响功能，删它需要改控件骨架 |
+| **P附3** | `hit` 表跨窗口共用、`hit.clear()` 只在 `draw()` 里。彻底修需把热区改成**按窗口作用域隔离**，涉及 8 处注册点 + 测试辅助函数，重构风险大于收益。当前无键名冲突、设置窗口每帧重写，只是自动化读热区的时机不稳定 |
+| **G附D** | `select_device` 只用主窗口表面查呈现支持。双显卡 + 跨屏拖子窗口才有风险，**需实机验证**才能确认是否值得改 |
+| **S4** | 三套宽度需求口径并存（`solve` / `layout_width` / `required_width`）。`required_width()` **生产代码无调用点**（只有测试用），属重构而非修 bug |
+
+
+**用户可见的问题已全部修完。** 剩下 5 条要么是纯冗余、要么需实机验证、
+要么是重构而非修 bug——继续清理的边际收益已明显低于引入回归的风险。
+
+---
+
+## 第二轮：2026-10-12（6 Agent 并行）
+
+> 代码质量 CQ / 缺陷 DF / 架构 AR / 性能 PF / 安全 SEC / UI 六路，外加 clippy 基线与 603 项测试基线。原始报告全文曾见 docs/agents/*.md。
+
+> 方法：6 个 Agent 并行只读审查（代码质量 CQ / 缺陷 DF / 架构 AR / 性能 PF / 安全 SEC / UI），  
+> 外加全 workspace clippy 基线（124 条警告行）与 603 项测试基线（全绿）。  
+> 原始报告全文见 `docs/agents/*.md`。本文档是分批修复的唯一依据。  
+> 关键 P0/P1 已由我逐条对照源码复核（DF-01/02/03、SEC-001/002、UI-P0-1/2/3 均已验证属实）。
+
+## 〇、基线状态（修复前）
+
+| 项      | 值                                           |
+| ------ | ------------------------------------------- |
+| 编译     | 通过（debug, x86_64-pc-windows-msvc）           |
+| clippy | 124 条 warning 行（跨 9 crate + examples/tests） |
+| 测试     | 603 项全绿（11 个 test 二进制）                      |
+| 发现总数   | 109 条编号发现 + clippy 机械项 ~60 处                |
+
+## 一、确认问题清单（按严重度）
+
+### P0（数据丢失 / 崩溃 / 安全漏洞 / 明显功能失效）
+
+| #    | 来源                     | 问题                                                                                     | 模块           |
+| ---- | ---------------------- | -------------------------------------------------------------------------------------- | ------------ |
+| F-01 | DF-01                  | 载荷按 `{hash}.bin` 共享命名 + delete 无条件删文件：置顶项与重复制条目同哈希，删任一即摧毁其余条目载荷（默认配置可达，保留策略自动触发）       | store        |
+| F-02 | SEC-001 + DF-03b       | `run_command` 经 `cmd /C program arg` 执行未转义 selection，`&`/`\|` 可注入任意命令（链路已就绪，UI 一接线即激活） | platform/app |
+| F-03 | SEC-002 + DF-03a       | `open_url` 经 `cmd /C start "" url`，URL 含 `&`/`%` 被 cmd 截断/展开                           | platform/app |
+| F-04 | CQ-3                   | `write_blob` 覆盖路径 `File::create` 截断后 write 失败即毁数据（应 .tmp+rename）                       | store        |
+| F-05 | CQ-1                   | usize→u32 `as` 截断使配置校验防线失效                                                             | core         |
+| F-06 | SEC-005                | `%TEMP%` 载荷目录名可预测（pid+序号）且不查 reparse point                                             | store        |
+| F-07 | SEC-006                | DB 行内 blob_file 未规范化，DB 被篡改可作任意文件读/删原语                                                 | store        |
+| F-08 | SEC-010                | 互斥体创建失败 `unwrap()` panic + 固定名可被本地进程预持 DoS                                             | bin          |
+| F-09 | PF-2                   | ingest 全链路（SHA-256 + blob 写 + insert + retention + reload）在 UI 线程，复制大图冻结数百 ms          | app/capture  |
+| F-10 | PF-1a                  | 列表每帧全量 clone items + 逐条 LayoutJob 全量哈希，帧成本随剪贴板总字节线性增长                                  | ui           |
+| F-11 | PF-1b                  | 行高每帧重复测量无缓存                                                                            | ui           |
+| F-12 | PF-4                   | 无变化也 ~100Hz 全速重绘，空闲 CPU 高                                                              | ui           |
+| F-13 | PF-3                   | 启动先显示窗口再初始化，期间无消息泵（假死观感）+ 字体双拷贝                                                        | ui           |
+| F-14 | PF-5 + CQ-11 + SEC-018 | preview 全文入库（放大帧级/DB/哈希三处成本；魔法数字 4000 无命名）                                             | store/app    |
+| F-15 | UI-P0-1                | `McpProbe` 从未启动，MCP 覆盖层永远显示「未连接」                                                       | ui           |
+| F-16 | UI-P0-2                | `Service::notify` 的 notice 全仓无读取方，8 处用户反馈静默丢失                                          | ui/app       |
+| F-17 | UI-P0-3                | 卡片子窗口无拖动区上报，鼠标无法移动窗口                                                                   | ui           |
+| F-18 | DF-02                  | FTS5 trigram 对 <3 字符查询静默返回空，LIKE 兜底不触发：1-2 字搜索（含两字中文词）永远搜不到                            | store        |
+| F-19 | DF-12                  | insert 先写载荷文件后开事务，事务失败留孤儿文件（需等下次启动 gc）                                                 | store        |
+
+### P1（特定场景功能错误 / 重要健壮性）
+
+| #    | 来源                | 问题                                                        | 模块               |
+| ---- | ----------------- | --------------------------------------------------------- | ---------------- |
+| F-20 | SEC-003           | MCP 默认启用且默认空 token，本地任意进程可读剪贴板/截屏/键鼠注入                    | mcp/core         |
+| F-21 | SEC-007           | MCP HTTP 解析无资源上限（header 行/body 大小/读超时）                    | mcp              |
+| F-22 | SEC-008           | 不可信图片解码无尺寸上限，解压炸弹可 OOM                                    | app              |
+| F-23 | SEC-009           | GDI 对象泄漏三处（backdrop Drop 顺序 / mcp capture 错误路径 / tray 收尾） | gfx/mcp/platform |
+| F-24 | SEC-011           | UNC 路径经 explorer 打开触发 SMB NTLM 凭据泄露                       | platform         |
+| F-25 | SEC-012           | FTS 回退路径把用户搜索词写入日志                                        | store            |
+| F-26 | DF-11a            | 保留策略/列表排序缺 `id DESC` 兜底（同毫秒并列淘汰目标不确定）                     | store            |
+| F-27 | DF-11b            | 数量淘汰逐条 delete = N+1 事务                                    | store            |
+| F-28 | PF-6              | 列表查询缺 `(pinned, created_at)` 复合索引 + 每次事件全量重读              | store            |
+| F-29 | PF-8              | `copy_item` 图片分支 UI 线程全量解码（点击卡顿）                          | app              |
+| F-30 | DF-04             | 自启读用 RRF_RT_REG_SZ、写用 REG_EXPAND_SZ，读函数永远看不到写的值           | platform         |
+| F-31 | DF-05             | 序列号基线无条件先推进，瞬时读取失败即永久漏捕该次复制                               | capture          |
+| F-32 | DF-06             | Html 条目写回写的是 HTML 源码纯文本（粘贴得到字面标签）                         | app              |
+| F-33 | UI-P1-1           | 子窗口 Context 不 apply theme，滚动条/tooltip 观感断裂                | ui               |
+| F-34 | UI-P1-3           | 主题切换瞬时硬切无过渡                                               | ui               |
+| F-35 | UI-P1-4 + UI-P2-3 | 选中描边 `2.0 * scale` 违反逻辑点约定（死分支同病）                         | ui               |
+| F-36 | AR-06             | Vulkan 管线组装两份相同实现（app.rs 内联 + SharedGfx::create）          | ui/gfx           |
+| F-37 | AR-05             | 配置写入全字符串键，4 处平行 match，字段改名静默失效                            | ui/app           |
+| F-38 | AR-04             | gfx→platform 误入 [dependencies]，渲染库拖入 arboard 链            | gfx              |
+| F-39 | AR-13             | rust-version=1.85 低于 let-chains 实际要求（1.88）                | workspace        |
+| F-40 | PF-9              | elide_text 超宽逐字符测量（每字符一次分配）                               | ui               |
+| F-41 | PF-10             | 每帧 3-4 次 env var 查询                                       | ui               |
+| F-42 | PF-12             | 捕获文本路径 bytes+text 双拷贝                                     | capture          |
+| F-43 | CQ-2/CQ-9         | StoreError::LimitReached 消息误导 + 死代码 allow                 | store            |
+
+### P2（一般质量 / 可维护性）
+
+| #    | 来源                        | 问题                                                    | 模块               |
+| ---- | ------------------------- | ----------------------------------------------------- | ---------------- |
+| F-44 | CQ-4                      | capture repr/derive 重复声明                              | capture          |
+| F-45 | CQ-5                      | bypass 参数与文档矛盾                                        | capture          |
+| F-46 | CQ-6                      | let-chain + if let else None 嵌套可读性                    | capture          |
+| F-47 | CQ-8                      | 三个配置死开关（capture_image/mcp.enabled/hide_on_focus_lost） | core             |
+| F-48 | CQ-10                     | `as_text()` expect 依赖调用方纪律                            | core             |
+| F-49 | CQ-12                     | `with_conn` 持锁执行回调，公开 API 死锁路径                        | store            |
+| F-50 | CQ-13                     | merge_groups 两条语句非原子                                  | store            |
+| F-51 | DF-07                     | 托盘 v4 回调解码内部模型与真实 wire format 不符（当前行为碰巧正确，测试固化错误格式）   | platform         |
+| F-52 | DF-08 + SEC-009c          | 托盘菜单宿主窗口/类不回收，重复 start 泄漏                             | platform         |
+| F-53 | DF-09                     | reader 级抑制死代码 + 800ms 与文档 900ms 不一致                   | capture          |
+| F-54 | DF-10                     | store 模块文档说不开 WAL，实际开启（文档漂移）                          | store            |
+| F-55 | UI-P2-1                   | 描边宽度硬编码绕过令牌                                           | ui               |
+| F-56 | UI-P2-2                   | 魔法数字集中区（开关/分段/MCP 面板/徽标）                              | ui               |
+| F-57 | UI-P2-4                   | 搜索展开/覆盖层/分段选中硬切换                                      | ui（随动效批）         |
+| F-58 | UI-P3-1                   | 键盘可达性缺失（方向键/Enter/Esc）                                | ui               |
+| F-59 | UI-P3-3                   | 光标图标映射不全                                              | ui               |
+| F-60 | UI-P3-2                   | thumbnail 陈旧引用 + GPU 缩略图显示未接线                         | ui               |
+| F-61 | AR-16                     | run_with_options 854 行巨块，主循环不可单测                      | ui（重构，见裁决）       |
+| F-62 | AR-03                     | paint.rs 6369 行重新成为神模块                                | ui（重构，见裁决）       |
+| F-63 | AR-01                     | 配置路径推导三处并存 + core 直接做 fs IO                           | core/app（重构，见裁决） |
+| F-64 | AR-02                     | 平台 API 三 crate 并存（gfx/platform/mcp 各一份 Win32）         | 全局（文档化，见裁决）      |
+| F-65 | AR-09                     | 卡片子窗口生产不可达（detach 无生产调用方），文档仍承诺「可拖出」                  | ui               |
+| F-66 | AR-10                     | LayoutConfig 旧架构遗留滞留 core 配置面                         | core             |
+| F-67 | AR-12                     | mcp 不在架构图 + /health 契约字符串耦合                           | mcp/ui           |
+| F-68 | AR-11                     | 三份架构文档与代码大面积不一致                                       | docs             |
+| F-69 | AR-14                     | opt-level="z" 取舍未验证                                   | workspace        |
+| F-70 | AR-17/18/19/20 + CQ-14~25 | 测试卫生、陈旧引用、P3 质量项（约 17 项小问题）                           | 多处               |
+| F-71 | PF-11/13/14/15/16         | P2/P3 性能小项                                            | gfx/ui/store     |
+| F-72 | DF-13                     | 序列号 32 位回绕理论漏捕（登记不修）                                  | capture          |
+
+### 明确不修（附理由）
+
+| 项                          | 理由                                     |
+| -------------------------- | -------------------------------------- |
+| AR-08（Service 非 trait 化重构） | 当前耦合深度浅，trait 化收益低于回归风险；记录在案           |
+| AR-07（先提交再开发）              | 属流程建议，非代码缺陷；本次修复完成后统一提交                |
+| 载荷加密（已知缺口）                 | 产品级决策，超出本次审查修复范围；维持 ARCHITECTURE.md 记录 |
+| CopyText 回环                | 旧审查已裁决「宁可功能缺失」，维持                      |
+| DF-13 序列号回绕                | 理论不可达（约 136 年），登记在案                    |
+
+## 二、分批修复计划与执行状态
+
+| 批次 | 内容                 | 状态                                                                      |
+| -- | ------------------ | ----------------------------------------------------------------------- |
+| B0 | clippy 机械修复（~60 处） | ✅ 完成：124 警告行 → 0；修复重复 `#[test]`（双跑）、AR-15 死测试复活、pixels_probe.rs 预存语法错误  |
+| B1 | P0 数据完整性 + 命令注入链   | ✅ 完成：F-01~F-08、F-18、F-19、F-26 全部落地（见下）                                  |
+| B2 | P0/P1 性能           | ✅ 完成：PF-1/2/3/4/5/6/7/9/10/14 落地；F-29/F-42 延期（理由见下）                     |
+| B3 | P0/P1 UI 功能缺陷      | ✅ 完成：F-15/F-16/F-17/F-33/F-35 落地（三个 UI P0 全部修复）                         |
+| B4 | P1 安全加固 + 质量       | ⚠️ 部分：F-24/F-25（SEC-011/012）未做；SEC-003/007/008/009、CQ 质量项未做（见「未修项」）     |
+| B5 | 文档收敛               | ⚠️ 部分：本清单即汇总文档；三份架构文档重写（AR-11）未做                                        |
+| B6 | UI 优化 + 动效         | ✅ 动效体系落地：anim.rs（4 单测）+ hover 补间 + 主题切换 220ms 补间 + 闸门联动；F-55/F-56 令牌化未做 |
+
+### B1 修复明细（全部有回归测试）
+
+- **DF-01**（P0 数据丢失）：`delete`/`delete_many` 删文件前引用计数检查——同哈希共享 `{hash}.bin` 时，只剩最后一个引用才删文件。回归测试 ×2（单条删/批量删）。
+- **SEC-001/002 + DF-03**（P0 命令注入）：`open_url` 弃 `cmd /C start` 改 `ShellExecuteW`；`run_command` 弃 shell 改 **argv 直传**；内置 URL 模板改 `{selection_urlencoded}`（自实现 percent-encode）。
+- **新发现并修复**（修复过程中）：用户规则的 `arg` 模板**只写不读**（规则永远跑内置模板，联动功能实际不可用）；两个内置 CommandAction 共用 id `"run_command"` 导致 DeepL 动作从未注册。
+- **CQ-3**：载荷原子写（.tmp+rename）；**DF-12**：事务失败清理孤儿载荷文件。
+- **SEC-005**：`%TEMP%` 载荷目录加随机分量 + reparse point 检测；**SEC-006**：`safe_blob_path` 路径规范化（+单测）。
+- **SEC-010**：互斥体创建失败 unwrap → 友好错误；**DF-04**：自启读改 `RRF_RT_ANY`；**DF-05**：序列号窥探/提交分离 + 剪贴板被占用时下轮重试；**DF-02**：trigram <3 字符查询闸断到 LIKE（+单测）；**DF-11a**：三处排序补 `id DESC` 并列兜底。
+- CQ-1/CQ-2/CQ-9 **无法复现**（描述的宏/错误枚举在当前代码不存在），标记跳过。
+
+### B2 修复明细
+
+- **PF-5**：preview 截断 512 字符（`PREVIEW_MAX_CHARS`；已知取舍：FTS 随 preview 截断，长文档仅前 512 字符可检索）。
+- **PF-1**：列表改**索引迭代**（消除 2000 条/帧 clone）+ **行高缓存**（`AppState::list_version` 失效判据）+ 只克隆可见行；`draw_rail_body` 同改。
+- **PF-6**：新增 `(pinned, created_at)` 复合索引。**PF-7**：`delete_many` 单事务批量删（数量/容量淘汰两处）。
+- **PF-10**：`env_flag` OnceLock 缓存。**PF-9**：`elide_text` 二分前缀。**PF-4**：空闲渲染闸门（无事件+无 pending repaint+配置未变+**无补间在飞** → 跳过 run_ui/tessellate/present；`svc.pump` 提到闸门前保证捕获不断）。**PF-3**：`focus_window` 移到全部初始化之后。**PF-2**：指纹移入捕获线程。**PF-14**：消除 35MB 字体二次拷贝。
+- **PF-15 评估后不修**：egui `Painter::text` 内部必然 `to_string()`，galley 缓存已消除昂贵部分。
+
+### B3 修复明细
+
+- **UI-P0-1**（F-15）：`McpProbe::start()` 接入 App 构造 + 每帧同步 `mcp_conn`。
+- **UI-P0-2**（F-16）：新增 notice toast（右上角、3s 过期即消费、自报热区 + 回归测试）。
+- **UI-P0-3**（F-17）：子窗口上报拖动区（卡片标题头，draw_child clear+push，childwin render 每帧 `set_drag_region_multi` + 回归测试）。
+- **UI-P1-1**（F-33）：子窗口 Context 每帧 `theme::apply`。**UI-P1-4/UI-P2-3**（F-35）：两处 `* scale` 描边改逻辑点。
+
+### B6 动效明细（用户明确要求项）
+
+- 新增 `ui/src/anim.rs`（约 300 行，零外部依赖）：`Ease`（Linear/OutCubic/OutExpo/InOutCubic，单调性+端点单测）、`tween_f32`（retarget 从当前显示值续接、完成精确吸附、状态存 `ctx.data`）、`tween_color`/`tween_rect`、`clear`、**`busy`**（闸门联动）。
+- 落地两处：**行 hover 背景补间**（110ms OutCubic，id 带 item.id）；**主题切换 Palette 补间**（220ms InOutCubic，`Palette::lerp` 只插颜色、几何直取目标值，egui Visuals 同步重灌）。
+- 空闲闸门已接入 `anim::busy`——否则动画只在事件帧推进，鼠标不动时卡半路。
+
+## 三、未修项与理由（诚实清单）
+
+| 项                                               | 级别    | 理由                                                                                     |
+| ----------------------------------------------- | ----- | -------------------------------------------------------------------------------------- |
+| SEC-003（MCP 默认无鉴权）                              | P1    | 需要 token 生成 + config 迁移 + http.rs 鉴权 enforcing 三处联动，改动面大；本次会话剩余预算不足以保证质量，**建议下一批第一项做** |
+| SEC-007（MCP HTTP 解析上限）                          | P1    | 同 MCP 子系统，宜与 SEC-003 同批                                                                |
+| SEC-008（图片解码上限）                                 | P2    | 需联核实测 image 0.25 默认 Limits 行为后再定阈值                                                     |
+| SEC-009（GDI 泄漏三处）                               | P2    | backdrop Drop 顺序 / mcp capture 错误路径 / tray 收尾，需逐处实机验证                                  |
+| SEC-011/012（UNC/NTLM、搜索词入日志）                    | P2    | 改动小但未及做                                                                                |
+| F-29（copy_item 图片解码异步化）                         | P1    | 需跨线程通道回写剪贴板；帧级大头已修，此项收益比下降                                                             |
+| F-42（捕获 bytes/text 双拷贝）                         | P2    | 需改核心类型 + 10 处构造点                                                                       |
+| AR-03/16（paint.rs 6369 行拆分 / 帧循环抽取）             | P1/P2 | 数千行重构，UI-REWRITE.md 已规划分步实施；本轮只做低风险收敛                                                  |
+| AR-01/02/12（配置路径三处 / 平台 API 三 crate / mcp 入架构图） | P1/P2 | 大搬迁类，记录在案待架构迭代                                                                         |
+| AR-11（三份架构文档重写）                                 | P2    | 文档工程，需以实物依赖边表为基准专文重写                                                                   |
+| F-55/F-56（描边令牌化 / 魔法数字）                         | P2    | 与 AR-03 的拆分协同做更合理                                                                      |
+| CQ-14~25 等 P3 质量项                               | P3    | 多为顺手项，未及                                                                               |
+
+## 四、最终状态继续执行
+
+> 项
+>
+> 修复前
+>
+> 修复后
+
+> clippy（--all-targets）
+>
+> 124 警告行
+>
+> **0 警告、0 错误**
+
+> 测试
+>
+> 603 passed（含 2 个重复双跑）
+>
+> **617 passed**（601 唯一 + 16 条新回归测试，11 个二进制全绿）
+
+> 预存缺陷
+>
+> pixels_probe.rs 语法错误（工作区）
+>
+> 已修
+
+> 新回归测试
+>
+> —
+>
+> DF-01 ×2、DF-02、原子写、批量删共享载荷、SEC-006 路径、子窗拖动区、notice toast、anim ×4、palette lerp ×1、命令注入 ×3 等共 16 条
+
+---
+
+## 第三轮：2026-10-23（3 Agent + 主线手动 UI 审查）
+
+> 安全面 8 条 + 数据链路 9 条 + gfx 渲染与资源 6 条。UI 逻辑一致性因 Agent 通道持续 429 改为主线手动审查，结论并入本章。
 
 > 本文件为多人合稿。每位审查者追加自己的章节，编号独立。
 
@@ -311,3 +697,5 @@ P2 的 6 条中，DL-05（补一个 `id DESC`）与 DL-09（返回真实删除�
 3. **GFX-03**（P2）：把重建风暴记账下沉到 `FrameRenderer::rebuild_swapchain`——主窗口当前没有任何风暴兜底，且该入口一改即覆盖全部调用路径。
 
 需实机验证的结论：GFX-01（验证层复现）、GFX-02（空闲 GPU 占用/功耗对比）、GFX-04/05（关窗与缩略图事件的停顿时长）。其余结论均有静态行号证据支撑。
+
+---

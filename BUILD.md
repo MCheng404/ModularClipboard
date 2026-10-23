@@ -111,7 +111,7 @@ cc-rs 编译 `sqlite3.c` 会失败（`failed to find tool "cl.exe"`）。
 ### 3.1 怎么跑
 
 ```bash
-./scripts/build.sh --test                 # 全量（542 条）
+./scripts/build.sh --test                 # 全量（934 条）
 ./scripts/build.sh --test paint::         # 按名字过滤，透传给 cargo
 ./scripts/build.sh --test -- --nocapture  # 看断言的诊断输出
 ./scripts/build.sh --doctest              # 单独跑 doctest
@@ -155,20 +155,28 @@ debug = "line-tables-only"
 于是每次都是全量重编 —— 看起来像"cargo 变慢了"，其实是自己在两套缓存之间
 反复横跳。要固定就在 config 里改，不要在命令行覆盖。
 
-### 3.5 测试分布（542 条）
+### 3.5 测试分布（934 条 / 23 个测试二进制）
 
-| crate | 条数 |
+| crate / 目标 | 条数 |
 |---|---|
-| `modular_clipboard_ui` | 215 |
-| `modular_clipboard_gfx` | 181 |
-| `modular_clipboard_platform` | 33 |
-| `modular_clipboard_app` | 27 |
+| `modular_clipboard_ui`（lib） | 442 |
+| `modular_clipboard_gfx`（lib） | 229 |
+| `modular_clipboard_core`（lib） | 52 |
+| `modular_clipboard_app`（lib） | 42 |
+| `modular_clipboard_platform`（lib） | 40 |
+| `modular_clipboard_store`（lib） | 33 |
+| `modular_clipboard_mcp`（lib） | 23 |
+| `modular_clipboard_capture`（lib） | 18 |
+| `modular_clipboard_ipc`（lib） | 12 |
 | `modular_clipboard`（main） | 8 |
-| `modular_clipboard_capture` | 9 |
-| `modular_clipboard_store` | 22 |
-| `modular_clipboard_core` | 17 |
-| `tests/integration.rs` | 24 |
-| `tests/event_delivery.rs` | 6 |
+| `app/tests/integration.rs` | 25 |
+| `ui/tests/event_delivery.rs` | 6 |
+| `ipc/tests/pipe_roundtrip.rs` | 2 |
+| `gfx/tests/icon_resource.rs` | 1 |
+| Doc-tests | 1 |
+
+`ui` 与 `gfx` 两个 lib 占了七成以上——渲染与绘制是本项目测试最密的地方，
+改这两处时务必连跑。
 
 ### 3.6 测试环境里必须知道的三个坑
 

@@ -1,4 +1,24 @@
-# 并行开发进度黑板
+# 开发史存档
+
+> 本文件合并了 4 份历史类文档。它们记录「这个项目怎么走到今天」，
+> **不承担现行规范职责**——现行规范见：
+>
+> | 想找什么 | 去这里 |
+> |---|---|
+> | 项目是什么、怎么构建运行 | `README.md` |
+> | 架构与模块地图 | `ARCHITECTURE.md` |
+> | 构建细节与环境要求 | `BUILD.md` |
+> | 逐版本变更 | `CHANGELOG.md` |
+> | DPI 三层量纲约定 | `docs/dpi-conventions.md` |
+> | 历轮审查发现 | `docs/reviews.md` |
+>
+> 各节按「与现行的距离」从近到远排：并行开发黑板 → UI 重构设计稿 →
+> 项目报告 → 旧 README。
+
+
+## 一、并行开发进度黑板（原 PROGRESS.md）
+
+> 多 Agent 并行开发期的工作簿：共享接口契约、文件所有权划分、实机验证基线。开发完成后它只是历史，但「接口契约为何是现在这样」仍能从这里查到。
 
 > 所有 Agent 共享此文件。开工前先读本文件了解他人进度，完成后立即更新自己的行。
 > 目录约定见文末「文件所有权」，**每个 Agent 只能改自己负责的文件**。
@@ -1770,3 +1790,422 @@ VK_LOADER_DEBUG=layer ... 2>&1 | grep "LAYER: Loading layer library"
 
 **判据依赖异步数据源时，必须先证明数据源在判定时刻已就绪**，
 否则「读不到」会被误当成「不存在」。
+
+## 二、新 UI 架构设计稿（原 UI-REWRITE.md）
+
+> 「卡片是一等实体」这次重构的设计决策记录：为什么旧架构必然反复出问题、分配算法为何取代 5 档降级阶梯、卡片如何分离为子窗口。
+
+> 目标：替换掉 `layout.rs`(3230行) + `view.rs`(1678行) + `panels.rs`(938行)
+> 这套「降级阶梯 + 双实现」的手工布局，换成卡片实体模型。
+> 渲染层（`gfx`）**保留**：逐批次 scissor 与尺寸同步已实测修复，不重写。
+
+## 为什么旧架构必然反复出问题
+
+旧架构有一个致命结构缺陷：**同一件事算两遍**。
+
+| 事实 | 布局侧 | 绘制侧 | 后果 |
+|---|---|---|---|
+| 某模块是否折叠 | `Tier::visibility()` | `is_veiled()` | 两边判据要人工保持同步 |
+| 面板矩形 | `layout::solve()` | `solved.rects[i]` | 索引错位则内容画到别处 |
+| 降级档位 | `Tier::for_width()` | 分支判断 | 改一处忘另一处 ⇒ 实机错、单测过 |
+
+历史症状：详情面板折叠态、状态栏提示压按钮，都是这个成因。
+`solve()` 单函数 292 行，5 档降级阶梯，档位与面板的交叉组合
+是 4×5 = 20 种，每种都要在两处写对。
+
+## 新架构：卡片是一等实体
+
+###核心倒转
+
+旧：先按宽度选一个「档位」，再让每个面板查自己的可见性。
+新：**每张卡片自己知道该显示什么**，布局只是问每张卡��要多少宽度。
+
+```text
+Workspace（工作区）
+  └── Cards: Vec<Card>          卡片列表，顺序即Z 序
+        Card {
+          id: CardId,
+          kind: CardKind,       History / Pinned / Detail / Rail
+          host: CardHost,       Docked | Window
+          rect: Rect,           由布局求解，绘制层直接读
+          size: Vec2,           用户拖出来的目标尺寸
+          collapsed: bool,      折叠 = 只留把手
+        }
+```
+
+`LayoutSolver` 只做一件事：给每张卡分配一个 `Rect`，然后**返回**。
+绘制层遍历卡片、读`card.rect`，不做任何二次判断。
+
+### 分配算法（取代 5 档降级阶梯）
+
+```text
+1. 收集可见卡片的最小宽度需求:  Σ min_width
+2. 若 Σ min_width ≤ 可用宽度 → 全部展开，按用户比例分配剩余空间
+3. 否则按优先级依次折叠（Detail → Rail → Pinned），
+   每折叠一张就重新检查是否够用
+```
+
+- **无档位**：宽度是连续函数，不是 5 个离散档。
+- **优先级写在一处**：`CardKind::collapse_priority()`。
+- **可测试**：判据是「分配后所有卡片矩形互不相交且都在区内」，
+  与 `solve()` 输出无关——不需要两处保持一致。
+
+### 置顶的两种模式
+
+用户要求：置顶有「共用单栏」与「独立子窗口分栏」两种。
+
+```rust
+enum PinnedMode {
+    /// 共用单栏：置顶与历史共享一个列表容器，顶部一段，共享选中态
+    SharedColumn,
+    /// 独立分栏：置顶是独立卡片，可拖出成子窗口
+    OwnCard,
+}
+```
+
+第一阶段只实现 `SharedColumn`。它反而比旧实现更简单：
+置顶不是独立面板，而是历史列表顶部的一段，数据由同一个
+列表容器按 `pinned` 分区渲染。
+
+### 卡片分离为子窗口
+
+```text
+拖拽卡片标题栏 → 移出工作区边界 ⇒ CardHost 变为 Window
+                → 创建真实 Win32 子窗口，各自带独立 EventLoop 状态
+拖回工作区内 ⇒ 销毁子窗口，卡片回到 Docked
+```
+
+第二阶段实现。接口先留好：`CardHost` 已经是枚举，
+`Workspace` 对两种 host 都只读 `card.rect`。
+
+## 分层
+
+```text
+ui/
+  card.rs        卡片模型：CardId / CardKind / Card / CardHost   【新】
+  workspace.rs   工作区：卡片集合、顺序、增删、Z 序              【新】
+  solver.rs      布局求解：需求收集 → 贪心分配 → 返回 Rect 列表  【新】
+  paint.rs       绘制：遍历卡片读 rect，不做二次判断             【新】
+  theme.rs       设计令牌（保留并精简）
+  icons.rs       图标（保留）
+  thumbnail.rs   缩略图缓存（保留）
+  presence.rs    托盘（保留）
+  renderer.rs    Vulkan 桥（保留，已修好 scissor）
+  app.rs         帧循环（保留，改为遍历 workspace）
+```
+
+被删除：`layout.rs`（3230）、`view.rs`（1678）、`panels.rs`（938）、
+`titlebar.rs`（833）。合计约 6700 行 → 预计新代码 2000 行以内。
+
+## 实施顺序（每步都可验证）
+
+| 步 | 内容 | 验证方式 |
+|---|---|---|
+| 1 | `card.rs` + `workspace.rs` + `solver.rs` + 布局守卫测试 | 纯逻辑测试：任意宽度下不重叠、不越界 |
+| 2 | `paint.rs` 单窗口绘制，跑通主窗口 | 截图 + 像素探针（已有 `verify_render.ps1`） |
+| 3 | 置顶 `SharedColumn` 模式 | 截图确认置顶与历史同栏 |
+| 4 | 卡片拖拽分离为子窗口 | 端到端脚本：拖出 → 独立窗口 → 拖回 |
+
+**每一步都保持主程序可编译可运行**，不搞一次性大爆炸。
+
+## 三、项目报告（原 项目报告.md）
+
+> 早期项目报告。技术栈/代码结构/运行环境/构建环境五节中，前两节已被 ARCHITECTURE.md 取代并保持更新，此处保留原始快照。
+
+| 项 | 值 |
+|---|---|
+| 报告日期 | 2026-10-08 |
+| 项目位置 | `D:\modular-clipboard`（本归档目录） |
+| 原始工作副本 | `D:\WorkBuddy\Tiez` |
+| 当前分支 | `feat/card-ui-rewrite` |
+| 提交数 | 101 |
+| 代码量 | 45,314 行 Rust（8 个 crate） |
+| 测试 | 628 个，全部通过 |
+
+---
+
+## 一、项目定位
+
+Windows 原生剪贴板管理器。核心特征：
+
+- **原生渲染**：自写 Vulkan 渲染后端，不依赖 WebView / Qt / Electron
+- **卡片化 UI**：置顶与历史都是「卡片」，可停靠、可拖出成独立窗口
+- **常驻托盘**：全局热键 `Ctrl+Shift+V`唤起，托盘菜单可清空/退出
+
+---
+
+## 二、技术栈
+
+| 领域 | 选型 | 说明 |
+|---|---|---|
+| 渲染 | `ash 0.38`（Vulkan） | 自写渲染器，egui 只负责排版产出顶点 |
+| UI | `egui 0.36` | 仅用于排版与控件逻辑，渲染走自写管线 |
+| 存储 | `rusqlite 0.40`（bundled） | SQLite + FTS5 全文索引 + 文件化大载荷 |
+| 平台 | `windows 0.62` | Win32 API 绑定 |
+| 其他 | `image` / `tracing` / `serde` / `parking_lot` | 图片解码、日志、序列化、锁 |
+
+---
+
+## 三、代码结构
+
+```
+crates/
+├── modular-clipboard/          入口：参数解析、单实例保护、启动编排
+├── modular-clipboard-core/     核心数据类型与配置
+├── modular-clipboard-capture/  剪贴板捕获（Windows 监听）
+├── modular-clipboard-store/    存储层（SQLite + FTS5 + 文件化载荷）
+├── modular-clipboard-platform/ 平台集成（托盘、全局热键、前台窗口探测）
+├── modular-clipboard-gfx/      Vulkan 渲染后端 + Win32 窗口   [20,166 行]
+├── modular-clipboard-app/      应用服务层（编排捕获/过滤/存储/界面）
+└── modular-clipboard-ui/       界面层（egui + 卡片布局）      [19,041 行]
+```
+
+代码集中在两个大 crate：`gfx`（渲染 + 窗口）与 `ui`（界面），合计占 87%。
+
+### 架构分层
+
+```
+        ┌─────────────────────────────┐
+        │  modular-clipboard (main)   │  参数、单实例、启动编排
+        └──────────────┬──────────────┘
+        ┌──────────────▼──────────────┐
+        │  modular-clipboard-app      │  服务编排：状态、过滤、事件
+        └──┬────────┬────────┬─────────┘
+     ┌─────▼──┐ ┌───▼────┐ ┌─▼────────┐
+     │capture │ │ store  │ │platform │  捕获 / 存储 / 托盘热键
+     └────────┘ └────────┘ └──────────┘
+        ┌───────▼─────────────────────┐
+        │  modular-clipboard-ui       │  egui 排版 → 顶点
+        └───────┬─────────────────────┘
+        ┌───────▼─────────────────────┐
+        │  modular-clipboard-gfx      │  Vulkan 渲染 + Win32 窗口
+        └─────────────────────────────┘
+```
+
+**关键设计**：`gfx` 不依赖 `egui`。UI 层把 `egui` 的 `ClippedPrimitive` 转成渲染层自己的 `DrawInput`（裸句柄 + 批次）后再提交，避免渲染层反向依赖 UI 层。
+
+---
+
+## 四、运行环境
+
+| 项 | 值 |
+|---|---|
+| 操作系统 | Windows 11（x64） |
+| CPU | 32 逻辑核心 |
+| 内存 | 63 GB |
+| 显卡 | 需支持 Vulkan 1.0+（软件渲染不保证） |
+| 显示缩放 | 本机 150%（1.5x），代码已做 DPI 适配 |
+
+### 运行时数据路径
+
+| 用途 | 路径 |
+|---|---|
+| 配置 | `%APPDATA%\modular-clipboard\config\config.json` |
+| 数据库 | `%APPDATA%\modular-clipboard\data\` |
+| 日志 | `%APPDATA%\modular-clipboard\data\app.log` |
+
+数据目录可用 `--data-dir <路径>` 覆盖（校验、转绝对、建目录）。
+
+---
+
+## 五、构建环境
+
+| 组件 | 版本 / 路径 |
+|---|---|
+| Rust | `rustc 1.97.1` / `cargo 1.97.1` |
+| 目标平台 | `x86_64-pc-windows-msvc` |
+| MSVC 工具链 | `D:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Tools\MSVC\14.52.36629` |
+| Windows SDK | `C:\Program Files (x86)\Windows Kits\10`（10.0.28000.0） |
+| Visual Studio | 2026 Insiders |
+
+### 为什么需要构建引导脚本
+
+MSVC 安装在 `D:\Program Files` 下（**非默认路径**），且系统 `PATH` 里没有 `cl.exe`。
+`rusqlite` 的 bundled SQLite 需要编译 `sqlite3.c`，`cc-rs` 必须能找到真正的 MSVC 工具链与 SDK，
+因此 `scripts/build.sh` 负责显式注入 `INCLUDE` / `LIB` 环境变量。
+
+Git Bash 会把 POSIX 路径（`/d/Program Files/...`）转换后再传给子进程，导致 `cl.exe` 找不到头文件。
+脚本统一用**原生 Windows 路径**并设置 `MSYS_NO_PATHCONV=1` 阻止自动转换。
+
+### 构建命令
+
+```bash
+# 必须用引导脚本，不能直接 cargo build
+./scripts/build.sh                  # debug
+./scripts/build.sh --release        # release
+./scripts/build.sh --test           # 全部测试
+```
+
+###产物
+
+`target/x86_64-pc-windows-msvc/release/modular-clipboard.exe`，约 **7.6 MB**。
+
+- PE `Subsystem = 2`（GUI）——**双击不会弹 cmd 窗口**
+- 导入表只有系统 DLL + `VCRUNTIME140.dll`
+
+> `crt-static` 静态链接已配置进 `.cargo/config.toml`，但**尚未完成一次验证构建**。
+> 生效后 `VCRUNTIME140.dll` 也会被链进去，产物成为真正的单文件。
+
+### 启动方式
+
+| 文件 | 用途 |
+|---|---|
+| `dist/modular-clipboard.exe` | 直接双击，**无 cmd 窗口** |
+| `启动剪贴板.vbs` | 静默启动（找不到 exe 时弹窗提示） |
+| `启动剪贴板.cmd` | **带 cmd 窗口**，仅用于排查问题（stderr 落盘 + 检查是否立即退出） |
+
+`.cmd` 双击必然附带控制台（`.cmd` 就是批处理），这与 exe 本身无关 —— 所以日常启动不要用它。
+
+---
+
+## 六、目前进展
+
+### 已完成
+
+| 模块 | 状态 |
+|---|---|
+| Vulkan 渲染后端（资源层 / 帧图 / 呈现） | 完成，128 单测 |
+| Win32 窗口与事件循环 | 完成 |
+| 存储层（SQLite + FTS5 + 文件化载荷） | 完成 |
+| 剪贴板捕获（Windows 监听 + 去重 + 密码字段跳过） | 完成 |
+| 托盘 + 全局热键 + 单实例保护 | 完成 |
+| 卡片化 UI（停靠 / 拖出成窗口 / 折叠） | 完成 |
+| 设置界面（5 分组 13 项） | 本日完成 |
+| 搜索图标重绘 | 本日完成 |
+
+### 本日修复的关键缺陷
+
+三个问题都属于「**测试全绿但实机不可用**」，共同点是缺的那一层测试根本没被执行：
+
+| 问题 | 根因 |
+|---|---|
+| 顶栏按钮点不动 | 整个顶栏被上报成拖动区，`WM_NCHITTEST` 返回 `HTCAPTION`，系统发`WM_NCLBUTTONDOWN` 而非 `WM_LBUTTONDOWN`，egui 收不到点击 |
+| 托盘右键菜单闪退 | 菜单宿主是不可置前台的窗口（`HWND_MESSAGE` 永久不可见；主窗口在隐藏态时同样不可置前台） |
+| 「显示托盘图标」开关无效 | `show_tray` 只被写入、从不被读取 |
+
+**教训**：`ui.interact()` 返回 true 不等于实机能收到点击 —— 中间隔着 Win32 命中测试。
+凡是「无边框窗口 + 自绘控件」，都必须单独验证 `chrome::hit_test`。
+
+### 待完成
+
+| 项 | 优先级 |
+|---|---|
+| **屏蔽应用列表**（`blocked_apps`）未进设置界面 | 中 |
+| 卡片**拖出**手势未实现（子窗口机制已就绪） | 中 |
+| 旧模块 `layout.rs` / `view.rs` / `panels.rs` / `titlebar.rs` 待删除 | 低 |
+| `crt-static` 静态链接未验证 | 中 |
+| 开机自启未实现 | 低 |
+| 发布流程（安装包 / 快捷方式） | 低 |
+
+---
+
+## 七、已知环境陷阱
+
+### 1. 编译会导致系统卡死
+
+见 `docs/编译卡死排查.md`。要点：
+
+- cargo 默认并行度 =逻辑核心数 = **32**，会榨干 CPU
+- 改 `rustflags` 或换 `CARGO_TARGET_DIR` 会触发 **210 个 crate 全量重编**（11 GB 产物）
+- 建议 `cargo build -j 12`，留余量给系统
+
+### 2. Defender 与编译争抢文件
+
+表现为两类「随机」故障，**根因是同一个**：
+
+| 现象 | 真实原因 |
+|---|---|
+| `failed to write .fingerprint/...` → 拒绝访问 (os error 5) | Defender 正在扫描该文件并独占锁定 |
+| rustc ICE：`encode_metadata` 里 `expect` 失败 | 同上 |
+| `incremental\...\.lock` 删除失败 | 同上 |
+
+**根治**：把 `target` 目录加入 Defender 排除项（需管理员权限）：
+
+```powershell
+Add-MpPreference -ExclusionPath "D:\WorkBuddy\Tiez\target"
+```
+
+临时绕过：`CARGO_INCREMENTAL=0`。
+
+### 3. 构建需用引导脚本
+
+直接 `cargo build` 会因找不到 `cl.exe` 而失败（MSVC 在非默认路径且不在 `PATH`）。
+
+---
+
+## 八、目录说明
+
+| 路径 | 内容 |
+|---|---|
+| `crates/` | 全部源码（8 个 crate） |
+| `dist/` | 可直接运行的 release 产物 |
+| `scripts/build.sh` | 构建引导脚本（注入 MSVC 环境） |
+| `scripts/verify_render.ps1` | 渲染验证（多尺寸截图） |
+| `docs/编译卡死排查.md` | 编译卡死的根因与对策 |
+| `ARCHITECTURE.md` | 架构设计 |
+| `PROGRESS.md` | 并行开发进度黑板（历史文档） |
+| `UI-REWRITE.md` | UI 重写方案 |
+| `启动剪贴板.vbs` | 静默启动器 |
+| `启动剪贴板.cmd` | 排查用启动脚本 |
+
+---
+
+## 九、下一步建议
+
+1. **完成 `crt-static` 验证构建** —— 达成真正的单文件分发
+2. **把 `target` 加入 Defender 排除项** —— 消除随机构建失败
+3. **补屏蔽应用列表** —— 捕获层已支持，界面未暴露
+4. **实现卡片拖出手势** —— 子窗口机制已就绪，缺交互
+5. **清理死代码** —— 删除 4 个旧模块
+
+## 四、旧版 README（原 README-归档说明.md）
+
+> 重构前的 README 全文存档。文件名自带「归档说明」，内容已被现行 README.md 取代。
+
+Windows 原生剪贴板管理器。自写 Vulkan 渲染后端，卡片化 UI，常驻托盘。
+
+📄 **完整项目报告见 [`项目报告.md`](项目报告.md)** —— 进展、环境、路径、已知陷阱全在里面。
+
+---
+
+## 快速开始
+
+```bash
+# 构建（必须用引导脚本，MSVC 在非默认路径且不在 PATH）
+./scripts/build.sh --release
+
+# 跑测试（628 个）
+./scripts/build.sh --test
+```
+
+## 目录
+
+| 路径 | 内容 |
+|---|---|
+| `crates/` | 源码，8 个 crate，45,314 行 |
+| `dist/modular-clipboard.exe` | 可直接双击运行（7.6 MB，无 cmd 窗口） |
+| `启动剪贴板.vbs` | 静默启动器 |
+| `启动剪贴板.cmd` | 排查用（**会弹 cmd 窗口**） |
+| `docs/编译卡死排查.md` | ⚠️ 编译前建议先读|
+| `项目报告.md` | 项目完整报告 |
+
+## 构建注意事项
+
+1. **务必用 `./scripts/build.sh`**，不要直接 `cargo build` —— MSVC 装在
+   `D:\Program Files\...`（非默认路径）且不在 `PATH`，`rusqlite` 的 bundled SQLite
+   需要编译 `sqlite3.c`。
+
+2. **建议限制并行度** `cargo build -j 12`：cargo 默认会开满 32 核导致系统卡死。
+
+3. **把 `target/` 加入 Defender 排除项**，否则会遇到随机的
+   「拒绝访问」与 rustc ICE。
+
+详见 [`docs/编译卡死排查.md`](docs/编译卡死排查.md)。
+
+## 运行时路径
+
+| 用途 | 位置 |
+|---|---|
+| 配置 | `%APPDATA%\modular-clipboard\config\config.json` |
+| 数据库 | `%APPDATA%\modular-clipboard\data\` |
+| 日志 | `%APPDATA%\modular-clipboard\data\app.log` |

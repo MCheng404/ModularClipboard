@@ -4,7 +4,7 @@
 
 ## [未发布]
 
-主题：特性移除——磨砂光标光晕。
+主题：大文件拆分、多 Agent 审查与安全加固。
 
 ### 移除
 
@@ -12,6 +12,65 @@
   浓度三个设置项）整体移除。该效果为装饰性且常驻持续重绘成本，权衡后
   决定不做。配置字段 `ui.glow` 随之删除；旧 `config.json` 里的该字段
   被 serde 忽略（不报错、不影响其余设置）。
+
+### 重构
+
+- **七个巨型文件拆分为模块家族**（「删一个功能 = 删一个文件 + 一行 `mod`」）：
+  - `store/lib.rs` 1854 → root 866 + `open`/`query`/`write`/`retention`/`groups`/`blobs`
+  - `platform/tray.rs` 1777 → root 712 + `tray/imp.rs`（Win32 实现整体收进 `#[cfg(windows)]`）
+  - `ui/imgedit.rs` 1574 → root 1246 + `imgedit/{crop,adjust,stroke}`
+  - `gfx/chrome.rs` 1395 → root 1163 + `chrome/{hit,corners}`
+  - `ui/icons.rs` 1369 → root 1096 + `icons/{font,draw,md}`
+  - 另含早前的 `paint`（16 子模块）、`app`（5）、`theme`（5）、
+    `config`（11）、`frame`、`window`、app-crate `lib`
+- **文档重整**：三份审查清单合并为 `docs/reviews.md`；四份历史类文档
+  （并行开发黑板 / UI 重构设计稿 / 项目报告 / 旧 README）合并为
+  `docs/history.md`；根级 md 收敛为 README / ARCHITECTURE / BUILD / CHANGELOG。
+- **仓库瘦身**：设计原型（`settings-proto` / `shadow-preview` / `main-proto`）、
+  实机探针与诊断脚本清除；`main` 只保留构建环境、文档、源代码、协议四类，
+  完整历史移至 `old` 分支。
+
+### 安全
+
+- **MCP HTTP 空 token 不再等于「无需认证」**：该服务能合成键鼠、截屏、
+  读写剪贴板，此前 token 为空时鉴权分支被整段跳过，恶意网页一个
+  `text/plain` 简单请求（免 CORS 预检）即可驱动。现改为空 token 仅许
+  loopback 对端；绑非 loopback 且无 token 直接拒绝启动；`Host` 头白名单
+  （`127.0.0.1` / `localhost` / `::1`）防 DNS rebinding。
+- **MCP HTTP 传输层加上限**：`Content-Length` 此前完全由请求方决定，
+  一个头即可 OOM。现加请求体上限 8MB、请求行/头行 8KB、头行数 64、
+  读超时 30s。
+- **托盘窗口不再处理 `WM_COMMAND`**：两条菜单路径都用 `TPM_RETURNCMD`
+  直接取返回值，该分支对合法流量是死代码，却让同完整性进程可
+  `PostMessageW` 伪造退出 / 清空历史 / 弹窗口。
+
+### 修复
+
+- **`max_items` 溢出导致删光历史**：配置值 ≥ 2^63 时 `as i64` 回绕成负数，
+  「保留数」被 `.max(0)` 兜成 0，下一次复制即删光全部未置顶条目。
+- **去重命中不补载荷**：原条目若插入时因当时上限太小而 `blob_file = NULL`，
+  会永远停在「看得见、复制必败」——用户调大上限后再次复制同样内容也修不好，
+  因为去重挡住了新插入。新增 `Store::backfill_payload` 在去重命中时补回。
+- **`insert` 失败回滚摧毁他人载荷**：原先无条件删 `{hash}.bin`，而该文件
+  与同哈希条目共享。改为按引用计数删。
+- **`like_search` 排序不确定**：`ORDER BY` 缺 `id DESC` 并列兜底，
+  同一毫秒插入的多条两次查询可能给不同顺序。
+- **`wait_own_inflight` 不复位 fence**：`abandon_frame` 走过后，槽位轮回转回时
+  `acquire` 的 reset 被 `in_flight` 门控跳过 ⇒ 每帧提交已 signal 未 reset 的
+  fence（`VUID-vkQueueSubmit-fence-00063`），直到交换链重建才自愈。
+- **设置窗/卡片子窗没有重绘闸门**：空闲时仍 ~125Hz 全量 acquire+paint+present。
+- **卡片子窗 `textures_delta` 漏清**：只在成功路径 `clear()`，paint 出错路径
+  直接返回，release 下不 panic 而是字体图集增量被静默丢弃、缺字形且不自愈。
+- **删除 7 处零引用死代码**：`Store::rename_group`、`Store::stats`、
+  `ActionPlan::payload_text`、`builtin_rule_templates`、`AppState::visible_count`、
+  `Service::request_show_window`、`anim::tween_rect`。
+
+### 测试
+
+- 新增守门测试：MCP 的 `Host` 白名单与行长度封顶（5 项）、
+  `max_items` 溢出不误删（1 项）、`backfill_payload` 补回与幂等（2 项）、
+  窗口模块导入的 32 个 VK 必须全部有映射（1 项）。
+- 基线：**934 项通过 / 23 个测试二进制 / clippy 零警告**。
 
 ---
 
