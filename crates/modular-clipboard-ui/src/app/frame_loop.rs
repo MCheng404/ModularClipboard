@@ -348,6 +348,8 @@ pub(super) fn run_mode(
     // **也**会在「窗口刚好被 resize 到 0」时命中，两者需要不同的日志
     // 措辞，因此单独记一个标志。只用于日志与拖动区，不参与控制流。
     let mut minimized = false;
+    // 卡片磨砂档位的**已应用值**：变化时要通知渲染层启停 GDI 捕获器。
+    let mut applied_card_blur: u8 = 0;
     // 上一帧记进日志的拖动区。只在**变化时**打日志——每帧都打会把
     // debug 日志刷成流水账，而拖动区平时是稳定的。
     // 拖动区段数（仅用于日志去重）。
@@ -724,6 +726,32 @@ pub(super) fn run_mode(
             egui::epaint::emath::vec2(mw, mh),
         ));
         children.sync_with(&mut app.ws, &shared, window.scale_factor(), main_rect);
+
+        // ---- 1.85 卡片磨砂：抓一次身后桌面 --------------------------
+        //
+        // 放在 `run_ui` **之前**：本帧的绘制就能用上刚抓到的像素
+        // （否则要等到下一帧，滚动时底图会慢半拍）。
+        //
+        // 捕获本身在渲染层按 30fps 节流，这里只是把结果交给 `UiState`。
+        // 失败只用 warn：抓屏失败不该杀死界面（与磨砂背景同款取舍）。
+        let want_card_blur = app.svc.state.config.ui.card_blur;
+        if want_card_blur != applied_card_blur {
+            painter.set_card_blur_enabled(want_card_blur > 0);
+            applied_card_blur = want_card_blur;
+        }
+        if want_card_blur > 0 && !hidden && !window.is_minimized() {
+            let scale = modular_clipboard_core::config::card_blur_downscale(want_card_blur);
+            match painter.capture_card_blur(window.hwnd().0 as isize, scale) {
+                Ok(Some((px, w, h))) => {
+                    app.paint_state.card_blur_pending = Some(egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &px,
+                    ));
+                }
+                Ok(None) => {} // 节流未到 / 最小化：沿用上一张纹理
+                Err(e) => tracing::warn!(%e, "卡片磨砂捕获失败，本帧沿用旧底图"),
+            }
+        }
 
         // ---- 1.9 渲染闸门（PF-4）----
         //

@@ -147,6 +147,11 @@ pub(super) enum ItemKind {
     Opacity,
     /// 卡片不透明度滑块（磨砂 / 半透明下让行卡片也透出模糊底图）。
     CardOpacity,
+    /// 卡片磨砂档位滑块（0 ~ 10，0 = 关闭）。
+    ///
+    /// 与 [`ItemKind::BlurStrength`] 不同：后者是**窗口背景层**的模糊，
+    /// 这一项给**每张行卡片**单独铺一层模糊的身后内容。
+    CardBlur,
     /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
     BlurStrength,
     /// 卡片阴影：开关行 + （开启时）模糊 / 浓度 / 垂直偏移三个滑条。
@@ -404,6 +409,7 @@ impl SettingsItem {
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::CardOpacity => (cfg.ui.card_opacity - 1.0).abs() > f32::EPSILON,
+            ItemKind::CardBlur => cfg.ui.card_blur != d.ui.card_blur,
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
             ItemKind::CardShadow => cfg.ui.card_shadow != d.ui.card_shadow,
             ItemKind::RowMeta => cfg.ui.row_meta != d.ui.row_meta,
@@ -470,6 +476,7 @@ impl SettingsItem {
             ItemKind::Backdrop => Some(Op::SetBackdrop(WindowBackdrop::None)),
             ItemKind::Opacity => Some(Op::SetOpacity(1.0)),
             ItemKind::CardOpacity => Some(Op::SetCardOpacity(d.ui.card_opacity)),
+            ItemKind::CardBlur => Some(Op::SetCardBlur(d.ui.card_blur)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
             // 字体缩放：恢复默认倍率（1.0×）。走 SetNumber 而非专用 Op——
             // 应用侧的即时生效钩子正是按 (Ui, "font_scale") 匹配的。
@@ -668,6 +675,12 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: msg("Card opacity"),
                 desc: msg("Opacity of entry cards; lower it to reveal the blurred background"),
                 kind: ItemKind::CardOpacity,
+            },
+            SettingsItem {
+                key: "ui.card_blur",
+                label: msg("Card blur"),
+                desc: msg("Frosted glass for entry cards: 0 = off, higher = blurrier"),
+                kind: ItemKind::CardBlur,
             },
             SettingsItem {
                 key: "ui.card_shadow",

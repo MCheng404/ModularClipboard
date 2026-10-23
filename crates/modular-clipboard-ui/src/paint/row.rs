@@ -116,6 +116,27 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // 顺序上选中在悬停/按下**之下**：accent 环是稳定骨架，指针反馈叠在
     // 它上面——悬停一个已选中的行仍然看得到反应（旧实现选中与悬停互斥，
     // 选中行对指针毫无反馈）。
+    // ---- 卡片磨砂底：模糊的身后桌面 --------------------------------
+    //
+    // 必须画在卡片色**之前**：磨砂是**底**，卡片色是盖在它上面的那层
+    // 玻璃，顺序反了就把底图盖死。
+    //
+    // 没有这一层时，把卡片调透只能透出窗口自己的 `list_bg`（比卡片更暗）
+    // ⇒ 观感是「卡片变暗」而不是「卡片变透」。玻璃的关键不是能透多少，
+    // 而是**透过来的是什么**（2026-10-23 用户反馈）。
+    //
+    // 纹理是**整窗客户区**的底图，按卡片矩形取其中一块（见
+    // `card_blur_uv`），因此每张卡片看到的是它自己身后那一块桌面。
+    if let Some(tex) = f.state.card_blur_tex.as_ref() {
+        let mut shape = egui::epaint::RectShape::filled(r, radius, egui::Color32::WHITE);
+        // `brush` 是 `Option<Arc<Brush>>`——纹理刷子要能在图元之间
+        // 共享（同一张底图被几十张卡片采样），所以是 Arc 而不是值。
+        shape.brush = Some(std::sync::Arc::new(egui::epaint::Brush {
+            fill_texture_id: tex.id(),
+            uv: card_blur_uv(f.area, r),
+        }));
+        painter.add(shape);
+    }
     // 行卡片底色用 `card_bg` 而不是 `surface_raised`：前者是「卡片透明度」
     // 设置的作用对象，后者是浮层令牌（见 `Palette::with_card_opacity`）。
     painter.rect_filled(r, radius, pal.card_bg);
@@ -1210,4 +1231,19 @@ pub(super) fn format_size(bytes: u64) -> String {
     } else {
         one(b / GB, "GB")
     }
+}
+
+/// 卡片矩形在**窗口客户区**里的归一化区域（卡片磨砂底图的采样 UV）。
+///
+/// 底图抓的是整个客户区身后的桌面，所以 UV 就是卡片相对客户区的位置。
+///
+/// 卡片部分滚出视口时 UV 会越界：线性采样按 clamp 处理，而那部分本来
+/// 也被滚动区的裁剪挡住，看不到——不值得为它做额外的裁剪计算。
+fn card_blur_uv(area: Rect, r: Rect) -> Rect {
+    let w = area.width().max(1.0);
+    let h = area.height().max(1.0);
+    Rect::from_min_max(
+        pos2((r.min.x - area.min.x) / w, (r.min.y - area.min.y) / h),
+        pos2((r.max.x - area.min.x) / w, (r.max.y - area.min.y) / h),
+    )
 }

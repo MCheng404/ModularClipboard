@@ -127,6 +127,12 @@ pub struct Painter<'a> {
     post: Option<PostFx>,
     /// 自研磨砂背景（懒创建，仅主窗口在 Acrylic 模式下存在）。
     backdrop: BackdropState,
+    /// 卡片磨砂的 CPU 侧捕获（懒创建，仅 `ui.card_blur > 0` 时存在）。
+    ///
+    /// 与 `backdrop` 分开的理由：两者**用途不同、分辨率不同、开关不同**。
+    /// 背景磨砂抓 1/2 分辨率交给 GPU 卷积；卡片磨砂抓 1/N（N 由档位定）
+    /// 直接当纹理用。合并会逼一方迁就另一方。
+    card_blur: CardBlurState,
     /// 已经告警过的磨砂降级**原因**（每种只记一次）。
     ///
     /// 为什么不是一个 `bool`：磨砂链上有四个独立的失败点（拿不到命令
@@ -177,6 +183,16 @@ pub(super) struct BackdropFx {
     /// 行为。首帧捕获失败（最小化/GDI 异常）时底图合成必须跳过，
     /// 等待第一次成功上传。
     uploaded: bool,
+}
+
+/// 卡片磨砂的运行状态：GDI 捕获器 + 节流时间戳。
+///
+/// 只有 CPU 侧资源——抓到的像素交给绘制层 `load_texture` 上传，
+/// 不占本结构任何 GPU 句柄（换窗口尺寸时无需回收）。
+#[derive(Default)]
+pub(super) struct CardBlurState {
+    capture: Option<DesktopCapture>,
+    last: Option<std::time::Instant>,
 }
 
 /// 磨砂背景的运行状态：GPU 资源 + GDI 捕获器 + 节流时间戳 + 背景亮度。
@@ -305,6 +321,7 @@ impl<'a> Painter<'a> {
             // 后处理资源按需创建，见 `ensure_post`。
             post: None,
             backdrop: BackdropState::default(),
+            card_blur: CardBlurState::default(),
             backdrop_warned: std::collections::HashSet::new(),
             stats: FrameStats::default(),
         })
@@ -411,6 +428,56 @@ impl<'a> Painter<'a> {
             Some(hwnd),
             blur_radius,
         )
+    }
+
+    /// 抓一次窗口身后的桌面，**降采样后**交给绘制层当卡片磨砂底图。
+    ///
+    /// 返回 `None` 有三种情形，都不算错误：节流未到（沿用上一张纹理）、
+    /// 窗口最小化（抓不到有意义的内容）、档位为 0（调用方不该调）。
+    ///
+    /// # 为什么走 CPU 侧而不是复用 GPU 模糊结果
+    ///
+    /// 背景磨砂的结果住在 GPU 离屏图里，而绘制层要按**卡片形状**（圆角）
+    /// 采样它，只能走 egui 的纹理通道——那需要 CPU 侧的 `ImageData`。
+    /// 把离屏图读回 CPU 反而更贵（一次同步 + 全图拷贝）。
+    ///
+    /// 直接按低分辨率抓则一举两得：`HALFTONE` 缩放本身是盒式平均，
+    /// **降采样即模糊**，不必再跑一遍卷积；上传量也只有几十 KB。
+    pub fn capture_card_blur(
+        &mut self,
+        hwnd: isize,
+        downscale: u32,
+    ) -> anyhow::Result<Option<(Vec<u8>, u32, u32)>> {
+        let now = std::time::Instant::now();
+        if !capture_due(self.card_blur.last, now, CAPTURE_INTERVAL) {
+            return Ok(None);
+        }
+        if self.card_blur.capture.is_none() {
+            // `swap_rb = true`：DIB 恒 BGRA，egui 的 `ColorImage` 要 RGBA。
+            self.card_blur.capture = Some(DesktopCapture::new(true)?);
+        }
+        let cap = self
+            .card_blur
+            .capture
+            .as_mut()
+            .expect("上面刚确保存在");
+        match cap.capture_behind_scaled(hwnd, downscale)? {
+            Some((bits, w, h)) => {
+                self.card_blur.last = Some(now);
+                Ok(Some((bits.to_vec(), w, h)))
+            }
+            // 最小化：不更新时间戳，下一帧再试。
+            None => Ok(None),
+        }
+    }
+
+    /// 停用卡片磨砂：立即释放 GDI 捕获器（用户在设置里关掉不该继续占用）。
+    pub fn set_card_blur_enabled(&mut self, on: bool) {
+        if on {
+            return; // 资源在下一帧 `capture_card_blur` 里懒创建。
+        }
+        self.card_blur.capture = None;
+        self.card_blur.last = None;
     }
 
     /// 启用/停用自研磨砂背景。

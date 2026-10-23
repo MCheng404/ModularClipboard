@@ -402,9 +402,12 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
         }
         ItemKind::CardOpacity => {
             let mut op = f.svc.state.config.ui.card_opacity;
-            // 与「背景不透明度」同一条依赖：背景不透明时没有底图可透，
-            // 这个滑块禁用并压暗（「关着还能调」会让用户以为没保存）。
-            let enabled = f.svc.state.config.ui.window_backdrop != WindowBackdrop::None;
+            // 背景不透明**且没开卡片磨砂**时，卡片后面没有东西可透，
+            // 滑块禁用并压暗（「关着还能调」会让用户以为没保存）。
+            // 开了卡片磨砂就有底图了（磨砂给每张卡片自带一层模糊的
+            // 身后内容），此时允许调。
+            let enabled = f.svc.state.config.ui.window_backdrop != WindowBackdrop::None
+                || f.svc.state.config.ui.card_blur > 0;
             let pal = f.pal;
             let changed = setting_row(ui, it.label, it.desc, |ui| {
                 ui.add(egui::Label::new(
@@ -424,6 +427,25 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             });
             if changed && enabled {
                 f.state.push(Op::SetCardOpacity(op));
+                record_recent(f, it.key);
+            }
+        }
+        ItemKind::CardBlur => {
+            let mut level = f.svc.state.config.ui.card_blur.min(10) as f32;
+            let pal = f.pal;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(if level < 0.5 {
+                        t("Off").to_string()
+                    } else {
+                        format!("{}", level as i32)
+                    })
+                    .color(pal.text_dim),
+                ));
+                draw_slider(f, ui, "card_blur", "", &mut level, 0.0..=10.0, true, 1.0)
+            });
+            if changed {
+                f.state.push(Op::SetCardBlur(level.round().clamp(0.0, 10.0) as u8));
                 record_recent(f, it.key);
             }
         }

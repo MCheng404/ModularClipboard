@@ -34,6 +34,7 @@ pub use card_row::RowMetaConfig;
 pub use card_row::RowMetaPart;
 pub use window::WindowBackdrop;
 pub use window::WindowPos;
+pub use window::card_blur_downscale;
 pub use secondary::SecondaryTheme;
 pub use theme_params::ThemeKnob;
 pub use theme_params::ThemeParams;

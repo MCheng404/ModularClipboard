@@ -12,6 +12,7 @@ use super::card_row::CardShadowConfig;
 use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
 use super::window::WindowPos;
+use super::window::default_card_blur;
 use super::window::default_card_opacity;
 use super::window::default_window_blur_strength;
 use super::window::default_window_opacity;
@@ -100,6 +101,21 @@ pub struct UiConfig {
     /// 默认 1.0（不改变既有观感）：需要「卡片也透」的用户自己往下调。
     #[serde(default = "default_card_opacity")]
     pub card_opacity: f32,
+    /// 卡片磨砂档位（0 ~ 10，**0 = 关闭**）。
+    ///
+    /// 与 `window_blur_strength` 不是一回事：后者模糊的是**窗口背景层**
+    /// （身后桌面铺满整窗），这一项给**每一张行卡片**单独铺一层模糊的
+    /// 身后内容，让卡片本身成为一块毛玻璃。
+    ///
+    /// # 为什么需要它
+    ///
+    /// 没有它时，`card_opacity` 调低只能透出**窗口自己的底色**
+    /// （`list_bg`，比卡片更暗）⇒ 卡片看起来是「变暗」而不是「变透明」
+    /// ——玻璃的关键不是能透多少，而是**透过来的是什么**。
+    ///
+    /// 默认 0（关）：多一次抓屏与纹理上传，不该默认付这个代价。
+    #[serde(default = "default_card_blur")]
+    pub card_blur: u8,
     /// 磨砂强度档位（1 ~ 10，默认 7）。仅在 `window_backdrop == Acrylic`
     /// 时生效。
     ///

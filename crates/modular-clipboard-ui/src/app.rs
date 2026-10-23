@@ -408,6 +408,21 @@ impl App {
             }
             modular_clipboard_core::config::WindowBackdrop::None => &self.pal,
         };
+        // 卡片透明度在**窗口背景无底图**时也要能生效——只要开了卡片磨砂。
+        //
+        // 早前的判据是「有没有背景效果」，理由是「不透明底图后面没有东西
+        // 可透」。但卡片磨砂给每张卡片自带了一层模糊的身后内容，卡片后面
+        // 于是**有东西可透**了；继续禁用这个滑块，用户开了磨砂却调不动
+        // 透明度，会以为设置没保存。
+        let card_blur_pal;
+        let pal_ref = if backdrop == modular_clipboard_core::config::WindowBackdrop::None
+            && self.svc.state.config.ui.card_blur > 0
+        {
+            card_blur_pal = pal_ref.with_card_opacity(card_alpha);
+            &card_blur_pal
+        } else {
+            pal_ref
+        };
 
         {
             let mut frame = crate::paint::Frame {
@@ -427,6 +442,34 @@ impl App {
 
         // 录制快捷键：**必须在绘制之后**读按键，因为 egui 的事件只在
         // 这一帧的输入里，且要先让输入框/按钮消费掉它们自己的点击。
+        // 卡片磨砂：渲染层上一帧抓到的像素在这里上传（需要 `Context`）。
+        //
+        // CAUTION: **不能**每次都 `load_texture`。
+        //
+        // `load_texture` 是「注册一张新纹理」：旧 `TextureHandle` 被替换
+        // 掉就 drop，egui 随即把那张纹理标 free，渲染层于是回收它的
+        // 描述符集再为新 id 分配一个。捕获按 30fps 走 ⇒ 每秒 30 次
+        // free+alloc。实测几秒就把用户纹理描述符池抽干
+        // （`ERROR_OUT_OF_POOL_MEMORY`，缩略图开始批量上传失败）。
+        //
+        // 稳态下纹理尺寸是**固定**的（客户区 ÷ 降采样倍率），所以只有
+        // 首次与窗口尺寸变化时才真的需要新建，其余帧用 `TextureHandle::set`
+        // 就地更新像素——同一个 id、同一个描述符集，零分配。
+        if let Some(img) = self.paint_state.card_blur_pending.take() {
+            let size = img.size;
+            let need_new = match &self.paint_state.card_blur_tex {
+                None => true,
+                Some(h) => h.size() != size,
+            };
+            if need_new {
+                let handle =
+                    ui.ctx().load_texture("card_blur", img, egui::TextureOptions::LINEAR);
+                self.paint_state.card_blur_tex = Some(handle);
+            } else if let Some(h) = &mut self.paint_state.card_blur_tex {
+                h.set(img, egui::TextureOptions::LINEAR);
+            }
+        }
+
         let ctx = self.ctx.clone();
         self.capture_recording(&ctx);
 
@@ -555,6 +598,12 @@ impl App {
                     // 卡片透明度只影响绘制（下一帧读配置即生效），
                     // 钳制与背景不透明度同一区间。
                     self.svc.state.config.ui.card_opacity = opacity.clamp(0.3, 1.0);
+                    self.after_config_change();
+                }
+                Op::SetCardBlur(level) => {
+                    // 档位 0 = 关闭（不抓屏、不上传纹理）。渲染层按
+                    // 「已应用值」变化启停 GDI 捕获器，这里只负责落配置。
+                    self.svc.state.config.ui.card_blur = level.min(10);
                     self.after_config_change();
                 }
                 Op::SetBlurStrength(level) => {

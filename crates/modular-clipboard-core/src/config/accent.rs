@@ -165,6 +165,7 @@ impl Default for UiConfig {
             window_backdrop: WindowBackdrop::None,
             window_opacity: 1.0,
             card_opacity: 1.0,
+            card_blur: 0,
             window_blur_strength: default_window_blur_strength(),
             card_shadow: CardShadowConfig::default(),
             row_meta: RowMetaConfig::default(),

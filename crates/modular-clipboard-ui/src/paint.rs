@@ -217,6 +217,8 @@ pub enum Op {
     SetOpacity(f32),
     /// 调卡片不透明度（0.3 ~ 1.0）。仅在磨砂 / 半透明背景下有意义。
     SetCardOpacity(f32),
+    /// 卡片磨砂档位（0 ~ 10，0 = 关闭）。
+    SetCardBlur(u8),
     /// 调磨砂强度档位（1 ~ 10）。
     SetBlurStrength(u8),
     /// 设置列表卡片阴影（开关 + 模糊 / 浓度 / 垂直偏移）。
@@ -677,6 +679,20 @@ pub struct UiState {
     /// GPU 内存只涨不消。
     pub thumb_tex:
         std::collections::HashMap<modular_clipboard_core::EntryId, egui::TextureId>,
+    /// 卡片磨砂：**待上传**的底图像素（渲染层按 30fps 节流捕获）。
+    ///
+    /// 分两段走是因为捕获发生在**渲染阶段**（第 4 步，画完之后），
+    /// 而上传必须发生在 `run_ui` 里（egui 的 `load_texture` 要 `Context`）。
+    /// 所以先存在这里，下一帧的 `draw_frame` 取走上传。
+    pub card_blur_pending: Option<egui::ColorImage>,
+    /// 卡片磨砂：当前生效的纹理句柄。
+    ///
+    /// # 为什么不是每帧重建
+    ///
+    /// `load_texture` 是**同名覆盖**语义：重复调用会每帧重传整图
+    /// （哪怕内容一样）。捕获本身有 30fps 节流，这里跟着只在**有新像素**
+    /// 时才上传，其余帧复用同一个句柄。
+    pub card_blur_tex: Option<egui::TextureHandle>,
     /// 本帧**出现过**的图片条目 id（纹理淘汰的判据）。
     ///
     /// 为什么不能在每个列表各自淘汰：主栏与内嵌置顶区是两个列表
