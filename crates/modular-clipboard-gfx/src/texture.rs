@@ -99,6 +99,39 @@ impl Sampler {
         Ok(Self { handle })
     }
 
+    /// 线性过滤 + **镜像重复**的采样器。
+    ///
+    /// 给卷积类 pass 用（`fs_blur`）：核把采样点推到图像外时，
+    /// `CLAMP_TO_EDGE` 会把边缘纹素**重复**计入——边缘那几个 tap 全部
+    /// 取到同一个像素，等效于把边缘朝外**拉伸**了半个核宽，观感是边框
+    /// 一圈发暗/发糊（暗背景下尤其明显）。
+    ///
+    /// `MIRRORED_REPEAT` 取的是**镜像**邻域：图外一点反射回图内，
+    /// 等价于「画外还有内容」，边缘与内部的模糊强度一致。
+    ///
+    /// # 为什么不是 `REPEAT`
+    ///
+    /// `REPEAT` 是**环绕**：左边越界会取到**右边**的内容，把画面另一
+    /// 侧的颜色渗到这一侧的边缘上。镜像只是一小块反射，不会出现这种
+    /// 跨画面的内容搬运。
+    pub fn new_linear_mirrored(device: &Device) -> anyhow::Result<Self> {
+        let info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::MIRRORED_REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::MIRRORED_REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::MIRRORED_REPEAT)
+            // 离屏目标只有一层 mip，不做 mipmap 过滤。
+            .min_lod(0.0)
+            .max_lod(0.0)
+            .anisotropy_enable(false);
+
+        let handle = unsafe { device.create_sampler(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建镜像采样器失败: {e:?}"))?;
+        Ok(Self { handle })
+    }
+
     /// 按 egui 的 [`egui::TextureOptions`] 创建设备。
     ///
     /// egui 允许逐纹理指定过滤方式（`TextureOptions::NEAREST` /

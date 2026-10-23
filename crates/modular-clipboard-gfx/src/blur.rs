@@ -307,7 +307,15 @@ pub struct BlurPipeline {
     /// 直通拷贝管线（`fs_copy`），用于降采样与合成。
     copy_pipeline: GraphicsPipeline,
     shader: ShaderModule,
+    /// 降采样 / 合成用的采样器（`CLAMP_TO_EDGE`）。
     sampler: Sampler,
+    /// **卷积**用的采样器（`MIRRORED_REPEAT`）。
+    ///
+    /// 只有 `fs_blur` 用它：核宽决定了采样点会越界多少，越界处取镜像
+    /// 邻域才不会把边缘纹素重复计入（那等于把边缘朝外拉伸半个核宽）。
+    /// 降采样与合成的采样点是精确 uv，不该用镜像——尤其是合成带 UV
+    /// 位移时，镜像会让越界那一小条出现可辨识的翻转图案。
+    sampler_mirror: Sampler,
     /// 横向卷积的 uniform。
     uniform_h: Buffer,
     /// 纵向卷积的 uniform。
@@ -358,6 +366,7 @@ impl BlurPipeline {
         // - 钳到边缘：模糊会把采样点推到图像外，REPEAT 会把对侧内容卷进来
         //   （表现为画面另一侧的颜色渗到边缘）。
         let sampler = Sampler::new_linear_clamped(device)?;
+        let sampler_mirror = Sampler::new_linear_mirrored(device)?;
 
         let u_size = std::mem::size_of::<BlurUniforms>() as vk::DeviceSize;
         let uniform_h = Buffer::new_host_visible(
@@ -414,6 +423,7 @@ impl BlurPipeline {
             copy_pipeline,
             shader,
             sampler,
+            sampler_mirror,
             uniform_h,
             uniform_v,
             descriptor_pool,
@@ -463,13 +473,20 @@ impl BlurPipeline {
         // ④ 合成读 blur_a；⑤ 纯降采样（超采样合成）也读 scene。
         // （`SET_DOWNSAMPLE_BACKDROP` 不在此写——它的源由
         // [`Self::bind_source`] 在捕获图创建后单独绑定。）
-        let sources = [
+        let mut sources = [
             view_of(&chain.scene),
             view_of(&chain.blur_a),
             view_of(&chain.blur_b),
             view_of(&chain.blur_a),
             view_of(&chain.scene),
         ];
+        // 两趟卷积换镜像采样器：核把采样点推出边界时，镜像邻域让边缘
+        // 与内部的模糊强度一致（见 [`Sampler::new_linear_mirrored`]）。
+        // 降采样与合成保持钳到边缘——它们的越界只来自合成的 UV 位移，
+        // 那时「拉伸最后一列」比「翻出一小块镜像」更不惹眼。
+        for i in [SET_BLUR_H, SET_BLUR_V] {
+            sources[i].sampler = self.sampler_mirror.handle();
+        }
         // 降采样与合成用直通管线、不读 uniform，但布局里有该绑定，
         // 必须指向一块**合法**的缓冲——未初始化的描述符是未定义行为。
         let uniforms = [
@@ -826,6 +843,7 @@ impl BlurPipeline {
         self.uniform_h.destroy(device);
         self.uniform_v.destroy(device);
         self.sampler.destroy(device);
+        self.sampler_mirror.destroy(device);
         self.shader.destroy(device);
         self.pipe_layout.destroy(device);
         self.desc_layout.destroy(device);
