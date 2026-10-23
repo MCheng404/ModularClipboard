@@ -359,6 +359,27 @@ pub(super) fn run_mode(
     // 拖动停止后最多 500ms 内写入，崩溃最多丢最后一次拖动。
     let mut last_pos_save: Option<std::time::Instant> = None;
 
+    // 跳过渲染的帧里 egui 交出的纹理增量（下面 2.5 / 3 / 4 三处会往里攒）。
+    //
+    // # 为什么必须攒着而不是丢掉
+    //
+    // `egui::FullOutput::textures_delta` 是**一次性**的：egui 在
+    // `Context::run` 里把这一帧纹理的变化（新建 / 局部补丁 / 释放）
+    // 交出来，就认为调用方已经消费了，下一帧**不会重发**。
+    //
+    // 丢掉它的后果主要落在**字体图集**上：中图集是按需栅格化的——
+    // 一条新内容里的新字符首次被排版时才画进图集，那一帧的增量就是
+    // 它的**唯一**上传机会。刚好在那时跳过渲染 ⇒ GPU 上的字体纹理
+    // 永远缺那一块 ⇒ 恢复显示后文字渲染错乱/缺失，而数据层完全不受
+    // 影响（复制粘贴照旧，于是极难联想到渲染层）。
+    //
+    // 完整故障链（2026-10-23 用户实测）：主窗口最小化 / 隐藏到托盘
+    // → 后台复制内容 → `svc.pump()` 返回 true ⇒ `request_repaint_after`
+    // ⇒ 渲染闸门放行 ⇒ `run_ui` 排版新预览文字 ⇒ 新字形入图集 ⇒ 增量
+    // 产生 → 但窗口不可见（`hidden` / 客户区 0×0）⇒ 增量被
+    // `DeltaGuard::drop` 清空 ⇒ 打开主窗口后文字异常。
+    let mut pending_delta = egui::TexturesDelta::default();
+
     while !quit {
         // ---- 0. 退出标志（必须在**所有** continue 之前）----------
         //
@@ -880,8 +901,18 @@ pub(super) fn run_mode(
         // 却仍在跑完整的 tessellate + queue_submit + device_wait_idle，
         // 等于纯烧 CPU 与带宽。
         if hidden {
-            // 增量由守卫在离开作用域时清空。
-            let _guard = DeltaGuard(std::mem::take(&mut output.textures_delta));
+            // 增量**不能丢**：收进积压，等下一次真正渲染时一起上传。
+            // 理由见 `pending_delta` 的声明处——egui 不重发增量，
+            // 清掉就等于让字体图集永久缺一块。
+            let skipped = std::mem::take(&mut output.textures_delta);
+            if !skipped.is_empty() {
+                tracing::debug!(
+                    set = skipped.set.len(),
+                    free = skipped.free.len(),
+                    "跳过渲染：本帧的纹理增量已积压，恢复显示后补传"
+                );
+            }
+            pending_delta.append(skipped);
             drop(output);
             // 睡固定间隔而非用 egui 的 delay：隐藏时没有下一次绘制，
             // egui 也不会请求重绘，用它的 delay 会退化成 0 延时忙等。
@@ -927,8 +958,18 @@ pub(super) fn run_mode(
             } else {
                 tracing::warn!("客户区尺寸为 {cw}x{ch}，跳过渲染");
             }
-            // 增量由守卫在离开作用域时清空。
-            let _guard = DeltaGuard(std::mem::take(&mut output.textures_delta));
+            // 增量**不能丢**：收进积压，等下一次真正渲染时一起上传。
+            // 理由见 `pending_delta` 的声明处——egui 不重发增量，
+            // 清掉就等于让字体图集永久缺一块。
+            let skipped = std::mem::take(&mut output.textures_delta);
+            if !skipped.is_empty() {
+                tracing::debug!(
+                    set = skipped.set.len(),
+                    free = skipped.free.len(),
+                    "跳过渲染：本帧的纹理增量已积压，恢复显示后补传"
+                );
+            }
+            pending_delta.append(skipped);
             drop(output);
             events.poll_for(Some(std::time::Duration::from_millis(50)));
             // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
@@ -958,12 +999,29 @@ pub(super) fn run_mode(
         //
         // 把这一帧要用的东西全部从 `output` 里取出来，之后让它整体 drop。
         // `tessellate` 按值消耗 shapes，因此要先 `mem::take` 才能整体 drop。
+        // 之前跳过渲染的帧攒下的增量必须**排在本帧之前**上传：它们是
+        // 更早产生的补丁，顺序颠倒会把新字形画到旧位置上（字体图集的
+        // 增量多为局部补丁 `ImageDelta::pos = Some(..)`）。
+        if !pending_delta.is_empty() {
+            let mut merged = std::mem::take(&mut pending_delta);
+            merged.append(std::mem::take(&mut output.textures_delta));
+            tracing::debug!(
+                set = merged.set.len(),
+                free = merged.free.len(),
+                "补传之前跳过渲染时积压的纹理增量"
+            );
+            output.textures_delta = merged;
+        }
         let mut textures_delta = DeltaGuard(std::mem::take(&mut output.textures_delta));
         let primitives = ctx.tessellate(std::mem::take(&mut output.shapes), ppp);
         drop(output);
 
         let Some(acquired) = fr.acquire()? else {            rebuild(&mut fr, &mut painter, (cw, ch))?;
             tracing::debug!("acquire 返回过期，已重建交换链");
+            // 本帧不渲染：把已取出的增量**还回**积压，否则它会随
+            // `DeltaGuard` 一起被 `clear()`（见 `pending_delta` 的说明）。
+            pending_delta.append(std::mem::take(&mut textures_delta.0));
+            drop(textures_delta);
             // 附属窗口**照样驱动**：主窗口藏起来不代表附属窗口该冻住
             // —— 它们仍留在屏幕上，不渲染就会被 Win32 标「无响应」。
             let topmost = app.svc.state.config.ui.always_on_top;
