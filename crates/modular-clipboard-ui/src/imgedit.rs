@@ -845,7 +845,7 @@ impl<'a> ImageEditor<'a> {
                     ToolTab::Brush => {
                         // ---- 颜色 ----
                         ui.horizontal(|ui| {
-                            ui.label(modular_clipboard_core::i18n::t(("颜色", "Color")));
+                            ui.label(modular_clipboard_core::i18n::t(("颜色", "Stroke color")));
                             for c in BRUSH_PRESETS {
                                 let col = egui::Color32::from_rgba_unmultiplied(
                                     c[0], c[1], c[2], c[3],

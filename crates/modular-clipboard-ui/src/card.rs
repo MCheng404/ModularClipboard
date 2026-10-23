@@ -67,7 +67,7 @@ impl CardKind {
     pub fn title(self) -> modular_clipboard_core::i18n::Bi {
         match self {
             CardKind::History => ("历史", "History"),
-            CardKind::Pinned => ("置顶", "Pinned"),
+            CardKind::Pinned => ("置顶卡片", "Pinned card"),
             CardKind::Detail => ("详情", "Details"),
             CardKind::Rail => ("视图", "View"),
         }

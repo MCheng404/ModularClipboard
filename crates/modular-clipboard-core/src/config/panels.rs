@@ -117,8 +117,8 @@ impl SearchPanelPos {
     /// 设置界面展示名（双语对）。
     pub fn label(self) -> crate::i18n::Bi {
         match self {
-            SearchPanelPos::Top => ("窗口上方", "Top"),
-            SearchPanelPos::Bottom => ("窗口下方", "Bottom"),
+            SearchPanelPos::Top => ("窗口上方", "Above"),
+            SearchPanelPos::Bottom => ("窗口下方", "Below"),
         }
     }
 }
@@ -164,10 +164,10 @@ impl TypeRailPos {
     /// 设置界面下拉框展示名（双语对）。
     pub fn label(self) -> crate::i18n::Bi {
         match self {
-            TypeRailPos::Right => ("右侧", "Right"),
-            TypeRailPos::Left => ("左侧", "Left"),
-            TypeRailPos::Top => ("顶部", "Top"),
-            TypeRailPos::Bottom => ("底部", "Bottom"),
+            TypeRailPos::Right => ("右侧", "Right edge"),
+            TypeRailPos::Left => ("左侧", "Left edge"),
+            TypeRailPos::Top => ("顶部", "Top edge"),
+            TypeRailPos::Bottom => ("底部", "Bottom edge"),
         }
     }
 

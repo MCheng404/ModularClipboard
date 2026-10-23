@@ -233,7 +233,7 @@ fn files_payload_produces_summary_preview() {
     });
     assert_eq!(s.state.items.len(), 1);
     assert!(
-        s.state.items[0].preview.contains("3 个文件"),
+        s.state.items[0].preview.contains("3 more files"),
         "实际: {}",
         s.state.items[0].preview
     );
@@ -282,7 +282,7 @@ fn image_ingest_persists_dimensions_for_raw_rgba_payload() {
         Some((w, h)),
         "尺寸必须透传到 img_w/img_h 列，否则界面无法渲染缩略图"
     );
-    assert_eq!(item.preview, "图片 320×240");
+    assert_eq!(item.preview, "Image 320×240");
     // 载荷原样落盘（仍是裸 RGBA，长度自洽）。
     assert_eq!(item.payload.as_ref().map(|p| p.len), Some((w * h * 4) as u64));
 }

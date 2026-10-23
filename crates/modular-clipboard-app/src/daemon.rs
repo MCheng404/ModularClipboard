@@ -812,10 +812,10 @@ mod tests {
         let err = snap
             .hotkey_error
             .expect("无托盘时注册必然失败，应带回失败信息");
-        assert!(err.contains("注册失败"), "信息应说明失败：{err}");
+        assert!(err.contains("registration failed"), "信息应说明失败：{err}");
         // 两个槽位都应出现在信息里（此处两个都注册不了）。
-        assert!(err.contains("显示主窗口"), "{err}");
-        assert!(err.contains("粘贴上一个条目"), "{err}");
+        assert!(err.contains("Show main window"), "{err}");
+        assert!(err.contains("Paste previous entry"), "{err}");
     }
 
     /// 关掉监听：常驻进程要停掉捕获，并回报 `capturing = false`。

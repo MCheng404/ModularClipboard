@@ -237,7 +237,7 @@ impl Icon {
         match self {
             Icon::Close => ("关闭", "Close"),
             Icon::Pinned => ("已置顶", "Pinned"),
-            Icon::Unpinned => ("置顶", "Pin"),
+            Icon::Unpinned => ("取消置顶", "Unpin"),
             Icon::Search => ("搜索", "Search"),
             Icon::Settings => ("设置", "Settings"),
             Icon::Text => ("文本", "Text"),
@@ -248,8 +248,11 @@ impl Icon {
             Icon::Collapse => ("折叠", "Collapse"),
             Icon::Expand => ("展开", "Expand"),
             Icon::Drag => ("拖拽", "Drag"),
+            // CAUTION: `Lock` / `Unlock` 必须成对（Locked / Lock），不能用
+            // Locked / Pin——后者把「锁」和「置顶」混成一个词，英文 UI 上
+            // 两个无关功能显示同一个名字，翻译表也无法按英文区分。
             Icon::Lock => ("已固定", "Locked"),
-            Icon::Unlock => ("固定", "Pin"),
+            Icon::Unlock => ("固定", "Lock"),
             Icon::Table => ("表格视图", "Table view"),
             Icon::Mask => ("密文视图", "Masked"),
             Icon::Trash => ("清空", "Clear"),

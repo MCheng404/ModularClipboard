@@ -182,11 +182,16 @@ impl Slot {
 /// 来判断是哪一行出了问题（见 `paint.rs` 的 Hotkey 渲染）。
 /// 启动注册与运行时重注册都用它拼，两处措辞才不会漂移。
 pub fn failed_message(slot: Slot, spec: HotkeySpec) -> String {
-    format!(
-        "{}：{} 注册失败（可能已被其它程序占用）",
-        modular_clipboard_core::i18n::t(slot.label()),
-        describe(spec)
-    )
+    // CAUTION: 格式串必须走 `t()`——早先是硬编码中文，
+    // 于是英文/日/俄界面下热键注册失败时弹的还是中文提示。
+    // 占位符用命名形式（`{a}` / `{b}`）而不是 `{}`，与 `build_preview`
+    // 同款手法：翻译时可以调换顺序，不必按索引拼。
+    modular_clipboard_core::i18n::t((
+        "{a}：{b} 注册失败（可能已被其它程序占用）",
+        "{a}: {b} registration failed (possibly taken by another app)",
+    ))
+    .replace("{a}", modular_clipboard_core::i18n::t(slot.label()))
+    .replace("{b}", &describe(spec))
 }
 
 /// 可读的组合键文本，用于设置界面展示与日志。
@@ -439,16 +444,17 @@ mod tests {
     fn failed_message_names_slot_and_combo() {
         // 格式是**契约**：设置界面靠「信息里包含该行当前组合文本」
         // 定位是哪一行注册失败了（paint.rs 的 Hotkey 渲染）。
+        // 断言英文：主语言是英文，测试进程里没有测试改全局语言。
         let msg = failed_message(Slot::Toggle, DEFAULT_HOTKEY);
-        assert!(msg.contains("显示主窗口"), "应含槽位名: {msg}"); // 默认中文环境
+        assert!(msg.contains("Show main window"), "应含槽位名: {msg}");
         assert!(msg.contains("Win+V"), "应含组合文本: {msg}");
-        assert!(msg.contains("占用"), "应说明可能的原因: {msg}");
+        assert!(msg.contains("taken"), "应说明可能的原因: {msg}");
 
         let msg2 = failed_message(
             Slot::PastePrevious,
             HotkeySpec::new(MOD_CONTROL, 0x56),
         );
-        assert!(msg2.contains("粘贴上一个条目"), "{msg2}"); // 默认中文环境
+        assert!(msg2.contains("Paste previous entry"), "{msg2}");
         assert!(msg2.contains("Ctrl+V"), "{msg2}");
     }
 }

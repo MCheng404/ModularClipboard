@@ -110,7 +110,7 @@ cc-rs 编译 `sqlite3.c` 会失败（`failed to find tool "cl.exe"`）。
 ### 3.1 怎么跑
 
 ```bash
-./scripts/build.sh --test                 # 全量（946 条）
+./scripts/build.sh --test                 # 全量（961 条）
 ./scripts/build.sh --test paint::         # 按名字过滤，透传给 cargo
 ./scripts/build.sh --test -- --nocapture  # 看断言的诊断输出
 ./scripts/build.sh --doctest              # 单独跑 doctest
@@ -154,13 +154,13 @@ debug = "line-tables-only"
 于是每次都是全量重编 —— 看起来像"cargo 变慢了"，其实是自己在两套缓存之间
 反复横跳。要固定就在 config 里改，不要在命令行覆盖。
 
-### 3.5 测试分布（946 条 / 23 个测试二进制）
+### 3.5 测试分布（961 条 / 23 个测试二进制）
 
 | crate / 目标 | 条数 |
 |---|---|
-| `modular_clipboard_ui`（lib） | 447 |
+| `modular_clipboard_ui`（lib） | 450 |
 | `modular_clipboard_gfx`（lib） | 229 |
-| `modular_clipboard_core`（lib） | 59 |
+| `modular_clipboard_core`（lib） | 71 |
 | `modular_clipboard_app`（lib） | 42 |
 | `modular_clipboard_platform`（lib） | 40 |
 | `modular_clipboard_store`（lib） | 33 |

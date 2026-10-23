@@ -25,6 +25,49 @@ use super::settings_items::FONT_SCALE_PRESETS;
 /// 折行数跳变、行高抖动）。最长选项 `Русский` 也放得下。
 const LANG_COMBO_W: f32 = 132.0;
 
+/// 语言菜单里要列出的选项下标——**不含当前选中项**。
+///
+/// 已选中的那项再列一遍没有意义（用户已经在那里了），只多占一行、
+/// 也让「点它是没反应」成为可能的误操作。
+///
+/// 提成纯函数是为了能写守门测试：直接在闭包里 `if i == sel { continue; }`
+/// 跟 egui 的 Ui 缠在一起，单测跑不起来。
+fn lang_menu_indices(sel: usize) -> impl Iterator<Item = usize> {
+    (0..LANG_CHOICES.len()).filter(move |i| *i != sel)
+}
+
+/// 语言菜单弹层的一体化样式：**没有分界线**。
+///
+/// 下拉项用的是 egui 的 `Button::selectable`，它默认 `.frame(true)`——
+/// 每一项各画一圈描边，多条挨在一起就成了「一格一格」的菜单，正是
+/// 用户反馈的「有分界线」。
+///
+/// [`egui::containers::menu::menu_style`] 把各态的 `bg_stroke` 清成
+/// `NONE`、inactive 填充清成透明，只留悬停/选中的一层**满宽**底色——
+/// 整列就读作一块连续的面板。
+///
+/// 在它之上再补两处：
+///
+/// - `item_spacing = 0`——条目之间留了间距就会露出菜单底色，同样读作
+///   分界线；
+/// - 条目圆角归零——各自带圆角会在交界处露出角缝，破坏一体感。
+fn lang_menu_style(s: &mut egui::Style) {
+    egui::containers::menu::menu_style(s);
+    s.spacing.item_spacing = egui::vec2(0.0, 0.0);
+    // CAUTION: `menu_style` 只清了 active/open/hovered/inactive 四态的
+    // 描边，漏了 `noninteractive`。菜单项通常不走那一态，所以**实际**
+    // 看不到分界线；但「一体化」的约定应当对全部五态成立——否则哪天
+    // egui 把某一项渲染成 noninteractive，描边就凭空回来了。
+    // `lang_menu_style_has_no_dividers` 正是据此抓出来的。
+    s.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    s.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::ZERO;
+    s.visuals.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
+    s.visuals.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
+    s.visuals.widgets.active.corner_radius = egui::CornerRadius::ZERO;
+    s.visuals.widgets.open.corner_radius = egui::CornerRadius::ZERO;
+    s.visuals.selection.stroke = egui::Stroke::NONE;
+}
+
 /// 界面语言可选项：配置值 + 显示名。
 ///
 /// # 为什么显示名用「语言自称」
@@ -178,15 +221,34 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 //
                 // 显示名一律用**语言自称**（见 `LANG_CHOICES` 的说明），
                 // 因此列表在任何当前语言下都自解释。
+                // CAUTION: 必须收**选项自己**的 `changed()`，不是 ComboBox 的。
+                //
+                // `show_ui` 返回 `InnerResponse<Option<R>>`：
+                // - `.inner`    = 闭包的返回值（菜单本帧没打开时是 `None`）；
+                // - `.response` = **ComboBox 那个按钮**的 response。
+                //
+                // 在菜单里点选一项只会改 `selectable_value` 内部那个值，
+                // **不会**把按钮的 response 标记为 changed。早先写的是
+                // `resp.response.changed()`，恒为 false ⇒ `Op::SetLanguage`
+                // 永远不推送 ⇒ 语言永远是「跟随系统」，且界面上看不出任何
+                // 异常（下拉框确实划过、确实高亮了，只是没落地）。
                 let resp = egui::ComboBox::from_id_salt("ui_language")
                     .selected_text(t(LANG_CHOICES[sel].1))
                     .width(LANG_COMBO_W)
+                    .popup_style(lang_menu_style.into())
                     .show_ui(ui, |ui| {
-                        for (i, (_, label)) in LANG_CHOICES.iter().enumerate() {
-                            ui.selectable_value(&mut sel, i, t(*label));
+                        let mut picked = false;
+                        // 已选中的不列出来：语言菜单里「当前项再出现一次」
+                        // 没有意义，只多占一行；剩下的每一项都能真正切换。
+                        for i in lang_menu_indices(sel) {
+                            if ui.selectable_value(&mut sel, i, t(LANG_CHOICES[i].1)).changed() {
+                                picked = true;
+                            }
                         }
+                        picked
                     });
-                if resp.response.changed() {
+                // `inner == None` = 本帧菜单没打开，不可能发生点选。
+                if resp.inner == Some(true) {
                     f.state.push(Op::SetLanguage(LANG_CHOICES[sel].0));
                     true
                 } else {
@@ -465,15 +527,24 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // 位置：四向分段控件（与「背景效果」同一控件）。
                 changed |= setting_row(ui, ("停靠位置", "Dock position"), ("类型栏贴在主窗口的哪一侧", "Which edge of the main window the bar sticks to"), |ui| {
                     use modular_clipboard_core::config::TypeRailPos;
+                    // CAUTION: 选项文案一律取 `TypeRailPos::label()`，不在这里
+                    // 重写一份字面量。
+                    //
+                    // 早前这里写的是 `("上", "Top")` / `("右", "Right")`，
+                    // 与 `core::config::panels` 里的 `("顶部", "Top")` /
+                    // `("右侧", "Right")` 是**同一概念的两份字面量**——英文
+                    // 完全相同，于是「Top」在英文里对应四个不同中文，
+                    // 既让英文 UI 歧义（同一个词三个意思），也让以英文为键的
+                    // 翻译表无法区分它们。取 label() 一份，两边自然一致。
                     let picked = draw_segmented(
                         f,
                         ui,
                         "type_rail_pos",
                         &[
-                            (TypeRailPos::Right, ("右", "Right")),
-                            (TypeRailPos::Left, ("左", "Left")),
-                            (TypeRailPos::Top, ("上", "Top")),
-                            (TypeRailPos::Bottom, ("下", "Bottom")),
+                            (TypeRailPos::Right, TypeRailPos::Right.label()),
+                            (TypeRailPos::Left, TypeRailPos::Left.label()),
+                            (TypeRailPos::Top, TypeRailPos::Top.label()),
+                            (TypeRailPos::Bottom, TypeRailPos::Bottom.label()),
                         ],
                         cfg.pos,
                     );
@@ -515,13 +586,15 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             let mut changed = false;
             changed |= setting_row(ui, ("停靠位置", "Dock position"), ("搜索面板贴在主窗口的上方还是下方", "Whether the panel docks above or below the main window"), |ui| {
                 use modular_clipboard_core::config::SearchPanelPos;
+                // 同 type_rail_pos：文案取 `SearchPanelPos::label()`，
+                // 不重写字面量（否则同一概念两份文案，英文键无法区分）。
                 let picked = draw_segmented(
                     f,
                     ui,
                     "search_panel_pos",
                     &[
-                        (SearchPanelPos::Top, ("上方", "Top")),
-                        (SearchPanelPos::Bottom, ("下方", "Bottom")),
+                        (SearchPanelPos::Top, SearchPanelPos::Top.label()),
+                        (SearchPanelPos::Bottom, SearchPanelPos::Bottom.label()),
                     ],
                     cfg.pos,
                 );
@@ -810,7 +883,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             p.text(
                 pos2(r.min.x + 4.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
-                t(("退出程序", "Quit")),
+                t(("退出程序", "Quit app")),
                 egui::FontId::proportional(pal.font_md),
                 pal.danger,
             );
@@ -1377,6 +1450,81 @@ mod tests {
         for (v, (zh, en)) in LANG_CHOICES {
             assert!(!zh.trim().is_empty(), "{v} 的中文显示名为空");
             assert!(!en.trim().is_empty(), "{v} 的英文显示名为空");
+        }
+    }
+
+    /// 菜单里必须列**除当前选中外**的每一项，一项不多一项不少。
+    ///
+    /// 这是「过滤已选中语言」的守门：漏过滤则当前项重复出现（点了没反应），
+    /// 过滤过头则某门语言根本选不到。
+    #[test]
+    fn lang_menu_indices_exactly_excludes_the_current_selection() {
+        for sel in 0..LANG_CHOICES.len() {
+            let shown: Vec<usize> = lang_menu_indices(sel).collect();
+            assert_eq!(
+                shown.len(),
+                LANG_CHOICES.len() - 1,
+                "sel={sel} 时应列 {n} 项，实得 {shown:?}",
+                n = LANG_CHOICES.len() - 1,
+            );
+            assert!(!shown.contains(&sel), "sel={sel} 不该出现在自己的菜单里");
+            // 其余下标必须齐备且有序。
+            let expect: Vec<usize> = (0..LANG_CHOICES.len()).filter(|i| *i != sel).collect();
+            assert_eq!(shown, expect, "sel={sel} 的菜单项不完整或乱序");
+        }
+    }
+
+    /// 菜单弹层必须「一体化」：没有分界线。
+    ///
+    /// 分界线的来源是 `Button::selectable` 默认 `.frame(true)`——每项各画
+    /// 一圈描边。本测试锁住 `lang_menu_style` 的三条约定：
+    /// 条目描边全清、条目间距归零、条目圆角归零。
+    #[test]
+    fn lang_menu_style_has_no_dividers() {
+        let mut s = egui::Style::default();
+        lang_menu_style(&mut s);
+        assert_eq!(s.spacing.item_spacing, egui::vec2(0.0, 0.0), "条目间距必须归零");
+        for w in [
+            &s.visuals.widgets.noninteractive,
+            &s.visuals.widgets.inactive,
+            &s.visuals.widgets.hovered,
+            &s.visuals.widgets.active,
+            &s.visuals.widgets.open,
+        ] {
+            assert_eq!(w.bg_stroke.width, 0.0, "条目描边必须清零，否则项与项之间有分界线");
+            assert_eq!(w.corner_radius, egui::CornerRadius::ZERO, "条目圆角必须归零，否则交界处露角缝");
+        }
+    }
+
+    /// 每个选项的配置值都必须能被 `parse_lang` 认回**同一个** Locale。
+    ///
+    /// 这条与 `core::i18n` 的 `every_locale_round_trips_through_parse_lang`
+    /// 是反向验证：那边从 Locale 出发查配置写法，这边从下拉框的配置值出发
+    /// 查 Locale。两边都过，才说明「用户选的值」与「系统认的值」对得上。
+    ///
+    /// 对不上时的症状正是 2026-10-23 修的那个 bug 的**另一种**成因：
+    /// 选是选上了，但配置写进去读出来变成「跟随系统」。
+    #[test]
+    fn lang_choice_values_parse_back_to_the_same_locale() {
+        use modular_clipboard_core::i18n::{LANG_SYSTEM, Locale, parse_lang};
+        // (配置值, 期望 Locale)；None = 跟随系统
+        let expect: [(&str, Option<Locale>); 6] = [
+            (LANG_SYSTEM, None),
+            ("zh-CN", Some(Locale::ZhCn)),
+            ("zh-TW", Some(Locale::ZhTw)),
+            ("en-US", Some(Locale::EnUs)),
+            ("ja-JP", Some(Locale::Ja)),
+            ("ru-RU", Some(Locale::Ru)),
+        ];
+        assert_eq!(LANG_CHOICES.len(), expect.len(), "选项数与期望表不一致");
+        for ((value, _), (want_value, want_locale)) in LANG_CHOICES.iter().zip(expect) {
+            assert_eq!(*value, want_value, "选项顺序/取值与期望不符");
+            assert_eq!(
+                parse_lang(value),
+                want_locale,
+                "选项 {value} 解析回来不是 {:?}",
+                want_locale
+            );
         }
     }
 }

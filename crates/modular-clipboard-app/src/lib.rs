@@ -1389,7 +1389,7 @@ mod tests {
             dims: None,
         };
         let preview = build_preview(&p);
-        assert!(preview.contains("3 个文件"), "实际: {preview}");
+        assert!(preview.contains("3 more files"), "实际: {preview}");
     }
 
     #[test]
@@ -1403,7 +1403,7 @@ mod tests {
             files: Vec::new(),
             dims: None,
         };
-        assert!(build_preview(&p).starts_with("图片"));
+        assert!(build_preview(&p).starts_with("Image"));
     }
 
     /// 裸 RGBA8 载荷（无文件头）也能得到尺寸文案——这正是修复前
@@ -1422,16 +1422,17 @@ mod tests {
             files: Vec::new(),
             dims: Some((w, h)),
         };
-        assert_eq!(build_preview(&p), "图片 64×48");
+        assert_eq!(build_preview(&p), "Image 64×48");
     }
 
     #[test]
     fn time_formatting_is_relative() {
         let now = 1_000_000_000i64;
-        assert_eq!(format_time(now - 30_000, now), "刚刚");
-        assert_eq!(format_time(now - 300_000, now), "5 分钟前");
-        assert_eq!(format_time(now - 7_200_000, now), "2 小时前");
-        assert_eq!(format_time(now - 172_800_000, now), "2 天前");
+        // 断言英文：app 的测试进程里没有测试改全局语言，恒为 EnUs（主语言）。
+        assert_eq!(format_time(now - 30_000, now), "Just now");
+        assert_eq!(format_time(now - 300_000, now), "5 min ago");
+        assert_eq!(format_time(now - 7_200_000, now), "2 hours ago");
+        assert_eq!(format_time(now - 172_800_000, now), "2 days ago");
     }
 
     #[test]

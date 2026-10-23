@@ -128,7 +128,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         f,
         ui,
         "accent_sat",
-        t(("饱和度", "Saturation")),
+        t(("饱和度", "HSV saturation")),
         format!("{}%", (s * 100.0).round() as i32),
         &mut s,
         0.0..=1.0,
@@ -403,7 +403,7 @@ pub(super) fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
         if n_over > 0 {
             ui.add_space(8.0);
             let reset_all =
-                draw_mini_button(f, ui, "token_reset_all", t(("全部重置", "Reset all")), Some("token_reset_all"));
+                draw_mini_button(f, ui, "token_reset_all", t(("全部重置", "Reset all tokens")), Some("token_reset_all"));
             if reset_all {
                 f.state.push(Op::ClearAllTokenOverrides);
             }

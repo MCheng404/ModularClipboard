@@ -172,7 +172,7 @@ modular-clipboard (bin)
 ## 测试
 
 ```bash
-cargo test --workspace      # 946 项（23 个测试二进制）
+cargo test --workspace      # 961 项（23 个测试二进制）
 cargo clippy --workspace --all-targets   # 零警告
 ```
 

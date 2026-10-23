@@ -222,6 +222,6 @@ pub fn format_time(ts_ms: i64, now_ms: i64) -> String {
     } else if diff < 86_400_000 {
         format!("{} {}", diff / 3_600_000, modular_clipboard_core::i18n::t(("小时前", "hours ago")))
     } else {
-        format!("{} 天前", diff / 86_400_000)
+        format!("{} {}", diff / 86_400_000, modular_clipboard_core::i18n::t(("天前", "days ago")))
     }
 }

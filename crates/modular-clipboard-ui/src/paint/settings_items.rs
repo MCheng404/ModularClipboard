@@ -237,7 +237,7 @@ pub(super) enum ItemKind {
 /// 区间内的常用档：标准 100% 是默认值，两侧各两档。
 pub const FONT_SCALE_PRESETS: &[(u8, Bi)] = &[
     (85, ("小", "Small")),
-    (100, ("标准", "Default")),
+    (100, ("标准", "Standard")),
     (115, ("大", "Large")),
     (130, ("特大", "X-Large")),
     (150, ("超大", "XX-Large")),
@@ -633,7 +633,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             },
             SettingsItem {
                 key: "ui.token_overrides",
-                label: ("令牌微调", "Token overrides"),
+                label: ("高级微调", "Token overrides"),
                 desc: ("逐项覆盖主题取值：任何元素、任何参数", "Override individual theme tokens: any element, any value"),
                 kind: ItemKind::TokenOverrides,
             },
@@ -783,7 +783,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             },
             SettingsItem {
                 key: "hotkey.paste_previous",
-                label: ("粘贴上一条", "Paste previous entry"),
+                label: ("粘贴上一条", "Paste previous"),
                 desc: ("把最近一条历史直接粘贴到当前输入处", "Paste the most recent entry into the focused app"),
                 kind: ItemKind::Hotkey(HotkeySlot::PastePrevious),
             },
@@ -936,7 +936,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             },
             SettingsItem {
                 key: "about.quit",
-                label: ("退出程序", "Quit"),
+                label: ("退出程序", "Quit app"),
                 desc: ("退出程序并停止后台记录", "Quit the app and stop recording"),
                 kind: ItemKind::Quit,
             },
