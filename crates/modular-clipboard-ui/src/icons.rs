@@ -58,66 +58,28 @@
 //! 屏幕空间光栅化口径）。改动 [`BASELINE_FACTOR`] 前先看它；
 //! 回归判据是 [`tests::glyph_ink_is_centred_in_its_box`]。
 
-use egui::{Align2, Color32, Pos2, Rect, Ui, Vec2, pos2};
+use egui::{Align2, Color32, Rect};
 
-/// 图标字体的名字，注册进 [`egui::FontDefinitions`] 时用。
-pub const ICON_FONT_NAME: &str = "modular-clipboard-icons";
+mod font;
+mod draw;
+mod md;
 
-/// 嵌入的图标字体（子集，4080 字节）。
-///
-/// 只含本模块 [`Icon`] 的 18 个变体，码位 `U+E000..=U+E011`。
-/// 由 `assets/` 下的源字体经`pyftsubset` 生成，改动 [`Icon`] 的码位
-/// 必须同步重新生成该文件——[`tests::every_icon_codepoint_has_ink`]
-/// 会拦住漏改。
-static ICON_TTF: &[u8] = include_bytes!("../assets/modular-clipboard-icons.ttf");
+use draw::vector_icon;
+pub use font::ASCENT_UNITS;
+pub use font::BASELINE_FACTOR;
+pub use font::DESCENT_UNITS;
+pub use font::EM_UNITS;
+pub use font::ICON_FONT_NAME;
+pub use font::LINE_GAP_UNITS;
+pub use font::ROW_HEIGHT_UNITS;
+pub use font::icon_font_data;
+pub use draw::icon_center;
+pub use draw::paint_inline;
+pub use md::MdIconGeom;
+pub use md::md_icon_geom;
+pub use md::paint_kind_icon;
 
-/// 图标的 [`egui::FontData`]。
-///
-/// 供 [`crate::theme::install_icon_font`] 注册用。走 `from_static`——
-/// 字体已经嵌在二进制里，不需要再拷一份所有权。
-///
-/// baseline 补偿（[`BASELINE_FACTOR`]）挂在这里：
-/// [`egui::FontTweak`] 是**注册期**属性，`FontId` 上没有对应字段。
-pub fn icon_font_data() -> egui::FontData {
-    egui::FontData::from_static(ICON_TTF).tweak(egui::FontTweak {
-        y_offset_factor: BASELINE_FACTOR,
-        ..Default::default()
-    })
-}
 
-/// 图标墨迹相对基线的纵向补偿系数（[`egui::FontTweak::y_offset_factor`]）。
-///
-/// # 为什么需要补偿
-///
-/// epaint 的行盒高度取自 **OS/2** 的 typo 度量（skrifa 不用 hhea）：
-/// `row_height = typoAscender - typoDescender + typoLineGap = 300 - 0 + 27 = 327`
-/// 单位，而 em 只有 300。多出来的 27 单位 lineGap 全部堆在基线**下方**，
-/// 于是行盒重心相对 em 盒下移，纯几何推算下墨迹平均会偏上
-/// `(ascent + descent - lineGap)/2 = 136.5` 单位，而实际墨迹中心均值在 150.7。
-///
-/// 推导：设 `ink_cy` 为字形墨迹中心（字体单位），`asc/desc/gap` 为 OS/2 度量，
-/// epaint 里基线位于 `行顶 + asc`，行盒居中于目标框，于是
-///
-/// ```text
-/// 墨迹中心(相对框心) = (asc + desc - gap)/2 - ink_cy
-/// ```
-///
-/// 代入 `(300 + 0 - 27)/2 - 150.7 = -14.2` 单位（偏上），
-/// 折成比例即 `+14.2 / 300 ≈ 0.047`；实测标定值0.0553（差异来自
-/// epaint 的整像素对齐与图集量化）。
-///
-/// # 符号：必须为正
-///
-/// [`egui::FontTweak::y_offset_factor`] 为负会把墨迹**上移**。
-/// 本常量曾经是 `-0.055`——符号写反了，等于在3.5px 的自然偏移上
-/// 再叠加 3.5px 反向偏移，实测把`Close` 的上下留白从 5/11 放大成 2/14。
-///
-/// # 校准方法
-///
-/// 不是拍脑袋，是 [`tests::report_ink_geometry`] 在 16 / 32 / 64 三个字号下
-/// 实测「墨迹中心 − 框心」的均值，取其反号。换字号时因为补偿正比于字号，
-/// 三个字号会同时收敛—— 单个字号碰巧居中不算数。
-pub const BASELINE_FACTOR: f32 = 0.0553;
 
 /// 墨迹相对 em 盒的缩放系数。
 ///
@@ -331,250 +293,16 @@ impl Icon {
     }
 }
 
-/// 圆头线段：线两端补一个圆，消除方头的尖角感。
-///
-/// 「圆角、简约」是图标风格的硬要求，而 egui 的 `line_segment` 只有
-/// 方头。两头补圆是成本最低的圆角做法（比整条胶囊网格轻得多）。
-fn round_line(painter: &egui::Painter, a: Pos2, b: Pos2, w: f32, color: Color32) {
-    painter.line_segment([a, b], egui::Stroke::new(w, color));
-    let r = w * 0.5;
-    painter.circle_filled(a, r, color);
-    painter.circle_filled(b, r, color);
-}
 
-/// 四枚自绘图标的实际绘制（圆角、简约风）。
-///
-/// 归一化坐标 0~1，`u()` 把它映射进 `rect` 的内接方框（`pad` 给描边
-/// 留余量，避免线宽的一半被包围盒裁掉）。线宽与顶栏图标同一口径
-/// （约边长 9.5%，下限 1.4 保证 1x 屏不出现断续）。
-fn vector_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
-    let side = rect.width().min(rect.height());
-    if side <= 0.0 {
-        return;
-    }
-    let w = (side * 0.095).max(1.4);
-    let pad = side * 0.09;
-    let inner = side - pad * 2.0;
-    let u = |x: f32, y: f32| Pos2::new(rect.min.x + pad + x * inner, rect.min.y + pad + y * inner);
 
-    match icon {
-        // 设置 = **左一条竖线 + 右三条横线**（用户指定的形状）。
-        //
-        // 三横线右端长短不一（长/短/中）形成节奏，比三根等长的更像
-        // 「调节器」而不是「列表」；都等长反而像汉堡菜单、与「设置」
-        // 的语义对不上。
-        Icon::Settings => {
-            round_line(painter, u(0.18, 0.14), u(0.18, 0.86), w, color);
-            round_line(painter, u(0.38, 0.22), u(0.92, 0.22), w, color);
-            round_line(painter, u(0.38, 0.50), u(0.74, 0.50), w, color);
-            round_line(painter, u(0.38, 0.78), u(0.86, 0.78), w, color);
-        }
-
-        // 置顶 = **圆头 + 直针**（`Pinned` 实心圆、`Unpinned` 描边圆）。
-        //
-        // 两态**形状完全相同**、只差填充，切换时不会有「换了个图标」
-        // 的跳变——用户分不清是「换图标了」还是「状态变了」。
-        // 比早前的「梯形身 + 矩形头」简约得多，16pt 下也糊不了。
-        Icon::Pinned | Icon::Unpinned => {
-            let filled = icon == Icon::Pinned;
-            let head_c = Pos2::new((u(0.0, 0.0).x + u(1.0, 0.0).x) * 0.5, u(0.0, 0.34).y);
-            let head_r = inner * 0.21;
-            if filled {
-                painter.circle_filled(head_c, head_r, color);
-            } else {
-                painter.circle_stroke(head_c, head_r, egui::Stroke::new(w, color));
-            }
-            // 针：从圆底伸到底部，圆头收尾。
-            round_line(
-                painter,
-                Pos2::new(head_c.x, u(0.0, 0.56).y),
-                Pos2::new(head_c.x, u(0.0, 0.94).y),
-                w,
-                color,
-            );
-        }
-
-        // 清空 = **圆角垃圾桶**（盖 + 小提手 + 梯形桶身），去掉早前的
-        // 两条内竖线——那是写实画法，16pt 下挤成一团，简约风不需要。
-        Icon::Trash => {
-            // 盖
-            round_line(painter, u(0.12, 0.28), u(0.88, 0.28), w, color);
-            // 提手：倒 U，坐在盖线上。
-            round_line(painter, u(0.38, 0.28), u(0.38, 0.12), w, color);
-            round_line(painter, u(0.38, 0.12), u(0.62, 0.12), w, color);
-            round_line(painter, u(0.62, 0.12), u(0.62, 0.28), w, color);
-            // 桶身：上宽下窄（开口朝上，由盖线闭合）。
-            round_line(painter, u(0.22, 0.40), u(0.30, 0.92), w, color);
-            round_line(painter, u(0.78, 0.40), u(0.70, 0.92), w, color);
-            round_line(painter, u(0.30, 0.92), u(0.70, 0.92), w, color);
-        }
-
-        // 复制 = **两枚重叠圆角矩形**（后层描边、前层实心）。
-        //
-        // 经典的「双文档」形状一眼可辨；前层实心让它在 16pt 下也有
-        // 明确的前后关系（两层都描边会糊成一个回）。
-        Icon::Copy => {
-            let radius = w * 1.1;
-            let back = Rect::from_min_max(u(0.36, 0.10), u(0.90, 0.64));
-            painter.rect_stroke(back, radius, egui::Stroke::new(w, color), egui::StrokeKind::Inside);
-            let front = Rect::from_min_max(u(0.10, 0.36), u(0.64, 0.90));
-            painter.rect_filled(front, radius, color);
-        }
-
-        // 其余图标不走这里（`Icon::paint` 已经拦截）。
-        _ => {}
-    }
-}
-
-/// 字体的 em 大小（`head.unitsPerEm`）。
-pub const EM_UNITS: f32 = 300.0;
-
-/// 字体的 `OS/2` typo ascender。**epaint 读的是这一项，不是 `hhea.ascent`。**
-///
-/// 与 [`DESCENT_UNITS`]、`LINE_GAP_UNITS`] 一起决定行盒高度，
-/// 因而是 [`BASELINE_FACTOR`] 存在的原因。
-pub const ASCENT_UNITS: f32 = 300.0;
-
-/// 字体的 `OS/2` typo descender（正值）。
-pub const DESCENT_UNITS: f32 = 0.0;
-
-/// 字体的 `OS/2` typo lineGap。
-///
-/// **这27 单位是baseline 补偿的真正来源**：行盒高度
-/// `= ascender - descender + lineGap = 327`，比 em（300）高出 27，
-/// 于是行盒重心相对 em 盒下移、墨迹整体偏上。
-pub const LINE_GAP_UNITS: f32 = 27.0;
-
-/// 行盒高度（字体单位）= `ascender - descender + lineGap`。
-///
-/// 与 [`EM_UNITS`] 的差值（27）即「需要补偿掉」的那个量。
-pub const ROW_HEIGHT_UNITS: f32 = ASCENT_UNITS - DESCENT_UNITS + LINE_GAP_UNITS;
-
-/// 绘制一个非交互的图标（不占响应空间），尺寸取 `icon_size` 令牌。
-///
-/// 用于「状态标记」这类场合——比如已置顶的图钉：
-/// 它只是提示当前状态，不可点击，因此不应该吃掉点击。
-pub fn paint_inline(ui: &mut Ui, icon: Icon, color: Color32, pal: &crate::theme::Palette, scale: f32) {
-    let side = pal.icon_size * scale;
-    let (rect, _resp) = ui.allocate_exact_size(Vec2::splat(side), egui::Sense::hover());
-    icon.paint(&ui.painter_at(rect), rect, color);
-}
-
-/// 图标在 `rect` 内的绘制中心。
-///
-/// 抽出来是为了让测试能验证「实际绘制位置」而不必真的跑一帧。
-pub fn icon_center(rect: Rect) -> egui::Pos2 {
-    pos2(rect.center().x, rect.center().y)
-}
-
-/// Markdown 徽标的几何参数（**纯函数**：绘制与测试共用一条算式）。
-///
-/// 归一化坐标（0..1，相对传入的边长 `side`）。抽成结构体是为了
-/// 让测试能验证「墨迹在框内、框铺满 rect」而不必真的跑一帧——
-/// 手绘图标没有字体度量可依，几何即规格。
-///
-/// # 2026-10-20 重绘（用户反馈「MD 图标渲染效果差」）
-///
-/// 1. **铺满 rect**：旧版外框只占约 70%×74%，而同屏的字体图标
-///    （[`INK_FIT`] 0.98）几乎铺满 ⇒ Markdown 徽标在列表行与类型栏
-///    里肉眼小一圈。现在外框取 `0.02..0.98`（96% 边长），与字体
-///    图标观感一致；
-/// 2. **笔画收细**：旧版 `stroke = side × 0.10`，16pt 下 1.6px，
-///    M 的三根竖笔挤成一团。现在 0.085（16pt → 1.36px、32pt →
-///    2.72px），小尺寸下更透气，大尺寸下不飘；
-/// 3. **M 与箭头重新配比**：M 占左 55%（x 0.20~0.52），箭头占右
-///    （x 0.66~0.86）；两者**底缘严格对齐**（都在 y 0.78）——旧版
-///    箭头吊在 y 0.32~0.62、M 在 0.32~0.70，底缘差 8%，看着
-///    「箭头短一截」。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MdIconGeom {
-    /// 外框（归一化 `[x0, y0, x1, y1]`）。
-    pub box_rect: [f32; 4],
-    /// M 的折线（左竖 → 谷底 → 右竖）。
-    pub m: [(f32, f32); 5],
-    /// 下箭头的折线（竖线 + V，顶点重复一次以连通两翼）。
-    pub arrow: [(f32, f32); 5],
-    /// 描边宽度相对边长的比例。
-    pub stroke_ratio: f32,
-}
-
-/// 见 [`MdIconGeom`]。
-pub fn md_icon_geom(side: f32) -> MdIconGeom {
-    let _ = side;
-    MdIconGeom {
-        box_rect: [0.02, 0.02, 0.98, 0.98],
-        // x 0.20~0.52（左 55% 给 M），y 0.22~0.78（占框高 56%，
-        // 上下各留约 22%——与字体图标的视觉重心一致）。
-        m: [
-            (0.20, 0.78),
-            (0.20, 0.22),
-            (0.36, 0.50),
-            (0.52, 0.22),
-            (0.52, 0.78),
-        ],
-        // 竖线 x=0.76：y 0.22~0.78（与 M 竖笔同底缘）；V 顶点
-        // (0.76,0.78)，两翼 (0.66,0.66) 与 (0.86,0.66)（V 深 0.12，
-        // 小尺寸下仍可辨）。
-        arrow: [
-            (0.76, 0.22),
-            (0.76, 0.78),
-            (0.66, 0.66),
-            (0.76, 0.78),
-            (0.86, 0.66),
-        ],
-        stroke_ratio: 0.085,
-    }
-}
-
-/// 按内容类型画徽标图标（行内右下角 / 类型过滤栏共用）。
-///
-/// Markdown 走**几何绘制**：图标字体的 PUA 码位（U+E000..E011）已占满，
-/// 加字形要重新生成 TTF；而「M + 下箭头」用几段线段就能表达清楚，
-/// 与 `paint.rs::draw_topbar_icon` 里那批几何图标同一套路。
-/// 几何参数见 [`md_icon_geom`]（纯函数，测试直接断言铺满与包含关系）。
-pub fn paint_kind_icon(
-    painter: &egui::Painter,
-    kind: modular_clipboard_core::ClipKind,
-    rect: Rect,
-    color: Color32,
-) {
-    use modular_clipboard_core::ClipKind;
-    if kind != ClipKind::Markdown {
-        Icon::for_kind(kind).paint(painter, rect, color);
-        return;
-    }
-    let side = rect.width().min(rect.height());
-    if side <= 0.0 || color == Color32::TRANSPARENT {
-        return;
-    }
-    let g = md_icon_geom(side);
-    let w = (side * g.stroke_ratio).max(1.0);
-    let stroke = egui::Stroke::new(w, color);
-    let u = |x: f32, y: f32| pos2(rect.min.x + x * side, rect.min.y + y * side);
-    // 外框：描边朝内（`Inside`），不侵占外圈留白。
-    let [bx0, by0, bx1, by1] = g.box_rect;
-    painter.rect_stroke(
-        Rect::from_min_max(u(bx0, by0), u(bx1, by1)),
-        w,
-        stroke,
-        egui::StrokeKind::Inside,
-    );
-    // M 与箭头：顶点重复（箭头）让折线连通，epaint 的 miter join
-    // 在尖角处自然收边，不需要额外处理。
-    painter.add(egui::Shape::line(
-        g.m.iter().map(|&(x, y)| u(x, y)).collect(),
-        stroke,
-    ));
-    painter.add(egui::Shape::line(
-        g.arrow.iter().map(|&(x, y)| u(x, y)).collect(),
-        stroke,
-    ));
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 测试专用导入：lib 目标看不到 `mod tests`，放在 root 顶层会被报未用。
     use egui::epaint::Color32;
+    use egui::{Vec2, pos2};
+    use font::ICON_TTF;
 
     /// 建一个只装了图标字体的 `Context`。不碰 GPU。
     ///
