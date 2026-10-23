@@ -54,6 +54,9 @@
   问题：gfx 的 Cargo.toml 注释自认「platform 只被 example 使用，不进渲染库本身」，但它声明在 [dependencies] 而非 [dev-dependencies]（全 workspace 无任何 [dev-dependencies] 节）。实际 src/ 中零处使用 platform（仅 examples/tray_probe.rs 用）。后果：ui 的依赖图被强行加上 platform→capture→arboard→windows 整条链。
   证据：grep modular_clipboard_platform 在 gfx/src 下 0 命中。
   建议：移到 [dev-dependencies]。
+  > **处置（2026-10-23）**：已直接**移除**该依赖，比降到 [dev-dependencies] 更彻底——
+  > 同日仓库瘦身删掉了 `crates/*/examples/` 下的全部实机探针（`platform` 仅被
+  > `tray_probe` 使用），删除后 `gfx/src` 与 `build.rs` 对其零使用。
 
 - [AR-05] P1 | ui/src/paint.rs:1785-2060、ui/src/app.rs:1729-1797 | 配置写入通道全字符串键，四处并行 match，字段改名静默失效
   问题：设置项用 ItemKind::Bool(ConfigGroup::Ui, "always_on_top") 声明，经 Op::SetBool{field} 到 app.rs set_bool_field(cfg, g, field, v) 落地；读写两侧各有一份 get_*/set_* 字符串 match（共 4 处平行 match，覆盖 21 个字段）。core::Config 字段一旦改名，编译期毫无提示，运行期落入 warn 静默失效。

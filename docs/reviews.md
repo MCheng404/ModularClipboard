@@ -237,7 +237,7 @@ capture 层目前**没有自写防护**——既没有「忽略自己刚写的�
 | F-35 | UI-P1-4 + UI-P2-3 | 选中描边 `2.0 * scale` 违反逻辑点约定（死分支同病）                         | ui               |
 | F-36 | AR-06             | Vulkan 管线组装两份相同实现（app.rs 内联 + SharedGfx::create）          | ui/gfx           |
 | F-37 | AR-05             | 配置写入全字符串键，4 处平行 match，字段改名静默失效                            | ui/app           |
-| F-38 | AR-04             | gfx→platform 误入 [dependencies]，渲染库拖入 arboard 链            | gfx              |
+| F-38 | AR-04             | gfx→platform 误入 [dependencies]，渲染库拖入 arboard 链 ✅ 2026-10-23 移除（探针删除后 `gfx/src` 零使用，直接删依赖而非降级） | gfx |
 | F-39 | AR-13             | rust-version=1.85 低于 let-chains 实际要求（1.88）                | workspace        |
 | F-40 | PF-9              | elide_text 超宽逐字符测量（每字符一次分配）                               | ui               |
 | F-41 | PF-10             | 每帧 3-4 次 env var 查询                                       | ui               |

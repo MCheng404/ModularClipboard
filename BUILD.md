@@ -19,7 +19,6 @@
 ./scripts/build.sh --test             # 跑测试（默认跳过 doctest）
 ./scripts/build.sh --doctest          # 只跑 doctest
 ./scripts/build.sh --package          # 生成规范化产物（推荐用这个交付）
-./scripts/build.sh --example probe    # 构建渲染探针
 ```
 
 临时需要原生工具链环境时（例如 `cargo install`）：

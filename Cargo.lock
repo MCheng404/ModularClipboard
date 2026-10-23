@@ -810,7 +810,6 @@ dependencies = [
  "bytemuck",
  "egui",
  "modular-clipboard-core",
- "modular-clipboard-platform",
  "naga",
  "tracing",
  "windows",

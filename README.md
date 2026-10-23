@@ -176,13 +176,9 @@ cargo test --workspace      # 934 项（23 个测试二进制）
 cargo clippy --workspace --all-targets   # 零警告
 ```
 
-实机探针（验证「只有真实 shell / 真实消息循环才能暴露的问题」）：
-
-```bash
-cargo run --example tray_probe          # 托盘图标 + 事件链路 + 热键注册/重注册/录制暂停
-cargo run --example tray_interact_probe # 真实子进程：关窗口≠退出 的四条链路
-cargo run --example backdrop_probe      # 自研磨砂合成路径回归（漏 configure 即全透明）
-```
+> 实机探针（`crates/*/examples/` 下的 `*_probe.rs`、`full_app.rs`）已于
+> 2026-10-23 仓库瘦身时移除——它们只在开发期用于验证「只有真实 shell /
+> 真实消息循环才能暴露的问题」，不属于交付内容。源码在 `old` 分支可查。
 
 ## 文档地图
 

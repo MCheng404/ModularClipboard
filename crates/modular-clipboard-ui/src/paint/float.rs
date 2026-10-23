@@ -47,7 +47,8 @@ pub(super) const RAIL_KIND_ORDER: [modular_clipboard_core::ClipKind; 5] = {
 /// 类型栏在左 / 上方同理。`crate::popup` 据此换算屏幕坐标（加主窗口
 /// 屏幕位置）。
 ///
-/// 这正是原型（`main-proto/index.html`）的布局：两个面板**漂在窗口
+/// 这正是原型（`main-proto/index.html`，已于 2026-10-23 仓库瘦身移除，
+/// 源码在 `old` 分支）的布局：两个面板**漂在窗口
 /// 之外**，间距透出桌面。2026-10-15 第三轮初版把它们画在窗口内，
 /// 与原型不符——Win32 窗口画不出客户区之外，只能靠独立弹窗实现。
 ///

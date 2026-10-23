@@ -265,9 +265,8 @@ impl EventLoop {
         //
         // `translate` 里的 `WM_SIZE` 分支是对的，但**它经常收不到**：
         // `MoveWindow` / `SetWindowPos` 这类改变窗口尺寸的调用，若来自
-        // **另一个进程**（本项目的 `scripts/verify_render.ps1` 与
-        // `measure_layout.ps1` 就是这样驱动窗口的），系统会用
-        // `SendMessage` 把 `WM_SIZE` **直接发给窗口过程**，
+        // **另一个进程**（外部自动化工具、实机验证脚本就是这样驱动窗口的），
+        // 系统会用 `SendMessage` 把 `WM_SIZE` **直接发给窗口过程**，
         // 它**不经过本进程的消息队列**，`PeekMessageW` 永远读不到。
         // 实测：把客户区从 420x560 拖到 900x800 后，队列里出现过
         // `WM_NCCALCSIZE`(0x60) 与 `WM_WINDOWPOSCHANGED`(0x47)，

@@ -13,9 +13,6 @@ bytemuck = { workspace = true }
 # window.rs 需要把 Win32 事件翻译成 egui 的 RawInput，
 # 这是 UI 层与渲染层之间唯一的耦合点，由本 crate 持有以避免循环依赖。
 egui = { workspace = true }
-# tray_probe 需要验证托盘常驻（托盘实现在 platform 层）。
-# 只被example 使用，不进渲染库本身。
-modular-clipboard-platform = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
@@ -36,62 +33,6 @@ windows = { version = "0.62", features = [
     #   因为 feature 交集问题影响其它 crate）
     "Win32_Graphics_Dwm",
 ] }
-
-[[example]]
-name = "probe"
-
-[[example]]
-name = "pipeline_probe"
-
-[[example]]
-name = "upload_probe"
-
-# 首次真实绘制验证（1 帧，1 次 draw call）
-[[example]]
-name = "draw_probe"
-
-# 端到端：egui 界面真正显示出来
-[[example]]
-name = "full_app"
-
-# 窗口与事件循环实机验证（无渲染，退出码 0 = 正常）
-[[example]]
-name = "window_probe"
-
-# 托盘常驻 + 全局快捷键实机验证（无渲染，退出码 0 = 正常）
-[[example]]
-name = "tray_probe"
-
-# 托盘交互端到端验证：起真实的 modular-clipboard.exe 子进程，
-# 用 Win32 消息注入验证「关窗口 ≠ 退出」四条链路。
-# 破坏性判据（清空历史）默认跳过，需 TRAY_E2E_ALLOW_CLEAR=1 才执行。
-[[example]]
-name = "tray_interact_probe"
-
-# 缩略图上屏验证（含 A/B 像素反证）
-[[example]]
-name = "thumb_probe"
-
-# 交换链重建路径验证（零像素校验、零离屏靶面）
-# 旧 resize_probe 因同时承担「主循环」与「像素校验」两个职责而删除：
-# 它借用生产管线的描述符集，无法跟随 pipeline.rs 演进；且负对照的
-# BG 常量与清屏色不一致，检查结果就是噪声。见 MEMORY 第 19 批坑 91~93。
-# resize 序列默认关闭，设 SWAPCHAIN_RESIZE=1 开启。
-[[example]]
-name = "swapchain_resize"
-
-# 像素渲染验证（自建完整离屏管线，不碰交换链、不借生产资源）
-[[example]]
-name = "pixels_probe"
-
-# 顶点坐标单位判定：逻辑点 还是 物理像素（纯 CPU，不建窗口）
-[[example]]
-name = "units_probe"
-
-# 点击位置 vs 渲染位置的双端实测：同一帧里同时抓 tessellate 顶点
-# 与PointerButton 命中，输出可断言的错位量（纯 CPU，不建窗口）
-[[example]]
-name = "coord_probe"
 
 # 着色器在编译期由 naga 编译为 SPIR-V，不进最终二进制。
 # 这样无需 glslc / glslang 等 C++ 工具链，保持纯 Rust 构建链。

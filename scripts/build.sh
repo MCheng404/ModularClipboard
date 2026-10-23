@@ -13,7 +13,6 @@
 #   ./scripts/build.sh --doctest        # 只跑 doctest
 #   ./scripts/build.sh --test icons::   # 只跑名字含 icons:: 的测试
 #   ./scripts/build.sh --package        # 生成规范化产物（见 package.sh）
-#   ./scripts/build.sh --example probe  # 构建探针（examples/）
 #
 # 除上面几个自有开关外，其余参数原样透传给 cargo（如 --nocapture、-p <crate>）。
 
@@ -27,10 +26,6 @@ source "$ROOT/scripts/env.sh"
 
 MODE=debug
 ACTION=build
-# 探针（examples/）不在默认构建目标里，需显式 `--example <name>`。
-# 不加这个开关时 `cargo build` 只出库与主程序，探针 exe 不会生成，
-# 而排查渲染问题恰恰只能靠探针——这个缺口曾导致「探针不存在」的误判。
-EXAMPLE=""
 EXTRA=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,8 +34,6 @@ while [ $# -gt 0 ]; do
         --test)    ACTION=test; shift ;;
         --doctest) ACTION=doctest; shift ;;
         --package) ACTION=package; shift ;;
-        --example) EXAMPLE="$2"; ACTION=example; shift 2 ;;
-        --example=*) EXAMPLE="${1#--example=}"; ACTION=example; shift ;;
         *) EXTRA+=("$1"); shift ;;
     esac
 done
@@ -71,9 +64,5 @@ case "$ACTION" in
         ;;
     doctest)
         cargo test --target "$TARGET" --workspace --doc ${EXTRA[@]+"${EXTRA[@]}"}
-        ;;
-    example)
-        cargo build --target "$TARGET" $(profile_flag) \
-            --example "$EXAMPLE" ${EXTRA[@]+"${EXTRA[@]}"}
         ;;
 esac
