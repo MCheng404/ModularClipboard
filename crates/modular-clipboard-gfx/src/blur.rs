@@ -35,7 +35,9 @@ use crate::pipeline::{
     BINDING_SAMPLER, BINDING_TEXTURE, BINDING_UNIFORM, DescriptorLayout, GraphicsPipeline,
     PipelineLayout,
 };
-use crate::shader::{BLUR_FRAGMENT_ENTRY, COPY_FRAGMENT_ENTRY, ShaderModule};
+use crate::shader::{
+    BLUR_FRAGMENT_ENTRY, COPY_FRAGMENT_ENTRY, ShaderModule, UPSAMPLE_FRAGMENT_ENTRY,
+};
 use crate::texture::{DeviceImage, Sampler};
 use crate::Gpu;
 
@@ -84,6 +86,26 @@ const SET_DOWNSAMPLE_BACKDROP: usize = 5;
 /// 描述符集总数。
 const SET_COUNT: usize = 6;
 
+/// Dual Filtering 的**降采样链深度上限**。
+///
+/// 每深一级，等效模糊半径翻倍、像素数降到 1/4。4 级后像素数已不足
+/// 源图的 1%，再深只会把底图糊成一块平均色（纹理感全丢）。
+const MAX_BLUR_LEVELS: usize = 4;
+
+/// 有降采样链时，收尾那趟高斯的半径（5 tap）。
+const CLEANUP_RADIUS: u32 = 2;
+
+/// 描述符池容量：固定的 6 组 + 链各级（降 + 升各一组）。
+/// 描述符池容量：固定的 6 组 + 链各级（降 + 升各一组）。
+///
+/// CAUTION: 这个数必须同时喂给 `descriptor_count` **和** `max_sets`。
+/// 只改 `descriptor_count` 会在分配第 7 个集合时直接
+/// `ERROR_OUT_OF_POOL_MEMORY`——`max_sets` 才是集合条数的硬上限。
+const POOL_SETS: u32 = (SET_COUNT + MAX_BLUR_LEVELS * 2) as u32;
+
+/// 降采样链上一级的相对倍率。
+const LEVEL_DIVISOR: u32 = 2;
+
 /// 模糊 uniform。布局必须与 `blur.wgsl` 的 `BlurUniforms` 逐字段一致。
 ///
 /// 大小 16 字节（8+4+4），无内部填充，`std140` 下与 WGSL 对齐规则相容。
@@ -109,6 +131,18 @@ impl BlurUniforms {
             dir: [texel[0], 0.0],
             radius: clamp_radius(radius) as f32,
             sigma,
+        }
+    }
+
+    /// tent 上采样参数：`dir` 复用为**源图纹素尺寸** `(1/w, 1/h)`。
+    ///
+    /// 与卷积路径的单向步长不冲突——两条路径各用一份 uniform 缓冲。
+    /// `radius` / `sigma` 对 tent 无意义，填 0。
+    pub fn texel(texel: [f32; 2]) -> Self {
+        Self {
+            dir: texel,
+            radius: 0.0,
+            sigma: 0.0,
         }
     }
 
@@ -254,6 +288,12 @@ pub struct BlurChain {
     pub blur_a: BlurTarget,
     /// 低分辨率中间图 B（横向卷积目标）。
     pub blur_b: BlurTarget,
+    /// Dual Filtering 的**降采样链**：`mips[i]` 是 `blur_a` 的 1/2^(i+1)。
+    ///
+    /// 半径由这条链的深度给出（每深一级半径翻倍、像素数降到 1/4），
+    /// 而不是由高斯核的 tap 数给出——这正是 Dual Filtering 相对大半径
+    /// 高斯的带宽优势所在。
+    pub mips: Vec<BlurTarget>,
     /// 降采样倍数。
     pub divisor: u32,
 }
@@ -269,12 +309,34 @@ impl BlurChain {
     ) -> anyhow::Result<Self> {
         let d = divisor.max(1);
         let low = downsample_extent(full_extent, d);
+        // 降采样链：每级再降 2 倍，直到不足 2 像素为止。
+        //
+        // 按上限 `MAX_BLUR_LEVELS` 全建——链的深度在运行期由档位决定
+        // （`levels_for_strength`），但**资源**一次性建齐：运行期重建
+        // 离屏目标要 `device_wait_idle`，那是全局副作用，不能因为用户
+        // 拖一下强度滑块就触发。
+        let mut mips = Vec::with_capacity(MAX_BLUR_LEVELS);
+        let mut cur = low;
+        for _ in 0..MAX_BLUR_LEVELS {
+            let next = downsample_extent(cur, LEVEL_DIVISOR);
+            if next.width >= cur.width && next.height >= cur.height {
+                break; // 尺寸不再缩小：再建只是浪费显存
+            }
+            mips.push(BlurTarget::new(gpu, render_pass, format, next)?);
+            cur = next;
+        }
         Ok(Self {
             scene: BlurTarget::new(gpu, render_pass, format, full_extent)?,
             blur_a: BlurTarget::new(gpu, render_pass, format, low)?,
             blur_b: BlurTarget::new(gpu, render_pass, format, low)?,
+            mips,
             divisor: d,
         })
+    }
+
+    /// 本帧实际要用几级降采样链（受已建资源上限约束）。
+    pub fn usable_levels(&self, want: usize) -> usize {
+        want.min(self.mips.len())
     }
 
     /// 尺寸是否与给定全分辨率一致。
@@ -287,6 +349,10 @@ impl BlurChain {
         self.scene.destroy(device);
         self.blur_a.destroy(device);
         self.blur_b.destroy(device);
+        for m in &mut self.mips {
+            m.destroy(device);
+        }
+        self.mips.clear();
     }
 }
 
@@ -306,6 +372,23 @@ pub struct BlurPipeline {
     blur_pipeline: GraphicsPipeline,
     /// 直通拷贝管线（`fs_copy`），用于降采样与合成。
     copy_pipeline: GraphicsPipeline,
+    /// tent 上采样管线（`fs_upsample`），Dual Filtering 的升采样端。
+    upsample_pipeline: GraphicsPipeline,
+    /// 上采样用的 uniform（源图纹素尺寸），**每级一份**。
+    ///
+    /// tent 的步长必须按**源**图的纹素算，链上每级的源尺寸都不同；
+    /// 一份缓冲做不到（同一帧多个 pass 读它，中途改写是未定义行为），
+    /// 所以按级各给一份——每份 32 字节。
+    mip_uniforms: Vec<Buffer>,
+    /// 上采样用的 uniform（源图纹素尺寸）。
+    uniform_t: Buffer,
+    /// 本帧降采样链的深度（0 = 退化为纯高斯，见 `set_radius`）。
+    levels: usize,
+    /// 降采样链 / 升采样链各级的「读上一级」描述符集。
+    ///
+    /// 前 `mips.len()` 个是降采样（源 = 上一级），紧接着 `mips.len()`
+    /// 个是升采样（源 = 下一级）。随链一起重建。
+    mip_sets: Vec<vk::DescriptorSet>,
     shader: ShaderModule,
     /// 降采样 / 合成用的采样器（`CLAMP_TO_EDGE`）。
     sampler: Sampler,
@@ -361,6 +444,14 @@ impl BlurPipeline {
             COPY_FRAGMENT_ENTRY,
         )?;
 
+        let upsample_pipeline = GraphicsPipeline::fullscreen(
+            device,
+            render_pass,
+            pipe_layout.handle,
+            &shader,
+            UPSAMPLE_FRAGMENT_ENTRY,
+        )?;
+
         // 采样器必须**线性 + 钳到边缘**：
         // - 线性：降采样靠它做一次双线性平均；卷积靠它让相邻 tap 平滑过渡。
         // - 钳到边缘：模糊会把采样点推到图像外，REPEAT 会把对侧内容卷进来
@@ -382,23 +473,36 @@ impl BlurPipeline {
             vk::SharingMode::EXCLUSIVE,
         )?;
 
-        // 描述符池：4 组，每组 1 uniform + 1 sampler + 1 texture。
+        let uniform_t = Buffer::new_host_visible(
+            gpu,
+            u_size,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            vk::SharingMode::EXCLUSIVE,
+        )?;
+
+        // 描述符池：固定的 6 组 + Dual Filtering 链各级（降 + 升各一组）。
+        // 池容量按**上限**一次给足——描述符集只在链重建时分配，
+        // 运行期不再增减，不会中途耗尽。
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: SET_COUNT as u32,
+                descriptor_count: POOL_SETS,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: SET_COUNT as u32,
+                descriptor_count: POOL_SETS,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: SET_COUNT as u32,
+                descriptor_count: POOL_SETS,
             },
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .max_sets(SET_COUNT as u32)
+            .max_sets(POOL_SETS)
+            // 链重建时要把上一批集合**归还**给池（`configure` 里的
+            // `free_descriptor_sets`）；没有这个标志，free 是未定义行为，
+            // 且池配额只减不增。
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .pool_sizes(&pool_sizes);
         let descriptor_pool = unsafe { device.create_descriptor_pool(&pool_info, None) }
             .map_err(|e| anyhow::anyhow!("创建模糊描述符池失败: {e:?}"))?;
@@ -421,6 +525,11 @@ impl BlurPipeline {
             pipe_layout,
             blur_pipeline,
             copy_pipeline,
+            upsample_pipeline,
+            mip_uniforms: Vec::new(),
+            uniform_t,
+            levels: 0,
+            mip_sets: Vec::new(),
             shader,
             sampler,
             sampler_mirror,
@@ -496,6 +605,71 @@ impl BlurPipeline {
             self.uniform_h.handle(),
             self.uniform_h.handle(),
         ];
+        // ---- Dual Filtering 链各级的描述符 ----
+        //
+        // 降采样 `n` 级 + 升采样 `n` 级，每级一组。源依次是「上一级的
+        // 结果」，因此必须**按级各自绑定**——固定那 6 组绑死在
+        // scene / blur_a / blur_b 上，复用不了。
+        let n = chain.mips.len();
+        // 释放上一轮分配的那批：**必须显式 free**，只 `clear()` 会把池
+        // 配额泄漏掉，重复 configure 几次就 `ERROR_OUT_OF_POOL_MEMORY`。
+        if !self.mip_sets.is_empty() {
+            let old = std::mem::take(&mut self.mip_sets);
+            unsafe { device.free_descriptor_sets(self.descriptor_pool, &old)? };
+        }
+        for u in &mut self.mip_uniforms {
+            u.destroy(device);
+        }
+        self.mip_uniforms.clear();
+        tracing::debug!(n, pool = POOL_SETS, "配置 Dual Filtering 链描述符");
+        if n > 0 {
+            let layouts = vec![self.desc_layout.handle; n * 2];
+            let alloc = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&layouts);
+            let sets = unsafe { device.allocate_descriptor_sets(&alloc) }
+                .map_err(|e| anyhow::anyhow!("模糊链描述符分配失败（n={n}）: {e:?}"))?;
+            anyhow::ensure!(
+                sets.len() == n * 2,
+                "模糊链描述符集分配数量不符：期望 {}，实际 {}",
+                n * 2,
+                sets.len()
+            );
+            // 升采样第 i 级的源是 mips[i]，tent 步长按**源**纹素算。
+            for i in 0..n {
+                let src = chain.mips[i].extent;
+                let mut u = Buffer::new_host_visible(
+                    gpu,
+                    std::mem::size_of::<BlurUniforms>() as vk::DeviceSize,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    vk::SharingMode::EXCLUSIVE,
+                )?;
+                u.write(
+                    device,
+                    0,
+                    bytemuck::bytes_of(&BlurUniforms::texel([
+                        1.0 / (src.width as f32).max(1.0),
+                        1.0 / (src.height as f32).max(1.0),
+                    ])),
+                )?;
+                self.mip_uniforms.push(u);
+            }
+            // 降采样组：源 = 上一级（第 0 级是 blur_a）。
+            let down_src: Vec<&BlurTarget> = std::iter::once(&chain.blur_a)
+                .chain(chain.mips.iter())
+                .take(n)
+                .collect();
+            for (i, src) in down_src.iter().enumerate() {
+                self.write_mip_set(device, sets[i], src, self.uniform_t.handle());
+            }
+            // 升采样组：源 = mips[i]。
+            for i in 0..n {
+                let u = self.mip_uniforms[i].handle();
+                self.write_mip_set(device, sets[n + i], &chain.mips[i], u);
+            }
+            self.mip_sets = sets;
+        }
+
         for i in 0..SET_DOWNSAMPLE_BACKDROP {
             let buf_info = vk::DescriptorBufferInfo {
                 buffer: uniforms[i],
@@ -548,7 +722,26 @@ impl BlurPipeline {
             1.0 / low.width.max(1) as f32,
             1.0 / low.height.max(1) as f32,
         ];
-        let r = clamp_radius(radius);
+        // ---- Dual Filtering：半径改由**降采样链的深度**给出 ----
+        //
+        // 高斯半径直接等于 tap 数（半径 12 就要 25 次采样 × 2 趟），要做
+        // 大半径只能加 tap。Dual Filtering 每深一级半径翻倍、像素数降到
+        // 1/4——半径更大而开销更小。
+        //
+        // 因此这里把档位换算成**级数**，收尾的高斯只留一个小半径把
+        // tent 升采样残留的方块感抹平（半径 2，5 tap，几乎免费）。
+        //
+        // 映射：radius 1..12 → levels 0..3。历史默认档位 7（radius 8）
+        // 落在 2 级，等效半径 ≈ 8，观感与升级前一致。
+        self.levels = (clamp_radius(radius) as usize / 4).min(MAX_BLUR_LEVELS);
+        // 有链时高斯**只负责抹掉 tent 升采样残留的方块感**（5 tap）。
+        // 半径已经由链的深度给出了——这里再按原半径跑 25 tap，
+        // 等于把同一份模糊做两遍，开销反而比升级前更高。
+        let r = if self.levels > 0 {
+            CLEANUP_RADIUS
+        } else {
+            clamp_radius(radius)
+        };
         let sigma = sigma_for_radius(r);
         self.uniform_h.write(
             device,
@@ -688,7 +881,57 @@ impl BlurPipeline {
             downsample_set,
             self.copy_pipeline.handle,
         )?;
-        // ② blur_a → blur_b（横向）
+        // ② Dual Filtering：降采样链到最低级，再 tent 升采样回来。
+        //
+        // 模糊半径由**链的深度**给出，而不是高斯核的 tap 数：每深一级
+        // 半径翻倍、像素数降到 1/4，所以「半径更大、开销更小」。
+        // 升采样用 3x3 tent（恒 9 次采样），把低分辨率结果平滑放大回去。
+        //
+        // 深度为 0 时整段跳过，退化为原来的「两趟高斯」。
+        let n = self.levels.min(chain.mips.len());
+        if n > 0 {
+            // 降采样：blur_a → mips[0] → … → mips[n-1]
+            self.transition_to_read(gpu, cmd, &mut chain.blur_a)?;
+            for i in 0..n {
+                self.blit(
+                    gpu,
+                    cmd,
+                    render_pass,
+                    &mut chain.mips[i],
+                    self.mip_sets[i],
+                    self.copy_pipeline.handle,
+                )?;
+                // 供下一级采样（最后一级也要，因为升采样第一步读它）。
+                self.transition_to_read(gpu, cmd, &mut chain.mips[i])?;
+            }
+            // 升采样：mips[n-1] → … → mips[0] → blur_a
+            for i in (0..n).rev() {
+                let set = self.mip_sets[n + i];
+                if i == 0 {
+                    self.blit(
+                        gpu,
+                        cmd,
+                        render_pass,
+                        &mut chain.blur_a,
+                        set,
+                        self.upsample_pipeline.handle,
+                    )?;
+                } else {
+                    self.blit(
+                        gpu,
+                        cmd,
+                        render_pass,
+                        &mut chain.mips[i - 1],
+                        set,
+                        self.upsample_pipeline.handle,
+                    )?;
+                    self.transition_to_read(gpu, cmd, &mut chain.mips[i - 1])?;
+                }
+            }
+            self.transition_to_read(gpu, cmd, &mut chain.blur_a)?;
+        }
+
+        // ③ blur_a → blur_b（横向）
         self.transition_to_read(gpu, cmd, &mut chain.blur_a)?;
         self.blit(
             gpu,
@@ -713,6 +956,51 @@ impl BlurPipeline {
         // ④ 结果停在 SHADER_READ，供合成采样。
         self.transition_to_read(gpu, cmd, &mut chain.blur_a)?;
         Ok(())
+    }
+
+    /// 写一组「读指定源图」的描述符（Dual Filtering 链各级用）。
+    ///
+    /// 与固定那 6 组的区别：源是**运行期才知道**的某一级，所以不能
+    /// 预绑定，只能在链重建时按级生成。
+    fn write_mip_set(
+        &self,
+        device: &ash::Device,
+        set: vk::DescriptorSet,
+        src: &BlurTarget,
+        uniform: vk::Buffer,
+    ) {
+        let buf_info = vk::DescriptorBufferInfo {
+            buffer: uniform,
+            offset: 0,
+            range: std::mem::size_of::<BlurUniforms>() as vk::DeviceSize,
+        };
+        let img = vk::DescriptorImageInfo {
+            sampler: self.sampler_mirror.handle(),
+            image_view: src.image.view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_UNIFORM)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(std::slice::from_ref(&buf_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_SAMPLER)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .image_info(std::slice::from_ref(&img)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(BINDING_TEXTURE)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(&img)),
+        ];
+        // SAFETY: 集合刚从池里分配，没有在途 GPU 工作引用它。
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
     /// 把图像从「渲染通道写完」转到「可被采样」。
@@ -835,6 +1123,10 @@ impl BlurPipeline {
     /// 销毁全部资源。前置条件：已 `device_wait_idle`。
     pub fn destroy(&mut self, gpu: &Gpu) {
         let device = &gpu.device;
+        for u in &mut self.mip_uniforms {
+            u.destroy(device);
+        }
+        self.mip_uniforms.clear();
         unsafe {
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_pipeline(self.blur_pipeline.handle, None);

@@ -176,6 +176,48 @@ fn fs_blur(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 @fragment
+fn fs_upsample(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Dual Filtering 的**升采样**端：3x3 tent 核
+    //
+    //      1  2  1
+    //      2  4  2   ÷ 16
+    //      1  2  1
+    //
+    // # 为什么用它而不是再来一趟高斯
+    //
+    // Dual Filtering 的要点是：模糊半径**由降采样链的深度**给出，
+    // 升采样只负责把低分辨率结果平滑地放大回去。tent 核是「两个盒式
+    // 卷积」的卷积，天然平滑，且**可以用硬件双线性合成到 4 次采样**
+    // （Jimenez 的版本）——这里直接用 9 次显式采样，代码直白，代价在
+    // 最小的那几级上可以忽略。
+    //
+    // 与高斯的关键差别：高斯的半径直接等于 tap 数（半径 12 就要 25 次
+    // 采样 × 2 趟），tent 恒为 9 次（一趟搞定两个方向）。要做大半径，
+    // 高斯只能加 tap，Dual Filtering 只需**多降一级**——而每降一级
+    // 像素数减少 75%，所以「半径翻倍、开销反而下降」。
+    //
+    // `u.dir` 这里被复用为**源图的纹素尺寸** `(1/w, 1/h)`（见
+    // `BlurUniforms::texel`）；高斯路径里它是单向步长，两者不冲突，
+    // 因为两条路径用各自的 uniform 缓冲。
+    let t = u.dir;
+    let c = textureSampleLevel(src, blur_sampler, in.uv, 0.0);
+
+    // 边邻（权重 2）
+    let e = textureSampleLevel(src, blur_sampler, in.uv + vec2<f32>(t.x, 0.0), 0.0)
+          + textureSampleLevel(src, blur_sampler, in.uv - vec2<f32>(t.x, 0.0), 0.0)
+          + textureSampleLevel(src, blur_sampler, in.uv + vec2<f32>(0.0, t.y), 0.0)
+          + textureSampleLevel(src, blur_sampler, in.uv - vec2<f32>(0.0, t.y), 0.0);
+
+    // 角邻（权重 1）
+    let k = textureSampleLevel(src, blur_sampler, in.uv + vec2<f32>(t.x, t.y), 0.0)
+          + textureSampleLevel(src, blur_sampler, in.uv + vec2<f32>(t.x, -t.y), 0.0)
+          + textureSampleLevel(src, blur_sampler, in.uv + vec2<f32>(-t.x, t.y), 0.0)
+          + textureSampleLevel(src, blur_sampler, in.uv + vec2<f32>(-t.x, -t.y), 0.0);
+
+    return (c * 4.0 + e * 2.0 + k) / 16.0;
+}
+
+@fragment
 fn fs_copy(in: VertexOutput) -> @location(0) vec4<f32> {
     // 降采样与最终合成都走这里。降采样时源是全分辨率场景、
     // 目标是 1/N 分辨率，线性采样器自动做一次双线性平均，

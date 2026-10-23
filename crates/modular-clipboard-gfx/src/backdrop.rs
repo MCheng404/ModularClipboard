@@ -873,7 +873,7 @@ mod tests {
 
         let (out2, w2, h2) = downsample_box_blur(&checker(64, 64), 64, 64, 4, 0);
         let mean: u32 = out2.iter().step_by(4).map(|&v| v as u32).sum::<u32>()
-            / (w2 * h2) as u32;
+            / (w2 * h2);
         assert!(
             (110..=145).contains(&mean),
             "棋盘格降采样后应接近中灰，实际 {mean}"

@@ -32,6 +32,8 @@ pub const BLUR_VERTEX_ENTRY: &std::ffi::CStr = c"vs_fullscreen";
 pub const BLUR_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_blur";
 /// `blur.wgsl` 的直通拷贝片元入口（降采样 / 合成）。
 pub const COPY_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_copy";
+/// `blur.wgsl` 的 tent 上采样片元入口（Dual Filtering 的升采样端）。
+pub const UPSAMPLE_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_upsample";
 
 /// 着色器模块。销毁时需调用 [`ShaderModule::destroy`]。
 pub struct ShaderModule {
