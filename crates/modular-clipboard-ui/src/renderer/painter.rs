@@ -6,10 +6,14 @@
 
 use ash::vk;
 use modular_clipboard_gfx::Gpu;
+use modular_clipboard_gfx::backdrop::CAPTURE_DOWNSCALE;
 use modular_clipboard_gfx::backdrop::CAPTURE_INTERVAL;
+use modular_clipboard_core::config::card_blur_downscale;
+use modular_clipboard_core::config::card_blur_passes;
 use modular_clipboard_gfx::backdrop::DesktopCapture;
 use modular_clipboard_gfx::backdrop::MotionPredictor;
 use modular_clipboard_gfx::backdrop::capture_due;
+use modular_clipboard_gfx::backdrop::downsample_box_blur;
 use modular_clipboard_gfx::backdrop::capture_size;
 use modular_clipboard_gfx::backdrop::client_origin;
 use modular_clipboard_gfx::blur::BlurChain;
@@ -193,6 +197,10 @@ pub(super) struct BackdropFx {
 pub(super) struct CardBlurState {
     capture: Option<DesktopCapture>,
     last: Option<std::time::Instant>,
+    /// 当前档位（0 = 关闭）。背景磨砂管线靠它判断要不要顺手产出卡片图。
+    level: u8,
+    /// 产出的卡片底图，等绘制层取走。
+    out: Option<(Vec<u8>, u32, u32)>,
 }
 
 /// 磨砂背景的运行状态：GPU 资源 + GDI 捕获器 + 节流时间戳 + 背景亮度。
@@ -446,7 +454,7 @@ impl<'a> Painter<'a> {
     pub fn capture_card_blur(
         &mut self,
         hwnd: isize,
-        downscale: u32,
+        level: u8,
     ) -> anyhow::Result<Option<(Vec<u8>, u32, u32)>> {
         let now = std::time::Instant::now();
         if !capture_due(self.card_blur.last, now, CAPTURE_INTERVAL) {
@@ -461,23 +469,48 @@ impl<'a> Painter<'a> {
             .capture
             .as_mut()
             .expect("上面刚确保存在");
-        match cap.capture_behind_scaled(hwnd, downscale)? {
+        // 只按 `CAPTURE_DOWNSCALE`(1/2) 抓，剩下的降采样交给 CPU——
+        // 与「背景磨砂共享抓屏」那条路径**逐字节一致**，两条路不会有
+        // 质量差（早前这里用 `capture_behind_scaled` 直接抓到目标尺寸，
+        // 只有一次 GDI 的 `HALFTONE` 平均，放大回卡片会看见方块边界）。
+        match cap.capture_behind(hwnd)? {
             Some((bits, w, h)) => {
                 self.card_blur.last = Some(now);
-                Ok(Some((bits.to_vec(), w, h)))
+                // 背景是磨砂时**不该**走到这里——那条路共享背景的抓屏
+                // （见 `record_backdrop_blur`）。出现这条日志说明共享没
+                // 生效，每秒会多付一次全屏 GDI `BitBlt`。
+                tracing::debug!("卡片磨砂：独立抓屏（背景未开磨砂）");
+                Ok(Some(Self::make_card_blur(bits, w, h, level)))
             }
             // 最小化：不更新时间戳，下一帧再试。
             None => Ok(None),
         }
     }
 
-    /// 停用卡片磨砂：立即释放 GDI 捕获器（用户在设置里关掉不该继续占用）。
-    pub fn set_card_blur_enabled(&mut self, on: bool) {
-        if on {
+    /// 抓到的（1/2 分辨率）像素 → 卡片底图：再降采样 + 若干趟盒式模糊。
+    fn make_card_blur(bits: &[u8], w: u32, h: u32, level: u8) -> (Vec<u8>, u32, u32) {
+        // 源已经是 1/2，所以这里只再降 `downscale / 2`（至少 1）。
+        let f = (card_blur_downscale(level) / CAPTURE_DOWNSCALE).max(1);
+        downsample_box_blur(bits, w, h, f, card_blur_passes(level))
+    }
+
+    /// 设置卡片磨砂档位（0 = 关闭）。
+    ///
+    /// 关闭时立即释放 GDI 捕获器与待取走的底图——用户在设置里关掉不该
+    /// 继续占用。
+    pub fn set_card_blur(&mut self, level: u8) {
+        self.card_blur.level = level;
+        if level > 0 {
             return; // 资源在下一帧 `capture_card_blur` 里懒创建。
         }
         self.card_blur.capture = None;
         self.card_blur.last = None;
+        self.card_blur.out = None;
+    }
+
+    /// 取走背景管线**顺带**产出的卡片底图（共享抓屏路径）。
+    pub fn take_card_blur(&mut self) -> Option<(Vec<u8>, u32, u32)> {
+        self.card_blur.out.take()
     }
 
     /// 启用/停用自研磨砂背景。
@@ -965,6 +998,10 @@ impl<'a> Painter<'a> {
         if hwnd == 0 {
             return Ok(());
         }
+        // 卡片磨砂档位先取出来：下面要拆借 `self.backdrop`，期间不能再
+        // 整体访问 `self`（`self.card_blur.level` 是另一个字段，但拆借
+        // 模式里混着读容易踩借用冲突，取成局部变量最省心）。
+        let cb_level = self.card_blur.level;
         self.ensure_backdrop(fr, render_extent, swap_extent, divisor, format)?;
 
         // ---- ① 运动观测（先于节流：节流帧也要喂预测器）----
@@ -1032,6 +1069,17 @@ impl<'a> Painter<'a> {
         // 到这里再借道 `BackdropState` 的剩余字段——直接放回拆借模式
         // 会与 `last_capture` 的写冲突，所以用局部变量延迟到函数尾。
         let capture_succeeded = observed_origin;
+
+        // 卡片磨砂：**同一份抓屏**顺手降采样成卡片底图。
+        //
+        // GDI `BitBlt` 是这套管线里最贵的一步（同步阻塞、毫秒级）。
+        // 背景与卡片各抓一次等于付两倍——而且两次抓屏相差一个节流
+        // 周期，窗口移动时卡片里的画面与背景里的会错位。共享之后卡片
+        // 只在 CPU 上多做一次小图降采样（几十微秒），且**与背景同一
+        // 时刻的内容**。
+        if cb_level > 0 {
+            self.card_blur.out = Some(Self::make_card_blur(bits, w, h, cb_level));
+        }
 
         // 上传 + 三趟卷积（降采样、横向、纵向）。
         //

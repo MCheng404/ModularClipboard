@@ -50,6 +50,15 @@ pub(super) fn default_card_blur() -> u8 {
 ///
 /// 档位 1（最轻）→ 倍率 3，档位 10（最重）→ 倍率 12。
 /// 倍率再往上，卡片上就只剩几块平均色，纹理感全丢。
+/// 卡片磨砂档位 → 降采样之后再叠的**盒式模糊趟数**。
+///
+/// 降采样本身是块平均，放大回卡片尺寸会看见方格边界与随窗口位置
+/// 抖动的接缝。叠几趟 3×3 分离式盒式把它抹平——盒式迭代定理：3 趟
+/// 已相当接近高斯。档位越高越需要它（倍率大 ⇒ 方块更大）。
+pub fn card_blur_passes(strength: u8) -> u32 {
+    (1 + strength as u32 / 4).min(3)
+}
+
 pub fn card_blur_downscale(strength: u8) -> u32 {
     (3 + strength.saturating_sub(1) as u32).min(12)
 }

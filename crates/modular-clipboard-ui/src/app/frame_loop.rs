@@ -736,20 +736,28 @@ pub(super) fn run_mode(
         // 失败只用 warn：抓屏失败不该杀死界面（与磨砂背景同款取舍）。
         let want_card_blur = app.svc.state.config.ui.card_blur;
         if want_card_blur != applied_card_blur {
-            painter.set_card_blur_enabled(want_card_blur > 0);
+            painter.set_card_blur(want_card_blur);
             applied_card_blur = want_card_blur;
         }
         if want_card_blur > 0 && !hidden && !window.is_minimized() {
-            let scale = modular_clipboard_core::config::card_blur_downscale(want_card_blur);
-            match painter.capture_card_blur(window.hwnd().0 as isize, scale) {
-                Ok(Some((px, w, h))) => {
-                    app.paint_state.card_blur_pending = Some(egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
-                        &px,
-                    ));
+            // 背景是**磨砂**时抓屏由背景管线顺带做（共享一次 `BitBlt`），
+            // 这里只把结果取走；否则才单独抓一次。
+            let acrylic = app.svc.state.config.ui.window_backdrop
+                == modular_clipboard_core::config::WindowBackdrop::Acrylic;
+            let got = if acrylic {
+                painter.take_card_blur()
+            } else {
+                match painter.capture_card_blur(window.hwnd().0 as isize, want_card_blur) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(%e, "卡片磨砂捕获失败，本帧沿用旧底图");
+                        None
+                    }
                 }
-                Ok(None) => {} // 节流未到 / 最小化：沿用上一张纹理
-                Err(e) => tracing::warn!(%e, "卡片磨砂捕获失败，本帧沿用旧底图"),
+            };
+            if let Some((px, w, h)) = got {
+                app.paint_state.card_blur_pending =
+                    Some(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &px));
             }
         }
 

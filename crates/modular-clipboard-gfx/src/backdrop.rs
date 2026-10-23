@@ -89,7 +89,139 @@ pub fn capture_due(last: Option<Instant>, now: Instant, interval: Duration) -> b
     }
 }
 
-    /// 客户区尺寸 → 捕获尺寸。负值/零值钳到 1（`vkCreateImage` 不接受 0，
+    /// 把 RGBA 像素**降采样**并叠若干次盒式模糊，返回新图（纯函数）。
+///
+/// # 为什么降采样之后再糊几次
+///
+/// 只降采样一次（按块取平均）得到的是**块状**的模糊：放大回卡片尺寸
+/// 后能看见明显的方格边界，边界还会随窗口位置抖动。叠 2~3 次分离式
+/// 3×3 盒式模糊能把这个块状感彻底抹掉——盒式迭代定理：3 次盒式模糊
+/// 的核已非常接近高斯。
+///
+/// 代价极低：输入是**降采样后**的小图（典型 110×130），3×3 分离式
+/// 每趟每个像素 3 次采样，全图约 4 万像素 × 2 趟 × 3 次 ≈ 24 万次
+/// 乘加，几十微秒级，远低于一次全屏 GDI `BitBlt`（毫秒级）。
+///
+/// # 为什么是盒式而不是真高斯
+///
+/// 真高斯要按半径取权重（半径 8 就是 17 次采样 × 2 趟），而这里的输入
+/// 已经在低分辨率上——同样的视觉半径用盒式只需 3 次采样。真正在意的
+/// 模糊半径由**降采样倍率**给出，盒式只负责抹掉方块边界。
+///
+/// `factor` 是每边的降采样倍数（1 = 不降采样，只模糊）。返回图尺寸为
+/// `w / factor × h / factor`（向上取整，至少 1）。
+pub fn downsample_box_blur(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    factor: u32,
+    passes: u32,
+) -> (Vec<u8>, u32, u32) {
+    let f = factor.max(1);
+    let ow = ((w / f).max(1)) as usize;
+    let oh = ((h / f).max(1)) as usize;
+    let sw = w as usize;
+    let fs = f as usize;
+
+    // ① 降采样：按 fs×fs 块取均值（块不足时按实际覆盖的像素平均）。
+    let mut buf = vec![0u8; ow * oh * 4];
+    for y in 0..oh {
+        for x in 0..ow {
+            let mut r = 0u32;
+            let mut g = 0u32;
+            let mut b = 0u32;
+            let mut n = 0u32;
+            for dy in 0..fs {
+                let sy = y * fs + dy;
+                if sy >= h as usize {
+                    break;
+                }
+                for dx in 0..fs {
+                    let sx = x * fs + dx;
+                    if sx >= sw {
+                        break;
+                    }
+                    let i = (sy * sw + sx) * 4;
+                    if i + 3 >= src.len() {
+                        break;
+                    }
+                    r += src[i] as u32;
+                    g += src[i + 1] as u32;
+                    b += src[i + 2] as u32;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            let o = (y * ow + x) * 4;
+            buf[o] = (r / n) as u8;
+            buf[o + 1] = (g / n) as u8;
+            buf[o + 2] = (b / n) as u8;
+            buf[o + 3] = 255;
+        }
+    }
+
+    // ② 分离式 3×3 盒式模糊：横一趟 + 纵一趟算一次 pass。
+    //    就地两缓冲轮换，避免每趟都分配。
+    let mut a = buf;
+    let mut tmp = vec![0u8; a.len()];
+    for _ in 0..passes {
+        // 横向
+        for y in 0..oh {
+            for x in 0..ow {
+                let mut r = 0u32;
+                let mut g = 0u32;
+                let mut b = 0u32;
+                let mut n = 0u32;
+                for d in [-1isize, 0, 1] {
+                    let nx = x as isize + d;
+                    if nx < 0 || nx >= ow as isize {
+                        continue;
+                    }
+                    let i = (y * ow + nx as usize) * 4;
+                    r += a[i] as u32;
+                    g += a[i + 1] as u32;
+                    b += a[i + 2] as u32;
+                    n += 1;
+                }
+                let o = (y * ow + x) * 4;
+                tmp[o] = (r / n) as u8;
+                tmp[o + 1] = (g / n) as u8;
+                tmp[o + 2] = (b / n) as u8;
+                tmp[o + 3] = 255;
+            }
+        }
+        // 纵向
+        for y in 0..oh {
+            for x in 0..ow {
+                let mut r = 0u32;
+                let mut g = 0u32;
+                let mut b = 0u32;
+                let mut n = 0u32;
+                for d in [-1isize, 0, 1] {
+                    let ny = y as isize + d;
+                    if ny < 0 || ny >= oh as isize {
+                        continue;
+                    }
+                    let i = (ny as usize * ow + x) * 4;
+                    r += tmp[i] as u32;
+                    g += tmp[i + 1] as u32;
+                    b += tmp[i + 2] as u32;
+                    n += 1;
+                }
+                let o = (y * ow + x) * 4;
+                a[o] = (r / n) as u8;
+                a[o + 1] = (g / n) as u8;
+                a[o + 2] = (b / n) as u8;
+                a[o + 3] = 255;
+            }
+        }
+    }
+    (a, ow as u32, oh as u32)
+}
+
+/// 客户区尺寸 → 捕获尺寸。负值/零值钳到 1（`vkCreateImage` 不接受 0，
     /// 最小化窗口的 `GetClientRect` 会返回 0×0，但调用方已先排除该情况）。
     pub fn capture_extent(width: i32, height: i32) -> (u32, u32) {
         (width.max(1) as u32, height.max(1) as u32)
@@ -704,5 +836,88 @@ mod tests {
     #[test]
     fn client_origin_rejects_null_hwnd() {
         assert!(client_origin(0).is_none(), "hwnd=0 必须拒绝而非解引用空句柄");
+    }
+
+    /// 棋盘格：相邻像素一黑一白，是检验「糊没糊掉」最锋利的输入。
+    fn checker(w: u32, h: u32) -> Vec<u8> {
+        let mut v = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = if (x + y) % 2 == 0 { 0u8 } else { 255u8 };
+                v.extend_from_slice(&[c, c, c, 255]);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn downsample_halves_each_side() {
+        let (out, w, h) = downsample_box_blur(&checker(64, 32), 64, 32, 4, 1);
+        assert_eq!((w, h), (16, 8), "降采样后尺寸应为 1/4");
+        assert_eq!(out.len(), (w * h * 4) as usize);
+        assert!(
+            out.iter().skip(3).step_by(4).all(|&a| a == 255),
+            "alpha 必须恒 255"
+        );
+    }
+
+    #[test]
+    fn downsample_is_area_average() {
+        // 2×2 全黑块 ⇒ 输出应为黑；整幅均值应落在中灰附近。
+        let src = vec![0u8; (8 * 8 * 4) as usize];
+        let (out, _, _) = downsample_box_blur(&src, 8, 8, 2, 0);
+        assert!(
+            out.iter().enumerate().all(|(i, &v)| i % 4 == 3 || v == 0),
+            "全黑输入降采样后 RGB 仍是 0（alpha 恒 255）"
+        );
+
+        let (out2, w2, h2) = downsample_box_blur(&checker(64, 64), 64, 64, 4, 0);
+        let mean: u32 = out2.iter().step_by(4).map(|&v| v as u32).sum::<u32>()
+            / (w2 * h2) as u32;
+        assert!(
+            (110..=145).contains(&mean),
+            "棋盘格降采样后应接近中灰，实际 {mean}"
+        );
+    }
+
+    #[test]
+    fn box_passes_reduce_contrast() {
+        // 模糊的唯一可测定义：**相邻像素差**变小。棋盘格最苛刻。
+        let spread = |v: &[u8], w: u32, h: u32| -> i64 {
+            let mut s = 0i64;
+            for y in 0..h as usize {
+                for x in 1..w as usize {
+                    let i = (y * w as usize + x) * 4;
+                    let j = (y * w as usize + x - 1) * 4;
+                    s += (v[i] as i64 - v[j] as i64).abs();
+                }
+            }
+            s
+        };
+        // factor=1：只模糊不降采样。
+        //
+        // CAUTION: 不能用 factor=2 + 棋盘格——2×2 块里恰好两黑两白，
+        // 降采样后整幅变成恒定的中灰，`spread` 直接归零，再糊也不变，
+        // 断言会假通过（或者在这里变成 0<0 失败）。模糊效果必须在
+        // **仍有对比**的输入上测。
+        let (a, w, h) = downsample_box_blur(&checker(128, 128), 128, 128, 1, 0);
+        let (b, _, _) = downsample_box_blur(&checker(128, 128), 128, 128, 1, 1);
+        let (c, _, _) = downsample_box_blur(&checker(128, 128), 128, 128, 1, 3);
+        let (sa, sb, sc) = (spread(&a, w, h), spread(&b, w, h), spread(&c, w, h));
+        assert!(
+            sb < sa && sc < sb,
+            "盒式趟数越多越平滑：0 趟 {sa} > 1 趟 {sb} > 3 趟 {sc}"
+        );
+    }
+
+    #[test]
+    fn downsample_survives_tiny_and_ragged_sizes() {
+        // 尺寸不能整除倍率、以及 1×1 极端，都不能 panic / 不能越界。
+        for (w, h, f) in [(7u32, 5u32, 4u32), (1, 1, 8), (3, 100, 3), (100, 3, 3)] {
+            let src = vec![80u8; (w * h * 4) as usize];
+            let (out, ow, oh) = downsample_box_blur(&src, w, h, f, 2);
+            assert_eq!(out.len(), (ow * oh * 4) as usize, "{w}x{h}/{f} 长度不符");
+            assert!(ow >= 1 && oh >= 1, "{w}x{h}/{f} 尺寸退化到 0");
+        }
     }
 }
