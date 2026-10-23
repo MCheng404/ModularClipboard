@@ -182,11 +182,67 @@ registry.register(Box::new(SendToPhoneAction))?;
 
 ## 已知限制
 
-1. **无托盘常驻**。目前是普通窗口，关闭窗口即退出进程，尚无系统托盘图标。`modular-clipboard-platform` 已实现注册表自启读写，但 UI 未接入。
-2. **无全局快捷键**。`modular-clipboard-core` 已定义 `Hotkey` 配置项，但 `global-hotkey` 尚未接入服务层——因此当前没有 `Ctrl+Shift+V` 唤出。
-3. **图片无缩略图预览**。详情面板只显示尺寸描述，未渲染实际图片。
-4. **单页加载上限 2000 条**，未实现分页加载。
-5. **载荷未加密**，明文存于 `%APPDATA%/modular-clipboard/blobs/`。
-6. **中文字体常驻 35MB**，见上文实测与取舍说明。
-7. **仅在 Windows 上验证过**。其他平台的 `#[cfg(not(windows))]` 分支为最小实现，未实测。
-8. **自动粘贴未做焦点校验**。`auto_paste` 依赖 250ms 固定延迟，在个别卡顿场景下可能丢失按键。
+1. **单页加载上限 2000 条**（`app::paths::PAGE_LIMIT`），未实现分页加载。
+2. **载荷未加密**，明文存于 `%APPDATA%/modular-clipboard/blobs/`。这是已知缺口，也是安全章节里唯一未做的一项。
+3. **中文字体常驻 35MB**，见上文实测与取舍说明。
+4. **仅在 Windows 上验证过**。其他平台的 `#[cfg(not(windows))]` 分支为最小实现，未实测。
+5. **图片编辑器是「简单」变换**：90° 旋转、水平/垂直翻转、亮度、对比度、饱和度、色温、伽马、画笔标注。没有曲线、选区、图层。
+
+> 早期此节列的「无托盘常驻」「无全局快捷键」「图片无缩略图预览」三项**均已实现**：
+> 托盘在 `platform/src/tray.rs` + `tray/imp.rs`（Shell_NotifyIcon），
+> 热键在 `platform` 的 `hotkey`（双槽位 RegisterHotKey），
+> 缩略图在 `ui/src/thumbnail.rs`。此处保留说明以免文档再次漂移。
+
+## 源码模块地图（2026-10-23 重构后）
+
+大文件已按「**删一个功能 = 删一个文件 + 一行 `mod`**」的口径拆开。
+下表是各 crate 的实际布局，找不到某个功能时先查这里。
+
+### `modular-clipboard-store`（SQLite 持久化）
+
+| 文件 | 职责 |
+|---|---|
+| `lib.rs` | 句柄定义 + `Drop`、路径常量、指纹、`GroupFilter` 词汇、配置注入 |
+| `open.rs` | 打开、建表迁移、位置访问（`data_dir` / `path`） |
+| `query.rs` | 分页列表、全文搜索与 LIKE 回退、行反序列化 |
+| `write.rs` | 插入、就地更新、置顶、删除（含引用计数删载荷） |
+| `retention.rs` | 保留策略淘汰、全量清空、孤儿载荷回收 |
+| `groups.rs` | 分组定义的增删改查 |
+| `blobs.rs` | 载荷文件层：路径规范化（SEC-006）、原子写、尺寸嗅探 |
+
+### `modular-clipboard-platform`（系统集成）
+
+| 文件 | 职责 |
+|---|---|
+| `lib.rs` | 公共 API 门面：托盘事件、热键槽位、自启动 |
+| `tray.rs` | `TrayEvent` / `Tray` 句柄 / 图标数据 / 跨平台桩 |
+| `tray/imp.rs` | Win32 实现（`#[cfg(windows)]`）：图标、消息循环、热键、右键菜单、mini 面板 |
+
+### `modular-clipboard-ui`（界面）
+
+| 文件 | 职责 |
+|---|---|
+| `paint.rs` + `paint/` | 绘制主入口 + 16 个绘制子模块（list/row/cards/detail/settings_*/topbar/…） |
+| `app.rs` + `app/` | 启动、配置写入、帧循环、录制、尺寸协商 |
+| `imgedit.rs` + `imgedit/` | 图片编辑器；`crop` 裁剪、`adjust` 影调、`stroke` 画笔 |
+| `icons.rs` + `icons/` | `font` 字体数据与度量、`draw` 矢量绘制、`md` 行内类型图标 |
+| `theme.rs` + `theme/` | `secondary` 强调色、`accent`、`system` 系统色、`visuals`、`fonts` |
+| `chrome.rs` + `chrome/` | `hit` 命中判定（纯函数）、`corners` DWM 圆角开关 |
+| `renderer.rs` + `renderer/painter.rs` | Vulkan 绘制记录 |
+| `thumbnail.rs` | 图片缩略图解码与缓存 |
+
+### `modular-clipboard-gfx`（Vulkan 基建）
+
+| 文件 | 职责 |
+|---|---|
+| `frame.rs` + `frame/renderer.rs` | 帧渲染、交换链重建 |
+| `window.rs` + `window/` | `event_loop` 事件循环、`keys` 键位翻译 |
+| `chrome.rs` + `chrome/` | 命中判定与圆角（见上） |
+
+### `modular-clipboard-core`（领域模型）
+
+`config.rs` 拆为 `config/` 11 个子模块（hotkey/storage/layout/ui/panels/card_row/window/secondary/theme_params/accent/mcp），根文件只留类型与再导出。
+
+### `modular-clipboard-app`（服务编排）
+
+`lib.rs` 拆出 `ingest.rs`（捕获入库管线）与 `paths.rs`（路径推导与分页/队列容量）。
