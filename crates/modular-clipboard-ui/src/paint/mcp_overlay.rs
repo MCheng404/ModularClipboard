@@ -147,7 +147,7 @@ pub(super) fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     p.text(
         pos2(panel.center().x, y + title_h / 2.0),
         egui::Align2::CENTER_CENTER,
-        t(("正在录制快捷键", "Recording shortcut")),
+        t("Recording shortcut"),
         egui::FontId::proportional(pal.font_md),
         pal.text_bright,
     );
@@ -230,7 +230,7 @@ pub(super) fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     p.text(
         pos2(panel.center().x, y + hint_h / 2.0),
         egui::Align2::CENTER_CENTER,
-        t(("录制完成后，点击任意位置停止录制", "Click anywhere to stop recording")),
+        t("Click anywhere to stop recording"),
         egui::FontId::proportional(pal.font_sm),
         pal.text_dim,
     );
@@ -280,7 +280,7 @@ pub(super) fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     let total_on = MCP_CAPS.iter().filter(|c| get_mcp_cap(&f.svc.state.config, c.field)).count();
     ui.horizontal(|ui| {
         ui.label(
-            egui::RichText::new(t(("MCP 调用设置", "MCP tool access")))
+            egui::RichText::new(t("MCP tool access"))
                 .strong()
                 .size(pal.font_md)
                 .color(pal.text_bright),
@@ -312,10 +312,7 @@ pub(super) fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     // 副标题：能力总数 / 当前可调用数。
     ui.label(
         egui::RichText::new(
-            t((
-                "共 {a} 个能力 · {b} 个可调用 · 关闭后全部不可用",
-                "{a} tools · {b} callable · all disabled when off",
-            ))
+            t("{a} tools · {b} callable · all disabled when off")
             .replace("{a}", &MCP_CAPS.len().to_string())
             .replace(
                 "{b}",
@@ -351,7 +348,7 @@ pub(super) fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
             let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter_at(dot).circle_filled(dot.center(), 3.5, color);
             ui.label(
-                egui::RichText::new(format!("{}{}", t(("MCP 服务：", "MCP service: ")), t(conn.label())))
+                egui::RichText::new(format!("{}{}", t("MCP service: "), t(conn.label())))
                     .size(pal.font_xs)
                     .color(color),
             );
@@ -405,8 +402,8 @@ pub(super) fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     bu.spacing_mut().item_spacing = vec2(8.0, 0.0);
-    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_done", t(("完成", "Done")), true);
-    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_cancel", t(("取消", "Cancel")), false);
+    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_done", t("Done"), true);
+    draw_mcp_overlay_btn(f, &mut bu, "settings_mcp_overlay_cancel", t("Cancel"), false);
 }
 
 /// 覆盖层底部按钮（自绘小按钮：圆角 + 文字，右对齐顺序）。
@@ -493,9 +490,9 @@ pub(super) fn settings_mcp_overlay_row(f: &mut Frame<'_>, ui: &mut Ui, cap: &Mcp
 pub(super) fn draw_mcp_badge(f: &mut Frame<'_>, ui: &mut Ui, ready: bool) {
     let pal = f.pal;
     let (text, fg) = if ready {
-        (t(("已连接", "Connected")), pal.accent)
+        (t("Connected"), pal.accent)
     } else {
-        (t(("未连接", "Not connected")), pal.text_dim)
+        (t("Not connected"), pal.text_dim)
     };
     // 宽度 = 三个全角字 + 8pt 内边距，随字号缩放：固定 50pt 时
     // 1.5× 字号（三字约 63pt）会把文字顶出徽标。
@@ -525,7 +522,7 @@ pub(super) fn draw_mcp_badge_disabled(f: &mut Frame<'_>, ui: &mut Ui) {
     p.text(
         r.center(),
         egui::Align2::CENTER_CENTER,
-        t(("已禁用", "Disabled")),
+        t("Disabled"),
         egui::FontId::proportional(pal.font_xs),
         pal.text_dim,
     );

@@ -12,6 +12,7 @@
 //! 因为一个快捷键被占用而不可用。
 
 use anyhow::{Context, Result};
+use modular_clipboard_core::i18n::msg;
 
 /// 快捷键配置：修饰键 + 虚拟键码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,10 +169,10 @@ impl Slot {
     /// 「某个快捷键注册失败」不告诉用户是哪一个，等于没说。
     ///
     /// 与设置界面的行标题保持一致（`paint.rs` 的快捷键卡片）。
-    pub const fn label(self) -> modular_clipboard_core::i18n::Bi {
+    pub const fn label(self) -> modular_clipboard_core::i18n::Msg {
         match self {
-            Slot::Toggle => ("显示主窗口", "Show main window"),
-            Slot::PastePrevious => ("粘贴上一个条目", "Paste previous entry"),
+            Slot::Toggle => msg("Show main window"),
+            Slot::PastePrevious => msg("Paste previous entry"),
         }
     }
 }
@@ -186,10 +187,7 @@ pub fn failed_message(slot: Slot, spec: HotkeySpec) -> String {
     // 于是英文/日/俄界面下热键注册失败时弹的还是中文提示。
     // 占位符用命名形式（`{a}` / `{b}`）而不是 `{}`，与 `build_preview`
     // 同款手法：翻译时可以调换顺序，不必按索引拼。
-    modular_clipboard_core::i18n::t((
-        "{a}：{b} 注册失败（可能已被其它程序占用）",
-        "{a}: {b} registration failed (possibly taken by another app)",
-    ))
+    modular_clipboard_core::i18n::t("{a}: {b} registration failed (possibly taken by another app)")
     .replace("{a}", modular_clipboard_core::i18n::t(slot.label()))
     .replace("{b}", &describe(spec))
 }

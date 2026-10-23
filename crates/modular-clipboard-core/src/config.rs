@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(TypeRailPos::from_str_opt("diagonal"), TypeRailPos::Right);
         for p in [TypeRailPos::Right, TypeRailPos::Left, TypeRailPos::Top, TypeRailPos::Bottom] {
             assert_eq!(TypeRailPos::from_str_opt(p.as_str()), p);
-            assert!(!p.label().0.is_empty() && !p.label().1.is_empty());
+            assert!(!p.label().is_empty());
         }
     }
 

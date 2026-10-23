@@ -3,23 +3,24 @@
 //! 派生只微调明度不重建——同一个色要同时服务深浅两套主题。
 
 use super::{Palette, TokenValue};
+use modular_clipboard_core::i18n::msg;
 
 /// 强调色预设色板（设置界面的一排色块）。
 ///
 /// 取名不按色相名而按「感觉」：用户找的是「那个像微信一样的绿」，
 /// 不是「hue=140」。全部取中间明度——同一个色要同时服务深浅两套
 /// （派生时只微调明度，不重建），过亮或过暗的色在一套里会不可读。
-pub const ACCENT_PRESETS: &[(modular_clipboard_core::i18n::Bi, [u8; 3])] = &[
-    (("默认蓝", "Ocean blue"), [0x3B, 0x82, 0xC4]),
-    (("天青", "Teal"), [0x2A, 0xA7, 0xA0]),
-    (("翠绿", "Emerald"), [0x4C, 0x9A, 0x4C]),
-    (("橄榄", "Olive"), [0x8A, 0x9A, 0x3C]),
-    (("琥珀", "Amber"), [0xC0, 0x8A, 0x2E]),
-    (("珊瑚", "Coral"), [0xC2, 0x5E, 0x4A]),
-    (("玫红", "Rose"), [0xC2, 0x44, 0x7F]),
-    (("紫罗兰", "Violet"), [0x8A, 0x5C, 0xC2]),
-    (("靛蓝", "Indigo"), [0x5A, 0x6F, 0xD6]),
-    (("石墨", "Graphite"), [0x6B, 0x72, 0x80]),
+pub const ACCENT_PRESETS: &[(modular_clipboard_core::i18n::Msg, [u8; 3])] = &[
+    (msg("Ocean blue"), [0x3B, 0x82, 0xC4]),
+    (msg("Teal"), [0x2A, 0xA7, 0xA0]),
+    (msg("Emerald"), [0x4C, 0x9A, 0x4C]),
+    (msg("Olive"), [0x8A, 0x9A, 0x3C]),
+    (msg("Amber"), [0xC0, 0x8A, 0x2E]),
+    (msg("Coral"), [0xC2, 0x5E, 0x4A]),
+    (msg("Rose"), [0xC2, 0x44, 0x7F]),
+    (msg("Violet"), [0x8A, 0x5C, 0xC2]),
+    (msg("Indigo"), [0x5A, 0x6F, 0xD6]),
+    (msg("Graphite"), [0x6B, 0x72, 0x80]),
 ];
 
 /// 由用户强调色派生整套 accent 令牌（覆盖一级主题的蓝系）。

@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde::Serialize;
+use crate::i18n::msg;
 
 /// 列表卡片阴影配置。
 ///
@@ -69,11 +70,11 @@ impl RowMetaPart {
     pub const ALL: [RowMetaPart; 3] = [RowMetaPart::Icon, RowMetaPart::Type, RowMetaPart::Size];
 
     /// 元素在设置编辑器中的名称（双语对）。
-    pub fn label(self) -> crate::i18n::Bi {
+    pub fn label(self) -> crate::i18n::Msg {
         match self {
-            RowMetaPart::Icon => ("图标", "Icon"),
-            RowMetaPart::Type => ("类型", "Type"),
-            RowMetaPart::Size => ("大小", "Size"),
+            RowMetaPart::Icon => msg("Icon"),
+            RowMetaPart::Type => msg("Type"),
+            RowMetaPart::Size => msg("Size"),
         }
     }
 }

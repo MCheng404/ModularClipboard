@@ -32,6 +32,7 @@
 //!    宽度是 0（solver 的既定设计）。照着它写代码会得到错的判断。
 
 use egui::{Rect, Vec2, vec2};
+use modular_clipboard_core::i18n::msg;
 
 /// 卡片身份。跨帧稳定，用于 egui 的 widget Id 与状态查找。
 ///
@@ -64,12 +65,12 @@ impl CardKind {
     ];
 
     /// 卡片标题（画在卡片头部；双语对）。
-    pub fn title(self) -> modular_clipboard_core::i18n::Bi {
+    pub fn title(self) -> modular_clipboard_core::i18n::Msg {
         match self {
-            CardKind::History => ("历史", "History"),
-            CardKind::Pinned => ("置顶卡片", "Pinned card"),
-            CardKind::Detail => ("详情", "Details"),
-            CardKind::Rail => ("视图", "View"),
+            CardKind::History => msg("History"),
+            CardKind::Pinned => msg("Pinned card"),
+            CardKind::Detail => msg("Details"),
+            CardKind::Rail => msg("View"),
         }
     }
 

@@ -302,7 +302,7 @@ pub(super) fn draw_license_popup(f: &mut Frame<'_>, area: Rect) {
     painter.text(
         egui::pos2(title_r.min.x + pal.space_lg, title_r.center().y),
         egui::Align2::LEFT_CENTER,
-        t(("开源协议", "License")),
+        t("License"),
         egui::FontId::proportional(pal.font_md),
         pal.text,
     );
@@ -340,7 +340,7 @@ pub(super) fn draw_license_popup(f: &mut Frame<'_>, area: Rect) {
     // CAUTION: `clicked()` 必须在 `on_hover_text` 之前取——后者按值
     // 消耗 `Response`（与列表行操作按钮同一个坑）。
     let close_clicked = close_resp.clicked();
-    close_resp.on_hover_text(t(("关闭", "Close")));
+    close_resp.on_hover_text(t("Close"));
     if close_clicked {
         f.state.license_popup = false;
     }
@@ -504,7 +504,7 @@ pub(super) fn draw_update_popup(f: &mut Frame<'_>, area: Rect) {
     painter.text(
         egui::pos2(title_r.min.x + 16.0, title_r.center().y),
         egui::Align2::LEFT_CENTER,
-        t(("发现新版本", "Update available")),
+        t("Update available"),
         egui::FontId::proportional(pal.font_md),
         pal.text,
     );
@@ -530,7 +530,7 @@ pub(super) fn draw_update_popup(f: &mut Frame<'_>, area: Rect) {
         },
     );
     let close_clicked = close_resp.clicked();
-    close_resp.on_hover_text(t(("关闭", "Close")));
+    close_resp.on_hover_text(t("Close"));
     if close_clicked || f.ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         f.state.update_popup = false;
     }
@@ -552,7 +552,7 @@ pub(super) fn draw_update_popup(f: &mut Frame<'_>, area: Rect) {
     painter.text(
         egui::pos2(x0, y),
         egui::Align2::LEFT_TOP,
-        t(("更新内容", "What's new")),
+        t("What's new"),
         egui::FontId::proportional(pal.font_sm),
         pal.text_dim,
     );
@@ -573,7 +573,7 @@ pub(super) fn draw_update_popup(f: &mut Frame<'_>, area: Rect) {
             painter.text(
                 notes_r.center(),
                 egui::Align2::CENTER_CENTER,
-                t(("暂无更新说明", "No release notes available")),
+                t("No release notes available"),
                 egui::FontId::proportional(pal.font_sm),
                 pal.text_dim,
             );
@@ -649,7 +649,7 @@ pub(super) fn draw_update_popup(f: &mut Frame<'_>, area: Rect) {
     painter.text(
         cancel_r.center(),
         egui::Align2::CENTER_CENTER,
-        t(("取消", "Cancel")),
+        t("Cancel"),
         egui::FontId::proportional(pal.font_sm),
         pal.text,
     );
@@ -671,9 +671,9 @@ pub(super) fn draw_update_popup(f: &mut Frame<'_>, area: Rect) {
     );
     // 无 release 详情时按钮语义是「打开仓库」（那里同样能下载）。
     let label = if notes.trim().is_empty() {
-        t(("打开仓库", "Open repo"))
+        t("Open repo")
     } else {
-        t(("更新", "Update"))
+        t("Update")
     };
     painter.text(
         update_r.center(),
@@ -776,7 +776,7 @@ pub(super) fn draw_settings_search(f: &mut Frame<'_>, search_rect: Rect) {
             );
             let r = child.add(
                 egui::TextEdit::singleline(&mut q)
-                    .hint_text(t(("搜索设置", "Search settings")))
+                    .hint_text(t("Search settings"))
                     .frame(egui::Frame::NONE)
                     .desired_width(text_rect.width()),
             );

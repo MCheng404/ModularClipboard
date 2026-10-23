@@ -178,11 +178,11 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
 
     if rows.is_empty() {
         let msg = match only_pinned {
-            Some(true) => t(("还没有置顶条目", "No pinned entries yet")),
+            Some(true) => t("No pinned entries yet"),
             // 有查询词**或类型过滤**生效 ⇒ 「没有匹配的结果」；
             // 两者都空才是「还没有剪贴板记录」（从没复制过东西）。
-            _ if !f.state.query.is_empty() || !type_kinds.is_empty() => t(("没有匹配的结果", "No matching results")),
-            _ => t(("还没有剪贴板记录", "No clipboard history yet")),
+            _ if !f.state.query.is_empty() || !type_kinds.is_empty() => t("No matching results"),
+            _ => t("No clipboard history yet"),
         };
         draw_empty(f, body, msg);
         return;

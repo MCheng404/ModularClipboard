@@ -810,7 +810,7 @@ impl LocalBackend {
             });
 
         if spawned.is_err() {
-            set_notice(state, modular_clipboard_core::i18n::t(("无法创建捕获线程", "Failed to start the capture thread")).into());
+            set_notice(state, modular_clipboard_core::i18n::t("Failed to start the capture thread").into());
             return;
         }
 
@@ -957,7 +957,7 @@ impl LocalBackend {
             }
             Err(e) => {
                 tracing::error!(%e, "入库失败");
-                set_notice(state, format!("{} {e}", modular_clipboard_core::i18n::t(("保存失败:", "Save failed:"))));
+                set_notice(state, format!("{} {e}", modular_clipboard_core::i18n::t("Save failed:")));
                 false
             }
         }
@@ -1053,10 +1053,7 @@ impl LocalBackend {
         {
             set_notice(
                 state,
-                modular_clipboard_core::i18n::t((
-                    "已复制到剪贴板，按 Ctrl+V 粘贴",
-                    "Copied — press Ctrl+V to paste",
-                ))
+                modular_clipboard_core::i18n::t("Copied — press Ctrl+V to paste")
                 .to_string(),
             );
             return Ok(());
@@ -1093,7 +1090,7 @@ impl LocalBackend {
     ) -> Result<()> {
         action::dispatch(&proposal.plan)?;
         self.store.touch(item.id).ok();
-        set_notice(state, format!("{}{}", modular_clipboard_core::i18n::t(("已执行：", "Done: ")), proposal.label));
+        set_notice(state, format!("{}{}", modular_clipboard_core::i18n::t("Done: "), proposal.label));
         Ok(())
         }
 

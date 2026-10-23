@@ -50,14 +50,14 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 来源标注：预设 / 自定义 / 默认。比只显示颜色多一分确定性
         // （用户看得知道自己用的是哪一个预设）。
         let source = if cur.is_none() {
-            t(("默认", "Default"))
+            t("Default")
         } else if crate::theme::ACCENT_PRESETS
             .iter()
             .any(|(_, p)| AccentColor::from_rgb(*p).to_rgb() == rgb)
         {
-            t(("预设", "Preset"))
+            t("Preset")
         } else {
-            t(("自定义", "Custom"))
+            t("Custom")
         };
         ui.add(egui::Label::new(
             egui::RichText::new(format!("{source}  {}", shown.to_hex())).color(pal.text_dim),
@@ -69,7 +69,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     ui.horizontal(|ui| {
         ui.add_space(1.0);
         for (i, (name, prgb)) in crate::theme::ACCENT_PRESETS.iter().enumerate() {
-        let name = t(*name);
+        let name = t(name);
             let s = 20.0;
             let (r, _) = ui.allocate_exact_size(vec2(s, s), Sense::empty());
             let resp = ui.interact(r, egui::Id::unique(("accent_preset", i)), Sense::click());
@@ -114,7 +114,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         f,
         ui,
         "accent_hue",
-        t(("色相", "Hue")),
+        t("Hue"),
         format!("{:.0}°", h),
         &mut h,
         0.0..=360.0,
@@ -128,7 +128,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         f,
         ui,
         "accent_sat",
-        t(("饱和度", "HSV saturation")),
+        t("HSV saturation"),
         format!("{}%", (s * 100.0).round() as i32),
         &mut s,
         0.0..=1.0,
@@ -142,7 +142,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         f,
         ui,
         "accent_val",
-        t(("明度", "Lightness")),
+        t("Lightness"),
         format!("{}%", (v * 100.0).round() as i32),
         &mut v,
         0.0..=1.0,
@@ -155,7 +155,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     // ---- 十六进制输入 + 恢复默认 ----
     ui.add_space(2.0);
     ui.horizontal(|ui| {
-        ui.add(egui::Label::new(t(("十六进制", "Hex"))));
+        ui.add(egui::Label::new(t("Hex")));
         ui.add_space(8.0);
         // 草稿同步的焦点感知：无焦点时每帧覆写为当前色（点预设 / 拖滑条
         // 后输入框跟着变），有焦点时保留用户输入（ rationale 见
@@ -222,7 +222,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 恢复默认：仅在用户改过时出现（默认态放个按钮是噪声）。
         if cur.is_some() {
             ui.add_space(8.0);
-            if draw_mini_button(f, ui, "accent_reset_default", t(("恢复默认", "Restore default")), Some("accent_reset_default")) {
+            if draw_mini_button(f, ui, "accent_reset_default", t("Restore default"), Some("accent_reset_default")) {
                 next = None;
                 changed = true;
             }
@@ -273,10 +273,10 @@ pub(super) fn draw_token_entry(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
 
     // 入口行本身做成一个可点条目：标签 + 摘要 + 「调整」。
     let label = if n_over > 0 {
-        t(("高级微调 · 已覆盖 {n} 个令牌", "Token overrides · {n} overridden"))
+        t("Token overrides · {n} overridden")
             .replace("{n}", &n_over.to_string())
     } else {
-        t(("高级微调", "Token overrides")).to_string()
+        t("Token overrides").to_string()
     };
     let (r, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), pal.control_height),
@@ -376,7 +376,7 @@ pub(super) fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
         ui.add_space(6.0);
         ui.add(
             egui::Label::new(
-                egui::RichText::new(t(("高级微调", "Token overrides"))).color(pal.text).size(pal.font_lg),
+                egui::RichText::new(t("Token overrides")).color(pal.text).size(pal.font_lg),
             ),
         );
     });
@@ -384,7 +384,7 @@ pub(super) fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(
-                t(("全部主题令牌的当前生效值。拖动即写入覆盖，优先于风格主题与强调色的派生值。", "Effective values of all theme tokens. Dragging writes an override, which wins over values derived from the style theme and accent color.")),
+                t("Effective values of all theme tokens. Dragging writes an override, which wins over values derived from the style theme and accent color."),
             )
             .color(pal.text_dim),
         )
@@ -397,13 +397,13 @@ pub(super) fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     // 摘要 + 全部重置（仅在有覆盖时出现——默认态放个按钮是噪声）。
     ui.horizontal(|ui| {
         ui.add(egui::Label::new(
-            egui::RichText::new(t(("已覆盖 {n} 个令牌", "{n} overridden"))
+            egui::RichText::new(t("{n} overridden")
                 .replace("{n}", &n_over.to_string())).color(pal.text_dim),
         ));
         if n_over > 0 {
             ui.add_space(8.0);
             let reset_all =
-                draw_mini_button(f, ui, "token_reset_all", t(("全部重置", "Reset all tokens")), Some("token_reset_all"));
+                draw_mini_button(f, ui, "token_reset_all", t("Reset all tokens"), Some("token_reset_all"));
             if reset_all {
                 f.state.push(Op::ClearAllTokenOverrides);
             }
@@ -422,9 +422,9 @@ pub(super) fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     for (name, value) in pal.tokens() {
         // 组标题：只在分组变化时画一次。
         let g = match value {
-            TokenValue::Color(_) => t(("颜色", "Colors")),
-            TokenValue::Num(_) => t(("数值", "Numbers")),
-            TokenValue::Dur(_) => t(("时长（只读）", "Durations (read-only)")),
+            TokenValue::Color(_) => t("Colors"),
+            TokenValue::Num(_) => t("Numbers"),
+            TokenValue::Dur(_) => t("Durations (read-only)"),
         };
         if g != group {
             group = g;
@@ -485,7 +485,7 @@ pub(super) fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
                             ui.painter_at(lr2).text(
                                 pos2(lr2.min.x + 20.0, lr2.center().y),
                                 Align2::LEFT_CENTER,
-                                t(("└ 透明度", "└ Opacity")),
+                                t("└ Opacity"),
                                 egui::FontId::proportional(pal.font_xs),
                                 pal.text_dim,
                             );

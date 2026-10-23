@@ -19,7 +19,7 @@
 //!    另外两处静默用错译文。
 //!
 //! 所以改成：**英文是主语言与查找键**，中文降为「跟随系统且系统是中文」
-//! 时的一种本地化。查表走 `Bi.1`（英文），译文表以英文为键
+//! 时的一种本地化。查表走 `Msg.1`（英文），译文表以英文为键
 //! （见 [`zh_hant`] / [`ja`] / [`ru`]）。
 //!
 //! 中文仍保留在调用点，不删：
@@ -61,14 +61,31 @@
 
 mod ja;
 mod ru;
+mod zh_hans;
 mod zh_hant;
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// 一条文案的 (中文, English) 对。
+/// 一条用户可见文案的**英文键**。
 ///
-/// **查找键是第二个元素（英文）**——见模块文档「为什么英文是主语言」。
-pub type Bi = (&'static str, &'static str);
+/// 英文是主语言也是查找键——见模块文档。各语言的译文住在
+/// [`zh_hans`] / [`zh_hant`] / [`ja`] / [`ru`] 四张表里。
+pub type Msg = &'static str;
+
+/// 标记「这串字符是用户可见文案」。
+///
+/// 运行期恒等（返回原串），存在的意义有两个：
+///
+/// 1. **覆盖守门能从源码认出哪些字符串是文案**——不是路径、不是 SQL、
+///    不是 egui 的 Id。静态表（`SETTINGS_CARDS` 的 label/desc）与
+///    `label()` 这类 match 臂用它标记；`t(...)` 的实参本身就是标记，
+///    不必再包一层。
+/// 2. 调用点读起来知道这串会被翻译，不是硬编码。
+///
+/// 与 GNU gettext 的 `N_()` 同款用法。
+pub const fn msg(s: Msg) -> Msg {
+    s
+}
 
 /// 界面语言。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,42 +120,43 @@ impl Locale {
     /// 内联元组取，不进表。
     fn overlay(self, en: &str) -> Option<&'static str> {
         let table = match self {
+            Locale::ZhCn => zh_hans::TABLE,
             Locale::ZhTw => zh_hant::TABLE,
             Locale::Ja => ja::TABLE,
             Locale::Ru => ru::TABLE,
-            Locale::ZhCn | Locale::EnUs => return None,
+            Locale::EnUs => return None,
         };
         // 线性查找：表只有三百来条，且只在「切到这三种语言」时才走。
         // 上二分查找要为几百个条目引入排序不变量，收益不抵复杂度。
         table.iter().find(|(k, _)| *k == en).map(|(_, v)| *v)
     }
 
-    /// 从语言对里取当前语言的那一条。
+    /// 按英文键取当前语言的译文。
     ///
-    /// - 简体中文 → 元组第一半；
-    /// - 英文 → 元组第二半（**主语言**）；
-    /// - 繁中/日/俄 → 查表，**查不到回落英文**。宁可显示英文也不要显示
-    ///   第三种语言混搭，更不要显示中文（用户已经明确选了别的语言）。
+    /// - 英文 → 键自身（**主语言**，不查表）；
+    /// - 其余四种 → 查各自的语言表，**查不到回落英文**。宁可显示英文
+    ///   也不要显示第三种语言混搭，更不要显示中文（用户已经明确选了
+    ///   别的语言）。
     #[inline]
-    pub fn pick(self, bi: Bi) -> &'static str {
+    pub fn pick(self, key: Msg) -> Msg {
         match self {
-            Locale::ZhCn => bi.0,
-            Locale::EnUs => bi.1,
-            other => other.overlay(bi.1).unwrap_or(bi.1),
+            Locale::EnUs => key,
+            other => other.overlay(key).unwrap_or(key),
         }
     }
 
-    /// 查该语言的复数子表：`en_key` 是英文**复数形**（`tp` 的 `other.1`），
+    /// 查该语言的复数子表：`en_key` 是英文**复数形**（`tp` 的 `other`），
     /// `cat` 决定取四形态中的哪一个。
     ///
     /// 没有收录该短语时返回 `None`，由 [`tp`] 回落 [`Self::pick`]——
     /// 不分单复数的语言（中/日）天然走那条路，不用在这里铺空表。
     fn plural_form(self, en_key: &str, cat: Plural) -> Option<&'static str> {
         let table = match self {
+            Locale::ZhCn => zh_hans::PLURALS,
             Locale::ZhTw => zh_hant::PLURALS,
             Locale::Ja => ja::PLURALS,
             Locale::Ru => ru::PLURALS,
-            Locale::ZhCn | Locale::EnUs => return None,
+            Locale::EnUs => return None,
         };
         table
             .iter()
@@ -191,8 +209,8 @@ pub fn locale() -> Locale {
 
 /// 按当前语言取文案。
 #[inline]
-pub fn t(bi: Bi) -> &'static str {
-    locale().pick(bi)
+pub fn t(key: Msg) -> Msg {
+    locale().pick(key)
 }
 
 /// CLDR 复数类别。整数场景里英文只用 One/Other，俄语用 One/Few/Many
@@ -277,25 +295,24 @@ pub fn plural_for(l: Locale, n: i64) -> Plural {
 /// 形态一个键必然撞键。所以复数子表按「英文复数形」聚合，值是该语言
 /// 四个 CLDR 形态的数组。
 #[inline]
-pub fn tp(n: i64, en_one: &'static str, other: Bi) -> &'static str {
+pub fn tp(n: i64, en_one: Msg, other: Msg) -> Msg {
     tp_for(locale(), n, en_one, other)
 }
 
 /// [`tp`] 的显式语言版。**纯函数**——测试用它逐语言断言，不必去翻转
 /// 进程级的 [`set_locale`]（那是全局原子量，并行测试会互相踩）。
-pub fn tp_for(l: Locale, n: i64, en_one: &'static str, other: Bi) -> &'static str {
+pub fn tp_for(l: Locale, n: i64, en_one: Msg, other: Msg) -> Msg {
     match l {
-        Locale::ZhCn => other.0,
         Locale::EnUs => {
             if plural_for(l, n) == Plural::One {
                 en_one
             } else {
-                other.1
+                other
             }
         }
         _ => {
             let cat = plural_for(l, n);
-            l.plural_form(other.1, cat).unwrap_or_else(|| l.pick(other))
+            l.plural_form(other, cat).unwrap_or_else(|| l.pick(other))
         }
     }
 }
@@ -382,6 +399,7 @@ mod tests {
     /// 全部译文表（含语言名），供跨语言测试遍历。
     fn all_tables() -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
         vec![
+            ("zh-CN", zh_hans::TABLE),
             ("zh-TW", zh_hant::TABLE),
             ("ja", ja::TABLE),
             ("ru", ru::TABLE),
@@ -389,20 +407,19 @@ mod tests {
     }
 
     #[test]
-    fn pick_returns_matching_half() {
-        let bi = ("取消置顶", "Unpin");
-        assert_eq!(Locale::ZhCn.pick(bi), "取消置顶");
-        assert_eq!(Locale::EnUs.pick(bi), "Unpin");
+    fn pick_translates_by_english_key() {
+        assert_eq!(Locale::ZhCn.pick("Unpin"), "取消置顶");
+        assert_eq!(Locale::EnUs.pick("Unpin"), "Unpin");
     }
 
     #[test]
     fn set_and_get_roundtrip() {
         set_locale(Locale::EnUs);
         assert_eq!(locale(), Locale::EnUs);
-        assert_eq!(t(("中", "EN")), "EN");
+        assert_eq!(t("Unpin"), "Unpin");
         set_locale(Locale::ZhCn);
         assert_eq!(locale(), Locale::ZhCn);
-        assert_eq!(t(("中", "EN")), "中");
+        assert_eq!(t("Unpin"), "取消置顶");
         // 还原主语言，避免影响同进程的其它测试。
         set_locale(Locale::EnUs);
     }
@@ -506,53 +523,39 @@ mod tests {
     /// 每种新语言都要真的能从表里取到译文，且与中英都不同。
     #[test]
     fn overlay_languages_actually_resolve() {
-        let bi = ("取消置顶", "Unpin");
-        assert_eq!(Locale::ZhTw.pick(bi), "取消置頂");
-        assert_eq!(Locale::Ja.pick(bi), "ピン留め解除");
-        assert_eq!(Locale::Ru.pick(bi), "Открепить");
+        assert_eq!(Locale::ZhTw.pick("Unpin"), "取消置頂");
+        assert_eq!(Locale::Ja.pick("Unpin"), "ピン留め解除");
+        assert_eq!(Locale::Ru.pick("Unpin"), "Открепить");
     }
 
     /// 表里没有的条目回落**英文**（主语言），而不是中文或乱码。
     #[test]
     fn missing_overlay_falls_back_to_english() {
-        let bi = ("这条不在任何覆盖表里", "Not in any catalog");
-        assert_eq!(Locale::ZhTw.pick(bi), "Not in any catalog");
-        assert_eq!(Locale::Ja.pick(bi), "Not in any catalog");
-        assert_eq!(Locale::Ru.pick(bi), "Not in any catalog");
+        assert_eq!(Locale::ZhCn.pick("Not in any catalog"), "Not in any catalog");
+        assert_eq!(Locale::ZhTw.pick("Not in any catalog"), "Not in any catalog");
+        assert_eq!(Locale::Ja.pick("Not in any catalog"), "Not in any catalog");
+        assert_eq!(Locale::Ru.pick("Not in any catalog"), "Not in any catalog");
     }
 
-    /// 非中英语言的 `pick` **绝不能返回中文那一半**。
+    /// 日/俄界面**绝不能出现简体中文**。
     ///
-    /// 这条挡的是「改键改到一半」或「表里混进中文键」：一旦发生，用户
-    /// 切到日语却看到中文——比看到英文糟糕得多（英文至少是主语言，
-    /// 切英文的人本来就能读）。回落只能回落到英文。
+    /// 这条挡的是「表被串了」或「回落链走错」：一旦发生，用户切到日语
+    /// 却看到简体——比看到英文糟糕得多（英文至少是主语言，切英文的人
+    /// 本来就能读）。回落只能回落到英文。
     ///
-    /// # 为什么不要求三张表条数/键集一致
-    ///
-    /// 曾经有 `all_tables_have_the_same_size` 与 `all_tables_cover_the_same_keys`。
-    /// 删掉「译文 == 英文」的无操作条目（单位类 ` ms` / ` MB` 在日语与
-    /// 繁体里就等于英文）之后，三张表条数天然不同——而这是**对的**：
-    /// 缺译文时 `pick` 的 `unwrap_or(en)` 回落英文，结果与塞一条
-    /// `(en, en)` 完全一样。要求条数一致等于要求把冗余条目塞回去。
+    /// CAUTION: 判据是「是不是**简体**那一份」，不是「含不含汉字」。
+    /// 繁体与日语译文本来就是汉字（「取消置頂」/「ピン留め解除」里的
+    /// 汉字），用 CJK 判定会把它们误报成没翻译。
     #[test]
-    fn non_chinese_locales_never_show_the_source_chinese() {
-        const SRC: &str = "这里是源码那一半中文";
-        for l in [Locale::ZhTw, Locale::Ja, Locale::Ru] {
-            // 表里有译文的词条：返回译文，绝不返回源码中文。
-            //
-            // CAUTION: 判据是「是不是源码那一半」，不是「含不含汉字」。
-            // 繁体译文本来就是汉字（「取消置頂」），用 CJK 判定会把它
-            // 误报成没翻译——第一版就栽在这里。
-            let got = l.pick((SRC, "Unpin"));
-            assert_ne!(got, SRC, "{l:?} 返回了源码的中文那一半");
-            // 表里没有的词条：回落英文，绝不回落源码中文。
-            let got = l.pick((SRC, "NoSuchEntryXyz"));
-            assert_eq!(got, "NoSuchEntryXyz", "{l:?} 缺译文时应回落英文");
-            assert_ne!(got, SRC, "{l:?} 回落到了源码中文而不是英文");
+    fn japanese_and_russian_never_show_simplified_chinese() {
+        // 取一条简体与英文不同的词条——这样「拿到简体」是可判别的。
+        let simplified = zh_hans::TABLE.iter().find(|(k, _)| *k == "Unpin").unwrap().1;
+        assert_ne!(simplified, "Unpin", "前置条件：该词条的简体与英文不同");
+        for l in [Locale::Ja, Locale::Ru] {
+            assert_ne!(l.pick("Unpin"), simplified, "{l:?} 显示了简体译文");
+            // 缺译文时回落英文，同样不许回落到简体。
+            assert_eq!(l.pick("NoSuchEntryXyz"), "NoSuchEntryXyz", "{l:?} 缺译文时应回落英文");
         }
-        // 反向对照：简体中文确实返回源码那一半——证明上面的断言有判别力，
-        // 不是恒真。
-        assert_eq!(Locale::ZhCn.pick((SRC, "Unpin")), SRC);
     }
 
     /// 译文键必须是**非空且不含中文**的英文串。
@@ -625,12 +628,12 @@ mod tests {
     #[test]
     fn tp_selects_the_right_form_per_language() {
         // 用「hours ago」这条真实词条：它在 ru::PLURALS 里有四形态。
-        let phrase = ("小时前", "hours ago");
-        // 英文：单数走 en_one，复数走 other 的英文半。
+        let phrase = "hours ago";
+        // 英文：单数走 en_one，复数走 other。
         assert_eq!(tp_for(Locale::EnUs, 1, "hour ago", phrase), "hour ago");
         assert_eq!(tp_for(Locale::EnUs, 2, "hour ago", phrase), "hours ago");
         assert_eq!(tp_for(Locale::EnUs, 0, "hour ago", phrase), "hours ago");
-        // 简体中文：一律取中文那一半。
+        // 简体中文：不分单复数，查表取回简体。
         assert_eq!(tp_for(Locale::ZhCn, 1, "hour ago", phrase), "小时前");
         assert_eq!(tp_for(Locale::ZhCn, 5, "hour ago", phrase), "小时前");
         // 俄语：CLDR 三形态各自不同。
@@ -646,7 +649,7 @@ mod tests {
     /// 表里没有的计数短语必须回落 `pick`（通用形），不能崩、不能显示空串。
     #[test]
     fn tp_falls_back_when_a_phrase_is_not_in_the_plural_table() {
-        let phrase = ("某条", "NoSuchPluralPhraseXyz");
+        let phrase = "NoSuchPluralPhraseXyz";
         // 俄语：PLURALS 无此键 ⇒ 走 `pick` ⇒ 表里也没有 ⇒ 回落英文。
         assert_eq!(tp_for(Locale::Ru, 2, "NoSuchPluralPhraseXyz", phrase), "NoSuchPluralPhraseXyz");
         // 英文单复数仍然正确——回落不影响主语言。
@@ -661,6 +664,7 @@ mod tests {
     #[test]
     fn plural_tables_are_well_formed() {
         for (name, plurals, table) in [
+            ("zh-CN", zh_hans::PLURALS, zh_hans::TABLE),
             ("zh-TW", zh_hant::PLURALS, zh_hant::TABLE),
             ("ja", ja::PLURALS, ja::TABLE),
             ("ru", ru::PLURALS, ru::TABLE),
@@ -803,11 +807,18 @@ mod tests {
         out
     }
 
-    /// 从（已剥注释/测试的）源码里提取 `(中文, 英文)` 二元组字面量。
+    /// 从（已剥注释/测试的）源码里抽出**标记过的文案键**。
     ///
-    /// 只认 `( "…" , "…" ,? )` 这一种形状：排除 `("a", "b", "c")` 三元组
-    /// 与函数调用的 `f("a", &other)`——后者第二个参数不是字面量。
-    fn bi_pairs(clean: &str) -> Vec<(String, String)> {
+    /// 两种标记，与 [`msg`] 的文档一致：
+    ///
+    /// - `msg("…")` —— 静态表与 match 臂的显式标记；
+    /// - `t("…")` —— 调用点，`t` 自己就是标记；
+    /// - `tp(n, "…", "…")` —— 只收**第三参**（复数/通用形）：第二参是
+    ///   英文单数形态，它本身就是英文、有意不进译文表。
+    ///
+    /// 实参不是字面量的（`t(it.label)`）不收——那条文案的字面量必然
+    /// 在别处以 `msg("…")` 出现。
+    fn source_keys(clean: &str) -> Vec<String> {
         fn skip_ws(v: &[char], mut i: usize) -> usize {
             while i < v.len() && v[i].is_whitespace() {
                 i += 1;
@@ -844,62 +855,88 @@ mod tests {
             }
             None
         }
+        /// 从 `i` 起读一个标识符，返回 (名字, 结束下标)。
+        fn ident(v: &[char], i: usize) -> (&str, usize) {
+            let mut j = i;
+            while j < v.len() && (v[j].is_alphanumeric() || v[j] == '_') {
+                j += 1;
+            }
+            // 字符下标切片代价高，直接比较就够了。
+            let name: String = v[i..j].iter().collect();
+            let owned = Box::leak(name.into_boxed_str());
+            (owned, j)
+        }
 
         let v: Vec<char> = clean.chars().collect();
         let mut out = Vec::new();
         let mut i = 0;
         while i < v.len() {
-            if v[i] != '(' {
+            if !(v[i].is_ascii_alphabetic() || v[i] == '_') {
                 i += 1;
                 continue;
             }
-            // CAUTION: `(` 前面若紧挨标识符字符，那是**函数/方法调用**的
-            // 参数表（`s.replace("&lt;", "<")`），不是元组字面量。不挡的话，
-            // `.replace()` 调用链里的相邻两个字符串会被配成假二元组——
-            // HTML 实体表（`"&lt;", "<"`）就是这么被误报成待译文案的。
-            if i > 0 && (v[i - 1].is_alphanumeric() || v[i - 1] == '_' || v[i - 1] == ':' || v[i - 1] == '>' || v[i - 1] == '.') {
+            // 跳过更长的标识符前缀（`format` 里的 `t` 不是我们的 `t`）
+            if i > 0 && (v[i - 1].is_alphanumeric() || v[i - 1] == '_') {
                 i += 1;
                 continue;
             }
-            let mut j = skip_ws(&v, i + 1);
-            let Some((a, after_a)) = parse_string(&v, j) else {
-                i += 1;
-                continue;
-            };
-            j = skip_ws(&v, after_a);
-            if j >= v.len() || v[j] != ',' {
+            let (name, mut j) = ident(&v, i);
+            j = skip_ws(&v, j);
+            if j >= v.len() || v[j] != '(' {
                 i += 1;
                 continue;
             }
             j = skip_ws(&v, j + 1);
-            let Some((b, after_b)) = parse_string(&v, j) else {
-                i += 1;
-                continue;
-            };
-            j = skip_ws(&v, after_b);
-            if j < v.len() && v[j] == ',' {
-                j = skip_ws(&v, j + 1);
-            }
-            if j < v.len() && v[j] == ')' {
-                // CAUTION: `(字符串, 字符串)` 元组不都是文案——egui 的 Id
-                // 元组（`("icon_btn_hover", "topbar_clear")`）、关于页的
-                // (名称, 链接) 表都是。判据两条满足其一：
-                //
-                // 1. 首半含 CJK——[`Bi`] 的定义就是 (中文, English)；
-                // 2. 两半全同——自称词（`("日本語", "日本語")`）与不变单位
-                //    （`(" MB", " MB")`）的中文半就是符号本身，不含 CJK，
-                //    但它们是真文案（俄语要写 `МБ`）。
-                //
-                // 另外英文半是 URL 的不收——链接里的字符不能动。
-                let cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
-                let is_url = b.starts_with("http://") || b.starts_with("https://");
-                if (cjk(&a) || a == b) && !is_url {
-                    out.push((a, b));
+            match name {
+                "msg" => {
+                    if let Some((k, _)) = parse_string(&v, j) {
+                        out.push(k);
+                    }
                 }
-                i = j + 1;
-            } else {
-                i += 1;
+                "t" => {
+                    if let Some((k, _)) = parse_string(&v, j) {
+                        out.push(k);
+                    }
+                }
+                "tp" => {
+                    // 第一参是计数表达式、第二参是英文单数（不进表），
+                    // 只收第三参。逐层跳过括号找到第二个逗号。
+                    let mut depth = 0usize;
+                    let mut commas = 0usize;
+                    let mut k = j;
+                    while k < v.len() {
+                        match v[k] {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => {
+                                if depth == 0 {
+                                    break;
+                                }
+                                depth -= 1;
+                            }
+                            '"' => {
+                                if let Some((_, after)) = parse_string(&v, k) {
+                                    k = after;
+                                    continue;
+                                }
+                            }
+                            ',' if depth == 0 => {
+                                commas += 1;
+                                if commas == 2 {
+                                    let m = skip_ws(&v, k + 1);
+                                    if let Some((key, _)) = parse_string(&v, m) {
+                                        out.push(key);
+                                    }
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                }
+                _ => {}
             }
+            i += 1;
         }
         out
     }
@@ -924,8 +961,8 @@ mod tests {
         }
     }
 
-    /// 扫全部源码拿到的 `(中文, 英文)` 对，按英文键去重。
-    fn source_pairs() -> Vec<(String, String)> {
+    /// 扫全部源码拿到的文案键（去重、保序）。
+    fn source_keys_all() -> Vec<String> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
         let mut files = Vec::new();
         collect_rs(&root.join("crates"), &mut files);
@@ -940,38 +977,89 @@ mod tests {
         for f in &files {
             let src = std::fs::read_to_string(f).unwrap_or_default();
             let clean = strip_test_modules(&strip_noise(&src));
-            for pair in bi_pairs(&clean) {
-                if seen.insert(pair.1.clone()) {
-                    out.push(pair);
+            for k in source_keys(&clean) {
+                if seen.insert(k.clone()) {
+                    out.push(k);
                 }
             }
         }
         out
     }
 
-    /// 源码里的每条用户可见文案，三张表都必须有译文（自称词除外）。
+    /// 扫全部源码里的**所有**字符串字面量（不做标记过滤）。
     ///
-    /// # 自称词豁免
+    /// 孤儿检查要用它而不是 [`source_keys_all`]：折叠时 `(" MB", " MB")`
+    /// 这类两半全同的对变成了**裸字面量**（自称词与不变单位有意不标记），
+    /// 只认标记会把 ru 表里的 ` MB` / ` ms` 误判成孤儿。
+    fn source_literals_all() -> Vec<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let mut files = Vec::new();
+        collect_rs(&root.join("crates"), &mut files);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap_or_default();
+            let clean = strip_test_modules(&strip_noise(&src));
+            let v: Vec<char> = clean.chars().collect();
+            let mut i = 0;
+            while i < v.len() {
+                if v[i] != '"' {
+                    i += 1;
+                    continue;
+                }
+                let mut lit = String::new();
+                let mut j = i + 1;
+                while j < v.len() {
+                    if v[j] == '\\' {
+                        j += 1;
+                        if j >= v.len() {
+                            break;
+                        }
+                        lit.push(match v[j] {
+                            'n' => '\n',
+                            't' => '\t',
+                            'r' => '\r',
+                            other => other,
+                        });
+                        j += 1;
+                        continue;
+                    }
+                    if v[j] == '"' {
+                        break;
+                    }
+                    lit.push(v[j]);
+                    j += 1;
+                }
+                if seen.insert(lit.clone()) {
+                    out.push(lit);
+                }
+                i = j + 1;
+            }
+        }
+        out
+    }
+
+    /// 源码里每条**标记过的**文案，四张表都必须有译文。
     ///
-    /// `zh == en` 的二元组是**自称词**（`("日本語", "日本語")`）：任何语言下
-    /// 显示的都是它自己，回落英文即得正确结果，进表反而是「译文 == 英文」
-    /// 的无操作条目（2026-10-23 刚清掉一批）。
+    /// # 谁算「标记过的」
+    ///
+    /// 见 [`source_keys`]：`msg("…")` 与 `t("…")`，外加 `tp` 的第三参。
+    /// 自称词（`日本語`）与不变单位（`MB`）**有意不标记**——它们在任何
+    /// 语言下都显示自己，回落英文即得正确结果，进表反而是「译文 == 英文」
+    /// 的无操作条目。
     #[test]
     fn every_source_string_is_translated() {
         let mut missing: Vec<String> = Vec::new();
-        for (zh, en) in source_pairs() {
-            if zh == en {
-                continue;
-            }
+        for key in source_keys_all() {
             for (name, t) in all_tables() {
-                if !t.iter().any(|(k, _)| *k == en) {
-                    missing.push(format!("  [{name}] 缺 {en:?}（源码中文 {zh:?}）"));
+                if !t.iter().any(|(k, _)| *k == key) {
+                    missing.push(format!("  [{name}] 缺 {key:?}"));
                 }
             }
         }
         assert!(
             missing.is_empty(),
-            "译文表覆盖不全，共 {} 处（加文案时要同时补三张表）:\n{}",
+            "译文表覆盖不全，共 {} 处（加文案时要同时补四张表）:\n{}",
             missing.len(),
             missing.join("\n")
         );
@@ -983,8 +1071,10 @@ mod tests {
     /// 留在表里是垃圾，新键没人译。两侧都查才能把这种改动暴露出来。
     #[test]
     fn no_orphan_translations() {
-        let src: std::collections::BTreeSet<String> =
-            source_pairs().into_iter().map(|(_, en)| en).collect();
+        // 标记过的键 + 裸字面量：后者兜住「两半全同」的自称词与不变单位。
+        let mut src: std::collections::BTreeSet<String> =
+            source_keys_all().into_iter().collect();
+        src.extend(source_literals_all());
         let mut orphans: Vec<String> = Vec::new();
         for (name, t) in all_tables() {
             for (k, _) in t {
@@ -995,6 +1085,7 @@ mod tests {
         }
         // 复数子表的键也必须还在源码里——同理会随英文措辞改动而失效。
         for (name, plurals, _) in [
+            ("zh-CN", zh_hans::PLURALS, zh_hans::TABLE),
             ("zh-TW", zh_hant::PLURALS, zh_hant::TABLE),
             ("ja", ja::PLURALS, ja::TABLE),
             ("ru", ru::PLURALS, ru::TABLE),

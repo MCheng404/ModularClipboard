@@ -29,6 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 use windows::core::{HSTRING, PCWSTR};
+use modular_clipboard_core::i18n::msg;
 
 /// 窗口类名。多实例共存时靠`RegisterClassExW` 的幂等语义区分。
 const CLASS_NAME: &str = "ModularClipboardTrayWindow";
@@ -457,19 +458,19 @@ unsafe fn show_context_menu(hwnd: HWND) {
             return;
         };
 
-        let items: [(modular_clipboard_core::i18n::Bi, usize); 3] = [
-            (("显示主窗口", "Show main window"), CMD_SHOW),
-            (("清空历史", "Clear history"), CMD_CLEAR),
-            (("退出", "Quit"), CMD_QUIT),
+        let items: [(modular_clipboard_core::i18n::Msg, usize); 3] = [
+            (msg("Show main window"), CMD_SHOW),
+            (msg("Clear history"), CMD_CLEAR),
+            (msg("Quit"), CMD_QUIT),
         ];
         for (i, (label, cmd)) in items.iter().enumerate() {
-            let text = HSTRING::from(modular_clipboard_core::i18n::t(*label));
+            let text = HSTRING::from(modular_clipboard_core::i18n::t(label));
             // 最后一项前插入一条分隔线，把「退出」与操作项分开。
             if i + 1 == items.len() {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
             if let Err(e) = AppendMenuW(menu, MF_STRING, *cmd, PCWSTR(text.as_ptr())) {
-                tracing::warn!("AppendMenuW({}) 失败: {e}", modular_clipboard_core::i18n::t(*label));
+                tracing::warn!("AppendMenuW({}) 失败: {e}", modular_clipboard_core::i18n::t(label));
             }
         }
 

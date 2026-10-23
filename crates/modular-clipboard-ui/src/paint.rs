@@ -58,7 +58,7 @@
 use egui::{Rect, Ui, Vec2, pos2, vec2};
 use modular_clipboard_app::Service;
 use modular_clipboard_core::item::EntryId;
-use modular_clipboard_core::i18n::Bi;
+use modular_clipboard_core::i18n::{Msg, msg};
 
 use crate::card::{CardKind, PinnedMode};
 use crate::theme::Palette;
@@ -496,16 +496,16 @@ impl SettingsCat {
     ];
 
     /// 导航标题（双语对）。
-    pub fn title(self) -> Bi {
+    pub fn title(self) -> Msg {
         match self {
-            SettingsCat::General => ("常规", "General"),
-            SettingsCat::Theme => ("主题", "Theme"),
-            SettingsCat::Appearance => ("外观", "Appearance"),
-            SettingsCat::Capture => ("捕获", "Capture"),
-            SettingsCat::Storage => ("存储", "Storage"),
-            SettingsCat::Shortcuts => ("快捷键", "Shortcuts"),
-            SettingsCat::Comm => ("通信", "Connection"),
-            SettingsCat::About => ("关于", "About"),
+            SettingsCat::General => msg("General"),
+            SettingsCat::Theme => msg("Theme"),
+            SettingsCat::Appearance => msg("Appearance"),
+            SettingsCat::Capture => msg("Capture"),
+            SettingsCat::Storage => msg("Storage"),
+            SettingsCat::Shortcuts => msg("Shortcuts"),
+            SettingsCat::Comm => msg("Connection"),
+            SettingsCat::About => msg("About"),
         }
     }
 
@@ -5619,7 +5619,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
         let mut prev = 0u8;
         for (pct, name) in FONT_SCALE_PRESETS {
-            assert!(!name.0.is_empty() && !name.1.is_empty(), "预设 {pct}% 缺少档位名");
+            assert!(!name.is_empty(), "预设 {pct}% 缺少档位名");
             assert!(*pct > prev, "预设必须严格升序：{prev} → {pct}");
             prev = *pct;
             let scale = f64::from(*pct) / 100.0;
@@ -5668,13 +5668,13 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         // 五个预设段都应登记热区（key = 选项文字）。
         for (_, name) in FONT_SCALE_PRESETS {
-            // 热区 key = **显示文字**（draw_segmented 用 t(name) 登记），
-            // 测试默认中文语言环境 ⇒ 取中文半。
-            let seg = settings_hit(&h, name.0);
-            assert!(seg.width() > 0.0, "预设「{}」应有热区", name.0);
+            // 热区 key = **显示文字**（`draw_segmented` 用 `t(name)` 登记）。
+            // 这里也用 `t(name)`：注册与查找走同一条路径，与当前语言无关。
+            let seg = settings_hit(&h, t(name));
+            assert!(seg.width() > 0.0, "预设「{}」应有热区", t(name));
         }
         // 点「大」（115%）。
-        let big = settings_hit(&h, "大");
+        let big = settings_hit(&h, t("Large"));
         let ops = h.settings_click_at(big.center());
         let hit = ops.iter().any(|o| matches!(
             o,
@@ -6128,12 +6128,12 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         // 10 个预设都应有热区（key = 预设名）。
         for (name, _) in crate::theme::ACCENT_PRESETS {
-            // 热区 key = 显示文字（中文环境测试 ⇒ 取中文半）。
-            let sw = settings_hit(&h, name.0);
-            assert!(sw.width() > 0.0, "预设「{}」应有热区", name.0);
+            // 同上：注册与查找都走 `t()`，与当前语言无关。
+            let sw = settings_hit(&h, t(name));
+            assert!(sw.width() > 0.0, "预设「{}」应有热区", t(name));
         }
         // 点「翠绿」⇒ SetAccent(Some(绿))。
-        let green = settings_hit(&h, "翠绿");
+        let green = settings_hit(&h, t("Emerald"));
         let ops = h.settings_click_at(green.center());
         let hit = ops.iter().any(|o| match o {
             Op::SetAccent(Some(c)) => {

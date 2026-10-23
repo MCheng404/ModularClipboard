@@ -387,7 +387,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
             if rr.clicked() {
                 f.state.push(Op::UndoEdit(item.id));
             }
-            rr.on_hover_text(t(("撤销修改", "Undo edit")));
+            rr.on_hover_text(t("Undo edit"));
             bx += badge_side + 5.0;
         }
         let b = Rect::from_center_size(pos2(bx + badge_side * 0.5, bcy), vec2(badge_side, badge_side));
@@ -410,9 +410,9 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
         // 消耗 `Response`，与行内三个操作按钮同一个坑）。
         let clicked = rr.clicked();
         rr.on_hover_text(if item.kind == modular_clipboard_core::ClipKind::Image {
-            t(("编辑图片", "Edit image"))
+            t("Edit image")
         } else {
-            t(("修改内容", "Edit content"))
+            t("Edit content")
         });
         if clicked {
             if item.kind == modular_clipboard_core::ClipKind::Image {
@@ -622,13 +622,13 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
         let tip = match i {
             0 => {
                 if item.pinned {
-                    t(("取消置顶", "Unpin"))
+                    t("Unpin")
                 } else {
-                    t(("置顶", "Pin"))
+                    t("Pin")
                 }
             }
-            1 => t(("复制", "Copy")),
-            _ => t(("删除", "Delete")),
+            1 => t("Copy"),
+            _ => t("Delete"),
         };
         if rr.clicked() && *enabled {
             f.state.push(op.clone());
@@ -713,7 +713,7 @@ pub(super) fn draw_inline_editor(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, i
         |ui| {
             let te = egui::TextEdit::multiline(&mut f.state.edit_buf)
                 .id(egui::Id::unique(("inline_editor", item.id)))
-                .hint_text(t(("输入内容…", "Type content…")))
+                .hint_text(t("Type content…"))
                 .font(egui::FontId::proportional(pal.font_md))
                 .desired_width(text_rect.width())
                 .frame(egui::Frame::NONE);
@@ -772,7 +772,7 @@ pub(super) fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, 
         color,
     );
     let ok_clicked = rr.clicked();
-    rr.on_hover_text(t(("确认修改（Ctrl+Enter）", "Save (Ctrl+Enter)")));
+    rr.on_hover_text(t("Save (Ctrl+Enter)"));
     if ok_clicked {
         f.state.push(Op::CommitEditText {
             id: item.id,
@@ -800,7 +800,7 @@ pub(super) fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, 
         color,
     );
     let no_clicked = rr.clicked();
-    rr.on_hover_text(t(("取消修改（Esc）", "Cancel (Esc)")));
+    rr.on_hover_text(t("Cancel (Esc)"));
     if no_clicked {
         f.state.push(Op::CancelEdit);
     }

@@ -9,13 +9,13 @@ pub struct ThemeKnob {
     /// [`ThemeParams`] 里的字段名（稳定键）。
     pub key: &'static str,
     /// 设置界面展示名（双语对）。
-    pub label: crate::i18n::Bi,
+    pub label: crate::i18n::Msg,
     /// 一句话说明（双语对）。
-    pub desc: crate::i18n::Bi,
+    pub desc: crate::i18n::Msg,
 }
 
 impl ThemeKnob {
-    pub(super) const fn new(key: &'static str, label: crate::i18n::Bi, desc: crate::i18n::Bi) -> Self {
+    pub(super) const fn new(key: &'static str, label: crate::i18n::Msg, desc: crate::i18n::Msg) -> Self {
         Self { key, label, desc }
     }
 }

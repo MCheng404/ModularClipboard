@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use modular_clipboard_core::config::McpConfig;
+use modular_clipboard_core::i18n::msg;
 
 /// 两次探测之间的间隔。
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
@@ -65,10 +66,10 @@ pub enum McpConn {
 
 impl McpConn {
     /// 徽标文案（双语对）。
-    pub fn label(self) -> modular_clipboard_core::i18n::Bi {
+    pub fn label(self) -> modular_clipboard_core::i18n::Msg {
         match self {
-            Self::Connected => ("已连接", "Connected"),
-            _ => ("未连接", "Not connected"),
+            Self::Connected => msg("Connected"),
+            _ => msg("Not connected"),
         }
     }
 
@@ -78,18 +79,12 @@ impl McpConn {
     }
 
     /// 状态说明（给界面上的状态行用；双语对）。
-    pub fn detail(self) -> modular_clipboard_core::i18n::Bi {
+    pub fn detail(self) -> modular_clipboard_core::i18n::Msg {
         match self {
-            Self::Disabled => ("总开关已关闭", "Turned off in settings"),
-            Self::Unconfigured => (
-                "未配置 HTTP 端口；stdio 模式由客户端托管，无法检测",
-                "No HTTP port configured; stdio mode is client-managed and cannot be probed",
-            ),
-            Self::Connected => ("服务运行中", "Service is running"),
-            Self::Disconnected => (
-                "未检测到服务（请确认已用 --mcp-http 启动）",
-                "No service detected (start it with --mcp-http)",
-            ),
+            Self::Disabled => msg("Turned off in settings"),
+            Self::Unconfigured => msg("No HTTP port configured; stdio mode is client-managed and cannot be probed"),
+            Self::Connected => msg("Service is running"),
+            Self::Disconnected => msg("No service detected (start it with --mcp-http)"),
         }
     }
 
@@ -316,15 +311,15 @@ mod tests {
     #[test]
     fn only_connected_maps_to_connected_label() {
         assert!(McpConn::Connected.is_connected());
-        assert_eq!(McpConn::Connected.label().0, "已连接");
+        assert_eq!(McpConn::Connected.label(), "Connected");
         for s in [
             McpConn::Disabled,
             McpConn::Unconfigured,
             McpConn::Disconnected,
         ] {
             assert!(!s.is_connected(), "{s:?} 不应算已连接");
-            assert_eq!(s.label().0, "未连接");
-            assert!(!s.detail().0.is_empty(), "每种未连接态都要有可读的说明");
+            assert_eq!(s.label(), "Not connected");
+            assert!(!s.detail().is_empty(), "每种未连接态都要有可读的说明");
         }
         assert_eq!(McpConn::default(), McpConn::Disabled);
     }

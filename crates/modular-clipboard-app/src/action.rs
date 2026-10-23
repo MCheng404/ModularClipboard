@@ -9,6 +9,7 @@
 
 
 use modular_clipboard_core::{ActionRule, ClipItem, ClipKind};
+use modular_clipboard_core::i18n::msg;
 
 /// 动作的唯一标识。
 pub type ActionId = &'static str;
@@ -22,7 +23,7 @@ pub trait Action: Send + Sync {
     fn id(&self) -> ActionId;
 
     /// 界面显示名（双语对）。
-    fn label(&self) -> modular_clipboard_core::i18n::Bi;
+    fn label(&self) -> modular_clipboard_core::i18n::Msg;
 
     /// 是否接受该条目。
     fn accepts(&self, item: &ClipItem) -> bool;
@@ -57,8 +58,8 @@ impl Action for OpenExternalAction {
     fn id(&self) -> ActionId {
         "open_external"
     }
-    fn label(&self) -> modular_clipboard_core::i18n::Bi {
-        ("打开", "Open")
+    fn label(&self) -> modular_clipboard_core::i18n::Msg {
+        msg("Open")
     }
     fn accepts(&self, item: &ClipItem) -> bool {
         // 文件类直接接受；文本类需形如路径。
@@ -86,8 +87,8 @@ impl Action for OpenUrlAction {
     fn id(&self) -> ActionId {
         "open_url"
     }
-    fn label(&self) -> modular_clipboard_core::i18n::Bi {
-        ("浏览器打开", "Open in browser")
+    fn label(&self) -> modular_clipboard_core::i18n::Msg {
+        msg("Open in browser")
     }
     fn accepts(&self, item: &ClipItem) -> bool {
         item.kind == ClipKind::Text
@@ -108,8 +109,8 @@ impl Action for RevealAction {
     fn id(&self) -> ActionId {
         "reveal"
     }
-    fn label(&self) -> modular_clipboard_core::i18n::Bi {
-        ("在资源管理器中显示", "Show in file manager")
+    fn label(&self) -> modular_clipboard_core::i18n::Msg {
+        msg("Show in file manager")
     }
     fn accepts(&self, item: &ClipItem) -> bool {
         match item.kind {
@@ -135,13 +136,13 @@ pub struct CommandAction {
     id: &'static str,
     program: String,
     arg_template: String,
-    label: modular_clipboard_core::i18n::Bi,
+    label: modular_clipboard_core::i18n::Msg,
 }
 
 impl CommandAction {
     pub fn new(
         id: &'static str,
-        label: modular_clipboard_core::i18n::Bi,
+        label: modular_clipboard_core::i18n::Msg,
         program: impl Into<String>,
         arg_template: impl Into<String>,
     ) -> Self {
@@ -158,7 +159,7 @@ impl Action for CommandAction {
     fn id(&self) -> ActionId {
         self.id
     }
-    fn label(&self) -> modular_clipboard_core::i18n::Bi {
+    fn label(&self) -> modular_clipboard_core::i18n::Msg {
         self.label
     }
     fn accepts(&self, item: &ClipItem) -> bool {
@@ -215,13 +216,13 @@ impl ActionRegistry {
         // 解析（`&` 截断、命令注入），`start` 也无法被 argv 直传 spawn。
         let _ = reg.register(Box::new(CommandAction::new(
             "run_command",
-            ("在浏览器中搜索", "Search in browser"),
+            msg("Search in browser"),
             "explorer",
             "https://www.bing.com/search?q={selection_urlencoded}",
         )));
         let _ = reg.register(Box::new(CommandAction::new(
             "translate_deepl",
-            ("翻译（DeepL 网页版）", "Translate (DeepL web)"),
+            msg("Translate (DeepL web)"),
             "explorer",
             "https://www.deepl.com/translator#en/zh/{selection_urlencoded}",
         )));
@@ -489,7 +490,7 @@ mod tests {
 
     #[test]
     fn command_action_substitutes_selection() {
-        let action = CommandAction::new("search_test", ("搜索", "Search"), "explorer", "https://x/?q={selection}");
+        let action = CommandAction::new("search_test", "Search", "explorer", "https://x/?q={selection}");
         let item = text_item("rust lang");
         let plan = action.plan(&item).unwrap();
         match plan {
@@ -506,7 +507,7 @@ mod tests {
         // `&` 不被编码时会截断/改写命令结构。
         let action = CommandAction::new(
             "search_enc",
-            ("搜索", "Search"),
+            "Search",
             "explorer",
             "https://x/?q={selection_urlencoded}",
         );

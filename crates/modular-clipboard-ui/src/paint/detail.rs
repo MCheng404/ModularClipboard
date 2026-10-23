@@ -48,7 +48,7 @@ pub(super) fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     let Some(id) = f.svc.state.selected else {
         // 选中丢失：原图缓存随之丢弃。
         clear_detail_image_zoom(f);
-        draw_empty(f, body, t(("选中一条记录查看详情", "Select an entry to see details")));
+        draw_empty(f, body, t("Select an entry to see details"));
         return;
     };
     // 先把选中的 item 拷一份：原图模式分支与三分支都需要
@@ -57,7 +57,7 @@ pub(super) fn draw_detail_body(f: &mut Frame<'_>, body: Rect) {
     let Some(item) = f.svc.state.items.iter().find(|it| it.id == id).cloned() else {
         // 选中条目已不存在：原图缓存同样失效。
         clear_detail_image_zoom(f);
-        draw_empty(f, body, t(("该记录已不存在", "This entry no longer exists")));
+        draw_empty(f, body, t("This entry no longer exists"));
         return;
     };
 
@@ -335,10 +335,10 @@ pub(super) fn draw_detail_image_zoom(f: &mut Frame<'_>, body: Rect, item: &ClipI
                 egui::StrokeKind::Inside,
             );
         } else {
-            draw_empty(f, content_band, t(("原图尺寸未知", "Original size unknown")));
+            draw_empty(f, content_band, t("Original size unknown"));
         }
     } else {
-        draw_empty(f, content_band, t(("原图加载失败", "Failed to load the original image")));
+        draw_empty(f, content_band, t("Failed to load the original image"));
     }
 
     // 来源 · 时间：给返回按钮留 80pt 空间。
@@ -376,7 +376,7 @@ pub(super) fn draw_rail_body(f: &mut Frame<'_>, body: Rect) {
     let pal = f.pal;
     let total = f.svc.state.items.len();
     if total == 0 {
-        draw_empty(f, body, t(("暂无数据", "No data")));
+        draw_empty(f, body, t("No data"));
         return;
     }
     let font = sized(pal.font_xs, f.scale);

@@ -580,7 +580,7 @@ pub(super) fn run_mode(
             if f.clear_history {
                 if let Err(e) = app.clear_history() {
                     tracing::warn!(%e, "托盘清空历史失败");
-                    app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("清空失败:", "Clear failed:"))));
+                    app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Clear failed:")));
                 }
                 // IMPORTANT: 必须请求重绘。
                 //
@@ -600,7 +600,7 @@ pub(super) fn run_mode(
                 if let Some(id) = app.svc.state.items.first().map(|i| i.id) {
                     if let Err(e) = app.svc.copy_and_paste(id) {
                         tracing::warn!(%e, "粘贴上一条失败");
-                        app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("粘贴失败:", "Paste failed:"))));
+                        app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Paste failed:")));
                     }
                 } else {
                     tracing::debug!("历史为空，忽略「粘贴上一条」");
@@ -611,7 +611,7 @@ pub(super) fn run_mode(
             if let Some(id) = f.mini_pick {
                 if let Err(e) = app.svc.copy_item(id) {
                     tracing::warn!(%e, "迷你面板复制条目失败");
-                    app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("复制失败:", "Copy failed:"))));
+                    app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Copy failed:")));
                 }
                 // 复制可能改变列表顺序（最近使用），请求重绘。
                 ctx.request_repaint();
@@ -1526,7 +1526,7 @@ Ok(w) => {
                     Err(e) => {
                         // 建窗失败：状态置回 None，否则每帧重试刷日志。
                         app.paint_state.image_editor = None;
-                        app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("无法打开图片编辑窗口:", "Cannot open the image editor:"))));
+                        app.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Cannot open the image editor:")));
                     }
                 }
             }

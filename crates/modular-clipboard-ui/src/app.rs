@@ -538,8 +538,8 @@ impl App {
                     // （同 `copy_item` 规则），防止捕获线程把自己写的内容再记一条。
                     let prompt = crate::paint::mcp_pair_prompt(&self.svc.state.config);
                     match self.svc.write_clipboard_text(&prompt) {
-                        Ok(()) => self.svc.notify(modular_clipboard_core::i18n::t(("已复制 AI 配对提示词", "AI pairing prompt copied")).into()),
-                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("复制配对提示词失败:", "Failed to copy the pairing prompt:")))),
+                        Ok(()) => self.svc.notify(modular_clipboard_core::i18n::t("AI pairing prompt copied").into()),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Failed to copy the pairing prompt:"))),
                     }
                 }
                 Op::SetOptNumber { group, field, value } => {
@@ -715,12 +715,12 @@ impl App {
                             }
                             slot.draft_mut(&mut self.paint_state).clear();
                             self.after_config_change();
-                            self.svc.notify(format!("{} {text}", modular_clipboard_core::i18n::t(("已设为", "Set to"))));
+                            self.svc.notify(format!("{} {text}", modular_clipboard_core::i18n::t("Set to")));
                         }
                         Err(e) => {
                             // 解析失败要说清楚**为什么**：只提示「无效」
                             // 用户就得自己猜是不是键名写错了。
-                            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("快捷键无效：", "Invalid shortcut:"))));
+                            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Invalid shortcut:")));
                         }
                     }
                 }
@@ -741,7 +741,7 @@ impl App {
                         }
                         Err(e) => {
                             tracing::error!(%e, "设置开机自启动失败");
-                            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("设置失败：", "Failed to apply:"))));
+                            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Failed to apply:")));
                         }
                     }
                 }
@@ -754,7 +754,7 @@ impl App {
                 }
                 Op::TogglePin(id) => {
                     if let Err(e) = self.svc.toggle_pin(id) {
-                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("置顶失败:", "Pin failed:"))));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Pin failed:")));
                     }
                 }
                 Op::Delete(id) => {
@@ -767,7 +767,7 @@ impl App {
                             // 用户以为自己刚改的字保存过了。
                             self.paint_state.clear_edit_state(id);
                         }
-                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("删除失败:", "Delete failed:")))),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Delete failed:"))),
                     }
                 }
                 Op::Copy(id) => {
@@ -777,8 +777,8 @@ impl App {
                     // 排查后发现是成功路径无反馈）。提示走 toast/弹窗通道
                     // （`ui.notice_popup` 决定呈现），3 秒自消。
                     match self.svc.copy_item(id) {
-                        Ok(()) => self.svc.notify(modular_clipboard_core::i18n::t(("已复制", "Copied")).into()),
-                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("复制失败:", "Copy failed:")))),
+                        Ok(()) => self.svc.notify(modular_clipboard_core::i18n::t("Copied").into()),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Copy failed:"))),
                     }
                 }
                 // ---- 内容编辑（2026-10-21）----
@@ -798,7 +798,7 @@ impl App {
                         }
                         Err(e) => {
                             self.svc
-                                .notify(modular_clipboard_core::i18n::t(("无法编辑：内容已被淘汰（{e}）", "Cannot edit: content was evicted ({e})")).replace("{e}", &e.to_string()));
+                                .notify(modular_clipboard_core::i18n::t("Cannot edit: content was evicted ({e})").replace("{e}", &e.to_string()));
                         }
                     }
                 }
@@ -815,7 +815,7 @@ impl App {
                     // 字要么按 Esc 退出——直接关掉会让他以为保存成功了。
                     // 真要删条目请走行上的删除按钮（那里有明确反馈）。
                     if text.trim().is_empty() {
-                        self.svc.notify(modular_clipboard_core::i18n::t(("内容为空，未保存", "Empty content, not saved")).into());
+                        self.svc.notify(modular_clipboard_core::i18n::t("Empty content, not saved").into());
                     } else {
                         self.commit_edit(id, text.into_bytes(), None);
                     }
@@ -845,7 +845,7 @@ impl App {
                             self.paint_state.edit_backup = None;
                         }
                         _ => {
-                            self.svc.notify(modular_clipboard_core::i18n::t(("没有可撤销的修改", "Nothing to undo")).into());
+                            self.svc.notify(modular_clipboard_core::i18n::t("Nothing to undo").into());
                         }
                     }
                 }
@@ -875,11 +875,11 @@ impl App {
                         }
                         (Ok(_), _) => {
                             self.svc
-                                .notify(modular_clipboard_core::i18n::t(("无法编辑图片：缺少尺寸信息", "Cannot edit image: missing dimensions")).into());
+                                .notify(modular_clipboard_core::i18n::t("Cannot edit image: missing dimensions").into());
                         }
                         (Err(e), _) => {
                             self.svc
-                                .notify(modular_clipboard_core::i18n::t(("无法编辑图片：内容已被淘汰（{e}）", "Cannot edit image: content was evicted ({e})")).replace("{e}", &e.to_string()));
+                                .notify(modular_clipboard_core::i18n::t("Cannot edit image: content was evicted ({e})").replace("{e}", &e.to_string()));
                         }
                     }
                 }
@@ -956,12 +956,9 @@ impl App {
                             // 成功也给通知：长按 5 秒是重操作，用户需要
                             // 明确的「生效了」反馈——没有反馈时会以为
                             // 「没反应」而反复重试（2026-10-22 反馈链）。
-                            self.svc.notify(modular_clipboard_core::i18n::t((
-                                "已清空全部历史",
-                                "All history cleared",
-                            )).to_string());
+                            self.svc.notify(modular_clipboard_core::i18n::t("All history cleared").to_string());
                         }
-                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("清空失败:", "Clear failed:")))),
+                        Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Clear failed:"))),
                     }
                 }
                 Op::Quit => {
@@ -984,7 +981,7 @@ impl App {
                     // 恰恰是用户最需要知道的那类。
                     if let Err(e) = modular_clipboard_platform::open_url(url) {
                         tracing::warn!("打开链接失败 {url}: {e}");
-                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开链接失败:", "Failed to open link:"))));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Failed to open link:")));
                     }
                 }
                 Op::OpenUrl(url) => {
@@ -993,7 +990,7 @@ impl App {
                     // 双击没反应是最难自查的一类故障。
                     let custom = self.svc.state.config.ui.browser_path.trim();
                     if let Err(e) = modular_clipboard_platform::open_url_with(&url, custom) {
-                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开链接失败:", "Failed to open link:"))));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Failed to open link:")));
                     }
                 }
                 Op::OpenDataDir => {
@@ -1001,7 +998,7 @@ impl App {
                     let dir = self.svc.data_dir().display().to_string();
                     let custom = self.svc.state.config.ui.explorer_path.trim();
                     if let Err(e) = modular_clipboard_platform::open_dir_with(&dir, custom) {
-                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开资源管理器失败:", "Failed to open the file manager:"))));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Failed to open the file manager:")));
                     }
                 }
                 Op::RevealPath(path) => {
@@ -1009,7 +1006,7 @@ impl App {
                     // （留空 = 系统 explorer /select 定位）。
                     let custom = self.svc.state.config.ui.explorer_path.trim();
                     if let Err(e) = modular_clipboard_platform::reveal_with(&path, custom) {
-                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("打开资源管理器失败:", "Failed to open the file manager:"))));
+                        self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Failed to open the file manager:")));
                     }
                 }
                 Op::SetTypeFilterKind { kind, multi } => {
@@ -1130,10 +1127,10 @@ impl App {
                 self.paint_state.edit_focus_pending = false;
                 self.paint_state.image_editor = None;
                 self.paint_state.image_editor_src = None;
-                self.svc.notify(modular_clipboard_core::i18n::t(("已保存修改", "Changes saved")).into());
+                self.svc.notify(modular_clipboard_core::i18n::t("Changes saved").into());
             }
             Err(e) => {
-                self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("保存失败:", "Save failed:"))));
+                self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Save failed:")));
             }
         }
     }
@@ -1470,7 +1467,7 @@ impl App {
     fn after_config_change(&mut self) {
         if let Err(e) = self.svc.save_config() {
             tracing::warn!(%e, "保存配置失败");
-            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t(("保存设置失败:", "Failed to save settings:"))));
+            self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Failed to save settings:")));
         }
     }
 

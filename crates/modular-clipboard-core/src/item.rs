@@ -4,6 +4,7 @@
 //! 而不会引入循环依赖或把平台细节泄漏到核心逻辑中。
 
 use serde::{Deserialize, Serialize};
+use crate::i18n::msg;
 
 /// 条目 ID。单库自增，不跨设备复用。
 pub type EntryId = i64;
@@ -43,13 +44,13 @@ impl ClipKind {
     }
 
     /// 界面展示名（双语对；列表行右下角标签 / 类型过滤栏 tooltip）。
-    pub fn label(self) -> crate::i18n::Bi {
+    pub fn label(self) -> crate::i18n::Msg {
         match self {
-            ClipKind::Text => ("文本", "Text"),
-            ClipKind::Html => ("HTML", "HTML"),
-            ClipKind::Image => ("图片", "Image"),
-            ClipKind::Files => ("文件", "Files"),
-            ClipKind::Markdown => ("Markdown", "Markdown"),
+            ClipKind::Text => msg("Text"),
+            ClipKind::Html => "HTML",
+            ClipKind::Image => msg("Image"),
+            ClipKind::Files => msg("Files"),
+            ClipKind::Markdown => "Markdown",
         }
     }
 }
@@ -204,6 +205,6 @@ mod tests {
     fn markdown_kind_serializes_as_lowercase() {
         assert_eq!(serde_json::to_string(&ClipKind::Markdown).unwrap(), "\"markdown\"");
         assert_eq!(ClipKind::Markdown.as_str(), "markdown");
-        assert_eq!(ClipKind::Markdown.label().0, "Markdown");
+        assert_eq!(ClipKind::Markdown.label(), "Markdown");
     }
 }

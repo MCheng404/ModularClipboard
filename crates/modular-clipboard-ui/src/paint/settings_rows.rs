@@ -9,7 +9,7 @@ use egui::Ui;
 use egui::pos2;
 use egui::vec2;
 use modular_clipboard_core::config::WindowBackdrop;
-use modular_clipboard_core::i18n::Bi;
+use modular_clipboard_core::i18n::Msg;
 use modular_clipboard_core::i18n::{t, tp};
 use crate::card::PinnedMode;
 use crate::theme::Palette;
@@ -79,13 +79,13 @@ fn lang_menu_style(s: &mut egui::Style) {
 ///
 /// 唯一例外是第一项「跟随系统」——它没有自称，只能随当前语言翻译
 /// （走 [`t`]，三种新语言的译项在 `core::i18n::catalog`）。
-const LANG_CHOICES: &[(&str, Bi)] = &[
-    (modular_clipboard_core::i18n::LANG_SYSTEM, ("跟随系统", "Follow system")),
-    ("zh-CN", ("简体中文", "简体中文")),
-    ("zh-TW", ("繁體中文", "繁體中文")),
-    ("en-US", ("English", "English")),
-    ("ja-JP", ("日本語", "日本語")),
-    ("ru-RU", ("Русский", "Русский")),
+const LANG_CHOICES: &[(&str, Msg)] = &[
+    (modular_clipboard_core::i18n::LANG_SYSTEM, msg("Follow system")),
+    ("zh-CN", "简体中文"),
+    ("zh-TW", "繁體中文"),
+    ("en-US", "English"),
+    ("ja-JP", "日本語"),
+    ("ru-RU", "Русский"),
 ];
 use super::settings_items::ItemKind;
 use super::settings_items::SETTINGS_CARDS;
@@ -106,6 +106,7 @@ use super::controls::draw_text_field;
 use super::theme_editor::draw_accent_editor;
 use super::theme_editor::draw_token_entry;
 use super::mcp_overlay::draw_mcp_info_btn;
+use modular_clipboard_core::i18n::msg;
 
 /// 一行设置项：按类型分派到开关 / 数值 / 单选 / 只读。
 pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsItem) {
@@ -170,8 +171,8 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     ui,
                     "pinned_mode",
                     &[
-                        (PinnedMode::SharedColumn, ("共用单栏", "Shared column")),
-                        (PinnedMode::OwnCard, ("独立分栏", "Own column")),
+                        (PinnedMode::SharedColumn, msg("Shared column")),
+                        (PinnedMode::OwnCard, msg("Own column")),
                     ],
                     f.ws.pinned_mode(),
                 );
@@ -191,7 +192,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 let readout = if font_scale_is_preset(cur) {
                     format!("{pct}%")
                 } else {
-                    format!("{pct}%{}", t(("（自定义）", " (custom)")))
+                    format!("{pct}%{}", t(" (custom)"))
                 };
                 ui.add(egui::Label::new(
                     egui::RichText::new(readout).color(pal.text_dim),
@@ -269,9 +270,9 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     ui,
                     "theme_mode",
                     &[
-                        (crate::theme::ThemeMode::FollowSystem, ("跟随系统", "Follow system")),
-                        (crate::theme::ThemeMode::Dark, ("深色", "Dark")),
-                        (crate::theme::ThemeMode::Light, ("浅色", "Light")),
+                        (crate::theme::ThemeMode::FollowSystem, msg("Follow system")),
+                        (crate::theme::ThemeMode::Dark, msg("Dark")),
+                        (crate::theme::ThemeMode::Light, msg("Light")),
                     ],
                     crate::theme::ThemeMode::from_dark_mode(f.svc.state.config.ui.dark_mode),
                 );
@@ -295,11 +296,11 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     ui,
                     "secondary_theme",
                     &[
-                        (SecondaryTheme::None, ("无", "None")),
-                        (SecondaryTheme::Paper, ("纸纹", "Paper")),
-                        (SecondaryTheme::Green, ("护眼绿", "Eye-care green")),
-                        (SecondaryTheme::Purple, ("星空紫", "Starfield purple")),
-                        (SecondaryTheme::Oled, ("OLED", "OLED")),
+                        (SecondaryTheme::None, msg("None")),
+                        (SecondaryTheme::Paper, msg("Paper")),
+                        (SecondaryTheme::Green, msg("Eye-care green")),
+                        (SecondaryTheme::Purple, msg("Starfield purple")),
+                        (SecondaryTheme::Oled, "OLED"),
                     ],
                     f.svc.state.config.ui.secondary_theme,
                 );
@@ -319,7 +320,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // 禁用的处理一致——「关着还能调」会让用户以为参数没保存）。
                 let _ = setting_row(ui, it.label, it.desc, |ui| {
                     ui.add(egui::Label::new(
-                        egui::RichText::new(t(("先选择一个风格主题", "Select a style theme first"))).color(f.pal.text_dim),
+                        egui::RichText::new(t("Select a style theme first")).color(f.pal.text_dim),
                     ));
                     false
                 });
@@ -369,9 +370,9 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     ui,
                     "window_backdrop",
                     &[
-                        (WindowBackdrop::None, ("无", "None")),
-                        (WindowBackdrop::Acrylic, ("磨砂", "Frosted")),
-                        (WindowBackdrop::Translucent, ("半透明", "Translucent")),
+                        (WindowBackdrop::None, msg("None")),
+                        (WindowBackdrop::Acrylic, msg("Frosted")),
+                        (WindowBackdrop::Translucent, msg("Translucent")),
                     ],
                     f.svc.state.config.ui.window_backdrop,
                 );
@@ -468,7 +469,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     f,
                     ui,
                     "card_shadow_blur",
-                    t(("模糊", "Blur")),
+                    t("Blur"),
                     format!("{}", cfg.blur.round() as i32),
                     &mut cfg.blur,
                     0.0..=24.0,
@@ -477,7 +478,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     f,
                     ui,
                     "card_shadow_opacity",
-                    t(("浓度", "Opacity")),
+                    t("Opacity"),
                     format!("{}%", (cfg.opacity * 100.0).round() as i32),
                     &mut cfg.opacity,
                     0.0..=0.6,
@@ -486,7 +487,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     f,
                     ui,
                     "card_shadow_offset_y",
-                    t(("偏移", "Offset")),
+                    t("Offset"),
                     format!("{}", cfg.offset_y.round() as i32),
                     &mut cfg.offset_y,
                     -8.0..=16.0,
@@ -516,22 +517,22 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             });
             if cfg.visible {
                 ui.add_space(2.0);
-                changed |= setting_row(ui, ("始终显示全部类型", "Show all types"), ("关闭时仅显示已有记录的类型", "When off, only types present in history are shown"), |ui| {
+                changed |= setting_row(ui, msg("Show all types"), msg("When off, only types present in history are shown"), |ui| {
                     draw_switch(f, ui, "type_rail_always", &mut cfg.always)
                 });
                 ui.add_space(2.0);
                 // 多选：按钮变开关，可同时点亮多个类型（2026-10-20 新增）。
-                changed |= setting_row(ui, ("多选组合过滤", "Multi-select"), ("开启后可同时选择多个类型，列表显示任一所选类型的条目", "Select several types at once; the list shows entries matching any of them"), |ui| {
+                changed |= setting_row(ui, msg("Multi-select"), msg("Select several types at once; the list shows entries matching any of them"), |ui| {
                     draw_switch(f, ui, "type_rail_multi", &mut cfg.multi)
                 });
                 ui.add_space(2.0);
                 // 文字标签：图标旁显示类型名称（2026-10-20 新增）。
-                changed |= setting_row(ui, ("显示类型名称", "Show type names"), ("在图标旁显示文字标签；竖直停靠时在图标下方，水平停靠时在右侧", "Text labels next to the icons: below them when vertical, to the right when horizontal"), |ui| {
+                changed |= setting_row(ui, msg("Show type names"), msg("Text labels next to the icons: below them when vertical, to the right when horizontal"), |ui| {
                     draw_switch(f, ui, "type_rail_labels", &mut cfg.labels)
                 });
                 ui.add_space(2.0);
                 // 位置：四向分段控件（与「背景效果」同一控件）。
-                changed |= setting_row(ui, ("停靠位置", "Dock position"), ("类型栏贴在主窗口的哪一侧", "Which edge of the main window the bar sticks to"), |ui| {
+                changed |= setting_row(ui, msg("Dock position"), msg("Which edge of the main window the bar sticks to"), |ui| {
                     use modular_clipboard_core::config::TypeRailPos;
                     // CAUTION: 选项文案一律取 `TypeRailPos::label()`，不在这里
                     // 重写一份字面量。
@@ -563,7 +564,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // 大小：24~48pt 滑块（步进由滑块天然连续，绘制侧钳制）。
                 let mut size = modular_clipboard_core::config::clamp_type_rail_size(cfg.size);
                 let pal = f.pal;
-                changed |= setting_row(ui, ("图标大小", "Icon size"), ("类型按钮的边长（24~48pt）", "Side length of each type button (24-48 pt)"), |ui| {
+                changed |= setting_row(ui, msg("Icon size"), msg("Side length of each type button (24-48 pt)"), |ui| {
                     ui.add(egui::Label::new(
                         egui::RichText::new(format!("{}", size.round() as i32)).color(pal.text_dim),
                     ));
@@ -590,7 +591,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             // 悬浮搜索面板：停靠位置（窗口上/下）+ 高度。整包替换。
             let mut cfg = f.svc.state.config.ui.search_panel;
             let mut changed = false;
-            changed |= setting_row(ui, ("停靠位置", "Dock position"), ("搜索面板贴在主窗口的上方还是下方", "Whether the panel docks above or below the main window"), |ui| {
+            changed |= setting_row(ui, msg("Dock position"), msg("Whether the panel docks above or below the main window"), |ui| {
                 use modular_clipboard_core::config::SearchPanelPos;
                 // 同 type_rail_pos：文案取 `SearchPanelPos::label()`，
                 // 不重写字面量（否则同一概念两份文案，英文键无法区分）。
@@ -612,7 +613,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             ui.add_space(2.0);
             let mut height = modular_clipboard_core::config::clamp_search_panel_height(cfg.height);
             let pal = f.pal;
-            changed |= setting_row(ui, ("面板高度", "Panel height"), ("搜索面板的高度（30~56pt）", "Height of the search panel (30-56 pt)"), |ui| {
+            changed |= setting_row(ui, msg("Panel height"), msg("Height of the search panel (30-56 pt)"), |ui| {
                 ui.add(egui::Label::new(
                     egui::RichText::new(format!("{}", height.round() as i32)).color(pal.text_dim),
                 ));
@@ -642,7 +643,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     f,
                     ui,
                     "notice_popup",
-                    &[(false, ("窗口内提示", "In-window toast")), (true, ("独立弹窗", "Separate popup"))],
+                    &[(false, msg("In-window toast")), (true, msg("Separate popup"))],
                     popup,
                 );
                 if let Some(p) = picked {
@@ -690,7 +691,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // `item_spacing.x` 归了 0（行与行才够呼吸），
                 // 同行控件零间距会挤成一团（用户实测反馈）。
                 ui.add_space(8.0);
-                if ui.small_button(t(("录制", "Record"))).clicked() {
+                if ui.small_button(t("Record")).clicked() {
                     f.state.push(Op::StartRecording(*slot));
                 }
                 changed
@@ -762,7 +763,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // 宽度随字号缩放（基准 170 / 230 @ font_sm 15），
                 // 否则 2× 字号下框里只显示得下 4~5 个字。
                 let w = pal.font_sm * if *secret { 11.3 } else { 15.3 };
-                draw_text_field(f, ui, field, &mut buf, t(*ph), *secret, w)
+                draw_text_field(f, ui, field, &mut buf, t(ph), *secret, w)
             });
             if changed {
                 f.state.push(Op::SetText {
@@ -864,8 +865,8 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     ui,
                     "paste_previous_mode",
                     &[
-                        (PM::NotifyOnly, ("仅粘贴并提示", "Copy & notify")),
-                        (PM::PasteAndType, ("直接粘贴并输入", "Copy & paste")),
+                        (PM::NotifyOnly, msg("Copy & notify")),
+                        (PM::PasteAndType, msg("Copy & paste")),
                     ],
                     cur,
                 );
@@ -889,7 +890,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             p.text(
                 pos2(r.min.x + 4.0, r.center().y),
                 egui::Align2::LEFT_CENTER,
-                t(("退出程序", "Quit app")),
+                t("Quit app"),
                 egui::FontId::proportional(pal.font_md),
                 pal.danger,
             );
@@ -986,7 +987,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 let resp = ui.add_sized(
                     egui::vec2(88.0, 28.0),
                     egui::Button::new(
-                        egui::RichText::new(t(("检查更新", "Check"))).color(pal.text),
+                        egui::RichText::new(t("Check")).color(pal.text),
                     )
                     .fill(pal.surface_variant),
                 );
@@ -1002,14 +1003,14 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     UpdateState::Idle => {}
                     UpdateState::Checking => {
                         ui.add(egui::Label::new(
-                            egui::RichText::new(t(("检查中…", "Checking…"))).color(pal.text_dim),
+                            egui::RichText::new(t("Checking…")).color(pal.text_dim),
                         ));
                     }
                     UpdateState::UpToDate { remote } => {
                         let s = if remote.is_empty() {
-                            t(("已是最新", "Up to date")).to_string()
+                            t("Up to date").to_string()
                         } else {
-                            format!("{}（v{remote}）", t(("已是最新", "Up to date")))
+                            format!("{}（v{remote}）", t("Up to date"))
                         };
                         ui.add(egui::Label::new(egui::RichText::new(s).color(pal.accent)));
                     }
@@ -1022,8 +1023,8 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                         // 文字本身就是入口（与「开源协议」行同款交互）。
                         let s = format!(
                             "{} v{remote}（{} {local}）",
-                            t(("发现新版本", "Update available")),
-                            t(("本地", "local"))
+                            t("Update available"),
+                            t("local")
                         );
                         let r = ui.add(
                             egui::Label::new(egui::RichText::new(s).color(pal.accent))
@@ -1051,19 +1052,19 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                             )
                             .truncate(),
                         )
-                        .on_hover_text(t(("远程不可达（网络/防火墙/git）", "Unreachable")));
+                        .on_hover_text(t("Unreachable"));
                     }
                     UpdateState::Downloading => {
                         // 后台下载中：只给状态，按钮不再可点（`start_self_update`
                         // 里已做幂等，重复点也不会再起一个下载线程）。
                         ui.add(egui::Label::new(
-                            egui::RichText::new(t(("下载中…", "Downloading…")))
+                            egui::RichText::new(t("Downloading…"))
                                 .color(pal.text_dim),
                         ));
                     }
                     UpdateState::Applying => {
                         ui.add(egui::Label::new(
-                            egui::RichText::new(t(("即将重启…", "Restarting…")))
+                            egui::RichText::new(t("Restarting…"))
                                 .color(pal.accent),
                         ));
                     }
@@ -1084,10 +1085,11 @@ pub(super) fn settings_search_results(f: &mut Frame<'_>, ui: &mut Ui, q: &str) {
             .filter(|it| {
                 // 搜索对**两种语言**的名称与介绍、以及稳定 key 全匹配：
                 // 界面切到英文时用中文词也能搜到，反之亦然。
-                it.label.0.contains(q)
-                    || it.label.1.contains(q)
-                    || it.desc.0.contains(q)
-                    || it.desc.1.contains(q)
+                // 匹配英文键**与**当前语言的译文：用户输入哪种都搜得到。
+                it.label.contains(q)
+                    || it.desc.contains(q)
+                    || t(it.label).contains(q)
+                    || t(it.desc).contains(q)
                     || it.key.contains(q)
             })
             .collect();
@@ -1131,10 +1133,10 @@ pub(super) fn settings_search_results(f: &mut Frame<'_>, ui: &mut Ui, q: &str) {
 pub(super) fn settings_recent_view(f: &mut Frame<'_>, ui: &mut Ui) {
     let pal = f.pal;
     if f.state.settings_recent.is_empty() {
-        ui.label(egui::RichText::new(t(("暂无最近修改的设置", "No recently changed settings"))).color(pal.text_dim));
+        ui.label(egui::RichText::new(t("No recently changed settings")).color(pal.text_dim));
         return;
     }
-    section(ui, t(("最近修改", "Recently changed")), f.pal);
+    section(ui, t("Recently changed"), f.pal);
     for (key, _ts) in f.state.settings_recent.iter().rev() {
         // 稳定 key → 当前语言的名称；找不到就显示 key（只可能是
         // 版本升级删掉了该设置项，留个可辨认的痕迹比空白好）。
@@ -1322,8 +1324,8 @@ pub(super) const CTRL_MIN_H: f32 = 24.0;
 /// 卡片外」的成因）。控件宽从 `min_rect` 取实际值，不靠猜。
 pub(super) fn setting_row(
     ui: &mut Ui,
-    label: Bi,
-    desc: Bi,
+    label: Msg,
+    desc: Msg,
     control: impl FnOnce(&mut Ui) -> bool,
 ) -> bool {
     let label = t(label);
@@ -1453,9 +1455,8 @@ mod tests {
     /// [`LANG_CHOICES`] 的说明；此处只挡「漏写一半」。
     #[test]
     fn lang_choice_labels_are_non_empty() {
-        for (v, (zh, en)) in LANG_CHOICES {
-            assert!(!zh.trim().is_empty(), "{v} 的中文显示名为空");
-            assert!(!en.trim().is_empty(), "{v} 的英文显示名为空");
+        for (v, label) in LANG_CHOICES {
+            assert!(!label.trim().is_empty(), "{v} 的显示名为空");
         }
     }
 

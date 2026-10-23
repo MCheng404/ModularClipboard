@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::theme_params::ThemeKnob;
+use crate::i18n::msg;
 
 /// 二级主题：叠加在一级（深浅）模式之上的**风格层**。
 ///
@@ -35,13 +36,13 @@ pub enum SecondaryTheme {
 
 impl SecondaryTheme {
     /// 设置界面展示名（双语对）。
-    pub fn label(self) -> crate::i18n::Bi {
+    pub fn label(self) -> crate::i18n::Msg {
         match self {
-            SecondaryTheme::None => ("无", "None"),
-            SecondaryTheme::Paper => ("纸纹", "Paper"),
-            SecondaryTheme::Green => ("护眼绿", "Eye-care green"),
-            SecondaryTheme::Purple => ("星空紫", "Starfield purple"),
-            SecondaryTheme::Oled => ("OLED", "OLED"),
+            SecondaryTheme::None => msg("None"),
+            SecondaryTheme::Paper => msg("Paper"),
+            SecondaryTheme::Green => msg("Eye-care green"),
+            SecondaryTheme::Purple => msg("Starfield purple"),
+            SecondaryTheme::Oled => "OLED",
         }
     }
 
@@ -86,28 +87,28 @@ impl SecondaryTheme {
 
 /// 纸质主题的旋钮（[`SecondaryTheme::Paper`]）。
 static PAPER_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("paper_tint", ("纸基浓度", "Paper tint"), ("暖色纸基的混合比例", "How strongly the warm paper base mixes in")),
-    ThemeKnob::new("paper_texture", ("纹理强度", "Texture strength"), ("纤维与噪点的明显程度", "How visible the fibers and grain are")),
+    ThemeKnob::new("paper_tint", msg("Paper tint"), msg("How strongly the warm paper base mixes in")),
+    ThemeKnob::new("paper_texture", msg("Texture strength"), msg("How visible the fibers and grain are")),
 ];
 
 /// 护眼绿主题的旋钮（[`SecondaryTheme::Green`]）。
 static GREEN_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("green_tint", ("绿意浓度", "Green tint"), ("绿色基调的混合比例", "How strongly the green base mixes in")),
-    ThemeKnob::new("green_warmth", ("色温", "Warmth"), ("偏青（冷）到偏黄（暖）", "From cyan (cool) to yellow (warm)")),
+    ThemeKnob::new("green_tint", msg("Green tint"), msg("How strongly the green base mixes in")),
+    ThemeKnob::new("green_warmth", msg("Warmth"), msg("From cyan (cool) to yellow (warm)")),
 ];
 
 /// 星空紫主题的旋钮（[`SecondaryTheme::Purple`]）。
 static PURPLE_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("purple_tint", ("紫度", "Purple tint"), ("紫色基调的混合比例", "How strongly the purple base mixes in")),
-    ThemeKnob::new("purple_stars", ("星点密度", "Star density"), ("背景星点的明显程度", "How visible the background stars are")),
-    ThemeKnob::new("star_random", ("分布随机化", "Randomize layout"), ("0 = 固定一片星空，1 = 每次重建换一片", "0 = one fixed sky, 1 = reshuffle on every rebuild")),
-    ThemeKnob::new("star_twinkle", ("闪烁", "Twinkle"), ("星点缓慢明暗呼吸的强度", "How strongly stars breathe between bright and dim")),
-    ThemeKnob::new("star_size_var", ("大小不规则", "Size variation"), ("星点半径的差异程度", "How much star radii vary")),
-    ThemeKnob::new("star_cursor", ("光标互动", "Cursor parallax"), ("星点随光标位置反向偏移（视差）", "Stars shift opposite to the cursor (parallax)")),
+    ThemeKnob::new("purple_tint", msg("Purple tint"), msg("How strongly the purple base mixes in")),
+    ThemeKnob::new("purple_stars", msg("Star density"), msg("How visible the background stars are")),
+    ThemeKnob::new("star_random", msg("Randomize layout"), msg("0 = one fixed sky, 1 = reshuffle on every rebuild")),
+    ThemeKnob::new("star_twinkle", msg("Twinkle"), msg("How strongly stars breathe between bright and dim")),
+    ThemeKnob::new("star_size_var", msg("Size variation"), msg("How much star radii vary")),
+    ThemeKnob::new("star_cursor", msg("Cursor parallax"), msg("Stars shift opposite to the cursor (parallax)")),
 ];
 
 /// OLED 主题的旋钮（[`SecondaryTheme::Oled`]）。
 static OLED_KNOBS: &[ThemeKnob] = &[
-    ThemeKnob::new("oled_black", ("纯黑程度", "Black level"), ("背景压向纯黑的比例", "How far the background is pushed toward pure black")),
-    ThemeKnob::new("oled_borders", ("分隔提亮", "Borders"), ("纯黑下靠描边区分层级", "Separate layers with brighter borders on pure black")),
+    ThemeKnob::new("oled_black", msg("Black level"), msg("How far the background is pushed toward pure black")),
+    ThemeKnob::new("oled_borders", msg("Borders"), msg("Separate layers with brighter borders on pure black")),
 ];

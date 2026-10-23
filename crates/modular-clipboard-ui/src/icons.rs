@@ -78,6 +78,7 @@ pub use draw::paint_inline;
 pub use md::MdIconGeom;
 pub use md::md_icon_geom;
 pub use md::paint_kind_icon;
+use modular_clipboard_core::i18n::msg;
 
 
 
@@ -233,30 +234,30 @@ impl Icon {
     }
 
     /// 无障碍标签（双语对）。屏幕阅读器会读出这个。
-    pub fn label(self) -> modular_clipboard_core::i18n::Bi {
+    pub fn label(self) -> modular_clipboard_core::i18n::Msg {
         match self {
-            Icon::Close => ("关闭", "Close"),
-            Icon::Pinned => ("已置顶", "Pinned"),
-            Icon::Unpinned => ("取消置顶", "Unpin"),
-            Icon::Search => ("搜索", "Search"),
-            Icon::Settings => ("设置", "Settings"),
-            Icon::Text => ("文本", "Text"),
-            Icon::Code => ("HTML", "HTML"),
-            Icon::Image => ("图片", "Image"),
-            Icon::File => ("文件", "Files"),
-            Icon::Minimize => ("最小化", "Minimize"),
-            Icon::Collapse => ("折叠", "Collapse"),
-            Icon::Expand => ("展开", "Expand"),
-            Icon::Drag => ("拖拽", "Drag"),
+            Icon::Close => msg("Close"),
+            Icon::Pinned => msg("Pinned"),
+            Icon::Unpinned => msg("Unpin"),
+            Icon::Search => msg("Search"),
+            Icon::Settings => msg("Settings"),
+            Icon::Text => msg("Text"),
+            Icon::Code => "HTML",
+            Icon::Image => msg("Image"),
+            Icon::File => msg("Files"),
+            Icon::Minimize => msg("Minimize"),
+            Icon::Collapse => msg("Collapse"),
+            Icon::Expand => msg("Expand"),
+            Icon::Drag => msg("Drag"),
             // CAUTION: `Lock` / `Unlock` 必须成对（Locked / Lock），不能用
             // Locked / Pin——后者把「锁」和「置顶」混成一个词，英文 UI 上
             // 两个无关功能显示同一个名字，翻译表也无法按英文区分。
-            Icon::Lock => ("已固定", "Locked"),
-            Icon::Unlock => ("固定", "Lock"),
-            Icon::Table => ("表格视图", "Table view"),
-            Icon::Mask => ("密文视图", "Masked"),
-            Icon::Trash => ("清空", "Clear"),
-            Icon::Copy => ("复制", "Copy"),
+            Icon::Lock => msg("Locked"),
+            Icon::Unlock => msg("Lock"),
+            Icon::Table => msg("Table view"),
+            Icon::Mask => msg("Masked"),
+            Icon::Trash => msg("Clear"),
+            Icon::Copy => msg("Copy"),
         }
     }
 
@@ -436,7 +437,7 @@ mod tests {
     fn every_icon_has_a_label() {
         // 空标签会让屏幕阅读器静默，这是可访问性缺陷。
         for &i in Icon::ALL {
-            assert!(!i.label().0.is_empty() && !i.label().1.is_empty(), "{i:?} 缺少无障碍标签");
+            assert!(!i.label().is_empty(), "{i:?} 缺少无障碍标签");
         }
     }
 

@@ -75,7 +75,7 @@ pub(super) fn capture_recording(&mut self, ctx: &egui::Context) {
         let mut chars = name.chars();
         let _first = chars.next();
         if chars.next().is_some() && !name.starts_with('F') {
-            self.svc.notify(modular_clipboard_core::i18n::t(("不支持把 {name} 设为快捷键", "{name} is not a supported shortcut")).replace("{name}", name));
+            self.svc.notify(modular_clipboard_core::i18n::t("{name} is not a supported shortcut").replace("{name}", name));
             return;
         }
         let hotkey = modular_clipboard_core::config::Hotkey {
@@ -88,7 +88,7 @@ pub(super) fn capture_recording(&mut self, ctx: &egui::Context) {
             win: modular_clipboard_platform::win_key_down(),
         };
         if !hotkey.ctrl && !hotkey.shift && !hotkey.alt && !hotkey.win {
-            self.svc.notify(modular_clipboard_core::i18n::t(("至少按住一个修饰键（Ctrl/Shift/Alt/Win）", "Hold at least one modifier (Ctrl/Shift/Alt/Win)")).into());
+            self.svc.notify(modular_clipboard_core::i18n::t("Hold at least one modifier (Ctrl/Shift/Alt/Win)").into());
             return;
         }
         // 后按的覆盖先按的：用户改主意就再按一次新的。

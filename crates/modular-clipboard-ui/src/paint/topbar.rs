@@ -27,6 +27,7 @@ use super::list::SEARCH_TYPING_GRACE;
 use super::shadow::card_shadow_layers;
 use super::shadow::fade_color;
 use super::shadow::lerp_color;
+use modular_clipboard_core::i18n::msg;
 
 // ---------------------------------------------------------------- 顶栏
 
@@ -101,7 +102,7 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
         vec2(sq, sq),
     );
     f.hit_insert("topbar_close", hide_r);
-    if icon_button(f, "topbar_close", hide_r, Icon::Minimize, t(("关闭到托盘", "Hide to tray")), false, false) {
+    if icon_button(f, "topbar_close", hide_r, Icon::Minimize, t("Hide to tray"), false, false) {
         f.state.push(Op::CloseWindow);
     }
 
@@ -400,7 +401,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut f.state.query)
-                    .hint_text(t(("搜索历史…", "Search history…")))
+                    .hint_text(t("Search history…"))
                     .desired_width(f32::INFINITY)
                     // IMPORTANT: 字号必须给**不带scale 的逻辑字号**。
                     //
@@ -511,7 +512,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
             // 清空后主动交还焦点：否则用户还得再点一次才能继续打字。
             f.ui.memory_mut(|m| m.request_focus(edit_resp.id));
         }
-        cr.on_hover_text(t(("清空搜索", "Clear search")));
+        cr.on_hover_text(t("Clear search"));
     }
 
     // 焦点请求在**画完之后**发：id 刚自报出来，此刻才有效。
@@ -912,7 +913,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
                 tp(
                     count as i64,
                     " entry (multi-select)",
-                    (" 条（可多选）", " entries (multi-select)")
+                    msg(" entries (multi-select)")
                 )
             )
         } else {
@@ -920,7 +921,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
                 "{} · {}{}",
                 t(kind.label()),
                 count,
-                tp(count as i64, " entry", (" 条", " entries"))
+                tp(count as i64, " entry", msg(" entries"))
             )
         };
         resp.on_hover_text(tip);
@@ -994,7 +995,7 @@ pub(super) fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
         "topbar_pin",
         r_pin,
         if pinned { Icon::Pinned } else { Icon::Unpinned },
-        if pinned { t(("取消窗口置顶", "Unpin window")) } else { t(("窗口置顶", "Pin window")) },
+        if pinned { t("Unpin window") } else { t("Pin window") },
         false,
         pinned,
     ) {
@@ -1004,7 +1005,7 @@ pub(super) fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
             value: !pinned,
         });
     }
-    if icon_button(f, "topbar_settings", r_set, Icon::Settings, t(("设置", "Settings")), false, false) {
+    if icon_button(f, "topbar_settings", r_set, Icon::Settings, t("Settings"), false, false) {
         f.state.push(Op::ToggleSettings);
     }
 }
@@ -1189,7 +1190,7 @@ pub(super) fn draw_clear_button(f: &mut Frame<'_>, r: Rect) {
 
     // 热区登记（拖动区挖空要用）。
     f.hit_insert("topbar_clear", r);
-    resp.on_hover_text(t(("清空全部历史（长按 5 秒）", "Clear all history (hold 5s)")));
+    resp.on_hover_text(t("Clear all history (hold 5s)"));
 }
 
 pub(super) fn icon_button(
@@ -1313,9 +1314,9 @@ pub(super) fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response
         },
     );
     resp.on_hover_text(if f.state.search_expanded {
-        t(("搜索（展开中）", "Search (expanded)"))
+        t("Search (expanded)")
     } else if !f.state.query.is_empty() {
-        t(("搜索（过滤生效中，点击查看）", "Search (filter active, click to view)"))
+        t("Search (filter active, click to view)")
     } else {
         "搜索"
     })

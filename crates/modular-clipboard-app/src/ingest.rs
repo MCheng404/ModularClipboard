@@ -10,6 +10,7 @@ use modular_clipboard_core::ClipKind;
 use std::time::Instant;
 
 use super::{AppState, SELF_WRITE_GUARD_MS_FLOOR};
+use modular_clipboard_core::i18n::msg;
 
 /// 在状态栏显示一条消息（3 秒后由绘制层过期）。
 pub(super) fn set_notice(state: &mut AppState, msg: String) {
@@ -114,7 +115,7 @@ pub(super) fn build_preview(payload: &CapturedPayload) -> String {
                 modular_clipboard_core::i18n::tp(
                     names.len() as i64,
                     "{a} + {b} more file",
-                    ("{a} 等 {b} 个文件", "{a} + {b} more files"),
+                    msg("{a} + {b} more files"),
                 )
                 .replace("{a}", &names[0])
                 .replace("{b}", &names.len().to_string())
@@ -131,13 +132,13 @@ pub(super) fn build_preview(payload: &CapturedPayload) -> String {
             match dims {
                 Some((w, h)) => format!(
                     "{} {w}×{h}",
-                    modular_clipboard_core::i18n::t(("图片", "Image"))
+                    modular_clipboard_core::i18n::t("Image")
                 ),
                 None => format!(
                     "{} {} {}",
-                    modular_clipboard_core::i18n::t(("图片", "Image")),
+                    modular_clipboard_core::i18n::t("Image"),
                     payload.bytes.len(),
-                    modular_clipboard_core::i18n::t(("字节", "bytes"))
+                    modular_clipboard_core::i18n::t("bytes")
                 ),
             }
         }
@@ -227,16 +228,16 @@ pub fn format_time(ts_ms: i64, now_ms: i64) -> String {
     use modular_clipboard_core::i18n::tp;
     let diff = now_ms - ts_ms;
     if diff < 60_000 {
-        modular_clipboard_core::i18n::t(("刚刚", "Just now")).to_string()
+        modular_clipboard_core::i18n::t("Just now").to_string()
     } else if diff < 3_600_000 {
         // 「min」是缩写，英文单复数同形；俄语仍要按 CLDR 选形。
         let n = diff / 60_000;
-        format!("{} {}", n, tp(n, "min ago", ("分钟前", "min ago")))
+        format!("{} {}", n, tp(n, "min ago", msg("min ago")))
     } else if diff < 86_400_000 {
         let n = diff / 3_600_000;
-        format!("{} {}", n, tp(n, "hour ago", ("小时前", "hours ago")))
+        format!("{} {}", n, tp(n, "hour ago", msg("hours ago")))
     } else {
         let n = diff / 86_400_000;
-        format!("{} {}", n, tp(n, "day ago", ("天前", "days ago")))
+        format!("{} {}", n, tp(n, "day ago", msg("days ago")))
     }
 }

@@ -8,7 +8,7 @@ use egui::Sense;
 use egui::Ui;
 use egui::pos2;
 use egui::vec2;
-use modular_clipboard_core::i18n::Bi;
+use modular_clipboard_core::i18n::Msg;
 use modular_clipboard_core::i18n::t;
 
 use super::{Frame};
@@ -332,7 +332,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
     // 补间键前缀——交互 Id 用 `("seg", i, label)`（选项文字全局唯一），
     // 补间 Id 必须再叠一层本实例名，否则两个控件会共享同一段补间。
     id_suffix: &'static str,
-    options: &[(T, Bi)],
+    options: &[(T, Msg)],
     cur: T,
 ) -> Option<T> {
     let pal = f.pal;
@@ -344,7 +344,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
     let font = egui::FontId::proportional(pal.font_sm);
     let mut seg_w = 0.0_f32;
     for (_, label) in options {
-        let label = t(*label);
+        let label = t(label);
         let w = ui
             .painter()
             .layout_no_wrap(label.to_string(), font.clone(), pal.text)
@@ -390,7 +390,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
     painter.rect_filled(pill, pal.radius_sm, pal.surface);
     let mut picked = None;
     for (i, (value, label)) in options.iter().enumerate() {
-        let label = t(*label);
+        let label = t(label);
         let seg = egui::Rect::from_min_max(
             pos2(r.min.x + seg_w * i as f32, r.min.y),
             pos2(r.min.x + seg_w * (i + 1) as f32, r.max.y),

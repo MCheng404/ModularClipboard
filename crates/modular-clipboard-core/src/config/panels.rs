@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde::Serialize;
+use crate::i18n::msg;
 
 /// 类型过滤栏配置（第三轮原型移植项）。
 ///
@@ -115,10 +116,10 @@ pub enum SearchPanelPos {
 
 impl SearchPanelPos {
     /// 设置界面展示名（双语对）。
-    pub fn label(self) -> crate::i18n::Bi {
+    pub fn label(self) -> crate::i18n::Msg {
         match self {
-            SearchPanelPos::Top => ("窗口上方", "Above"),
-            SearchPanelPos::Bottom => ("窗口下方", "Below"),
+            SearchPanelPos::Top => msg("Above"),
+            SearchPanelPos::Bottom => msg("Below"),
         }
     }
 }
@@ -162,12 +163,12 @@ pub enum TypeRailPos {
 
 impl TypeRailPos {
     /// 设置界面下拉框展示名（双语对）。
-    pub fn label(self) -> crate::i18n::Bi {
+    pub fn label(self) -> crate::i18n::Msg {
         match self {
-            TypeRailPos::Right => ("右侧", "Right edge"),
-            TypeRailPos::Left => ("左侧", "Left edge"),
-            TypeRailPos::Top => ("顶部", "Top edge"),
-            TypeRailPos::Bottom => ("底部", "Bottom edge"),
+            TypeRailPos::Right => msg("Right edge"),
+            TypeRailPos::Left => msg("Left edge"),
+            TypeRailPos::Top => msg("Top edge"),
+            TypeRailPos::Bottom => msg("Bottom edge"),
         }
     }
 
