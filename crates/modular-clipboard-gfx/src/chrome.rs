@@ -80,134 +80,38 @@
 //! 表项在 `Window::drop` 里由 [`forget`] 清理：HWND 会被系统复用，
 //! 不清理的话新窗口可能捡到旧窗口的拖动区。
 
-use std::ffi::c_void;
-
 use egui::emath::{Pos2, Rect, Vec2};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{
-    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
-    DwmSetWindowAttribute,
-};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetCursorPos, GetWindowRect, IsZoomed, LoadCursorW, SetCursor,
     SetForegroundWindow, SetWindowPos, WindowFromPoint, SWP_NOACTIVATE, SWP_NOZORDER,
-    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, HTTRANSPARENT, WM_NCHITTEST,
-    IDC_ARROW, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTLEFT, HTRIGHT,
+    HTTOP, HTTOPLEFT, HTTOPRIGHT, WM_NCHITTEST, IDC_ARROW,
 };
 
-// 非客户区指针消息（裸常量，避免 crate 枚举类型差异）。
-// 用裸常量与 window.rs 里 SC_CLOSE 的处理风格一致。
-const WM_NCMOUSEMOVE: u32 = 0x00A0;
-const WM_NCLBUTTONDOWN: u32 = 0x00A1;
-const WM_NCLBUTTONUP: u32 = 0x00A2;
-const WM_NCLBUTTONDBLCLK: u32 = 0x00A3;
-// 这几条客户区消息在 SetCapture 后也可能落到拖动窗口上。
-const WM_MOUSEMOVE_C: u32 = 0x0200;
-const WM_LBUTTONUP_C: u32 = 0x0202;
-const WM_CAPTURECHANGED_C: u32 = 0x0215;
-// WM_SETCURSOR（0x0020）不在 WM_NC* 段里，但同样是窗口过程
-// 决定光标形状的消息，这里一并接管（见 handle_non_client）。
-const WM_SETCURSOR: u32 = 0x0020;
+mod hit;
+mod corners;
 
-/// 边缘 resize 区的默认宽度，**逻辑点**。
-///
-/// 取6 是 Windows 11 原生无边框窗口的观感值。物理像素由
-/// [`GetDpiForWindow`] 换算，所以高分屏上不会细得点不中。
-pub const DEFAULT_RESIZE_BORDER: f32 = 6.0;
+use hit::WM_CAPTURECHANGED_C;
+use hit::WM_LBUTTONUP_C;
+use hit::WM_MOUSEMOVE_C;
+use hit::WM_NCLBUTTONDBLCLK;
+use hit::WM_NCLBUTTONDOWN;
+use hit::WM_NCLBUTTONUP;
+use hit::WM_NCMOUSEMOVE;
+use hit::WM_SETCURSOR;
+pub use hit::DEFAULT_RESIZE_BORDER;
+pub use hit::HitZone;
+pub use hit::hit_test;
+pub use hit::popup_zone;
+pub use corners::apply_rounded_corners;
+pub use corners::disable_rounded_corners;
 
-// ---------------------------------------------------------------------------
-// 纯逻辑：命中测试（可直接单测，不碰任何 Win32）
-// ---------------------------------------------------------------------------
 
-/// 指针落在窗口的哪个区域。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HitZone {
-    /// 客户区，事件照常交给 egui。
-    Client,
-    /// 拖动区（自绘标题栏），系统接管窗口移动。
-    Caption,
-    /// 上 / 下 / 左 / 右边缘，非模态指针捕获驱动缩放。
-    Top,
-    Bottom,
-    Left,
-    Right,
-    /// 四角。
-    TopLeft,
-    TopRight,
-    BottomLeft,
-    BottomRight,
-    /// **点击穿透**：指针不在窗口的有效内容上（弹窗的投影 / 透明边距）。
-    ///
-    /// 悬浮面板的窗口矩形要比面板本身大一圈来容纳投影，那圈区域
-    /// 画出来是透明的。命中判定按**窗口矩形**而不是按像素 alpha，
-    /// 于是不处理的话，点在投影上会被这个窗口吃掉——用户想点
-    /// 面板后面的东西却没反应（面板越靠边越明显）。
-    /// 返回 `HTTRANSPARENT` 后点击落到下面的窗口，行为与「那里
-    /// 没有这个窗口」完全一致。
-    Transparent,
-}
-
-impl HitZone {
-    /// 该区域对应的 `WM_NCHITTEST` 返回值。
-    pub fn hit_code(self) -> u32 {
-        match self {
-            HitZone::Client => HTCLIENT,
-            HitZone::Caption => HTCAPTION,
-            HitZone::Top => HTTOP,
-            HitZone::Bottom => HTBOTTOM,
-            HitZone::Left => HTLEFT,
-            HitZone::Right => HTRIGHT,
-            HitZone::TopLeft => HTTOPLEFT,
-            HitZone::TopRight => HTTOPRIGHT,
-            HitZone::BottomLeft => HTBOTTOMLEFT,
-            HitZone::BottomRight => HTBOTTOMRIGHT,
-            // NOTE: windows crate 里 `HTTRANSPARENT` 是 `i32`，
-            // 其余命中码是 `u32`——这里显式转换而不是让整个 match 迁就它。
-            HitZone::Transparent => HTTRANSPARENT as u32,
-        }
-    }
-
-    /// 该区域应显示的系统光标资源 ID。
-    ///
-    /// - 边/角：对应的 resize 光标（`IDC_SIZEWE` 等）；
-    /// - 拖动区：箭头（与原生窗口的标题栏光标一致，移动窗口
-    ///   本来就是箭头）；
-    /// - 客户区：返回 `None`——那里由 egui 的光标决定
-    ///   （手型 / I-beam 等）。
-    pub fn cursor_id(self) -> Option<u16> {
-        Some(match self {
-            HitZone::Left | HitZone::Right => IDC_SIZEWE.0 as u16,
-            HitZone::Top | HitZone::Bottom => IDC_SIZENS.0 as u16,
-            HitZone::TopLeft | HitZone::BottomRight => IDC_SIZENWSE.0 as u16,
-            HitZone::TopRight | HitZone::BottomLeft => IDC_SIZENESW.0 as u16,
-            HitZone::Caption => IDC_ARROW.0 as u16,
-            // 透明区：光标由下面的窗口负责（它才是命中目标）。
-            HitZone::Client | HitZone::Transparent => return None,
-        })
-    }
-}
-
-/// 弹窗命中判定：面板之外 = 点击穿透。**纯逻辑**，可直接单测。
-///
-/// `panel = None`（主窗口）⇒ `None`，走常规 [`hit_test`]。
-/// `Some(rect)` 且点在 rect 外 ⇒ [`HitZone::Transparent`]（点击落到
-/// 下面的窗口）；点在 rect 内 ⇒ `None`（照常由 `hit_test` 判）。
-///
-/// 抽成独立函数而不是塞在 `hit_zone_at_screen` 里：那条路径要真实
-/// HWND + `ScreenToClient`，单测里根本执行不到——而「面板外必须穿透」
-/// 恰恰是最该有测试的一条（漏了就是「点投影把底下的窗口吃掉」）。
-pub fn popup_zone(pos: Pos2, panel: Option<Rect>) -> Option<HitZone> {
-    match panel {
-        Some(r) if !r.contains(pos) => Some(HitZone::Transparent),
-        _ => None,
-    }
-}
 
 /// 设置弹窗的有效内容矩形（逻辑点、客户区坐标系）。
 ///
@@ -230,92 +134,6 @@ pub fn panel_shape(hwnd: HWND) -> Option<Rect> {
     chrome_of(hwnd).panel
 }
 
-/// 判定 `pos`（**逻辑点**，客户区坐标系）落在哪个区域。
-///
-/// `drag` 是自绘标题栏的矩形（逻辑点）。`None` 表示**没有拖动区**——
-/// 此时除边缘外全部是 `Client`。
-///
-/// # 优先级：角 > 边 > 标题栏 > 客户区
-///
-/// 边缘优先于拖动区，与原生窗口一致：原生窗口的上边框本来就压在
-/// 标题栏之上，两者共存时用户预期是「最上面几条像素是缩放」。
-/// 反过来（标题栏优先）会让顶部边缘永远拉不动。
-///
-/// # 退化输入
-///
-/// - `border <= 0` ⇒ 只有 `Client` 与 `Caption`（无 resize）。
-/// - 窗口比 `2 * border` 还小（角与角重叠）⇒ `border` 被钳到
-///   `size / 2`，保证四角判定不会互相吞掉，且中心区始终存在。
-///   命中测试。`drag` 是自绘标题栏拖动区（逻辑点、客户区坐标系）。
-///
-/// # IMPORTANT: 调用方**必须**把交互控件从 `drag` 里排除
-///
-/// 返回 `HitZone::Caption` 会让系统把下一次按下转成
-/// `WM_NCLBUTTONDOWN`（非客户区消息），**根本不会产生
-/// `WM_LBUTTONDOWN`** —— 于是 egui 收不到点击。
-///
-/// 早前 UI 层把**整个顶栏**报成拖动区：
-/// `f.state.drag_region = Some(bar);`，而 `bar` 里含齿轮、垃圾桶、
-/// 搜索框。结果点这些控件毫无反应（表现是「设置打不开」），
-/// 但 paint 层的交互测试**全部通过** —— 测试环境没有
-/// `WM_NCHITTEST`，这条路径在测试里根本不执行。
-pub fn hit_test(pos: Pos2, size: Vec2, border: f32, drag: &[Rect]) -> HitZone {
-    let inside = pos.x >= 0.0 && pos.y >= 0.0 && pos.x < size.x && pos.y < size.y;
-
-    if !inside {
-        // 指针在窗口外：交给系统（会变成 HTNOWHERE / 激活相邻窗口）。
-        // 绝不能在这里返回 Caption 之类的非 client 值——
-        // 那会让鼠标移到窗口外时窗口仍被"抓住"。
-        return HitZone::Client;
-    }
-
-    // NaN / 负尺寸不该出现，但边界函数不能因此 panic。
-    let w = if size.x.is_finite() && size.x > 0.0 { size.x } else { 0.0 };
-    let h = if size.y.is_finite() && size.y > 0.0 { size.y } else { 0.0 };
-    let mut b = if border.is_finite() && border > 0.0 { border } else { 0.0 };
-    b = b.min(w / 2.0).min(h / 2.0);
-
-    if b > 0.0 {
-        let near_left = pos.x < b;
-        let near_right = pos.x >= w - b;
-        let near_top = pos.y < b;
-        let near_bottom = pos.y >= h - b;
-
-        // 角先判：否则小窗口下角会被边吞掉。
-        match (near_top, near_bottom, near_left, near_right) {
-            (true, false, true, false) => return HitZone::TopLeft,
-            (true, false, false, true) => return HitZone::TopRight,
-            (false, true, true, false) => return HitZone::BottomLeft,
-            (false, true, false, true) => return HitZone::BottomRight,
-            _ => {}
-        }
-        if near_top {
-            return HitZone::Top;
-        }
-        if near_bottom {
-            return HitZone::Bottom;
-        }
-        if near_left {
-            return HitZone::Left;
-        }
-        if near_right {
-            return HitZone::Right;
-        }
-    }
-
-    // 拖动区是**多段**的：控件从中挖空，点任意一段才算标题栏。
-    //
-    // IMPORTANT: 这里必须逐段判`contains`。早前只有一段（整个顶栏），
-    // 于是齿轮、垃圾桶、搜索框全被算成 `Caption`，
-    // 系统不产生 `WM_LBUTTONDOWN`，egui 收不到点击。
-    for r in drag {
-        if r.width() > 0.0 && r.height() > 0.0 && r.contains(pos) {
-            return HitZone::Caption;
-        }
-    }
-
-    HitZone::Client
-}
 
 // ---------------------------------------------------------------------------
 // 全局外壳状态（窗口过程拿不到实例，见模块文档）
@@ -884,69 +702,12 @@ pub(crate) unsafe fn handle_non_client(
     Some(LRESULT(zone.hit_code() as isize))
 }
 
-/// 打开 Win11 圆角，并去掉系统自动画的那条 1px 描边。
-///
-/// **优雅降级**：Win10 或调用失败时只记一条 debug，不 panic、不中断启动。
-/// 圆角是锦上添花，缺了不影响任何功能。
-/// 明确**不要**系统圆角（`DWMWCP_DONOTROUND`）。
-///
-/// # 为什么需要这个
-///
-/// 微软文档写得很清楚：使用**每像素 alpha 分层**（在窗口周围画透明像素
-/// 以实现自定义阴影）的窗口，**无法**被 DWM 圆角化——系统把它当非矩形
-/// 窗口处理。反过来也成立：只要 DWM 还在尝试圆角，我们自绘的投影就会
-/// 被它那一刀切掉（实机表现为四个角的三角形）。
-///
-/// 因此「自研圆角 + 自研投影」的窗口必须**显式关掉**系统圆角，让窗口
-/// 保持矩形，圆角与投影全部由渲染层画。
-pub fn disable_rounded_corners(hwnd: HWND) {
-    let pref = DWMWCP_DONOTROUND;
-    if let Err(e) = unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &pref as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
-            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
-        )
-    } {
-        tracing::debug!("关闭系统圆角失败（Win10 或 DWM 不可用，属预期）: {e:?}");
-    }
-}
-
-pub fn apply_rounded_corners(hwnd: HWND) {
-    // Win11 才认DWMWA_WINDOW_CORNER_PREFERENCE（属性号 33）。
-    // Win10 上返回 E_INVALIDARG，属预期。
-    let pref = DWMWCP_ROUND;
-    if let Err(e) = unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &pref as *const DWM_WINDOW_CORNER_PREFERENCE as *const c_void,
-            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
-        )
-    } {
-        tracing::debug!("设置圆角失败（Win10 或 DWM 不可用，属预期）: {e:?}");
-    }
-
-    // Win11 会给无边框窗口补一条 1px 描边，配上 egui 自绘的背景很违和。
-    // DWMWA_COLOR_NONE(0xFFFFFFFE) 表示「不要边框」。
-    let none = DWMWA_COLOR_NONE;
-    let res = unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &none as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        )
-    };
-    if let Err(e) = res {
-        tracing::debug!("关闭系统描边失败（Win10 或 DWM 不可用，属预期）: {e:?}");
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 测试专用导入：lib 目标看不到 `mod tests`，放在 root 顶层会被报未用。
+    use windows::Win32::UI::WindowsAndMessaging::{HTCLIENT, HTTRANSPARENT};
 
     const SIZE: Vec2 = Vec2::new(400.0, 600.0);
     const B: f32 = 6.0;
