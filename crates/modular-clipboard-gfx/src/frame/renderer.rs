@@ -1374,6 +1374,22 @@ impl<'a> FrameRenderer<'a> {
         // `anyhow::Context`，手工包一层。
         unsafe { self.gpu.device.wait_for_fences(&fences, true, FENCE_TIMEOUT) }
             .map_err(|e| anyhow::anyhow!("等待本窗口在途帧完成失败: {e:?}"))?;
+        // 等待成功后**必须 reset** 这批栅栏（Vulkan 规范：fence 被 wait
+        // 到 signaled 之后、再提交之前，要 `vkResetFences` 才能再次用）。
+        //
+        // CAUTION: 早先这里只清 `in_flight` 而不 reset，于是
+        // `abandon_frame`（每帧可达的错误路径）走过之后，槽位轮回转回时
+        // `acquire` 里「`in_flight` 为真才 reset」的分支被跳过 ⇒
+        // `present` 把一个**已 signal 但未 reset** 的 fence 交给
+        // `queue_submit`，即 `VUID-vkQueueSubmit-fence-00063`，
+        // 每帧违规、直到交换链重建重建栅栏才自愈（GFX-01）。
+        //
+        // 这里没有任何「等完还要读栅栏状态」的下游：唯一的
+        // `fence_signaled` 读取点在 `acquire` 自己那次 wait 之后，
+        // 与本函数无关。
+        // SAFETY: 句柄由本结构持有且尚未销毁； fences 均已 signaled。
+        unsafe { self.gpu.device.reset_fences(&fences) }
+            .map_err(|e| anyhow::anyhow!("复位本窗口 submit 栅栏失败: {e:?}"))?;
         // 等待成功后清标记：GPU 已读完这些槽位的资源，后续无论是销毁
         // 重建还是继续复用，状态都是自洽的。
         for s in self.slots.iter_mut() {
