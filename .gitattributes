@@ -1,0 +1,32 @@
+# ⚠️ 顺序有意义：gitattributes 里**最后一条匹配的行生效**。
+# 所以通配规则必须写在前面，具体规则写在后面才能覆盖它。
+
+* text=auto
+
+# 含中文的 Windows 脚本必须是 GBK（cmd / wscript 按系统 ANSI 码页读）。
+#
+# 声明为 binary（= -diff -merge -text）：否则 Git 按文本处理、会规范化
+# 行尾，改动时可能破坏 GBK 字节序列。这类损坏只在用户双击运行时才暴露，
+# 而且 cmd 报的是「命令语法不正确」，指向的位置往往看起来完全正常。
+*.cmd   binary
+*.vbs   binary
+
+# 文本文件统一按 LF 存储、检出时转 CRLF（Windows 习惯）。
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.wgsl      text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# ---- GitHub Linguist：语言统计只保留 Rust（项目主体编写语言）----
+#
+# 仓库里另有大量验证 / 构建脚本（PowerShell、Python、Shell）、HTML 原型、
+# WGSL 着色器、文档与二进制资源（图片/字体/图标），它们都不是产品的
+# 编写语言，纳入语言条会稀释 Rust 的占比。
+#
+# 遵循本文件开头「最后一条匹配生效」的规则：先对所有文件关闭语言检测，
+# 再单独对 *.rs 打开。
+*    linguist-detectable=false
+*.rs linguist-detectable=true

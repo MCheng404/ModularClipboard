@@ -1,0 +1,764 @@
+//! 渲染通道与图形管线。
+//!
+//! 管线是固定的一组状态（本项目不做材质切换），因此只需在启动时创建一次，
+//! 之后每帧复用。渲染通道在交换链重建时必须重建——它的附件引用了
+//! 交换链的图像视图。
+
+use ash::{Device, vk};
+
+use crate::shader::ShaderModule;
+use crate::Swapchain;
+
+/// uniform 缓冲区的绑定槽。
+pub const BINDING_UNIFORM: u32 = 0;
+/// 采样器的绑定槽。
+pub const BINDING_SAMPLER: u32 = 1;
+/// 字体图集纹理的绑定槽。
+pub const BINDING_TEXTURE: u32 = 2;
+/// 用户纹理（图片缩略图）。与 `BINDING_TEXTURE`（字体图集）分开的理由：
+/// 字体图集是单通道覆盖率图，缩略图是 RGBA 彩色图，
+/// 片元着色器对两者的合成方式不同。
+pub const BINDING_USER_TEXTURE: u32 = 3;
+/// 用户纹理的**独立采样器**（linear）。字体图集走 [`BINDING_SAMPLER`]
+/// （nearest），两者过滤要求正相反，见布局构造处的长注释。
+pub const BINDING_USER_SAMPLER: u32 = 4;
+
+/// 顶点属性位置。
+mod location {
+    /// 屏幕空间位置（vec2<f32>）
+    pub const POS: u32 = 0;
+    /// 纹理坐标（vec2<f32>）
+    pub const UV: u32 = 1;
+    /// 顶点色（u32，打包为 ABGR）
+    pub const COLOR: u32 = 2;
+    /// 纹理索引（u32）：0 = 字体图集，1 = 用户纹理（缩略图）
+    pub const TEX_ID: u32 = 3;
+}
+
+/// uniform 数据布局。
+///
+/// 对应 WGSL 中的 `Uniforms` struct。布局必须与着色器声明完全一致，
+/// 字段顺序与 std140 对齐规则共同决定实际字节布局：
+/// - `mat4x4<f32>` 占 64 字节，4 字节对齐
+/// - `vec2<f32>` 占 8 字节，但对齐要求是 8 的倍数
+/// - 两个 `f32` 各占 4 字节
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Uniforms {
+    /// 视口尺寸（物理像素）。
+    pub size_in_pixels: [f32; 2],
+    /// 设备像素比。
+    pub dpr: f32,
+    /// 填充，保证结构体大小是 16 字节的倍数。
+    pad: f32,
+}
+
+impl Uniforms {
+    /// 构造 uniform。
+    ///
+    /// `scale` 是 egui 的 `pixels_per_point`（逻辑像素 → 物理像素的比例）。
+    ///
+    /// 2026-10-17：删掉了恒为单位矩阵的 `clip_from_uv`（64 字节）。
+    /// 它从来只有单位矩阵一个值（有测试钉过），而着色器自己做
+    /// 像素→NDC ⇒ 每顶点 16 个 FMA 的纯浪费，还留着一个
+    /// 「谁把它设成非单位矩阵就二次变换」的陷阱。uniform 80 → 16 字节。
+    pub fn new(size_in_pixels: [f32; 2], scale: f32) -> Self {
+        Self {
+            size_in_pixels,
+            dpr: scale,
+            pad: 0.0,
+        }
+    }
+}
+
+/// 渲染通道。
+pub struct RenderPass {
+    pub handle: vk::RenderPass,
+}
+
+impl RenderPass {
+    /// 为给定交换链格式创建渲染通道。
+    pub fn new(device: &Device, format: vk::Format) -> anyhow::Result<Self> {
+        let color_attachment = vk::AttachmentDescription {
+            format,
+            flags: vk::AttachmentDescriptionFlags::empty(),
+            samples: vk::SampleCountFlags::TYPE_1,
+            // load_op 用 CLEAR：每帧重绘背景色，不依赖图像原有内容。
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::STORE,
+            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+            // `initial_layout` 必须是 COLOR_ATTACHMENT_OPTIMAL，不能是 UNDEFINED。
+            //
+            // `cmd_begin_render_pass` 会按 `initial_layout` **隐式**转换布局。
+            // 若此处写 UNDEFINED，它会先做一次 `UNDEFINED → COLOR_ATTACHMENT_OPTIMAL`；
+            // 而 `FrameRenderer::open_command_buffer` 在开通道**之前**已用
+            // `LayoutTracker` 显式录了一道屏障转到 COLOR_ATTACHMENT_OPTIMAL。
+            // 两套机制并存 ⇒ 显式屏障的 `oldLayout`（PRESENT_SRC_KHR）已过期
+            // ⇒ `VUID-VkImageMemoryBarrier-oldLayout-01197`。
+            //
+            // 改成 COLOR_ATTACHMENT_OPTIMAL 后只剩**一套**转换机制：
+            // 显式屏障是权威，渲染通道不再隐式转换，两者一致。
+            //
+            // 之所以**不**同时改 `LayoutTracker` 的初值：
+            // 交换链图像在首次 acquire 前真实布局就是 UNDEFINED
+            // （`vkCreateSwapchainKHR` 不保留上一帧内容）。
+            // 若谎报为 COLOR_ATTACHMENT_OPTIMAL，
+            // `open_command_buffer` 里 `old_layout == UNDEFINED` 的分支
+            // 就永远走不到，首帧会去等待一个**不存在的写入**。
+            initial_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            // `final_layout` 故意**不**设 PRESENT_SRC_KHR，
+            // 而是保持 COLOR_ATTACHMENT_OPTIMAL。
+            //
+            // `final_layout` 若为 PRESENT_SRC_KHR，渲染通道**结束时**
+            // 会隐式做一次 `COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR`；
+            // 而 `FrameRenderer::present` 在 `cmd_end_render_pass` 之后
+            // 又录了一道**显式**屏障做同样的转换。
+            // 隐式那次已执行 ⇒ 显式屏障的 `oldLayout` 过期
+            // ⇒ `VUID-VkImageMemoryBarrier-oldLayout-01197`。
+            //
+            // 设为 COLOR_ATTACHMENT_OPTIMAL 后，渲染通道**完全不做**
+            // 隐式转换，转到 PRESENT 的责任全交给 `present()` 的显式屏障
+            // ——它还带访问掩码与阶段掩码，隐式转换做不到这些。
+            //
+            // 规范上这仍然合法：`queue_present` 要求图像在
+            // PRESENT_SRC_KHR，而 `present()` 的显式屏障正好做到这一点。
+            //
+            // 这样 `LayoutTracker` 成为布局记账的**唯一权威**，
+            // CPU 记账与 GPU 实际状态不再有两套机制打架。
+            final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        };
+
+        let color_ref = vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        };
+
+        let color = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(std::slice::from_ref(&color_ref));
+
+        let dependency = vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+
+        let attachments = [color_attachment];
+        let subpasses = [color];
+        let dependencies = [dependency];
+        let info = vk::RenderPassCreateInfo::default()
+            .attachments(&attachments)
+            .subpasses(&subpasses)
+            .dependencies(&dependencies);
+
+        let handle = unsafe { device.create_render_pass(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建渲染通道失败: {e:?}"))?;
+        Ok(Self { handle })
+    }
+
+    /// 销毁渲染通道。
+    pub fn destroy(&self, device: &Device) {
+        unsafe { device.destroy_render_pass(self.handle, None) };
+    }
+}
+
+/// 描述符集布局。
+pub struct DescriptorLayout {
+    pub handle: vk::DescriptorSetLayout,
+}
+
+impl DescriptorLayout {
+    /// 创建布局：uniform buffer + sampler + combined image sampler。
+    ///
+    /// `update_after_bind` 决定是否给全部绑定加
+    /// [`vk::DescriptorBindingFlags::UPDATE_AFTER_BIND`]。它由调用方
+    /// （通常是 [`crate::Gpu`]）按设备**实际支持**传入——
+    /// 对未启用的 feature 使用该标志会把`VUID-vkUpdateDescriptorSets-None-03047`
+    /// 换成「feature 未启用」的违规，等于没修。
+    ///
+    /// # 为什么需要 `UPDATE_AFTER_BIND`
+    ///
+    /// 本项目每个在飞帧槽位各有独立的描述符集，且槽位的 GPU 工作与 CPU
+    /// 的下一帧并行。`full_app` 在若干帧在途时会重写**所有**槽位的描述符
+    /// （字体图集重建 / 交换链重建 / uniform 内容变化）。
+    /// 规范禁止更新「被 pending 命令缓冲使用中」的描述符集，除非该绑定
+    /// 创建时带了 `UPDATE_AFTER_BIND_BIT`或
+    /// `UPDATE_UNUSED_WHILE_PENDING_BIT`。
+    ///
+    /// 选前者而非后者：后者的语义是「更新时保证该绑定尚未被使用」，
+    /// 而多帧在途**恰恰**就是「已被使用」。要满足它只能每次重写前
+    /// 等完所有在飞槽位——等于放弃多帧并行。
+    ///
+    /// # ash 0.38 陷阱
+    ///
+    /// `DescriptorSetLayoutBinding` **结构体里没有 `binding_flags` 字段**
+    /// （任何 Vulkan 版本都没有）。绑定标志只能通过
+    /// `DescriptorSetLayoutBindingFlagsCreateInfo` 挂在
+    /// `DescriptorSetLayoutCreateInfo` 的 `p_next` 上，
+    /// 且其数组长度必须与 `bindings` 一致。
+    pub fn new(device: &Device, update_after_bind: bool) -> anyhow::Result<Self> {
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_UNIFORM)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                // uniform 只在顶点着色器用到，但片元也可能访问，
+                // 声明为 BOTH 更安全（着色器未使用不报错）。
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_TEXTURE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // 用户纹理：图片缩略图。与字体图集分绑的原因见常量注释。
+            // 顶点的 `tex_id`（0/1）在片元着色器里分支选择采样哪张。
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_USER_TEXTURE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            // 用户纹理的**独立采样器**（2026-10-17）。
+            //
+            // 字体图集必须点采样（`BINDING_SAMPLER` + nearest）：
+            // 线性插值会把相邻字形的覆盖率渗进边缘，小字号糊成灰块。
+            // 但缩略图/原图用 nearest 会在「显示 ≠ 纹理」的所有比例下
+            // 走样（实测 100% DPI：320pt 显示 vs 512px 纹理 = 1.6× 缩小，
+            // 照片全是摩尔纹）。两者过滤要求正相反 ⇒ 两个 sampler 绑定。
+            //
+            // 帧槽集合写占位值（字体批次不采样它），用户纹理集合写线性。
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_USER_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+
+        // 标志数组与 bindings 一一对应，长度必须相同（由构造器按切片长度设置）。
+        // 具体构造逻辑与 `blur` 共用，见 [`Self::from_bindings`]。
+        Self::from_bindings(device, &bindings, update_after_bind)
+    }
+
+    /// 创建模糊管线的描述符布局：uniform + sampler + combined image sampler。
+    ///
+    /// 绑定号与 [`Self::new`] 的前三项**刻意相同**（`0/1/2`）：
+    /// 同一套 `BINDING_*` 常量在两条管线上语义一致，避免出现
+    /// 「同一个常量在不同布局里指向不同资源」的隐式分歧。
+    /// 模糊管线不需要字体图集与用户纹理两个独立绑定——它只采样一张
+    /// 中间图像，所以少一个 binding。
+    pub fn blur(device: &Device, update_after_bind: bool) -> anyhow::Result<Self> {
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_UNIFORM)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_TEXTURE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        Self::from_bindings(device, &bindings, update_after_bind)
+    }
+
+    /// 由绑定列表构造布局。两个公开构造函数共用，保证
+    /// 「`UPDATE_AFTER_BIND` 的启用规则」只有一份实现。
+    fn from_bindings(
+        device: &Device,
+        bindings: &[vk::DescriptorSetLayoutBinding],
+        update_after_bind: bool,
+    ) -> anyhow::Result<Self> {
+        // 标志数组与 bindings 一一对应，长度必须相同（由构造器按切片长度设置）。
+        let binding_flags: Vec<vk::DescriptorBindingFlags> = bindings
+            .iter()
+            .map(|_| {
+                if update_after_bind {
+                    vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                } else {
+                    vk::DescriptorBindingFlags::empty()
+                }
+            })
+            .collect();
+        let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+            .binding_flags(&binding_flags);
+
+        let mut info = vk::DescriptorSetLayoutCreateInfo::default().bindings(bindings);
+        if update_after_bind {
+            // 加了绑定的 UPDATE_AFTER_BIND_BIT，**布局本身**就必须带
+            // `UPDATE_AFTER_BIND_POOL`（规范强制，验证层实测报
+            // `VUID-VkDescriptorSetLayoutCreateInfo-flags-03000`）。
+            // 这与描述符池那侧的 `DescriptorPoolCreateFlags::UPDATE_AFTER_BIND`
+            // 是**两处独立**的要求，漏任何一处都违规。
+            info = info.flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL);
+            // 仅在真的加标志时挂 pNext —— 空标志数组会让验证层报
+            // 「flags 数量与 bindings 不符」类问题，且毫无收益。
+            info = info.push_next(&mut flags_info);
+        }
+
+        let handle = unsafe { device.create_descriptor_set_layout(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建描述符集布局失败: {e:?}"))?;
+        Ok(Self { handle })
+    }
+
+    pub fn destroy(&self, device: &Device) {
+        unsafe { device.destroy_descriptor_set_layout(self.handle, None) };
+    }
+}
+
+/// 管线布局。
+pub struct PipelineLayout {
+    pub handle: vk::PipelineLayout,
+}
+
+impl PipelineLayout {
+    pub fn new(device: &Device, set_layouts: &[vk::DescriptorSetLayout]) -> anyhow::Result<Self> {
+        // 本项目暂不使用 push constant（uniform 走描述符集），
+        // 因此不声明任何 range。
+        Self::with_push_constants(device, set_layouts, &[])
+    }
+
+    /// 带 push constant 范围的管线布局。
+    ///
+    /// 模糊链的拷贝管线用它传「合成底图的 UV 位移」（自研磨砂移动
+    /// 预测，见 `blur.rs` 的 [`crate::blur::Blit::uv_offset`]）：
+    /// 该参数**每次绘制**都变，push constant 是 Vulkan 为此设计的
+    /// 通道——比 uniform 少一块缓冲与一次描述符写入。
+    ///
+    /// 约束（规范硬性）：同一 layout 下各 range 的 stage/offset/size
+    /// 不得重叠；着色器侧声明的 push constant 接口必须落在某个 range
+    /// 内，否则 `create_graphics_pipelines` 直接失败。
+    pub fn with_push_constants(
+        device: &Device,
+        set_layouts: &[vk::DescriptorSetLayout],
+        push_ranges: &[vk::PushConstantRange],
+    ) -> anyhow::Result<Self> {
+        let info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(set_layouts)
+            .push_constant_ranges(push_ranges);
+
+        let handle = unsafe { device.create_pipeline_layout(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建管线布局失败: {e:?}"))?;
+        Ok(Self { handle })
+    }
+
+    pub fn destroy(&self, device: &Device) {
+        unsafe { device.destroy_pipeline_layout(self.handle, None) };
+    }
+}
+
+/// 图形管线。
+pub struct GraphicsPipeline {
+    pub handle: vk::Pipeline,
+}
+
+impl GraphicsPipeline {
+    /// 创建图形管线。
+    ///
+    /// 顶点输入布局与 WGSL 的 `@location` 声明一一对应：
+    /// - location 0: `vec2<f32>` 位置
+    /// - location 1: `vec2<f32>` UV
+    /// - location 2: `u32` 颜色
+    pub fn new(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        layout: vk::PipelineLayout,
+        shader: &ShaderModule,
+    ) -> anyhow::Result<Self> {
+        // 单一顶点缓冲，交错布局
+        // pos(8) + uv(8) + color(4) + tex_id(4) = 24 字节
+        let stride = (2 * 4 + 2 * 4 + 4 + 4) as u32;
+        let binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(stride)
+            .input_rate(vk::VertexInputRate::VERTEX);
+
+        let attributes = [
+            vk::VertexInputAttributeDescription::default()
+                .location(location::POS)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0),
+            vk::VertexInputAttributeDescription::default()
+                .location(location::UV)
+                .binding(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(8),
+            vk::VertexInputAttributeDescription::default()
+                .location(location::COLOR)
+                .binding(0)
+                .format(vk::Format::R32_UINT)
+                .offset(16),
+            //纹理索引。放在顶点里而非「按纹理分批」，
+            //这样一次 draw 内可混字体与缩略图图元，批次数不增。
+            vk::VertexInputAttributeDescription::default()
+                .location(location::TEX_ID)
+                .binding(0)
+                .format(vk::Format::R32_UINT)
+                .offset(20),
+        ];
+
+        let bindings = [binding];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes);
+
+        // 动态视口与剪裁：窗口尺寸变化时只更新这两个值，无需重建管线。
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            // UI 不需要背面剔除，关闭可省一次光栅化分支。
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        // egui 的 `Color32` 是**预乘 alpha**（RGB 已乘过 alpha），
+        // 因此混合必须用预乘公式 `ONE, ONE_MINUS_SRC_ALPHA`。
+        //
+        // # 用直通公式（`SRC_ALPHA`）会怎样
+        //
+        // 颜色会被**再乘一次 alpha**。不透明处（alpha=255）看不出来，
+        // 但抗锯齿的羽化边缘 alpha<1 —— 结果比「填充色」和「背景色」
+        // **都暗**，表现为每条边都镶一圈深色描边。
+        //
+        // 实测（白色卡片、背景 #F2F4F7）：羽化边缘覆盖率 c≈0.7 处，
+        // 直通公式给出 `255×0.7² + 242×0.3 = 197.5`——比白(255)和背景(242)
+        // 都暗；而正确公式 `255×0.7 + 242×0.3 = 251` 才是应有的浅过渡。
+        //
+        // 用户反馈的「圆角弧线末端一段深色短线」就是这个：弧线的羽化带
+        // 最长，偏色最明显。**这是全局性的渲染缺陷，不是某个控件的问题。**
+        //
+        // 与 egui 官方后端一致：`egui-wgpu` 用的正是
+        // `src_factor: One, dst_factor: OneMinusSrcAlpha`。
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            );
+
+        let blend_attachments = [blend_attachment];
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(&blend_attachments);
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false);
+
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+        ];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+
+        let stages = [shader.vertex_stage(), shader.fragment_stage()];
+
+        // 这些状态结构体的生命周期需覆盖 create_graphics_pipelines 调用，
+        // 因此必须先绑定到局部变量——直接写内联临时值会在调用前被释放。
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
+        // ash 0.38 返回 Vec<Pipeline>，错误类型是 (已创建的管线, VkResult)，
+        // 便于部分成功时回收资源。这里只建一条管线，取首个即可。
+        let handle = unsafe {
+            device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&info),
+                None,
+            )
+        }
+        .map_err(|(partial, res)| {
+            // 部分创建成功时必须销毁，否则泄漏
+            unsafe {
+                for p in partial {
+                    device.destroy_pipeline(p, None);
+                }
+            }
+            anyhow::anyhow!("创建图形管线失败: {res:?}")
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("管线创建成功但返回列表为空"))?;
+
+        Ok(Self { handle })
+    }
+
+    /// 创建**无顶点输入**的全屏管线（模糊 / 降采样 / 合成用）。
+    ///
+    /// 与 [`Self::new`] 的差别只有三处，其余状态（动态视口与剪裁、
+    /// 无背面剔除、无深度、单采样）完全一致：
+    ///
+    /// 1. **顶点输入为空**：顶点位置由 `blur.wgsl` 的
+    ///    `@builtin(vertex_index)` 现算，不需要顶点缓冲；
+    /// 2. **关闭混合**：模糊与合成都是**覆盖写**——混进旧内容会让
+    ///    每一趟卷积都把上一次的结果再叠一次，画面逐帧变亮/变脏；
+    /// 3. 顶点阶段入口是 `vs_fullscreen` 而非 `vs_main`。
+    ///
+    /// `fragment_entry` 决定这是「高斯卷积」还是「直通拷贝」：
+    /// 两者共用同一套顶点阶段与管线状态，只是片元入口不同。
+    pub fn fullscreen(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        layout: vk::PipelineLayout,
+        shader: &ShaderModule,
+        fragment_entry: &'static std::ffi::CStr,
+    ) -> anyhow::Result<Self> {
+        // 顶点输入状态留空：无绑定、无属性。全屏三角形的顶点由
+        // `vertex_index` 生成，绑定任何缓冲都是多余的。
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        // 动态视口与剪裁：每趟模糊的目标尺寸不同（全分辨率场景 /
+        // 1/N 的中间图），靠动态状态切换，无需为每种尺寸重建管线。
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        // IMPORTANT: 混合必须**关闭**。开启后 dst 是上一次写入的内容，
+        // 全屏覆盖写会变成「叠加上一层」，模糊结果逐趟偏移、合成时
+        // 半透明底图与清晰界面互相污染。
+        let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(false)
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            );
+
+        let blend_attachments = [blend_attachment];
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(&blend_attachments);
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false);
+
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+        ];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default()
+            .dynamic_states(&dynamic_states);
+
+        let stages = [
+            shader.vertex_stage_named(crate::shader::BLUR_VERTEX_ENTRY),
+            shader.fragment_stage_named(fragment_entry),
+        ];
+
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterization)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
+        let handle = unsafe {
+            device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                std::slice::from_ref(&info),
+                None,
+            )
+        }
+        .map_err(|(partial, res)| {
+            unsafe {
+                for p in partial {
+                    device.destroy_pipeline(p, None);
+                }
+            }
+            anyhow::anyhow!("创建全屏管线失败: {res:?}")
+        })?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("全屏管线创建成功但返回列表为空"))?;
+
+        Ok(Self { handle })
+    }
+
+    pub fn destroy(&self, device: &Device) {
+        unsafe { device.destroy_pipeline(self.handle, None) };
+    }
+}
+
+/// 渲染通道的附件格式需与交换链一致。供测试与文档引用。
+pub fn swapchain_format(swapchain: &Swapchain) -> vk::Format {
+    swapchain.format
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uniform_layout_matches_wgsl() {
+        // WGSL Uniforms: vec2(8) + f32(4) + f32(4) = 16
+        // Rust 侧 [f32;2] + f32 + f32 同样应是 16 字节
+        // （2026-10-17 删掉了恒为单位矩阵的 clip_from_uv：80 → 16）
+        assert_eq!(
+            size_of::<Uniforms>(),
+            16,
+            "uniform 大小与 WGSL 声明不符，着色器会读到错位数据"
+        );
+    }
+
+    #[test]
+    fn uniform_is_pod_and_zeroable() {
+        // bytemuck 派生要求字段无填充差异；构造后再逐字节比较以验证
+        let u = Uniforms::new([800.0, 600.0], 1.5);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&u as *const Uniforms as *const u8, size_of::<Uniforms>())
+        };
+        let zero = Uniforms::new([0.0, 0.0], 0.0);
+        assert_ne!(bytes, unsafe {
+            std::slice::from_raw_parts(
+                &zero as *const Uniforms as *const u8,
+                size_of::<Uniforms>(),
+            )
+        });
+    }
+
+    #[test]
+    fn vertex_stride_matches_attribute_offsets() {
+        // 步长必须等于 `Vertex` 的真实字节数。
+        //
+        // 早前这里硬编码 `20`，与 `GraphicsPipeline::new` 里的步长各自
+        // 维护一份。加 `tex_id` 字段时只改了后者，这个测试**仍然通过**
+        // （它验证的是自己算的 20，不是实际步长）—— 正是它本该防住的漂移。
+        let real = std::mem::size_of::<crate::buffer::Vertex>();
+        assert_eq!(
+            real, 24,
+            "Vertex 现在是 pos(8)+uv(8)+color(4)+tex_id(4)"
+        );
+        // 最后一个属性（tex_id @ offset 20，占 4 字节）必须落在步长之内
+        assert!(20 + 4 <= real);
+    }
+
+    #[test]
+    fn bindings_are_distinct() {
+        // 绑定槽号必须互不相同，否则描述符布局会覆盖前一项
+        let mut ids = vec![BINDING_UNIFORM, BINDING_SAMPLER, BINDING_TEXTURE];
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "绑定槽号必须互不相同");
+    }
+
+    #[test]
+    fn uniform_is_16_byte_aligned_for_std140() {
+        // std140 要求 uniform 成员按 16 字节对齐；80 不是 16 的倍数，
+        // 因此 Rust 侧结构体末尾的填充必须存在（否则着色器越界读）。
+        // 这里确认当前定义没有多余填充导致的对齐浪费。
+        assert_eq!(size_of::<Uniforms>() % 4, 0);
+    }
+
+    #[test]
+    fn binding_flag_count_must_match_binding_count() {
+        // `DescriptorSetLayoutBindingFlagsCreateInfo.binding_flags()` 用切片长度
+        // 决定 `binding_count`。若两者不等，验证层会报
+        // 「flags 数量与 bindings 不符」——而这在无 GPU 的单测里测不到。
+        // 本函数与 `DescriptorLayout::new` 里的map 逻辑一一对应。
+        let binding_count = 3usize;
+        let flags_for = |update_after_bind: bool| -> Vec<vk::DescriptorBindingFlags> {
+            (0..binding_count)
+                .map(|_| {
+                    if update_after_bind {
+                        vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                    } else {
+                        vk::DescriptorBindingFlags::empty()
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(flags_for(true).len(), binding_count);
+        assert_eq!(flags_for(false).len(), binding_count);
+    }
+
+    #[test]
+    fn update_after_bind_requires_no_dynamic_offset() {
+        // `UPDATE_AFTER_BIND` 的硬性约束：带该标志的绑定**不得**使用
+        // dynamic offset。本项目的 uniform 用 `DescriptorBufferInfo`
+        // 里写死的 offset（非 dynamic），dynamic states 只有
+        // VIEWPORT/SCISSOR——没有 DYNAMIC_OFFSET，因此该约束成立。
+        //
+        // 这条测试的价值是**记录前提**：若将来有人给管线加了
+        // DYNAMIC_OFFSET state，本测试会立刻失败，提示
+        // 「加UPDATE_AFTER_BIND 的前提被破坏了」。
+        const DYNAMIC_STATES: [vk::DynamicState; 2] =
+            [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        // ash 0.38 的 `DynamicState` 常量只列到 STENCIL_REFERENCE(8)，
+        // 没有导出 DYNAMIC_OFFSET——但规范里它是 9。用 from_raw 构造，
+        // 免得「枚举缺常量」被误当成「不存在这个动态状态」。
+        let dynamic_offset = vk::DynamicState::from_raw(9);
+        for s in DYNAMIC_STATES {
+            assert_ne!(
+                s.as_raw(),
+                dynamic_offset.as_raw(),
+                "带 UPDATE_AFTER_BIND 的 uniform 绑定不得使用 DYNAMIC_OFFSET"
+            );
+        }
+        assert_eq!(
+            DYNAMIC_STATES.len(),
+            2,
+            "dynamic states 列表被改动——若新增了 DYNAMIC_OFFSET，\
+             uniform 绑定的 UPDATE_AFTER_BIND 就不再合法"
+        );
+    }
+}

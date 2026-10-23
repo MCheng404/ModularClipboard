@@ -1,0 +1,33 @@
+[package]
+name = "modular-clipboard-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+modular-clipboard-core = { workspace = true }
+modular-clipboard-store = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# 命名管道服务端/客户端（transport::windows）。
+# 必须显式列出全部 feature：cargo 的 feature 统一是**交集**，
+# 不能依赖其它 crate 顺带开启（MEMORY.md 记录过由此产生的编译失败）。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # CreateFileW / ReadFile / WriteFile / FILE_* 常量。
+    # ReadFile/WriteFile 的 OVERLAPPED 参数还要求 Win32_System_IO。
+    "Win32_Storage_FileSystem",
+    # CreateNamedPipeW / ConnectNamedPipe / DisconnectNamedPipe。
+    # 前两者的 SECURITY_ATTRIBUTES 参数还要求 Win32_Security。
+    "Win32_System_Pipes",
+    "Win32_Security",
+    "Win32_System_IO",
+    # instance.rs：FindWindowW / ShowWindow / SetForegroundWindow（唤起界面窗口）。
+    "Win32_UI_WindowsAndMessaging",
+    # instance.rs：CreateMutexW（界面实例互斥体）。
+    "Win32_System_Threading",
+] }

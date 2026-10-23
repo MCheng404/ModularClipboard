@@ -1,0 +1,49 @@
+[package]
+name = "modular-clipboard-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+modular-clipboard-core = { workspace = true }
+modular-clipboard-store = { workspace = true }
+modular-clipboard-app = { workspace = true }
+# 窗口标题常量与实例守卫（界面进程的单实例互斥体）。
+modular-clipboard-ipc = { workspace = true }
+# 渲染后端：ash 直驱的原生 Vulkan（原先经 eframe/wgpu，现已移除）。
+modular-clipboard-gfx = { workspace = true }
+# 托盘常驻与全局快捷键：presence.rs 需要 tray::Tray 与 hotkey 描述。
+modular-clipboard-platform = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+egui = { workspace = true }
+# 缩略图解码。已在 workspace 中声明（store / app 也在用），此处只复用，
+# 不引入新的依赖来源。
+image = { workspace = true }
+# 与渲染桥直接交互的句柄类型；顶点数据用 bytemuck 投递给缓冲。
+ash = { workspace = true }
+bytemuck = { workspace = true }
+# 「检查更新」解析 GitHub releases API 的 JSON（拿 release notes 与
+# 下载页地址）。只在 `about.rs` 用，不扩散到其它模块。
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# presence.rs 直接操作 HWND（唤起/隐藏窗口）。
+# 必须显式列出全部 feature：cargo 的 feature 统一是**交集**，
+# 不能依赖其它 crate 顺带开启（MEMORY.md 记录过由此产生的编译失败）。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # presence.rs：SetWindowDisplayAffinity（磨砂的捕获自排除）。
+    "Win32_UI_WindowsAndMessaging",
+    # presence.rs：focus_window 的 Alt 键前台切换技巧（keybd_event）。
+    "Win32_UI_Input_KeyboardAndMouse",
+    # presence.rs：AttachThreadInput / GetCurrentThreadId
+    "Win32_System_Threading",
+    # theme.rs：读 AppsUseLightTheme 以跟随系统主题。
+    # 必须显式声明——cargo feature 是**交集**，不能依赖
+    # modular-clipboard-platform 顺带开启（MEMORY.md 有记录）。
+    "Win32_System_Registry",
+    # mem.rs：进程内存账目（GetProcessMemoryInfo）。配合 mem.rs 的
+    # 阶段打点，用于定位窗口/GPU 子系统各自的驻留成本。
+    "Win32_System_ProcessStatus",
+] }

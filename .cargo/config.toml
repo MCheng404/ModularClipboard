@@ -1,0 +1,43 @@
+# 默认使用 MSVC 目标：Windows 原生 ABI，且 rusqlite 的 bundled SQLite
+# 需要一个真正的 C 编译器。本机 Visual Studio 位于 D:\Program Files 下，
+# 因此具体环境变量注入见 scripts/env.sh（被 scripts/build.sh source）。
+[build]
+target = "x86_64-pc-windows-msvc"
+
+# NOTE: 不要在命令行上临时切 `CARGO_INCREMENTAL`。
+#
+# 增量开/关会用到**两套不同的**构建缓存。交替使用等于每次都让另一套
+# 失效，于是每次都是全量重编 —— 看起来像「cargo 变慢了」，其实是自己
+# 在两套缓存之间反复横跳。这里显式固定，命令行就不要再覆盖它。
+[profile.dev]
+incremental = true
+
+# NOTE: 测试构建的调试信息只保留行表。
+#
+# 完整调试信息会让每个测试二进制都带上几十 MB 的 PDB 数据，链接时间
+# 与磁盘占用都被它主导；而行表已足够给出「文件 + 行号」的回溯，
+# 排查断言失败完全够用。只作用于 `cargo test`（profile.test），
+# 不影响 `cargo build` 出来的 debug 产物。
+[profile.test]
+debug = "line-tables-only"
+
+[target.x86_64-pc-windows-msvc]
+# rusqlite bundled 会编译 sqlite3.c，交由 cc-rs 用 cl.exe 处理。
+# 链接器由 rustc 自带的 lld-link / link 处理，无需额外指定。
+#
+# NOTE: `+crt-static`：把 MSVC C 运行时**静态**链进去。
+#
+# 默认是动态链接，于是产物依赖 `VCRUNTIME140.dll`——它只随
+# VS 运行时安装包分发。别人的机器上（尤其是没装开发环境的）
+# 双击 exe 会报「找不到 VCRUNTIME140.dll」。
+#
+# 静态链接后是**真正的单文件**：只需复制 exe 本身。
+# 实测导入表里其余 20 个 DLL（kernel32/user32/gdi32/shell32/
+# advapi32/oleaut32/imm32/dwmapi/ntdll/combase…）全是系统组件，
+# Windows 10+ 自带，无需附带。
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+CC = { value = "cl.exe", force = false }
+CXX = { value = "cl.exe", force = false }
+AR = { value = "lib.exe", force = false }

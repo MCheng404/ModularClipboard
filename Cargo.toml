@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/modular-clipboard-core",
+    "crates/modular-clipboard-store",
+    "crates/modular-clipboard-capture",
+    "crates/modular-clipboard-platform",
+    "crates/modular-clipboard-app",
+    "crates/modular-clipboard-ipc",
+    "crates/modular-clipboard-mcp",
+    "crates/modular-clipboard-gfx",
+    "crates/modular-clipboard-ui",
+    "crates/modular-clipboard",
+]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+modular-clipboard-core = { path = "crates/modular-clipboard-core" }
+modular-clipboard-store = { path = "crates/modular-clipboard-store" }
+modular-clipboard-capture = { path = "crates/modular-clipboard-capture" }
+modular-clipboard-platform = { path = "crates/modular-clipboard-platform" }
+modular-clipboard-app = { path = "crates/modular-clipboard-app" }
+modular-clipboard-ipc = { path = "crates/modular-clipboard-ipc" }
+modular-clipboard-mcp = { path = "crates/modular-clipboard-mcp" }
+modular-clipboard-gfx = { path = "crates/modular-clipboard-gfx" }
+modular-clipboard-ui = { path = "crates/modular-clipboard-ui" }
+
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rtrb = "0.4"
+
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+# NOTE: `features` 决定了**能解哪些图片文件**，必须与
+# `crate::thumbnail::IMAGE_EXTS`（UI 侧扩展名白名单）严格对齐。
+# 加/去格式时两侧一起改，否则会出现「判成图片却解不出来」。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
+directories = "6.0"
+sha2 = "0.11"
+
+arboard = "3.6"
+trash = "5.2"
+
+# default_fonts：0.37 起不再默认启用。本项目的字体链是
+# 「LXGW/图标字体插在族表最前，egui 内置字体垫底兜底」——
+# 不显式开启就退化成「项目字体加载失败 = 满屏豆腐」。
+egui = { version = "0.37", features = ["default_fonts"] }
+# eframe 已移除：渲染后端改为 ash 直驱 Vulkan（见 crates/modular-clipboard-ui/src/app.rs）。
+# 它的引入会让 Vulkan 为每个枚举到的 Adapter 加载对应厂商驱动栈，
+# 内存占用从 85MB 涨到 383MB（MEMORY.md 有实测数据）。
+
+ash = { version = "0.38", features = ["std"] }
+
+bytemuck = { version = "1.25", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true

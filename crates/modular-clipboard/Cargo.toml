@@ -1,0 +1,34 @@
+[package]
+name = "modular-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "modular-clipboard"
+path = "src/main.rs"
+
+[dependencies]
+modular-clipboard-core = { workspace = true }
+modular-clipboard-app = { workspace = true }
+modular-clipboard-mcp = { workspace = true }
+modular-clipboard-ui = { workspace = true }
+# 常驻进程 ⇄ 界面进程的通道（`--daemon` / `--ui` 两种角色）。
+modular-clipboard-ipc = { workspace = true }
+# --help 的数据目录文本经 ui 层转发 store 的目录常量（见 ui::default_data_dir_display），
+# 本 crate 不直接依赖 store，保持「只依赖 core/app/ui 三层」的架构约定。
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+# 单实例保护用命名互斥体（见 main.rs 的 SingleInstanceGuard）。
+# 版本与 gfx/platform 一致（0.62），不引��� workspace 条目以免影响其他 crate。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    # `MessageBoxW`：GUI 子系统没有 stdout/stderr，
+    # `--version` / `--help` / 启动失败只能靠它告知用户。
+    "Win32_UI_WindowsAndMessaging",
+    # tests/icon_resource.rs：ExtractIconExW 数 exe 自带的图标资源。
+    "Win32_UI_Shell",
+] }

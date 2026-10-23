@@ -1,0 +1,45 @@
+name: CI
+
+# 每次 PR / main 推送跑测试 + clippy 零警告门禁。
+# 只有 Windows 可构建（windows-rs / MSVC / 剪贴板与 DWM 绑定），
+# 单平台矩阵即可，不需要 Linux/macOS 行。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      # MSVC 环境（cl.exe / INCLUDE / LIB）。之后 scripts/env.sh 检测到
+      # cl.exe 已在 PATH 就走「ambient」路径，不再手工注入本机路径。
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 安装 Rust（stable, MSVC）
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          rustup component add clippy
+          rustc -vV
+          cargo -vV
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 测试（--lib --tests，跳过 doctest）
+        run: ./scripts/build.sh --test
+
+      - name: clippy 零警告门禁
+        run: |
+          source scripts/env.sh
+          cargo clippy --workspace --all-targets -- -D warnings
