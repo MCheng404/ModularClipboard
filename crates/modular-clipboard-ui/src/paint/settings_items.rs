@@ -1263,19 +1263,32 @@ pub(super) fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
 /// 自带背景/边框/缩进，与本项目的行控件语言不一致。而且它的高度与
 /// 字体缩放不走 `pal`，会破坏「与文字同屏的固定高度按字号算」的约定。
 ///
-/// # 箭头为什么是字符而不是自绘多边形
+/// # 箭头是什么：圆角折线，不是字符也不是多边形
 ///
-/// 早先用 `Shape::convex_polygon` 画实心三角，2026-10-24 用户要求改用
-/// `>` 字符渲染。字符路线有两个实打实的好处：
+/// 2026-10-24 用户要求「`>` / `v` 是渲染出来的而不是字符，圆角设计」。
+/// 所以它既不是 `painter.text` 画的字符，也不是 `convex_polygon` 的实心
+/// 三角，而是**两段线 + 三个圆**拼出来的圆角折线（chevron）：
 ///
-/// 1. **随字体缩放白拿**——字号由 `pal` 算，笔画粗细与抗锯齿交给字体
-///    光栅化器，小字号下不会像手算多边形那样糊成一团；
-/// 2. **基线天然对齐**——`Align2::CENTER_CENTER` 直接把字符中心摆在行
-///    中心，而多边形要手算垂直中心，且视觉中心与几何中心还不完全重合
-///    （三角的视觉重心偏上），字符没有这个问题。
+/// - 两段 `line_segment` 给出折线的身段；
+/// - 转角与两个外端各一个半径 = 线宽/2 的实心圆，把直角转折和端头
+///   一并圆掉。
 ///
-/// 状态用 `>`（折叠，指向右）/ `v`（展开，指向下）表达，与文件树、
-/// 常见设置面板的朝向一致。
+/// egui 的 `Stroke` 只有 `width` 与 `color`（没有线帽字段），
+/// `Shape::line` 由 tessellator 以**平头**端点生成——所以圆角必须靠
+/// 端头补圆，没有「设个 cap 就行」的捷径。
+///
+/// # `>` 与 `v` 是同一个形状的两个角度
+///
+/// 折线按展开态（`v`，顶点在下）定义，再绕自身中心旋转 `φ`：
+/// `φ = 0°` 是 `v`，`φ = 90°` 是 `>`。折叠状态只是旋转目标不同，
+/// 于是「展开 ↔ 折叠」自然就是一段 90° 的旋转补间
+/// （[`crate::anim::tween_f32`]，`Ease::InOutCubic`——与主题切换、
+/// 面板开合同款缓动）。
+///
+/// CAUTION: 补间是**惰性**的，而设置窗口有 `RedrawGate`：静止帧整帧
+/// 跳过。动画进行中若不 `request_repaint_after` 预约下一拍，转序会在
+/// 第一帧后被闸门饿死，看起来就是「图标瞬间跳变、没有动画」
+/// （项目记忆里「计时器住在 draw() 里必被渲染闸门饿死」同款）。
 ///
 /// # 命中区
 ///
@@ -1318,46 +1331,58 @@ pub(super) fn settings_group_header(
         });
     }
 
-    // ---- `>` 形箭头：字符渲染 + 圆角容器 ----
-    //
-    // 容器是**圆角方块**而非整条行：整行已有 hover 底色（上面那笔
-    // `row_hover`），箭头再套一个圆角小块是为了让这个可点的符号有
-    // 明确的「靶子感」——纯平的风格里，一块带底色的圆角小方块是最
-    // 轻的「这是按钮」信号，比描边廉价感少。
+    // ---- 圆角折线箭头：两段线 + 三个端头圆 ----
     let cy = bb.center().y;
-    let icon_side = row_h * 0.82;
-    let icon = egui::Rect::from_center_size(
-        egui::pos2(bb.min.x + 3.0 + icon_side * 0.5, cy),
-        egui::vec2(icon_side, icon_side),
-    );
-    // 底色两档：常态 `surface_variant`（与「检查更新」按钮同色，视觉上
-    // 归为「可点的块」），hover 提亮到 `row_hover`。
-    let icon_bg = if hovered {
-        pal.row_hover
-    } else {
-        pal.surface_variant
-    };
-    painter.rect_filled(icon, pal.radius_sm, icon_bg);
+    let cx = bb.min.x + 3.0 + pal.font_sm * 0.42;
 
-    // `>` = 折叠（指向右，提示「展开」）；`v` = 展开（指向下）。
-    //
-    // NOTE: 符号不进 i18n——它是图形语言不是文案，且 `>` / `v` 在四种
-    // 语言的字体里都有字形（不会出现缺字方框）。
-    let arrow_glyph = if folded { ">" } else { "v" };
-    let arrow_color = if hovered { pal.text } else { pal.text_dim };
-    painter.text(
-        icon.center(),
-        egui::Align2::CENTER_CENTER,
-        arrow_glyph,
-        // 字号比容器略小：字符的视觉重量比同号数字大，等号会撑满。
-        egui::FontId::proportional(pal.font_sm * 0.92),
-        arrow_color,
+    // 展开态（v）的三个关键点：顶点在下、两端在上方左右。
+    // 尺寸按字号算 ⇒ 随 `font_scale` 等比缩放（与其它控件同一量纲）。
+    let h = pal.font_sm * 0.42; // 顶点/端点的纵向半距
+    let w = pal.font_sm * 0.34; // 两端点的横向半距
+    let apex = egui::vec2(0.0, h);
+    let arm_a = egui::vec2(-w, -h);
+    let arm_b = egui::vec2(w, -h);
+
+    // 旋转角：0° = v（展开），90° = >（折叠）。补间到目标角。
+    let target_deg = if folded { 90.0 } else { 0.0 };
+    let deg = crate::anim::tween_f32(
+        f.ui.ctx(),
+        egui::Id::unique(("group_fold", it.key)),
+        target_deg,
+        std::time::Duration::from_millis(180),
+        crate::anim::Ease::InOutCubic,
     );
+    // 动画进行中 ⇒ 预约下一拍，否则 RedrawGate 把后续帧饿死（见函数
+    // 文档的 CAUTION）。
+    if (deg - target_deg).abs() > 0.5 {
+        f.ui
+            .ctx()
+            .request_repaint_after(std::time::Duration::from_millis(16));
+    }
+    let (sin, cos) = deg.to_radians().sin_cos();
+    let rot = |v: egui::Vec2| -> egui::Pos2 {
+        egui::pos2(cx + v.x * cos - v.y * sin, cy + v.x * sin + v.y * cos)
+    };
+    let (p_apex, p_a, p_b) = (rot(apex), rot(arm_a), rot(arm_b));
+
+    // 颜色也补间：hover 时提亮，与旋转同步（不然颜色先跳、形状后转，
+    // 观感是两段独立的动画）。
+    let arrow_color = if hovered { pal.text } else { pal.text_dim };
+    let stroke_w = (pal.font_sm * 0.13).max(1.2);
+    let stroke = egui::Stroke::new(stroke_w, arrow_color);
+    painter.line_segment([p_a, p_apex], stroke);
+    painter.line_segment([p_apex, p_b], stroke);
+    // 端头与转角的圆角：半径 = 线宽/2，三段各一个。egui 的线是平头
+    // 端点（Stroke 没有 cap 字段），圆润全靠这三个圆补出来。
+    let cap_r = stroke_w * 0.5;
+    painter.circle_filled(p_apex, cap_r, arrow_color);
+    painter.circle_filled(p_a, cap_r, arrow_color);
+    painter.circle_filled(p_b, cap_r, arrow_color);
 
     // 组名：小一号 + 次要色——它是分隔标记，不是设置项本身。
-    // 左边界让出箭头容器 + 间隙。
+    // 左边界让出箭头（横向半距 w + 圆头）再留一点呼吸。
     painter.text(
-        egui::pos2(icon.max.x + 8.0, cy),
+        egui::pos2(cx + w + cap_r + 8.0, cy),
         egui::Align2::LEFT_CENTER,
         t(it.label),
         egui::FontId::proportional(pal.font_sm),

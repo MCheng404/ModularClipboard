@@ -5963,6 +5963,63 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
+    /// 折叠箭头必须是**补间推进**的，不能瞬间跳到目标角。
+    ///
+    /// 2026-10-24 用户要求「`>` 到 `v` 的过程有动画」。这条测试守住两件事：
+    ///
+    /// 1. 目标切换后，第一帧的角度**既不是旧值也不是新值**（说明真的在补间）；
+    /// 2. 推进数帧后收敛到目标角（说明补间能走完，没被闸门饿死）。
+    ///
+    /// 第 2 点是重点：`tween_f32` 是惰性的，而设置窗口有 `RedrawGate`，
+    /// 静止帧整帧跳过。动画进行中若不 `request_repaint_after` 预约下一拍，
+    /// 补间永远走不到第二帧——那条路径没有任何报错，只会表现为
+    /// 「图标瞬间跳变、没有动画」。
+    #[test]
+    fn fold_arrow_tweens_between_states() {
+        let mut h = Harness::new("fold-tween", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.state
+            .settings_folded
+            .insert("appearance.window".to_string());
+        h.state
+            .settings_folded
+            .insert("appearance.cards".to_string());
+        h.settings_frame();
+
+        // 展开液态玻璃组 ⇒ 目标角从 90° 变 0°。
+        let r = h.state.hit.get(HitNs::Settings, "appearance.glass");
+        let r = r.expect("组标题应登记热区");
+        h.settings_click_at(r.center());
+
+        // 推进若干帧：每帧拨 1/60s（夹具时钟驱动 egui 的 `input.time`，
+        // 补间按它前进）。180ms 的动画约需 11 帧，40 帧足够收敛。
+        let mut mid_seen = false;
+        for _ in 0..40 {
+            h.advance_secs(1.0 / 60.0);
+            h.settings_frame();
+            let deg = crate::anim::peek_f32(
+                &h.ctx,
+                egui::Id::unique(("group_fold", "appearance.glass")),
+            );
+            // 补间值存在且既非起点也非终点 ⇒ 中间态（动画真的在跑）。
+            if let Some(v) = deg
+                && (v - 0.0).abs() > 0.5
+                && (v - 90.0).abs() > 0.5
+            {
+                mid_seen = true;
+            }
+            if !h.state.settings_folded.contains("appearance.glass") && mid_seen {
+                break;
+            }
+        }
+        assert!(mid_seen, "折叠箭头应有中间态（旋转补间生效）");
+        assert!(
+            !h.state.settings_folded.contains("appearance.glass"),
+            "点击后应展开"
+        );
+    }
+
     /// 右下角信息编辑器：三个 chip（图标 / 类型 / 大小）都必须登记热区。
     #[test]
     fn row_meta_chips_have_hit_regions() {

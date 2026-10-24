@@ -175,6 +175,23 @@ pub fn restart(ctx: &Context, id: Id, from: f32, to: f32, dur: Duration, ease: E
     })
 }
 
+/// 读某个补间的**当前显示值**（不推进、不改变状态）。
+///
+/// # 为什么需要它
+///
+/// 补间的推进结果只体现在绘制上，而绘制是不可断言的。测试要验证
+/// 「动画真的在走、没被渲染闸门饿死」，只能读状态。`AnimStore` 是私有
+/// 的，所以开这个只读入口。
+///
+/// `None` = 该 id 从未注册过补间。
+pub fn peek_f32(ctx: &Context, id: Id) -> Option<f32> {
+    let now = ctx.input(|i| i.time);
+    ctx.data(|d| {
+        d.get_temp::<AnimStore>(store_id())
+            .and_then(|s| s.map.get(&id).map(|t| t.value_at(now)))
+    })
+}
+
 /// 颜色补间：四通道各自补间后组装。
 ///
 /// 透明度参与补间（淡入淡出的常用轴）。
