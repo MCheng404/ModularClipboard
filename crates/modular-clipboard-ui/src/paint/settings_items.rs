@@ -1277,10 +1277,10 @@ pub(super) fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
 /// `Shape::line` 由 tessellator 以**平头**端点生成——所以圆角必须靠
 /// 端头补圆，没有「设个 cap 就行」的捷径。
 ///
-/// # `>` 与 `v` 是同一个形状的两个角度
+/// # `<` 与 `v` 是同一个形状的两个角度
 ///
 /// 折线按展开态（`v`，顶点在下）定义，再绕自身中心旋转 `φ`：
-/// `φ = 0°` 是 `v`，`φ = 90°` 是 `>`。折叠状态只是旋转目标不同，
+/// `φ = 0°` 是 `v`，`φ = -90°` 是 `<`。折叠状态只是旋转目标不同，
 /// 于是「展开 ↔ 折叠」自然就是一段 90° 的旋转补间
 /// （[`crate::anim::tween_f32`]，`Ease::InOutCubic`——与主题切换、
 /// 面板开合同款缓动）。
@@ -1333,18 +1333,28 @@ pub(super) fn settings_group_header(
 
     // ---- 圆角折线箭头：两段线 + 三个端头圆 ----
     let cy = bb.center().y;
-    let cx = bb.min.x + 3.0 + pal.font_sm * 0.42;
+    // 横向中心：留出半宽 + 端头圆 + 一点呼吸，让箭头不贴行首。
+    let cx = bb.min.x + 3.0 + pal.font_sm * 0.26;
 
     // 展开态（v）的三个关键点：顶点在下、两端在上方左右。
     // 尺寸按字号算 ⇒ 随 `font_scale` 等比缩放（与其它控件同一量纲）。
-    let h = pal.font_sm * 0.42; // 顶点/端点的纵向半距
-    let w = pal.font_sm * 0.34; // 两端点的横向半距
+    //
+    // CAUTION: 0.26 / 0.22 是量出来的，不是拍脑袋。第一版用 0.42 / 0.34，
+    // 箭头总高 12.6pt——占 28pt 行高的 45%，线宽还是字号的 13%，
+    // 2026-10-24 用户反馈「渲染出来太大」。现在总高 ≈ 7.8pt（行高的
+    // 28%）、线宽 ≈ 字号的 8.5%，与项目里其它线性图标（`icons/draw.rs`）
+    // 同一量级。
+    let h = pal.font_sm * 0.26; // 顶点/端点的纵向半距
+    let w = pal.font_sm * 0.22; // 两端点的横向半距
     let apex = egui::vec2(0.0, h);
     let arm_a = egui::vec2(-w, -h);
     let arm_b = egui::vec2(w, -h);
 
-    // 旋转角：0° = v（展开），90° = >（折叠）。补间到目标角。
-    let target_deg = if folded { 90.0 } else { 0.0 };
+    // 旋转角：0° = v（展开），-90° = <（折叠）。
+    //
+    // 用户 2026-10-24 明确要 `< / v` 而非 `> / v`：`<` 是「往左收」的
+    // 朝向，与设置面板从左侧导航展开/收起的空间隐喻一致。
+    let target_deg = if folded { -90.0 } else { 0.0 };
     let deg = crate::anim::tween_f32(
         f.ui.ctx(),
         egui::Id::unique(("group_fold", it.key)),
@@ -1368,13 +1378,20 @@ pub(super) fn settings_group_header(
     // 颜色也补间：hover 时提亮，与旋转同步（不然颜色先跳、形状后转，
     // 观感是两段独立的动画）。
     let arrow_color = if hovered { pal.text } else { pal.text_dim };
-    let stroke_w = (pal.font_sm * 0.13).max(1.2);
+    // 线宽 ≈ 字号的 8.5%：与 `icons/draw.rs` 的线性图标同量级。下限 1.0
+    // 防极小字号下细到看不见。
+    let stroke_w = (pal.font_sm * 0.085).max(1.0);
     let stroke = egui::Stroke::new(stroke_w, arrow_color);
     painter.line_segment([p_a, p_apex], stroke);
     painter.line_segment([p_apex, p_b], stroke);
-    // 端头与转角的圆角：半径 = 线宽/2，三段各一个。egui 的线是平头
-    // 端点（Stroke 没有 cap 字段），圆润全靠这三个圆补出来。
-    let cap_r = stroke_w * 0.5;
+    // 端头与转角的圆角：egui 的线是平头端点（Stroke 没有 cap 字段），
+    // 圆润全靠这三个圆补出来。
+    //
+    // CAUTION: 半径取**略大于**线宽/2（0.62 而非 0.5）。平头是垂直于线
+    // 的矩形端，两段线在转角处各留一个很小的三角缝隙；半径等于半宽时
+    // 盖不住，转角会看出一道细 V 形缺口。0.62 倍刚好填满又不至于让端点
+    // 鼓成圆球。
+    let cap_r = stroke_w * 0.62;
     painter.circle_filled(p_apex, cap_r, arrow_color);
     painter.circle_filled(p_a, cap_r, arrow_color);
     painter.circle_filled(p_b, cap_r, arrow_color);

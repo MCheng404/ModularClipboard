@@ -5987,7 +5987,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             .insert("appearance.cards".to_string());
         h.settings_frame();
 
-        // 展开液态玻璃组 ⇒ 目标角从 90° 变 0°。
+        // 展开液态玻璃组 ⇒ 目标角从 -90°（<）变 0°（v）。
         let r = h.state.hit.get(HitNs::Settings, "appearance.glass");
         let r = r.expect("组标题应登记热区");
         h.settings_click_at(r.center());
@@ -6005,7 +6005,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             // 补间值存在且既非起点也非终点 ⇒ 中间态（动画真的在跑）。
             if let Some(v) = deg
                 && (v - 0.0).abs() > 0.5
-                && (v - 90.0).abs() > 0.5
+                && (v - (-90.0)).abs() > 0.5
             {
                 mid_seen = true;
             }
