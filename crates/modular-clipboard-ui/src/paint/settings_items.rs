@@ -1255,7 +1255,7 @@ pub(super) fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
     }
 }
 
-/// 可折叠的分组标题行：三角箭头 + 组名，点击切换折叠。
+/// 可折叠的分组标题行：`>` 形箭头 + 组名，点击切换折叠。
 ///
 /// # 为什么自绘而不用 `egui::CollapsingHeader`
 ///
@@ -1263,16 +1263,24 @@ pub(super) fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
 /// 自带背景/边框/缩进，与本项目的行控件语言不一致。而且它的高度与
 /// 字体缩放不走 `pal`，会破坏「与文字同屏的固定高度按字号算」的约定。
 ///
-/// # 箭头为什么是三角而不是文字「展开/收起」
+/// # 箭头为什么是字符而不是自绘多边形
 ///
-/// 组名右侧已经有空间放计数，箭头是最省地方的状态指示；且它随
-/// `font_scale` 等比缩放（边长按 `pal.font_sm` 算），不会在小字号下
-/// 糊成一团。
+/// 早先用 `Shape::convex_polygon` 画实心三角，2026-10-24 用户要求改用
+/// `>` 字符渲染。字符路线有两个实打实的好处：
+///
+/// 1. **随字体缩放白拿**——字号由 `pal` 算，笔画粗细与抗锯齿交给字体
+///    光栅化器，小字号下不会像手算多边形那样糊成一团；
+/// 2. **基线天然对齐**——`Align2::CENTER_CENTER` 直接把字符中心摆在行
+///    中心，而多边形要手算垂直中心，且视觉中心与几何中心还不完全重合
+///    （三角的视觉重心偏上），字符没有这个问题。
+///
+/// 状态用 `>`（折叠，指向右）/ `v`（展开，指向下）表达，与文件树、
+/// 常见设置面板的朝向一致。
 ///
 /// # 命中区
 ///
 /// 整行都是点击区（不只箭头）：组标题行的目的是「收起来」，一个小
-/// 三角不是可靠的靶子。登记用组的稳定 key，与 `settings_folded` 一致。
+/// 箭头不是可靠的靶子。登记用组的稳定 key，与 `settings_folded` 一致。
 pub(super) fn settings_group_header(
     f: &mut Frame<'_>,
     ui: &mut Ui,
@@ -1310,35 +1318,46 @@ pub(super) fn settings_group_header(
         });
     }
 
-    // 三角箭头：边长按字号算，与组名同一垂直中心。
-    let cx = bb.min.x + 5.0;
+    // ---- `>` 形箭头：字符渲染 + 圆角容器 ----
+    //
+    // 容器是**圆角方块**而非整条行：整行已有 hover 底色（上面那笔
+    // `row_hover`），箭头再套一个圆角小块是为了让这个可点的符号有
+    // 明确的「靶子感」——纯平的风格里，一块带底色的圆角小方块是最
+    // 轻的「这是按钮」信号，比描边廉价感少。
     let cy = bb.center().y;
-    let a = pal.font_xs * 0.34;
-    let (p0, p1, p2) = if folded {
-        // ▶ 指向右（收起）
-        (
-            egui::pos2(cx - a * 0.6, cy - a),
-            egui::pos2(cx - a * 0.6, cy + a),
-            egui::pos2(cx + a * 0.7, cy),
-        )
+    let icon_side = row_h * 0.82;
+    let icon = egui::Rect::from_center_size(
+        egui::pos2(bb.min.x + 3.0 + icon_side * 0.5, cy),
+        egui::vec2(icon_side, icon_side),
+    );
+    // 底色两档：常态 `surface_variant`（与「检查更新」按钮同色，视觉上
+    // 归为「可点的块」），hover 提亮到 `row_hover`。
+    let icon_bg = if hovered {
+        pal.row_hover
     } else {
-        // ▼ 指向下（展开）
-        (
-            egui::pos2(cx - a, cy - a * 0.6),
-            egui::pos2(cx + a, cy - a * 0.6),
-            egui::pos2(cx, cy + a * 0.7),
-        )
+        pal.surface_variant
     };
-    let arrow = if hovered { pal.text } else { pal.text_dim };
-    painter.add(egui::Shape::convex_polygon(
-        vec![p0, p1, p2],
-        arrow,
-        egui::Stroke::NONE,
-    ));
+    painter.rect_filled(icon, pal.radius_sm, icon_bg);
+
+    // `>` = 折叠（指向右，提示「展开」）；`v` = 展开（指向下）。
+    //
+    // NOTE: 符号不进 i18n——它是图形语言不是文案，且 `>` / `v` 在四种
+    // 语言的字体里都有字形（不会出现缺字方框）。
+    let arrow_glyph = if folded { ">" } else { "v" };
+    let arrow_color = if hovered { pal.text } else { pal.text_dim };
+    painter.text(
+        icon.center(),
+        egui::Align2::CENTER_CENTER,
+        arrow_glyph,
+        // 字号比容器略小：字符的视觉重量比同号数字大，等号会撑满。
+        egui::FontId::proportional(pal.font_sm * 0.92),
+        arrow_color,
+    );
 
     // 组名：小一号 + 次要色——它是分隔标记，不是设置项本身。
+    // 左边界让出箭头容器 + 间隙。
     painter.text(
-        egui::pos2(bb.min.x + 5.0 + a * 2.2, cy),
+        egui::pos2(icon.max.x + 8.0, cy),
         egui::Align2::LEFT_CENTER,
         t(it.label),
         egui::FontId::proportional(pal.font_sm),
