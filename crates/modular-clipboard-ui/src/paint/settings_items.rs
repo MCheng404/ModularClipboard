@@ -577,14 +577,37 @@ pub(super) struct SettingsCard {
 
 /// 默认折叠的分组 key。
 ///
-/// 只有「开了对应模式才有意义」的组才进来：液态玻璃的三项在非玻璃
+/// 只有「开了对应模式才有意义」的组才进来：液态玻璃的四项在非玻璃
 /// 背景下全是禁用态，铺在首屏是纯噪音。收起来之后外观卡首屏从
-/// 16 项降到 13 项，用户第一眼看到的是常用项。
+/// 17 项降到 13 项，用户第一眼看到的是常用项。
 ///
-/// CAUTION: 这里是「默认」，不是「永远」。用户的点击会写进
-/// `settings_folded`，与这张表**异或**判断（见 `settings_card` 的
-/// 遍历）：表内的组点一次 = 展开，表外的组点一次 = 收起。
-const DEFAULT_FOLDED: &[&str] = &["appearance.glass"];
+/// # 这是「初始快照」，不是「永远」
+///
+/// 首次进入设置界面前灌进 `settings_folded`（见
+/// `seed_default_folds`），此后完全由用户点击驱动。默认折叠的组
+/// 点一次即展开——不存在「这张表里的组永远收着」这回事。
+pub(super) const DEFAULT_FOLDED: &[&str] = &["appearance.glass"];
+
+/// 把 [`DEFAULT_FOLDED`] 灌进折叠快照（只做一次）。
+///
+/// # 为什么要 seed 而不是每次判断时异或
+///
+/// 异或方案下「集合里有 key」的含义随组而反（默认折叠的组里有 key
+/// = 展开，默认展开的组里有 key = 折叠），点击分支因此必须分情况写。
+/// 漏了分支的后果是**默认折叠的组永远展不开**：点它走 `remove`，而它
+/// 本就不在集合里（no-op），下一帧异或回来还是折叠。2026-10-24 用户
+/// 反馈「液态玻璃无法展开」正是这个。
+///
+/// seed 之后语义统一：有 key = 折叠，点击即切换（insert ↔ remove）。
+fn seed_default_folds(f: &mut Frame<'_>) {
+    if f.state.settings_folds_seeded {
+        return;
+    }
+    f.state.settings_folds_seeded = true;
+    for k in DEFAULT_FOLDED {
+        f.state.settings_folded.insert((*k).to_string());
+    }
+}
 
 /// 全部分类卡片（导航顺序与 `SettingsCat::ALL` 一致）。
 pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
@@ -1187,6 +1210,9 @@ pub(super) fn get_opt_number(
 
 /// 设置内容视图分发：搜索非空 → 结果；空态聚焦 → 最近修改；否则当前分类。
 pub(super) fn settings_content(f: &mut Frame<'_>, ui: &mut Ui) {
+    // 先灌默认折叠：下面三条视图（搜索 / 最近 / 令牌面板）都可能提前
+    // return，而折叠状态是跨视图共享的，必须在最前面 seed。
+    seed_default_folds(f);
     let q = f.state.settings_query.trim().to_string();
     if !q.is_empty() {
         settings_search_results(f, ui, &q);
@@ -1265,7 +1291,10 @@ pub(super) fn settings_group_header(
     let hovered = resp.hovered();
     let clicked = resp.clicked();
     if clicked {
-        // 命中键与折叠键同源：点的是哪一行，收的就是哪一组。
+        // 快照语义下切换是无条件的：折叠 ⇒ 移除（展开），展开 ⇒ 插入
+        // （折叠）。默认折叠的组此刻「在集合里」，点一下即移除——
+        // 早先的异或设计在这里分情况写，漏了默认折叠那一支，导致
+        // 「液态玻璃无法展开」。
         if folded {
             f.state.settings_folded.remove(it.key);
         } else {
@@ -1448,11 +1477,9 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
             while idx < card.items.len() {
                 let it = &card.items[idx];
                 if matches!(it.kind, ItemKind::Group) {
-                    // 与 `DEFAULT_FOLDED` 异或：默认收起的组，用户点一次
-                    // 是展开（从集合移除 ⇒ 不折叠）；默认展开的组，点一次
-                    // 是收起（加入集合）。
-                    folded = f.state.settings_folded.contains(it.key)
-                        ^ DEFAULT_FOLDED.contains(&it.key);
+                    // 快照语义：集合里有 key = 折叠。`DEFAULT_FOLDED` 已在
+                    // `seed_default_folds` 灌进来，这里不做任何异或。
+                    folded = f.state.settings_folded.contains(it.key);
                     // 组内项数：从下一个位置数到再一个组标题（或卡片末尾）。
                     let count = card.items[idx + 1..]
                         .iter()

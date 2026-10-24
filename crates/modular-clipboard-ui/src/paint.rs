@@ -962,10 +962,26 @@ pub struct UiState {
     /// 分组是卡片内的一级标题（`ItemKind::Group`），点标题行折叠/展开。
     /// 存 key 而非索引：卡片表里增删组不会让用户的折叠偏好错位。
     ///
+    /// # 语义：**当前折叠状态的快照**，不是「与默认的差异」
+    ///
+    /// 首次进入设置界面前，`settings_folds_seeded` 把
+    /// `settings_items::DEFAULT_FOLDED` 灌进来；此后完全由用户点击驱动
+    /// （点一下 insert、再点一下 remove）。
+    ///
+    /// CAUTION: 早先这里用「集合成员 异或 默认折叠表」判断，理由是
+    /// 不想加 seed 标记。那个设计有个直接后果：**默认折叠的组永远
+    /// 展不开**——点它走 `remove`，而它本就不在集合里（no-op），下一帧
+    /// 异或回来还是折叠。2026-10-24 用户反馈「液态玻璃无法展开」正是
+    /// 这个。异或让「集合里有 key」的含义随组而反（默认折叠的组里
+    /// 有 key = 展开，默认展开的组里有 key = 折叠），点击分支稍不留神
+    /// 就写成单向的。快照语义下两者一致：有 key = 折叠，点击即切换。
+    ///
     /// 只在内存里（不落配置）：折叠是「这次想少看一点」的临时意图，
     /// 不是偏好设置——为它加一个配置字段不值得，且每次开关设置窗口
     /// 都回到全展开反而更符合「临时收起来」的语义。
     pub settings_folded: std::collections::HashSet<String>,
+    /// 默认折叠是否已灌入 [`Self::settings_folded`]（见该字段的语义说明）。
+    settings_folds_seeded: bool,
     // 注：原先这里有 `settings_scroll`（手写滚动偏移）。设置面板
     // 改用 `ScrollArea` 后由 egui 自己管理滚动位置，该字段整体删除。
 
@@ -5876,6 +5892,75 @@ fn with_pinned(mut self, n: usize) -> Self {
                 "开启状态下滑条 {key} 应有热区"
             );
         }
+    }
+
+    /// 默认折叠的分组必须**点得开**。
+    ///
+    /// 2026-10-24 用户反馈「液态玻璃无法展开」。根因是折叠状态用
+    /// 「集合成员 异或 默认折叠表」判断，而点击分支只写了默认展开那
+    /// 一支：默认折叠的组走 `remove`，可它本就不在集合里（no-op），
+    /// 下一帧异或回来还是折叠 ⇒ 永远展不开。
+    ///
+    /// 现在改成快照语义（seed 后有点 = 折叠、点击即切换），这条测试
+    /// 守住「默认折叠组点一次能展开、再点一次能收起」。
+    #[test]
+    fn default_folded_group_toggles() {
+        let mut h = Harness::new("fold-glass", vec2(780.0, 900.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        // 折叠前两组：外观卡有 17 项 + 4 个组标题，900pt 的视口装不到
+        // 第 4 组——`ScrollArea` 只 allocate 可见区内的内容，组标题行
+        // 不在可视区就没有热区（与 card_shadow 那几个测试同因）。
+        h.state
+            .settings_folded
+            .insert("appearance.window".to_string());
+        h.state
+            .settings_folded
+            .insert("appearance.cards".to_string());
+        h.settings_frame();
+
+        // 首帧：液态玻璃组应已折叠（seed 把 DEFAULT_FOLDED 灌进来）。
+        assert!(
+            h.state.settings_folded.contains("appearance.glass"),
+            "液态玻璃组默认应折叠"
+        );
+        // 折叠 ⇒ 组内项没有热区（玻璃模糊度是第一项）。
+        assert!(
+            h.state
+                .hit
+                .get(HitNs::Settings, "ui.glass_blur")
+                .is_none(),
+            "折叠时玻璃模糊度不该有热区"
+        );
+
+        // 点组标题行 ⇒ 展开。
+        let r = h.state.hit.get(HitNs::Settings, "appearance.glass");
+        let r = r.expect("液态玻璃组标题应登记热区");
+        h.settings_click_at(r.center());
+        assert!(
+            !h.state.settings_folded.contains("appearance.glass"),
+            "点一次应展开"
+        );
+        // CAUTION: 点击那一帧的遍历用的是**点击前**读到的 `folded`（状态
+        // 是在遍历中途改的），所以那一帧玻璃项仍未画出来。要多跑一帧
+        // 才能看到展开后的布局——这也是真实程序里的行为（下一帧生效）。
+        h.settings_frame();
+        assert!(
+            h.state
+                .hit
+                .get(HitNs::Settings, "ui.glass_blur")
+                .is_some_and(|r| r.width() > 0.0),
+            "展开后玻璃模糊度应有热区"
+        );
+
+        // 再点一次 ⇒ 收起。
+        let r = h.state.hit.get(HitNs::Settings, "appearance.glass");
+        let r = r.expect("组标题行应仍在");
+        h.settings_click_at(r.center());
+        assert!(
+            h.state.settings_folded.contains("appearance.glass"),
+            "再点一次应收起"
+        );
     }
 
     /// 右下角信息编辑器：三个 chip（图标 / 类型 / 大小）都必须登记热区。
