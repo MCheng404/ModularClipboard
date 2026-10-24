@@ -20,6 +20,7 @@ pub mod blur;
 pub mod buffer;
 pub mod chrome;
 pub mod frame;
+pub mod glass;
 pub mod pipeline;
 pub mod shader;
 pub mod staging;
