@@ -16,11 +16,13 @@
 use std::ffi::CString;
 
 pub mod backdrop;
+pub mod capture_worker;
 pub mod blur;
 pub mod buffer;
 pub mod chrome;
 pub mod frame;
 pub mod glass;
+pub mod glass_pass;
 pub mod pipeline;
 pub mod shader;
 pub mod staging;

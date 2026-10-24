@@ -221,6 +221,18 @@ pub enum Op {
     SetCardBlur(u8),
     /// 调磨砂强度档位（1 ~ 10）。
     SetBlurStrength(u8),
+    /// 液态玻璃的三个审美参数（整包替换）。
+    ///
+    /// 同 `SetCardShadow`：三个滑块可能在一帧内连续拖动，逐字段 push
+    /// 会让 `apply_ops` 跑三遍、写三遍盘。
+    SetGlass {
+        /// 折射强度（0 = 只剩磨砂）。
+        refract: f32,
+        /// 色散差异量（0 = 无彩边）。
+        dispersion: f32,
+        /// Fresnel 幂次。
+        edge: f32,
+    },
     /// 设置列表卡片阴影（开关 + 模糊 / 浓度 / 垂直偏移）。
     ///
     /// 整包替换而不是逐字段 Op：三个滑块 + 开关可能在一帧内连续改动，
@@ -666,6 +678,20 @@ pub struct UiState {
     /// 由 `draw_type_rail` 量好后写这里，布局侧下一帧按它定弹窗尺寸
     /// （首帧用估算值，一帧内修正）。`None` = 还没量过。
     pub rail_panel_size: Option<Vec2>,
+    /// 本帧参与**液态玻璃**合成的矩形（逻辑点）。
+    ///
+    /// 由绘制层在各面板/卡片画底色前 `push_glass` 收集，帧循环取出后交给
+    /// 渲染层的玻璃 pass。玻璃是观感层：收集失败不该影响绘制，所以这里是
+    /// 「尽力而为」的 Vec 而不是 Result。
+    ///
+    /// CAUTION: 帧循环取走时会 `mem::take` 清空。若某条绘制路径没跑
+    /// （窗口最小化、跳过渲染），下一帧重新收集，不会累积陈旧矩形。
+    pub glass_rects: Vec<modular_clipboard_gfx::glass_pass::GlassRect>,
+    /// 行卡片底色的 alpha（`palette.card_bg.a()`）。
+    ///
+    /// 玻璃 pass 只改 RGB，覆盖度由这个 alpha 定——这样「卡片不透明度」
+    /// 滑块对玻璃同样生效，且语义与磨砂路径一致。
+    pub glass_card_alpha: f32,
     /// 图片缩略图的**像素**缓存（第三轮：图片条目内嵌显示）。
     ///
     /// LRU + 字节预算，见 [`crate::thumbnail::ThumbnailCache`]。
@@ -1291,6 +1317,42 @@ impl<'a> Frame<'a> {
     pub fn hit_get(&self, key: &str) -> Option<Rect> {
         self.state.hit_get_from(self.hit_ns, key)
     }
+
+    /// 登记一个参与**液态玻璃**合成的矩形。
+    ///
+    /// # 调用时机
+    ///
+    /// 必须在画该面板/卡片的**底色之前**：玻璃 pass 在 egui 内容之前跑
+    /// （它是背景层），矩形只用于「这个像素属于哪张卡片」。
+    ///
+    /// # 为什么上限是 16 张
+    ///
+    /// `gfx::glass_pass::MAX_GLASS_CARDS`。超出部分由 uniform 换算处静默
+    /// 丢弃——列表可见行约 10 张 + 顶栏 + 搜索面板 + 类型栏，正常不会超。
+    pub fn push_glass(&mut self, r: Rect, radius: f32) {
+        // 与 `hit_insert` 同一套健全性检查：非有限坐标/零面积/不在客户区内
+        // 的矩形不该进 uniform（NaN 会让 SDF 全程为假，整张卡片没玻璃）。
+        let sane = r.min.x.is_finite()
+            && r.min.y.is_finite()
+            && r.max.x.is_finite()
+            && r.max.y.is_finite()
+            && r.width() > 0.0
+            && r.height() > 0.0;
+        if !sane || !self.area.intersects(r) {
+            return;
+        }
+        if self.state.glass_rects.len() >= modular_clipboard_gfx::glass_pass::MAX_GLASS_CARDS {
+            return;
+        }
+        self.state
+            .glass_rects
+            .push(modular_clipboard_gfx::glass_pass::GlassRect::new(r, radius));
+    }
+
+    /// 记录行卡片底色 alpha（供玻璃 pass 定覆盖度）。
+    pub fn set_glass_card_alpha(&mut self, a: f32) {
+        self.state.glass_card_alpha = a;
+    }
 }
 
 /// 画一个**独立子窗口**的整帧内容。
@@ -1395,6 +1457,12 @@ pub fn draw_child(f: &mut Frame<'_>) {
 /// 不挡内容）一致，位置偏差已在各组件的文档里说明。
 pub fn draw(f: &mut Frame<'_>) {
     let area = f.area;
+    // 玻璃收集器每帧重置：帧循环取走后是空的，而「没取走」的帧
+    // （跳过渲染）也不该把上一帧的矩形留到下一帧——面板可能已收起。
+    // 默认 alpha 给 1.0（不透明）：万一某条路径忘了设，玻璃至少是
+    // 实底的，不会整片消失。
+    f.state.glass_rects.clear();
+    f.state.glass_card_alpha = 1.0;
     // 背景必须铺满整个客户区，否则窗口边缘会露出 clear color。
     f.ui.painter().rect_filled(area, 0.0, f.pal.bg);
 

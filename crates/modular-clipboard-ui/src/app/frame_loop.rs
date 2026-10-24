@@ -1079,9 +1079,30 @@ pub(super) fn run_mode(
         // 磨砂（自研 Acrylic）走 backdrop 路径：先铺「身后桌面的实时
         // 模糊」底图再叠加界面。半透明/无走普通路径——半透明的透出
         // 由交换链像素 alpha 完成，不需要捕获。
-        if app.svc.state.config.ui.window_backdrop
-            == modular_clipboard_core::config::WindowBackdrop::Acrylic
-        {
+        // 玻璃与磨砂**同路**：都要先铺身后桌面的底图再叠界面。差别只在
+        // 铺那一趟是「拷模糊结果」还是「按卡片折射」（见 painter 的
+        // `backdrop_blit` 分派）。
+        if matches!(
+            app.svc.state.config.ui.window_backdrop,
+            modular_clipboard_core::config::WindowBackdrop::Acrylic
+                | modular_clipboard_core::config::WindowBackdrop::Glass
+        ) {
+            // 玻璃参数：矩形由绘制层收集（`Frame::push_glass`），审美三项
+            // 来自配置。取走即清，下一帧重新收集。
+            if app.svc.state.config.ui.window_backdrop
+                == modular_clipboard_core::config::WindowBackdrop::Glass
+            {
+                let cfg = &app.svc.state.config.ui;
+                let rects = std::mem::take(&mut app.paint_state.glass_rects);
+                let card_alpha = app.paint_state.glass_card_alpha;
+                painter.set_glass(modular_clipboard_gfx::glass_pass::GlassParams {
+                    rects,
+                    refract: cfg.glass_refract,
+                    dispersion: cfg.glass_dispersion,
+                    edge: cfg.glass_edge,
+                    card_alpha,
+                });
+            }
             painter.paint_backdrop(
                 &mut fr,
                 window.hwnd().0 as isize,
@@ -1131,8 +1152,14 @@ pub(super) fn run_mode(
         if backdrop != applied_backdrop {
             applied_backdrop = backdrop;
             presence::apply_backdrop(window.hwnd(), backdrop);
-            let acrylic = backdrop == modular_clipboard_core::config::WindowBackdrop::Acrylic;
-            painter.set_backdrop_enabled(acrylic);
+            // CAUTION: 玻璃也必须算「启用」。它复用磨砂的抓屏 + 模糊链，
+            // 判成 false 会把那些资源整套销毁，玻璃立刻只剩透明。
+            let backdrop_on = matches!(
+                backdrop,
+                modular_clipboard_core::config::WindowBackdrop::Acrylic
+                    | modular_clipboard_core::config::WindowBackdrop::Glass
+            );
+            painter.set_backdrop_enabled(backdrop_on);
             fr.set_clear_color(if backdrop
                 == modular_clipboard_core::config::WindowBackdrop::None
             {

@@ -15,11 +15,13 @@ use modular_clipboard_gfx::backdrop::MotionPredictor;
 use modular_clipboard_gfx::backdrop::capture_due;
 use modular_clipboard_gfx::backdrop::downsample_box_blur;
 use modular_clipboard_gfx::backdrop::capture_size;
+use modular_clipboard_gfx::capture_worker::{CaptureOut, CaptureWorker};
 use modular_clipboard_gfx::backdrop::client_origin;
 use modular_clipboard_gfx::blur::BlurChain;
 use modular_clipboard_gfx::blur::BlurPipeline;
 use modular_clipboard_gfx::blur::DEFAULT_DIVISOR;
 use modular_clipboard_gfx::blur::DEFAULT_RADIUS;
+use modular_clipboard_gfx::glass_pass::{GlassParams, GlassPipeline};
 use modular_clipboard_gfx::buffer::UniformBuffer;
 use modular_clipboard_gfx::buffer::Vertex;
 use modular_clipboard_gfx::frame::CommonBindings;
@@ -206,7 +208,12 @@ pub(super) struct CardBlurState {
 /// 磨砂背景的运行状态：GPU 资源 + GDI 捕获器 + 节流时间戳 + 背景亮度。
 pub(super) struct BackdropState {
     fx: Option<BackdropFx>,
-    capture: Option<DesktopCapture>,
+    /// 抓屏工作线程（见 `gfx::capture_worker`）。
+    ///
+    /// 取代了原先 `Option<DesktopCapture>`：GDI `BitBlt` 是同步阻塞、
+    /// 毫秒级的调用，跑在主线程上会让帧循环停摆（滚动列表时的
+    /// 「一顿一顿」有它一份）。搬到工作线程后主线程只发请求 + 取结果。
+    capture_worker: CaptureWorker,
     last_capture: Option<Instant>,
     /// 上一次成功捕获的背景平均亮度（0~1），供上层决定背景层实度。
     luminance: Option<f32>,
@@ -224,19 +231,30 @@ pub(super) struct BackdropState {
     /// `(预测位置 − 本原点) / 交换链尺寸` 平移采样坐标，把过期快照
     /// 贴回窗口当前位置（消除拖动磨砂的轻微拖影）。
     capture_origin: Option<(f32, f32)>,
+    /// 液态玻璃管线（背景效果 = 玻璃时才建）。
+    ///
+    /// 与 `fx` 分开：它**不依赖尺寸**（uniform 每帧写、源纹理每帧绑），
+    /// 只在首次创建与交换链重建时重生，不像 `fx` 那样一改尺寸就整套重建。
+    glass: Option<GlassPipeline>,
+    /// 绘制层本帧送来的玻璃参数（矩形 + 三个审美参数）。
+    ///
+    /// 每帧由 `set_glass` 覆盖；`None` 或矩形为空 ⇒ 退回普通磨砂合成。
+    glass_params: Option<GlassParams>,
 }
 
 impl Default for BackdropState {
     fn default() -> Self {
         Self {
             fx: None,
-            capture: None,
+            capture_worker: CaptureWorker::new(),
             last_capture: None,
             luminance: None,
             blur_radius: DEFAULT_RADIUS,
             predictor: MotionPredictor::new(),
             origin: None,
             capture_origin: None,
+            glass: None,
+            glass_params: None,
         }
     }
 }
@@ -249,7 +267,13 @@ impl BackdropState {
             fx.pipeline.destroy(gpu);
             fx.capture_img.destroy(&gpu.device);
         }
-        self.capture = None;
+        // 玻璃管线同样销毁：它绑着 `render_pass`，而交换链重建会换通道。
+        if let Some(mut g) = self.glass.take() {
+            g.destroy(gpu);
+        }
+        self.glass_params = None;
+        // 抓屏线程常驻：它只占一个线程 + 空闲时零 CPU，销毁它反而要让
+        // 下一次开启重新建 GDI 对象。
         self.last_capture = None;
         self.luminance = None;
         // 捕获原点作废：下一帧重新捕获前没有可对齐的快照。
@@ -528,12 +552,55 @@ impl<'a> Painter<'a> {
             fx.pipeline.destroy(self.gpu);
             fx.capture_img.destroy(&self.gpu.device);
         }
-        self.backdrop.capture = None;
+        if let Some(mut g) = self.backdrop.glass.take() {
+            self.gpu.wait_idle();
+            g.destroy(self.gpu);
+        }
+        self.backdrop.glass_params = None;
         self.backdrop.last_capture = None;
         // 捕获原点与轨迹作废：再开启时首帧重新捕获，避免用过期原点
         // 算出错误位移（表现为「重新开启磨砂那一下底图错位」）。
         self.backdrop.capture_origin = None;
         self.backdrop.predictor.reset();
+    }
+
+    /// 送入本帧的玻璃参数（绘制层每帧调用）。
+    ///
+    /// # 为什么由绘制层送而不是渲染层算
+    ///
+    /// 卡片矩形是 **egui 布局的产物**（行高随内容变、面板随配置变），
+    /// 只有绘制层知道。渲染层只负责把它翻译成 uniform。
+    ///
+    /// # 生命周期
+    ///
+    /// 参数**每帧被消费一次**：`paint_backdrop` 用掉即清，避免下一帧
+    /// （可能滚动过、面板已收起）拿到过期矩形。
+    pub fn set_glass(&mut self, params: GlassParams) {
+        self.backdrop.glass_params = Some(params);
+    }
+
+    /// 当前是否配了玻璃参数（诊断/测试用）。
+    pub fn has_glass(&self) -> bool {
+        self.backdrop.glass_params.is_some()
+    }
+
+    /// 懒创建玻璃管线。
+    ///
+    /// 与 `ensure_backdrop` 不同：它**不看尺寸**。uniform 每帧写、源
+    /// 纹理每帧绑，所以管线只在首次与交换链重建（render_pass 变了）时
+    /// 需要重生。这样用户拖强度滑块不会触发重建。
+    fn ensure_glass(&mut self, fr: &FrameRenderer<'a>) -> anyhow::Result<()> {
+        if self.backdrop.glass.is_some() {
+            return Ok(());
+        }
+        let render_pass = fr.render_pass();
+        let pipe = GlassPipeline::new(self.gpu, render_pass, fr.slot_count())?;
+        self.backdrop.glass = Some(pipe);
+        tracing::debug!(
+            slots = fr.slot_count(),
+            "玻璃管线已创建"
+        );
+        Ok(())
     }
 
     /// 一帧的实际绘制逻辑。`mode` 决定走哪条合成路径；
@@ -704,6 +771,16 @@ impl<'a> Painter<'a> {
                 render_extent,
                 divisor,
             )?;
+            // 玻璃管线按需创建（只看 render_pass 与槽位数，不看尺寸）。
+            // 放在录制之前：它自己不录制命令，只是备好资源。
+            if self
+                .backdrop
+                .glass_params
+                .as_ref()
+                .is_some_and(GlassParams::is_active)
+            {
+                self.ensure_glass(fr)?;
+            }
         }
         // 合成底图用的句柄（`Blit` 是 Copy 的小结构，先取出避免借用冲突）。
         // 首帧尚未上传过捕获图时不能铺底图（采样未初始化图像是 UB），
@@ -712,18 +789,59 @@ impl<'a> Painter<'a> {
         // `uv_offset`：磨砂移动预测补偿。拖动窗口时底图是过期快照，
         // 这里按「已走位移 + 一帧预测」平移采样坐标，让磨砂实时跟住
         // 窗口；静止时位移为 0，与旧行为逐字节一致。
+        // 玻璃模式把这一趟**升级**：不再整屏拷模糊结果，而是读「清晰 + 模糊」
+        // 两张背景，按卡片矩形做折射/色散/Fresnel。产出物同为 `Blit`
+        // （管线 + 布局 + 描述符集 + push constant 完全同构），所以渲染层
+        // 的 `prelude` 机制一行都不用改。
         let backdrop_blit = if use_backdrop
             && self.backdrop.fx.as_ref().is_some_and(|fx| fx.uploaded)
         {
             let offset = self.backdrop_uv_offset(swap_extent);
-            Some(
-                self.backdrop
-                    .fx
-                    .as_ref()
-                    .expect("上面刚检查过")
-                    .pipeline
-                    .composite(offset),
-            )
+            if self
+                .backdrop
+                .glass_params
+                .as_ref()
+                .is_some_and(GlassParams::is_active)
+                && self.backdrop.glass.is_some()
+            {
+                // 参数取走即清：每帧消费一次，避免下一帧（可能已滚动 /
+                // 面板已收起）拿到过期矩形。
+                // `let ... else` 而不是 `is_some()` + `expect()`：前者一次
+                // 性完成解构与兜底，clippy 也不必抱怨「刚检查过又 expect」。
+                // 两个字段分别借：`fx`（不可变，读两张源纹理的视图）与
+                // `glass`（可变，写 uniform + 描述符）。同结构体的不同字段
+                // 可以同时借，这也是把它们放在一个 `BackdropState` 里的原因。
+                let (Some(fx), Some(pipe)) =
+                    (self.backdrop.fx.as_ref(), self.backdrop.glass.as_mut())
+                else {
+                    // 参数已就绪但资源没建齐（ensure_glass 失败被吞了）。
+                    // 退化成普通磨砂合成：至少有底图，不会黑屏。
+                    return Ok(());
+                };
+                let g = self
+                    .backdrop
+                    .glass_params
+                    .take()
+                    .expect("is_active 刚检查过 glass_params 非空");
+                let u = g.uniform(pixels_per_point, render_extent);
+                pipe.prepare(
+                    self.gpu,
+                    slot,
+                    &u,
+                    fx.capture_img.view,
+                    fx.chain.blur_a.image.view,
+                )?;
+                Some(pipe.blit(slot, offset))
+            } else {
+                Some(
+                    self.backdrop
+                        .fx
+                        .as_ref()
+                        .expect("上面刚检查过")
+                        .pipeline
+                        .composite(offset),
+                )
+            }
         } else {
             None
         };
@@ -1025,15 +1143,29 @@ impl<'a> Painter<'a> {
         }
 
         // 本帧观测到的原点先拷贝出来：下面按字段拆借 `&mut self.backdrop`
-        // 期间不能再整体访问它。捕获与观测同帧发生，拷贝值即「快照
-        // 对应的窗口位置」。
+        // 期间不能再整体访问它。
+        //
+        // CAUTION: 抓屏异步化之后，「观测」与「快照」**不再同帧**——请求
+        // 本帧发、结果可能下一帧才回。所以这个原点是「发起抓屏那刻」的
+        // 位置，与快照内容对应的真实时刻相差一次 `BitBlt`（几毫秒）。
+        //
+        // 权衡：这个偏差让磨砂移动预测在快速拖动时最多差几毫秒的位移
+        // （窗口 2000px/s ⇒ 约 10px）。要精确就得让工作线程回传抓屏时刻
+        // 的原点，而那需要线程安全地读一次窗口位置——为 10px 的误差加一
+        // 条跨线程同步不值得。原来的同步版本偏差是同量级（观测早于阻塞
+        // 式的 BitBlt 完成），所以这不是回退。
         let observed_origin = self.backdrop.origin;
 
-        // 拆字段借用：`fx` 与 `capture` 是 `BackdropState` 的两个互不相交
-        // 字段，逐字段借比整体 `&mut self.backdrop` 少一层间接冲突。
+        // 拆字段借用：`fx` 与其余字段互不相交，逐字段借比整体
+        // `&mut self.backdrop` 少一层间接冲突。
+        //
+        // `capture_worker` **必须一起解构**：拆借期间再写
+        // `self.backdrop.capture_worker` 会撞借用检查（E0502）。它的
+        // `request` / `poll` 都是 `&self`，解构出的 `&mut` 会自动
+        // reborrow 成 `&`，无需改动签名。
         let BackdropState {
             fx,
-            capture,
+            capture_worker,
             last_capture,
             luminance,
             // blur_radius / predictor / origin / capture_origin 已在
@@ -1042,20 +1174,36 @@ impl<'a> Painter<'a> {
         } = &mut self.backdrop;
         let fx = fx.as_mut().expect("ensure_backdrop 刚确保存在");
 
-        // 捕获。GDI 初始化失败属于「永不发生但必须兜住」的分支：
-        // 降级为本帧不更新底图（已上传过的话上一帧结果仍在用）。
-        let cap = match capture {
-            Some(c) => c,
-            None => match DesktopCapture::new(Self::needs_rb_swap(format)) {
-                Ok(c) => capture.insert(c),
-                Err(e) => {
-                    tracing::warn!("桌面捕获器初始化失败，磨砂背景停更: {e:#}");
-                    return Ok(());
-                }
-            },
-        };
-        let Some((bits, w, h)) = cap.capture_behind(hwnd)? else {
-            return Ok(()); // 最小化：跳过
+        // ---- 抓屏（工作线程，非阻塞）----
+        //
+        // 本帧发请求，结果可能本帧就到、也可能下一帧才到（`BitBlt`
+        // 毫秒级 vs 帧间隔 16ms）。没抓到就沿用上一帧的底图——磨砂对
+        // 一帧延迟不敏感，而主线程省下的那次阻塞是实打实的：
+        // 滚动列表时的「一顿一顿」有它一份。
+        //
+        // CAUTION: 请求必须在**节流放行后**才发（上面几个 early return
+        // 之后）。每帧都发会让工作线程永远在抓屏、忙不过来，pending
+        // 守卫随即开始丢请求。
+        capture_worker.request(hwnd, Self::needs_rb_swap(format));
+        let (bits, w, h) = match capture_worker.poll() {
+            Some(CaptureOut::Ok(b, w, h)) => {
+                // 抓屏链路的心跳：工作线程抓到 → 主线程收到。
+                // 这条日志消失说明异步抓屏断了（那时磨砂会停在旧画面），
+                // 而它没有任何报错——只能靠日志发现。
+                tracing::debug!(
+                    w,
+                    h,
+                    pending = capture_worker.pending(),
+                    "抓屏结果已就绪"
+                );
+                (b, w, h)
+            }
+            Some(CaptureOut::Skipped) => return Ok(()), // 最小化
+            Some(CaptureOut::Failed(e)) => {
+                tracing::warn!("桌面抓屏失败，磨砂背景停更: {e}");
+                return Ok(());
+            }
+            None => return Ok(()), // 本帧还没抓到：沿用上一帧底图
         };
         if (w, h) != capture_size(swap_extent.width, swap_extent.height) {
             // resize 竞态：客户区已变、交换链还没重建。跳过本帧，
@@ -1078,7 +1226,7 @@ impl<'a> Painter<'a> {
         // 只在 CPU 上多做一次小图降采样（几十微秒），且**与背景同一
         // 时刻的内容**。
         if cb_level > 0 {
-            self.card_blur.out = Some(Self::make_card_blur(bits, w, h, cb_level));
+            self.card_blur.out = Some(Self::make_card_blur(&bits, w, h, cb_level));
         }
 
         // 上传 + 三趟卷积（降采样、横向、纵向）。
@@ -1090,7 +1238,7 @@ impl<'a> Painter<'a> {
         // 记下本帧背景的**平均亮度**（0~1）。渲染层据此调整背景层实度：
         // 纯黑壁纸 + 浅色主题时，若背景层太透，深色文字会落在被压暗的
         // 背景上，对比度直接崩掉（这是纯色桌面下最实际的可读性问题）。
-        *luminance = Some(Self::luminance_of(bits));
+        *luminance = Some(Self::luminance_of(&bits));
 
         let cmd = match fr.current_command_buffer() {
             Some(c) => c,
@@ -1101,7 +1249,7 @@ impl<'a> Painter<'a> {
         };
         let render_pass = fr.render_pass();
         let gpu = self.gpu;
-        if let Err(e) = fr.record_texture_upload(&mut fx.capture_img, bits, None, (w, h)) {
+        if let Err(e) = fr.record_texture_upload(&mut fx.capture_img, &bits, None, (w, h)) {
             self.warn_backdrop(BackdropWarn::Upload, &format!("桌面位图上传失败: {e:#}"));
             return Ok(());
         }

@@ -23,6 +23,12 @@ pub const BINDING_USER_TEXTURE: u32 = 3;
 /// （nearest），两者过滤要求正相反，见布局构造处的长注释。
 pub const BINDING_USER_SAMPLER: u32 = 4;
 
+/// 玻璃合成的**模糊**源纹理绑定（清晰源用 [`BINDING_TEXTURE`]）。
+///
+/// 属于玻璃管线自己的布局，与 egui 布局的 `BINDING_USER_TEXTURE`（同值 3）
+/// 不冲突——两套布局各自独立，不会同时绑定。
+pub const BINDING_TEXTURE_BLUR: u32 = 3;
+
 /// 顶点属性位置。
 mod location {
     /// 屏幕空间位置（vec2<f32>）
@@ -267,6 +273,37 @@ impl DescriptorLayout {
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(BINDING_TEXTURE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        Self::from_bindings(device, &bindings, update_after_bind)
+    }
+
+    /// 玻璃合成的描述符布局：uniform + sampler + **两张**源纹理。
+    ///
+    /// 两张纹理（清晰 / 模糊）都要在片元里采样，且各自可能因尺寸变化而
+    /// 重建，因此都声明为 `COMBINED_IMAGE_SAMPLER`——一个绑定点只能绑
+    /// 一个组合图采样器，两个绑定点就是两张图。
+    pub fn glass(device: &Device, update_after_bind: bool) -> anyhow::Result<Self> {
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_UNIFORM)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_SAMPLER)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_TEXTURE)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(BINDING_TEXTURE_BLUR)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),

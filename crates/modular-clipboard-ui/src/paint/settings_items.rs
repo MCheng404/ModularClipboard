@@ -141,8 +141,14 @@ pub(super) enum ItemKind {
     /// 「界面上任何元素、任何参数都允许自由调整」的最终出口：二级
     /// 主题的旋钮覆盖常见需求，这里覆盖其余一切。
     TokenOverrides,
-    /// 背景效果单选（无 / 磨砂 / 半透明）。
+    /// 背景效果单选（无 / 磨砂 / 半透明 / 玻璃）。
     Backdrop,
+    /// 液态玻璃的折射强度（0 ~ 1，仅玻璃模式可用）。
+    GlassRefract,
+    /// 液态玻璃的色散差异量（0 ~ 1，0 = 无彩边）。
+    GlassDispersion,
+    /// 液态玻璃的 Fresnel 幂次（1 ~ 12，越小光晕越铺开）。
+    GlassEdge,
     /// 背景不透明度滑块。
     Opacity,
     /// 卡片不透明度滑块（磨砂 / 半透明下让行卡片也透出模糊底图）。
@@ -407,6 +413,18 @@ impl SettingsItem {
                     || !cfg.ui.theme_overrides.nums.is_empty()
             }
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
+            ItemKind::GlassRefract => {
+                cfg.ui.window_backdrop == WindowBackdrop::Glass
+                    && (cfg.ui.glass_refract - d.ui.glass_refract).abs() > 1e-6
+            }
+            ItemKind::GlassDispersion => {
+                cfg.ui.window_backdrop == WindowBackdrop::Glass
+                    && (cfg.ui.glass_dispersion - d.ui.glass_dispersion).abs() > 1e-6
+            }
+            ItemKind::GlassEdge => {
+                cfg.ui.window_backdrop == WindowBackdrop::Glass
+                    && (cfg.ui.glass_edge - d.ui.glass_edge).abs() > 1e-6
+            }
             ItemKind::Opacity => (cfg.ui.window_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::CardOpacity => (cfg.ui.card_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::CardBlur => cfg.ui.card_blur != d.ui.card_blur,
@@ -478,6 +496,13 @@ impl SettingsItem {
             ItemKind::CardOpacity => Some(Op::SetCardOpacity(d.ui.card_opacity)),
             ItemKind::CardBlur => Some(Op::SetCardBlur(d.ui.card_blur)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
+            ItemKind::GlassRefract | ItemKind::GlassDispersion | ItemKind::GlassEdge => {
+                Some(Op::SetGlass {
+                    refract: d.ui.glass_refract,
+                    dispersion: d.ui.glass_dispersion,
+                    edge: d.ui.glass_edge,
+                })
+            }
             // 字体缩放：恢复默认倍率（1.0×）。走 SetNumber 而非专用 Op——
             // 应用侧的即时生效钩子正是按 (Ui, "font_scale") 匹配的。
             ItemKind::FontScale => Some(Op::SetNumber {
@@ -655,7 +680,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             SettingsItem {
                 key: "ui.window_backdrop",
                 label: msg("Background effect"),
-                desc: msg("None, frosted blur, or translucent"),
+                desc: msg("None, frosted blur, translucent, or liquid glass"),
                 kind: ItemKind::Backdrop,
             },
             SettingsItem {
@@ -723,6 +748,37 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: msg("Notifications"),
                 desc: msg("How feedback appears: in-window toasts or a separate popup"),
                 kind: ItemKind::NoticeMode,
+            },
+        ],
+    },
+    // 液态玻璃的审美参数**单独成卡**而不是塞进「外观」。
+    //
+    // 两个理由：
+    // 1. 它们只在背景效果 = 玻璃时才有意义，混在外观卡里会被误当成
+    //    通用外观项；
+    // 2. 外观卡已经很长（首屏只能看到前几项），再加三条会把后面的
+    //    「类型过滤栏」「搜索面板」挤到折叠线以下。
+    SettingsCard {
+        cat: SettingsCat::Appearance,
+        title: msg("Liquid glass"),
+        items: &[
+            SettingsItem {
+                key: "ui.glass_refract",
+                label: msg("Glass refraction"),
+                desc: msg("How strongly the glass bends what is behind it; 0 = no bending"),
+                kind: ItemKind::GlassRefract,
+            },
+            SettingsItem {
+                key: "ui.glass_dispersion",
+                label: msg("Glass dispersion"),
+                desc: msg("Color fringing at the edges: 0 = none, higher = more prismatic"),
+                kind: ItemKind::GlassDispersion,
+            },
+            SettingsItem {
+                key: "ui.glass_edge",
+                label: msg("Glass rim light"),
+                desc: msg("Fresnel highlight along the edges; lower spreads it out"),
+                kind: ItemKind::GlassEdge,
             },
         ],
     },

@@ -62,6 +62,49 @@ pub fn glass_normal(p: [f32; 2], half: [f32; 2], radius: f32, eps: f32) -> [f32;
     }
 }
 
+/// SDF 的**解析**梯度（= 外法线）。
+///
+/// # 为什么在 [`glass_normal`] 之外再要一个
+///
+/// `glass_normal` 用中心差分：4 次 SDF 调用，每次含一个 `sqrt`。而圆角
+/// 矩形 SDF 的内部量 `q = max(|p| - half + r, 0)` **本身就是未归一化的
+/// 梯度**——`q / |q|` 即外法线（`q = 0` 的平坦区梯度为 0，与中心差分的
+/// 零向量一致）。所以解析版一次 SDF 就够，省下 3 次 `sqrt` 与一堆
+/// `max`/`abs`。
+///
+/// 玻璃 pass 是**每像素**跑这条链的（2026-10-24 用户实测滚动列表卡顿，
+/// 剖析后确认这是单像素成本里最大的一项），所以这个等价替换值得做。
+/// `glass_normal`（中心差分）保留：测试用它做黄金模型，验证解析版没错。
+///
+/// # 两者何时会不一致
+///
+/// 中心差分在**圆角与直边的接缝**附近会有半步的采样偏差（差分点跨过了
+/// 接缝），解析版没有。差异量级是 `eps`（1 像素）的一小部分，而折射位移
+/// 的最小可辨单位远大于此——观感无差。
+///
+/// # 唯一的坑：象限符号
+///
+/// `q` 用 `|p|` 算 ⇒ 负半轴要乘回符号，见实现里的 CAUTION。
+pub fn glass_normal_analytic(p: [f32; 2], half: [f32; 2], radius: f32) -> [f32; 2] {
+    let r = radius.min(half[0]).min(half[1]).max(0.0);
+    let qx = (p[0].abs() - half[0] + r).max(0.0);
+    let qy = (p[1].abs() - half[1] + r).max(0.0);
+    let len = (qx * qx + qy * qy).sqrt();
+    if len < 1e-6 {
+        return [0.0, 0.0];
+    }
+    // CAUTION: `q` 是用 **|p|** 算的，上下/左右半平面被折到了一起。
+    // 梯度必须按 p 所在的象限还原符号，否则负半轴的法线整体反向——
+    // 折射会把内容朝反方向推（观感是「玻璃在吸气而不是推气」），
+    // 而这类偏差**不报任何错**。
+    //
+    // 这条正是 `analytic_normal_matches_central_difference` 抓到的：
+    // (-90,-25) 处中心差分给 (0,-1)，未修正的解析版给 (0,+1)。
+    let sx = if p[0] < 0.0 { -1.0 } else { 1.0 };
+    let sy = if p[1] < 0.0 { -1.0 } else { 1.0 };
+    [sx * qx / len, sy * qy / len]
+}
+
 /// 折射造成的 UV 位移（单位：UV，即 [0,1] 纹理空间）。
 ///
 /// `normal` 是外法线（`glass_normal` 的输出），`eta = 1 / ior`。
@@ -151,12 +194,47 @@ pub fn dome_refract_offset(local: [f32; 2], eta: f32, power: f32) -> [f32; 2] {
 
 /// Fresnel 边缘光强度（0 = 全透射，1 = 全反射）。
 ///
-/// 2D 情形下 `eye = (0,0,1)`，`|dot(eye, n)|` 由法线的 xy 长度给出：
-/// 直边中央法线朝外（xy 长度 1）⇒ 项为 0 ⇒ 全透射；边缘处法线趋于水平
-/// 的切向 ⇒ 项趋 1 ⇒ 出现亮边。
-pub fn fresnel_edge(normal: [f32; 2], power: f32) -> f32 {
-    let facing = 1.0 - (normal[0] * normal[0] + normal[1] * normal[1]).sqrt().min(1.0);
-    facing.powf(power.max(0.0))
+/// # `normal` 是**斜率场**，不是 SDF 梯度
+///
+/// 这是 2026-10-24 修正过的语义。此前直接吃 [`glass_normal`]（SDF 梯度），
+/// 公式写成 `1 - |n|`，**物理映射是反的**，后果是整片平坦内部全亮：
+///
+/// - 圆角矩形 SDF 的梯度在内部恒为 0、在贴边处为 1；
+/// - 于是 `1 - |n|` 在内部 = 1（最亮）、在边缘 = 0（不亮）——恰好颠倒。
+/// - 而「直边中央不透亮」那条旧测试把这个错误钉住了：它拿 SDF 梯度
+///   （贴边 = 1）算，得到 0，就断言「边缘不该亮」。
+///
+/// 正确的模型：玻璃是一片**弯曲的薄片**。表面法线的 xy 分量就是薄片的
+/// **斜率**——中心平（对着观众，法线 (0,0,1)）⇒ 无反射；越靠边缘越倾斜
+/// ⇒ 越接近掠射 ⇒ Fresnel 越强。所以：
+///
+/// ```text
+///   fresnel = pow(clamp(|slope|, 0, 1), power)
+/// ```
+///
+/// 单调递增，中心 0、边缘 1，且**处处平滑**（SDF 梯度在「平坦区 / 贴边」
+/// 之间有跳变，用它会出现一条硬边亮带）。
+///
+/// 现成的平滑斜率场是 [`dome_refract_offset`] 用的那个穹顶法线：
+/// `normalize(local) * min(|local|, 1)`。调用方传它。
+pub fn fresnel_edge(slope: [f32; 2], power: f32) -> f32 {
+    let m = (slope[0] * slope[0] + slope[1] * slope[1]).sqrt().min(1.0);
+    m.powf(power.max(0.0))
+}
+
+/// 穹顶斜率场（[`fresnel_edge`] 的配套输入）。
+///
+/// 与 [`dome_refract_offset`] 用同一个场，保证「折射强的地方恰好也亮」——
+/// 两者分开算会出现「折射很明显但边缘不亮」的割裂感。
+///
+/// `local` 是归一化到 `[-1, 1]` 的局部坐标（相对中心、按半尺寸归一）。
+pub fn dome_slope(local: [f32; 2]) -> [f32; 2] {
+    let len = (local[0] * local[0] + local[1] * local[1]).sqrt();
+    if len < 1e-6 {
+        return [0.0, 0.0]; // 穹顶顶点：薄片水平，无斜率
+    }
+    let curvature = len.min(1.0);
+    [local[0] / len * curvature, local[1] / len * curvature]
 }
 
 /// 色散的三个 IOR（R 最小、B 最大 ⇒ 蓝光弯得更多，边缘出现彩色描边）。
@@ -246,6 +324,38 @@ mod tests {
     }
 
     #[test]
+    fn analytic_normal_matches_central_difference() {
+        // 解析梯度必须与中心差分（黄金模型）一致——否则 shader 里的
+        // 等价替换会悄悄改变观感，而那种偏差正是「看起来有点怪」、
+        // 与真实故障无法区分的那一类。
+        let samples: [(f32, f32); 12] = [
+            (90.0, 25.0),
+            (99.0, 29.0),
+            (95.0, 5.0),
+            (99.0, 0.0),
+            (0.0, 29.5),
+            (99.5, 29.5),
+            (50.0, 29.0),
+            (50.0, 0.0),   // 平坦区
+            (0.0, 0.0),    // 正中心
+            (-90.0, -25.0),
+            (99.0, -29.0),
+            (70.0, 12.0),
+        ];
+        for &(x, y) in &samples {
+            let cd = glass_normal([x, y], HALF, 8.0, 1.0);
+            let an = glass_normal_analytic([x, y], HALF, 8.0);
+            let diff = ((cd[0] - an[0]).powi(2) + (cd[1] - an[1]).powi(2)).sqrt();
+            assert!(
+                diff < 0.02,
+                "({x},{y}) 解析法线与中心差分不一致：cd={cd:?} an={an:?} 差 {diff}"
+            );
+        }
+        // 平坦区：两者都必须是零向量（中心清晰的前提）。
+        assert_eq!(glass_normal_analytic([50.0, 0.0], HALF, 8.0), [0.0, 0.0]);
+    }
+
+    #[test]
     fn refraction_is_centered_clear_and_edge_strong() {
         // 玻璃的位移分布必须是「中心 ≈ 0、边缘最大」。
         //
@@ -331,14 +441,28 @@ mod tests {
 
     #[test]
     fn fresnel_brightens_only_near_edge() {
-        // 直边中央：法线完全朝外 ⇒ facing = 0 ⇒ 不透亮。
-        let n = glass_normal([99.0, 0.0], HALF, 8.0, 1.0);
-        let f = fresnel_edge(n, 5.0);
-        assert!(f < 0.05, "直边中央 Fresnel 应接近 0，实际 {f}");
-        // 近圆角处：法线偏切向 ⇒ facing 上升 ⇒ 亮边。
-        let n2 = glass_normal([HALF[0] - 2.0, HALF[1] - 2.0], HALF, 8.0, 0.5);
-        let f2 = fresnel_edge(n2, 5.0);
-        assert!(f2 > f, "圆角处应更亮：{f2} > {f}");
+        // 新语义（2026-10-24 修正）：入参是**斜率场**，中心 0、边缘 1。
+        //
+        // CAUTION: 这里必须用 `dome_slope` 而不是 `glass_normal`。
+        // 旧版吃 SDF 梯度，公式还是 `1 - |n|` ⇒ 物理映射整个反了：
+        // SDF 梯度在内部恒 0、贴边为 1，于是 `1-|n|` 让**整片内部最亮**、
+        // 边缘不亮。旧测试「直边中央应接近 0」正好把这个错误钉死了。
+        let local = |x: f32, y: f32| [x / HALF[0], y / HALF[1]];
+        let center = fresnel_edge(dome_slope(local(0.0, 0.0)), 5.0);
+        let mid = fresnel_edge(dome_slope(local(50.0, 0.0)), 5.0);
+        let edge = fresnel_edge(dome_slope(local(99.0, 29.0)), 5.0);
+        assert!(center < 1e-6, "中心（薄片水平）应无 Fresnel，实际 {center}");
+        assert!(mid > center, "越靠边缘越亮：{mid} > {center}");
+        assert!(edge > mid, "边缘最亮：{edge} > {mid}");
+        assert!(edge > 0.9, "边缘应接近全亮，实际 {edge}");
+        // 单调性：斜率场模长单调增 ⇒ Fresnel 单调增。
+        let mut prev = 0.0;
+        for i in 0..=10 {
+            let t = i as f32 / 10.0;
+            let f = fresnel_edge(dome_slope(local(99.0 * t, 29.0 * t)), 5.0);
+            assert!(f >= prev - 1e-6, "Fresnel 应单调不减：{prev} -> {f}");
+            prev = f;
+        }
     }
 
     #[test]

@@ -626,6 +626,20 @@ impl App {
                         level.clamp(1, modular_clipboard_gfx::blur::BLUR_LEVELS);
                     self.after_config_change();
                 }
+                Op::SetGlass {
+                    refract,
+                    dispersion,
+                    edge,
+                } => {
+                    // 三个审美参数只影响玻璃 pass 的 uniform，下一帧即生效
+                    // （无需重建任何 GPU 资源——这正是 `GlassPipeline` 不看
+                    // 尺寸的理由：拖滑块不该触发 `device_wait_idle`）。
+                    let u = &mut self.svc.state.config.ui;
+                    u.glass_refract = refract.clamp(0.0, 1.0);
+                    u.glass_dispersion = dispersion.clamp(0.0, 1.0);
+                    u.glass_edge = edge.clamp(1.0, 12.0);
+                    self.after_config_change();
+                }
                 Op::SetCardShadow(s) => {
                     // 卡片阴影只需改配置：行卡片每帧读配置画投影，下一帧
                     // 即生效。值域钳制在绘制侧做（见 `draw_card_shadow`），

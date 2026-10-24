@@ -127,6 +127,11 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     //
     // 纹理是**整窗客户区**的底图，按卡片矩形取其中一块（见
     // `card_blur_uv`），因此每张卡片看到的是它自己身后那一块桌面。
+    // 液态玻璃：本帧起这张卡片要参与折射合成（仅背景效果 = 玻璃时生效）。
+    // 必须在画底色**之前**——玻璃 pass 跑在 egui 内容之前。
+    f.push_glass(r, radius);
+    // `Color32::a()` 给的是 0~255 的 u8，玻璃 pass 要 0~1 的 f32。
+    f.set_glass_card_alpha(pal.card_bg.a() as f32 / 255.0);
     if let Some(tex) = f.state.card_blur_tex.as_ref() {
         let mut shape = egui::epaint::RectShape::filled(r, radius, egui::Color32::WHITE);
         // `brush` 是 `Option<Arc<Brush>>`——纹理刷子要能在图元之间

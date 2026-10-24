@@ -35,6 +35,17 @@ pub const COPY_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_copy";
 /// `blur.wgsl` 的 tent 上采样片元入口（Dual Filtering 的升采样端）。
 pub const UPSAMPLE_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_upsample";
 
+/// `glass.wgsl` 编译出的 SPIR-V 词。
+///
+/// 与 `blur.wgsl` 分开而不是并进去：玻璃只有**一个**入口（`fs_glass`），
+/// 且要读两张源纹理 + 一份带数组的 uniform，描述符布局与模糊不同。
+const GLASS_SPIRV_WORDS: &[u32] = &include!(concat!(env!("OUT_DIR"), "/glass.rs"));
+
+/// `glass.wgsl` 的全屏三角形顶点入口。
+pub const GLASS_VERTEX_ENTRY: &std::ffi::CStr = c"vs_fullscreen";
+/// `glass.wgsl` 的液态玻璃合成片元入口。
+pub const GLASS_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_glass";
+
 /// 着色器模块。销毁时需调用 [`ShaderModule::destroy`]。
 pub struct ShaderModule {
     module: vk::ShaderModule,
@@ -59,6 +70,14 @@ impl ShaderModule {
         let info = vk::ShaderModuleCreateInfo::default().code(BLUR_SPIRV_WORDS);
         let module = unsafe { device.create_shader_module(&info, None) }
             .map_err(|e| anyhow::anyhow!("创建模糊着色器模块失败: {e:?}"))?;
+        Ok(Self { module })
+    }
+
+    /// 从内嵌的玻璃着色器创建模块（`glass.wgsl`）。
+    pub fn new_glass(device: &ash::Device) -> anyhow::Result<Self> {
+        let info = vk::ShaderModuleCreateInfo::default().code(GLASS_SPIRV_WORDS);
+        let module = unsafe { device.create_shader_module(&info, None) }
+            .map_err(|e| anyhow::anyhow!("创建玻璃着色器模块失败: {e:?}"))?;
         Ok(Self { module })
     }
 

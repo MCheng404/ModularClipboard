@@ -373,6 +373,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                         (WindowBackdrop::None, msg("None")),
                         (WindowBackdrop::Acrylic, msg("Frosted")),
                         (WindowBackdrop::Translucent, msg("Translucent")),
+                        (WindowBackdrop::Glass, msg("Glass")),
                     ],
                     f.svc.state.config.ui.window_backdrop,
                 );
@@ -397,6 +398,44 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             });
             if changed && enabled {
                 f.state.push(Op::SetOpacity(op));
+                record_recent(f, it.key);
+            }
+        }
+        // ---- 液态玻璃的三个审美参数 ----
+        //
+        // 三者只在背景效果 = 玻璃时可用；其余模式下压暗（与磨砂强度同一
+        // 套交互）。整包推 `Op::SetGlass`：三个值一起走，避免一帧内
+        // 连续拖动导致三次写盘。
+        ItemKind::GlassRefract | ItemKind::GlassDispersion | ItemKind::GlassEdge => {
+            let cfg = &f.svc.state.config.ui;
+            let mut v = match it.kind {
+                ItemKind::GlassRefract => cfg.glass_refract,
+                ItemKind::GlassDispersion => cfg.glass_dispersion,
+                _ => cfg.glass_edge,
+            };
+            let (lo, hi, step) = match it.kind {
+                ItemKind::GlassRefract => (0.0_f32, 1.0_f32, 0.01_f32),
+                ItemKind::GlassDispersion => (0.0, 1.0, 0.01),
+                _ => (1.0, 12.0, 0.5),
+            };
+            let enabled = cfg.window_backdrop == WindowBackdrop::Glass;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                // 两位小数：0.35 / 5.00。档位型参数（BlurStrength）显示 x/10，
+                // 这三个是连续量，显示原值更直观。
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("{v:.2}")).color(f.pal.text_dim),
+                ));
+                // `draw_slider`（f32 连续量）而不是 `draw_step_slider`
+                // （后者是 u8 档位滑块，玻璃参数是连续量）。
+                draw_slider(f, ui, it.key, "", &mut v, lo..=hi, enabled, step)
+            });
+            if changed && enabled {
+                let c = &f.svc.state.config.ui;
+                f.state.push(Op::SetGlass {
+                    refract: c.glass_refract,
+                    dispersion: c.glass_dispersion,
+                    edge: c.glass_edge,
+                });
                 record_recent(f, it.key);
             }
         }
