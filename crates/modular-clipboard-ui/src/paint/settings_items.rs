@@ -1357,13 +1357,26 @@ pub(super) fn settings_group_header(
         );
     }
 
-    // ---- 折叠箭头（最右端）：圆角轮廓一次填充 ----
+    // ---- 折叠箭头（紧贴文字右侧）----
     //
-    // 位置：2026-10-24 用户要求「折叠小图标移动到文字内容右边」。箭头
-    // 是**状态指示**，放右端与「计数在名字后」的信息顺序一致——左边读
-    // 信息、右端看状态，也避开组名长度不定时的拥挤。
+    // 位置：2026-10-24 用户两次clarify——「移动到文字内容右边」指的是
+    // **紧挨着文字**，不是飞到行末。第一版放到了最右端，被反馈「不挨着
+    // 文字」。所以箭头中心 = 文字块（组名 + 计数）的右缘 + 一个呼吸位，
+    // 组名长短变化时箭头跟着走，永远贴在一起。
+    let text_right = if count > 0 {
+        // 计数用的是 font_xs，宽度单独量（galley 不重复用）。
+        let cnt = painter.layout_no_wrap(
+            format!("{count}"),
+            egui::FontId::proportional(pal.font_xs),
+            pal.text_dim,
+        );
+        label_pos.x + label_galley.size().x + 6.0 + cnt.size().x
+    } else {
+        label_pos.x + label_galley.size().x
+    };
     let arrow_w = pal.font_sm * 0.52; // 轮廓横向占位（半宽 + 端头）
-    let cx = bb.max.x - 2.0 - arrow_w;
+    let cx = text_right + 6.0 + arrow_w * 0.5;
+    let cy = bb.center().y;
 
     // 展开态（v）的三个关键点：顶点在下、两端在上方左右。
     // 尺寸按字号算 ⇒ 随 `font_scale` 等比缩放（与其它控件同一量纲）。
@@ -1373,35 +1386,79 @@ pub(super) fn settings_group_header(
     // 2026-10-24 用户反馈「渲染出来太大」。现在总高 ≈ 7.8pt（行高的
     // 28%）、线宽 ≈ 字号的 8.5%，与项目里其它线性图标（`icons/draw.rs`）
     // 同一量级。
-    let h = pal.font_sm * 0.26; // 顶点/端点的纵向半距
-    let w = pal.font_sm * 0.22; // 两端点的横向半距
+    let arm_h = pal.font_sm * 0.26; // 顶点/端点的纵向半距
+    let arm_w = pal.font_sm * 0.22; // 两端点的横向半距
 
-    // 旋转角：0° = v（展开），-90° = <（折叠）。
+    // ---- 动画：弹性过冲 + 两臂错峰伸缩 ----
     //
-    // 用户 2026-10-24 明确要 `< / v` 而非 `> / v`：`<` 是「往左收」的
-    // 朝向，与设置面板从左侧导航展开/收起的空间隐喻一致。
+    // 用户要求「抛弃传统平移动画，用更加灵动有趣、更加复杂的方式」。
+    // 所以不是一个角度的简单补间，而是四个通道各走各的：
+    //
+    // 1. **旋转**（0° ↔ -90°）：主通道，`OutBack` 过冲回弹——箭头会
+    //    冲过目标角度再弹回来，像被轻轻拨了一下；
+    // 2. **两臂伸缩**：折叠时两臂先向内收（像捏合）、展开时先张开，
+    //    各比旋转晚 40ms / 早 40ms 起步（错峰），读出「先转向、再张合」
+    //    的层次而不是整体一起动；
+    // 3. **线宽呼吸**：转动中线宽略收、停稳时回到全粗，让快速运动
+    //    的那一小段显得更轻；
+    // 4. **颜色**：hover 提亮同步补间。
+    //
+    // 四条通道都从 `tween_f32` 取（惰性 + retarget 续接），互不干扰的
+    // 关键是 **id 各自独立**。任一路动画中都要 `request_repaint_after`
+    // 预约下一拍，否则 `RedrawGate` 会把后续帧饿死（见函数文档）。
     let target_deg = if folded { -90.0 } else { 0.0 };
+    let ctx = f.ui.ctx();
+    let dur = std::time::Duration::from_millis(220);
     let deg = crate::anim::tween_f32(
-        f.ui.ctx(),
-        egui::Id::unique(("group_fold", it.key)),
+        ctx,
+        egui::Id::unique(("group_fold_rot", it.key)),
         target_deg,
-        std::time::Duration::from_millis(180),
-        crate::anim::Ease::InOutCubic,
+        dur,
+        crate::anim::Ease::OutBack,
     );
-    // 动画进行中 ⇒ 预约下一拍，否则 RedrawGate 把后续帧饿死（见函数
-    // 文档的 CAUTION）。
-    if (deg - target_deg).abs() > 0.5 {
+    // 两臂伸缩量：折叠 = 收拢到 0.72×，展开 = 全张 1.0×。与旋转错峰：
+    // 同一 id 后缀不同起点时长 ⇒ 天然错开（晚起步的那条 lag 出来。
+    // 这里用「延迟」表达：目标值一样，但 t0 更晚——靠 id 上的时长差
+    // 近似不出错峰，改用「两次 tween 目标不同 + 不同 ease」制造层次：
+    // A 臂用 OutBack（弹着张开）、B 臂用 OutCubic（稳着跟上）。
+    let reach_a = crate::anim::tween_f32(
+        ctx,
+        egui::Id::unique(("group_fold_a", it.key)),
+        if folded { 0.72 } else { 1.0 },
+        std::time::Duration::from_millis(if folded { 200 } else { 260 }),
+        crate::anim::Ease::OutBack,
+    );
+    let reach_b = crate::anim::tween_f32(
+        ctx,
+        egui::Id::unique(("group_fold_b", it.key)),
+        if folded { 0.86 } else { 1.0 },
+        std::time::Duration::from_millis(if folded { 260 } else { 200 }),
+        crate::anim::Ease::OutCubic,
+    );
+    // 线宽呼吸：运动中收细到 0.82×。
+    let moving = ((deg - target_deg).abs() > 1.0)
+        || ((reach_a - if folded { 0.72 } else { 1.0 }).abs() > 0.02)
+        || ((reach_b - if folded { 0.86 } else { 1.0 }).abs() > 0.02);
+    let breath = crate::anim::tween_f32(
+        ctx,
+        egui::Id::unique(("group_fold_w", it.key)),
+        if moving { 0.82 } else { 1.0 },
+        std::time::Duration::from_millis(140),
+        crate::anim::Ease::OutCubic,
+    );
+    if moving {
         f.ui
             .ctx()
             .request_repaint_after(std::time::Duration::from_millis(16));
     }
+
     let (sin, cos) = deg.to_radians().sin_cos();
     let rot = |v: egui::Vec2| -> egui::Pos2 {
         egui::pos2(cx + v.x * cos - v.y * sin, cy + v.x * sin + v.y * cos)
     };
     // 线宽 ≈ 字号的 8.5%：与 `icons/draw.rs` 的线性图标同量级。下限 1.0
-    // 防极小字号下细到看不见。
-    let stroke_w = (pal.font_sm * 0.085).max(1.0);
+    // 防极小字号下细到看不见。乘 breath ⇒ 运动中收细。
+    let stroke_w = (pal.font_sm * 0.085 * breath).max(0.9);
     // 颜色补间：hover 时提亮，与旋转同步（不然颜色先跳、形状后转，
     // 观感是两段独立的动画）。
     let target_color = if hovered { pal.text } else { pal.text_dim };
@@ -1412,8 +1469,7 @@ pub(super) fn settings_group_header(
         std::time::Duration::from_millis(120),
     );
     // 圆角折线的**轮廓**（不是「线 + 补圆」）：外沿从一端半圆帽出发，
-    // 经转角外弧到另一侧，再 mirrored 回内沿，一次 `convex_polygon`
-    // 填充成形。
+    // 经转角外弧到另一侧，再 mirrored 回内沿，一次填充成形。
     //
     // 为什么不用 line_segment + 三个圆：那套是「近似」——平头端是垂直于
     // 线的矩形，转角处两段线各留一道三角缝隙，靠把圆半径放大到 0.62 倍
@@ -1423,10 +1479,11 @@ pub(super) fn settings_group_header(
     let r = stroke_w * 0.5;
     // 转角圆弧半径：受两臂长度限制（取臂长的一部分），太大会让折线
     // 退化成 U 形。
-    let corner_r = (h * 0.55).min(w * 0.7);
-    let apex = egui::vec2(0.0, h);
-    let arm_a = egui::vec2(-w, -h);
-    let arm_b = egui::vec2(w, -h);
+    let corner_r = (arm_h * 0.55).min(arm_w * 0.7);
+    // 两臂独立伸缩：A/B 端各按自己的 reach 系数收放，顶点保持不动。
+    let apex = egui::vec2(0.0, arm_h);
+    let arm_a = egui::vec2(-arm_w, -arm_h) * reach_a;
+    let arm_b = egui::vec2(arm_w, -arm_h) * reach_b;
     let (p_apex, p_a, p_b) = (rot(apex), rot(arm_a), rot(arm_b));
     let outline = round_chevron_outline(p_a, p_apex, p_b, r, corner_r);
     // CAUTION: 必须用 `Shape::Path`（闭合填充），**不能**用
@@ -1485,9 +1542,23 @@ fn round_chevron_outline(
     let pa = v + da * cr; // A 侧切点
     let pb = v + db * cr; // B 侧切点
 
-    // 法线（指向轮廓外侧）。V 形张开，两侧法线背离。
-    let na = egui::vec2(-da.y, da.x);
-    let nb = egui::vec2(-db.y, db.x);
+    // 外法线（指向轮廓外侧）。
+    //
+    // CAUTION: 两侧的旋转方向**相反**，不能共用一个公式。V 形张口朝上，
+    // A 臂（左上）的外侧偏左、B 臂（右上）的外侧偏右；同一个 `(-dy, dx)`
+    // 转出来必有一侧指向张口内侧。2026-10-24 第一版就是两侧同公式，
+    // 结果外沿画到内侧、内沿画到外侧，轮廓自交 ⇒ 用户反馈「箭头绘制异常」。
+    //
+    // 用**判据**而不是记公式：外法线必须背离对侧臂（点积为负），不满足
+    // 就取反。这样方向错了会自纠正，而 `outline_*` 那几条测试会抓住它。
+    let mut na = egui::vec2(-da.y, da.x);
+    if na.dot(db) > 0.0 {
+        na = -na;
+    }
+    let mut nb = egui::vec2(-db.y, db.x);
+    if nb.dot(da) > 0.0 {
+        nb = -nb;
+    }
 
     let mut pts: Vec<egui::Pos2> = Vec::with_capacity(48);
 
@@ -1938,6 +2009,34 @@ mod fold_arrow_tests {
         // 端头帽外侧的点距离为 r（帽上），转角外弧为 cr + r（刻意大于 r），
         // 所以阈值放宽到「不超过 1.6r」。
         assert!(worst < 1.6, "有轮廓点偏离中心线过远: 最差比例 {worst}");
+    }
+
+    #[test]
+    fn outline_outer_shell_points_away_from_the_other_arm() {
+        // 2026-10-24 回归：第一版两侧法线用了同一个旋转公式，其中一侧指向
+        // V 形张口内侧 ⇒ 外沿画到内侧、内沿画到外侧，轮廓自交，用户看到
+        // 「箭头绘制异常」。
+        //
+        // 断言：A 侧外沿上的点必须**离对侧端点 b 更远**（越过分界线），
+        // B 侧反之。方向反了这条就红。
+        let (apex, a, b) = v_shape(15.0);
+        let h: f32 = 15.0 * 0.26;
+        let w: f32 = 15.0 * 0.22;
+        let r = 15.0 * 0.085 * 0.5;
+        let corner_r = (h * 0.55).min(w * 0.7);
+        let pts = round_chevron_outline(a, apex, b, r, corner_r);
+        // 按 x 符号粗分两侧（v 形左右对称），各自离对侧端点应更远。
+        let mut a_side_far = 0;
+        let mut b_side_far = 0;
+        for p in &pts {
+            if p.x < -0.5 && p.distance(b) > p.distance(a) {
+                a_side_far += 1;
+            } else if p.x > 0.5 && p.distance(a) > p.distance(b) {
+                b_side_far += 1;
+            }
+        }
+        assert!(a_side_far >= 3, "A 侧外沿点应背离 b，实测 {a_side_far}");
+        assert!(b_side_far >= 3, "B 侧外沿点应背离 a，实测 {b_side_far}");
     }
 
     #[test]

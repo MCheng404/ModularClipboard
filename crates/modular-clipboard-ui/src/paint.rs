@@ -6000,7 +6000,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             h.settings_frame();
             let deg = crate::anim::peek_f32(
                 &h.ctx,
-                egui::Id::unique(("group_fold", "appearance.glass")),
+                egui::Id::unique(("group_fold_rot", "appearance.glass")),
             );
             // 补间值存在且既非起点也非终点 ⇒ 中间态（动画真的在跑）。
             if let Some(v) = deg

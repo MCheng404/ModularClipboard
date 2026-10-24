@@ -40,6 +40,12 @@ pub enum Ease {
     OutExpo,
     /// 两端慢中间快（入场+出场）。主题切换、面板开合。
     InOutCubic,
+    /// 过冲回弹（出场）：冲过目标值再回落。
+    ///
+    /// 给「有质量感的小控件」用——折叠箭头、开关把手。比 `OutCubic`
+    /// 多一分灵动：读者能看出「它是有意停在那里的」，而不是滑到位就死。
+    /// 系数 1.70158 是业界惯用值（约 10% 过冲）。
+    OutBack,
 }
 
 impl Ease {
@@ -64,6 +70,14 @@ impl Ease {
                 } else {
                     1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
                 }
+            }
+            // c3 = 1.70158 + 1：标准 OutBack。t=0 与 t=1 都精确落在端点上
+            // （0 与 1），中间过冲到 ~1.097 后回落——过冲量约 10%。
+            Self::OutBack => {
+                let c1 = 1.70158;
+                let c3 = c1 + 1.0;
+                let u = t - 1.0;
+                1.0 + c3 * u.powi(3) + c1 * u.powi(2)
             }
         }
     }
@@ -301,6 +315,25 @@ mod tests {
             assert_eq!(ease.apply(0.0), 0.0, "{ease:?} 起点应为 0");
             assert!((ease.apply(1.0) - 1.0).abs() < 1e-6, "{ease:?} 终点应为 1");
         }
+    }
+
+    #[test]
+    fn out_back_overshoots_then_settles() {
+        // OutBack 的签名特征：**过冲**（超过 1）再回落，且端点精确。
+        // 这条守住「别退化成 OutCubic」——过冲没了它就只是普通出场曲线，
+        // 而调用方（折叠箭头）要的就是那一下弹。
+        let mut peak = 0.0f32;
+        for i in 0..=40 {
+            let t = i as f32 / 40.0;
+            let v = Ease::OutBack.apply(t);
+            peak = peak.max(v);
+        }
+        assert!(
+            peak > 1.02 && peak < 1.20,
+            "OutBack 应过冲 2%~20%，实测峰值 {peak}"
+        );
+        assert_eq!(Ease::OutBack.apply(0.0), 0.0);
+        assert!((Ease::OutBack.apply(1.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
