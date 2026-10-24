@@ -1331,10 +1331,39 @@ pub(super) fn settings_group_header(
         });
     }
 
-    // ---- 圆角折线箭头：两段线 + 三个端头圆 ----
+    // 行垂直中心：组名、计数、箭头三者共用。
     let cy = bb.center().y;
-    // 横向中心：留出半宽 + 端头圆 + 一点呼吸，让箭头不贴行首。
-    let cx = bb.min.x + 3.0 + pal.font_sm * 0.26;
+
+    // ---- 组名 + 计数（左）----
+    //
+    // 用 galley 而不是 `painter.text`：计数要紧跟组名，必须知道组名的
+    // 实际宽度（`text` 直接画、不返回尺寸）。
+    let label_galley = painter.layout_no_wrap(
+        t(it.label).to_string(),
+        egui::FontId::proportional(pal.font_sm),
+        pal.text_dim,
+    );
+    let label_pos = egui::pos2(bb.min.x + 2.0, cy - label_galley.size().y * 0.5);
+    painter.add(egui::Shape::galley(label_pos, label_galley.clone(), pal.text_dim));
+    // 计数跟在组名右侧：分组标题的信息顺序是「名字 + 有几项」，状态
+    // 指示（箭头）单独占最右端，三者不混在一起。
+    if count > 0 {
+        painter.text(
+            egui::pos2(label_pos.x + label_galley.size().x + 6.0, cy),
+            egui::Align2::LEFT_CENTER,
+            format!("{count}"),
+            egui::FontId::proportional(pal.font_xs),
+            pal.text_dim,
+        );
+    }
+
+    // ---- 折叠箭头（最右端）：圆角轮廓一次填充 ----
+    //
+    // 位置：2026-10-24 用户要求「折叠小图标移动到文字内容右边」。箭头
+    // 是**状态指示**，放右端与「计数在名字后」的信息顺序一致——左边读
+    // 信息、右端看状态，也避开组名长度不定时的拥挤。
+    let arrow_w = pal.font_sm * 0.52; // 轮廓横向占位（半宽 + 端头）
+    let cx = bb.max.x - 2.0 - arrow_w;
 
     // 展开态（v）的三个关键点：顶点在下、两端在上方左右。
     // 尺寸按字号算 ⇒ 随 `font_scale` 等比缩放（与其它控件同一量纲）。
@@ -1346,9 +1375,6 @@ pub(super) fn settings_group_header(
     // 同一量级。
     let h = pal.font_sm * 0.26; // 顶点/端点的纵向半距
     let w = pal.font_sm * 0.22; // 两端点的横向半距
-    let apex = egui::vec2(0.0, h);
-    let arm_a = egui::vec2(-w, -h);
-    let arm_b = egui::vec2(w, -h);
 
     // 旋转角：0° = v（展开），-90° = <（折叠）。
     //
@@ -1373,51 +1399,155 @@ pub(super) fn settings_group_header(
     let rot = |v: egui::Vec2| -> egui::Pos2 {
         egui::pos2(cx + v.x * cos - v.y * sin, cy + v.x * sin + v.y * cos)
     };
-    let (p_apex, p_a, p_b) = (rot(apex), rot(arm_a), rot(arm_b));
-
-    // 颜色也补间：hover 时提亮，与旋转同步（不然颜色先跳、形状后转，
-    // 观感是两段独立的动画）。
-    let arrow_color = if hovered { pal.text } else { pal.text_dim };
     // 线宽 ≈ 字号的 8.5%：与 `icons/draw.rs` 的线性图标同量级。下限 1.0
     // 防极小字号下细到看不见。
     let stroke_w = (pal.font_sm * 0.085).max(1.0);
-    let stroke = egui::Stroke::new(stroke_w, arrow_color);
-    painter.line_segment([p_a, p_apex], stroke);
-    painter.line_segment([p_apex, p_b], stroke);
-    // 端头与转角的圆角：egui 的线是平头端点（Stroke 没有 cap 字段），
-    // 圆润全靠这三个圆补出来。
-    //
-    // CAUTION: 半径取**略大于**线宽/2（0.62 而非 0.5）。平头是垂直于线
-    // 的矩形端，两段线在转角处各留一个很小的三角缝隙；半径等于半宽时
-    // 盖不住，转角会看出一道细 V 形缺口。0.62 倍刚好填满又不至于让端点
-    // 鼓成圆球。
-    let cap_r = stroke_w * 0.62;
-    painter.circle_filled(p_apex, cap_r, arrow_color);
-    painter.circle_filled(p_a, cap_r, arrow_color);
-    painter.circle_filled(p_b, cap_r, arrow_color);
-
-    // 组名：小一号 + 次要色——它是分隔标记，不是设置项本身。
-    // 左边界让出箭头（横向半距 w + 圆头）再留一点呼吸。
-    painter.text(
-        egui::pos2(cx + w + cap_r + 8.0, cy),
-        egui::Align2::LEFT_CENTER,
-        t(it.label),
-        egui::FontId::proportional(pal.font_sm),
-        pal.text_dim,
+    // 颜色补间：hover 时提亮，与旋转同步（不然颜色先跳、形状后转，
+    // 观感是两段独立的动画）。
+    let target_color = if hovered { pal.text } else { pal.text_dim };
+    let arrow_color = crate::anim::tween_color(
+        f.ui.ctx(),
+        egui::Id::unique(("group_fold_c", it.key)),
+        target_color,
+        std::time::Duration::from_millis(120),
     );
+    // 圆角折线的**轮廓**（不是「线 + 补圆」）：外沿从一端半圆帽出发，
+    // 经转角外弧到另一侧，再 mirrored 回内沿，一次 `convex_polygon`
+    // 填充成形。
+    //
+    // 为什么不用 line_segment + 三个圆：那套是「近似」——平头端是垂直于
+    // 线的矩形，转角处两段线各留一道三角缝隙，靠把圆半径放大到 0.62 倍
+    // 线宽去盖；盖是盖住了，但端点会被撑成略鼓的小球，且旋转到某些角度
+    // 时缝隙位置变化、填补量不再均匀。轮廓多边形没有这些问题：它是
+    // 解析的，任何角度下都光滑。
+    let r = stroke_w * 0.5;
+    // 转角圆弧半径：受两臂长度限制（取臂长的一部分），太大会让折线
+    // 退化成 U 形。
+    let corner_r = (h * 0.55).min(w * 0.7);
+    let apex = egui::vec2(0.0, h);
+    let arm_a = egui::vec2(-w, -h);
+    let arm_b = egui::vec2(w, -h);
+    let (p_apex, p_a, p_b) = (rot(apex), rot(arm_a), rot(arm_b));
+    let outline = round_chevron_outline(p_a, p_apex, p_b, r, corner_r);
+    // CAUTION: 必须用 `Shape::Path`（闭合填充），**不能**用
+    // `convex_polygon`。V 形外扩的轮廓是**凹**多边形——张口那一侧是凹
+    // 的；`convex_polygon` 会按凸包三角化，把箭头填成一只实心扇形。
+    // `PathShape` 走通用三角化（ear clipping），凹的也正确。
+    painter.add(egui::Shape::Path(egui::epaint::PathShape {
+        points: outline,
+        closed: true,
+        fill: arrow_color,
+        stroke: egui::Stroke::NONE.into(),
+    }));
 
-    // 右侧计数：这一组有几项。折叠时它是「里面还有东西」的唯一提示——
-    // 否则用户只看到一行标题，会以为那些设置被删了。
-    if count > 0 {
-        painter.text(
-            egui::pos2(bb.max.x - 2.0, cy),
-            egui::Align2::RIGHT_CENTER,
-            format!("{count}"),
-            egui::FontId::proportional(pal.font_xs),
-            pal.text_dim,
-        );
-    }
     ui.add_space(4.0);
+}
+
+/// 圆角折线的**闭合轮廓**（V 形两臂 + 端头半圆 + 转角圆弧）。
+///
+/// 返回的点集按「外沿 → 内沿」顺序绕行一周，喂给 `Shape::Path`
+/// （`closed: true`）即可。
+///
+/// CAUTION: **不能**喂 `Shape::convex_polygon`——V 形外扩的轮廓是凹多边形
+/// （张口那侧是凹的），凸包三角化会把它填成实心扇形。
+///
+/// # 为什么要轮廓而不是「线 + 补圆」
+///
+/// `Shape::line` 由 tessellator 以**平头**端点生成（egui 的 `Stroke`
+/// 只有 `width`/`color`，没有线帽字段）。用「两段线 + 三个圆」近似圆角
+/// 时，平头是垂直于线的矩形端，转角处两段线各留一道三角缝隙，只能靠
+/// 把圆半径放大到线宽的 0.6 倍去盖——盖住了，但端点被撑成略鼓的小球，
+/// 且图形旋转时缝隙位置变化、填补量不再均匀。
+///
+/// 轮廓是解析的：外沿 = 端点半圆帽 + 直线段 + 转角外弧，内沿镜像。
+/// 任何旋转角度下都光滑，没有接缝。
+///
+/// # 参数
+///
+/// - `a` / `b`：两臂的外端点
+/// - `v`：转角顶点
+/// - `r`：线宽的一半（轮廓到中心线的距离）
+/// - `corner_r`：转角圆弧半径（≤ 任一侧切点距离，否则退化成 U 形）
+fn round_chevron_outline(
+    a: egui::Pos2,
+    v: egui::Pos2,
+    b: egui::Pos2,
+    r: f32,
+    corner_r: f32,
+) -> Vec<egui::Pos2> {
+    // 两臂方向（从顶点指向两端）。
+    let da = (a - v).normalized();
+    let db = (b - v).normalized();
+    let la = a.distance(v);
+    let lb = b.distance(v);
+    // 切点：转角圆弧与直线段的接界。受臂长约束（留出端头帽的位置）。
+    let cr = corner_r.min(la - r).min(lb - r).max(0.0);
+    let pa = v + da * cr; // A 侧切点
+    let pb = v + db * cr; // B 侧切点
+
+    // 法线（指向轮廓外侧）。V 形张开，两侧法线背离。
+    let na = egui::vec2(-da.y, da.x);
+    let nb = egui::vec2(-db.y, db.x);
+
+    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(48);
+
+    // ---- 外沿：A 端半圆帽 → 直线 → 转角外弧 → 直线 → B 端半圆帽 ----
+    // A 端帽：以 a 为圆心、半径 r 的半圆，从 -na 侧扫到 +na 侧（外侧）。
+    let a_dir = da; // 帽的「轴向」朝臂内
+    arc(&mut pts, a, a_dir, na, r, true);
+    // A 臂外侧直线段：a + na*r → pa + na*r
+    pts.push(pa + na * r);
+    // 转角外弧：以 v 为圆心，半径 cr + r，从 pa 的法向转到 pb 的法向。
+    // 用参数 t ∈ [0,1] 在 pa/r 与 pb/r 之间按圆弧采样（夹角已知）。
+    arc_between(&mut pts, v, pa + na * r, pb + nb * r, cr + r);
+    pts.push(pb + nb * r);
+    // B 端帽
+    let b_dir = db;
+    arc(&mut pts, b, b_dir, nb, r, true);
+
+    // ---- 内沿：镜像回去（B → v → A）----
+    arc_between(&mut pts, v, pb - nb * r, pa - na * r, (cr - r).max(0.0));
+    pts.push(pa - na * r);
+    let b_dir_rev = -b_dir;
+    arc(&mut pts, b, b_dir_rev, -nb, r, true);
+    pts.push(pa - na * r);
+    let a_dir_rev = -a_dir;
+    arc(&mut pts, a, a_dir_rev, -na, r, true);
+    pts
+}
+
+/// 端头半圆帽：以 `c` 为圆心，从 `-n` 侧经 `axis` 方向扫到 `+n` 侧。
+///
+/// `axis` 是帽的轴向（指向图形内侧），`n` 是与它垂直的法向。
+fn arc(pts: &mut Vec<egui::Pos2>, c: egui::Pos2, axis: egui::Vec2, n: egui::Vec2, r: f32, _ccw: bool) {
+    let steps = 8;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let ang = std::f32::consts::PI * t;
+        // 从 -n 起，绕 axis 旋到 +n。
+        let dir = -n * ang.cos() + axis * ang.sin();
+        pts.push(c + dir * r);
+    }
+}
+
+/// 两点之间的圆弧采样（已知圆心与半径）：从 `p0` 扫到 `p1`，取短弧。
+fn arc_between(pts: &mut Vec<egui::Pos2>, center: egui::Pos2, p0: egui::Pos2, p1: egui::Pos2, radius: f32) {
+    let a0 = (p0 - center).angle();
+    let a1 = (p1 - center).angle();
+    let mut delta = a1 - a0;
+    // 取短弧（|delta| ≤ π）。
+    while delta > std::f32::consts::PI {
+        delta -= std::f32::consts::TAU;
+    }
+    while delta < -std::f32::consts::PI {
+        delta += std::f32::consts::TAU;
+    }
+    let steps = 10;
+    for i in 1..=steps {
+        let t = i as f32 / steps as f32;
+        let ang = a0 + delta * t;
+        pts.push(center + egui::vec2(ang.cos(), ang.sin()) * radius);
+    }
 }
 
 /// 一张卡片：圆角背景 + 标题行（标题 + 条件重置按钮）+ 设置行。
@@ -1742,4 +1872,106 @@ pub(super) fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         }
     });
     changed
+}
+
+#[cfg(test)]
+mod fold_arrow_tests {
+    use super::round_chevron_outline;
+
+    /// egui 的 `Vec2` 没有叉积，测试自备一个（只在这里用）。
+    trait CrossExt {
+        fn cross(self, o: egui::Vec2) -> f32;
+    }
+    impl CrossExt for egui::Vec2 {
+        fn cross(self, o: egui::Vec2) -> f32 {
+            self.x * o.y - self.y * o.x
+        }
+    }
+
+    /// 展开态（v，顶点在下）的三个关键点：与 `settings_group_header`
+    /// 同一套系数，确保测的是真形状。
+    fn v_shape(scale: f32) -> (egui::Pos2, egui::Pos2, egui::Pos2) {
+        let h = scale * 0.26;
+        let w = scale * 0.22;
+        (
+            egui::pos2(0.0, h),  // 顶点（下）
+            egui::pos2(-w, -h), // A 端
+            egui::pos2(w, -h),  // B 端
+        )
+    }
+
+    #[test]
+    fn outline_is_closed_and_has_both_shells() {
+        let (apex, a, b) = v_shape(15.0);
+        let h: f32 = 15.0 * 0.26;
+        let w: f32 = 15.0 * 0.22;
+        let r = 15.0 * 0.085 * 0.5;
+        let corner_r = (h * 0.55).min(w * 0.7);
+        let pts = round_chevron_outline(a, apex, b, r, corner_r);
+        // 外沿：A 帽 9 点 + 1 切点 + 转角外弧 10 点 + 1 切点 + B 帽 9 点
+        // 内沿：转角内弧 10 + 1 切点 + B 帽 9 + 1 切点 + A 帽 9
+        assert!(pts.len() >= 40, "轮廓点太少: {}", pts.len());
+        assert!(pts.len() <= 70, "轮廓点太多: {}", pts.len());
+        // 所有点有限（NaN 会让 Path 三角化炸掉）。
+        for p in &pts {
+            assert!(p.x.is_finite() && p.y.is_finite(), "非有限坐标: {p:?}");
+        }
+    }
+
+    #[test]
+    fn outline_stays_near_the_centerline() {
+        // 轮廓必须贴着中心线：每个点到最近的中心线段距离 ≈ r（±20%）。
+        // 这条守住「端头圆鼓成球」和「轮廓跑飞」两类退化。
+        let (apex, a, b) = v_shape(15.0);
+        let h: f32 = 15.0 * 0.26;
+        let w: f32 = 15.0 * 0.22;
+        let r = 15.0 * 0.085 * 0.5;
+        let corner_r = (h * 0.55).min(w * 0.7);
+        let pts = round_chevron_outline(a, apex, b, r, corner_r);
+        let mut worst = 0.0f32;
+        for p in &pts {
+            // 到两臂线段的距离取最小。
+            let d = seg_dist(*p, a, apex).min(seg_dist(*p, b, apex));
+            let ratio = (d - r).abs() / r;
+            worst = worst.max(ratio);
+        }
+        // 端头帽外侧的点距离为 r（帽上），转角外弧为 cr + r（刻意大于 r），
+        // 所以阈值放宽到「不超过 1.6r」。
+        assert!(worst < 1.6, "有轮廓点偏离中心线过远: 最差比例 {worst}");
+    }
+
+    #[test]
+    fn outline_is_concave_not_a_fan() {
+        // 关键回归：轮廓必须是**凹**的（V 形张口侧内凹）。若哪天误改回
+        // `convex_polygon`，三角形化会填成实心扇形——这里用「存在一个
+        // 内角 > 180° 的点」来断言凹性。
+        let (apex, a, b) = v_shape(15.0);
+        let h: f32 = 15.0 * 0.26;
+        let w: f32 = 15.0 * 0.22;
+        let r = 15.0 * 0.085 * 0.5;
+        let corner_r = (h * 0.55).min(w * 0.7);
+        let pts = round_chevron_outline(a, apex, b, r, corner_r);
+        let mut reflex = 0;
+        let n = pts.len();
+        for i in 0..n {
+            let prev = pts[(i + n - 1) % n];
+            let cur = pts[i];
+            let next = pts[(i + 1) % n];
+            let cross = (cur - prev).cross(next - cur);
+            if cross < 0.0 {
+                reflex += 1;
+            }
+        }
+        assert!(reflex >= 2, "轮廓应有内凹点（V 形张口），实测 {reflex}");
+    }
+
+    fn seg_dist(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+        let ab = b - a;
+        let len2 = ab.length_sq();
+        if len2 < 1e-9 {
+            return p.distance(a);
+        }
+        let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+        p.distance(a + ab * t)
+    }
 }
