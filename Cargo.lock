@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "directories",
  "modular-clipboard-app",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-app"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-capture"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-core"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-gfx"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ash",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-ipc"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "modular-clipboard-core",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-mcp"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-platform"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-store"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "modular-clipboard-ui"
-version = "0.2.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "ash",
