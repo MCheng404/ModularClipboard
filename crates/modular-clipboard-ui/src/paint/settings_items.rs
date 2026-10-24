@@ -1562,40 +1562,61 @@ fn round_chevron_outline(
 
     let mut pts: Vec<egui::Pos2> = Vec::with_capacity(48);
 
-    // ---- 外沿：A 端半圆帽 → 直线 → 转角外弧 → 直线 → B 端半圆帽 ----
-    // A 端帽：以 a 为圆心、半径 r 的半圆，从 -na 侧扫到 +na 侧（外侧）。
-    let a_dir = da; // 帽的「轴向」朝臂内
-    arc(&mut pts, a, a_dir, na, r, true);
-    // A 臂外侧直线段：a + na*r → pa + na*r
-    pts.push(pa + na * r);
-    // 转角外弧：以 v 为圆心，半径 cr + r，从 pa 的法向转到 pb 的法向。
-    // 用参数 t ∈ [0,1] 在 pa/r 与 pb/r 之间按圆弧采样（夹角已知）。
-    arc_between(&mut pts, v, pa + na * r, pb + nb * r, cr + r);
-    pts.push(pb + nb * r);
-    // B 端帽
-    let b_dir = db;
-    arc(&mut pts, b, b_dir, nb, r, true);
+    // ---- 绕行顺序：外沿（A→B）→ B 端帽 → 内沿（B→A）→ A 端帽 ----
+    //
+    // CAUTION: 这个顺序是**硬性的**，2026-10-24 前两版都错在这：
+    //
+    // - 第一版把「A 帽 → A 臂外 → 转角外弧 → B 臂外 → B 帽」当外沿，
+    //   然后内沿又从 B 帽的**同一起点**出发 ⇒ B 端帽被画了两次，且内沿
+    //   第一段从外沿终点直穿端头区连到内侧，轮廓自交；
+    // - 端头帽只能出现**一次**，它是外沿与内沿之间的过渡：外沿走到帽的
+    //   一侧，帽扫到另一侧，内沿从另一侧接着走。
+    //
+    // 所以正确的单向闭合曲线是：
+    //   A 臂外直线 → 转角外弧 → B 臂外直线 → B 端帽
+    //   → B 臂内直线 → 转角内弧 → A 臂内直线 → A 端帽 →（闭合回起点）
 
-    // ---- 内沿：镜像回去（B → v → A）----
-    arc_between(&mut pts, v, pb - nb * r, pa - na * r, (cr - r).max(0.0));
-    pts.push(pa - na * r);
-    let b_dir_rev = -b_dir;
-    arc(&mut pts, b, b_dir_rev, -nb, r, true);
-    pts.push(pa - na * r);
-    let a_dir_rev = -a_dir;
-    arc(&mut pts, a, a_dir_rev, -na, r, true);
+    // A 臂外侧直线：a + na*r → pa + na*r（Path 自动连线，只推终点）。
+    pts.push(a + na * r);
+    pts.push(pa + na * r);
+    // 转角外弧：以 v 为圆心，从 pa 的法向转到 pb 的法向。
+    //
+    // CAUTION: 半径是 **√(cr² + r²)**，不是 `cr + r`。切点 pa 在 v→a 方向
+    // 上距 v 为 cr，外沿点是 pa 再沿法向挪 r——那是一个直角三角形，
+    // 斜边才是该点到 v 的距离。2026-10-24 第三版传 `cr + r`，采样点被
+    // 强制推到更远的圆上，弧线与直线段不再相切 ⇒ 与直线段相交，
+    // `outline_does_not_self_intersect` 当场抓到 2 处。
+    let arc_r = (cr * cr + r * r).sqrt();
+    arc_between(&mut pts, v, pa + na * r, pb + nb * r, arc_r);
+    // B 臂外侧直线：pb + nb*r → b + nb*r。
+    pts.push(b + nb * r);
+    // B 端帽：b+nb*r →（经最外点 b+db*r）→ b-nb*r。
+    //
+    // `arc(c, axis, n)` 从 -n 侧经 axis 扫到 +n 侧；这里要的方向相反
+    // （从 +nb 到 -nb），所以把 n 取反：t=0 ⇒ -(-nb) = +nb，t=1 ⇒ -nb。
+    arc(&mut pts, b, db, -nb, r);
+    // B 臂内侧直线：b-nb*r → pb-nb*r。
+    pts.push(pb - nb * r);
+    // 转角内弧：同一个斜边半径（内沿点到 v 的距离同样是 √(cr² + r²)），
+    // 只是角度范围在张口那一侧。
+    arc_between(&mut pts, v, pb - nb * r, pa - na * r, arc_r);
+    // A 臂内侧直线：pa-na*r → a-na*r。
+    pts.push(a - na * r);
+    // A 端帽：a-na*r →（经最外点 a+da*r）→ a+na*r，正好闭合到外沿起点。
+    // 方向与 `arc` 的默认扫描一致（-n → +n），不用取反。
+    arc(&mut pts, a, da, na, r);
     pts
 }
 
-/// 端头半圆帽：以 `c` 为圆心，从 `-n` 侧经 `axis` 方向扫到 `+n` 侧。
+/// 半圆帽：以 `c` 为圆心，从 `-n` 侧经 `axis`（最外点）扫到 `+n` 侧。
 ///
-/// `axis` 是帽的轴向（指向图形内侧），`n` 是与它垂直的法向。
-fn arc(pts: &mut Vec<egui::Pos2>, c: egui::Pos2, axis: egui::Vec2, n: egui::Vec2, r: f32, _ccw: bool) {
+/// 半径 `r`，`steps` 段折线近似。方向由 `n` 的符号决定——要反向扫就把
+/// `n` 取反（见 `round_chevron_outline` 里 B 端帽的用法）。
+fn arc(pts: &mut Vec<egui::Pos2>, c: egui::Pos2, axis: egui::Vec2, n: egui::Vec2, r: f32) {
     let steps = 8;
     for i in 0..=steps {
-        let t = i as f32 / steps as f32;
-        let ang = std::f32::consts::PI * t;
-        // 从 -n 起，绕 axis 旋到 +n。
+        let ang = std::f32::consts::PI * (i as f32 / steps as f32);
+        // 从 -n 起，绕 axis 旋到 +n：axis 垂直 n，故这是平面内的半圆。
         let dir = -n * ang.cos() + axis * ang.sin();
         pts.push(c + dir * r);
     }
@@ -1620,6 +1641,7 @@ fn arc_between(pts: &mut Vec<egui::Pos2>, center: egui::Pos2, p0: egui::Pos2, p1
         pts.push(center + egui::vec2(ang.cos(), ang.sin()) * radius);
     }
 }
+
 
 /// 一张卡片：圆角背景 + 标题行（标题 + 条件重置按钮）+ 设置行。
 ///
@@ -2009,6 +2031,79 @@ mod fold_arrow_tests {
         // 端头帽外侧的点距离为 r（帽上），转角外弧为 cr + r（刻意大于 r），
         // 所以阈值放宽到「不超过 1.6r」。
         assert!(worst < 1.6, "有轮廓点偏离中心线过远: 最差比例 {worst}");
+    }
+
+    /// 轮廓必须是**简单闭合曲线**（不自交）。
+    ///
+    /// 2026-10-24 连续三版都栽在自交上：两侧法线同公式（外沿内沿颠倒）、
+    /// 端头帽组织错乱（B 帽画两次、内沿从外沿终点直穿端头）。前两条测试
+    /// （法线朝向、凹性）各自只抓一个面，这条用最笨也最可靠的办法：
+    /// 两两求线段交点。粗折线的轮廓只有相邻边在顶点相接，**任何非相邻
+    /// 边相交都是自交** ⇒ 图形必然错乱。
+    #[test]
+    fn outline_does_not_self_intersect() {
+        let (apex, a, b) = v_shape(15.0);
+        let h: f32 = 15.0 * 0.26;
+        let w: f32 = 15.0 * 0.22;
+        let r = 15.0 * 0.085 * 0.5;
+        let corner_r = (h * 0.55).min(w * 0.7);
+        let pts = round_chevron_outline(a, apex, b, r, corner_r);
+        let n = pts.len();
+        let mut hits = 0;
+        for i in 0..n {
+            let p0 = pts[i];
+            let p1 = pts[(i + 1) % n];
+            for j in (i + 2)..n {
+                // 跳过首尾相邻的两组（共享端点不算交）。
+                if i == 0 && j == n - 1 {
+                    continue;
+                }
+                let q0 = pts[j];
+                let q1 = pts[(j + 1) % n];
+                if segs_cross(p0, p1, q0, q1) {
+                    hits += 1;
+                }
+            }
+        }
+        assert!(hits == 0, "轮廓自交 {hits} 处 ⇒ 填充结果必然错乱");
+    }
+
+    /// 相邻边在顶点处应当**首尾相接**（轮廓连续，没有跳跃）。
+    ///
+    /// 自交之外的另一类错乱是「跳点」：某两个相邻点之间被一条横穿图形的
+    /// 长直线连起来。这里断言每对相邻点的间距都不超过一个采样步长
+    /// （弧采样步长约 0.4r，直线段则更短），超出即说明有跳点。
+    #[test]
+    fn outline_has_no_long_jumps() {
+        let (apex, a, b) = v_shape(15.0);
+        let h: f32 = 15.0 * 0.26;
+        let w: f32 = 15.0 * 0.22;
+        let r = 15.0 * 0.085 * 0.5;
+        let corner_r = (h * 0.55).min(w * 0.7);
+        let pts = round_chevron_outline(a, apex, b, r, corner_r);
+        // 上限：轮廓最长单边。外侧直线段长 = 臂长 - 转角半径
+        // （8.47 - 2.15 ≈ 6.4pt），弧步长 < 0.5pt。取 9pt：超过它必然
+        // 不是正常的相邻采样点，而是横穿图形的长直线。
+        let max_step = 9.0;
+        for i in 0..pts.len() {
+            let d = pts[i].distance(pts[(i + 1) % pts.len()]);
+            assert!(d <= max_step, "第 {i} 段跳点 {d:.2}pt ⇒ 有横穿图形的长直线");
+        }
+    }
+
+    /// 两条线段是否**真交叉**（排除端点相接与共线退化）。
+    fn segs_cross(p0: egui::Pos2, p1: egui::Pos2, q0: egui::Pos2, q1: egui::Pos2) -> bool {
+        let d1 = p1 - p0;
+        let d2 = q1 - q0;
+        let denom = d1.x * d2.y - d1.y * d2.x;
+        if denom.abs() < 1e-9 {
+            return false; // 平行或退化
+        }
+        let diff = q0 - p0;
+        let t = (diff.x * d2.y - diff.y * d2.x) / denom;
+        let u = (diff.x * d1.y - diff.y * d1.x) / denom;
+        // 严格在两条线段内部相交（不含端点）才算自交。
+        t > 1e-6 && t < 1.0 - 1e-6 && u > 1e-6 && u < 1.0 - 1e-6
     }
 
     #[test]
