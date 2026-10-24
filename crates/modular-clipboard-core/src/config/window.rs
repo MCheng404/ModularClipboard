@@ -23,6 +23,16 @@ pub enum WindowBackdrop {
     /// 文字/卡片不透明保证可读性。不再用整窗 `LWA_ALPHA` 淡出
     /// （那会把文字一起变透明，低不透明度下不可读）。
     Translucent,
+    /// 液态玻璃：在磨砂之上再加一层 GPU 折射（两级：中心穹顶 + 边缘
+    /// 轮廓）、色散与 Fresnel 边缘光。
+    ///
+    /// 与 [`Self::Acrylic`] 的关系：玻璃**复用** Acrylic 的抓屏与模糊链
+    /// （同一份 `capture_img` + `blur_a`），只在其上多画一趟玻璃 pass。
+    /// 所以它是「磨砂 + 光学层」，不是另一套背景机制。
+    ///
+    /// 审美取向（折射多强、色散多宽、亮边多亮）**不设默认答案**——
+    /// 全部做成可调项，由用户定。
+    Glass,
 }
 
 /// `window_opacity` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
@@ -33,6 +43,30 @@ pub(super) fn default_window_opacity() -> f32 {
 /// `card_opacity` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
 pub(super) fn default_card_opacity() -> f32 {
     1.0
+}
+
+/// 玻璃折射强度的 serde 缺省。
+///
+/// 0.35 来自 bergice/liquidglass 的边缘轮廓折射系数（`refractVec * 0.35`），
+/// 是「能看出折射、又不把内容撕走」的经验值。用户可调 0 ~ 1。
+pub(super) fn default_glass_refract() -> f32 {
+    0.35
+}
+
+/// 色散强度缺省（0 = 关闭色散，1 = 满）。
+///
+/// 色散 = R/G/B 各用一个 IOR（1.50/1.52/1.54）分别采样，边缘因此出现
+/// 彩色描边。开太大会像「显卡坏了」，故缺省取中等偏弱。
+pub(super) fn default_glass_dispersion() -> f32 {
+    0.5
+}
+
+/// Fresnel 边缘光幂次缺省。
+///
+/// `pow(1 - |dot(eye, n)|, power)`：越小光晕越铺开到整张卡片，越大越集中
+/// 在边缘一两像素。5.0 是 Heckel 教程里的值，边缘一圈亮线。
+pub(super) fn default_glass_edge() -> f32 {
+    5.0
 }
 
 /// `card_blur` 的 serde 缺省值：0 = 关闭（不抓屏、不上传纹理）。

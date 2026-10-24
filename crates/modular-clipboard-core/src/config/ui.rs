@@ -13,6 +13,9 @@ use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
 use super::window::WindowPos;
 use super::window::default_card_blur;
+use super::window::default_glass_dispersion;
+use super::window::default_glass_edge;
+use super::window::default_glass_refract;
 use super::window::default_card_opacity;
 use super::window::default_window_blur_strength;
 use super::window::default_window_opacity;
@@ -116,6 +119,18 @@ pub struct UiConfig {
     /// 默认 0（关）：多一次抓屏与纹理上传，不该默认付这个代价。
     #[serde(default = "default_card_blur")]
     pub card_blur: u8,
+    /// 玻璃折射强度（0 ~ 1）。仅 `window_backdrop == Glass` 时生效。
+    ///
+    /// 审美项，无「正确值」：0 = 只剩磨砂（等同 Acrylic），1 = 边缘剧烈
+    /// 扭曲。审美取向交给用户，故单独暴露。
+    #[serde(default = "default_glass_refract")]
+    pub glass_refract: f32,
+    /// 色散强度（0 ~ 1）。0 = 关闭彩色描边。
+    #[serde(default = "default_glass_dispersion")]
+    pub glass_dispersion: f32,
+    /// Fresnel 边缘光幂次（0.5 ~ 12）。
+    #[serde(default = "default_glass_edge")]
+    pub glass_edge: f32,
     /// 磨砂强度档位（1 ~ 10，默认 7）。仅在 `window_backdrop == Acrylic`
     /// 时生效。
     ///

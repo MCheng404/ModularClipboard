@@ -380,6 +380,14 @@ impl App {
         // 无模式用原 palette。
         let backdrop = self.svc.state.config.ui.window_backdrop;
         let opacity = self.svc.state.config.ui.window_opacity;
+        // 玻璃复用磨砂的**背景层**（同一套 alpha 计算），光学层（折射/色散/
+        // Fresnel）由渲染层的玻璃 pass 叠上去。所以这里把它并到 Acrylic 分支。
+        let backdrop_is_glass = backdrop == modular_clipboard_core::config::WindowBackdrop::Glass;
+        let backdrop = if backdrop_is_glass {
+            modular_clipboard_core::config::WindowBackdrop::Acrylic
+        } else {
+            backdrop
+        };
         // 卡片不透明度：磨砂 / 半透明下把行卡片底色也降 alpha，让模糊底图
         // 透过卡片显示（否则只有行间缝隙能看出磨砂，卡片本身仍是实底）。
         // 无背景时不生效——不透明底图后面没有东西可透。
@@ -407,6 +415,11 @@ impl App {
                 &backdrop_pal
             }
             modular_clipboard_core::config::WindowBackdrop::None => &self.pal,
+            // 值永远不会到这里：上方已把玻璃并入 Acrylic。Rust 的穷尽性
+            // 检查基于**类型**而非值，所以必须显式写这个分支。
+            modular_clipboard_core::config::WindowBackdrop::Glass => unreachable!(
+                "背景玻璃已在上方并入 Acrylic，不该走到这里"
+            ),
         };
         // 卡片透明度在**窗口背景无底图**时也要能生效——只要开了卡片磨砂。
         //

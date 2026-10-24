@@ -632,6 +632,13 @@ pub fn apply_backdrop(hwnd: HWND, mode: WindowBackdrop) {
     // 分层窗口的 LWA_ALPHA 是整窗淡出，与磨砂/半透明的新语义互斥。
     // 幂等：样式已正确时跳过，避免每帧触发窗口重算。
     let _ = unsafe { set_layered(hwnd, false) };
+    // 玻璃与磨砂一样要从捕获里排除自己（否则会把自己的画面抓进底图）。
+    let mode = match mode {
+        modular_clipboard_core::config::WindowBackdrop::Glass => {
+            modular_clipboard_core::config::WindowBackdrop::Acrylic
+        }
+        other => other,
+    };
     let affinity = match mode {
         // 捕获自排除：让桌面捕获「看见」窗口身后而不是窗口自己。
         // （`MC_NO_EXCLUDE` 只是验证用的临时开关：关闭排除后外部截图
@@ -643,7 +650,8 @@ pub fn apply_backdrop(hwnd: HWND, mode: WindowBackdrop) {
                 WDA_EXCLUDEFROMCAPTURE
             }
         }
-        WindowBackdrop::Translucent | WindowBackdrop::None => WDA_NONE,
+        // 玻璃上方已并入 Acrylic，这里同样只为满足穷尽性检查。
+        WindowBackdrop::Translucent | WindowBackdrop::None | WindowBackdrop::Glass => WDA_NONE,
     };
     // SAFETY: hwnd 已由上面的 IsWindow 校验。
     if let Err(e) = unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
