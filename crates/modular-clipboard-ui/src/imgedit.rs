@@ -949,7 +949,7 @@ impl<'a> Drop for ImageEditor<'a> {
         // 与 `Popup` / `ChildWindow` 同款三件事，顺序不能换：
         // 抽干残留 posted 消息 → 等 GPU 空闲 → 销毁表面。
         self.events.drain_pending();
-        self.gfx.gpu.wait_idle();
+        self.gfx.wait_own_window_inflight();
         unsafe {
             self.gfx.gpu.destroy_surface(self.surface);
         }

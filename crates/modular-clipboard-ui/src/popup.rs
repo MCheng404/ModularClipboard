@@ -570,7 +570,7 @@ impl Drop for Popup<'_> {
         // 再等 GPU 空闲（in-flight 命令可能仍在读 surface），
         // 最后销毁表面。
         self.events.drain_pending();
-        self.gfx.gpu.wait_idle();
+        self.gfx.wait_own_window_inflight();
         unsafe {
             self.gfx.gpu.destroy_surface(self.surface);
         }

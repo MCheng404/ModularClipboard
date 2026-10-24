@@ -152,6 +152,11 @@ pub struct Painter<'a> {
     backdrop_warned: std::collections::HashSet<BackdropWarn>,
     /// 累计统计，供上层显示与诊断。
     pub stats: FrameStats,
+    /// 「已经有人等过本窗口的在途帧」标记，见 [`Self::mark_synced`]。
+    ///
+    /// 只由 `WindowGfx::drop` 置位；主窗口的 Painter 不住在 `WindowGfx`
+    /// 里，永远保持 `false`（它 Drop 时的设备级等待等不到别人，无害）。
+    synced: bool,
 }
 
 /// 磨砂降级的**原因**分类（告警按它去重，见 `Painter::backdrop_warned`）。
@@ -356,6 +361,7 @@ impl<'a> Painter<'a> {
             card_blur: CardBlurState::default(),
             backdrop_warned: std::collections::HashSet::new(),
             stats: FrameStats::default(),
+            synced: false,
         })
     }
 
@@ -1284,6 +1290,16 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// 告知「本窗口的在途帧已经等过」，[`Self::drop`] 里那次设备级
+    /// `wait_idle` 可以免掉。
+    ///
+    /// 只给附属窗口用（`WindowGfx::drop` 调）。它免掉的不只是一次冗余
+    /// 等待：设备级等待在附属窗口销毁时是**跨窗口死锁**的一环，见
+    /// `FrameRenderer::drop` 的 CAUTION。
+    pub fn mark_synced(&mut self) {
+        self.synced = true;
+    }
+
     /// 确保磨砂资源存在且尺寸匹配，否则整体重建。
     ///
     /// 模糊链按 `render_extent`（超采样后）建，`divisor` 已乘过超采样
@@ -1307,7 +1323,6 @@ impl<'a> Painter<'a> {
         }
         if let Some(mut old) = self.backdrop.fx.take() {
             self.gpu.wait_idle();
-            old.chain.destroy(&self.gpu.device);
             old.pipeline.destroy(self.gpu);
             old.capture_img.destroy(&self.gpu.device);
         }
@@ -1821,8 +1836,21 @@ pub(super) fn backdrop_uv_offset_from(
 
 impl Drop for Painter<'_> {
     fn drop(&mut self) {
-        // 必须先让 GPU 彻底空闲：下面这些对象都可能被在途命令引用。
-        self.gpu.wait_idle();
+        // 下面这些对象（字体图集、用户纹理）都可能被在途命令引用，销毁前
+        // 必须等 GPU。
+        //
+        // CAUTION: 这里默认走**设备级** `wait_idle`，而它在附属窗口的销毁
+        // 路径上是跨窗口死锁的一环（见 `FrameRenderer::drop` 的 CAUTION）。
+        // 所以 `WindowGfx::drop` 会先等自己窗口的在途帧，再调
+        // [`Self::mark_synced`] 把这次等待免掉——那时本窗口的命令早已
+        // 完成，本 Painter 的纹理不可能再被引用（每窗口一份，不共享）。
+        //
+        // 主窗口的 Painter 不住在 `WindowGfx` 里（见 `app::frame_loop`），
+        // 不会有人调 `mark_synced`，于是保留设备级等待：进程退出时其他
+        // 窗口早已销毁，那次等待等不到别人。
+        if !self.synced {
+            self.gpu.wait_idle();
+        }
         if let Some(mut f) = self.font.take() {
             f.destroy(&self.gpu.device);
         }

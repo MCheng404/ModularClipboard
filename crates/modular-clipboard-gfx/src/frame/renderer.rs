@@ -1358,7 +1358,7 @@ impl<'a> FrameRenderer<'a> {
     /// 只等 `in_flight` 的槽位：从未提交过的栅栏处于 unsignaled 状态，
     /// 把它们混进 `wait_all=true` 的等待会**永久阻塞**（该栅栏永远不会
     /// 被 signal）。这是本函数唯一需要小心的地方。
-    fn wait_own_inflight(&mut self) -> anyhow::Result<()> {
+    pub fn wait_own_inflight(&mut self) -> anyhow::Result<()> {
         let fences: Vec<vk::Fence> = self
             .slots
             .iter()
@@ -1677,8 +1677,26 @@ impl<'a> FrameRenderer<'a> {
 
 impl Drop for FrameRenderer<'_> {
     fn drop(&mut self) {
-        // 在飞命令可能还引用着交换链图像与 framebuffer，必须等 GPU 空闲。
-        self.gpu.wait_idle();
+        // 在飞命令可能还引用着交换链图像与 framebuffer，必须先等它们完成。
+        //
+        // CAUTION: 等的是**本渲染器自己的**在途提交，不是设备级
+        // `vkDeviceWaitIdle`。多窗口共享一个 `VkDevice`，设备级等待会把
+        // **其他窗口**的在途帧一起排干；而附属窗口（设置/子窗/图片编辑/
+        // 搜索面板）是「用一下就走」的，它销毁时主窗口正在呈现往返中，
+        // 设备级等待于是变成跨窗口死锁——实测症状：打开设置窗口再关掉，
+        // 界面进程挂死且 `taskkill /F` 都杀不掉（阻塞在驱动内部）。
+        //
+        // 本渲染器要销毁的资源（交换链、framebuffer、staging、命令池）
+        // 只可能被**自己**提交的命令引用，等自己的 `submit_fence` 既是
+        // 充分的、也是最小代价的。
+        //
+        // 退化分支：等自己超时（2s）才落到设备级。那时本窗口大概真的
+        // 挂住了，而不等就销毁是规范违反（驱动内部竞态）；两害相权，
+        // 让进程继续挂着比让它在销毁中途崩溃更容易留下可诊断的日志。
+        if let Err(e) = self.wait_own_inflight() {
+            tracing::warn!("等本窗口在途帧超时，退化到设备级等待: {e:#}");
+            self.gpu.wait_idle();
+        }
         // wait_idle 之后销毁 staging 才是安全的：GPU 可能还在读它，
         // 而它是 `cmd_copy_buffer_to_image` 的数据源。
         self.staging.destroy();

@@ -115,7 +115,13 @@ impl GlassPipeline {
         let device = &gpu.device;
         let n = slot_count.max(1);
 
-        let desc_layout = DescriptorLayout::glass(device, false)?;
+        // CAUTION: 这里必须是 `true`。玻璃的描述符集**每帧都被重写**
+        // （uniform 随卡片矩形变、两张源纹理的视图随尺寸重建而变），
+        // 而帧槽的 GPU 工作与 CPU 的下一帧并行——规范禁止更新「被
+        // pending 命令缓冲使用中」的集合，除非绑定带了
+        // `UPDATE_AFTER_BIND`。`blur.rs` 传 `false` 是对的（它的集合只在
+        // `configure`/`bind_source` 时写一次），玻璃不能照抄。
+        let desc_layout = DescriptorLayout::glass(device, true)?;
         let pc = vk::PushConstantRange {
             stage_flags: OFFSET_STAGE,
             offset: 0,

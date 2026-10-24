@@ -315,7 +315,7 @@ impl<'a> Drop for ChildWindow<'a> {
         // 再等 GPU 空闲（上一帧的 in-flight 命令可能仍在读 surface），
         // 最后销毁表面（它属于 `Gpu`，必须先于 `gfx` 的交换链销毁）。
         self.events.drain_pending();
-        self.gfx.gpu.wait_idle();
+        self.gfx.wait_own_window_inflight();
         unsafe {
             // `gfx.gpu` 是 `&Gpu`，表面由它创建、由它销毁。
             self.gfx.gpu.destroy_surface(self.surface);

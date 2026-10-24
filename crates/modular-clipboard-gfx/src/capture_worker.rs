@@ -43,7 +43,10 @@ pub enum CaptureOut {
 
 /// 抓屏工作线程的句柄。
 pub struct CaptureWorker {
-    tx: Sender<CaptureReq>,
+    /// 发送端。用 `Option` 包着是为了 [`Self::shutdown`] 能**先断开
+    /// channel 再 join**——字段不可移出，没法直接 `drop(self.tx)`，
+    /// 而不断开就 join 是死锁，见那里的 CAUTION。
+    tx: Option<Sender<CaptureReq>>,
     rx: Receiver<CaptureOut>,
     handle: Option<std::thread::JoinHandle<()>>,
     /// 待处理的请求数（诊断用：堆压说明抓屏跟不上节流）。
@@ -99,7 +102,7 @@ impl CaptureWorker {
             .expect("启动抓屏线程失败");
 
         Self {
-            tx: tx_req,
+            tx: Some(tx_req),
             rx: rx_out,
             handle: Some(handle),
             pending,
@@ -117,8 +120,9 @@ impl CaptureWorker {
         }
         if self
             .tx
-            .send(CaptureReq { hwnd, swap_rb })
-            .is_ok()
+            .as_ref()
+            .and_then(|tx| tx.send(CaptureReq { hwnd, swap_rb }).ok())
+            .is_some()
         {
             self.pending
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -137,10 +141,24 @@ impl CaptureWorker {
 
     /// 停掉工作线程并等它退出。
     ///
-    /// 发送端随 `CaptureWorker` 一起 drop（`self.tx` 是唯一 sender），
-    /// 工作线程的 `recv()` 随即返回 `Err` 并自行退出；这里只负责 join，
-    /// 避免进程退出时它还在跑（那时它持有的 GDI 对象会被系统回收）。
+    /// # CAUTION: 必须先断开 channel，再 join
+    ///
+    /// Rust 的自定义 `Drop::drop` 在**所有字段 drop 之前**执行。所以
+    /// 「发送端随 `self` 一起 drop、线程随即退出」这个直觉在这里是错的：
+    /// `drop()` 里调 `join()` 时 `tx` 一定还活着，工作线程阻塞在
+    /// `recv()` 永远等不到 `Err` ⇒ **join 永久死锁**。
+    ///
+    /// 2026-10-24 实测症状正是「打开设置窗口再关掉就卡死」：销毁链
+    /// `SettingsWindow` → `Painter` → `BackdropState` → `CaptureWorker`
+    /// 走到这里挂住，且 `taskkill /F` 都杀不掉（阻塞在内核等待）。
+    ///
+    /// 解法就是把 `tx` 包进 `Option`，join 前 `take()` 掉——sender 一没，
+    /// `recv()` 立刻返回 `Err`，线程自行退出。
+    ///
+    /// 若线程正卡在一轮 `BitBlt`（毫秒级），join 会多等这几毫秒，
+    /// 可接受；那不是死锁，抓屏周期本身就是 33ms。
     pub fn shutdown(&mut self) {
+        self.tx.take();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }

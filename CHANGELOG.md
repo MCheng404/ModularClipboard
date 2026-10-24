@@ -4,6 +4,19 @@
 
 ## [未发布]
 
+### 修复
+
+- **打开设置窗口再关掉，界面进程卡死**（且 `taskkill /F` 都杀不掉）：
+  根因是 `CaptureWorker` 的 `Drop` 里 join 工作线程，而 Rust 的自定义
+  `Drop::drop` 在**所有字段 drop 之前**执行——此刻发送端 `tx` 一定还
+  活着，工作线程阻塞在 `recv()` 永远等不到 `Err`，join 于是永久死锁。
+  销毁链 `SettingsWindow` → `Painter` → `BackdropState` →
+  `CaptureWorker` 走到这里挂住。
+  修法：`tx` 包进 `Option`，`shutdown()` 里先 `take()` 断开 channel
+  再 join。附带把三处**设备级** `wait_idle` 换成「只等自己窗口的在途
+  帧」——多窗口共享一个 `VkDevice`，设备级等待会把其他窗口的在途工作
+  一起排干，在附属窗口销毁路径上是同一类跨窗口风险。
+
 ### 新增
 
 - **液态玻璃**（背景效果新增 `玻璃`，设置 → 外观 → 背景效果）：

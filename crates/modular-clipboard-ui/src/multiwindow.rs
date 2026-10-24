@@ -173,6 +173,44 @@ pub struct WindowGfx<'a> {
     rebuild_streak: u32,
 }
 
+impl<'a> WindowGfx<'a> {
+    /// 销毁前等待**本窗口**的在途帧完成。
+    ///
+    /// # 为什么不是 `gpu.wait_idle()`
+    ///
+    /// `vkDeviceWaitIdle` 是设备级同步：多窗口共享设备时会把**所有**窗口
+    /// 的在途工作一起排干。附属窗口（设置/子窗/图片编辑/搜索面板）销毁
+    /// 时，主窗口正处在呈现往返中，而那一帧的 CB 完成要等呈现引擎释放
+    /// 交换链图像——两侧互相等，就是 2026-10-24 实测到的「打开设置窗口
+    /// 再关掉，界面进程挂死且 `taskkill /F` 杀不掉」（阻塞在驱动内部）。
+    ///
+    /// 等自己的 `submit_fence` 即充分：surface / framebuffer / 纹理 /
+    /// staging 都只可能被**本窗口**提交的命令引用。
+    ///
+    /// 等不到也**不**退化到设备级——那正是要避开的东西。记录后继续销毁：
+    /// 真到那一步，进程挂着比在销毁途中崩溃更容易定位。
+    pub fn wait_own_window_inflight(&mut self) {
+        if let Err(e) = self.fr.wait_own_inflight() {
+            tracing::warn!("等本窗口在途帧失败（销毁路径继续）: {e:#}");
+        }
+        // 告诉 painter「已经等过」：它 Drop 里那次设备级等待对附属窗口
+        // 既多余又是死锁的一环，免掉。
+        self.painter.mark_synced();
+    }
+}
+
+impl Drop for WindowGfx<'_> {
+    fn drop(&mut self) {
+        // 字段 drop 顺序是 `painter` → `fr`，两者各自还有一次等待。
+        // 先在这里统一等掉，后面两次都变成空操作（栅栏已 signal、
+        // `in_flight` 已清）。
+        //
+        // 不先等的后果：`painter` 的设备级 `wait_idle` 会连带等主窗口的
+        // 在途帧，而主窗口那帧可能正在等本窗口的 surface 释放——死锁。
+        self.wait_own_window_inflight();
+    }
+}
+
 /// 同一目标尺寸允许的最大连续重建次数。
 ///
 /// 超过就停手并告警。取值权衡：正常路径下交换链尺寸**一次**就该收敛

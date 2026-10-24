@@ -432,7 +432,7 @@ impl<'a> Drop for SettingsWindow<'a> {
         // 3. 最后销毁 surface（它属于 `Gpu`，必须先于交换链销毁——
         //    字段声明顺序保证了 `gfx` 在我们之后 drop）。
         self.events.drain_pending();
-        self.gfx.gpu.wait_idle();
+        self.gfx.wait_own_window_inflight();
         unsafe {
             self.gfx.gpu.destroy_surface(self.surface);
         }
