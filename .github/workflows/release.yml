@@ -1,0 +1,220 @@
+name: 发布
+
+# 合并版发布规则：
+# - push 到 main：自动构建并发布测试版（滚动 tag：test-latest）
+# - workflow_dispatch：手动触发稳定版发布（语义化 tag：vX.Y.Z）
+# - 产物与本地一致：dist/modular-clipboard.exe / BUILD_INFO.txt / SHA256SUMS.txt
+# - 任何发布前都会跑测试；测试失败则不发布
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "稳定版 tag（留空 = 自动按 Cargo.toml 的版本生成，如 v0.2.1）"
+        required: false
+        default: ""
+      prerelease:
+        description: "是否作为预发布（稳定版手动发布时可选）"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  test-prerelease:
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 安装 Rust（stable, MSVC）
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          rustc -vV
+          cargo -vV
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 测试
+        run: ./scripts/build.sh --test
+
+      - name: 打包
+        run: ./scripts/build.sh --package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: modular-clipboard-${{ github.sha }}
+          path: dist/
+          retention-days: 90
+
+      - name: 发布测试版
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: test-latest
+        run: |
+          set -euo pipefail
+          SHORT=$(git rev-parse --short=12 HEAD)
+          NOW=$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M')
+
+          {
+            echo "## 测试版 · $SHORT"
+            echo
+            echo "- 构建时间：$NOW (UTC+8)"
+            echo "- 触发：\`${{ github.event_name }}\` / [run ${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "- 提交：\`${SHORT}\` (${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})"
+            echo "- 自动发布，滚动 tag：test-latest"
+            echo
+            echo "### BUILD_INFO.txt"
+            echo '```'
+            cat dist/BUILD_INFO.txt
+            echo '```'
+            echo
+            echo "### SHA256SUMS.txt"
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } > notes.md
+
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" \
+            dist/modular-clipboard.exe \
+            dist/BUILD_INFO.txt \
+            dist/SHA256SUMS.txt \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "测试版 ($SHORT)" \
+            --notes-file notes.md
+
+          echo "已发布测试版：$TAG"
+
+  stable-release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 安装 Rust（stable, MSVC）
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable-x86_64-pc-windows-msvc
+          rustc -vV
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 校验版本号与 tag 规则
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [[ ! "$CARGO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Cargo.toml version must be semver like X.Y.Z"
+            exit 1
+          fi
+
+          INPUT_TAG="${{ inputs.tag }}"
+          if [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
+            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              :
+            elif [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              TAG="v${TAG}"
+            else
+              echo "Invalid tag: $TAG. Expected vX.Y.Z or X.Y.Z"
+              exit 1
+            fi
+          else
+            TAG="v${CARGO_VERSION}"
+          fi
+
+          if [[ "${TAG#v}" != "$CARGO_VERSION" ]]; then
+            echo "Tag $TAG does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 测试
+        run: ./scripts/build.sh --test
+
+      - name: 打包
+        run: ./scripts/build.sh --package
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: modular-clipboard-${{ steps.meta.outputs.version }}
+          path: dist/
+          retention-days: 90
+
+      - name: 发布稳定版
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          SHORT=$(git rev-parse --short=12 HEAD)
+          NOW=$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M')
+
+          {
+            echo "## 稳定版 $VERSION · $SHORT"
+            echo
+            echo "- 构建时间：$NOW (UTC+8)"
+            echo "- 触发：\`${{ github.event_name }}\` / [run ${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo "- 提交：\`${SHORT}\` (${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})"
+            echo "- 稳定版 tag 规则：vX.Y.Z（例如 v0.2.1）"
+            echo
+            echo "### BUILD_INFO.txt"
+            echo '```'
+            cat dist/BUILD_INFO.txt
+            echo '```'
+            echo
+            echo "### SHA256SUMS.txt"
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } > notes.md
+
+          gh release delete "$TAG" --yes --cleanup-tag || true
+
+          if [[ "${{ inputs.prerelease }}" == "true" ]]; then
+            gh release create "$TAG" \
+              dist/modular-clipboard.exe \
+              dist/BUILD_INFO.txt \
+              dist/SHA256SUMS.txt \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "稳定版 $VERSION ($SHORT)" \
+              --notes-file notes.md
+          else
+            gh release create "$TAG" \
+              dist/modular-clipboard.exe \
+              dist/BUILD_INFO.txt \
+              dist/SHA256SUMS.txt \
+              --target "$GITHUB_SHA" \
+              --title "稳定版 $VERSION ($SHORT)" \
+              --notes-file notes.md
+          fi
+
+          echo "已发布稳定版：$TAG"
