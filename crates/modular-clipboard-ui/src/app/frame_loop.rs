@@ -1103,12 +1103,22 @@ pub(super) fn run_mode(
                     card_alpha,
                 });
             }
+            // 模糊半径按模式取：磨砂用自己的档位，玻璃用**自有的**档位。
+            //
+            // 早先两者共用 `window_blur_strength`，玻璃用户想调模糊时
+            // 设置里唯一相关的滑块（磨砂强度）在玻璃模式下是禁用态——
+            // 2026-10-24 用户反馈「玻璃模糊度用的是磨砂的参数」。
+            let blur_strength = if app.svc.state.config.ui.window_backdrop
+                == modular_clipboard_core::config::WindowBackdrop::Glass
+            {
+                app.svc.state.config.ui.glass_blur
+            } else {
+                app.svc.state.config.ui.window_blur_strength
+            };
             painter.paint_backdrop(
                 &mut fr,
                 window.hwnd().0 as isize,
-                modular_clipboard_gfx::blur::radius_for_strength(
-                    app.svc.state.config.ui.window_blur_strength,
-                ),
+                modular_clipboard_gfx::blur::radius_for_strength(blur_strength),
                 &primitives,
                 ppp,
                 window.scale_factor(),

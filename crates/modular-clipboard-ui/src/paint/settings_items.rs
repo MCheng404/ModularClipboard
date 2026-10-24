@@ -143,6 +143,12 @@ pub(super) enum ItemKind {
     TokenOverrides,
     /// 背景效果单选（无 / 磨砂 / 半透明 / 玻璃）。
     Backdrop,
+    /// 玻璃模式的自有模糊档位（1 ~ 10，仅玻璃模式可用）。
+    ///
+    /// 与 [`ItemKind::BlurStrength`] 分开：后者只服务磨砂（玻璃模式下
+    /// 禁用），而玻璃的光学合成需要不同的模糊量。共用一项会让用户
+    /// 「想调玻璃模糊时唯一相关的滑块是死的」（2026-10-24 反馈）。
+    GlassBlur,
     /// 液态玻璃的折射强度（0 ~ 1，仅玻璃模式可用）。
     GlassRefract,
     /// 液态玻璃的色散差异量（0 ~ 1，0 = 无彩边）。
@@ -413,6 +419,9 @@ impl SettingsItem {
                     || !cfg.ui.theme_overrides.nums.is_empty()
             }
             ItemKind::Backdrop => cfg.ui.window_backdrop != WindowBackdrop::None,
+            ItemKind::GlassBlur => {
+                cfg.ui.window_backdrop == WindowBackdrop::Glass && cfg.ui.glass_blur != d.ui.glass_blur
+            }
             ItemKind::GlassRefract => {
                 cfg.ui.window_backdrop == WindowBackdrop::Glass
                     && (cfg.ui.glass_refract - d.ui.glass_refract).abs() > 1e-6
@@ -496,13 +505,20 @@ impl SettingsItem {
             ItemKind::CardOpacity => Some(Op::SetCardOpacity(d.ui.card_opacity)),
             ItemKind::CardBlur => Some(Op::SetCardBlur(d.ui.card_blur)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
-            ItemKind::GlassRefract | ItemKind::GlassDispersion | ItemKind::GlassEdge => {
-                Some(Op::SetGlass {
-                    refract: d.ui.glass_refract,
-                    dispersion: d.ui.glass_dispersion,
-                    edge: d.ui.glass_edge,
-                })
-            }
+            // 四个玻璃参数共享一个 Op：重置其中任意一个，其余三个一并
+            // 归位。`reset_op` 拿不到当前配置（只有默认值 `d`），而
+            // 「重置这一项」的语义本就是「这张卡回到默认」——四个都是
+            // 这张卡的项，一起归位比「只归一个、其余停在用户值」更符合
+            // 卡片级重置按钮的承诺（见 `settings_card` 的重置分支）。
+            ItemKind::GlassBlur
+            | ItemKind::GlassRefract
+            | ItemKind::GlassDispersion
+            | ItemKind::GlassEdge => Some(Op::SetGlass {
+                refract: d.ui.glass_refract,
+                dispersion: d.ui.glass_dispersion,
+                edge: d.ui.glass_edge,
+                blur: d.ui.glass_blur,
+            }),
             // 字体缩放：恢复默认倍率（1.0×）。走 SetNumber 而非专用 Op——
             // 应用侧的即时生效钩子正是按 (Ui, "font_scale") 匹配的。
             ItemKind::FontScale => Some(Op::SetNumber {
@@ -559,12 +575,31 @@ pub(super) struct SettingsCard {
     pub(super) items: &'static [SettingsItem],
 }
 
+/// 默认折叠的分组 key。
+///
+/// 只有「开了对应模式才有意义」的组才进来：液态玻璃的三项在非玻璃
+/// 背景下全是禁用态，铺在首屏是纯噪音。收起来之后外观卡首屏从
+/// 16 项降到 13 项，用户第一眼看到的是常用项。
+///
+/// CAUTION: 这里是「默认」，不是「永远」。用户的点击会写进
+/// `settings_folded`，与这张表**异或**判断（见 `settings_card` 的
+/// 遍历）：表内的组点一次 = 展开，表外的组点一次 = 收起。
+const DEFAULT_FOLDED: &[&str] = &["appearance.glass"];
+
 /// 全部分类卡片（导航顺序与 `SettingsCat::ALL` 一致）。
 pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
     SettingsCard {
         cat: SettingsCat::General,
         title: msg("General"),
         items: &[
+            SettingsItem {
+                key: "general.window",
+                label: msg("Window and startup"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
+            },
             SettingsItem {
                 key: "ui.language",
                 label: msg("Interface language"),
@@ -608,6 +643,14 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::Autostart,
             },
             SettingsItem {
+                key: "general.external",
+                label: msg("External programs"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
+            },
+            SettingsItem {
                 key: "ui.browser_path",
                 label: msg("Browser path"),
                 desc: msg("App used to open link entries; empty = system default browser"),
@@ -636,6 +679,14 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
         title: msg("Theme"),
         items: &[
             SettingsItem {
+                key: "theme.main",
+                label: msg("Theme"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
+            },
+            SettingsItem {
                 key: "ui.dark_mode",
                 label: msg("Light / dark mode"),
                 desc: msg("Follow the system, or force dark / light"),
@@ -660,6 +711,14 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::ThemeParams,
             },
             SettingsItem {
+                key: "theme.advanced",
+                label: msg("Advanced tweaks"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
+            },
+            SettingsItem {
                 key: "ui.token_overrides",
                 label: msg("Token overrides"),
                 desc: msg("Override individual theme tokens: any element, any value"),
@@ -671,6 +730,14 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
         cat: SettingsCat::Appearance,
         title: msg("Appearance"),
         items: &[
+            SettingsItem {
+                key: "appearance.window",
+                label: msg("Window and background"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
+            },
             SettingsItem {
                 key: "ui.font_scale",
                 label: msg("Font scale"),
@@ -694,6 +761,14 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: msg("Background opacity"),
                 desc: msg("Transparency of the background layer; text stays opaque"),
                 kind: ItemKind::Opacity,
+            },
+            SettingsItem {
+                key: "appearance.cards",
+                label: msg("Row cards"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
             },
             SettingsItem {
                 key: "ui.card_opacity",
@@ -732,6 +807,14 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::Bool(ConfigGroup::Ui, "md_rendered"),
             },
             SettingsItem {
+                key: "appearance.panels",
+                label: msg("Panels and popups"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
+            },
+            SettingsItem {
                 key: "ui.type_rail",
                 label: msg("Type filter bar"),
                 desc: msg("Floating type buttons at the window edge: click to filter; multi-select, adjustable position and size"),
@@ -762,6 +845,20 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
         cat: SettingsCat::Appearance,
         title: msg("Liquid glass"),
         items: &[
+            SettingsItem {
+                key: "appearance.glass",
+                label: msg("Liquid glass"),
+                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
+                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
+                desc: msg("Settings group"),
+                kind: ItemKind::Group,
+            },
+            SettingsItem {
+                key: "ui.glass_blur",
+                label: msg("Glass blur"),
+                desc: msg("Blur strength in glass mode, independent of frosted blur"),
+                kind: ItemKind::GlassBlur,
+            },
             SettingsItem {
                 key: "ui.glass_refract",
                 label: msg("Glass refraction"),
@@ -1132,6 +1229,107 @@ pub(super) fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
     }
 }
 
+/// 可折叠的分组标题行：三角箭头 + 组名，点击切换折叠。
+///
+/// # 为什么自绘而不用 `egui::CollapsingHeader`
+///
+/// 项目全程自绘控件（纯平风格 + 统一的 `pal` 量纲），`CollapsingHeader`
+/// 自带背景/边框/缩进，与本项目的行控件语言不一致。而且它的高度与
+/// 字体缩放不走 `pal`，会破坏「与文字同屏的固定高度按字号算」的约定。
+///
+/// # 箭头为什么是三角而不是文字「展开/收起」
+///
+/// 组名右侧已经有空间放计数，箭头是最省地方的状态指示；且它随
+/// `font_scale` 等比缩放（边长按 `pal.font_sm` 算），不会在小字号下
+/// 糊成一团。
+///
+/// # 命中区
+///
+/// 整行都是点击区（不只箭头）：组标题行的目的是「收起来」，一个小
+/// 三角不是可靠的靶子。登记用组的稳定 key，与 `settings_folded` 一致。
+pub(super) fn settings_group_header(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    it: &SettingsItem,
+    folded: bool,
+    count: usize,
+) {
+    let pal = f.pal;
+    ui.add_space(8.0);
+    let row_h = pal.control_height * 0.72;
+    let (bb, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), egui::Sense::click());
+    let painter = ui.painter_at(bb);
+    if resp.hovered() {
+        painter.rect_filled(bb, pal.radius_sm, pal.row_hover);
+    }
+    let hovered = resp.hovered();
+    let clicked = resp.clicked();
+    if clicked {
+        // 命中键与折叠键同源：点的是哪一行，收的就是哪一组。
+        if folded {
+            f.state.settings_folded.remove(it.key);
+        } else {
+            f.state.settings_folded.insert(it.key.to_string());
+        }
+    }
+    f.hit_insert(it.key, bb);
+    if hovered {
+        resp.on_hover_text(if folded {
+            t("Expand")
+        } else {
+            t("Collapse")
+        });
+    }
+
+    // 三角箭头：边长按字号算，与组名同一垂直中心。
+    let cx = bb.min.x + 5.0;
+    let cy = bb.center().y;
+    let a = pal.font_xs * 0.34;
+    let (p0, p1, p2) = if folded {
+        // ▶ 指向右（收起）
+        (
+            egui::pos2(cx - a * 0.6, cy - a),
+            egui::pos2(cx - a * 0.6, cy + a),
+            egui::pos2(cx + a * 0.7, cy),
+        )
+    } else {
+        // ▼ 指向下（展开）
+        (
+            egui::pos2(cx - a, cy - a * 0.6),
+            egui::pos2(cx + a, cy - a * 0.6),
+            egui::pos2(cx, cy + a * 0.7),
+        )
+    };
+    let arrow = if hovered { pal.text } else { pal.text_dim };
+    painter.add(egui::Shape::convex_polygon(
+        vec![p0, p1, p2],
+        arrow,
+        egui::Stroke::NONE,
+    ));
+
+    // 组名：小一号 + 次要色——它是分隔标记，不是设置项本身。
+    painter.text(
+        egui::pos2(bb.min.x + 5.0 + a * 2.2, cy),
+        egui::Align2::LEFT_CENTER,
+        t(it.label),
+        egui::FontId::proportional(pal.font_sm),
+        pal.text_dim,
+    );
+
+    // 右侧计数：这一组有几项。折叠时它是「里面还有东西」的唯一提示——
+    // 否则用户只看到一行标题，会以为那些设置被删了。
+    if count > 0 {
+        painter.text(
+            egui::pos2(bb.max.x - 2.0, cy),
+            egui::Align2::RIGHT_CENTER,
+            format!("{count}"),
+            egui::FontId::proportional(pal.font_xs),
+            pal.text_dim,
+        );
+    }
+    ui.add_space(4.0);
+}
+
 /// 一张卡片：圆角背景 + 标题行（标题 + 条件重置按钮）+ 设置行。
 ///
 /// # 背景为什么用 `egui::Frame` 而不是先算高度再 `rect_filled`
@@ -1158,7 +1356,27 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
             // 行高收紧后必须把间距补回来，否则相邻两行贴在一起。
             ui.spacing_mut().item_spacing = vec2(0.0, 14.0);
 
-            // 顶部行：无标题文字，仅当有项偏离默认值时在**右上方**出现「重置」。
+            // ---- 卡片标题行：标题在左，条件重置按钮在右 ----
+            //
+            // 标题一直显示（早前**没有标题**，只有改动时才出现的重置
+            // 按钮）。缺了它，同一个分类下的多张卡片（外观/液态玻璃、
+            // 快捷键/迷你面板、关于/技术栈）看起来是同一块内容的断续
+            // 拼接——2026-10-24 用户反馈「设置界面看着好乱」，这是
+            // 首因：用户无法知道眼前这组开关属于哪张卡。
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(t(card.title))
+                                .size(pal.font_md)
+                                .color(pal.text),
+                        )
+                        .selectable(false),
+                    );
+                });
+            });
+
+            // 顶部行：仅当有项偏离默认值时在**右上方**出现「重置」。
             let changed_any = {
                 let cfg = &f.svc.state.config;
                 card.items.iter().any(|it| it.is_changed(cfg, f.ws))
@@ -1217,8 +1435,42 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
                 });
             }
 
-            for it in card.items {
+            // ---- 分组遍历：`ItemKind::Group` 是组标题，可折叠 ----
+            //
+            // 组标题之后的项归属该组；折叠时整组跳过（直到下一个组标题）。
+            // 组 key 存 `settings_folded`，所以增删组不会让用户的折叠
+            // 偏好错位。
+            //
+            // 组标题本身照常画（哪怕折叠）：折叠态要看得出「这里有一组
+            // 东西被收起来了」，否则用户会以为那些设置消失了。
+            let mut folded = false;
+            let mut idx = 0usize;
+            while idx < card.items.len() {
+                let it = &card.items[idx];
+                if matches!(it.kind, ItemKind::Group) {
+                    // 与 `DEFAULT_FOLDED` 异或：默认收起的组，用户点一次
+                    // 是展开（从集合移除 ⇒ 不折叠）；默认展开的组，点一次
+                    // 是收起（加入集合）。
+                    folded = f.state.settings_folded.contains(it.key)
+                        ^ DEFAULT_FOLDED.contains(&it.key);
+                    // 组内项数：从下一个位置数到再一个组标题（或卡片末尾）。
+                    let count = card.items[idx + 1..]
+                        .iter()
+                        .take_while(|x| !matches!(x.kind, ItemKind::Group))
+                        .count();
+                    settings_group_header(f, ui, it, folded, count);
+                    if folded {
+                        ui.add_space(2.0);
+                    }
+                    idx += 1;
+                    continue;
+                }
+                if folded {
+                    idx += 1;
+                    continue;
+                }
                 settings_item_row(f, ui, it);
+                idx += 1;
             }
 
             // 通信卡片底部：「一键 AI 配对提示词」按钮。

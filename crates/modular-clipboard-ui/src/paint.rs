@@ -232,6 +232,12 @@ pub enum Op {
         dispersion: f32,
         /// Fresnel 幂次。
         edge: f32,
+        /// 玻璃模式的自有模糊档位（1 ~ 10）。
+        ///
+        /// 与磨砂强度（`SetBlurStrength`）分开：玻璃的光学合成会改变
+        /// 底图观感，合适的模糊量与磨砂不同，共用一项会让改一个
+        /// 另一个跟着变（2026-10-24 用户反馈）。
+        blur: u8,
     },
     /// 设置列表卡片阴影（开关 + 模糊 / 浓度 / 垂直偏移）。
     ///
@@ -951,6 +957,15 @@ pub struct UiState {
     ///
     /// 任何设置控件被改动时登记；重置某卡片时清除该卡片所有项。
     pub settings_recent: Vec<(String, u64)>,
+    /// 已折叠的设置分组（组的稳定 key）。
+    ///
+    /// 分组是卡片内的一级标题（`ItemKind::Group`），点标题行折叠/展开。
+    /// 存 key 而非索引：卡片表里增删组不会让用户的折叠偏好错位。
+    ///
+    /// 只在内存里（不落配置）：折叠是「这次想少看一点」的临时意图，
+    /// 不是偏好设置——为它加一个配置字段不值得，且每次开关设置窗口
+    /// 都回到全展开反而更符合「临时收起来」的语义。
+    pub settings_folded: std::collections::HashSet<String>,
     // 注：原先这里有 `settings_scroll`（手写滚动偏移）。设置面板
     // 改用 `ScrollArea` 后由 egui 自己管理滚动位置，该字段整体删除。
 
@@ -5849,6 +5864,10 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("card-shadow-sl", vec2(780.0, 560.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
+        // 折叠「窗口与背景」组：外观卡加了卡片标题 + 四个组标题后，
+        // 560pt 的夹具视口装不下 card_shadow 的三个子滑条。收起来让
+        // 目标进首屏（这些测试只跑一帧，靠首屏可见）。
+        h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         for key in ["card_shadow_blur", "card_shadow_opacity", "card_shadow_offset_y"] {
             let r = h.state.hit.get(HitNs::Settings, key);
@@ -5865,6 +5884,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("rowmeta-hits", vec2(780.0, 560.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
+        h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         for key in ["rowmeta_chip_icon", "rowmeta_chip_type", "rowmeta_chip_size"] {
             let r = h.state.hit.get(HitNs::Settings, key);
@@ -5882,6 +5902,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("rowmeta-click", vec2(780.0, 560.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
+                h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         let chip = settings_hit(&h, "rowmeta_chip_type");
         let ops = h.settings_click_at(chip.center());
@@ -5913,6 +5934,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let mut h = Harness::new("rowmeta-drag", vec2(780.0, 560.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
+                h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         let icon = settings_hit(&h, "rowmeta_chip_icon");
         let size = settings_hit(&h, "rowmeta_chip_size");

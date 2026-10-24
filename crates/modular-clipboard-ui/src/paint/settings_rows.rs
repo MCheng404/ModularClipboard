@@ -401,11 +401,39 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 record_recent(f, it.key);
             }
         }
-        // ---- 液态玻璃的三个审美参数 ----
+        // ---- 液态玻璃的四个参数（模糊 + 三个审美）----
         //
-        // 三者只在背景效果 = 玻璃时可用；其余模式下压暗（与磨砂强度同一
-        // 套交互）。整包推 `Op::SetGlass`：三个值一起走，避免一帧内
-        // 连续拖动导致三次写盘。
+        // 四者只在背景效果 = 玻璃时可用；其余模式下压暗（与磨砂强度同一
+        // 套交互）。整包推 `Op::SetGlass`：四个值一起走，避免一帧内
+        // 连续拖动导致多次写盘。
+        //
+        // CAUTION: 推送时必须把**局部改动值**写回对应字段。早先这里读
+        // 的是 `config` 里的旧值（`c.glass_refract` 等），于是拖动被
+        // 整个丢弃——滑杆动了、数值显示变了，一松手全部回弹。
+        // 2026-10-24 用户反馈「玻璃参数无法拖动调整」正是这个：
+        // 三个滑块全都在推旧值。
+        ItemKind::GlassBlur => {
+            let cfg = &f.svc.state.config.ui;
+            let mut v = cfg.glass_blur;
+            let enabled = cfg.window_backdrop == WindowBackdrop::Glass;
+            let pal = f.pal;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("{v}/10")).color(pal.text_dim),
+                ));
+                draw_step_slider(f, ui, it.key, &mut v, 1..=10, enabled)
+            });
+            if changed && enabled {
+                let c = &f.svc.state.config.ui;
+                f.state.push(Op::SetGlass {
+                    refract: c.glass_refract,
+                    dispersion: c.glass_dispersion,
+                    edge: c.glass_edge,
+                    blur: v,
+                });
+                record_recent(f, it.key);
+            }
+        }
         ItemKind::GlassRefract | ItemKind::GlassDispersion | ItemKind::GlassEdge => {
             let cfg = &f.svc.state.config.ui;
             let mut v = match it.kind {
@@ -430,11 +458,18 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 draw_slider(f, ui, it.key, "", &mut v, lo..=hi, enabled, step)
             });
             if changed && enabled {
+                // 从配置取另外三个的**当前值**，只把本次拖动的那个换成 `v`。
                 let c = &f.svc.state.config.ui;
+                let (refract, dispersion, edge) = match it.kind {
+                    ItemKind::GlassRefract => (v, c.glass_dispersion, c.glass_edge),
+                    ItemKind::GlassDispersion => (c.glass_refract, v, c.glass_edge),
+                    _ => (c.glass_refract, c.glass_dispersion, v),
+                };
                 f.state.push(Op::SetGlass {
-                    refract: c.glass_refract,
-                    dispersion: c.glass_dispersion,
-                    edge: c.glass_edge,
+                    refract,
+                    dispersion,
+                    edge,
+                    blur: c.glass_blur,
                 });
                 record_recent(f, it.key);
             }

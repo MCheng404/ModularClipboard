@@ -10,6 +10,7 @@ use super::card_row::CardShadowConfig;
 use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
 use super::window::default_glass_dispersion;
+use super::window::default_glass_blur;
 use super::window::default_glass_edge;
 use super::window::default_glass_refract;
 use super::window::default_window_blur_strength;
@@ -171,6 +172,7 @@ impl Default for UiConfig {
             card_blur: 0,
             glass_refract: default_glass_refract(),
             glass_dispersion: default_glass_dispersion(),
+            glass_blur: default_glass_blur(),
             glass_edge: default_glass_edge(),
             window_blur_strength: default_window_blur_strength(),
             card_shadow: CardShadowConfig::default(),

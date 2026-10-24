@@ -57,6 +57,10 @@ pub(super) fn default_glass_refract() -> f32 {
 ///
 /// 色散 = R/G/B 各用一个 IOR（1.50/1.52/1.54）分别采样，边缘因此出现
 /// 彩色描边。开太大会像「显卡坏了」，故缺省取中等偏弱。
+pub(super) fn default_glass_blur() -> u8 {
+    7
+}
+
 pub(super) fn default_glass_dispersion() -> f32 {
     0.5
 }

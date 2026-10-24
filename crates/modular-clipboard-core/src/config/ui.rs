@@ -13,6 +13,7 @@ use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
 use super::window::WindowPos;
 use super::window::default_card_blur;
+use super::window::default_glass_blur;
 use super::window::default_glass_dispersion;
 use super::window::default_glass_edge;
 use super::window::default_glass_refract;
@@ -119,6 +120,25 @@ pub struct UiConfig {
     /// 默认 0（关）：多一次抓屏与纹理上传，不该默认付这个代价。
     #[serde(default = "default_card_blur")]
     pub card_blur: u8,
+    /// 玻璃模式的自有模糊档位（1 ~ 10，默认 7）。
+    ///
+    /// # 为什么不复用 `window_blur_strength`
+    ///
+    /// 早先玻璃与磨砂**共用**这一个档位，问题有两个：
+    ///
+    /// 1. 玻璃的光学合成（两级折射 + 色散）本身会强烈改变底图的观感，
+    ///    与磨砂合适的模糊量未必适合玻璃——用户想让磨砂 3 档、玻璃
+    ///    8 档时，改一个另一个跟着变；
+    /// 2. 「磨砂强度」那一项在玻璃模式下是**禁用态**（压暗、拖不动），
+    ///    于是玻璃用户想调模糊时发现唯一相关的滑块是死的，剩下三个
+    ///    审美参数（折射/色散/边缘光）都不管模糊——2026-10-24 用户
+    ///    反馈「玻璃模糊度用的是磨砂的参数」。
+    ///
+    /// 默认 7 与 `window_blur_strength` 一致：两者都映射到同一套
+    /// 高斯半径（`gfx::blur::radius_for_strength`），旧用户升级后
+    /// 玻璃观感不变。
+    #[serde(default = "default_glass_blur")]
+    pub glass_blur: u8,
     /// 玻璃折射强度（0 ~ 1）。仅 `window_backdrop == Glass` 时生效。
     ///
     /// 审美项，无「正确值」：0 = 只剩磨砂（等同 Acrylic），1 = 边缘剧烈

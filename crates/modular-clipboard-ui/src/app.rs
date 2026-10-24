@@ -630,14 +630,20 @@ impl App {
                     refract,
                     dispersion,
                     edge,
+                    blur,
                 } => {
                     // 三个审美参数只影响玻璃 pass 的 uniform，下一帧即生效
                     // （无需重建任何 GPU 资源——这正是 `GlassPipeline` 不看
                     // 尺寸的理由：拖滑块不该触发 `device_wait_idle`）。
+                    //
+                    // `blur` 走模糊链的 `set_radius`：同样是 uniform 级
+                    // 改动，不重建管线（见 `Painter::paint_backdrop` 里
+                    // `radius_changed` 的分支）。
                     let u = &mut self.svc.state.config.ui;
                     u.glass_refract = refract.clamp(0.0, 1.0);
                     u.glass_dispersion = dispersion.clamp(0.0, 1.0);
                     u.glass_edge = edge.clamp(1.0, 12.0);
+                    u.glass_blur = blur.clamp(1, 10);
                     self.after_config_change();
                 }
                 Op::SetCardShadow(s) => {
