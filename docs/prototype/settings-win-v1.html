@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>设置界面 HTML 原型 v1 · ModularClipboard</title>
+<style>
+/* ============================================================
+   设计令牌（深色为默认，.window.light 覆盖）
+   取值与 crates/modular-clipboard-ui/src/theme.rs 的 Palette 对齐
+   ============================================================ */
+.window {
+  --bg:            #121519;
+  --surface:       #1D2128;
+  --sv:            #262B34;   /* surface_variant：内嵌控件底 */
+  --sr:            #2F3540;   /* surface_raised：浮层 */
+  --border:        rgba(110,120,134,.30);
+  --bsub:          rgba(255,255,255,.07);
+  --text:          #E3E6E8;
+  --dim:           #BCC2CB;
+  --bright:        #FCFCFC;
+  --accent:        #84B7EB;
+  --accent-soft:   rgba(132,183,235,.15);
+  --accent-line:   rgba(132,183,235,.38);
+  --hover:         rgba(255,255,255,.055);
+  --card-shadow:   inset 0 1px 0 rgba(255,255,255,.05), 0 0 0 1px var(--accent-line), 0 0 22px rgba(132,183,235,.11), 0 4px 18px rgba(0,0,0,.38);
+  --card-border:   transparent;
+  --win-shadow:    0 24px 64px rgba(0,0,0,.42);
+  --scrollbar:     rgba(255,255,255,.16);
+}
+.window.light {
+  --bg:            #F2F4F7;
+  --surface:       #FAFBFC;
+  --sv:            #ECEFF3;
+  --sr:            #FFFFFF;
+  --border:        rgba(124,134,146,.42);
+  --bsub:          rgba(16,20,26,.09);
+  --text:          #24292E;
+  --dim:           #545454;
+  --bright:        #0F0F0F;
+  --accent:        #1D65AF;
+  --accent-soft:   rgba(29,101,175,.12);
+  --accent-line:   rgba(29,101,175,.32);
+  --hover:         rgba(16,20,26,.05);
+  --card-shadow:   0 1px 2px rgba(16,20,26,.06), 0 8px 20px rgba(16,20,26,.10), 0 22px 52px rgba(16,20,26,.12);
+  --card-border:   var(--bsub);
+  --win-shadow:    0 24px 64px rgba(16,20,26,.18);
+  --scrollbar:     rgba(16,20,26,.18);
+}
+
+/* ============================================================
+   页面外框（仅原型展示用，不属于应用窗口）
+   ============================================================ */
+* { margin:0; padding:0; box-sizing:border-box; }
+html,body { height:100%; }
+body {
+  background:#E9ECF1;
+  font-family:"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+  color:#2A2F36;
+  display:flex; align-items:center; justify-content:center;
+  padding:24px 16px;
+  min-height:100vh;
+}
+.tbtn {
+  border:1px solid #C9D0D9; background:#fff; color:#3A4149;
+  font-size:12px; padding:5px 12px; border-radius:999px; cursor:pointer;
+  font-family:inherit;
+}
+.tbtn:hover { background:#F2F5F8; }
+.tbtn.on { background:#1D2128; border-color:#1D2128; color:#fff; }
+
+/* ============================================================
+   窗口外壳（780 × 560 逻辑点，1px = 1pt）
+   ============================================================ */
+.window {
+  width:780px; height:560px;
+  background:var(--bg); color:var(--text);
+  border-radius:14px;
+  box-shadow:var(--win-shadow);
+  display:flex; flex-direction:column;
+  overflow:hidden; position:relative;
+  font-size:14px;
+}
+/* 顶部拖动区（44pt，对应 settingswin.rs 的 title_h） */
+.dragbar {
+  height:44px; flex:none; cursor:move; position:relative; z-index:5;
+}
+.dragbar::after {
+  content:"拖动移动窗口"; position:absolute; left:50%; top:50%;
+  transform:translate(-50%,-50%);
+  font-size:11px; color:var(--dim); opacity:0; transition:opacity .15s;
+  pointer-events:none;
+}
+.dragbar:hover::after { opacity:.55; }
+
+.body { flex:1; display:flex; min-height:0; padding:0 18px 18px; gap:22px; }
+
+/* ---------------- 左列：搜索 + 导航 ----------------
+   三种样式（原型对比用，由工具栏切换）：
+   B = 无框裸列（v1 初版）；A = 整块悬浮侧栏卡（推荐）；
+   C = 悬浮侧栏卡 + 选中项左侧强调竖条。 */
+.nav { width:180px; flex:none; display:flex; flex-direction:column; gap:10px; min-height:0; }
+.search {
+  flex:none; height:36px; border-radius:999px;
+  background:var(--sv); border:1px solid var(--bsub);
+  display:flex; align-items:center; padding:0 12px; gap:8px;
+  cursor:text;
+}
+.search:focus-within { border-color:var(--accent-line); }
+.search input {
+  flex:1; border:none; outline:none; background:transparent;
+  color:var(--text); font-size:13px; font-family:inherit; min-width:0;
+}
+.search input::placeholder { color:var(--dim); }
+.search svg { flex:none; color:var(--dim); }
+
+/* 样式 A / C：整块悬浮侧栏卡 */
+.nav.asside, .nav.cside {
+  background:var(--surface);
+  border:1px solid var(--card-border);
+  border-radius:16px;
+  box-shadow:var(--card-shadow);
+  padding:10px;
+}
+/* 侧栏底脚：应用名（A/C 可见，B 隐藏） */
+.nav-foot {
+  flex:none; display:none; align-items:center; gap:7px;
+  margin:2px 2px 0; padding:9px 6px 3px;
+  border-top:1px solid var(--bsub);
+  font-size:11px; color:var(--dim); letter-spacing:.02em;
+}
+.nav.asside .nav-foot, .nav.cside .nav-foot { display:flex; }
+.nav-foot .dot {
+  width:7px; height:7px; border-radius:999px; background:var(--accent); flex:none;
+  box-shadow:0 0 6px var(--accent);
+}
+
+.navlist { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:2px; padding:2px 0; }
+.navlist::-webkit-scrollbar { width:0; }
+.nav-item {
+  position:relative;
+  display:flex; align-items:center; gap:9px;
+  height:34px; padding:0 11px; border-radius:999px;
+  border:none; background:transparent; cursor:pointer;
+  color:var(--dim); font-size:13px; font-family:inherit;
+  transition:background .12s, color .12s; text-align:left; flex:none;
+}
+.nav-item svg { flex:none; }
+.nav-item:hover { background:var(--hover); color:var(--text); }
+.nav-item.sel { background:var(--accent-soft); color:var(--bright); font-weight:600; }
+.nav-item.sel svg { color:var(--accent); }
+/* 样式 C：选中项改为左侧强调竖条，去掉填充 */
+.nav.cside .nav-item.sel { background:transparent; }
+.nav.cside .nav-item.sel::before {
+  content:""; position:absolute; left:-6px; top:8px; bottom:8px; width:3px;
+  border-radius:999px; background:var(--accent);
+}
+.nav-item .badge {
+  margin-left:auto; font-size:10.5px; font-weight:500;
+  background:var(--sv); color:var(--dim);
+  padding:1px 7px; border-radius:999px;
+}
+.nav-item.sel .badge { background:rgba(132,183,235,.22); color:var(--accent); }
+.window.light .nav-item.sel .badge { background:rgba(29,101,175,.14); }
+
+/* ---------------- 右列：页头 + 滚动内容 ---------------- */
+.main { flex:1; min-width:0; display:flex; flex-direction:column; }
+/* 页头行：主标签与关闭按钮都垂直居中在**搜索框的中心线**上
+   （2026-10-25 反馈：三者平齐，并去除主标签描述）。
+   搜索框中心 = 侧栏卡顶 + 10(卡内边距) + 18(半高) = 卡顶 + 28；
+   卡顶 = 右列顶 ⇒ 页头高 56 时其中心正好在 +28。 */
+.mainhead { flex:none; height:56px; display:flex; align-items:center; gap:14px; position:relative; }
+.mainhead .ht { min-width:0; }
+.mainhead h2 { font-size:17px; font-weight:650; color:var(--bright); line-height:1.2; }
+.iconbtn {
+  position:absolute; right:0; top:50%; transform:translateY(-50%);
+  width:30px; height:30px; border-radius:999px;
+  border:none; background:transparent; cursor:pointer;
+  display:flex; align-items:center; justify-content:center; color:var(--dim);
+}
+.iconbtn:hover { background:var(--hover); color:var(--bright); }
+
+.scroll { flex:1; overflow-y:auto; padding:2px 8px 6px 0; min-height:0; }
+.scroll::-webkit-scrollbar { width:8px; }
+.scroll::-webkit-scrollbar-thumb { background:var(--scrollbar); border-radius:999px; border:2px solid transparent; background-clip:content-box; }
+.scroll::-webkit-scrollbar-track { background:transparent; }
+
+/* ============================================================
+   卡片（悬浮式）
+   ============================================================ */
+.card {
+  background:var(--surface);
+  border:1px solid var(--card-border);
+  border-radius:16px;
+  box-shadow:var(--card-shadow);
+  padding:16px 20px 10px;
+  margin-bottom:14px;
+}
+.card:last-child { margin-bottom:2px; }
+.card-head { display:flex; align-items:center; margin-bottom:6px; }
+.card-head h3 { font-size:14.5px; font-weight:650; color:var(--bright); }
+.card-head .hint { font-size:11.5px; color:var(--dim); margin-left:10px; }
+.card-head .sp { flex:1; }
+
+/* 行 */
+.row {
+  display:grid; grid-template-columns:1fr auto; gap:20px; align-items:center;
+  padding:9px 0; border-top:1px solid var(--bsub);
+}
+.group .row:first-of-type, .card > .row:first-of-type { border-top:none; }
+.row-text { min-width:0; }
+.row-label { font-size:13.5px; color:var(--text); line-height:1.35; }
+.row-desc { font-size:12px; color:var(--dim); margin-top:2px; line-height:1.4; }
+.row-ctrl { display:flex; align-items:center; gap:8px; flex:none; }
+.row.disabled { opacity:.42; pointer-events:none; }
+.row.stack { display:block; }
+
+/* 组标题（仅关于卡使用） */
+.group { margin-top:2px; }
+.group-head {
+  display:flex; align-items:center; gap:7px; width:100%;
+  border:none; background:transparent; cursor:pointer;
+  font-family:inherit; padding:10px 0 6px; color:var(--dim);
+  font-size:11.5px; font-weight:600; letter-spacing:.06em;
+}
+.group-head .count {
+  font-size:10.5px; font-weight:500; letter-spacing:0;
+  background:var(--sv); border-radius:999px; padding:1px 7px; color:var(--dim);
+}
+.group-head .chev { margin-left:auto; transition:transform .18s; }
+.group-head.folded .chev { transform:rotate(-90deg); }
+.group-body { overflow:hidden; }
+.group-head.folded + .group-body { display:none; }
+
+/* ============================================================
+   控件（全圆角 / 胶囊语言）
+   ============================================================ */
+/* 开关 */
+.tgl {
+  width:42px; height:23px; border-radius:999px; border:none; cursor:pointer;
+  background:var(--sv); box-shadow:inset 0 0 0 1px var(--border);
+  position:relative; transition:background .16s; flex:none;
+}
+.tgl::after {
+  content:""; position:absolute; top:2.5px; left:2.5px;
+  width:18px; height:18px; border-radius:999px;
+  background:var(--dim); transition:transform .16s, background .16s;
+}
+.tgl.on { background:var(--accent); box-shadow:none; }
+.tgl.on::after { transform:translateX(19px); background:#fff; }
+.window.light .tgl.on::after { background:#fff; }
+
+/* 分段控件 */
+.seg { display:flex; background:var(--sv); border-radius:999px; padding:3px; gap:2px; box-shadow:inset 0 0 0 1px var(--bsub); }
+.seg button {
+  border:none; background:transparent; cursor:pointer; border-radius:999px;
+  color:var(--dim); font-size:12px; font-family:inherit;
+  padding:4px 12px; line-height:1; transition:background .13s, color .13s; white-space:nowrap;
+}
+.seg button:hover { color:var(--text); }
+.seg button.sel { background:var(--sr); color:var(--bright); font-weight:600; box-shadow:0 1px 3px rgba(0,0,0,.22); }
+.window.light .seg button.sel { box-shadow:0 1px 3px rgba(16,20,26,.14); }
+.seg.accent button.sel { background:var(--accent); color:#0A0D12; }
+.window.light .seg.accent button.sel { color:#fff; }
+
+/* 滑条 */
+.slider-wrap { display:flex; align-items:center; gap:10px; width:230px; }
+input[type=range] {
+  -webkit-appearance:none; appearance:none; flex:1; height:20px; background:transparent; cursor:pointer;
+}
+input[type=range]::-webkit-slider-runnable-track {
+  height:5px; border-radius:999px; background:var(--sv); box-shadow:inset 0 0 0 1px var(--bsub);
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance:none; width:14px; height:14px; border-radius:999px;
+  background:#fff; border:1px solid rgba(0,0,0,.18); margin-top:-5px;
+  box-shadow:0 1px 3px rgba(0,0,0,.35);
+}
+input[type=range]::-moz-range-track { height:5px; border-radius:999px; background:var(--sv); }
+input[type=range]::-moz-range-thumb {
+  width:13px; height:13px; border-radius:999px; background:#fff;
+  border:1px solid rgba(0,0,0,.18); box-shadow:0 1px 3px rgba(0,0,0,.35);
+}
+.slider-val {
+  min-width:52px; text-align:center; font-size:12px; color:var(--bright);
+  background:var(--sv); border-radius:999px; padding:3px 9px; font-variant-numeric:tabular-nums;
+}
+
+/* 数字输入 */
+.num { display:flex; align-items:center; gap:6px; }
+.num button {
+  width:22px; height:22px; border-radius:999px; border:1px solid var(--border);
+  background:var(--sv); color:var(--text); cursor:pointer; font-size:13px; line-height:1;
+  display:flex; align-items:center; justify-content:center; font-family:inherit;
+}
+.num button:hover { background:var(--sr); }
+.num input {
+  width:64px; height:26px; border-radius:999px; border:1px solid var(--bsub);
+  background:var(--sv); color:var(--text); font-size:12.5px; text-align:center;
+  outline:none; font-family:inherit;
+}
+.num input:focus { border-color:var(--accent-line); }
+.num .unit { font-size:12px; color:var(--dim); }
+
+/* 文本输入 */
+.txt {
+  height:28px; border-radius:999px; border:1px solid var(--bsub);
+  background:var(--sv); color:var(--text); font-size:12.5px;
+  padding:0 14px; outline:none; font-family:inherit; width:230px;
+}
+.txt:focus { border-color:var(--accent-line); }
+.txt::placeholder { color:var(--dim); }
+
+/* 按钮 */
+.btn {
+  height:28px; border-radius:999px; padding:0 16px; cursor:pointer;
+  font-size:12.5px; font-family:inherit; border:1px solid var(--border);
+  background:var(--sv); color:var(--text); transition:background .13s;
+  display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
+}
+.btn:hover { background:var(--sr); }
+.btn.primary { background:var(--accent); border-color:transparent; color:#0A0D12; font-weight:600; }
+.btn.primary:hover { filter:brightness(1.06); }
+.btn.danger { color:#E28D8F; border-color:rgba(226,141,143,.4); background:transparent; }
+.btn.danger:hover { background:rgba(226,141,143,.12); }
+.window.light .btn.danger { color:#B42D31; border-color:rgba(180,45,49,.35); }
+.btn.ghost { background:transparent; border-color:transparent; color:var(--dim); padding:0 10px; height:24px; }
+.btn.ghost:hover { background:var(--hover); color:var(--text); }
+
+/* 键帽 */
+.keycap {
+  display:inline-flex; align-items:center; gap:5px;
+  background:var(--sv); border:1px solid var(--border); border-radius:8px;
+  box-shadow:0 1.5px 0 var(--border), 0 2px 5px rgba(0,0,0,.2);
+  padding:4px 11px; font-size:12.5px; color:var(--bright); cursor:pointer;
+  font-variant-numeric:tabular-nums;
+}
+.keycap:hover { background:var(--sr); }
+.keycap .rec { color:var(--accent); font-size:11px; }
+
+/* 色板 */
+.swatches { display:flex; align-items:center; gap:7px; }
+.sw { width:19px; height:19px; border-radius:999px; cursor:pointer; border:2px solid transparent; transition:transform .12s; }
+.sw:hover { transform:scale(1.12); }
+.sw.sel { border-color:var(--bright); box-shadow:0 0 0 1.5px var(--bg) inset; }
+.hex {
+  width:78px; height:26px; border-radius:999px; border:1px solid var(--bsub);
+  background:var(--sv); color:var(--text); font-size:12px; text-align:center;
+  outline:none; font-family:ui-monospace,Consolas,monospace;
+}
+
+/* 角标 chips */
+.chips { display:flex; gap:7px; }
+.chip {
+  display:inline-flex; align-items:center; gap:6px; cursor:grab;
+  border-radius:999px; padding:5px 12px; font-size:12px; font-family:inherit;
+  border:1px solid var(--border); background:var(--sv); color:var(--dim);
+  transition:background .13s, color .13s;
+}
+.chip.on { background:var(--accent-soft); border-color:var(--accent-line); color:var(--bright); }
+.chip svg { color:var(--accent); }
+.chip:not(.on) svg { color:var(--dim); }
+
+/* 链接行 */
+.row-link { cursor:pointer; }
+.row-link:hover .row-label { color:var(--accent); }
+.row-link .go { color:var(--dim); display:flex; }
+.row-link:hover .go { color:var(--accent); }
+.row-link .url { font-size:11.5px; color:var(--dim); font-family:ui-monospace,Consolas,monospace; margin-top:2px; }
+
+/* 复选（迷你面板修饰键） */
+.checks { display:flex; gap:8px; flex-wrap:wrap; }
+.chk {
+  display:inline-flex; align-items:center; gap:7px; cursor:pointer;
+  border-radius:999px; padding:5px 13px 5px 9px; font-size:12px;
+  border:1px solid var(--border); background:var(--sv); color:var(--dim);
+}
+.chk .box {
+  width:15px; height:15px; border-radius:999px; border:1.5px solid var(--border);
+  display:flex; align-items:center; justify-content:center; flex:none;
+}
+.chk.on { color:var(--bright); border-color:var(--accent-line); background:var(--accent-soft); }
+.chk.on .box { background:var(--accent); border-color:var(--accent); }
+.chk.on .box::after { content:""; width:5px; height:5px; border-radius:999px; background:#fff; }
+
+/* 技术栈 chips */
+.stack { display:flex; gap:8px; flex-wrap:wrap; }
+.stack .chip { cursor:pointer; }
+
+/* 条件卡（液态玻璃）进入动画 */
+@keyframes cardin { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:none; } }
+.card.cond { animation:cardin .22s ease both; }
+/* 依赖行动画：主开关/分段切换时子行淡入（隐藏而非置灰，2026-10-25 反馈） */
+@keyframes rowin { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
+.row.cond { animation:rowin .18s ease both; }
+.hidden { display:none !important; }
+
+/* ============================================================
+   原型控制台：折叠在右下角（不影响设置窗口主体展示）
+   ============================================================ */
+.proto { position:fixed; right:18px; bottom:18px; z-index:50; display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
+.proto-btn {
+  border:none; cursor:pointer; font-family:inherit;
+  display:inline-flex; align-items:center; gap:7px;
+  background:#1D2128; color:#fff; font-size:12px; font-weight:600;
+  padding:8px 15px; border-radius:999px;
+  box-shadow:0 6px 20px rgba(16,20,26,.28);
+}
+.proto-btn:hover { background:#2A2F38; }
+.proto-btn svg { flex:none; }
+.proto-panel {
+  width:308px; max-width:calc(100vw - 36px);
+  background:#fff; border:1px solid #D5DBE3; border-radius:14px;
+  box-shadow:0 16px 44px rgba(16,20,26,.22);
+  padding:14px 16px; display:none;
+}
+.proto-panel.open { display:block; animation:protoin .16s ease both; }
+@keyframes protoin { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+.proto-head { display:flex; align-items:center; font-size:13px; font-weight:700; color:#2A2F36; }
+.proto-head .x { margin-left:auto; border:none; background:transparent; cursor:pointer; color:#98A2AD; font-size:16px; line-height:1; padding:2px 4px; border-radius:6px; }
+.proto-head .x:hover { background:#EFF2F6; color:#2A2F36; }
+.proto-sub { font-size:11.5px; color:#7A828C; margin:4px 0 10px; line-height:1.5; }
+.proto-row { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:12px; color:#3A4149; }
+.proto-row > span { flex:none; width:56px; }
+.proto-theme { display:flex; gap:6px; }
+.proto-note {
+  border-top:1px solid #E7EBF0; margin-top:4px; padding-top:10px;
+  font-size:11.5px; color:#6B7480; line-height:1.75;
+  max-height:236px; overflow-y:auto;
+}
+.proto-note b { color:#3A4149; }
+</style>
+</head>
+<body>
+
+<div class="window" id="win">
+  <div class="dragbar" title="拖动区：客户区顶部 44pt"></div>
+
+  <div class="body">
+    <!-- ==================== 左列 ==================== -->
+    <aside class="nav asside">
+      <label class="search">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+        <input placeholder="搜索设置">
+      </label>
+      <div class="navlist">
+        <button class="nav-item sel" data-cat="general">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16"/><circle cx="9" cy="7" r="2.2" fill="var(--bg)"/><path d="M4 17h16"/><circle cx="15" cy="17" r="2.2" fill="var(--bg)"/></svg>
+          常规
+        </button>
+        <button class="nav-item" data-cat="appearance">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a9 9 0 1 0 0 18c1.5 0 2-1 2-2s-.7-2-2-2h-1.5a2 2 0 0 1 0-4H17a4 4 0 0 0 4-4c0-4-4-6-9-6z"/><circle cx="8.5" cy="9" r="1.1" fill="currentColor" stroke="none"/><circle cx="12" cy="7" r="1.1" fill="currentColor" stroke="none"/><circle cx="7.5" cy="13.5" r="1.1" fill="currentColor" stroke="none"/></svg>
+          外观
+        </button>
+        <button class="nav-item" data-cat="capture">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4.5" width="14" height="16.5" rx="3.5"/><path d="M9 4.5V3.5A1.5 1.5 0 0 1 10.5 2h3A1.5 1.5 0 0 1 15 3.5v1"/><path d="M9 11h6M9 15h4"/></svg>
+          捕获
+        </button>
+        <button class="nav-item" data-cat="storage">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5.5" rx="7.5" ry="3"/><path d="M4.5 5.5v6c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3v-6"/><path d="M4.5 11.5v6c0 1.66 3.36 3 7.5 3s7.5-1.34 7.5-3v-6"/></svg>
+          存储
+        </button>
+        <button class="nav-item" data-cat="shortcuts">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6.5" width="19" height="11.5" rx="3"/><path d="M7 10.5h.01M11 10.5h.01M15 10.5h.01M18 10.5h.01"/><path d="M8 14.5h8"/></svg>
+          快捷键
+        </button>
+        <button class="nav-item" data-cat="comm">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 2.5v4M15 2.5v4"/><rect x="6.5" y="6.5" width="11" height="7" rx="2.5"/><path d="M12 13.5v4.5a2.5 2.5 0 0 0 2.5 2.5"/></svg>
+          通信
+        </button>
+        <button class="nav-item" data-cat="about">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5"/><path d="M12 7.8h.01"/></svg>
+          关于
+        </button>
+      </div>
+      <div class="nav-foot"><span class="dot"></span>ModularClipboard</div>
+    </aside>
+
+    <!-- ==================== 右列 ==================== -->
+    <div class="main">
+      <div class="mainhead">
+        <div class="ht">
+          <h2 id="catTitle">常规</h2>
+        </div>
+        <button class="iconbtn" title="关闭" onclick="this.blur()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+
+      <div class="scroll" id="scroll">
+
+        <!-- ========== 常规 ========== -->
+        <section class="cat active" data-cat="general">
+          <div class="card">
+            <div class="card-head"><h3>窗口与启动</h3><span class="hint">登录后的运行方式与主窗口行为</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">界面语言</div><div class="row-desc">跟随系统，或从列表固定一种</div></div>
+              <div class="row-ctrl"><div class="seg" data-seg><button class="sel">跟随系统</button><button>简体中文</button><button>English</button></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">开机自启动</div><div class="row-desc">登录后即在后台开始记录，从托盘打开窗口</div></div>
+              <div class="row-ctrl"><button class="tgl" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">启动时最小化</div><div class="row-desc">启动后隐藏到托盘，不打开窗口</div></div>
+              <div class="row-ctrl"><button class="tgl" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">显示托盘图标</div><div class="row-desc">运行时在系统托盘显示图标与菜单</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">窗口置顶</div><div class="row-desc">保持主窗口位于其他窗口之上</div></div>
+              <div class="row-ctrl"><button class="tgl" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">失焦时隐藏</div><div class="row-desc">其他应用获得焦点时隐藏主窗口</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">置顶布局</div><div class="row-desc">置顶条目放在同一列表，或独立可拖拽分栏</div></div>
+              <div class="row-ctrl"><div class="seg" data-seg><button class="sel">共用单栏</button><button>独立分栏</button></div></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>外部程序</h3><span class="hint">留空 = 使用系统默认</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">浏览器路径</div><div class="row-desc">打开链接条目时使用的程序</div></div>
+              <div class="row-ctrl"><input class="txt" placeholder="默认（系统浏览器）"></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">文件管理器路径</div><div class="row-desc">打开文件条目时使用的程序</div></div>
+              <div class="row-ctrl"><input class="txt" placeholder="默认（explorer.exe）"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ========== 外观 ========== -->
+        <section class="cat" data-cat="appearance">
+          <div class="card">
+            <div class="card-head"><h3>主题</h3><span class="sp"></span><button class="btn ghost">重置</button></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">明暗模式</div><div class="row-desc">跟随系统，或强制深色 / 浅色</div></div>
+              <div class="row-ctrl"><div class="seg accent" data-seg><button class="sel">跟随系统</button><button>浅色</button><button>深色</button></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">主题色</div><div class="row-desc">界面强调色：色板、色相滑块或十六进制任选</div></div>
+              <div class="row-ctrl">
+                <div class="swatches">
+                  <span class="sw sel" style="background:#84B7EB"></span>
+                  <span class="sw" style="background:#A0DAAE"></span>
+                  <span class="sw" style="background:#EBC98E"></span>
+                  <span class="sw" style="background:#E28D8F"></span>
+                  <span class="sw" style="background:#95CFE4"></span>
+                  <span class="sw" style="background:#B9A7E4"></span>
+                  <input class="hex" value="#84B7EB">
+                </div>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">风格主题</div><div class="row-desc">叠加在明暗模式上的风格层：纸纹 / 护眼绿 / 星空紫 / OLED</div></div>
+              <div class="row-ctrl"><div class="seg" data-seg data-role="secondary"><button class="sel">无</button><button>纸纹</button><button>护眼绿</button><button>星空紫</button><button>OLED</button></div></div>
+            </div>
+            <div class="row hidden" id="styleParams">
+              <div class="row-text"><div class="row-label">风格参数</div><div class="row-desc">当前风格主题的强度与力度</div></div>
+              <div class="row-ctrl">
+                <div class="slider-wrap"><input type="range" min="0" max="100" value="60"><span class="slider-val">60%</span></div>
+                <div class="slider-wrap"><input type="range" min="0" max="100" value="40"><span class="slider-val">40%</span></div>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">高级微调</div><div class="row-desc">逐项覆盖主题令牌：任何元素、任何值</div></div>
+              <div class="row-ctrl"><button class="btn">打开令牌编辑器</button></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>文字</h3><span class="hint">字号与条目内容的呈现</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">字体缩放</div><div class="row-desc">文字大小；预设档位立即生效</div></div>
+              <div class="row-ctrl"><div class="seg" data-seg><button>小</button><button class="sel">标准</button><button>大</button><button>特大</button><button>超大</button></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">图片缩略图</div><div class="row-desc">图片条目显示为缩略图；关闭则仅显示大小文字</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">Markdown 渲染</div><div class="row-desc">排版标题、列表与代码块；关闭则显示等宽原文</div></div>
+              <div class="row-ctrl"><button class="tgl" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">卡片角标</div><div class="row-desc">卡片角落的图标 / 类型 / 大小：点击切换显隐，拖动重排</div></div>
+              <div class="row-ctrl">
+                <div class="chips">
+                  <button class="chip on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h10M4 17h13"/></svg>图标</button>
+                  <button class="chip on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16v12H4z"/><path d="M8 10h8M8 14h5"/></svg>类型</button>
+                  <button class="chip on"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8l4-4 4 4M8 4v16M14 16l4 4 4-4M18 20V4"/></svg>大小</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>窗口背景</h3><span class="hint">背景效果与整体不透明度</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">背景效果</div><div class="row-desc">无 / 磨砂 / 半透明 / 液态玻璃</div></div>
+              <div class="row-ctrl"><div class="seg accent" data-seg data-role="backdrop"><button class="sel">无</button><button>磨砂</button><button>半透明</button><button>液态玻璃</button></div></div>
+            </div>
+            <div class="row hidden" id="blurRow">
+              <div class="row-text"><div class="row-label">磨砂强度</div><div class="row-desc">磨砂模式下的模糊强度</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="1" max="10" value="5"><span class="slider-val">5</span></div></div>
+            </div>
+            <div class="row hidden" id="opacityRow">
+              <div class="row-text"><div class="row-label">背景不透明度</div><div class="row-desc">背景层的透明度；文字保持不透明</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="20" max="100" value="100"><span class="slider-val">100%</span></div></div>
+            </div>
+          </div>
+
+          <div class="card cond hidden" id="glassCard">
+            <div class="card-head"><h3>液态玻璃</h3><span class="hint">仅在背景效果 = 液态玻璃时可用</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">玻璃模糊度</div><div class="row-desc">玻璃模式下的模糊强度，独立于磨砂模糊</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="1" max="10" value="5"><span class="slider-val">5</span></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">玻璃折射</div><div class="row-desc">玻璃弯折背后内容的程度；0 = 不弯折</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="0" max="100" value="35"><span class="slider-val">0.35</span></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">玻璃色散</div><div class="row-desc">边缘的彩边效果：0 = 无，越高越明显</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="0" max="100" value="15"><span class="slider-val">0.15</span></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">玻璃边缘光</div><div class="row-desc">边缘的 Fresnel 高光；越小越铺展</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="1" max="12" value="4"><span class="slider-val">4</span></div></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>行卡片</h3><span class="hint">历史条目的卡片观感</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">卡片不透明度</div><div class="row-desc">调低可透出模糊底图</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="20" max="100" value="100"><span class="slider-val">100%</span></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">卡片磨砂</div><div class="row-desc">0 = 关闭，越高越模糊</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="0" max="10" value="0"><span class="slider-val">0</span></div></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">卡片阴影</div><div class="row-desc">条目卡片下方的投影；深色模式自动加深</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle data-dep="shadowSub"></button></div>
+            </div>
+            <div class="row" id="shadowSub">
+              <div class="row-text"></div>
+              <div class="row-ctrl">
+                <div class="slider-wrap"><input type="range" min="0" max="20" value="8"><span class="slider-val">8</span></div>
+                <div class="slider-wrap"><input type="range" min="0" max="100" value="45"><span class="slider-val">45%</span></div>
+                <div class="slider-wrap"><input type="range" min="0" max="12" value="3"><span class="slider-val">3</span></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>悬浮面板</h3><span class="hint">类型栏、搜索面板与通知</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">类型过滤栏</div><div class="row-desc">窗口边缘的悬浮类型按钮：点击过滤；可多选，位置与大小可调</div></div>
+              <div class="row-ctrl"><button class="tgl" data-toggle data-dep="typeRailSub"></button></div>
+            </div>
+            <div class="row hidden" id="typeRailSub">
+              <div class="row-text"></div>
+              <div class="row-ctrl">
+                <div class="seg" data-seg><button class="sel">左侧</button><button>右侧</button></div>
+                <div class="slider-wrap" style="width:130px"><input type="range" min="24" max="48" value="32"><span class="slider-val">32</span></div>
+              </div>
+            </div>
+            <div class="row hidden" id="typeRailSub2">
+              <div class="row-text"><div class="row-label">类型栏细节</div><div class="row-desc">始终显示 / 允许多选 / 显示文字标签</div></div>
+              <div class="row-ctrl">
+                <div class="checks">
+                  <button class="chk on"><span class="box"></span>始终显示</button>
+                  <button class="chk on"><span class="box"></span>多选</button>
+                  <button class="chk"><span class="box"></span>标签</button>
+                </div>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">搜索面板</div><div class="row-desc">悬浮搜索面板；停靠位置与高度可调</div></div>
+              <div class="row-ctrl">
+                <div class="seg" data-seg><button class="sel">窗口上方</button><button>窗口下方</button></div>
+                <div class="slider-wrap" style="width:130px"><input type="range" min="120" max="360" value="240"><span class="slider-val">240</span></div>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">通知方式</div><div class="row-desc">反馈如何出现：窗内 toast 或独立弹窗</div></div>
+              <div class="row-ctrl"><div class="seg" data-seg><button class="sel">窗内提示</button><button>独立弹窗</button></div></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ========== 捕获 ========== -->
+        <section class="cat" data-cat="capture">
+          <div class="card">
+            <div class="card-head"><h3>记录行为</h3><span class="hint">剪贴板记录的方式与节奏</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">记录剪贴板</div><div class="row-desc">关闭后不再记录新条目</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">跳过密码字段</div><div class="row-desc">输入密码时跳过剪贴板内容</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">复制去重</div><div class="row-desc">相同内容置顶，而不是重复记录</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle></button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">监听间隔</div><div class="row-desc">多久检查一次剪贴板；越低越快但开销越大</div></div>
+              <div class="row-ctrl"><div class="slider-wrap"><input type="range" min="50" max="2000" step="50" value="200"><span class="slider-val">200 ms</span></div></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ========== 存储 ========== -->
+        <section class="cat" data-cat="storage">
+          <div class="card">
+            <div class="card-head"><h3>容量与清理</h3><span class="hint">历史保留策略</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">历史条数上限</div><div class="row-desc">保留多少条；留空 = 仅按容量淘汰</div></div>
+              <div class="row-ctrl">
+                <div class="num"><button data-step="-100">−</button><input value="1000"><button data-step="100">＋</button><span class="unit">条</span></div>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">单条大小上限</div><div class="row-desc">超过此大小的剪贴板内容不被记录</div></div>
+              <div class="row-ctrl">
+                <div class="num"><button data-step="-1">−</button><input value="24"><button data-step="1">＋</button><span class="unit">MB</span></div>
+              </div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">清理临时文件</div><div class="row-desc">启动时清理上次运行遗留的临时文件</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle></button></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ========== 快捷键 ========== -->
+        <section class="cat" data-cat="shortcuts">
+          <div class="card">
+            <div class="card-head"><h3>全局快捷键</h3><span class="hint">点击键帽重新录制</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">显示 / 隐藏主窗口</div><div class="row-desc">在任意位置唤出主窗口</div></div>
+              <div class="row-ctrl"><button class="keycap">Win&nbsp;+&nbsp;V</button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">粘贴上一条</div><div class="row-desc">将最新条目粘贴到当前应用</div></div>
+              <div class="row-ctrl"><button class="keycap">Ctrl&nbsp;+&nbsp;Alt&nbsp;+&nbsp;V</button></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">粘贴方式</div><div class="row-desc">「仅粘贴并提示」只写剪贴板由你手动粘贴；「直接粘贴并输入」会向目标窗口发送 Ctrl+V</div></div>
+              <div class="row-ctrl"><div class="seg" data-seg><button class="sel">仅粘贴并提示</button><button>直接粘贴并输入</button></div></div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>迷你面板</h3><span class="hint">修饰键 + 右键唤出</span></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">启用</div><div class="row-desc">按住修饰键右键，在光标处弹出最近条目</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle data-dep="miniSub"></button></div>
+            </div>
+            <div class="row" id="miniSub">
+              <div class="row-text"><div class="row-label">显示条数</div><div class="row-desc">面板中显示的最近条目数</div></div>
+              <div class="row-ctrl"><div class="num"><button data-step="-1">−</button><input value="5"><button data-step="1">＋</button><span class="unit">条</span></div></div>
+            </div>
+            <div class="row" id="miniSub2">
+              <div class="row-text"><div class="row-label">预览长度</div><div class="row-desc">每条最大字符数（控制宽度）</div></div>
+              <div class="row-ctrl"><div class="num"><button data-step="-4">−</button><input value="48"><button data-step="4">＋</button><span class="unit">字符</span></div></div>
+            </div>
+            <div class="row" id="miniSub3">
+              <div class="row-text"><div class="row-label">触发修饰键</div><div class="row-desc">可组合使用，至少保留一个</div></div>
+              <div class="row-ctrl">
+                <div class="checks">
+                  <button class="chk on"><span class="box"></span>Ctrl + 右键</button>
+                  <button class="chk"><span class="box"></span>Shift + 右键</button>
+                  <button class="chk"><span class="box"></span>Alt + 右键</button>
+                  <button class="chk"><span class="box"></span>Win + 右键</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ========== 通信 ========== -->
+        <section class="cat" data-cat="comm">
+          <div class="card">
+            <div class="card-head"><h3>MCP 服务</h3><span class="sp"></span><button class="btn ghost" title="可调用能力说明">ⓘ</button></div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">MCP 服务</div><div class="row-desc">关闭后禁用所有 MCP 调用</div></div>
+              <div class="row-ctrl"><button class="tgl on" data-toggle data-dep="mcpSub"></button></div>
+            </div>
+            <div class="row" id="mcpSub">
+              <div class="row-text"><div class="row-label">监听地址</div><div class="row-desc">MCP 服务监听的地址</div></div>
+              <div class="row-ctrl"><input class="txt" style="width:150px" value="127.0.0.1"></div>
+            </div>
+            <div class="row" id="mcpSub2">
+              <div class="row-text"><div class="row-label">端口</div><div class="row-desc">MCP 服务端口；留空 = 未设置</div></div>
+              <div class="row-ctrl"><div class="num"><button data-step="-1">−</button><input value="9123"><button data-step="1">＋</button></div></div>
+            </div>
+            <div class="row" id="mcpSub3">
+              <div class="row-text"><div class="row-label">访问密钥</div><div class="row-desc">访问密钥；留空表示无需认证</div></div>
+              <div class="row-ctrl"><input class="txt" style="width:150px" type="password" placeholder="None"></div>
+            </div>
+            <div class="row">
+              <div class="row-text"><div class="row-label">AI 配对提示词</div><div class="row-desc">复制能力清单与 stdio / HTTP 两种接入配置</div></div>
+              <div class="row-ctrl"><button class="btn">复制提示词</button></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ========== 关于 ========== -->
+        <section class="cat" data-cat="about">
+          <div class="card">
+            <div class="card-head"><h3>关于</h3></div>
+            <div class="group">
+              <button class="group-head" data-fold><svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>软件信息<span class="count">3</span></button>
+              <div class="group-body">
+                <div class="row">
+                  <div class="row-text"><div class="row-label">版本</div></div>
+                  <div class="row-ctrl"><span style="font-size:12.5px;color:var(--dim);font-variant-numeric:tabular-nums">v0.2.3 · 9ddba86</span></div>
+                </div>
+                <div class="row">
+                  <div class="row-text"><div class="row-label">版本检查</div><div class="row-desc">获取最新 tag 并与本地比较</div></div>
+                  <div class="row-ctrl"><button class="btn">检查更新</button></div>
+                </div>
+                <div class="row row-link">
+                  <div class="row-text"><div class="row-label">开源协议</div><div class="row-desc">点击查看全文</div></div>
+                  <div class="row-ctrl"><span style="font-size:12px;color:var(--dim)">GNU GPL v3.0</span><span class="go"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span></div>
+                </div>
+              </div>
+            </div>
+            <div class="group">
+              <button class="group-head" data-fold><svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>项目<span class="count">2</span></button>
+              <div class="group-body">
+                <div class="row row-link">
+                  <div class="row-text"><div class="row-label">项目主页</div><div class="row-desc">源码、问题追踪与发布</div></div>
+                  <div class="row-ctrl"><span class="go"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span></div>
+                </div>
+                <div class="row row-link">
+                  <div class="row-text"><div class="row-label">作者主页</div><div class="row-desc">开发者的 GitHub 主页</div></div>
+                  <div class="row-ctrl"><span class="go"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span></div>
+                </div>
+              </div>
+            </div>
+            <div class="group">
+              <button class="group-head" data-fold><svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>数据<span class="count">2</span></button>
+              <div class="group-body">
+                <div class="row row-link">
+                  <div class="row-text"><div class="row-label">数据目录</div><div class="row-desc">点击在文件管理器中打开</div></div>
+                  <div class="row-ctrl"><span class="url">%APPDATA%\modular-clipboard</span><span class="go"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span></div>
+                </div>
+                <div class="row">
+                  <div class="row-text"><div class="row-label">退出程序</div><div class="row-desc">退出应用并停止记录</div></div>
+                  <div class="row-ctrl"><button class="btn danger">退出程序</button></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>技术栈</h3><span class="hint">点击名称打开对应仓库</span></div>
+            <div class="row stack">
+              <div class="stack">
+                <button class="chip">Rust</button>
+                <button class="chip">egui / epaint</button>
+                <button class="chip">Vulkan · ash</button>
+                <button class="chip">SQLite · FTS5</button>
+                <button class="chip">winit</button>
+                <button class="chip">Win32 API</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 原型控制台（折叠在右下角） ==================== -->
+<div class="proto">
+  <div class="proto-panel" id="protoPanel">
+    <div class="proto-head">设置界面 HTML 原型 <span style="color:#98A2AD;font-weight:500">v5</span>
+      <button class="x" id="protoClose" title="收起">×</button>
+    </div>
+    <div class="proto-sub">780 × 560 逻辑点 · 全圆角 / 悬浮卡片 / 松散节奏 · 分类已按功能相关性重组（主题并入外观）· 左导航定稿 A 悬浮卡</div>
+    <div class="proto-row"><span>侧栏样式</span>
+      <div id="navStyle" style="display:flex;background:#fff;border:1px solid #C9D0D9;border-radius:999px;padding:3px;gap:2px">
+        <button data-v="b" style="border:none;background:transparent;cursor:pointer;border-radius:999px;font-size:12px;font-family:inherit;padding:4px 12px;color:#7A828C">B 裸列（初版）</button>
+        <button class="sel" data-v="a" style="border:none;background:#1D2128;cursor:pointer;border-radius:999px;font-size:12px;font-family:inherit;padding:4px 12px;color:#fff;font-weight:600">A 悬浮卡</button>
+        <button data-v="c" style="border:none;background:transparent;cursor:pointer;border-radius:999px;font-size:12px;font-family:inherit;padding:4px 12px;color:#7A828C">C 竖条</button>
+      </div>
+    </div>
+    <div class="proto-row"><span>主题</span>
+      <div class="proto-theme">
+        <button class="tbtn on" id="themeDark">深色</button>
+        <button class="tbtn" id="themeLight">浅色</button>
+      </div>
+    </div>
+    <div class="proto-note">
+      <b>原型说明</b>（迭代确认后再改 Rust 源码）：① 分类由 8 个合并为 7 个——「主题」并入「外观」，导航为 常规 / 外观 / 捕获 / 存储 / 快捷键 / 通信 / 关于；
+      ② <b>左导航定稿 A 悬浮卡</b>（2026-10-25 确认）：整块 surface 圆角卡 + 投影，与右侧卡片同一视觉语言，底部带应用名锚点；B 裸列 / C 竖条保留在侧栏切换里作对照；
+      ③ 全部控件统一胶囊圆角（开关、分段、滑条、输入框、按钮、导航项、键帽），内容卡圆角 16pt；<b>悬浮卡的“浮起”分主题表达</b>（2026-10-25 反馈）——浅色：三层柔和投影（贴地 / 中距 / 远距）；深色：黑投影在近黑底上几乎不可见，改用 <b>1px 主题色环 + 22px 主题色光晕 + 顶部受光高光</b>围绕悬浮卡；
+      ④ 行节奏放宽：卡片内边距 16/20、行间距约 18pt、卡间距 14pt，左右列间距 22pt（2026-10-25 反馈：原 14pt 时深色主题色光晕与内容卡连片，视觉上左侧“吃”进内容区），分隔线为 7% 透明度的发丝线；
+      ⑤ 依赖项一律「隐藏」而非置灰：磨砂强度仅在磨砂模式出现；背景不透明度在背景效果 = 无时隐藏；风格参数、阴影子参数、类型栏子项、迷你面板子项、MCP 子项同样随主开关隐藏，出现时带淡入；
+      ⑥ 令牌编辑器、搜索 / 最近修改视图、许可证与更新弹窗保持既有结构，本版未重绘。
+    </div>
+  </div>
+  <button class="proto-btn" id="protoBtn">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h10M4 17h13"/><circle cx="18" cy="12" r="2" fill="#1D2128"/><circle cx="15" cy="17" r="2" fill="#1D2128"/></svg>
+    原型控制
+  </button>
+</div>
+
+<script>
+(function(){
+  var win = document.getElementById('win');
+  var scroll = document.getElementById('scroll');
+  var titleEl = document.getElementById('catTitle');
+
+  // 原型控制台开合（默认收起，只留右下角按钮）
+  var protoPanel = document.getElementById('protoPanel');
+  document.getElementById('protoBtn').addEventListener('click', function(){ protoPanel.classList.add('open'); });
+  document.getElementById('protoClose').addEventListener('click', function(){ protoPanel.classList.remove('open'); });
+
+  // 窄视口自适应：预览面板 < 828pt 时整体缩放窗口，防止左右被裁
+  function fit(){
+    var s = Math.min(1, (window.innerWidth - 48) / 780);
+    win.style.transform = s < 1 ? 'scale(' + s + ')' : '';
+  }
+  window.addEventListener('resize', fit);
+  fit();
+
+  // 2026-10-25：去除主标签描述，只留分类名。
+  var HEADS = {
+    general:    '常规',
+    appearance: '外观',
+    capture:    '捕获',
+    storage:    '存储',
+    shortcuts:  '快捷键',
+    comm:       '通信',
+    about:      '关于'
+  };
+
+  // 分类切换
+  document.querySelectorAll('.nav-item').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var cat = btn.dataset.cat;
+      document.querySelectorAll('.nav-item').forEach(function(n){ n.classList.toggle('sel', n===btn); });
+      document.querySelectorAll('.cat').forEach(function(c){ c.classList.toggle('active', c.dataset.cat===cat); });
+      titleEl.textContent = HEADS[cat];
+      scroll.scrollTop = 0;
+    });
+  });
+
+  // 主题切换
+  var dBtn = document.getElementById('themeDark'), lBtn = document.getElementById('themeLight');
+  dBtn.addEventListener('click', function(){ win.classList.remove('light'); dBtn.classList.add('on'); lBtn.classList.remove('on'); });
+  lBtn.addEventListener('click', function(){ win.classList.add('light'); lBtn.classList.add('on'); dBtn.classList.remove('on'); });
+
+  // 侧栏样式切换（原型对比）
+  var navStyle = document.getElementById('navStyle');
+  var navEl = document.querySelector('.nav');
+  navStyle.querySelectorAll('button').forEach(function(b){
+    b.addEventListener('click', function(){
+      navStyle.querySelectorAll('button').forEach(function(x){
+        x.classList.remove('sel');
+        x.style.background = 'transparent'; x.style.color = '#7A828C'; x.style.fontWeight = '400';
+      });
+      b.classList.add('sel');
+      b.style.background = '#1D2128'; b.style.color = '#fff'; b.style.fontWeight = '600';
+      navEl.classList.remove('asside','cside');
+      if (b.dataset.v === 'a') navEl.classList.add('asside');
+      if (b.dataset.v === 'c') navEl.classList.add('cside');
+    });
+  });
+
+  // 依赖行：隐藏而非置灰（2026-10-25 反馈），出现时带淡入
+  var DEP_GROUPS = {
+    shadowSub:   ['shadowSub'],
+    miniSub:     ['miniSub', 'miniSub2', 'miniSub3'],
+    mcpSub:      ['mcpSub', 'mcpSub2', 'mcpSub3'],
+    typeRailSub: ['typeRailSub', 'typeRailSub2']
+  };
+  function showRow(row, on) {
+    if (!row) return;
+    row.classList.toggle('hidden', !on);
+    if (on) { row.classList.remove('cond'); void row.offsetWidth; row.classList.add('cond'); }
+  }
+
+  // 开关
+  document.querySelectorAll('[data-toggle]').forEach(function(t){
+    t.addEventListener('click', function(){
+      t.classList.toggle('on');
+      var dep = t.dataset.dep;
+      if (dep && DEP_GROUPS[dep]) {
+        var on = t.classList.contains('on');
+        DEP_GROUPS[dep].forEach(function(id){ showRow(document.getElementById(id), on); });
+      }
+    });
+  });
+
+  // 分段控件
+  document.querySelectorAll('[data-seg]').forEach(function(seg){
+    seg.querySelectorAll('button').forEach(function(b){
+      b.addEventListener('click', function(){
+        seg.querySelectorAll('button').forEach(function(x){ x.classList.remove('sel'); });
+        b.classList.add('sel');
+        if (seg.dataset.role === 'backdrop') {
+          var v = b.textContent.trim();
+          // 磨砂强度仅磨砂模式出现；背景不透明度在「无」时不可调节（隐藏）
+          showRow(document.getElementById('blurRow'), v === '磨砂');
+          showRow(document.getElementById('opacityRow'), v !== '无');
+          var glass = document.getElementById('glassCard');
+          var isGlass = v === '液态玻璃';
+          glass.classList.toggle('hidden', !isGlass);
+          if (isGlass) { glass.classList.remove('cond'); void glass.offsetWidth; glass.classList.add('cond'); }
+        }
+        if (seg.dataset.role === 'secondary') {
+          showRow(document.getElementById('styleParams'), b.textContent.trim() !== '无');
+        }
+      });
+    });
+  });
+
+  // 组折叠（关于卡）
+  document.querySelectorAll('[data-fold]').forEach(function(h){
+    h.addEventListener('click', function(){ h.classList.toggle('folded'); });
+  });
+
+  // 数字步进
+  document.querySelectorAll('.num button').forEach(function(b){
+    b.addEventListener('click', function(){
+      var input = b.parentElement.querySelector('input');
+      var v = parseInt(input.value || '0', 10) + parseInt(b.dataset.step, 10);
+      input.value = Math.max(0, v);
+    });
+  });
+
+  // 滑条数值显示
+  document.querySelectorAll('.slider-wrap').forEach(function(w){
+    var r = w.querySelector('input'), v = w.querySelector('.slider-val');
+    r.addEventListener('input', function(){
+      var raw = parseFloat(r.value);
+      var txt = raw;
+      if (r.min==='0' && r.max==='100' && v.textContent.indexOf('%')>=0) txt = raw + '%';
+      else if (v.textContent.indexOf(' ms')>=0) txt = raw + ' ms';
+      else if (r.min==='0' && r.max==='100') txt = (raw/100).toFixed(2);
+      v.textContent = txt;
+    });
+  });
+
+  // chip / chk 切换
+  document.querySelectorAll('.chip').forEach(function(c){
+    c.addEventListener('click', function(){ c.classList.toggle('on'); });
+  });
+  document.querySelectorAll('.chk').forEach(function(c){
+    c.addEventListener('click', function(){ c.classList.toggle('on'); });
+  });
+  document.querySelectorAll('.sw').forEach(function(s){
+    s.addEventListener('click', function(){
+      s.parentElement.querySelectorAll('.sw').forEach(function(x){ x.classList.remove('sel'); });
+      s.classList.add('sel');
+    });
+  });
+})();
+</script>
+</body>
+</html>

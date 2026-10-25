@@ -325,12 +325,17 @@ pub(super) fn draw_step_slider(
 /// 分段控件，共用 id 会互相串台。
 ///
 /// 返回 `Some(value)` 表示本帧点击了某项。
+///
+/// # 热区键（2026-10-25 起两枚）
+///
+/// 1. `"{id_suffix}/{选项英文键}"`——命名空间键，**优先用它**。设置
+///    重组（主题并入外观）后同一分类里会出现同文选项，译文键互相覆盖；
+/// 2. 选项译文——兼容既有调用方与测试。
 pub(super) fn draw_segmented<T: Copy + PartialEq>(
     f: &mut Frame<'_>,
     ui: &mut Ui,
-    // 本实例的唯一标识。同时是热区注释里说的「同帧多控件不互相覆盖」的
-    // 补间键前缀——交互 Id 用 `("seg", i, label)`（选项文字全局唯一），
-    // 补间 Id 必须再叠一层本实例名，否则两个控件会共享同一段补间。
+    // 本实例的唯一标识。同时是热区命名空间键的前缀与补间键前缀——
+    // 同一帧里可能有多个分段控件，共用 id 会互相串台。
     id_suffix: &'static str,
     options: &[(T, Msg)],
     cur: T,
@@ -365,7 +370,10 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
     let total_w = seg_w * options.len() as f32;
     let (r, _) = ui.allocate_exact_size(vec2(total_w, h), egui::Sense::empty());
     let painter = ui.painter_at(r);
-    painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+    // 全圆角改版（2026-10-25）：容器从 `radius_md`(6) 改**胶囊**
+    // （半径 = 控件高一半）——分段控件整体读作一枚胶囊，选中段是胶囊
+    // 里的一枚小胶囊。
+    painter.rect_filled(r, h * 0.5, pal.surface_variant);
     // ---- 选中指示器：按段索引补间滑动 --------------------------------
     //
     // 目标值 = 当前选中段的下标（`position` 找不到时给 0——理论上
@@ -382,23 +390,26 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
         std::time::Duration::from_millis(160),
         crate::anim::Ease::OutCubic,
     );
-    // 指示器左右各内缩 2pt（与原实现一致），圆角 radius_sm。
+    // 指示器左右各内缩 2pt（与原实现一致），圆角改**胶囊**（2026-10-25
+    // 全圆角改版：radius_sm → (h-4)/2，与容器同语言）。
     let pill = Rect::from_min_max(
         pos2(r.min.x + seg_w * pill_idx + 2.0, r.min.y + 2.0),
         pos2(r.min.x + seg_w * (pill_idx + 1.0) - 2.0, r.max.y - 2.0),
     );
-    painter.rect_filled(pill, pal.radius_sm, pal.surface);
+    painter.rect_filled(pill, (h - 4.0) * 0.5, pal.surface);
     let mut picked = None;
     for (i, (value, label)) in options.iter().enumerate() {
-        let label = t(label);
+        // `label` 是**英文键**（`Msg`）；`shown` 才是当前语言的译文。
+        // 热区的命名空间键用英文键（语言无关、恒定），译文键作兼容保留。
+        let shown = t(label);
         let seg = egui::Rect::from_min_max(
             pos2(r.min.x + seg_w * i as f32, r.min.y),
             pos2(r.min.x + seg_w * (i + 1) as f32, r.max.y),
         );
-        let resp = ui.interact(seg, egui::Id::unique(("seg", i, label)), egui::Sense::click());
+        let resp = ui.interact(seg, egui::Id::unique(("seg", i, shown)), egui::Sense::click());
         // 文字放不下时按**段宽**省略：`draw_text` 不裁剪，直接画会
         // 越到相邻段上（视觉上两段文字叠在一起）。
-        let text = elide_to_width(ui, label, &font, seg.width() - 8.0);
+        let text = elide_to_width(ui, shown, &font, seg.width() - 8.0);
         // 文字颜色补间（130ms）：选中态 accent、悬停提亮、常态弱化，
         // 三者之间交叉淡入，与滑动指示器同步。首帧直接落到目标
         // （`tween_color` 惰性插入），之后才在变化时补间。
@@ -411,7 +422,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
         };
         let color = crate::anim::tween_color(
             ui.ctx(),
-            egui::Id::unique(("seg_text", id_suffix, label)),
+            egui::Id::unique(("seg_text", id_suffix, shown)),
             target_color,
             std::time::Duration::from_millis(130),
         );
@@ -425,11 +436,16 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
         if resp.clicked() {
             picked = Some(*value);
         }
-        // 登记热区：key 用**选项文字**。同一帧只画当前分类的卡片，
-        // 各分类的选项名互不重复（字体缩放的「小/标准/大/特大/超大」、
-        // 主题的「跟随系统/深色/浅色」…），因此不会互相覆盖。
-        // 自动化（MCP 的 click_element）与回归测试都靠它定位分段控件。
-        f.hit_insert(label, seg);
+        // 登记热区（两枚键，2026-10-25）：
+        //
+        // 1. `"{控件名}/{选项英文键}"`——**命名空间键**。设置重组后同一
+        //    分类里会出现同文选项（外观的风格主题与背景效果都有
+        //    `"None"`），译文键互相覆盖（HashMap 后注册的赢），自动化
+        //    再也点不到先注册的那个。命名空间键按控件寻址，不受影响，
+        //    且与界面语言无关（英文键恒定）。
+        // 2. 选项译文——既有测试与调用方按选项文字寻址，保留兼容。
+        f.hit_insert(format!("{id_suffix}/{label}"), seg);
+        f.hit_insert(shown, seg);
     }
     picked
 }
@@ -470,11 +486,13 @@ pub(super) fn elide_to_width(ui: &Ui, text: &str, font: &egui::FontId, max_w: f3
     chars[..lo].iter().collect::<String>() + "…"
 }
 
-/// 文本输入框：清晰圆角背景（surface_variant 实底 + 边框），在右侧区域里靠右。
+/// 文本输入框：胶囊背景（surface_variant 实底 + 边框），在右侧区域里靠右。
 ///
 /// 旧实现用 `frame(Frame::NONE)` 无背景，在 right_to_left 里虽靠右但没有
 /// 可见边界，文字起点不明，看起来「没有对齐右边」。改为先 allocate 固定
 /// 宽度区域、画背景，再在内部放 TextEdit；聚焦时边框变 accent。
+///
+/// 2026-10-25 全圆角改版：圆角从 `radius_md`(6) 改**胶囊**（半高）。
 pub(super) fn draw_text_field(
     f: &mut Frame<'_>,
     ui: &mut Ui,
@@ -489,15 +507,16 @@ pub(super) fn draw_text_field(
     let pal = f.pal;
     // 高度随字号缩放：固定 30pt 时 1.5× 字号（行高 ~33）会被裁掉。
     let h = pal.control_height + 2.0;
+    let pill = h * 0.5;
     let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::empty());
     let painter = ui.painter_at(r);
-    painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+    painter.rect_filled(r, pill, pal.surface_variant);
     // 常态描边；聚焦时**叠**一层补间的 accent 描边（颜色 130ms 过渡，
     // 宽度仍按 1.0 → 1.5 两档硬切——宽度补间在 1px 量级上看不出，反而
     // 要让抗锯齿边缘抖一下）。
     painter.rect_stroke(
         r,
-        pal.radius_md,
+        pill,
         egui::Stroke::new(1.0, pal.border),
         egui::StrokeKind::Inside,
     );
@@ -533,7 +552,7 @@ pub(super) fn draw_text_field(
         );
         painter.rect_stroke(
             r,
-            pal.radius_md,
+            pill,
             egui::Stroke::new(1.0 + 0.5 * focus_k, ring),
             egui::StrokeKind::Inside,
         );
@@ -541,8 +560,44 @@ pub(super) fn draw_text_field(
     resp.changed()
 }
 
-/// 迷你文字按钮（设置页行内辅助动作：「恢复默认」「重置」等）。
+/// 数字输入的胶囊外壳（2026-10-25 全圆角改版）。
 ///
+/// 先铺胶囊底（`surface_variant` + 发丝边），再把调用方的控件
+/// （`DragValue`）放进内区 child。存在理由：`DragValue` 没有
+/// `desired_width`（egui 0.37 未提供），不能像 [`draw_text_field`]
+/// 那样把 TextEdit 直接收进自绘外壳；固定宽 + 内 child `max_rect`
+/// 约束是同等效果的最小改法。
+///
+/// 宽度按字号缩放（基准 112 @ font_sm 15，与热键输入框同档）：
+/// 最长内容是「2000 entries」这类「数值 + 单位」组合。
+pub(super) fn draw_number_field(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    add: impl FnOnce(&mut Ui) -> bool,
+) -> bool {
+    let pal = f.pal;
+    let h = pal.control_height + 2.0;
+    let w = pal.font_sm * 7.5;
+    let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::empty());
+    let pill = h * 0.5;
+    let p = ui.painter_at(r);
+    p.rect_filled(r, pill, pal.surface_variant);
+    p.rect_stroke(
+        r,
+        pill,
+        egui::Stroke::new(1.0, pal.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+    let inner = r.shrink2(vec2(10.0, 2.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    add(&mut child)
+}
+
+/// 迷你文字按钮（设置页行内辅助动作：「恢复默认」「重置」等）。
 /// 自绘理由同开关 / 滑块：纯平毛玻璃语言要统一，`egui::Button` 的
 /// 默认立体感与整体观感不符。悬停底色走 110ms 补间（与顶栏图标按钮
 /// 同一套机制，见 `icon_button` 附近的注释）。
@@ -586,13 +641,16 @@ pub(super) fn draw_mini_button(
     );
     // 先铺不透明底再叠半透明提亮（与类型栏按钮同一个理由：半透明
     // 令牌不能直接当填充，见 `draw_type_rail` 的 CAUTION）。
-    p.rect_filled(r, pal.radius_sm, pal.surface_variant);
+    //
+    // 全圆角改版（2026-10-25）：radius_sm → 胶囊（半高）。
+    let pill = r.height() * 0.5;
+    p.rect_filled(r, pill, pal.surface_variant);
     if hover > 0.004 {
-        p.rect_filled(r, pal.radius_sm, fade_color(pal.row_hover, hover));
+        p.rect_filled(r, pill, fade_color(pal.row_hover, hover));
     }
     p.rect_stroke(
         r,
-        pal.radius_sm,
+        pill,
         egui::Stroke::new(1.0, pal.border_subtle),
         egui::StrokeKind::Inside,
     );

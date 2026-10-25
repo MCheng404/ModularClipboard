@@ -543,6 +543,14 @@ palette! {
     radius_md: num = 6.0 => 6.0,
     /// 大圆角：面板、卡片。
     radius_lg: num = 10.0 => 10.0,
+    /// 特大圆角：设置窗口的悬浮卡片（侧栏卡 / 内容卡）。
+    ///
+    /// 2026-10-25 设置界面改版（HTML 原型定稿）：全部控件统一胶囊
+    /// 圆角、卡片改「悬浮式」——卡片圆角从 `radius_lg`(10) 提到 16，
+    /// 与 14pt 起的卡间距、柔和投影一起读出「浮在窗口底上」的层级。
+    /// 与其它 radius 一样**不随 font_scale 缩放**（圆角是形貌不是文字，
+    /// 见 `font_scale_scales_fonts_and_text_bearing_geometry` 的断言）。
+    radius_xl: num = 16.0 => 16.0,
 
     // ---- 间距（4 的倍数）----
     space_xs: num = 4.0 => 4.0,
@@ -1247,7 +1255,7 @@ mod tests {
 
     /// 期望的非颜色令牌清单。登记规则同 [`EXPECTED_COLOR_TOKENS`]。
     const EXPECTED_NUM_TOKENS: &[&str] = &[
-        "radius_sm", "radius_md", "radius_lg",
+        "radius_sm", "radius_md", "radius_lg", "radius_xl",
         "space_xs", "space_sm", "space_md", "space_lg", "space_xl",
         "font_xs", "font_sm", "font_md", "font_lg", "font_xl", "font_title",
         "stroke_thin", "stroke_normal", "stroke_thick",
@@ -1422,7 +1430,7 @@ mod tests {
                 }
             };
             let groups: [(&str, &[(&str, f32)]); 4] = [
-                ("半径", &[("radius_sm", f("radius_sm")), ("radius_md", f("radius_md")), ("radius_lg", f("radius_lg"))]),
+                ("半径", &[("radius_sm", f("radius_sm")), ("radius_md", f("radius_md")), ("radius_lg", f("radius_lg")), ("radius_xl", f("radius_xl"))]),
                 (
                     "间距",
                     &[

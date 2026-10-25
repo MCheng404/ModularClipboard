@@ -572,21 +572,63 @@ impl SettingsItem {
 pub(super) struct SettingsCard {
     pub(super) cat: SettingsCat,
     pub(super) title: Msg,
+    /// 条件卡：谓词返回 `false` 时整卡不画。
+    ///
+    /// 2026-10-25 用户反馈「磨砂强度跟随背景效果磨砂隐藏，而不是不可
+    /// 选择」的卡片级推广：液态玻璃的四项在非玻璃背景下曾是「默认
+    /// 折叠的一组禁用滑条」，现在整卡按背景效果显隐——不可用的设置
+    /// 不该占据版面。
+    pub(super) cond: Option<fn(&modular_clipboard_core::config::Config) -> bool>,
     pub(super) items: &'static [SettingsItem],
+}
+
+/// 当前配置下该项是否**整项不画**（依赖项不可用 ⇒ 隐藏，不是置灰）。
+///
+/// 2026-10-25 用户反馈：「磨砂强度跟随背景效果磨砂隐藏，而不是不可
+/// 选择」「背景不透明度在背景效果为无时不可调节」。禁用态（压暗但
+/// 仍可点）会让用户以为参数没保存；隐藏则让「不可用」与「不存在」
+/// 一致，版面也只呈现与当前模式相关的内容。
+///
+/// 卡片级条件（液态玻璃整卡）走 [`SettingsCard::cond`]，不在这里。
+///
+/// CAUTION: 复合项（类型过滤栏 / 卡片阴影 / MCP 总开关行）的子参数
+/// 由各自的渲染臂内部按开关收放（`if cfg.visible { … }`），不走本
+/// 函数——它们的子行不是独立 `SettingsItem`。
+pub(super) fn item_hidden(
+    it: &SettingsItem,
+    cfg: &modular_clipboard_core::config::Config,
+) -> bool {
+    use modular_clipboard_core::config::WindowBackdrop;
+    match it.key {
+        // 磨砂强度：仅磨砂模式有意义（半透明 / 无背景 / 玻璃都不用它）。
+        "ui.blur_strength" => cfg.ui.window_backdrop != WindowBackdrop::Acrylic,
+        // 背景不透明度：背景效果为「无」时窗口底是不透明的，调节无效。
+        "ui.window_opacity" => cfg.ui.window_backdrop == WindowBackdrop::None,
+        // 卡片不透明度：没有可透的底图时（无背景效果且未开卡片磨砂）
+        // 滑块无从表现——与磨砂强度同一判据。
+        "ui.card_opacity" => {
+            cfg.ui.window_backdrop == WindowBackdrop::None && cfg.ui.card_blur == 0
+        }
+        // 风格参数：二级主题选「无」时没有任何旋钮。
+        "ui.secondary_theme_params" => cfg.ui.secondary_theme.knobs().is_empty(),
+        // 迷你面板子项：总开关关闭时整组隐藏（总开关行恒显示）。
+        "mini_panel.count" | "mini_panel.preview_chars" | "mini_panel.ctrl"
+        | "mini_panel.shift" | "mini_panel.alt" | "mini_panel.win" => {
+            !cfg.mini_panel.enabled
+        }
+        // MCP 连接子项：总开关关闭时隐藏（总开关行恒显示）。
+        "mcp.host" | "mcp.port" | "mcp.token" => !cfg.mcp.enabled,
+        _ => false,
+    }
 }
 
 /// 默认折叠的分组 key。
 ///
-/// 只有「开了对应模式才有意义」的组才进来：液态玻璃的四项在非玻璃
-/// 背景下全是禁用态，铺在首屏是纯噪音。收起来之后外观卡首屏从
-/// 17 项降到 13 项，用户第一眼看到的是常用项。
-///
-/// # 这是「初始快照」，不是「永远」
-///
-/// 首次进入设置界面前灌进 `settings_folded`（见
-/// `seed_default_folds`），此后完全由用户点击驱动。默认折叠的组
-/// 点一次即展开——不存在「这张表里的组永远收着」这回事。
-pub(super) const DEFAULT_FOLDED: &[&str] = &["appearance.glass"];
+/// 2026-10-25 改版后为**空**：唯一需要默认折叠的「液态玻璃」组已改成
+/// **条件卡**（背景效果 ≠ 玻璃时整卡不画，见 [`SettingsCard::cond`]），
+/// 不再需要「铺出来再收起来」。保留机制本身——组折叠仍由用户点击驱动，
+/// 只是没有初始快照了。
+pub(super) const DEFAULT_FOLDED: &[&str] = &[];
 
 /// 把 [`DEFAULT_FOLDED`] 灌进折叠快照（只做一次）。
 ///
@@ -611,24 +653,46 @@ fn seed_default_folds(f: &mut Frame<'_>) {
 
 /// 全部分类卡片（导航顺序与 `SettingsCat::ALL` 一致）。
 pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
+    // ====================================================================
+    // 常规（2026-10-25 重组：原「General」一张卡按功能相关性拆成两张）
+    //
+    // 启动行为与外部程序是两类关注点：混在一张卡里要靠组标题折叠才能
+    // 分开，不如直接分成两张平级卡——「窗口与启动」在前（开机后的
+    // 运行方式与主窗口行为），「外部程序」在后（两类路径覆盖）。
+    // ====================================================================
     SettingsCard {
         cat: SettingsCat::General,
-        title: msg("General"),
+        title: msg("Window and startup"),
+        cond: None,
         items: &[
-            SettingsItem {
-                key: "general.window",
-                label: msg("Window and startup"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
+            // 界面语言排第一：它决定用户能不能读懂后面所有项。
             SettingsItem {
                 key: "ui.language",
                 label: msg("Interface language"),
                 desc: msg("Display language: follow the system, or pin one from the list"),
                 kind: ItemKind::Language,
             },
+            // 启动三件套：自启动 → 启动时最小化 → 托盘图标，
+            // 按「登录后发生什么」的时间顺序排。
+            SettingsItem {
+                key: "ui.autostart",
+                label: msg("Launch at startup"),
+                desc: msg("Start recording in the background at sign-in; open the window from the tray"),
+                kind: ItemKind::Autostart,
+            },
+            SettingsItem {
+                key: "ui.start_minimized",
+                label: msg("Start minimized"),
+                desc: msg("Start hidden in the tray instead of opening the window"),
+                kind: ItemKind::Bool(ConfigGroup::Ui, "start_minimized"),
+            },
+            SettingsItem {
+                key: "ui.show_tray",
+                label: msg("Show tray icon"),
+                desc: msg("Show an icon and menu in the system tray while running"),
+                kind: ItemKind::Bool(ConfigGroup::Ui, "show_tray"),
+            },
+            // 窗口行为两件套。
             SettingsItem {
                 key: "ui.always_on_top",
                 label: msg("Always on top"),
@@ -642,37 +706,18 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::Bool(ConfigGroup::Ui, "hide_on_focus_lost"),
             },
             SettingsItem {
-                key: "ui.show_tray",
-                label: msg("Show tray icon"),
-                desc: msg("Show an icon and menu in the system tray while running"),
-                kind: ItemKind::Bool(ConfigGroup::Ui, "show_tray"),
-            },
-            SettingsItem {
-                key: "ui.start_minimized",
-                label: msg("Start minimized"),
-                desc: msg("Start hidden in the tray instead of opening the window"),
-                kind: ItemKind::Bool(ConfigGroup::Ui, "start_minimized"),
-            },
-            SettingsItem {
                 key: "ui.pinned_mode",
                 label: msg("Pinned layout"),
                 desc: msg("Pin entries in the same list, or in a separate draggable column"),
                 kind: ItemKind::PinnedMode,
             },
-            SettingsItem {
-                key: "ui.autostart",
-                label: msg("Launch at startup"),
-                desc: msg("Start recording in the background at sign-in; open the window from the tray"),
-                kind: ItemKind::Autostart,
-            },
-            SettingsItem {
-                key: "general.external",
-                label: msg("External programs"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
+        ],
+    },
+    SettingsCard {
+        cat: SettingsCat::General,
+        title: msg("External programs"),
+        cond: None,
+        items: &[
             SettingsItem {
                 key: "ui.browser_path",
                 label: msg("Browser path"),
@@ -697,18 +742,23 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             },
         ],
     },
+    // ====================================================================
+    // 外观（2026-10-25 重组：原独立「主题」分类并入「外观」）
+    //
+    // 明暗模式 / 主题色 / 风格层本就是外观的关注点，单独占一个导航位
+    // 只会把「外观」拆成两半。合并后导航 8 → 7：常规 / 外观 / 捕获 /
+    // 存储 / 快捷键 / 通信 / 关于。
+    //
+    // 外观内六张卡按「从全局到局部」排列：
+    //   主题（我是谁）→ 文字（读什么）→ 窗口背景（站在什么前面）
+    //   → 液态玻璃（背景的一种）→ 行卡片（每一条长什么样）
+    //   → 悬浮面板（辅助层）。
+    // ====================================================================
     SettingsCard {
-        cat: SettingsCat::Theme,
+        cat: SettingsCat::Appearance,
         title: msg("Theme"),
+        cond: None,
         items: &[
-            SettingsItem {
-                key: "theme.main",
-                label: msg("Theme"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
             SettingsItem {
                 key: "ui.dark_mode",
                 label: msg("Light / dark mode"),
@@ -727,20 +777,14 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 desc: msg("A style layer on top of light / dark: paper, eye-care green, starfield purple, OLED"),
                 kind: ItemKind::SecondaryTheme,
             },
+            // 风格参数：二级主题选「无」时整项隐藏（item_hidden）。
             SettingsItem {
                 key: "ui.secondary_theme_params",
                 label: msg("Style parameters"),
                 desc: msg("Intensity and strength of the current style theme"),
                 kind: ItemKind::ThemeParams,
             },
-            SettingsItem {
-                key: "theme.advanced",
-                label: msg("Advanced tweaks"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
+            // 令牌覆盖入口：二级视图占据大半个内容区，放在主题卡末行。
             SettingsItem {
                 key: "ui.token_overrides",
                 label: msg("Token overrides"),
@@ -749,24 +793,47 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             },
         ],
     },
+    // 「文字」卡：字号与条目内容的呈现（从原外观卡拆出）。
     SettingsCard {
         cat: SettingsCat::Appearance,
-        title: msg("Appearance"),
+        title: msg("Text"),
+        cond: None,
         items: &[
-            SettingsItem {
-                key: "appearance.window",
-                label: msg("Window and background"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
             SettingsItem {
                 key: "ui.font_scale",
                 label: msg("Font scale"),
                 desc: msg("Text size; presets apply instantly"),
                 kind: ItemKind::FontScale,
             },
+            SettingsItem {
+                key: "ui.image_inline",
+                label: msg("Image thumbnails"),
+                desc: msg("Show image entries as thumbnails; off = size text only"),
+                kind: ItemKind::Bool(ConfigGroup::Ui, "image_inline"),
+            },
+            SettingsItem {
+                key: "ui.md_rendered",
+                label: msg("Render Markdown"),
+                desc: msg("Lay out headings, lists and code blocks; off = monospaced source"),
+                kind: ItemKind::Bool(ConfigGroup::Ui, "md_rendered"),
+            },
+            SettingsItem {
+                key: "ui.row_meta",
+                label: msg("Card meta badges"),
+                desc: msg("Icon, type and size at the card's corner: click to toggle, drag to reorder"),
+                kind: ItemKind::RowMeta,
+            },
+        ],
+    },
+    // 「窗口背景」卡：背景效果 + 两个依赖项。
+    //
+    // 磨砂强度仅在磨砂模式出现、背景不透明度在「无」时隐藏
+    // （item_hidden）——2026-10-25 用户反馈的「隐藏而不是不可选择」。
+    SettingsCard {
+        cat: SettingsCat::Appearance,
+        title: msg("Window background"),
+        cond: None,
+        items: &[
             SettingsItem {
                 key: "ui.window_backdrop",
                 label: msg("Background effect"),
@@ -785,97 +852,20 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 desc: msg("Transparency of the background layer; text stays opaque"),
                 kind: ItemKind::Opacity,
             },
-            SettingsItem {
-                key: "appearance.cards",
-                label: msg("Row cards"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
-            SettingsItem {
-                key: "ui.card_opacity",
-                label: msg("Card opacity"),
-                desc: msg("Opacity of entry cards; lower it to reveal the blurred background"),
-                kind: ItemKind::CardOpacity,
-            },
-            SettingsItem {
-                key: "ui.card_blur",
-                label: msg("Card blur"),
-                desc: msg("Frosted glass for entry cards: 0 = off, higher = blurrier"),
-                kind: ItemKind::CardBlur,
-            },
-            SettingsItem {
-                key: "ui.card_shadow",
-                label: msg("Card shadow"),
-                desc: msg("Drop shadow under entry cards; dark mode deepens it automatically"),
-                kind: ItemKind::CardShadow,
-            },
-            SettingsItem {
-                key: "ui.row_meta",
-                label: msg("Card meta badges"),
-                desc: msg("Icon, type and size at the card's corner: click to toggle, drag to reorder"),
-                kind: ItemKind::RowMeta,
-            },
-            SettingsItem {
-                key: "ui.image_inline",
-                label: msg("Image thumbnails"),
-                desc: msg("Show image entries as thumbnails; off = size text only"),
-                kind: ItemKind::Bool(ConfigGroup::Ui, "image_inline"),
-            },
-            SettingsItem {
-                key: "ui.md_rendered",
-                label: msg("Render Markdown"),
-                desc: msg("Lay out headings, lists and code blocks; off = monospaced source"),
-                kind: ItemKind::Bool(ConfigGroup::Ui, "md_rendered"),
-            },
-            SettingsItem {
-                key: "appearance.panels",
-                label: msg("Panels and popups"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
-            SettingsItem {
-                key: "ui.type_rail",
-                label: msg("Type filter bar"),
-                desc: msg("Floating type buttons at the window edge: click to filter; multi-select, adjustable position and size"),
-                kind: ItemKind::TypeRail,
-            },
-            SettingsItem {
-                key: "ui.search_panel",
-                label: msg("Search panel"),
-                desc: msg("Floating search panel; dock position and height adjustable"),
-                kind: ItemKind::SearchPanel,
-            },
-            SettingsItem {
-                key: "ui.notice_popup",
-                label: msg("Notifications"),
-                desc: msg("How feedback appears: in-window toasts or a separate popup"),
-                kind: ItemKind::NoticeMode,
-            },
         ],
     },
-    // 液态玻璃的审美参数**单独成卡**而不是塞进「外观」。
+    // 液态玻璃参数卡：**条件卡**——背景效果 = 玻璃时才出现。
     //
+    // 2026-10-25 改版：从「外观卡里默认折叠的一组」升级为独立条件卡。
     // 两个理由：
-    // 1. 它们只在背景效果 = 玻璃时才有意义，混在外观卡里会被误当成
-    //    通用外观项；
-    // 2. 外观卡已经很长（首屏只能看到前几项），再加三条会把后面的
-    //    「类型过滤栏」「搜索面板」挤到折叠线以下。
+    // 1. 它们只在玻璃模式下有意义，混在外观卡里会被误当成通用外观项；
+    // 2. 折叠组仍会占一行标题 + 折叠箭头，条件卡在不该出现时**完全不占
+    //    版面」——「不可用即不存在」比「不可用但可见」更诚实。
     SettingsCard {
         cat: SettingsCat::Appearance,
         title: msg("Liquid glass"),
+        cond: Some(|cfg| cfg.ui.window_backdrop == WindowBackdrop::Glass),
         items: &[
-            SettingsItem {
-                key: "appearance.glass",
-                label: msg("Liquid glass"),
-                // desc 对 Group 项闲置（不显示），但字段统一必须有值；
-                // 空串会被 i18n 覆盖守门当成漏翻的文案，给个真实键。
-                desc: msg("Settings group"),
-                kind: ItemKind::Group,
-            },
             SettingsItem {
                 key: "ui.glass_blur",
                 label: msg("Glass blur"),
@@ -902,9 +892,65 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             },
         ],
     },
+    // 「行卡片」卡：每一条历史条目长什么样（从原外观卡拆出）。
+    SettingsCard {
+        cat: SettingsCat::Appearance,
+        title: msg("Row cards"),
+        cond: None,
+        items: &[
+            SettingsItem {
+                key: "ui.card_opacity",
+                label: msg("Card opacity"),
+                desc: msg("Opacity of entry cards; lower it to reveal the blurred background"),
+                kind: ItemKind::CardOpacity,
+            },
+            SettingsItem {
+                key: "ui.card_blur",
+                label: msg("Card blur"),
+                desc: msg("Frosted glass for entry cards: 0 = off, higher = blurrier"),
+                kind: ItemKind::CardBlur,
+            },
+            SettingsItem {
+                key: "ui.card_shadow",
+                label: msg("Card shadow"),
+                desc: msg("Drop shadow under entry cards; dark mode deepens it automatically"),
+                kind: ItemKind::CardShadow,
+            },
+        ],
+    },
+    // 「悬浮面板」卡：类型栏 / 搜索面板 / 通知（从原外观卡拆出）。
+    SettingsCard {
+        cat: SettingsCat::Appearance,
+        title: msg("Panels and popups"),
+        cond: None,
+        items: &[
+            SettingsItem {
+                key: "ui.type_rail",
+                label: msg("Type filter bar"),
+                desc: msg("Floating type buttons at the window edge: click to filter; multi-select, adjustable position and size"),
+                kind: ItemKind::TypeRail,
+            },
+            SettingsItem {
+                key: "ui.search_panel",
+                label: msg("Search panel"),
+                desc: msg("Floating search panel; dock position and height adjustable"),
+                kind: ItemKind::SearchPanel,
+            },
+            SettingsItem {
+                key: "ui.notice_popup",
+                label: msg("Notifications"),
+                desc: msg("How feedback appears: in-window toasts or a separate popup"),
+                kind: ItemKind::NoticeMode,
+            },
+        ],
+    },
+    // ====================================================================
+    // 捕获（2026-10-25 重组：原无标题的散项并入「记录行为」卡）
+    // ====================================================================
     SettingsCard {
         cat: SettingsCat::Capture,
-        title: msg("Capture"),
+        title: msg("Recording behavior"),
+        cond: None,
         items: &[
             SettingsItem {
                 key: "capture.enabled",
@@ -932,9 +978,13 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             },
         ],
     },
+    // ====================================================================
+    // 存储（2026-10-25 重组：原无标题的散项并入「容量与清理」卡）
+    // ====================================================================
     SettingsCard {
         cat: SettingsCat::Storage,
-        title: msg("Storage"),
+        title: msg("Capacity and cleanup"),
+        cond: None,
         items: &[
             SettingsItem {
                 key: "storage.max_items",
@@ -959,6 +1009,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
     SettingsCard {
         cat: SettingsCat::Shortcuts,
         title: msg("Shortcuts"),
+        cond: None,
         items: &[
             SettingsItem {
                 key: "hotkey.toggle",
@@ -983,6 +1034,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
     SettingsCard {
         cat: SettingsCat::Shortcuts,
         title: msg("Mini panel"),
+        cond: None,
         items: &[
             SettingsItem {
                 key: "mini_panel.enabled",
@@ -990,6 +1042,8 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 desc: msg("Right-click with a modifier to pop up recent entries at the cursor"),
                 kind: ItemKind::Bool(ConfigGroup::MiniPanel, "enabled"),
             },
+            // 以下六项在总开关关闭时整项隐藏（item_hidden）——
+            // 2026-10-25「隐藏而不是不可选择」。
             SettingsItem {
                 key: "mini_panel.count",
                 label: msg("Entry count"),
@@ -1031,6 +1085,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
     SettingsCard {
         cat: SettingsCat::Comm,
         title: msg("MCP service"),
+        cond: None,
         items: &[
             SettingsItem {
                 key: "mcp.enabled",
@@ -1038,6 +1093,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 desc: msg("Turn off to disable all MCP calls"),
                 kind: ItemKind::McpToggle,
             },
+            // 监听地址 / 端口 / 密钥：总开关关闭时隐藏（item_hidden）。
             SettingsItem {
                 key: "mcp.host",
                 label: msg("Listen address"),
@@ -1061,6 +1117,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
     SettingsCard {
         cat: SettingsCat::About,
         title: msg("About"),
+        cond: None,
         items: &[
             SettingsItem {
                 key: "about.group.app",
@@ -1131,6 +1188,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
     SettingsCard {
         cat: SettingsCat::About,
         title: msg("Built with"),
+        cond: None,
         items: &[SettingsItem {
             key: "about.stack",
             label: msg("Built with"),
@@ -1218,10 +1276,13 @@ pub(super) fn settings_content(f: &mut Frame<'_>, ui: &mut Ui) {
         settings_search_results(f, ui, &q);
     } else if f.state.settings_show_recent {
         settings_recent_view(f, ui);
-    } else if f.state.settings_cat == SettingsCat::Theme && f.state.theme_tokens_expanded {
+    } else if f.state.settings_cat == SettingsCat::Appearance && f.state.theme_tokens_expanded {
         // 二级视图（2026-10-19）：令牌面板占据整个右侧内容区——用户要求
         // 「基本覆盖设置窗口的一大半区域」。左导航与搜索框保持可见，
         // 返回按钮（面板左上角 ‹）关掉它。
+        //
+        // 2026-10-25：主题并入外观后，二级视图的宿主分类从 Theme 改为
+        // Appearance（入口行在外观 → 主题卡末行）。
         draw_token_panel(f, ui);
     } else {
         settings_category_cards(f, ui);
@@ -1236,8 +1297,14 @@ pub(super) fn settings_content(f: &mut Frame<'_>, ui: &mut Ui) {
 /// 「技术栈」两张）。早前这里用 `find(...)`，于是第二张起永远不会被
 /// 画出来——表现为「技术栈卡片加了却看不见」（2026-10-22 用户反馈）。
 ///
-/// 卡片之间留 12pt 间距：`Frame` 的圆角背景自带外缘，不留白的话
-/// 两张卡片会贴在一起，看不出是两块。
+/// # 条件卡
+///
+/// `SettingsCard::cond` 为 `Some` 且谓词不满足时整卡跳过（液态玻璃
+/// 参数卡只在背景效果 = 玻璃时出现，2026-10-25）。
+///
+/// 卡片之间留 14pt 间距：`Frame` 的圆角背景自带外缘，不留白的话
+/// 两张卡片会贴在一起，看不出是两块。12 → 14 是 2026-10-25 松散
+/// 节奏改版的一部分（悬浮卡的投影/光晕也需要这段呼吸空间）。
 pub(super) fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
     // CAUTION: 必须先把 `settings_cat` **拷出来**再迭代。
     //
@@ -1247,8 +1314,13 @@ pub(super) fn settings_category_cards(f: &mut Frame<'_>, ui: &mut Ui) {
     let cat = f.state.settings_cat;
     let mut first = true;
     for card in SETTINGS_CARDS.iter().filter(|c| c.cat == cat) {
+        if let Some(cond) = card.cond
+            && !cond(&f.svc.state.config)
+        {
+            continue;
+        }
         if !first {
-            ui.add_space(12.0);
+            ui.add_space(14.0);
         }
         first = false;
         settings_card(f, ui, card);
@@ -1307,7 +1379,8 @@ pub(super) fn settings_group_header(
     let (bb, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), egui::Sense::click());
     let painter = ui.painter_at(bb);
     if resp.hovered() {
-        painter.rect_filled(bb, pal.radius_sm, pal.row_hover);
+        // 全圆角改版（2026-10-25）：radius_sm → 胶囊（半高）。
+        painter.rect_filled(bb, row_h * 0.5, pal.row_hover);
     }
     let hovered = resp.hovered();
     let clicked = resp.clicked();
@@ -1468,177 +1541,85 @@ pub(super) fn settings_group_header(
         target_color,
         std::time::Duration::from_millis(120),
     );
-    // 圆角折线的**轮廓**（不是「线 + 补圆」）：外沿从一端半圆帽出发，
-    // 经转角外弧到另一侧，再 mirrored 回内沿，一次填充成形。
-    //
-    // 为什么不用 line_segment + 三个圆：那套是「近似」——平头端是垂直于
-    // 线的矩形，转角处两段线各留一道三角缝隙，靠把圆半径放大到 0.62 倍
-    // 线宽去盖；盖是盖住了，但端点会被撑成略鼓的小球，且旋转到某些角度
-    // 时缝隙位置变化、填补量不再均匀。轮廓多边形没有这些问题：它是
-    // 解析的，任何角度下都光滑。
-    let r = stroke_w * 0.5;
-    // 转角圆弧半径：受两臂长度限制（取臂长的一部分），太大会让折线
-    // 退化成 U 形。
-    let corner_r = (arm_h * 0.55).min(arm_w * 0.7);
+    // ---- 几何：展开态三个关键点，绕中心旋转 ----
     // 两臂独立伸缩：A/B 端各按自己的 reach 系数收放，顶点保持不动。
+    // 折叠时臂收拢（0.72×）、展开时全张（1.0×）⇒ 「捏合/张开」的层次感。
     let apex = egui::vec2(0.0, arm_h);
     let arm_a = egui::vec2(-arm_w, -arm_h) * reach_a;
     let arm_b = egui::vec2(arm_w, -arm_h) * reach_b;
     let (p_apex, p_a, p_b) = (rot(apex), rot(arm_a), rot(arm_b));
-    let outline = round_chevron_outline(p_a, p_apex, p_b, r, corner_r);
-    // CAUTION: 必须用 `Shape::Path`（闭合填充），**不能**用
-    // `convex_polygon`。V 形外扩的轮廓是**凹**多边形——张口那一侧是凹
-    // 的；`convex_polygon` 会按凸包三角化，把箭头填成一只实心扇形。
-    // `PathShape` 走通用三角化（ear clipping），凹的也正确。
-    painter.add(egui::Shape::Path(egui::epaint::PathShape {
-        points: outline,
-        closed: true,
-        fill: arrow_color,
-        stroke: egui::Stroke::NONE.into(),
-    }));
+    // 圆半径 = 线宽 × 0.55（略大于半宽）：让相邻形状充分重叠，避免
+    // 两个 AA 边界相切处露出 1px 淡线。详见下面绘制段的说明。
+    let r = stroke_w * 0.55;
 
+    // ---- 绘制：两段线 + 三个圆（多凸形状叠加）----
+    //
+    // CAUTION: 这是**第三次重写**。前两版都走「单一解析轮廓」路线
+    // （构造闭合多边形一次填充），连栽四次：两侧法线同公式导致外沿内沿
+    // 颠倒、端头帽绕序错乱、转角弧半径把 √(cr²+r²) 算成 cr+r、轮廓自交。
+    // 这条路线的复杂度（绕序 / 法线 / 切点 / 弧半径 / 凹多边形三角化）
+    // 远超收益——每多一步就多一处能悄悄错的地方，而视觉上根本看不出
+    // 解析弧与折线采样的差别。
+    //
+    // 现在改为**多凸形状叠加**：两段 line_segment + 三个 circle_filled。
+    // 每个形状都是凸的、彼此独立，绘制顺序明确，从**结构上**不可能自交
+    // ——不存在「绕序错了」这回事。圆角线帽与圆角转角由三个圆补出：
+    //
+    // - 端头圆（a、b）：半径略大于半线宽，视觉上就是标准圆角线帽
+    //   （圆的一半在线条内部、一半在外部）；
+    // - 转角圆（v）：盖住两段线在顶点的平头接缝，外角自然圆润；
+    // - 半径取线宽的 0.55 倍（略大于 0.5）：让相邻形状**充分重叠**，
+    //   各自 AA 边界不会在内部露出细缝。0.5 刚好相切时，两个 AA 边
+    //   相邻处会出现 1px 的淡线。
+    let parts = chevron_parts(p_a, p_apex, p_b, r);
+    for seg in parts.segments {
+        painter.line_segment(seg, egui::Stroke::new(stroke_w, arrow_color));
+    }
+    // 圆画在线段**之后**：盖住端头平头。
+    for c in parts.caps {
+        painter.circle_filled(c, parts.radius, arrow_color);
+    }
     ui.add_space(4.0);
 }
 
-/// 圆角折线的**闭合轮廓**（V 形两臂 + 端头半圆 + 转角圆弧）。
+/// 圆角 chevron 的绘制部件：两段线 + 三个圆角圆。
 ///
-/// 返回的点集按「外沿 → 内沿」顺序绕行一周，喂给 `Shape::Path`
-/// （`closed: true`）即可。
+/// # 为什么是「多个凸形状叠加」而不是「单一闭合轮廓」
 ///
-/// CAUTION: **不能**喂 `Shape::convex_polygon`——V 形外扩的轮廓是凹多边形
-/// （张口那侧是凹的），凸包三角化会把它填成实心扇形。
+/// 2026-10-24 前两版都走「构造闭合多边形一次填充」路线，连栽四次：
+/// 两侧法线同公式（外沿内沿颠倒）、端头帽绕序错乱、转角弧半径把
+/// √(cr²+r²) 算成 cr+r、轮廓自交。这条路线要同时对绕序 / 法线 /
+/// 切点 / 弧半径 / 凹多边形三角化五件事，每多一步就多一处能悄悄错的
+/// 地方，而视觉上根本看不出解析弧与折线采样的差别。
 ///
-/// # 为什么要轮廓而不是「线 + 补圆」
+/// 多凸叠加没有这些坑：两段线是凸的、圆是凸的，绘制顺序明确，**结构上**
+/// 不存在自交。圆角线帽与圆角转角由三个圆补出（半径略大于半线宽），
+/// 这正是多数绘图库实现 round join + round cap 的做法。
 ///
-/// `Shape::line` 由 tessellator 以**平头**端点生成（egui 的 `Stroke`
-/// 只有 `width`/`color`，没有线帽字段）。用「两段线 + 三个圆」近似圆角
-/// 时，平头是垂直于线的矩形端，转角处两段线各留一道三角缝隙，只能靠
-/// 把圆半径放大到线宽的 0.6 倍去盖——盖住了，但端点被撑成略鼓的小球，
-/// 且图形旋转时缝隙位置变化、填补量不再均匀。
+/// # 字段语义
 ///
-/// 轮廓是解析的：外沿 = 端点半圆帽 + 直线段 + 转角外弧，内沿镜像。
-/// 任何旋转角度下都光滑，没有接缝。
+/// - `segments`：两段线（a→v、v→b），各自等宽、平头端点
+/// - `caps`：三个圆（a、v、b），盖住平头端点与转角接缝
+/// - `radius`：圆的半径（≥ 线宽/2，保证与线段充分重叠）
+pub(super) struct ChevronParts {
+    pub(super) segments: [[egui::Pos2; 2]; 2],
+    pub(super) caps: [egui::Pos2; 3],
+    pub(super) radius: f32,
+}
+
+/// 组装 chevron 的绘制部件。
 ///
-/// # 参数
-///
-/// - `a` / `b`：两臂的外端点
-/// - `v`：转角顶点
-/// - `r`：线宽的一半（轮廓到中心线的距离）
-/// - `corner_r`：转角圆弧半径（≤ 任一侧切点距离，否则退化成 U 形）
-fn round_chevron_outline(
+/// 纯函数：只做坐标装配，不做任何几何推断（推断就是上两版出错的地方）。
+pub(super) fn chevron_parts(
     a: egui::Pos2,
     v: egui::Pos2,
     b: egui::Pos2,
-    r: f32,
-    corner_r: f32,
-) -> Vec<egui::Pos2> {
-    // 两臂方向（从顶点指向两端）。
-    let da = (a - v).normalized();
-    let db = (b - v).normalized();
-    let la = a.distance(v);
-    let lb = b.distance(v);
-    // 切点：转角圆弧与直线段的接界。受臂长约束（留出端头帽的位置）。
-    let cr = corner_r.min(la - r).min(lb - r).max(0.0);
-    let pa = v + da * cr; // A 侧切点
-    let pb = v + db * cr; // B 侧切点
-
-    // 外法线（指向轮廓外侧）。
-    //
-    // CAUTION: 两侧的旋转方向**相反**，不能共用一个公式。V 形张口朝上，
-    // A 臂（左上）的外侧偏左、B 臂（右上）的外侧偏右；同一个 `(-dy, dx)`
-    // 转出来必有一侧指向张口内侧。2026-10-24 第一版就是两侧同公式，
-    // 结果外沿画到内侧、内沿画到外侧，轮廓自交 ⇒ 用户反馈「箭头绘制异常」。
-    //
-    // 用**判据**而不是记公式：外法线必须背离对侧臂（点积为负），不满足
-    // 就取反。这样方向错了会自纠正，而 `outline_*` 那几条测试会抓住它。
-    let mut na = egui::vec2(-da.y, da.x);
-    if na.dot(db) > 0.0 {
-        na = -na;
-    }
-    let mut nb = egui::vec2(-db.y, db.x);
-    if nb.dot(da) > 0.0 {
-        nb = -nb;
-    }
-
-    let mut pts: Vec<egui::Pos2> = Vec::with_capacity(48);
-
-    // ---- 绕行顺序：外沿（A→B）→ B 端帽 → 内沿（B→A）→ A 端帽 ----
-    //
-    // CAUTION: 这个顺序是**硬性的**，2026-10-24 前两版都错在这：
-    //
-    // - 第一版把「A 帽 → A 臂外 → 转角外弧 → B 臂外 → B 帽」当外沿，
-    //   然后内沿又从 B 帽的**同一起点**出发 ⇒ B 端帽被画了两次，且内沿
-    //   第一段从外沿终点直穿端头区连到内侧，轮廓自交；
-    // - 端头帽只能出现**一次**，它是外沿与内沿之间的过渡：外沿走到帽的
-    //   一侧，帽扫到另一侧，内沿从另一侧接着走。
-    //
-    // 所以正确的单向闭合曲线是：
-    //   A 臂外直线 → 转角外弧 → B 臂外直线 → B 端帽
-    //   → B 臂内直线 → 转角内弧 → A 臂内直线 → A 端帽 →（闭合回起点）
-
-    // A 臂外侧直线：a + na*r → pa + na*r（Path 自动连线，只推终点）。
-    pts.push(a + na * r);
-    pts.push(pa + na * r);
-    // 转角外弧：以 v 为圆心，从 pa 的法向转到 pb 的法向。
-    //
-    // CAUTION: 半径是 **√(cr² + r²)**，不是 `cr + r`。切点 pa 在 v→a 方向
-    // 上距 v 为 cr，外沿点是 pa 再沿法向挪 r——那是一个直角三角形，
-    // 斜边才是该点到 v 的距离。2026-10-24 第三版传 `cr + r`，采样点被
-    // 强制推到更远的圆上，弧线与直线段不再相切 ⇒ 与直线段相交，
-    // `outline_does_not_self_intersect` 当场抓到 2 处。
-    let arc_r = (cr * cr + r * r).sqrt();
-    arc_between(&mut pts, v, pa + na * r, pb + nb * r, arc_r);
-    // B 臂外侧直线：pb + nb*r → b + nb*r。
-    pts.push(b + nb * r);
-    // B 端帽：b+nb*r →（经最外点 b+db*r）→ b-nb*r。
-    //
-    // `arc(c, axis, n)` 从 -n 侧经 axis 扫到 +n 侧；这里要的方向相反
-    // （从 +nb 到 -nb），所以把 n 取反：t=0 ⇒ -(-nb) = +nb，t=1 ⇒ -nb。
-    arc(&mut pts, b, db, -nb, r);
-    // B 臂内侧直线：b-nb*r → pb-nb*r。
-    pts.push(pb - nb * r);
-    // 转角内弧：同一个斜边半径（内沿点到 v 的距离同样是 √(cr² + r²)），
-    // 只是角度范围在张口那一侧。
-    arc_between(&mut pts, v, pb - nb * r, pa - na * r, arc_r);
-    // A 臂内侧直线：pa-na*r → a-na*r。
-    pts.push(a - na * r);
-    // A 端帽：a-na*r →（经最外点 a+da*r）→ a+na*r，正好闭合到外沿起点。
-    // 方向与 `arc` 的默认扫描一致（-n → +n），不用取反。
-    arc(&mut pts, a, da, na, r);
-    pts
-}
-
-/// 半圆帽：以 `c` 为圆心，从 `-n` 侧经 `axis`（最外点）扫到 `+n` 侧。
-///
-/// 半径 `r`，`steps` 段折线近似。方向由 `n` 的符号决定——要反向扫就把
-/// `n` 取反（见 `round_chevron_outline` 里 B 端帽的用法）。
-fn arc(pts: &mut Vec<egui::Pos2>, c: egui::Pos2, axis: egui::Vec2, n: egui::Vec2, r: f32) {
-    let steps = 8;
-    for i in 0..=steps {
-        let ang = std::f32::consts::PI * (i as f32 / steps as f32);
-        // 从 -n 起，绕 axis 旋到 +n：axis 垂直 n，故这是平面内的半圆。
-        let dir = -n * ang.cos() + axis * ang.sin();
-        pts.push(c + dir * r);
-    }
-}
-
-/// 两点之间的圆弧采样（已知圆心与半径）：从 `p0` 扫到 `p1`，取短弧。
-fn arc_between(pts: &mut Vec<egui::Pos2>, center: egui::Pos2, p0: egui::Pos2, p1: egui::Pos2, radius: f32) {
-    let a0 = (p0 - center).angle();
-    let a1 = (p1 - center).angle();
-    let mut delta = a1 - a0;
-    // 取短弧（|delta| ≤ π）。
-    while delta > std::f32::consts::PI {
-        delta -= std::f32::consts::TAU;
-    }
-    while delta < -std::f32::consts::PI {
-        delta += std::f32::consts::TAU;
-    }
-    let steps = 10;
-    for i in 1..=steps {
-        let t = i as f32 / steps as f32;
-        let ang = a0 + delta * t;
-        pts.push(center + egui::vec2(ang.cos(), ang.sin()) * radius);
+    radius: f32,
+) -> ChevronParts {
+    ChevronParts {
+        segments: [[a, v], [v, b]],
+        caps: [a, v, b],
+        radius,
     }
 }
 
@@ -1655,19 +1636,52 @@ fn arc_between(pts: &mut Vec<egui::Pos2>, center: egui::Pos2, p0: egui::Pos2, p1
 /// `Frame::show` 内部先往 painter 塞一个 `Noop` 占位，内容测量完再把背景
 /// 形状填进那个占位符：背景尺寸恒等于内容尺寸，且 z 序在内容之下
 /// （不会盖住文字）。这是「背景包裹内容」的标准做法，行高怎么变都不会露底。
+///
+/// # 悬浮式样式（2026-10-25 改版，HTML 原型定稿）
+///
+/// - 圆角 `radius_lg`(10) → **`radius_xl`(16)**；
+/// - 内边距 `symmetric(12, 6)` → **`symmetric(20, 13)`**（宽松节奏）；
+/// - 行间距 14 → **18**；
+/// - 描边恒 1pt：浅色 `border_subtle` 发丝边，深色**透明**（边由
+///   主题色环表达）。恒 1pt 是因为 `Frame` 把 stroke 宽度计入布局，
+///   两种主题必须同宽，否则切换主题时内容会跳动 1pt；
+/// - 内容画完后补**投影 / 围绕**（`draw_settings_card_shadow`）。
+///
+/// # 为什么投影只能「内容之后补」
+///
+/// 卡片高度由内容决定——`Frame::show` 返回后才知道外矩形，投影没有
+/// 「先于填充」的绘制机会（列表行可以：行高静态已知）。解法是把晕带
+/// 拆成四条 1pt 环带，整体位于卡片矩形之外 ⇒ 画在内容之后不盖任何
+/// 东西。详见 [`crate::paint::shadow::draw_settings_card_shadow]。
 pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard) {
     let pal = f.pal;
-    egui::Frame::new()
+    // 投影晕环的占位符：**先于帧背景**插入（帧自己的 Noop 占位在这
+    // 之后），内容画完后把晕环形状写回这个索引 ⇒ 晕环位于帧填充与
+    // 内容之下（z 序 = 插入次序）。卡片高度内容驱动，没有「先画」
+    // 的机会，这是唯一能让外扩矩形盖住卡片内部却不被看见的画法。
+    // 详见 `shadow::settings_halo_shape` 的文档。
+    let halo_idx = ui.painter().add(egui::Shape::Noop);
+    let inner = egui::Frame::new()
         .fill(pal.surface)
-        .corner_radius(pal.radius_lg)
-        .inner_margin(egui::Margin::symmetric(12, 6))
+        .stroke(egui::Stroke::new(
+            1.0,
+            if pal.is_dark {
+                egui::Color32::TRANSPARENT
+            } else {
+                pal.border_subtle
+            },
+        ))
+        .corner_radius(pal.radius_xl)
+        .inner_margin(egui::Margin::symmetric(20, 13))
         .show(ui, |ui| {
             // 行间距：设置项之间拉开呼吸感（2.0 太挤，文字贴在一起）。
             //
             // 14.0 而不是 8.0：行高现在**精确等于标签块**（标题 + 说明），
             // 早前那 8pt 里其实混着控件溢出撑出来的空白，看起来才够松。
             // 行高收紧后必须把间距补回来，否则相邻两行贴在一起。
-            ui.spacing_mut().item_spacing = vec2(0.0, 14.0);
+            // 2026-10-25：14 → 18，配合 20/13 的卡片内边距做「松散轻柔」
+            // 的节奏（HTML 原型定稿）。
+            ui.spacing_mut().item_spacing = vec2(0.0, 18.0);
 
             // ---- 卡片标题行：标题在左，条件重置按钮在右 ----
             //
@@ -1716,7 +1730,10 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
                                     .color(pal.text),
                             )
                             .fill(pal.surface_variant)
-                            .corner_radius(pal.radius_md),
+                            // 全圆角改版（2026-10-25）：radius_md → 胶囊。
+                            // 半径按控件高度档位取（按钮实际高度 ≈ 字号 +
+                            // 内边距×2，`control_height` 是同档量纲）。
+                            .corner_radius((pal.control_height + 2.0) * 0.5),
                         );
                         let rect = resp.rect;
                         let clicked = resp.clicked();
@@ -1780,6 +1797,13 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
                     idx += 1;
                     continue;
                 }
+                // 2026-10-25「隐藏而不是不可选择」：依赖项在当前配置下
+                // 无意义时整项跳过（磨砂强度 / 背景不透明度 / 风格参数 /
+                // 卡片不透明度 / 迷你面板与 MCP 子项，见 `item_hidden`）。
+                if item_hidden(it, &f.svc.state.config) {
+                    idx += 1;
+                    continue;
+                }
                 settings_item_row(f, ui, it);
                 idx += 1;
             }
@@ -1795,7 +1819,8 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
                 let (bb, resp) = ui.allocate_exact_size(vec2(btn_w, 36.0), egui::Sense::click());
                 let p = ui.painter_at(bb);
                 let hovered = resp.hovered();
-                p.rect_filled(bb, pal.radius_md, if hovered { pal.accent_hover } else { pal.accent });
+                // 全圆角改版（2026-10-25）：radius_md → 胶囊（半高）。
+                p.rect_filled(bb, bb.height() * 0.5, if hovered { pal.accent_hover } else { pal.accent });
                 p.text(
                     bb.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1809,6 +1834,22 @@ pub(super) fn settings_card(f: &mut Frame<'_>, ui: &mut Ui, card: &SettingsCard)
                 }
             }
         });
+
+    // 写回投影晕环（占位符索引在帧背景之前 ⇒ 晕环在填充与内容之下）。
+    // `InnerResponse::response.rect` 是**外矩形**（含描边与内边距），
+    // 正是晕环要围绕的目标。
+    ui.painter().set(
+        halo_idx,
+        super::shadow::settings_halo_shape(inner.response.rect, pal.radius_xl, pal),
+    );
+    // 边缘装饰（深色主题色环 + 受光高光）画在填充**之上**——描边要被
+    // 看见必须叠在填充上；它与内容之间隔着内边距，不会压到文字。
+    super::shadow::draw_settings_card_edge(
+        ui.painter(),
+        inner.response.rect,
+        pal.radius_xl,
+        pal,
+    );
 }
 
 /// 卡片阴影的参数行（滑条 + 右侧读数），标签是运行时文本。
@@ -1874,7 +1915,8 @@ pub(super) fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     let font = egui::FontId::proportional(pal.font_sm);
     let chip_h = pal.font_sm + 9.0;
     let chip_pad_x = 11.0;
-    let chip_radius = 7.0;
+    // 全圆角改版（2026-10-25）：chip 从圆角方块(7)改**胶囊**（半高）。
+    let chip_radius = chip_h * 0.5;
     let chip_gap = 6.0;
 
     // 拖拽态跨帧记忆：当前正被拖动的元素。
@@ -1969,23 +2011,13 @@ pub(super) fn draw_row_meta_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
 
 #[cfg(test)]
 mod fold_arrow_tests {
-    use super::round_chevron_outline;
+    use super::chevron_parts;
 
-    /// egui 的 `Vec2` 没有叉积，测试自备一个（只在这里用）。
-    trait CrossExt {
-        fn cross(self, o: egui::Vec2) -> f32;
-    }
-    impl CrossExt for egui::Vec2 {
-        fn cross(self, o: egui::Vec2) -> f32 {
-            self.x * o.y - self.y * o.x
-        }
-    }
-
-    /// 展开态（v，顶点在下）的三个关键点：与 `settings_group_header`
+    /// chevron 的三个关键点（展开态 v 形）：与 `settings_group_header`
     /// 同一套系数，确保测的是真形状。
     fn v_shape(scale: f32) -> (egui::Pos2, egui::Pos2, egui::Pos2) {
-        let h = scale * 0.26;
-        let w = scale * 0.22;
+        let h: f32 = scale * 0.26;
+        let w: f32 = scale * 0.22;
         (
             egui::pos2(0.0, h),  // 顶点（下）
             egui::pos2(-w, -h), // A 端
@@ -1993,179 +2025,77 @@ mod fold_arrow_tests {
         )
     }
 
-    #[test]
-    fn outline_is_closed_and_has_both_shells() {
-        let (apex, a, b) = v_shape(15.0);
-        let h: f32 = 15.0 * 0.26;
-        let w: f32 = 15.0 * 0.22;
-        let r = 15.0 * 0.085 * 0.5;
-        let corner_r = (h * 0.55).min(w * 0.7);
-        let pts = round_chevron_outline(a, apex, b, r, corner_r);
-        // 外沿：A 帽 9 点 + 1 切点 + 转角外弧 10 点 + 1 切点 + B 帽 9 点
-        // 内沿：转角内弧 10 + 1 切点 + B 帽 9 + 1 切点 + A 帽 9
-        assert!(pts.len() >= 40, "轮廓点太少: {}", pts.len());
-        assert!(pts.len() <= 70, "轮廓点太多: {}", pts.len());
-        // 所有点有限（NaN 会让 Path 三角化炸掉）。
-        for p in &pts {
-            assert!(p.x.is_finite() && p.y.is_finite(), "非有限坐标: {p:?}");
-        }
-    }
-
-    #[test]
-    fn outline_stays_near_the_centerline() {
-        // 轮廓必须贴着中心线：每个点到最近的中心线段距离 ≈ r（±20%）。
-        // 这条守住「端头圆鼓成球」和「轮廓跑飞」两类退化。
-        let (apex, a, b) = v_shape(15.0);
-        let h: f32 = 15.0 * 0.26;
-        let w: f32 = 15.0 * 0.22;
-        let r = 15.0 * 0.085 * 0.5;
-        let corner_r = (h * 0.55).min(w * 0.7);
-        let pts = round_chevron_outline(a, apex, b, r, corner_r);
-        let mut worst = 0.0f32;
-        for p in &pts {
-            // 到两臂线段的距离取最小。
-            let d = seg_dist(*p, a, apex).min(seg_dist(*p, b, apex));
-            let ratio = (d - r).abs() / r;
-            worst = worst.max(ratio);
-        }
-        // 端头帽外侧的点距离为 r（帽上），转角外弧为 cr + r（刻意大于 r），
-        // 所以阈值放宽到「不超过 1.6r」。
-        assert!(worst < 1.6, "有轮廓点偏离中心线过远: 最差比例 {worst}");
-    }
-
-    /// 轮廓必须是**简单闭合曲线**（不自交）。
+    /// 线段必须**首尾相接**（a→v、v→b），不能有跳点。
     ///
-    /// 2026-10-24 连续三版都栽在自交上：两侧法线同公式（外沿内沿颠倒）、
-    /// 端头帽组织错乱（B 帽画两次、内沿从外沿终点直穿端头）。前两条测试
-    /// （法线朝向、凹性）各自只抓一个面，这条用最笨也最可靠的办法：
-    /// 两两求线段交点。粗折线的轮廓只有相邻边在顶点相接，**任何非相邻
-    /// 边相交都是自交** ⇒ 图形必然错乱。
+    /// 多凸方案的正确性全靠「两段线在顶点相接」这一件事——相接了，
+    /// 三个圆就一定能盖住所有接缝；没相接，中间就会出现断口。
     #[test]
-    fn outline_does_not_self_intersect() {
+    fn segments_share_the_apex() {
         let (apex, a, b) = v_shape(15.0);
-        let h: f32 = 15.0 * 0.26;
-        let w: f32 = 15.0 * 0.22;
-        let r = 15.0 * 0.085 * 0.5;
-        let corner_r = (h * 0.55).min(w * 0.7);
-        let pts = round_chevron_outline(a, apex, b, r, corner_r);
-        let n = pts.len();
-        let mut hits = 0;
-        for i in 0..n {
-            let p0 = pts[i];
-            let p1 = pts[(i + 1) % n];
-            for j in (i + 2)..n {
-                // 跳过首尾相邻的两组（共享端点不算交）。
-                if i == 0 && j == n - 1 {
-                    continue;
-                }
-                let q0 = pts[j];
-                let q1 = pts[(j + 1) % n];
-                if segs_cross(p0, p1, q0, q1) {
-                    hits += 1;
-                }
-            }
-        }
-        assert!(hits == 0, "轮廓自交 {hits} 处 ⇒ 填充结果必然错乱");
+        let parts = chevron_parts(a, apex, b, 1.0);
+        assert_eq!(parts.segments[0], [a, apex], "第一段应是 a→apex");
+        assert_eq!(parts.segments[1], [apex, b], "第二段应是 apex→b");
     }
 
-    /// 相邻边在顶点处应当**首尾相接**（轮廓连续，没有跳跃）。
+    /// 三个圆心必须落在 a / v / b 上，且半径 ≥ 线宽/2。
     ///
-    /// 自交之外的另一类错乱是「跳点」：某两个相邻点之间被一条横穿图形的
-    /// 长直线连起来。这里断言每对相邻点的间距都不超过一个采样步长
-    /// （弧采样步长约 0.4r，直线段则更短），超出即说明有跳点。
+    /// 半径 ≥ 半宽是硬要求：小于它时圆盖不住线段的平头端，两个 AA
+    /// 边界相切处会露出 1px 淡线。0.55× 是实现里取的值（略大于半宽
+    /// 以让相邻形状充分重叠）。
     #[test]
-    fn outline_has_no_long_jumps() {
+    fn caps_sit_on_the_endpoints_and_cover_the_strokes() {
         let (apex, a, b) = v_shape(15.0);
-        let h: f32 = 15.0 * 0.26;
-        let w: f32 = 15.0 * 0.22;
-        let r = 15.0 * 0.085 * 0.5;
-        let corner_r = (h * 0.55).min(w * 0.7);
-        let pts = round_chevron_outline(a, apex, b, r, corner_r);
-        // 上限：轮廓最长单边。外侧直线段长 = 臂长 - 转角半径
-        // （8.47 - 2.15 ≈ 6.4pt），弧步长 < 0.5pt。取 9pt：超过它必然
-        // 不是正常的相邻采样点，而是横穿图形的长直线。
-        let max_step = 9.0;
-        for i in 0..pts.len() {
-            let d = pts[i].distance(pts[(i + 1) % pts.len()]);
-            assert!(d <= max_step, "第 {i} 段跳点 {d:.2}pt ⇒ 有横穿图形的长直线");
-        }
+        let stroke_w = 15.0 * 0.085;
+        let r = stroke_w * 0.55;
+        let parts = chevron_parts(a, apex, b, r);
+        assert_eq!(parts.caps, [a, apex, b], "圆心应落在 a / v / b");
+        assert!(
+            parts.radius >= stroke_w * 0.5,
+            "圆半径 {} 必须 ≥ 线宽一半 {}，否则盖不住平头端",
+            parts.radius,
+            stroke_w * 0.5
+        );
+        assert!(
+            parts.radius < stroke_w * 0.7,
+            "圆半径 {} 也不该大到让端点鼓成球（上限 0.7×线宽）",
+            parts.radius
+        );
     }
 
-    /// 两条线段是否**真交叉**（排除端点相接与共线退化）。
-    fn segs_cross(p0: egui::Pos2, p1: egui::Pos2, q0: egui::Pos2, q1: egui::Pos2) -> bool {
-        let d1 = p1 - p0;
-        let d2 = q1 - q0;
-        let denom = d1.x * d2.y - d1.y * d2.x;
-        if denom.abs() < 1e-9 {
-            return false; // 平行或退化
-        }
-        let diff = q0 - p0;
-        let t = (diff.x * d2.y - diff.y * d2.x) / denom;
-        let u = (diff.x * d1.y - diff.y * d1.x) / denom;
-        // 严格在两条线段内部相交（不含端点）才算自交。
-        t > 1e-6 && t < 1.0 - 1e-6 && u > 1e-6 && u < 1.0 - 1e-6
-    }
-
+    /// 两臂独立伸缩（动画）后，线段仍必须共享顶点。
+    ///
+    /// 动画里 A/B 臂各乘自己的 `reach` 系数，顶点不动。这条断言伸缩
+    /// 不会把「相接」破坏掉——`ChevronParts` 的装配是纯的，只要输入
+    /// 点位正确输出就正确，但万一将来装配逻辑改成「按 reach 计算端点」
+    /// 就需要这条守着。
     #[test]
-    fn outline_outer_shell_points_away_from_the_other_arm() {
-        // 2026-10-24 回归：第一版两侧法线用了同一个旋转公式，其中一侧指向
-        // V 形张口内侧 ⇒ 外沿画到内侧、内沿画到外侧，轮廓自交，用户看到
-        // 「箭头绘制异常」。
-        //
-        // 断言：A 侧外沿上的点必须**离对侧端点 b 更远**（越过分界线），
-        // B 侧反之。方向反了这条就红。
+    fn arms_shrink_independently_but_stay_joined() {
         let (apex, a, b) = v_shape(15.0);
-        let h: f32 = 15.0 * 0.26;
-        let w: f32 = 15.0 * 0.22;
-        let r = 15.0 * 0.085 * 0.5;
-        let corner_r = (h * 0.55).min(w * 0.7);
-        let pts = round_chevron_outline(a, apex, b, r, corner_r);
-        // 按 x 符号粗分两侧（v 形左右对称），各自离对侧端点应更远。
-        let mut a_side_far = 0;
-        let mut b_side_far = 0;
-        for p in &pts {
-            if p.x < -0.5 && p.distance(b) > p.distance(a) {
-                a_side_far += 1;
-            } else if p.x > 0.5 && p.distance(a) > p.distance(b) {
-                b_side_far += 1;
+        for reach_a in [0.72f32, 1.0] {
+            for reach_b in [0.86f32, 1.0] {
+                // 顶点不动，两端按各自系数缩放（与 settings_group_header 一致）。
+                let a2 = egui::pos2(a.x * reach_a, a.y * reach_a);
+                let b2 = egui::pos2(b.x * reach_b, b.y * reach_b);
+                let parts = chevron_parts(a2, apex, b2, 1.0);
+                assert_eq!(parts.segments[0][1], parts.segments[1][0], "两段必须在顶点相接");
+                assert_eq!(parts.caps[0], parts.segments[0][0]);
+                assert_eq!(parts.caps[2], parts.segments[1][1]);
             }
         }
-        assert!(a_side_far >= 3, "A 侧外沿点应背离 b，实测 {a_side_far}");
-        assert!(b_side_far >= 3, "B 侧外沿点应背离 a，实测 {b_side_far}");
     }
 
+    /// 装配是纯函数：同输入恒同输出，无隐藏状态。
+    ///
+    /// 这条是给「几何推断」那类 bug 的反向守门——上两版的轮廓构造把
+    /// 法线/切点/弧半径都做成了隐式推断，错了要靠人眼发现。多凸方案
+    /// 只做装配，本条断言它保持这个性质。
     #[test]
-    fn outline_is_concave_not_a_fan() {
-        // 关键回归：轮廓必须是**凹**的（V 形张口侧内凹）。若哪天误改回
-        // `convex_polygon`，三角形化会填成实心扇形——这里用「存在一个
-        // 内角 > 180° 的点」来断言凹性。
+    fn assembly_is_pure_and_deterministic() {
         let (apex, a, b) = v_shape(15.0);
-        let h: f32 = 15.0 * 0.26;
-        let w: f32 = 15.0 * 0.22;
-        let r = 15.0 * 0.085 * 0.5;
-        let corner_r = (h * 0.55).min(w * 0.7);
-        let pts = round_chevron_outline(a, apex, b, r, corner_r);
-        let mut reflex = 0;
-        let n = pts.len();
-        for i in 0..n {
-            let prev = pts[(i + n - 1) % n];
-            let cur = pts[i];
-            let next = pts[(i + 1) % n];
-            let cross = (cur - prev).cross(next - cur);
-            if cross < 0.0 {
-                reflex += 1;
-            }
-        }
-        assert!(reflex >= 2, "轮廓应有内凹点（V 形张口），实测 {reflex}");
-    }
-
-    fn seg_dist(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
-        let ab = b - a;
-        let len2 = ab.length_sq();
-        if len2 < 1e-9 {
-            return p.distance(a);
-        }
-        let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
-        p.distance(a + ab * t)
+        let p1 = chevron_parts(a, apex, b, 1.0);
+        let p2 = chevron_parts(a, apex, b, 1.0);
+        assert_eq!(p1.segments, p2.segments);
+        assert_eq!(p1.caps, p2.caps);
+        assert_eq!(p1.radius, p2.radius);
     }
 }

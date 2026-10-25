@@ -44,8 +44,9 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 行同款病，见 token_row_h 的 CAUTION）。
         let swatch_h = (pal.font_sm * 1.7).max(22.0);
         let (r, _) = ui.allocate_exact_size(vec2(48.0, swatch_h), Sense::empty());
+        // 全圆角改版（2026-10-25）：预览块 radius_sm → 胶囊（半高）。
         ui.painter_at(r)
-            .rect_filled(r, pal.radius_sm, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            .rect_filled(r, swatch_h * 0.5, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         ui.add_space(8.0);
         // 来源标注：预设 / 自定义 / 默认。比只显示颜色多一分确定性
         // （用户看得知道自己用的是哪一个预设）。
@@ -75,23 +76,26 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
             let resp = ui.interact(r, egui::Id::unique(("accent_preset", i)), Sense::click());
             let selected = cur.is_some_and(|c| c.to_rgb() == *prgb);
             let p = ui.painter_at(r);
+            // 全圆角改版（2026-10-25）：色板从圆角方块改**正圆**
+            // （半径 = 边长一半）——HTML 原型里色板就是圆点。
+            let dot = s * 0.5;
             p.rect_filled(
                 r,
-                pal.radius_sm,
+                dot,
                 egui::Color32::from_rgb(prgb[0], prgb[1], prgb[2]),
             );
             if selected {
                 // 选中圈：text_bright 描边（任何底色上都看得见）。
                 p.rect_stroke(
                     r,
-                    pal.radius_sm,
+                    dot,
                     egui::Stroke::new(2.0, pal.text_bright),
                     egui::StrokeKind::Inside,
                 );
             } else if resp.hovered() {
                 p.rect_stroke(
                     r,
-                    pal.radius_sm,
+                    dot,
                     egui::Stroke::new(1.0, pal.text_dim),
                     egui::StrokeKind::Inside,
                 );
@@ -165,15 +169,17 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
             f.state.accent_hex = shown.to_hex();
         }
         let w = pal.font_sm * 7.3;
+        let pill = (pal.control_height + 2.0) * 0.5;
         let (r, _) = ui.allocate_exact_size(
             vec2(w, pal.control_height + 2.0),
             egui::Sense::empty(),
         );
         let painter = ui.painter_at(r);
-        painter.rect_filled(r, pal.radius_md, pal.surface_variant);
+        // 全圆角改版（2026-10-25）：radius_md → 胶囊（半高）。
+        painter.rect_filled(r, pill, pal.surface_variant);
         painter.rect_stroke(
             r,
-            pal.radius_md,
+            pill,
             egui::Stroke::new(1.0, pal.border),
             egui::StrokeKind::Inside,
         );
@@ -208,7 +214,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
             );
             painter.rect_stroke(
                 r,
-                pal.radius_md,
+                pill,
                 egui::Stroke::new(1.0 + 0.5 * focus_k, ring),
                 egui::StrokeKind::Inside,
             );
@@ -284,7 +290,8 @@ pub(super) fn draw_token_entry(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     );
     let p = ui.painter_at(r);
     if resp.hovered() {
-        p.rect_filled(r, pal.radius_sm, pal.row_hover);
+        // 全圆角改版（2026-10-25）：radius_sm → 胶囊（半高）。
+        p.rect_filled(r, r.height() * 0.5, pal.row_hover);
     }
     p.text(
         egui::pos2(r.min.x + 4.0, r.center().y),

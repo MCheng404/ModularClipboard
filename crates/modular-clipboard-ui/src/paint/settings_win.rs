@@ -33,9 +33,19 @@ use super::shadow::fade_color;
 /// 设置界面布局常量：左侧导航列宽（逻辑点）。
 ///
 /// `settingswin` 的拖动区用这两个值挖掉左列，二者必须保持一致。
-pub const SETTINGS_NAV_W: f32 = 172.0;
+pub const SETTINGS_NAV_W: f32 = 180.0;
 /// 设置界面外缘留白（逻辑点）。
-pub const SETTINGS_MARGIN: f32 = 12.0;
+pub const SETTINGS_MARGIN: f32 = 18.0;
+/// 左右列间距（逻辑点）。
+///
+/// 2026-10-25 改版：14 → 22。悬浮卡带 22pt 主题色光晕（深色）/ 三层
+/// 投影（浅色），间距小于光晕半径时两列的光晕连成一片，左侧「涨」
+/// 进内容区（用户反馈「内容显示区域被左导航栏吃掉一部分」）。
+pub const SETTINGS_COL_GAP: f32 = 22.0;
+/// 侧栏卡内边距（搜索框 / 导航项 / 底脚共用的内缩）。
+const NAV_PAD: f32 = 8.0;
+/// 侧栏底脚高度（发丝线 + 应用名）。
+const SETTINGS_NAV_FOOTER_H: f32 = 30.0;
 
 /// 设置界面：左侧搜索框 + 圆角导航块，右侧卡片分组。
 ///
@@ -70,23 +80,80 @@ pub fn draw_settings(f: &mut Frame<'_>) {
     let m = SETTINGS_MARGIN;
     let left_w = SETTINGS_NAV_W;
 
-    // ---- 左列：搜索框 + 导航块 ----
-    let left_x0 = area.min.x + m;
-    let left_x1 = left_x0 + left_w;
+    // ---- 左列：一整块悬浮侧栏卡（搜索 + 导航 + 应用名锚点）----
+    //
+    // 2026-10-25 改版（HTML 原型定稿 A 方案）：左导航不再是「裸胶囊列
+    // 直接落在窗口底上 + 一块圆角底」，而是与右侧内容卡**同一视觉
+    // 语言**的悬浮卡——surface 底 + `radius_xl` + 分主题投影/围绕
+    // （浅色三层黑影 / 深色主题色环+光晕，见
+    // [`crate::paint::shadow::draw_settings_card_shadow`]）。矩形静态
+    // 已知（铺满左列全高）：先铺底，再画内部，晕带最后补（环带整体
+    // 位于卡片矩形之外，盖不到导航项）。
+    let nav_card = Rect::from_min_max(
+        pos2(area.min.x + m, area.min.y + m),
+        pos2(area.min.x + m + left_w, area.max.y - m),
+    );
+    // 必须用**视口级** painter 画底与晕带：`painter_at(nav_card)` 会把
+    // 裁剪区缩到卡片矩形，外扩的晕带整个被裁掉。
+    //
+    // CAUTION: `Painter` 持有 `&Ui` 的借用——铺底、画项、补晕带三段必须
+    // **各自重新取**（`f.ui.painter()` 只是克隆内部 Arc，成本可忽略），
+    // 否则第一个 `vp` 会把 `f`  immutable 借住，后面的
+    // `draw_settings_search(f, …)` 全部撞 E0502。
+    {
+        let vp = f.ui.painter();
+        // 侧栏卡矩形静态已知（铺满左列全高）⇒ 晕环可以直接先画：
+        // 外扩矩形盖住卡片内部的部分随后被不透明填充遮住。
+        vp.add(super::shadow::settings_halo_shape(
+            nav_card,
+            pal.radius_xl,
+            pal,
+        ));
+        vp.rect_filled(nav_card, pal.radius_xl, pal.surface);
+        // 浅色：发丝边；深色：边由主题色环表达（`draw_settings_card_edge`
+        // 里画，内容之后），这里不描边。
+        if !pal.is_dark {
+            vp.rect_stroke(
+                nav_card,
+                pal.radius_xl,
+                egui::Stroke::new(1.0, pal.border_subtle),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
+    // 搜索框（卡内顶部，通宽减内边距）。
+    let nav_inner = nav_card.shrink(NAV_PAD);
     // 高度随字号缩放（`control_height` 已含字体缩放）。
     let search_h = pal.control_height * 1.21;
-    let search_rect = Rect::from_min_size(pos2(left_x0, area.min.y + m), vec2(left_w, search_h));
+    let search_rect = Rect::from_min_size(nav_inner.min, vec2(nav_inner.width(), search_h));
     draw_settings_search(f, search_rect);
 
+    // 导航列表：搜索框与底脚之间。
     let nav_top = search_rect.max.y + 10.0;
-    let nav_bottom = area.max.y - m;
+    let nav_bottom = nav_inner.max.y - SETTINGS_NAV_FOOTER_H;
     if nav_bottom > nav_top + 8.0 {
-        let nav_rect = Rect::from_min_max(pos2(left_x0, nav_top), pos2(left_x1, nav_bottom));
+        let nav_rect = Rect::from_min_max(
+            pos2(nav_inner.min.x, nav_top),
+            pos2(nav_inner.max.x, nav_bottom),
+        );
         draw_settings_nav(f, nav_rect);
     }
 
-    // ---- 右列：右上关闭按钮 + 内容 ----
-    let right_x0 = left_x1 + m + 4.0; // 列间留白
+    // 底脚：发丝线 + 应用名，给侧栏一个视觉锚点（否则卡片下方一大片
+    // 空白读作「没画完」）。
+    draw_settings_nav_footer(f, nav_card);
+
+    // 边缘装饰（深色主题色环 + 受光高光）：画在填充之上、内容之后。
+    //
+    // CAUTION: 先绑到局部变量再取址——`&f.ui.painter()` 这种「临时值
+    // 立即取址」会被 clippy 的 needless_borrow 命中（参数要 &Painter，
+    // 而 `painter()` 返回值）。`Painter` 是内部 Arc 的薄包装，克隆可忽略。
+    let vp = f.ui.painter();
+    super::shadow::draw_settings_card_edge(&vp, nav_card, pal.radius_xl, pal);
+
+    // ---- 右列页头行：主标签 + 关闭按钮，都与搜索框同线 ----
+    let right_x0 = nav_card.max.x + SETTINGS_COL_GAP;
     let right = Rect::from_min_max(
         pos2(right_x0, area.min.y + m),
         area.max - vec2(m, m),
@@ -95,26 +162,46 @@ pub fn draw_settings(f: &mut Frame<'_>) {
         return;
     }
 
-    // 右上角关闭按钮（独立于内容区，不随滚动）。
-    let close_r = Rect::from_min_size(
-        pos2(right.max.x - 30.0, right.min.y),
+    // 2026-10-25 用户反馈：「关闭窗口按钮与搜索框平齐，主标签也和
+    // 搜索框平齐在同一条线上，去除主标签描述」。三者共用搜索框的
+    // 垂直中心线：
+    // - 主标签 = 当前分类名（与导航选中项同一份标题源，加粗），在左；
+    // - 关闭按钮在右，垂直中心对齐；
+    // - 描述行取消——分类名自解释，副标题白占一行还把内容区往下推。
+    //
+    // CAUTION: 主标签落在顶部拖动带（44pt）内是无害的——它只是文字，
+    // 不注册交互；关闭按钮有 `close_zone_w`(40) 挖洞，点得动。
+    let head_cy = search_rect.center().y;
+    f.ui.painter().text(
+        pos2(right.min.x, head_cy),
+        egui::Align2::LEFT_CENTER,
+        t(f.state.settings_cat.title()),
+        crate::theme::emphasis(pal.font_md, f.scale),
+        pal.text_bright,
+    );
+
+    // 右上角关闭按钮（独立于内容区，不随滚动）：垂直中心对齐搜索框。
+    let close_r = Rect::from_center_size(
+        pos2(right.max.x - 15.0, head_cy),
         vec2(30.0, 30.0),
     );
     draw_settings_close(f, close_r);
 
-    // 内容区：关闭按钮下方，可滚动。
+    // 内容区：页头行下方，可滚动。
     //
-    // 右缘**让出滚动条宽度 + 呼吸空间**：egui 的浮动滚动条画在内容区
-    // 右缘之上（`ScrollStyle::floating`，不占布局宽度），正好压住右侧
-    // 控件——开关、分段控件的最后一段、滑条手柄都会被它挡住（用户反馈
-    // 「滑条展开后容易挡到按钮」）。让出后控件整体左移，滚动条落在
-    // 空白里，与列表行（`draw_history_body` 的 `row_w`）同一处理。
+    // 视口用**右列全宽**——滚动条让位由**卡片**内缩完成（见下面
+    // `show` 闭包里的 `set_width`），不是缩视口：egui 的浮动滚动条
+    // 画在视口右缘**之上**，缩视口只会把滚动条一起左移，照样压住
+    // 卡片右缘（2026-10-25 用户反馈「滚动条和卡片边上粘在一起」，
+    // 旧代码的让出量因此落在了滚动条与窗口边之间——看不见的地方）。
+    // 与列表行 `row_w` 同一处理，见 `draw_history_body`。
+    //
+    // 顶缘 = 搜索框底 / 关闭按钮底 的较大者 + 呼吸位：字号放大时任一
+    // 元素变高都不会被内容区盖上。
+    let head_bottom = search_rect.max.y.max(close_r.max.y);
     let content = Rect::from_min_max(
-        pos2(right.min.x, close_r.max.y + 6.0),
-        pos2(
-            (right.max.x - SCROLLBAR_RESERVE - SCROLLBAR_GAP).max(right.min.x + 8.0),
-            right.max.y,
-        ),
+        pos2(right.min.x, head_bottom + 10.0),
+        pos2(right.max.x, right.max.y),
     );
     if content.height() <= 8.0 {
         return;
@@ -130,6 +217,19 @@ pub fn draw_settings(f: &mut Frame<'_>) {
         .id_salt("settings_scroll")
         .auto_shrink([false, false])
         .show(&mut ui, |ui| {
+            // 卡片右缘让出滚动条热区 + 呼吸空间（逻辑点）。
+            //
+            // CAUTION: 让的是**内容宽度**（`set_width` 把内层 Ui 的
+            // min/max 宽一起钉住），不是视口宽度。egui 0.36+ 默认
+            // `ScrollStyle::floating`：滚动条不占布局宽度，浮在
+            // `[视口.max.x - 10, 视口.max.x]` 上。缩视口 ⇒ 滚动条
+            // 跟着左移，与卡片右缘零距相贴甚至压住开关/分段最后一段
+            // （用户反馈「滑条展开后容易挡到按钮」）。
+            //
+            // 无条件让出（不像列表行那样仅可滚动时让）：卡片宽度不随
+            // 「本分类能否滚动」跳变，切分类时控件不会横向抖动。
+            let card_w = (content.width() - SCROLLBAR_RESERVE - SCROLLBAR_GAP).max(160.0);
+            ui.set_width(card_w);
             settings_content(f, ui);
         });
 
@@ -727,6 +827,9 @@ pub(super) fn push_blur_split_marker(f: &mut Frame<'_>, area: Rect) {
 }
 
 /// 右上角关闭按钮（绝对定位，不随滚动）。
+///
+/// 2026-10-25 全圆角改版：悬停底从 `radius_sm` 改**圆形**
+/// （半径 = 按钮边一半）——图标按钮统一成圆形是「全圆角」的收口。
 pub(super) fn draw_settings_close(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     let btn = f.ui.scope_builder(
@@ -738,7 +841,9 @@ pub(super) fn draw_settings_close(f: &mut Frame<'_>, r: Rect) {
     );
     let btn = btn.inner;
     if btn.hovered() {
-        f.ui.painter_at(r).rect_filled(r, pal.radius_sm, pal.row_hover);
+        f.ui
+            .painter_at(r)
+            .rect_filled(r, r.height() * 0.5, pal.row_hover);
     }
     crate::icons::Icon::Close.paint(
         &f.ui.painter_at(r),
@@ -751,7 +856,11 @@ pub(super) fn draw_settings_close(f: &mut Frame<'_>, r: Rect) {
     }
 }
 
-/// 左侧搜索框：圆角输入框，右侧放大镜。
+/// 左侧搜索框：胶囊输入框（表面变体底 + 发丝边），右侧放大镜。
+///
+/// 2026-10-25 全圆角改版：圆角从 `radius_md`(6) 改为**胶囊**
+/// （半径 = 框高一半），并补一层 `border_subtle` 发丝边——悬浮侧栏
+/// 卡里没有可见边界的输入框会读作「一块灰疤」。
 ///
 /// 定稿交互：内容为空且聚焦时显示「最近修改」；输入内容后转为
 /// 搜索结果视图；失焦且内容为空时恢复当前分类卡片。
@@ -763,7 +872,17 @@ pub(super) fn draw_settings_search(f: &mut Frame<'_>, search_rect: Rect) {
             .scope_id(egui::Id::unique("settings_search"))
             .max_rect(search_rect),
         |u| {
-            u.painter().rect_filled(search_rect, pal.radius_md, pal.surface_variant);
+            let pill = search_rect.height() * 0.5;
+            {
+                let p = u.painter();
+                p.rect_filled(search_rect, pill, pal.surface_variant);
+                p.rect_stroke(
+                    search_rect,
+                    pill,
+                    egui::Stroke::new(1.0, pal.border_subtle),
+                    egui::StrokeKind::Inside,
+                );
+            }
             // 文字输入区（左侧留白，右侧留图标位）。
             let text_rect = Rect::from_min_max(
                 search_rect.min + vec2(10.0, 0.0),
@@ -780,6 +899,27 @@ pub(super) fn draw_settings_search(f: &mut Frame<'_>, search_rect: Rect) {
                     .frame(egui::Frame::NONE)
                     .desired_width(text_rect.width()),
             );
+            // 聚焦描边转 accent（130ms 补间，与 `draw_text_field` 同一套：
+            // 颜色过渡、宽度两档硬切——1px 量级的宽度补间只会让抗锯齿
+            // 边缘抖一下）。
+            //
+            // CAUTION: painter 在 `child` 建好之后重新取——`u.painter()`
+            // 借住 `u`，与随后的 `u.new_child`（要 `&mut u`）相撞。
+            let focus_k = crate::anim::tween_f32(
+                u.ctx(),
+                egui::Id::unique("settings_search_focus"),
+                if r.has_focus() { 1.0 } else { 0.0 },
+                std::time::Duration::from_millis(130),
+                crate::anim::Ease::OutCubic,
+            );
+            if focus_k > 0.004 {
+                u.painter().rect_stroke(
+                    search_rect,
+                    pill,
+                    egui::Stroke::new(1.0 + 0.5 * focus_k, pal.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
             // 右侧放大镜。
             let icon_r = Rect::from_center_size(
                 pos2(search_rect.max.x - 15.0, search_rect.center().y),
@@ -822,34 +962,11 @@ pub(super) fn draw_plug_icon(painter: &egui::Painter, r: egui::Rect, color: egui
     painter.line_segment([u(8.0, 11.0), u(8.0, 14.5)], stroke);
 }
 
-/// 自绘调色板图标（「主题」分类导航项）。
-///
-/// 三个色圆点 + 一道斜笔：既读出「调色板」的形状，又暗示「多个颜色
-/// 可选」。用**当前主题的明暗关系**取色（而不是固定红黄蓝）——导航
-/// 图标跟着主题走，切到 OLED / 纸质时不会出现一个刺眼的原色块。
-///
-/// CAUTION: 三个点必须用不透明色：透明点在磨砂卡片上会透出底图，
-/// 小尺寸下糊成一团。
-pub(super) fn draw_palette_icon(painter: &egui::Painter, r: egui::Rect, color: egui::Color32) {
-    let u = |x: f32, y: f32| -> egui::Pos2 { pos2(r.min.x + x, r.min.y + y) };
-    let rad = 2.6_f32;
-    // 三点错位排布（上二下一），避免一条直线的呆板感。
-    painter.circle_filled(u(4.6, 5.0), rad, color);
-    painter.circle_filled(u(11.4, 4.2), rad, color);
-    painter.circle_filled(u(8.0, 10.6), rad, color);
-    // 一道斜笔（画家的笔触感），从左上划到右下。
-    painter.line_segment(
-        [u(3.0, 13.2), u(13.0, 13.2)],
-        egui::Stroke::new(1.4, color),
-    );
-}
-
 pub(super) fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
     let pal = f.pal;
     let painter = f.ui.painter_at(nav_rect);
-    painter.rect_filled(nav_rect, pal.radius_lg, pal.surface);
 
-    let pad = 6.0;
+    let pad = 4.0;
     let gap = 2.0;
     // 项高随字号缩放，否则大字号下导航文字会顶到相邻项。
     let item_h = pal.control_height * 1.43;
@@ -888,7 +1005,7 @@ pub(super) fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
         pos2(nav_rect.min.x + pad, pill_y),
         pos2(nav_rect.max.x - pad, pill_y + item_h),
     );
-    painter.rect_filled(pill, pal.radius_md, pal.row_selected);
+    painter.rect_filled(pill, item_h * 0.5, pal.row_selected);
 
     for (i, cat) in SettingsCat::ALL.iter().enumerate() {
         let r = item_rect(i);
@@ -909,7 +1026,7 @@ pub(super) fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
                 crate::anim::Ease::OutCubic,
             );
             if hov_t > 0.004 {
-                painter.rect_filled(r, pal.radius_md, fade_color(pal.row_hover, hov_t));
+                painter.rect_filled(r, item_h * 0.5, fade_color(pal.row_hover, hov_t));
             }
         }
         // 图标（左）+ 标题（紧挨图标，不留大空隙）。
@@ -933,13 +1050,15 @@ pub(super) fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
             if selected { pal.text_bright } else { pal.text_dim },
             std::time::Duration::from_millis(130),
         );
-        // 「通信」用自绘插头、「主题」用自绘调色板（图标字体的 PUA
-        // 码位已占满，新增字形要重新生成 TTF，成本高）：头 + 两个脚
-        // + 线。其余分类用字体图标。
+        // 「通信」用自绘插头（图标字体的 PUA 码位已占满，新增字形要
+        // 重新生成 TTF，成本高）：头 + 两个脚 + 线。其余分类用字体图标。
+        //
+        // 2026-10-25：原「主题」分类的自绘调色板分支随 Theme 并入
+        // Appearance 一并移除——外观分类直接用字体图标
+        // （`Icon::Image`），调色板自绘函数保留（关于页等处仍可能
+        // 复用；确认无引用后再删）。
         if *cat == SettingsCat::Comm {
             draw_plug_icon(&painter, icon_r, icon_color, pal.stroke_normal);
-        } else if *cat == SettingsCat::Theme {
-            draw_palette_icon(&painter, icon_r, icon_color);
         } else {
             cat.icon().paint(&painter, icon_r, icon_color);
         }
@@ -973,4 +1092,39 @@ pub(super) fn draw_settings_nav(f: &mut Frame<'_>, nav_rect: Rect) {
             f.state.settings_show_recent = false;
         }
     }
+}
+
+/// 侧栏底脚：发丝线 + 应用名（accent 圆点 + 名称）。
+///
+/// 给悬浮侧栏卡一个视觉锚点——否则卡片下方一大片空白读作「没画完」
+/// （HTML 原型 A 方案的同款处理）。名称是产品自称词（同 `OLED` /
+/// `日本語` 的待遇）：**不进 i18n 表**，任何语言下都显示自身。
+///
+/// `card` 是侧栏卡的**外矩形**；本函数在其底部内边距之内绘制。
+pub(super) fn draw_settings_nav_footer(f: &mut Frame<'_>, card: Rect) {
+    let pal = f.pal;
+    let painter = f.ui.painter_at(card);
+    let line_y = card.max.y - SETTINGS_NAV_FOOTER_H;
+    painter.line_segment(
+        [
+            pos2(card.min.x + NAV_PAD, line_y),
+            pos2(card.max.x - NAV_PAD, line_y),
+        ],
+        egui::Stroke::new(1.0, pal.border_subtle),
+    );
+    // 圆点 + 名称垂直中心 = 发丝线到卡片内底边的中点。
+    let cy = line_y + (SETTINGS_NAV_FOOTER_H - NAV_PAD) * 0.5;
+    let dot_r = 3.0;
+    painter.circle_filled(
+        pos2(card.min.x + NAV_PAD + dot_r, cy),
+        dot_r,
+        pal.accent,
+    );
+    painter.text(
+        pos2(card.min.x + NAV_PAD + dot_r * 2.0 + 6.0, cy),
+        egui::Align2::LEFT_CENTER,
+        "ModularClipboard",
+        egui::FontId::proportional(pal.font_xs),
+        pal.text_dim,
+    );
 }

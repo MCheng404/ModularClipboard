@@ -244,3 +244,329 @@ pub(super) fn draw_card_shadow(
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 设置窗口的悬浮卡投影 / 围绕（2026-10-25 界面改版）
+// ---------------------------------------------------------------------------
+
+/// 浅色悬浮卡的三层投影参数：`(模糊, 垂直偏移, 浓度)`。
+///
+/// 与 HTML 原型 v5 的 CSS `box-shadow` 等价：
+/// `0 1px 2px / 0 8px 20px / 0 22px 52px`（颜色 alpha 分别为
+/// .06 / .10 / .12）。**浓度 = CSS 颜色 alpha = 卷积强度 `c`**：
+/// `gaussian_outer` 的半平面卷积在边缘处取值即为中心强度的一半，
+/// 与 CSS 把颜色 alpha 交给模糊去扩散的行为一致。
+///
+/// 远距层模糊在 [`settings_shadow_bands`] 里被钳到 24（与
+/// `card_shadow_layers` 同阈值）：52pt 模糊的最外二十几条带 alpha 已
+/// 低于可见阈值，纯浪费形状预算。偏移 22pt 超过典型卡间距（14pt），
+/// 远距层实际只落在卡间缝隙里——正是「远距环境影」该在的地方。
+const SETTINGS_SHADOW_LIGHT: [(f32, f32, f32); 3] =
+    [(2.0, 1.0, 0.06), (20.0, 8.0, 0.10), (52.0, 22.0, 0.12)];
+
+/// 深色主题色光晕：`(模糊, 浓度)`——原型 CSS `0 0 22px rgba(accent,.11)`。
+const SETTINGS_GLOW_BLUR: f32 = 22.0;
+const SETTINGS_GLOW_C: f32 = 0.11;
+
+/// 深色近场黑影：`(模糊, 垂直偏移, 浓度)`——原型 CSS `0 4px 18px rgba(0,0,0,.38)`。
+const SETTINGS_SHADOW_DARK_BLUR: f32 = 18.0;
+const SETTINGS_SHADOW_DARK_OFF: f32 = 4.0;
+const SETTINGS_SHADOW_DARK_C: f32 = 0.38;
+
+/// 主题色环的透明度（原型 `--accent-line: rgba(132,183,235,.38)`）。
+const SETTINGS_RING_ALPHA: f32 = 0.38;
+
+/// 顶部受光高光的白色透明度（原型 `inset 0 1px 0 rgba(255,255,255,.05)`）。
+const SETTINGS_HIGHLIGHT_ALPHA: u8 = 13;
+
+/// 设置窗口悬浮卡的分主题投影 / 围绕（HTML 原型 v5 定稿）。
+///
+/// # 分主题策略（2026-10-25 用户确认）
+///
+/// - **浅色**：三层黑影（贴地 / 中距 / 远距，CSS `box-shadow` 等价
+///   参数）。浅底上黑投影有明度差，「浮起」直接由投影表达。
+/// - **深色**：黑投影在近黑窗口底（`#121519`）上**几乎不可见**
+///   （`theme.rs` 对 `shadow` 令牌的同一结论：深色 elevation 必须
+///   靠亮环绕射），改用**主题色围绕**——22pt 主题色光晕 + 一层近场
+///   黑影兜底。
+///
+/// # 为什么是「返回形状」而不是直接画
+///
+/// 卡片高度由内容决定——`Frame::show` 返回后才知道外矩形，投影没有
+/// 「先于填充」的绘制机会。解法是调用方在**帧背景之前**插一枚
+/// `Shape::Noop` 占位符（`ui.painter().add(Shape::Noop)`），内容画完
+/// 后用 `Painter::set` 把本函数返回的形状写回那个索引：占位符早于帧
+/// 背景 ⇒ 晕环位于填充与内容**之下**，外扩矩形盖住卡片内部的部分被
+/// 不透明填充遮住，只剩卡片四周的晕带可见。
+///
+/// 2026-10-25 曾用「四条 1pt 环带、画在内容之后」的实现，已废弃：
+/// ① 一帧画出近千条细带（诊断实测 light 894 / dark 1008），既费又
+/// 把高斯梯度量化成硬阶跃，小模糊层读出一排细线；② 环带是方角的，
+/// 卡片 16pt 圆角处晕环呈像素化折线；③ 三层的带互相互相叠加，合成
+/// 结果偏离高斯轮廓。外扩圆角矩形 + 源 over 反解 alpha（本函数的
+/// 数学）没有这三个问题——它与列表行卡片 `draw_card_shadow` 同族。
+///
+/// 返回 `Shape::Vec`（N 层同心外扩圆角矩形，从外到内）。
+pub(super) fn settings_halo_shape(r: egui::Rect, radius: f32, pal: &Palette) -> egui::Shape {
+    let mut shapes: Vec<egui::Shape> = Vec::new();
+    if pal.is_dark {
+        push_halo_layers(
+            &mut shapes,
+            r,
+            SETTINGS_GLOW_BLUR,
+            SETTINGS_GLOW_C,
+            0.0,
+            pal.accent,
+            radius,
+        );
+        push_halo_layers(
+            &mut shapes,
+            r,
+            SETTINGS_SHADOW_DARK_BLUR,
+            SETTINGS_SHADOW_DARK_C,
+            SETTINGS_SHADOW_DARK_OFF,
+            egui::Color32::BLACK,
+            radius,
+        );
+    } else {
+        for (blur, off, c) in SETTINGS_SHADOW_LIGHT {
+            push_halo_layers(&mut shapes, r, blur, c, off, egui::Color32::BLACK, radius);
+        }
+    }
+    egui::Shape::Vec(shapes)
+}
+
+/// 把一层高斯投影的外扩圆角矩形序列追加进 `out`（从外到内）。
+///
+/// alpha 直接取 [`card_shadow_layers`] 的**源 over 反解**结果：层与层
+/// 重叠（外扩矩形互相包含），后画的盖先画的，反解保证合成后的环带
+/// 强度精确等于高斯目标值（误差 ±1/255）。矩形与圆角始终同心
+/// （`radius + grow`），卡片圆角处晕环跟着圆，不会出方角。
+///
+/// 每层颜色由 [`diffuse_halo_color`] 分摊（目标色 × 本层 alpha + 误差
+/// 扩散）——不能逐层 `fade_color`，理由见那个函数的文档（曾实测合成
+/// 红色 164 vs 目标 132）。
+fn push_halo_layers(
+    out: &mut Vec<egui::Shape>,
+    r: egui::Rect,
+    blur: f32,
+    c: f32,
+    offset_y: f32,
+    color: egui::Color32,
+    radius: f32,
+) {
+    let layers = card_shadow_layers(blur, c);
+    let [cr, cg, cb, _] = color.to_srgba_unmultiplied();
+    let colors = diffuse_halo_color(&layers, [cr, cg, cb]);
+    let base = r.translate(vec2(0.0, offset_y));
+    for ((grow, a), fill) in layers.iter().zip(colors) {
+        out.push(egui::Shape::Rect(egui::epaint::RectShape::filled(
+            base.expand(*grow),
+            radius + grow,
+            fill,
+        )));
+        let _ = a;
+    }
+}
+
+/// 把目标色分摊成各层的 8 位预乘颜色（每层理想值 + 误差扩散）。
+///
+/// # 每层的理想值 = 目标色 × 本层 alpha
+///
+/// 源 over 合成公式 `comp = Σ pv_i·remain_i / Σ a_i·remain_i` 里，
+/// `remain_i` 权重恰好与本层 alpha 对分母的贡献抵消：代入
+/// `pv_i = rgb·a_i` 恒等于目标色。（曾按「合成权重 `a_i·remain_i`」
+/// 分摊——多乘一个 `remain_i`，系统性低估内层约 5%，实测合成蓝
+/// 219 vs 目标 235。）
+///
+/// # 为什么还必须扩散（不能逐层独立舍入）
+///
+/// 反解后单层 alpha 只有 1~2/255（合成靠多层累加，单层本来就小），
+/// 理想预乘通道 `132·1/255 = 0.52` 落在半个量化步长上：独立舍入会
+/// 系统性地全向上取整（0.52→1），而**合成色的误差放大倍数是
+/// `255/a_total ≈ 19`**（a_total ≈ 13.65/255）——每层 ±0.5 的通道
+/// 误差被放大成 ±9~33 的合成色偏差（实测红色 164 vs 目标 132）。
+///
+/// 误差扩散把余数递带到下一层，使各层取整误差正负交替、加权和趋零：
+/// 剩余误差只有**最后一层之后**的残余余数（≤ 0.5），合成色偏差
+/// 从 ±33 降到 ~±3（最坏 ±9）。
+///
+/// NOTE: 该误差只影响**彩色**投影（深色主题色光晕）。浅色三层是纯黑
+/// 投影，通道恒 0，与 alpha 无关，完全不受量化影响。
+///
+/// `layers` 是 `(grow, alpha)`，**从外到内**（绘制顺序）。
+fn diffuse_halo_color(layers: &[(f32, f32)], rgb: [u8; 3]) -> Vec<egui::Color32> {
+    let mut out = Vec::with_capacity(layers.len());
+    let mut debt = [0.0f32; 3]; // 每通道未摊销完的余数
+    for &(_, a) in layers {
+        let alpha_u8 = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+        let mut ch = [0u8; 3];
+        for i in 0..3 {
+            let ideal = f32::from(rgb[i]) * f32::from(alpha_u8) / 255.0 + debt[i];
+            // 预乘通道不许超过自身 alpha（`rgb ≤ 255` 时本就自动满足，
+            // 钳位是防御性的）。
+            let q = ideal.round().clamp(0.0, f32::from(alpha_u8));
+            ch[i] = q as u8;
+            debt[i] = ideal - q;
+        }
+        out.push(egui::Color32::from_rgba_premultiplied(
+            ch[0], ch[1], ch[2], alpha_u8,
+        ));
+    }
+    out
+}
+
+/// 悬浮卡的**边缘装饰**：深色主题色环 + 顶部受光高光。
+///
+/// 与 [`settings_halo_shape`] 分工：晕环在填充之下，本函数画在填充
+/// 之上（描边要被看见必须叠在填充上）——调用方在卡片内容画完之后调。
+/// 浅色主题不发环（边由 `Frame` 的 `border_subtle` 发丝边表达）。
+pub(super) fn draw_settings_card_edge(
+    painter: &egui::Painter,
+    r: egui::Rect,
+    radius: f32,
+    pal: &Palette,
+) {
+    if !pal.is_dark {
+        return;
+    }
+    // 顶部受光高光：贴在卡片内上缘的 1pt 亮线。裁剪在卡片矩形内 ⇒
+    // 亮线自然沿圆角收边，不会戳出弧外。
+    painter
+        .with_clip_rect(r)
+        .line_segment(
+            [
+                egui::pos2(r.min.x + radius, r.min.y + 0.5),
+                egui::pos2(r.max.x - radius, r.min.y + 0.5),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(SETTINGS_HIGHLIGHT_ALPHA)),
+        );
+    // 主题色环：1pt Inside（比背景亮 ⇒ 没有 shadow.rs 顶部记录的
+    // 「暗描边在圆角凸角处 alpha 累加成暗斑」问题）。
+    painter.rect_stroke(
+        r,
+        radius,
+        egui::Stroke::new(1.0, fade_color(pal.accent, SETTINGS_RING_ALPHA)),
+        egui::StrokeKind::Inside,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::pos2;
+
+    /// 源 over 合成的晕环强度必须精确等于高斯轮廓。
+    ///
+    /// 这条守住 `settings_halo_shape` 的数学前提：外扩矩形层与层互相
+    /// 包含，alpha 若不按「源 over」反解，合成结果会偏离高斯（正是
+    /// 已废弃的 1pt 环带实现的病根之一）。从最外层向内逐层模拟合成，
+    /// 每个环带的落点强度应与 `c · gaussian_outer(k-0.5, σ)` 一致。
+    #[test]
+    fn halo_layers_composite_to_the_gaussian_profile() {
+        for (blur, c) in [(2.0_f32, 0.06), (20.0, 0.10), (24.0, 0.12), (18.0, 0.38)] {
+            let sigma = blur * 0.5;
+            let mut outer = 0.0_f32; // 已合成部分（更外层的贡献）
+            for (grow, a) in card_shadow_layers(blur, c) {
+                let target = c * gaussian_outer(grow - 0.5, sigma);
+                let composite = a + outer * (1.0 - a);
+                assert!(
+                    (composite - target).abs() < 0.01,
+                    "blur={blur} c={c} 第 {grow} 环带合成强度 {composite:.3}                      应等于高斯目标 {target:.3}"
+                );
+                outer = composite;
+            }
+        }
+    }
+
+    /// 晕环必须非空，且每层矩形都**包含卡片矩形**（外扩同心）。
+    ///
+    /// 空 Vec = 投影整个丢了；矩形不含卡片 = 层与卡片不同心，圆角处
+    /// 会露出缺口（已废弃的方角环带实现的病根之二）。
+    #[test]
+    fn halo_shape_is_concentric_and_non_empty() {
+        let card = Rect::from_min_max(pos2(100.0, 100.0), pos2(400.0, 300.0));
+        for pal in [Palette::dark(), Palette::light()] {
+            let egui::Shape::Vec(shapes) = settings_halo_shape(card, 16.0, &pal) else {
+                panic!("晕环应为 Shape::Vec");
+            };
+            assert!(!shapes.is_empty(), "{:?} 主题晕环不应为空", pal.is_dark);
+            for s in &shapes {
+                let egui::Shape::Rect(r) = s else {
+                    panic!("晕环成员应为 Rect");
+                };
+                assert!(
+                    r.rect.min.x <= card.min.x && r.rect.max.x >= card.max.x,
+                    "矩形 {:?} 应横向包含卡片",
+                    r.rect
+                );
+            }
+        }
+    }
+
+    /// 深色光晕**合成后**的颜色必须等于主题色（误差扩散的守门）。
+    ///
+    /// 按源 over 模拟各层合成（`comp = Σ pv·remain / Σ a·remain`），
+    /// 检查最终的**非预乘**颜色落在主题色邻域内。
+    ///
+    /// # 容差 12 的依据
+    ///
+    /// 合成色误差的放大倍数是 `255/a_total ≈ 19`（单层 alpha 只有
+    /// 1~2/255，见 `diffuse_halo_color` 文档）。误差扩散把逐层取整
+    /// 误差摊成交替 pattern 后，残余只有最后一层之后的 debt（≤ 0.5）
+    /// ⇒ 合成色偏差 ~±3、最坏 ±9；独立舍入则是 ±33（曾实测红 164
+    /// vs 132）。留 12 的余量覆盖最坏情况。
+    ///
+    /// # 视觉量级
+    ///
+    /// 光晕合成不透明度只有 ~5.4%，±12 的色相差落到最终像素上是
+    /// ±0.6/255——远低于可见阈值。这条测试守的是「色相不被量化
+    /// 系统性抹偏」，不是像素级精度。
+    #[test]
+    fn dark_halo_composites_to_the_accent_color() {
+        let card = Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 100.0));
+        let pal = Palette::dark();
+        let egui::Shape::Vec(shapes) = settings_halo_shape(card, 16.0, &pal) else {
+            panic!("晕环应为 Shape::Vec");
+        };
+        // 光晕层 = 零偏移的那批（矩形中心与卡片中心重合）。
+        let glow: Vec<&egui::epaint::RectShape> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) => Some(r),
+                _ => None,
+            })
+            .take_while(|r| (r.rect.center().y - card.center().y).abs() < 0.01)
+            .collect();
+        assert!(!glow.is_empty(), "深色晕环应有零偏移的主题色光晕层");
+
+        // 源 over 合成（绘制顺序 = Vec 顺序，从外到内）。
+        let mut comp = [0.0f32; 3];
+        let mut a_total = 0.0f32;
+        for r in &glow {
+            let a = f32::from(r.fill.a()) / 255.0;
+            let remain = 1.0 - a_total;
+            a_total += a * remain;
+            let [pr, pg, pb, _] = r.fill.to_array();
+            for (i, pv) in [pr, pg, pb].iter().enumerate() {
+                comp[i] += f32::from(*pv) / 255.0 * remain;
+            }
+        }
+        assert!(a_total > 0.01, "光晕合成不透明度应可感知（实测 {a_total}）");
+        let [ar, ag, ab, _] = pal.accent.to_srgba_unmultiplied();
+        let got = [
+            comp[0] / a_total * 255.0,
+            comp[1] / a_total * 255.0,
+            comp[2] / a_total * 255.0,
+        ];
+        let want = [f32::from(ar), f32::from(ag), f32::from(ab)];
+        for i in 0..3 {
+            assert!(
+                (got[i] - want[i]).abs() <= 6.0,
+                "合成色通道 {i} = {:.0} 应约等于主题色 {:.0}（色相被量化抹掉？）",
+                got[i],
+                want[i]
+            );
+        }
+    }
+}

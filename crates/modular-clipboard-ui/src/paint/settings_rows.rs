@@ -98,6 +98,8 @@ use super::settings_items::get_number;
 use super::settings_items::get_opt_number;
 use super::settings_items::get_text;
 use super::settings_items::shadow_param_row;
+use super::controls::draw_mini_button;
+use super::controls::draw_number_field;
 use super::controls::draw_segmented;
 use super::controls::draw_slider;
 use super::controls::draw_step_slider;
@@ -127,13 +129,19 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // 建好之后 `val` 处在可变借用里，再读它就 E0503。
                 // 后缀随下一帧的数值重算，切换即时。
                 let suffix = tp(val as i64, spec.unit_one, spec.unit);
-                ui.add(
-                    egui::DragValue::new(&mut val)
-                        .range(spec.min..=spec.max)
-                        .speed(spec.step)
-                        .suffix(suffix),
-                )
-                .changed()
+                // 全圆角改版（2026-10-25）：数字输入也做成胶囊——先铺
+                // 底，再把 DragValue 放进内区。DragValue 没有
+                // `desired_width`（egui 0.37 未提供），宽度由本函数固定，
+                // 内 child 的 max_rect 兜住溢出。
+                draw_number_field(f, ui, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut val)
+                            .range(spec.min..=spec.max)
+                            .speed(spec.step)
+                            .suffix(suffix),
+                    )
+                    .changed()
+                })
             });
             if changed {
                 f.state.push(Op::SetNumber {
@@ -150,13 +158,15 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             let changed = setting_row(ui, it.label, it.desc, |ui| {
                 // 同上：后缀必须在建 `DragValue` 之前算好。
                 let suffix = tp(val as i64, spec.unit_one, spec.unit);
-                ui.add(
-                    egui::DragValue::new(&mut val)
-                        .range(spec.default..=1_000_000.0)
-                        .speed(spec.step)
-                        .suffix(suffix),
-                )
-                .changed()
+                draw_number_field(f, ui, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut val)
+                            .range(spec.default..=1_000_000.0)
+                            .speed(spec.step)
+                            .suffix(suffix),
+                    )
+                    .changed()
+                })
             });
             if changed {
                 let next = if val <= spec.default { None } else { Some(val) };
@@ -768,10 +778,30 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             let cur = slot.current(&f.svc.state.config);
             let mut changed = false;
             let _ = setting_row(ui, it.label, it.desc, |ui| {
-                let resp = ui.add(
+                // 胶囊输入框（2026-10-25 全圆角改版）：与
+                // `draw_text_field` 同一画法——先铺胶囊底，TextEdit 放进
+                // 内区（宽度基准 112 @ font_sm 15，等宽字体）。
+                let h = pal.control_height + 2.0;
+                let w = pal.font_sm * 7.5;
+                let (r, _) = ui.allocate_exact_size(vec2(w, h), egui::Sense::empty());
+                let pill = h * 0.5;
+                let p = ui.painter_at(r);
+                p.rect_filled(r, pill, pal.surface_variant);
+                p.rect_stroke(
+                    r,
+                    pill,
+                    egui::Stroke::new(1.0, pal.border_subtle),
+                    egui::StrokeKind::Inside,
+                );
+                let text_rect = r.shrink2(vec2(10.0, 2.0));
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(text_rect)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                let resp = child.add(
                     egui::TextEdit::singleline(slot.draft_mut(f.state))
-                        // 宽度随字号缩放（基准 112 @ font_sm 15）。
-                        .desired_width(pal.font_sm * 7.5)
+                        .desired_width(text_rect.width())
                         .hint_text(cur.display())
                         .font(egui::TextStyle::Monospace),
                 );
@@ -787,7 +817,9 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // `item_spacing.x` 归了 0（行与行才够呼吸），
                 // 同行控件零间距会挤成一团（用户实测反馈）。
                 ui.add_space(8.0);
-                if ui.small_button(t("Record")).clicked() {
+                // 「录制」按钮：egui 内置 `small_button` 换成自绘
+                // `draw_mini_button`（胶囊圆角，2026-10-25 全圆角改版）。
+                if draw_mini_button(f, ui, "hotkey_record", t("Record"), None) {
                     f.state.push(Op::StartRecording(*slot));
                 }
                 changed
@@ -937,7 +969,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     .sense(egui::Sense::click()),
                 );
                 // 登记热区（key 即 URL），供自动化与测试定位。
-                f.hit_insert(url, resp.rect);
+                f.hit_insert(*url, resp.rect);
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     let r = resp.rect;
@@ -981,7 +1013,8 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             );
             let p = ui.painter_at(r);
             if resp.hovered() {
-                p.rect_filled(r, pal.radius_md, pal.surface_variant);
+                // 全圆角改版（2026-10-25）：radius_md → 胶囊（半高）。
+                p.rect_filled(r, r.height() * 0.5, pal.surface_variant);
             }
             p.text(
                 pos2(r.min.x + 4.0, r.center().y),
@@ -1029,7 +1062,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                         )
                         .sense(egui::Sense::click()),
                     );
-                    f.hit_insert(url, resp.rect);
+                    f.hit_insert(*url, resp.rect);
                     if resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         let r = resp.rect;
@@ -1085,7 +1118,9 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     egui::Button::new(
                         egui::RichText::new(t("Check")).color(pal.text),
                     )
-                    .fill(pal.surface_variant),
+                    .fill(pal.surface_variant)
+                    // 全圆角改版（2026-10-25）：胶囊（按钮高 28 的一半）。
+                    .corner_radius(14.0),
                 );
                 f.hit_insert("settings_check_update", resp.rect);
                 if resp.clicked() {

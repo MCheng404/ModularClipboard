@@ -87,7 +87,7 @@ mod row;
 pub(crate) use float::FloatLayout;
 pub(crate) use notice::{NOTICE_TTL, draw_notice_panel};
 pub(crate) use settings_items::mcp_pair_prompt;
-pub(crate) use settings_win::{SETTINGS_MARGIN, SETTINGS_NAV_W, draw_settings};
+pub(crate) use settings_win::{SETTINGS_COL_GAP, SETTINGS_MARGIN, SETTINGS_NAV_W, draw_settings};
 pub(crate) use topbar::{draw_popup_shadow, draw_search_panel, draw_type_rail};
 
 // root 自己用到的子模块项（draw / draw_child）。
@@ -481,14 +481,13 @@ pub enum SettingsCat {
     /// 常规：窗口行为。
     #[default]
     General,
-    /// 主题：一级深浅 / 主题色 / 二级主题 / 高级微调。
+    /// 外观：主题（明暗 / 主题色 / 风格层 / 令牌覆盖）+ 文字 + 背景 +
+    /// 行卡片 + 悬浮面板。
     ///
-    /// 2026-10-18 从「外观」拆出：主题层（一级 → 二级 → 强调色 →
-    /// 令牌覆盖）自成一张关注点卡，且令牌编辑器有近 60 行——混在
-    /// 外观卡里会把背景效果 / 卡片阴影挤出一屏（热区登记跳过不可见
-    /// 控件，回归测试全线飘红）。
-    Theme,
-    /// 外观：背景效果 / 卡片阴影等窗口与列表观感。
+    /// 2026-10-25「主题」分类并入：明暗、主题色、风格层本就是外观的
+    /// 关注点，单独占一个导航位只会把「外观」拆成两半。原 Theme 分类
+    /// 的设置项全部迁入 `SettingsCat::Appearance` 的卡片（主题 / 文字 /
+    /// 窗口背景 / 液态玻璃 / 行卡片 / 悬浮面板六张）。
     Appearance,
     /// 捕获：剪贴板记录行为。
     Capture,
@@ -504,9 +503,10 @@ pub enum SettingsCat {
 
 impl SettingsCat {
     /// 全部分类（导航顺序）。
-    pub const ALL: [SettingsCat; 8] = [
+    ///
+    /// 2026-10-25：Theme 并入 Appearance，8 → 7。
+    pub const ALL: [SettingsCat; 7] = [
         SettingsCat::General,
-        SettingsCat::Theme,
         SettingsCat::Appearance,
         SettingsCat::Capture,
         SettingsCat::Storage,
@@ -519,7 +519,6 @@ impl SettingsCat {
     pub fn title(self) -> Msg {
         match self {
             SettingsCat::General => msg("General"),
-            SettingsCat::Theme => msg("Theme"),
             SettingsCat::Appearance => msg("Appearance"),
             SettingsCat::Capture => msg("Capture"),
             SettingsCat::Storage => msg("Storage"),
@@ -533,9 +532,6 @@ impl SettingsCat {
     pub fn icon(self) -> crate::icons::Icon {
         match self {
             SettingsCat::General => crate::icons::Icon::Settings,
-            // 主题分类用自绘调色板（图标字体的 PUA 码位已占满，新增
-            // 字形要重新生成 TTF——见 draw_settings_nav 的特判）。
-            SettingsCat::Theme => crate::icons::Icon::Settings,
             SettingsCat::Appearance => crate::icons::Icon::Image,
             SettingsCat::Capture => crate::icons::Icon::Text,
             SettingsCat::Storage => crate::icons::Icon::Table,
@@ -549,7 +545,6 @@ impl SettingsCat {
     pub fn hot_key(self) -> &'static str {
         match self {
             SettingsCat::General => "settings_cat_general",
-            SettingsCat::Theme => "settings_cat_theme",
             SettingsCat::Appearance => "settings_cat_appearance",
             SettingsCat::Capture => "settings_cat_capture",
             SettingsCat::Storage => "settings_cat_storage",
@@ -563,7 +558,6 @@ impl SettingsCat {
     pub fn reset_key(self) -> &'static str {
         match self {
             SettingsCat::General => "settings_reset_general",
-            SettingsCat::Theme => "settings_reset_theme",
             SettingsCat::Appearance => "settings_reset_appearance",
             SettingsCat::Capture => "settings_reset_capture",
             SettingsCat::Storage => "settings_reset_storage",
@@ -1129,11 +1123,18 @@ pub enum HitNs {
     Popup(crate::popup::PopupKind),
 }
 
-/// 按窗口分隔的热区表（见 [`UiState::hit`]）。
+/// 按窗口分隔的热区表（见 [`UiState::hit]`）。
 #[derive(Default)]
 pub struct HitTable(std::collections::HashMap<HitNs, HitMap>);
 
-type HitMap = std::collections::HashMap<&'static str, Rect>;
+/// 热区键 → 矩形。
+///
+/// 2026-10-25 从 `&'static str` 改 `String`：分段控件的选项热区原来用
+/// **选项译文**当键（`draw_segmented` 的约定），而设置重组后同一分类里
+/// 出现了两处 `"无"`（风格主题 / 背景效果）——同名键后注册的覆盖先注册
+/// 的，自动化再也点不到前者。现在分段控件除译文集外还登记一枚
+/// `"{控件名}/{选项英文键}"` 的命名空间键，需要 String 才能拼。
+type HitMap = std::collections::HashMap<String, Rect>;
 
 impl HitTable {
     /// 清空某个窗口的热区。每个绘制入口开工前调一次。
@@ -1142,8 +1143,8 @@ impl HitTable {
     }
 
     /// 登记一个热区。
-    pub fn insert(&mut self, ns: HitNs, key: &'static str, r: Rect) {
-        self.0.entry(ns).or_default().insert(key, r);
+    pub fn insert(&mut self, ns: HitNs, key: impl Into<String>, r: Rect) {
+        self.0.entry(ns).or_default().insert(key.into(), r);
     }
 
     /// 查某个窗口的热区。
@@ -1157,10 +1158,10 @@ impl HitTable {
     }
 
     /// 某个窗口登记的所有 key（顺序不定，断言前请排序）。
-    pub fn keys(&self, ns: HitNs) -> Vec<&'static str> {
+    pub fn keys(&self, ns: HitNs) -> Vec<String> {
         self.0
             .get(&ns)
-            .map(|m| m.keys().copied().collect())
+            .map(|m| m.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -1275,7 +1276,7 @@ impl UiState {
     // 显式带 ns 的版本留给 `Frame` 之外的使用方（测试）。
 
     /// 把热区写进**指定窗口**的命名空间。
-    pub fn hit_insert_to(&mut self, ns: HitNs, key: &'static str, r: Rect) {
+    pub fn hit_insert_to(&mut self, ns: HitNs, key: impl Into<String>, r: Rect) {
         self.hit.insert(ns, key, r);
     }
 
@@ -1330,7 +1331,10 @@ impl<'a> Frame<'a> {
     /// 它的坐标落在窗口之外，自动化（MCP 的 `click_element`）拿着它去点，
     /// 点的是空气、甚至点到别的窗口上。部分可见的仍登记——用户能点到
     /// 露出来的那一部分。
-    pub fn hit_insert(&mut self, key: &'static str, r: Rect) {
+    ///
+    /// `key` 收 `impl Into<String>`（2026-10-25）：分段控件的命名空间键
+    /// （`"{控件名}/{选项英文键}"`）是运行时拼的，见 [`HitMap`] 的说明。
+    pub fn hit_insert(&mut self, key: impl Into<String>, r: Rect) {
         let sane = r.min.x.is_finite()
             && r.min.y.is_finite()
             && r.max.x.is_finite()
@@ -4226,14 +4230,14 @@ fn with_pinned(mut self, n: usize) -> Self {
         // NOTE: 早前所有开关共用一个键（`"settings_switch"`），`hit` 是
         // `HashMap` 会互相覆盖，map 里只剩最后一个，于是这条断言
         // 永远只能看到一项。现在键是配置字段名，可以逐项核对。
-        let keys: Vec<&str> = h
+        let keys: Vec<String> = h
             .state
             .hit
             .keys(HitNs::Settings)
             .into_iter()
             .filter(|k| {
                 matches!(
-                    *k,
+                    k.as_str(),
                     "always_on_top"
                         | "hide_on_focus_lost"
                         | "show_tray"
@@ -5776,7 +5780,9 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 现在配置项走的是 `FontScale` 分段控件，点击必须产出带倍率的 Op。
     #[test]
     fn font_scale_segment_emits_scaled_number_op() {
-        let mut h = Harness::new("font-scale-seg", vec2(780.0, 560.0));
+        // 2026-10-25：字体缩放移到「文字」卡（外观第 2 张），560pt 视口
+        // 只装得下「主题」卡——热区只登记可见控件，拔高夹具。
+        let mut h = Harness::new("font-scale-seg", vec2(780.0, 900.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
         h.settings_frame();
@@ -5802,7 +5808,8 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 字体缩放偏离默认值时，外观卡片的「重置」必须把它恢复成 1.0×。
     #[test]
     fn font_scale_reset_restores_default() {
-        let mut h = Harness::new("font-scale-reset", vec2(780.0, 560.0));
+        // 同上：「文字」卡在外观第 2 张，需要高视口才能看到重置按钮。
+        let mut h = Harness::new("font-scale-reset", vec2(780.0, 900.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
         h.svc.state.config.ui.font_scale = 1.5;
@@ -5825,7 +5832,9 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// `settings_item_row` 的推送，界面点了毫无反应还静默通过。
     #[test]
     fn card_shadow_switch_emits_set_card_shadow() {
-        let mut h = Harness::new("card-shadow-sw", vec2(780.0, 560.0));
+        // 2026-10-25：卡片阴影移到「行卡片」卡（外观第 5 张，前面还有
+        // 主题/文字/窗口背景三张 + 隐藏的液态玻璃），1600pt 视口才装得下。
+        let mut h = Harness::new("card-shadow-sw", vec2(780.0, 1600.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
         h.settings_frame();
@@ -5851,7 +5860,8 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 卡片阴影偏离默认（关掉）时，外观卡片「重置」把它恢复默认（开启）。
     #[test]
     fn card_shadow_reset_restores_default() {
-        let mut h = Harness::new("card-shadow-reset", vec2(780.0, 560.0));
+        // 同上：「行卡片」卡需要高视口（见 card_shadow_switch 的注释）。
+        let mut h = Harness::new("card-shadow-reset", vec2(780.0, 1600.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
         h.svc.state.config.ui.card_shadow = modular_clipboard_core::config::CardShadowConfig {
@@ -5877,13 +5887,11 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 不该把「找不到热区」当成失败。
     #[test]
     fn card_shadow_sliders_have_hit_regions_when_enabled() {
-        let mut h = Harness::new("card-shadow-sl", vec2(780.0, 560.0));
+        // 2026-10-25：组折叠随设置重组消失（液态玻璃改成条件卡），
+        // 改用高视口让「行卡片」卡（外观第 5 张）整卡进首屏。
+        let mut h = Harness::new("card-shadow-sl", vec2(780.0, 1600.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
-        // 折叠「窗口与背景」组：外观卡加了卡片标题 + 四个组标题后，
-        // 560pt 的夹具视口装不下 card_shadow 的三个子滑条。收起来让
-        // 目标进首屏（这些测试只跑一帧，靠首屏可见）。
-        h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         for key in ["card_shadow_blur", "card_shadow_opacity", "card_shadow_offset_y"] {
             let r = h.state.hit.get(HitNs::Settings, key);
@@ -5894,7 +5902,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
-    /// 默认折叠的分组必须**点得开**。
+    /// 组标题行点一次收起、再点一次展开（快照语义）。
     ///
     /// 2026-10-24 用户反馈「液态玻璃无法展开」。根因是折叠状态用
     /// 「集合成员 异或 默认折叠表」判断，而点击分支只写了默认展开那
@@ -5902,64 +5910,64 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 下一帧异或回来还是折叠 ⇒ 永远展不开。
     ///
     /// 现在改成快照语义（seed 后有点 = 折叠、点击即切换），这条测试
-    /// 守住「默认折叠组点一次能展开、再点一次能收起」。
+    /// 守住「点一次收起、再点一次展开、收起时组内项没有热区」。
+    ///
+    /// 2026-10-25：液态玻璃组随设置重组消失（改成条件卡，见
+    /// `SettingsCard::cond`），测试对象换成「关于」卡的「软件信息」
+    /// 组——组折叠机制本身没动。
     #[test]
-    fn default_folded_group_toggles() {
-        let mut h = Harness::new("fold-glass", vec2(780.0, 900.0));
+    fn group_header_click_toggles_fold() {
+        let mut h = Harness::new("fold-toggle", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Appearance;
-        // 折叠前两组：外观卡有 17 项 + 4 个组标题，900pt 的视口装不到
-        // 第 4 组——`ScrollArea` 只 allocate 可见区内的内容，组标题行
-        // 不在可视区就没有热区（与 card_shadow 那几个测试同因）。
-        h.state
-            .settings_folded
-            .insert("appearance.window".to_string());
-        h.state
-            .settings_folded
-            .insert("appearance.cards".to_string());
+        h.state.settings_cat = SettingsCat::About;
         h.settings_frame();
 
-        // 首帧：液态玻璃组应已折叠（seed 把 DEFAULT_FOLDED 灌进来）。
+        // 首帧：默认展开 ⇒ 组内项有热区（协议行登记 "settings_license"）。
         assert!(
-            h.state.settings_folded.contains("appearance.glass"),
-            "液态玻璃组默认应折叠"
+            !h.state.settings_folded.contains("about.group.app"),
+            "默认不应折叠"
         );
-        // 折叠 ⇒ 组内项没有热区（玻璃模糊度是第一项）。
         assert!(
             h.state
                 .hit
-                .get(HitNs::Settings, "ui.glass_blur")
-                .is_none(),
-            "折叠时玻璃模糊度不该有热区"
+                .get(HitNs::Settings, "settings_license")
+                .is_some_and(|r| r.width() > 0.0),
+            "展开时组内项应有热区"
         );
 
-        // 点组标题行 ⇒ 展开。
-        let r = h.state.hit.get(HitNs::Settings, "appearance.glass");
-        let r = r.expect("液态玻璃组标题应登记热区");
+        // 点组标题行 ⇒ 收起。
+        let r = h
+            .state
+            .hit
+            .get(HitNs::Settings, "about.group.app")
+            .expect("组标题应登记热区");
         h.settings_click_at(r.center());
         assert!(
-            !h.state.settings_folded.contains("appearance.glass"),
-            "点一次应展开"
+            h.state.settings_folded.contains("about.group.app"),
+            "点一次应收起"
         );
         // CAUTION: 点击那一帧的遍历用的是**点击前**读到的 `folded`（状态
-        // 是在遍历中途改的），所以那一帧玻璃项仍未画出来。要多跑一帧
-        // 才能看到展开后的布局——这也是真实程序里的行为（下一帧生效）。
+        // 是在遍历中途改的），所以那一帧组内项仍未消失。要多跑一帧
+        // 才能看到收起后的布局——这也是真实程序里的行为（下一帧生效）。
         h.settings_frame();
         assert!(
             h.state
                 .hit
-                .get(HitNs::Settings, "ui.glass_blur")
-                .is_some_and(|r| r.width() > 0.0),
-            "展开后玻璃模糊度应有热区"
+                .get(HitNs::Settings, "settings_license")
+                .is_none(),
+            "收起时组内项不该有热区"
         );
 
-        // 再点一次 ⇒ 收起。
-        let r = h.state.hit.get(HitNs::Settings, "appearance.glass");
-        let r = r.expect("组标题行应仍在");
+        // 再点一次 ⇒ 展开。
+        let r = h
+            .state
+            .hit
+            .get(HitNs::Settings, "about.group.app")
+            .expect("组标题行应仍在");
         h.settings_click_at(r.center());
         assert!(
-            h.state.settings_folded.contains("appearance.glass"),
-            "再点一次应收起"
+            !h.state.settings_folded.contains("about.group.app"),
+            "再点一次应展开"
         );
     }
 
@@ -5976,20 +5984,19 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 「图标瞬间跳变、没有动画」。
     #[test]
     fn fold_arrow_tweens_between_states() {
+        // 2026-10-25：液态玻璃组随设置重组消失，测试对象换成「关于」
+        // 卡的「软件信息」组（补间键跟着组 key 走，机制不变）。
         let mut h = Harness::new("fold-tween", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Appearance;
-        h.state
-            .settings_folded
-            .insert("appearance.window".to_string());
-        h.state
-            .settings_folded
-            .insert("appearance.cards".to_string());
+        h.state.settings_cat = SettingsCat::About;
         h.settings_frame();
 
-        // 展开液态玻璃组 ⇒ 目标角从 -90°（<）变 0°（v）。
-        let r = h.state.hit.get(HitNs::Settings, "appearance.glass");
-        let r = r.expect("组标题应登记热区");
+        // 收起「软件信息」组 ⇒ 目标角从 0°（v）变 -90°（<）。
+        let r = h
+            .state
+            .hit
+            .get(HitNs::Settings, "about.group.app")
+            .expect("组标题应登记热区");
         h.settings_click_at(r.center());
 
         // 推进若干帧：每帧拨 1/60s（夹具时钟驱动 egui 的 `input.time`，
@@ -6000,7 +6007,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             h.settings_frame();
             let deg = crate::anim::peek_f32(
                 &h.ctx,
-                egui::Id::unique(("group_fold_rot", "appearance.glass")),
+                egui::Id::unique(("group_fold_rot", "about.group.app")),
             );
             // 补间值存在且既非起点也非终点 ⇒ 中间态（动画真的在跑）。
             if let Some(v) = deg
@@ -6009,24 +6016,25 @@ fn with_pinned(mut self, n: usize) -> Self {
             {
                 mid_seen = true;
             }
-            if !h.state.settings_folded.contains("appearance.glass") && mid_seen {
+            if h.state.settings_folded.contains("about.group.app") && mid_seen {
                 break;
             }
         }
         assert!(mid_seen, "折叠箭头应有中间态（旋转补间生效）");
         assert!(
-            !h.state.settings_folded.contains("appearance.glass"),
-            "点击后应展开"
+            h.state.settings_folded.contains("about.group.app"),
+            "点击后应收起"
         );
     }
 
     /// 右下角信息编辑器：三个 chip（图标 / 类型 / 大小）都必须登记热区。
     #[test]
     fn row_meta_chips_have_hit_regions() {
-        let mut h = Harness::new("rowmeta-hits", vec2(780.0, 560.0));
+        // 2026-10-25：卡片角标移到「文字」卡（外观第 2 张），560pt 视口
+        // 装不下；组折叠键随重组消失，拔高夹具代替。
+        let mut h = Harness::new("rowmeta-hits", vec2(780.0, 900.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
-        h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         for key in ["rowmeta_chip_icon", "rowmeta_chip_type", "rowmeta_chip_size"] {
             let r = h.state.hit.get(HitNs::Settings, key);
@@ -6041,10 +6049,10 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 顺序与其他两个显隐位保持不变。
     #[test]
     fn row_meta_chip_click_toggles_visibility() {
-        let mut h = Harness::new("rowmeta-click", vec2(780.0, 560.0));
+        // 同上：「文字」卡需要高视口（见 row_meta_chips_have_hit_regions）。
+        let mut h = Harness::new("rowmeta-click", vec2(780.0, 900.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
-                h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         let chip = settings_hit(&h, "rowmeta_chip_type");
         let ops = h.settings_click_at(chip.center());
@@ -6073,10 +6081,10 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 拖拽跨帧：按下（帧 1）→ 移动越过其他 chip（帧 2）→ 抬起（帧 3）。
     #[test]
     fn row_meta_chip_drag_reorders() {
-        let mut h = Harness::new("rowmeta-drag", vec2(780.0, 560.0));
+        // 同上：「文字」卡需要高视口（见 row_meta_chips_have_hit_regions）。
+        let mut h = Harness::new("rowmeta-drag", vec2(780.0, 900.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
-                h.state.settings_folded.insert("appearance.window".to_string());
         h.settings_frame();
         let icon = settings_hit(&h, "rowmeta_chip_icon");
         let size = settings_hit(&h, "rowmeta_chip_size");
@@ -6286,9 +6294,9 @@ fn with_pinned(mut self, n: usize) -> Self {
                 h.state.settings_cat = cat;
                 h.settings_frame();
                 let keys = h.state.hit.keys(HitNs::Settings);
-                let rects: Vec<(&'static str, Rect)> = keys
+                let rects: Vec<(String, Rect)> = keys
                     .iter()
-                    .filter_map(|k| h.state.hit.get(HitNs::Settings, k).map(|r| (*k, r)))
+                    .filter_map(|k| h.state.hit.get(HitNs::Settings, k).map(|r| (k.clone(), r)))
                     .collect();
                 for (key, r) in &rects {
                     assert!(
@@ -6304,16 +6312,24 @@ fn with_pinned(mut self, n: usize) -> Self {
                     );
                 }
                 // 同一分类内的热区互不重叠（相邻分段共边不算重叠）。
-                for (i, (ka, ra)) in rects.iter().enumerate() {
-                    for (kb, rb) in rects.iter().skip(i + 1) {
+                //
+                // CAUTION: 先按**矩形去重**再两两比对——2026-10-25 起分段
+                // 选项登记两枚键（译文 + `"{控件名}/{选项英文键}"`，见
+                // `draw_segmented`），同选项的两枚键矩形全同，不去重会把
+                // 同一控件误判成「互相侵占」。
+                let mut uniq: Vec<Rect> = Vec::new();
+                for (_, r) in &rects {
+                    if !uniq.iter().any(|u| u == r) {
+                        uniq.push(*r);
+                    }
+                }
+                for (i, ra) in uniq.iter().enumerate() {
+                    for rb in uniq.iter().skip(i + 1) {
                         let ox = (ra.max.x.min(rb.max.x) - ra.min.x.max(rb.min.x)).max(0.0);
                         let oy = (ra.max.y.min(rb.max.y) - ra.min.y.max(rb.min.y)).max(0.0);
                         assert!(
                             ox <= 1.0 || oy <= 1.0,
-                            "字体 {scale}× 下 {cat:?} 的热区「{ka}」与「{kb}」重叠了 \
-                             {:.1}x{:.1}（布局互相侵占）",
-                            ox,
-                            oy
+                            "字体 {scale}× 下 {cat:?} 的热区重叠了 {ox:.1}x{oy:.1}（布局互相侵占）"
                         );
                     }
                 }
@@ -6321,42 +6337,96 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
+    /// 设置内容区的控件必须让开浮动滚动条（2026-10-25 用户反馈）。
+    ///
+    /// egui 0.36+ 默认 `ScrollStyle::floating`：滚动条**不占布局宽度**，
+    /// 浮在视口右缘 `[视口.max.x - 10, 视口.max.x]` 之上，且交互**后
+    /// 注册**（并列取最后 = 最上层）⇒ 压住其覆盖的一切。
+    ///
+    /// 让位必须由**卡片宽度**完成（`settings_win.rs` 的 ScrollArea 闭包
+    /// 里 `set_width(视口宽 - RESERVE - GAP)`），不能缩视口：缩视口只
+    /// 会把滚动条一起左移，照样压在卡片右缘上——旧代码正是如此，
+    /// 「让出量」落在了滚动条与窗口边之间（看不见的地方），用户看到
+    /// 的就是「滚动条和卡片边上粘在一起」。
+    ///
+    /// 这条守门遍历内容区全部热区，断言没有控件伸进滚动条区。关闭
+    /// 按钮按设计贴右缘且位于页头（滚动区之外），显式排除。
+    #[test]
+    fn settings_controls_clear_the_floating_scrollbar() {
+        let mut h = Harness::new("settings-scrollbar-gap", vec2(780.0, 560.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        h.settings_frame();
+
+        // 视口右缘 = 窗口右缘 - 外缘留白；滚动条宽 = `SCROLLBAR_WIDTH`。
+        let vp_right = h.area.max.x - crate::paint::SETTINGS_MARGIN;
+        let bar_left = vp_right - crate::theme::SCROLLBAR_WIDTH;
+        let mut checked = 0_usize;
+        for k in h.state.hit.keys(HitNs::Settings) {
+            // 关闭按钮在页头行（滚动区之外），按设计贴右缘。
+            if k == "settings_close" {
+                continue;
+            }
+            let Some(r) = h.state.hit.get(HitNs::Settings, &k) else {
+                continue;
+            };
+            checked += 1;
+            assert!(
+                r.max.x <= bar_left,
+                "内容区控件「{k}」右缘 {:.1} 伸进了浮动滚动条区（左界 {bar_left:.1}）",
+                r.max.x
+            );
+        }
+        assert!(checked > 10, "应检查到一批内容区控件（实测 {checked}）");
+    }
+
     /// 大字号下设置行改为**上下堆叠**：标签不再与控件争宽度。
     ///
     /// 守的是「并排时描述只剩 6 个字」这种可读性崩坏——堆叠后描述能拿到
     /// 整行宽度，控件也独占一行。
+    ///
+    /// 2026-10-25：两个探针都换成**命名空间热键**（`"{控件名}/{选项英文键}"`，
+    /// 见 `draw_segmented`）——重组后「无」这个选项译文在风格主题与背景
+    /// 效果里各有一份，译文键互相覆盖，测到哪一份纯看注册顺序。探针改
+    /// 用「文字」卡里相邻的两行（字体缩放 → 图片缩略图）：同卡相邻，
+    /// 行距变化只反映堆叠，不掺卡片间距。
     #[test]
     fn large_font_stacks_setting_rows() {
-        // 用高窗口：1.5× 下外观卡片总高超过 560（需要滚动），
-        // 而热区只登记可见控件——不高一点就测不到两行的相对位置。
-        let mut h = Harness::new("font-stack", vec2(780.0, 1200.0));
+        // 用高窗口：1.5× 下「主题」卡实测约 1000pt（强调色编辑器 +
+        // 各行的说明折行都随字号膨胀），「文字」卡被推到 1000 以下——
+        // 而热区只登记可见控件，1600 才装得下两行探针。
+        let mut h = Harness::new("font-stack", vec2(780.0, 1600.0));
         h.state.show_settings = true;
         h.state.settings_cat = SettingsCat::Appearance;
 
-        // 1.0×：并排 —— 字体缩放分段与背景效果分段**同一行**（y 区间一致）。
+        // 1.0×：并排 —— 相邻两行的控件行距 ≈ 单行行高。
         h.pal = crate::theme::Palette::light();
         crate::theme::apply(&h.ctx, &h.pal);
         h.settings_frame();
-        let font_y = settings_hit(&h, "标准").min.y;
-        let backdrop_y = settings_hit(&h, "无").min.y;
+        let a1 = settings_hit(&h, "font_scale/Standard").min.y;
+        let b1 = settings_hit(&h, "image_inline").min.y;
+        let pitch_10 = b1 - a1;
         assert!(
-            (font_y - backdrop_y).abs() > 20.0,
-            "1.0× 下两行本就在不同行（间距应 > 20）：{font_y} vs {backdrop_y}"
+            pitch_10 > 20.0,
+            "1.0× 下相邻两行控件应有正常行距：{pitch_10:.1}"
         );
 
         // 1.5×：堆叠 —— 每行的控件独占一行，行距显著变大。
         h.pal = crate::theme::Palette::light().with_font_scale(1.5);
         crate::theme::apply(&h.ctx, &h.pal);
         h.settings_frame();
-        let font_y15 = settings_hit(&h, "标准").min.y;
-        let backdrop_y15 = settings_hit(&h, "无").min.y;
-        let pitch_10 = backdrop_y - font_y;
-        let pitch_15 = backdrop_y15 - font_y15;
+        let a15 = settings_hit(&h, "font_scale/Standard").min.y;
+        let b15 = settings_hit(&h, "image_inline").min.y;
+        let pitch_15 = b15 - a15;
         assert!(
             pitch_15 > pitch_10 * 1.5,
             "1.5× 下应改为上下堆叠（行距 {pitch_15:.1} 应远大于 1.0× 的 {pitch_10:.1}）"
         );
     }
+
+
+
+
 
 
     // ------------------------------------------------------------------
@@ -6371,7 +6441,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn accent_preset_click_emits_set_accent() {
         let mut h = Harness::new("accent-preset", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Theme;
+        h.state.settings_cat = SettingsCat::Appearance;
         h.settings_frame();
 
         // 10 个预设都应有热区（key = 预设名）。
@@ -6399,7 +6469,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn secondary_theme_segment_emits_op() {
         let mut h = Harness::new("secondary-theme", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Theme;
+        h.state.settings_cat = SettingsCat::Appearance;
         h.settings_frame();
         for name in ["无", "纸纹", "护眼绿", "星空紫", "OLED"] {
             assert!(
@@ -6423,7 +6493,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn theme_params_disabled_without_secondary_theme() {
         let mut h = Harness::new("theme-params-off", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Theme;
+        h.state.settings_cat = SettingsCat::Appearance;
         h.svc.state.config.ui.secondary_theme = modular_clipboard_core::config::SecondaryTheme::None;
         h.settings_frame();
         // 无主题 ⇒ 没有旋钮热区（paper_tint 等键名不存在于热区表）。
@@ -6467,7 +6537,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn token_editor_collapsed_by_default_and_expands() {
         let mut h = Harness::new("token-editor", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Theme;
+        h.state.settings_cat = SettingsCat::Appearance;
         // 选中星空主题：主题卡才会画旋钮（None 时只有「先选择一个
         // 二级主题」提示行），「内容区整体切换」才有可断言的对照。
         h.svc.state.config.ui.secondary_theme =
@@ -6547,7 +6617,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn token_override_hue_slider_emits_op() {
         let mut h = Harness::new("token-override", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Theme;
+        h.state.settings_cat = SettingsCat::Appearance;
         h.settings_frame();
         // 展开令牌编辑器。
         let _ops = h.settings_click_at(settings_hit(&h, "token_expand").center());
@@ -6580,7 +6650,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     fn token_reset_all_emits_clear() {
         let mut h = Harness::new("token-reset", vec2(780.0, 900.0));
         h.state.show_settings = true;
-        h.state.settings_cat = SettingsCat::Theme;
+        h.state.settings_cat = SettingsCat::Appearance;
         h.svc.state.config.ui.theme_overrides.nums.insert("radius_md".into(), 12.0);
         h.settings_frame();
         // 「全部重置」在**二级面板**里（2026-10-19）：先点入口行打开。

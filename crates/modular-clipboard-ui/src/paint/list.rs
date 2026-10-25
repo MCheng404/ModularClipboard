@@ -66,7 +66,7 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
     // 测试反而挂。
     //
     // 两个列表（主栏 / 内嵌置顶区）必须用**不同 key**：`hit` 是
-    // `HashMap<&str, Rect>`，同名会互相覆盖（settings 开关就踩过）。
+    // `HashMap<String, Rect>`，同名会互相覆盖（settings 开关就踩过）。
     f.hit_insert(
         if only_pinned == Some(true) {
             "pinned_body"
