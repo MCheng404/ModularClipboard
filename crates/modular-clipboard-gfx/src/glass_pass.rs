@@ -68,7 +68,7 @@ pub struct GlassUniforms {
     pub radius: f32,
     /// 有效卡片数。
     pub count: u32,
-    /// 卡片底色 alpha。
+    /// 卡片底色 alpha（玻璃层的覆盖度；着色器侧按预乘使用）。
     pub card_alpha: f32,
     /// 尾部填充（与 WGSL 的 `pad: vec4<f32>` 对应）。
     pub pad: [f32; 4],
@@ -339,7 +339,11 @@ pub struct GlassParams {
     pub dispersion: f32,
     /// Fresnel 幂次。
     pub edge: f32,
-    /// 卡片底色 alpha（玻璃只改 RGB，覆盖度由它定）。
+    /// 卡片底色 alpha：玻璃层的覆盖度（0 = 完全露出真实桌面，1 = 不透明）。
+    ///
+    /// CAUTION: `glass.wgsl` 拿它做**预乘**（`rgb * a, a`），不是只写进
+    /// alpha 通道——交换链按 PRE_MULTIPLIED 合成，只写 alpha 会让半透明
+    /// 卡片被额外叠一层桌面而发白。
     pub card_alpha: f32,
 }
 

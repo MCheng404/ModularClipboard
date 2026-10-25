@@ -105,12 +105,70 @@ pub fn glass_normal_analytic(p: [f32; 2], half: [f32; 2], radius: f32) -> [f32; 
     [sx * qx / len, sy * qy / len]
 }
 
+/// 2D 斜率场抬起成 3D 表面法线时，xy 分量的放大倍数。
+///
+/// 玻璃是一片**弯曲的薄片**：2D 的 SDF 法线/穹顶斜率给出薄片在 xy 上
+/// 的倾斜方向，抬起成 3D 法线 `N = normalize(vec3(n * TILT, 1))` 才有
+/// 可折射的表面。TILT 越大薄片越「鼓」（同样距边处越接近掠射）。
+///
+/// 2.0：单位长 2D 法线抬起后 `|N.xy| ≈ 0.894`、`N.z ≈ 0.447`，即边缘
+/// 处薄片倾约 63°——介于「平板」与「半球」之间，是液态玻璃边缘那种
+/// 明显但不成哈哈镜的透镜感。
+pub const SURFACE_TILT: f32 = 2.0;
+
+/// 单位长 2D 法线抬起后的 `|N.xy|`（`TILT / sqrt(TILT² + 1)`）。
+pub const EDGE_NXY: f32 = 0.894_427_2;
+
+/// 参考 eta（[`DEFAULT_ETA`]）在**边缘**（`|n| = 1`）处的折射因子
+/// `sqrt(1 - eta²(1 - N.z²)) - eta·N.z`。
+///
+/// 用它把 [`refract_offset`] 归一化：于是 `power` 的语义仍是「边缘处的
+/// 最大位移」（与文档契约一致），而 eta 的差别**只**体现在因子上——
+/// 这正是色散可见度所在。改 `SURFACE_TILT` 必须同步改这三个常量，
+/// 见 `tilt_constants_are_self_consistent` 与
+/// `shader_constants_match_rust`（后者扫 `glass.wgsl` 的同一批字面量）。
+pub const EDGE_FACTOR: f32 = 0.504_630_6;
+
 /// 折射造成的 UV 位移（单位：UV，即 [0,1] 纹理空间）。
 ///
-/// `normal` 是外法线（`glass_normal` 的输出），`eta = 1 / ior`。
-/// `incident` 取 `-normal`（光从玻璃外垂直射入曲面），`refract()` 的
-/// WGSL/GLSL 语义是「入射方向、法线、eta」，返回折射后的方向，这里只用
-/// 它的 xy 分量去偏移采样坐标。
+/// `normal` 是薄片表面的 2D 斜率（SDF 法线为单位长，穹顶斜率 ≤ 1），
+/// `eta = 1 / ior`。
+///
+/// # 为什么入射不能取 `-normal`
+///
+/// 早期版本把 `incident = -normal`（2D 向量）喂给 `refract()`。那是个
+/// **退化模型**：`dot(N, I) = -|N|²`，对单位法线恒为 -1，于是
+/// `k = 1 - eta²(1 - 1) = 1`、`s = 1`，整个式子塌成
+///
+/// ```text
+/// (eta·(-n) - (eta·(-1) + 1)·n)·power = -n·power
+/// ```
+///
+/// ——**eta 被完全约掉**。后果有三个，且都不报错：
+///
+/// 1. `IOR_R/G/B` 三个折射率给出**完全相同**的位移 ⇒ 色散（边缘彩边）
+///    恒为 0，`glass_dispersion` 滑块是死的；
+/// 2. 边缘那 1~3 次分通道采样白付（两个通道采样坐标逐位相同）；
+/// 3. `eta = 1`（ior = 1，即「没有玻璃」）时位移仍是 `-n·power` 而非 0
+///    ——物理上就不该有折射。
+///
+/// 正确模型：入射是**正对玻璃的视线** `I = (0, 0, -1)`，法线是抬起后的
+/// 3D 法线 `N = normalize(vec3(n·TILT, 1))`。此时
+///
+/// ```text
+/// T.xy = -(s - eta·N.z) · N.xy,   s = sqrt(1 - eta²(1 - N.z²))
+/// ```
+///
+/// eta 安安稳稳地留在式子里：ior 越大 ⇒ eta 越小 ⇒ `(s - eta·N.z)` 越大
+/// ⇒ 蓝光弯得比红光多，色散才成立。
+///
+/// # `power` 的语义（归一化）
+///
+/// 上式再乘 `EDGE_NXY / EDGE_FACTOR` 的倒数归一：于是 **`|n| = 1` 且
+/// `eta = DEFAULT_ETA` 时位移模长恰好等于 `power`**，与旧模型的幅值逐点
+/// 对齐（实测 `|n| = 0.5` 处旧 0.632·power、新 0.643·power，差 1.8%）。
+/// 换句话说这次修的是「eta 有没有用」，不是「折射有多强」——观感不变，
+/// 色散才开始生效。
 ///
 /// # `power` 必须与 [`edge_falloff`] 相乘后使用
 ///
@@ -123,17 +181,27 @@ pub fn glass_normal_analytic(p: [f32; 2], half: [f32; 2], radius: f32) -> [f32; 
 /// **不要**在别处再乘一次衰减，也不要拿这个值当「全局位移上限」
 /// ——它不是。
 pub fn refract_offset(normal: [f32; 2], eta: f32, power: f32) -> [f32; 2] {
-    let incident = [-normal[0], -normal[1]];
-    // refract(I, N, eta) 的标准实现（WGSL 内建同一套）：
-    //   k = 1 - eta^2 * (1 - dot(N, I)^2)
-    //   T = eta * I - (eta * dot(N, I) + sqrt(k)) * N
-    let d = normal[0] * incident[0] + normal[1] * incident[1];
+    // 抬起成 3D 法线。|normal| 已知量级（0~1），无需先归一化：
+    // `t = |n|·TILT`，归一化系数 `inv = 1/sqrt(t² + 1)` 一次算出
+    // `N.xy` 与 `N.z` 两者。
+    let t = (normal[0] * normal[0] + normal[1] * normal[1]).sqrt() * SURFACE_TILT;
+    let inv = 1.0 / (t * t + 1.0).sqrt();
+    let nx = normal[0] * SURFACE_TILT * inv;
+    let ny = normal[1] * SURFACE_TILT * inv;
+    let nz = inv;
+    // refract(I, N, eta) 的标准实现（WGSL 内建同一套），I = (0,0,-1)：
+    //   d = dot(N, I) = -N.z
+    //   k = 1 - eta^2 * (1 - d^2)
+    //   T = eta*I - (eta*d + sqrt(k)) * N
+    // 取 xy 分量（I.xy = 0）：
+    //   T.xy = -(eta*d + s) * N.xy = -(s - eta*N.z) * N.xy
+    let d = -nz;
     let k = (1.0 - eta * eta * (1.0 - d * d)).max(0.0);
     let s = k.sqrt();
-    [
-        (eta * incident[0] - (eta * d + s) * normal[0]) * power,
-        (eta * incident[1] - (eta * d + s) * normal[1]) * power,
-    ]
+    let f = s - eta * nz;
+    // 归一到「边缘 + 参考 eta ⇒ 模长 = power」。
+    let scale = (f / EDGE_FACTOR) / EDGE_NXY;
+    [-nx * scale * power, -ny * scale * power]
 }
 
 /// 边缘轮廓折射的衰减权重。
@@ -238,6 +306,11 @@ pub fn dome_slope(local: [f32; 2]) -> [f32; 2] {
 }
 
 /// 色散的三个 IOR（R 最小、B 最大 ⇒ 蓝光弯得更多，边缘出现彩色描边）。
+///
+/// CAUTION: 它们只有在 [`refract_offset`]**真的让 eta 参与运算**时才有
+/// 意义。早前那版把入射取成 `-normal`，eta 被约掉，三个 IOR 算出完全
+/// 相同的位移——滑块能拖、画面没反应。`refraction_varies_with_eta`
+/// 与 `dispersion_offsets_actually_differ` 盯住这条。
 pub const IOR_R: f32 = 1.50;
 pub const IOR_G: f32 = 1.52;
 pub const IOR_B: f32 = 1.54;
@@ -462,6 +535,142 @@ mod tests {
             let f = fresnel_edge(dome_slope(local(99.0 * t, 29.0 * t)), 5.0);
             assert!(f >= prev - 1e-6, "Fresnel 应单调不减：{prev} -> {f}");
             prev = f;
+        }
+    }
+
+    #[test]
+    fn tilt_constants_are_self_consistent() {
+        // `EDGE_NZ / EDGE_NXY / EDGE_FACTOR` 都是从 `SURFACE_TILT` 推出来的
+        // 常量（f32 常量不能调 `sqrt`，只能写字面量）。改 TILT 忘改它们，
+        // 折射幅值会整体偏掉而不报错——这条把它钉住。
+        let denom = (SURFACE_TILT * SURFACE_TILT + 1.0).sqrt();
+        assert!(
+            (EDGE_NXY - SURFACE_TILT / denom).abs() < 1e-6,
+            "EDGE_NXY={EDGE_NXY} 应为 TILT/sqrt(TILT²+1)={}",
+            SURFACE_TILT / denom
+        );
+        // 抬起后的法线必须是单位向量：`N.z² + |N.xy|² == 1`。
+        let nz = 1.0 / denom;
+        assert!(
+            (nz * nz + EDGE_NXY * EDGE_NXY - 1.0).abs() < 1e-6,
+            "抬起后的法线必须是单位向量"
+        );
+        let eta = DEFAULT_ETA;
+        let f0 = (1.0 - eta * eta * (1.0 - nz * nz)).sqrt() - eta * nz;
+        assert!(
+            (EDGE_FACTOR - f0).abs() < 1e-6,
+            "EDGE_FACTOR={EDGE_FACTOR} 应为 {f0}"
+        );
+    }
+
+    #[test]
+    fn refraction_magnitude_matches_documented_power_at_edge() {
+        // 归一化的契约：`|n| = 1` 且 eta = DEFAULT_ETA 时位移模长 == power。
+        // 这条是「修物理模型不能顺手改掉折射强度」的守门——观感参数
+        // （默认 0.35）的含义必须原样保留。
+        let n = glass_normal([99.0, 29.0], HALF, 8.0, 1.0);
+        let len = (n[0] * n[0] + n[1] * n[1]).sqrt();
+        assert!((len - 1.0).abs() < 1e-3, "取样点应给出单位法线，实际 |n|={len}");
+        for power in [0.1_f32, 0.35, 1.0] {
+            let o = refract_offset(n, DEFAULT_ETA, power);
+            let mag = (o[0] * o[0] + o[1] * o[1]).sqrt();
+            assert!(
+                (mag - power).abs() < 1e-3,
+                "power={power} 时边缘位移应为 {power}，实际 {mag}"
+            );
+        }
+        // 方向仍然是 -n（朝卡片内推，与旧模型同向）。
+        let o = refract_offset(n, DEFAULT_ETA, 0.35);
+        assert!(o[0] * n[0] + o[1] * n[1] < 0.0, "位移应朝法线反方向：{o:?}");
+    }
+
+    #[test]
+    fn refraction_varies_with_eta() {
+        // 退化模型的判据（eta 被约掉 ⇒ 位移与 eta 无关）。这条是保证
+        // `IOR_*` 还有意义的**根本**守门：它红 = 色散一定失效。
+        let n = glass_normal([99.0, 29.0], HALF, 8.0, 1.0);
+        let mag = |eta: f32| {
+            let o = refract_offset(n, eta, 0.35);
+            (o[0] * o[0] + o[1] * o[1]).sqrt()
+        };
+        let m1 = mag(1.0 / 1.2);
+        let m2 = mag(1.0 / 1.9);
+        assert!(
+            (m1 - m2).abs() > 1e-3,
+            "eta 必须影响位移大小，否则色散恒为 0：ior1.2 => {m1}, ior1.9 => {m2}"
+        );
+        // ior 越大 ⇒ eta 越小 ⇒ 弯得越多。
+        assert!(m2 > m1, "大 ior 应弯得更多：{m2} > {m1}");
+    }
+
+    #[test]
+    fn refraction_vanishes_when_ior_is_one() {
+        // ior = 1（eta = 1）意味着「介质与空气相同」⇒ 不该有任何折射。
+        // 旧模型（入射 = -normal）在这里给 `-n·power`，是个恒不为零的
+        // 假位移——这条正是它过不了的测试。
+        let n = glass_normal([99.0, 29.0], HALF, 8.0, 1.0);
+        let o = refract_offset(n, 1.0, 0.35);
+        assert!(
+            (o[0] * o[0] + o[1] * o[1]).sqrt() < 1e-6,
+            "ior=1 应无折射，实际 {o:?}"
+        );
+        // 穹顶那一路（法线非单位长）同样必须归零。
+        let d = dome_refract_offset([0.6, 0.3], 1.0, 0.35);
+        assert!(
+            (d[0] * d[0] + d[1] * d[1]).sqrt() < 1e-6,
+            "ior=1 时穹顶也应无折射，实际 {d:?}"
+        );
+    }
+
+    #[test]
+    fn dispersion_offsets_actually_differ() {
+        // 色散的**可观测**判据：三个通道的位移必须真的不同，且差值大到
+        // 能在边缘拉开可见的彩边宽度。
+        //
+        // 旧模型三通道逐位相同（差 0），而 `dispersion_orders_blue_strongest`
+        // 用的是 >=，因此**照常通过**——正是它漏掉了这个缺陷。所以要一条
+        // 严格不等 + 量级下限的测试。
+        let n = glass_normal([95.0, 25.0], HALF, 8.0, 1.0);
+        let mag = |ior: f32| {
+            let o = refract_offset(n, 1.0 / ior, 0.35);
+            (o[0] * o[0] + o[1] * o[1]).sqrt()
+        };
+        let (r, g, b) = (mag(IOR_R), mag(IOR_G), mag(IOR_B));
+        assert!(b > g && g > r, "色散顺序错且必须严格递增：R={r} G={g} B={b}");
+        // 边缘位移量级 ≈ 0.35 UV ⇒ 蓝红差应有约 1% 以上（720px 宽窗口上
+        // 就是 3~10px 的彩边宽度）。
+        let spread = (b - r) / r;
+        assert!(
+            spread > 0.01,
+            "蓝红位移差 {spread:.4} 太小，肉眼看不出彩边（R={r} B={b}）"
+        );
+    }
+
+    #[test]
+    fn shader_constants_match_rust() {
+        // 着色器无法单测，但**常量**可以：把 `glass.wgsl` 里的同名 const
+        // 抠出来逐一对数值。手抄常量时漏改一边是这类项目的经典故障，
+        // 且症状是「折射整体偏一点」，没人会怀疑常量。
+        let src = include_str!("../shaders/glass.wgsl");
+        for (name, want) in [
+            ("SURFACE_TILT", SURFACE_TILT),
+            ("EDGE_NXY", EDGE_NXY),
+            ("EDGE_FACTOR", EDGE_FACTOR),
+        ] {
+            let decl = format!("const {name}: f32 = ");
+            let at = src
+                .find(&decl)
+                .unwrap_or_else(|| panic!("glass.wgsl 里找不到 `{name}` 的常量声明"));
+            let rest = &src[at + decl.len()..];
+            let end = rest.find(';').expect("常量声明应以分号结束");
+            let got: f32 = rest[..end]
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("`{name}` 的字面量无法解析：{}", &rest[..end]));
+            assert!(
+                (got - want).abs() < 1e-6,
+                "glass.wgsl 的 {name}={got} 与 Rust 侧的 {want} 不一致"
+            );
         }
     }
 

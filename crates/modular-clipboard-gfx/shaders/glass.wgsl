@@ -62,16 +62,30 @@ const IOR_B: f32 = 1.54;
 /// 默认折射率比值 `eta = 1 / ior`（ior = 1.5）。
 const DEFAULT_ETA: f32 = 1.0 / 1.5;
 
+/// 2D 斜率场抬起成 3D 表面法线时 xy 分量的放大倍数。与 `glass::SURFACE_TILT` 一致。
+const SURFACE_TILT: f32 = 2.0;
+/// 单位长 2D 法线抬起后的 `|N.xy|`（`TILT / sqrt(TILT² + 1)`）。
+const EDGE_NXY: f32 = 0.8944272;
+/// 参考 eta 在边缘（`|n| = 1`）处的折射因子
+/// `sqrt(1 - eta²(1 - N.z²)) - eta·N.z`，用来把 `refract_uv` 归一到
+/// 「`power` = 边缘最大位移」。
+const EDGE_FACTOR: f32 = 0.5046306;
+
 /// 穹顶折射相对边缘轮廓折射的强度比。
 ///
 /// Rust 侧的测试用 `dome power = 0.03`、`edge power = 0.35`，比值 0.086。
 /// 取 0.08：穹顶只负责「中心也有折射」，主角是边缘轮廓。
 const DOME_RATIO: f32 = 0.08;
 
-/// 磨砂/清晰混合的距离尺度（像素）：距边这么多像素以内渐变为磨砂。
+/// 磨砂/清晰混合的距离尺度（像素）：**离边超过**这么多像素即算「内部」。
 ///
-/// 中心清晰（能看见折射后的桌面）、边缘磨砂——液态玻璃的辨识度全在
-/// 这个分布上。整片都清晰就只是「透明卡片」，整片都糊就退回 Acrylic。
+/// 液态玻璃的辨识度全在这个分布上：
+/// **边缘清晰**（能看见折射后的桌面，配合最强的折射与 Fresnel 亮边），
+/// **中心磨砂**（`de ≥ FROST_SCALE` 时 85% 磨砂 + 15% 清晰）。
+///
+/// CAUTION: 方向与早期注释相反——`frost` 随**距边距离**单调**递增**
+/// （`de = 0` 在边缘），所以是「越往里越糊」。整片清晰就只是「透明卡片」，
+/// 整片磨砂就退回 Acrylic，两者都不是玻璃。
 const FROST_SCALE: f32 = 36.0;
 
 /// 色散生效的**距边带宽**（像素）。
@@ -104,8 +118,12 @@ struct GlassUniforms {
     radius: f32,
     /// 有效卡片数（`rects` 前多少项有意义）。
     count: u32,
-    /// 卡片底色 alpha：玻璃只改 RGB，alpha 交给它——半透明卡片下
-    /// 玻璃层该透多少由绘制层决定，与背景层的 alpha 语义解耦。
+    /// 卡片底色 alpha：玻璃层的**覆盖度**（0 = 完全露出真实桌面，
+    /// 1 = 玻璃层不透明）。
+    ///
+    /// CAUTION: 它参与的是 `rgb * a` 的**预乘**，不是只写进 alpha 通道。
+    /// 交换链按 PRE_MULTIPLIED 合成，只改 alpha 不改 RGB 会让半透明
+    /// 卡片被额外叠一层桌面（见 `fs_glass` 末尾的 CAUTION）。
     card_alpha: f32,
     /// 占位，把结构体补到 16 字节倍数（WGSL uniform 的规则）。
     ///
@@ -238,16 +256,44 @@ fn glass_normal(p: vec2<f32>, half: vec2<f32>, r: f32, eps: f32) -> vec2<f32> {
     return g / l;
 }
 
-/// `refract(I, N, eta)` 的 2D 形式，返回 UV 位移。
+/// `refract(I, N, eta)` 的 2D 投影，返回 UV 位移。
 ///
-/// 与 `glass::refract_offset` 逐行对应。`incident = -normal`（光从玻璃外
-/// 垂直射入曲面）。
+/// 与 `glass::refract_offset` 逐行对应。**入射是正对玻璃的视线**
+/// `I = (0, 0, -1)`，法线是 2D 斜率场抬起成的 3D 法线
+/// `N = normalize(vec3(n * SURFACE_TILT, 1))`。
+///
+/// # CAUTION: 入射**不能**取 `-n`
+///
+/// 那是个退化模型：`dot(N, I) = -|N|²`，对单位法线恒为 -1 ⇒
+/// `k = 1 - eta²(1 - 1) = 1` ⇒ `s = 1` ⇒ 整个式子塌成 `-n * power`，
+/// **eta 被完全约掉**。后果（三个都不报错）：
+///
+/// 1. `IOR_R/G/B` 算出逐位相同的位移 ⇒ 色散恒为 0，滑块是死的；
+/// 2. 边缘那两次分通道采样坐标完全相同，纯浪费带宽；
+/// 3. `eta = 1`（ior = 1，等于没有玻璃）时位移仍是 `-n·power` 而非 0。
+///
+/// 抬起成 3D 后 `T.xy = -(s - eta·N.z)·N.xy`，eta 安稳留在式子里，
+/// ior 越大弯得越多 ⇒ 蓝光在边缘外侧，色散成立。
+///
+/// # 归一化
+///
+/// 上式再乘 `(f / EDGE_FACTOR) / EDGE_NXY`（`f = s - eta·N.z`）归一：
+/// 于是 `|n| = 1` 且 `eta = DEFAULT_ETA` 时位移模长恰好等于 `power`，
+/// 与旧模型的幅值逐点对齐（实测 `|n| = 0.5` 处旧 0.632·power、
+/// 新 0.643·power）。这次改的是「eta 有没有用」，不是「折射多强」。
 fn refract_uv(n: vec2<f32>, eta: f32, power: f32) -> vec2<f32> {
-    let i = -n;
-    let d = dot(n, i);
-    let k = max(1.0 - eta * eta * (1.0 - d * d), 0.0);
+    // 抬起：|n| 已知量级（0~1），`inv = 1/sqrt(t² + 1)` 一次给出
+    // `N.xy`（乘 TILT·inv）与 `N.z`（= inv），省一次 normalize。
+    let t = length(n) * SURFACE_TILT;
+    let inv = 1.0 / sqrt(t * t + 1.0);
+    let nxy = n * (SURFACE_TILT * inv);
+    let nz = inv;
+    // d = dot(N, I) = -N.z（I = (0,0,-1)）
+    let k = max(1.0 - eta * eta * (1.0 - nz * nz), 0.0);
     let s = sqrt(k);
-    return (eta * i - (eta * d + s) * n) * power;
+    let f = s - eta * nz;
+    let scale = (f / EDGE_FACTOR) / EDGE_NXY;
+    return -nxy * scale * power;
 }
 
 /// 穹顶（半球透镜）法线的斜率场：`normalize(local) * min(|local|, 1)`。
@@ -347,10 +393,15 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
             sharp_rgb = sg.rgb;
         }
 
-        // ---- 磨砂 / 清晰混合：中心清晰、边缘磨砂 ----
+        // ---- 磨砂 / 清晰混合：边缘清晰、中心磨砂 ----
         //
-        // 液态玻璃的辨识度全在这个分布上。整片清晰 = 透明卡片，
-        // 整片磨砂 = 退回 Acrylic。
+        // `de` 是**距边距离**：贴边处 `frost → 0` 取折射后的清晰图，
+        // 深入内部 `frost → 0.85` 主要是磨砂。与折射衰减 `fall` 正好
+        // 反向——贴边处折射最强且最清晰（那是液态玻璃的辨识特征），
+        // 内部折射归零、退回磨砂。
+        //
+        // CAUTION: 上限取 0.85 而不是 1.0：整片纯磨砂就退回 Acrylic，
+        // 留 15% 的清晰分量让中心也有一点「玻璃感」而不是一块色块。
         let frost = clamp(de / FROST_SCALE, 0.0, 1.0) * 0.85;
         var rgb = mix(sharp_rgb, blurred.rgb, frost);
 
@@ -362,8 +413,23 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         let f = pow(clamp(length(slope), 0.0, 1.0), max(u.edge, 0.0));
         rgb = rgb + RIM_TINT * f;
 
-        // alpha 取磨砂底图的：玻璃只改颜色，覆盖语义不变。
-        out = vec4<f32>(rgb, blurred.a * u.card_alpha);
+        // ---- 输出：必须**预乘** ----
+        //
+        // 交换链是按 `PRE_MULTIPLIED` 合成的（`Swapchain::new_for_surface`
+        // 里的 `composite_alpha` 选择）：DWM 算的是
+        // `src.rgb + (1 - src.a) * 桌面`。所以 RGB 必须已经乘过 alpha。
+        //
+        // CAUTION: 早前写成 `vec4(rgb, blurred.a * u.card_alpha)`——RGB
+        // 是**未预乘**的折射结果。于是 `card_opacity < 1` 时合成出来是
+        // `玻璃 + (1-a)·桌面`，比玻璃和桌面**都亮**（a=0.5 时凭空多出
+        // 0.25 份桌面），表现为半透明卡片发白、发灰，且调低不透明度
+        // 反而更亮——与「越透明越淡」的直觉相反，且**不报任何错**。
+        //
+        // `blurred.a` 恒为 1（GDI 捕获已强制 alpha=255，卷积保持），
+        // 它在这里只是「底图自身的覆盖度」，与卡片透明度相乘即为
+        // 玻璃层最终覆盖度。
+        let a = clamp(u.card_alpha, 0.0, 1.0) * blurred.a;
+        out = vec4<f32>(rgb * a, a);
         break;
     }
 
