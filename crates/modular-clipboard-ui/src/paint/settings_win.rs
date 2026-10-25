@@ -146,11 +146,11 @@ pub fn draw_settings(f: &mut Frame<'_>) {
 
     // 边缘装饰（深色主题色环 + 受光高光）：画在填充之上、内容之后。
     //
-    // CAUTION: 先绑到局部变量再取址——`&f.ui.painter()` 这种「临时值
-    // 立即取址」会被 clippy 的 needless_borrow 命中（参数要 &Painter，
-    // 而 `painter()` 返回值）。`Painter` 是内部 Arc 的薄包装，克隆可忽略。
+    // CAUTION: `Ui::painter()` 返回的**已经是** `&Painter`（egui 的签名如
+    // 此），再写 `&vp` 是「引用的引用」，会被 clippy 的 needless_borrow
+    // 命中。绑到局部变量只是为了不让借用与下面的 `f.ui` 可变借用打架。
     let vp = f.ui.painter();
-    super::shadow::draw_settings_card_edge(&vp, nav_card, pal.radius_xl, pal);
+    super::shadow::draw_settings_card_edge(vp, nav_card, pal.radius_xl, pal);
 
     // ---- 右列页头行：主标签 + 关闭按钮，都与搜索框同线 ----
     let right_x0 = nav_card.max.x + SETTINGS_COL_GAP;

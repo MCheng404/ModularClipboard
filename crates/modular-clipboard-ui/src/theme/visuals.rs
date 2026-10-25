@@ -110,6 +110,24 @@ pub fn apply(ctx: &egui::Context, palette: &Palette) {
 
     v.text_cursor.stroke = egui::Stroke::new(p.stroke_thick, p.accent);
 
+    // ---- egui 的开发者诊断：显式开关，不跟随构建类型 ------------------
+    //
+    // `Options::warn_on_id_clash` 的 egui 缺省是 `cfg!(debug_assertions)`：
+    // debug 构建里只要同一帧出现两个同 ID 的控件，egui 就会把红框 + 红字
+    // **画在真实界面上**，颜色取 `Visuals::error_fg_color`——而这个字段
+    // 在上面被映射成了 `palette.danger`，于是它看起来就是「UI 自己冒出一
+    // 片红字」，与真正的渲染故障无从分辨。
+    //
+    // 本项目 debug 是**日常跑法**（`build.sh --run` / `cargo run`），
+    // release 才是分发（`package.sh`），所以「跟随 debug_assertions」在
+    // 这里恰好是反的：开发期诊断会盖在用户每天看的界面上。
+    //
+    // 改成显式开关：默认关闭，需要排查 ID 冲突时设 `MC_EGUI_ID_CLASH=1`
+    // 再开（与其它 `MC_*` 开关同一套 `env_flag`，结果带缓存）。
+    ctx.options_mut(|o| {
+        o.warn_on_id_clash = crate::app::boot::env_flag("MC_EGUI_ID_CLASH");
+    });
+
     // `Context::set_visuals` 只写入 `theme_preference` 当前指向的那套
     // style。切主题时若另一套仍是旧值，egui 内部任何按 theme 取样式的
     // 路径（弹窗、原生窗口）就会读到上一次的配色——「切了但没全切」。

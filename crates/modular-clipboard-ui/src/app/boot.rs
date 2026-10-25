@@ -81,7 +81,7 @@ pub(super) const TRAY_TOOLTIP: &str = "ModularClipboard"; // 托盘悬停提示�
 /// 3~4 次（`MC_DIAG` ×3、`MC_SETTINGS` ×1）——这些开关只在启动时设定，
 /// 没有热切换需求，缓存结果不改变任何行为。每个不同的名字最多碰一次
 /// 真实环境块，此后是一次 Mutex 加锁 + HashMap 查找。
-pub(super) fn env_flag(name: &str) -> bool {
+pub(crate) fn env_flag(name: &str) -> bool {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, bool>>,
     > = std::sync::OnceLock::new();

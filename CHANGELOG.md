@@ -6,6 +6,46 @@
 
 ### 修复
 
+- **玻璃「色散」滑块无效（折射物理模型退化）**：`refract_uv` 把入射取成
+  `-normal`，于是 `dot(N, I) = -|N|²`，对单位法线恒为 -1 ⇒
+  `k = 1 - eta²(1 - 1) = 1`、`s = 1`，整个折射式塌成 `-n · power`，
+  **eta 被完全约掉**。后果：① `IOR_R/G/B` 三个折射率算出逐位相同的位移
+  ⇒ 色散恒为 0，滑块能拖、画面没反应；② 边缘那两次分通道采样坐标相同，
+  纯浪费带宽；③ `eta = 1`（等于没有玻璃）时位移仍不为 0。改为物理正确的
+  模型：入射 `(0,0,-1)`、法线抬起 `normalize(vec3(n·SURFACE_TILT, 1))`
+  （TILT=2.0），`T.xy = -(s - eta·N.z)·N.xy`；再按 `EDGE_FACTOR/EDGE_NXY`
+  归一，使「`|n|=1` 且 eta 缺省 ⇒ 位移模长 == power」，与旧模型幅值逐点
+  对齐（`|n|=0.5` 处 0.632 → 0.643，差 1.8%）——修的是「eta 有没有用」，
+  不是「折射多强」。修复后蓝红位移差约 3.8%（720px 窗口上约 3~10px
+  彩边）。新增守门测试：`refraction_varies_with_eta`、
+  `refraction_vanishes_when_ior_is_one`、`dispersion_offsets_actually_differ`
+  （旧测试用 `>=`，色散全失效时照常通过，正是它漏掉该缺陷）、
+  `tilt_constants_are_self_consistent`、`shader_constants_match_rust`
+  （扫 `glass.wgsl` 的同名字面量）。
+- **半透明卡片在玻璃模式下反而更亮（玻璃层 alpha 未预乘）**：交换链按
+  `PRE_MULTIPLIED` 合成，DWM 算 `src.rgb + (1-src.a)·桌面`，而 `fs_glass`
+  输出的是 `vec4(rgb, blurred.a · card_alpha)`，RGB 未乘 alpha ⇒
+  `card_opacity < 1` 时凭空多叠一层桌面（a=0.5 多 0.25 份），表现为
+  「调低不透明度反而发白」。改为输出 `vec4(rgb·a, a)`。
+- **风格主题的「无」选不中（egui widget ID 冲突）**：`draw_segmented` 用
+  `Id::unique(("seg", i, shown))` 作交互 ID，`shown` 是**当前语言的选项
+  译文**。设置重组（主题并入外观）后风格主题与背景效果的第 0 项都叫
+  「无」⇒ 两格 ID 逐位相同；egui 同一帧里后注册的那格覆盖
+  `widgets.insert(id, ..)` 的矩形，先注册那格（风格主题，行在上方）的
+  `Response` 按别人的矩形判命中 ⇒ 点不动。ID 改为只由「控件实例名 +
+  段下标」决定（`seg_hit_id`），与译文无关。守门测试
+  `seg_ids_are_unique_across_controls` 覆盖全部 9 个分段控件。
+- **界面上莫名出现的红色文字**：那是 egui 的开发者诊断
+  `Context::check_for_id_clash`——同一帧有两个同 ID 控件时画红框加
+  `🔥 Second use of widget ID …`，颜色取 `Visuals::error_fg_color`，而
+  `theme::visuals` 把它映射成了 `palette.danger`，于是看着像 UI 画错了
+  （行首 □ 是 🔥 在本仓字体里无字形）。一处冲突会在两个矩形各画一份，
+  所以一份冲突看着像「一片按钮都有红字」。它的开关
+  `Options::warn_on_id_clash` 缺省是 `cfg!(debug_assertions)`，而本项目
+  **debug 是日常跑法**（`build.sh` 默认 MODE=debug，只有 `package.sh` 是
+  release）⇒ 开发期诊断天天盖在界面上。改为显式开关：默认关闭，排查时
+  设环境变量 `MC_EGUI_ID_CLASH=1` 再开。
+
 - **悬浮卡投影渲染异常（重叠覆盖 + 多渲染）**：一帧曾画出 894（浅色）/
   1008（深色）条 1pt 细带——「四条 1pt 环带画在内容之后」的方案把高斯
   梯度量化成硬阶跃（读出一排细线）、环带是方角的（16pt 圆角处呈像素化

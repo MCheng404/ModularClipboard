@@ -49,7 +49,7 @@ use modular_clipboard_app::Service;
 
 use crate::theme;
 
-mod boot;
+pub(crate) mod boot;
 mod config_write;
 mod frame_loop;
 mod recording;

@@ -309,6 +309,27 @@ pub(super) fn draw_step_slider(
 ///
 /// 自绘圆形信息图标：accent 底色 + 圆点 + 竖线（不依赖字体字形，
 /// 图标字体里没有 info 码位，新增字形需要重新生成 TTF）。
+/// 分段控件某一格的**交互 ID**（`ui.interact` 用）。
+///
+/// # CAUTION: 键里**不能掺选项译文**
+///
+/// 早前写成 `Id::unique(("seg", i, shown))`——`shown` 是当前语言的
+/// 选项译文。设置重组（主题并入外观）后同一分类里会出现**同文**选项：
+/// 风格主题（`secondary_theme`）与背景效果（`window_backdrop`）的第 0 项
+/// 都叫「无」，于是两格的 ID 逐位相同。
+///
+/// 后果是 egui 的 widget ID 冲突：同一帧里后注册的那格把
+/// `widgets.insert(id, ..)` 里的矩形覆盖掉，先注册那格的 `Response`
+/// 按**别人的矩形**判命中 ⇒ **点不动**。用户报的「风格主题无法选择『无』」
+/// 就是它（风格主题那行在上方，是先注册的一方）。同时 egui 会在画面上
+/// 画红色冲突告警框。
+///
+/// 只用「控件实例 + 段下标」：与语言无关、与选项译文无关，同一帧内
+/// 各控件的 `id_suffix` 互不相同（设置项字段名），下标天然不重复。
+pub(super) fn seg_hit_id(id_suffix: &'static str, i: usize) -> egui::Id {
+    egui::Id::unique(("seg", id_suffix, i))
+}
+
 /// 分段选择控件（segmented control）：整体一个圆角实底（surface_variant），
 /// 选中项用 surface 实底 + accent 文字，未选中 text_dim。
 ///
@@ -406,7 +427,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
             pos2(r.min.x + seg_w * i as f32, r.min.y),
             pos2(r.min.x + seg_w * (i + 1) as f32, r.max.y),
         );
-        let resp = ui.interact(seg, egui::Id::unique(("seg", i, shown)), egui::Sense::click());
+        let resp = ui.interact(seg, seg_hit_id(id_suffix, i), egui::Sense::click());
         // 文字放不下时按**段宽**省略：`draw_text` 不裁剪，直接画会
         // 越到相邻段上（视觉上两段文字叠在一起）。
         let text = elide_to_width(ui, shown, &font, seg.width() - 8.0);
@@ -659,4 +680,61 @@ pub(super) fn draw_mini_button(
         f.hit_insert(key, r);
     }
     resp.clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seg_hit_id;
+
+    /// 设置里所有分段控件的实例名（与 `settings_rows.rs` 的调用点一致）。
+    ///
+    /// 同一帧内它们必须两两不撞——撞了就是「某一行点不动」。
+    const SEG_SUFFIXES: [&str; 9] = [
+        "font_scale",
+        "notice_popup",
+        "paste_previous_mode",
+        "pinned_mode",
+        "search_panel_pos",
+        "secondary_theme",
+        "theme_mode",
+        "type_rail_pos",
+        "window_backdrop",
+    ];
+
+    #[test]
+    fn seg_ids_are_unique_across_controls() {
+        // 回归：风格主题与背景效果的第 0 项都叫「无」。ID 掺了选项译文
+        // 时两者逐位相同 ⇒ 先注册的行（风格主题）点不动，egui 还会画
+        // 红色 ID 冲突告警框（2026-10-25 用户报「风格主题无法选择 无」）。
+        let a = seg_hit_id("secondary_theme", 0);
+        let b = seg_hit_id("window_backdrop", 0);
+        assert_ne!(a, b, "不同控件的同一下标必须给出不同 ID");
+
+        // 全部控件 × 前 4 个下标两两不同。
+        for (i, x) in SEG_SUFFIXES.iter().enumerate() {
+            for y in &SEG_SUFFIXES[i + 1..] {
+                for idx in 0..4 {
+                    assert_ne!(
+                        seg_hit_id(x, idx),
+                        seg_hit_id(y, idx),
+                        "{x} 与 {y} 的第 {idx} 项 ID 冲突"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seg_id_is_index_scoped_and_deterministic() {
+        // 同一控件内各段必须分开（否则 `clicked` 会串到别的段上）。
+        let ids: Vec<_> = (0..4).map(|i| seg_hit_id("theme_mode", i)).collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "同一控件的第 {i} 段与后面某段 ID 相同");
+            }
+        }
+        // 确定性：同一 (控件, 下标) 每次必须给同一个 ID，否则补间与
+        // 交互状态每帧丢失。
+        assert_eq!(seg_hit_id("theme_mode", 2), seg_hit_id("theme_mode", 2));
+    }
 }

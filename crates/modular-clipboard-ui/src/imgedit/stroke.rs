@@ -76,8 +76,15 @@ pub fn apply_strokes(pixels: &mut [u8], w: u32, h: u32, strokes: &[Stroke]) {
                     if i + 3 >= pixels.len() {
                         continue;
                     }
-                    // 标准 source-over 混合（在**未预乘**空间算，egui 的
-                    // ColorImage 也是未预乘）。
+                    // 标准 source-over 混合。这里操作的是 `preview_pixels`
+                    // 产出的**原始 RGBA 字节**（未预乘），所以按未预乘
+                    // 公式算；只有在把结果交给 egui 时才由
+                    // `from_rgba_unmultiplied` 转成 `Color32` 的预乘存储。
+                    //
+                    // CAUTION: 别把「ColorImage 是未预乘的」当真——
+                    // `ColorImage::pixels` 是 `Color32`，内部**按预乘存**
+                    // （`r()` 返回已乘分量）。混淆这两者就是本仓踩过的
+                    // 「二次预乘、颜色整体发暗」（见 `paint::shadow`）。
                     let inv = 1.0 - ca;
                     pixels[i] = (cr * ca + pixels[i] as f32 * inv).clamp(0.0, 255.0) as u8;
                     pixels[i + 1] = (cg * ca + pixels[i + 1] as f32 * inv).clamp(0.0, 255.0) as u8;
