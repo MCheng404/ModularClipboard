@@ -170,13 +170,13 @@ pub const EDGE_FACTOR: f32 = 0.504_630_6;
 /// 换句话说这次修的是「eta 有没有用」，不是「折射有多强」——观感不变，
 /// 色散才开始生效。
 ///
-/// # `power` 必须与 [`edge_falloff`] 相乘后使用
+/// # `power` 必须与 [`bevel_weight`] 相乘后使用
 ///
-/// 本函数返回的是**边缘处的最大位移**（那里曲面最陡、法线最长）。
-/// 玻璃的设计是「中心清晰、边缘折射」，所以调用方必须乘上
-/// `edge_falloff(d, ..)`：边缘处 `power * falloff` 可达 0.1~0.35 UV
-/// （这是设计意图——没有这么大的位移就看不到折射），中心处
-/// `falloff → 0`，位移归零。
+/// 本函数返回的是**轮廓处的最大位移**（那里斜边最陡、法线最长）。
+/// 玻璃的设计是「中心几乎不折、全靠轮廓那一带」，所以调用方必须乘上
+/// `bevel_weight(de, radius)`：轮廓处 `power * weight` 可达 0.1~0.35 UV
+/// （这是设计意图——没有这么大的位移就看不到折射），带内端
+/// `weight → 0`，位移归零。
 ///
 /// **不要**在别处再乘一次衰减，也不要拿这个值当「全局位移上限」
 /// ——它不是。
@@ -204,19 +204,76 @@ pub fn refract_offset(normal: [f32; 2], eta: f32, power: f32) -> [f32; 2] {
     [-nx * scale * power, -ny * scale * power]
 }
 
-/// 边缘轮廓折射的衰减权重。
+/// 斜角（bevel）带的折射权重：轮廓处 1、带内端 0。
 ///
-/// 距边缘越近权重越大（`dist → 0` 时 → 1，深入内部 → 0）。这是 bergice
-/// 实现里 `exp(-|dist| * 0.4)` 的那一项——**边缘处折射最强**，因为那里
-/// 曲面最陡。
+/// # 为什么不是 `exp(-de · 0.4)`
+///
+/// 指数衰减有两个毛病：
+///
+/// 1. **长尾 + 硬跳变**：`de = 10` 处还剩 1.8%，而那里 [`glass_sdf`] 的法线
+///    **早已是零向量**（平坦区），折射被法线突然截断 ⇒ 平滑表面上留一条
+///    隐约的棱；
+/// 2. **带宽与形状无关**：`exp` 的尺度是写死的像素数，与卡片圆角半径各写
+///    一份，改圆角时两者漂移。
+///
+/// Apple 与各家的移植都把玻璃看成**带斜边的板**：斜边宽度就是圆角半径，
+/// 高度剖面在轮廓处最陡、在带内端水平（Apple 用的是凸超椭圆
+/// `h(x) = (1-(1-x)⁴)^¼`）。位移 ∝ 剖面斜率，于是：
+///
+/// - 带宽 = `radius`（与形状同源，改圆角自动跟着变）；
+/// - 权重取 `(1 - x)²`（`x = de / radius`）：轮廓处 1、带内端 0，且**内端
+///   斜率为 0** ⇒ 与平坦区严丝合缝，没有跳变。
 ///
 /// # CAUTION: 入参是**距边距离**，不是 SDF 值
 ///
 /// 圆角矩形的 SDF 在内部恒等于 `-radius`（平坦区，见 [`glass_sdf`] 的
-/// 公式），拿它当距离会让**整片内部的折射强度一模一样**——中心本该清晰
-/// 的地方也糊着一层折射。必须先用 [`dist_to_edge`] 换成真实距离。
-pub fn edge_falloff(dist_to_edge: f32, sharpness: f32) -> f32 {
-    (-dist_to_edge.max(0.0) * sharpness).exp()
+/// 公式），拿它当距离会让**整片内部的折射强度一模一样**。必须先用
+/// [`dist_to_edge`] 换成真实距离。
+pub fn bevel_weight(dist_to_edge: f32, radius: f32) -> f32 {
+    let band = radius.max(1.0);
+    let x = (dist_to_edge.max(0.0) / band).min(1.0);
+    let t = 1.0 - x;
+    t * t
+}
+
+/// 镜面高光强度（Blinn-Phong 的 `dot(N, L)` 形式，归一到 [0, 1]）。
+///
+/// Apple 的液态玻璃「用一圈**镜面高光取代描边**：朝向光源的一侧最亮，背光
+/// 一侧淡下去」（HIG Materials 的口径）。各向同性的 `pow(|slope|, k)` 做
+/// 不到这一点——它四边一样亮，看着像描了一圈边而不像玻璃。
+///
+/// `normal` 是斜角带上**朝外**的法线（单位长），`light` 是**指向光源**的
+/// 单位向量（屏幕空间 y 向下 ⇒ 左上打光是 `(-0.6, -0.8)`）。背光侧
+/// `dot < 0` 一律取 0——不该出现负高光。
+pub fn specular_rim(normal: [f32; 2], light: [f32; 2], shininess: f32) -> f32 {
+    let d = normal[0] * light[0] + normal[1] * light[1];
+    d.max(0.0).powf(shininess.max(0.5))
+}
+
+/// 相对亮度（Rec.709 权重）。
+pub fn luminance(rgb: [f32; 3]) -> f32 {
+    0.212_6 * rgb[0] + 0.715_2 * rgb[1] + 0.072_2 * rgb[2]
+}
+
+/// 亮度自适应的目标中灰，见 [`luminosity_adapt`]。
+pub const LUMA_TARGET: f32 = 0.5;
+
+/// Apple「regular」变体的亮度自适应：**压缩**背后内容的亮度范围。
+///
+/// HIG 写得很直接：regular 变体「blurs and **adjusts the luminosity of
+/// background content** to maintain legibility」；clear 变体在内容偏亮时
+/// 建议叠一层 35% 的暗色；visionOS 的 glass「limits the range of background
+/// color information so a window can continue to provide contrast」。
+///
+/// 三者是同一件事的两面：亮底压暗、暗底提亮，把底图亮度往中灰收一点，
+/// 前景（本项目是卡片上的文字）的对比度就不随壁纸/桌面内容漂移。
+///
+/// 实现是**三通道同比例缩放** `k = 1 + gain·(target − luma)`：只动亮度、
+/// 不动色相与饱和（逐通道各自拉向中灰会把颜色一起洗掉）。`gain = 0`
+/// 时恒等。
+pub fn luminosity_adapt(rgb: [f32; 3], gain: f32) -> [f32; 3] {
+    let k = (1.0 + gain * (LUMA_TARGET - luminance(rgb))).max(0.0);
+    [rgb[0] * k, rgb[1] * k, rgb[2] * k]
 }
 
 /// 点到卡片边缘的**真实距离**（像素）。
@@ -445,16 +502,15 @@ mod tests {
         let edge = mag_at(99.0, 29.0);
         assert!(center < 1e-6, "中心位移应为 0，实际 {center}");
         assert!(mid < edge, "位移应随靠近边缘增大：{mid} < {edge}");
-        // 合成 falloff 之后，中心必须 ≈ 0。
+        // 合成斜角权重之后，中心必须 ≈ 0。
         //
         // CAUTION: 这里必须用 `dist_to_edge` 而不是 SDF——SDF 在内部恒为
-        // `-radius`，用它算 falloff 会让中心的折射强度和边缘一模一样。
+        // `-radius`，用它算权重会让中心的折射强度和边缘一模一样。
         let d_center = glass_sdf([0.0, 0.0], HALF, 8.0);
         let de = dist_to_edge([0.0, 0.0], HALF, d_center);
-        let eff = edge * edge_falloff(de, 0.4);
-        // 1e-5 而不是 1e-6：这里残留的是 f32 指数/乘法的噪声量级
-        // （2e-6），不是真实折射。卡 1e-6 会在不同优化等级间抖动。
-        assert!(eff < 1e-5, "中心合成位移应为 0，实际 {eff}（距边 {de}）");
+        let eff = edge * bevel_weight(de, 8.0);
+        // 距边 30px、圆角半径 8 ⇒ 带外，权重严格为 0（不再是 exp 的长尾）。
+        assert_eq!(eff, 0.0, "中心合成位移应为 0，实际 {eff}（距边 {de}）");
         // 而边缘处应当实打实地有折射。
         let d_edge = glass_sdf([99.0, 29.0], HALF, 8.0);
         let de_edge = dist_to_edge([99.0, 29.0], HALF, d_edge);
@@ -500,16 +556,82 @@ mod tests {
     }
 
     #[test]
-    fn edge_falloff_peaks_at_edge() {
-        assert!(edge_falloff(0.0, 0.4) > 0.99, "边缘处权重应接近 1");
+    fn bevel_weight_is_band_limited_and_smooth() {
+        // 轮廓处满权重、带内端严格归零——严格为零（不是 exp 的 1.8% 长尾）
+        // 才不会在平坦区留一条硬棱。
+        assert!(bevel_weight(0.0, 8.0) > 0.99, "轮廓处权重应接近 1");
+        assert_eq!(bevel_weight(8.0, 8.0), 0.0, "带内端必须严格为 0");
+        assert_eq!(bevel_weight(50.0, 8.0), 0.0, "带外恒为 0");
+        // 单调递减。
+        let mut prev = 1.0;
+        for i in 1..=8 {
+            let w = bevel_weight(i as f32, 8.0);
+            assert!(w < prev, "权重应单调递减：{i}px 处 {w} ≥ {prev}");
+            prev = w;
+        }
+        // 内端斜率为 0（与平坦区严丝合缝）：最后一格的差分必须远小于第一格。
+        let first = bevel_weight(0.0, 8.0) - bevel_weight(1.0, 8.0);
+        let last = bevel_weight(7.0, 8.0) - bevel_weight(8.0, 8.0);
         assert!(
-            edge_falloff(50.0, 0.4) < 1e-6,
-            "深入内部 50px 权重应接近 0"
+            last < first * 0.25,
+            "带内端应平滑归零：首格 {first}、末格 {last}"
         );
-        // 单调递减
-        let a = edge_falloff(1.0, 0.4);
-        let b = edge_falloff(2.0, 0.4);
-        assert!(a > b, "衰减应单调：{a} > {b}");
+        // 带宽随圆角半径走（与形状同源）。
+        assert!(
+            bevel_weight(12.0, 16.0) > bevel_weight(12.0, 8.0),
+            "圆角大的卡片斜角带更宽"
+        );
+        // 退化：半径为 0 时不得除零 / NaN。
+        assert!(bevel_weight(3.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn specular_is_directional() {
+        // Apple 的要点：高光**取代描边**且朝向光源的一侧最亮。各向同性的
+        // 写法过不了这条——它四边一样亮。
+        let light = [-0.6, -0.8]; // 左上打光（屏幕空间 y 向下）
+        // 最亮处是**外法线与光源同向**的那一小段轮廓（本例即左上方向的
+        // 斜边），不是「整个上边缘」——这正是它取代描边后仍读作玻璃的
+        // 原因：亮带沿轮廓渐变，而不是一圈等宽的线。
+        let lit = specular_rim(light, light, 8.0);
+        let back = specular_rim([0.6, 0.8], light, 8.0);
+        assert!(lit > 0.99, "正对光源处应几乎全亮，实际 {lit}");
+        assert_eq!(back, 0.0, "背光侧不得有高光，实际 {back}");
+        // 上边缘比左边缘亮（光源更偏上），右/下边缘完全不亮。
+        let up = specular_rim([0.0, -1.0], light, 8.0);
+        let down = specular_rim([0.0, 1.0], light, 8.0);
+        let left = specular_rim([-1.0, 0.0], light, 8.0);
+        let right = specular_rim([1.0, 0.0], light, 8.0);
+        assert!(up > left && left > 0.0, "上 > 左 > 0：{up} / {left}");
+        assert_eq!(down, 0.0, "下边缘背光，实际 {down}");
+        assert_eq!(right, 0.0, "右边缘背光，实际 {right}");
+        // 平坦区（法线为零向量）没有高光。
+        assert_eq!(specular_rim([0.0, 0.0], light, 8.0), 0.0);
+        // 锐度越大高光越集中（斜射处衰减更快）。
+        assert!(specular_rim([-1.0, 0.0], light, 32.0) < left);
+    }
+
+    #[test]
+    fn luminosity_adapt_compresses_toward_mid_grey() {
+        // Apple regular 变体：亮底压暗、暗底提亮，前景对比度才不随壁纸漂移。
+        let bright = luminosity_adapt([0.9, 0.9, 0.9], 0.25);
+        let dark = luminosity_adapt([0.1, 0.1, 0.1], 0.25);
+        assert!(bright[0] < 0.9, "亮底应被压暗，实际 {bright:?}");
+        assert!(dark[0] > 0.1, "暗底应被提亮，实际 {dark:?}");
+        // gain = 0 恒等。
+        assert_eq!(luminosity_adapt([0.7, 0.2, 0.4], 0.0), [0.7, 0.2, 0.4]);
+        // 只动亮度、不动色相：三通道同比例 ⇒ 比值不变。
+        let src = [0.8, 0.4, 0.2];
+        let out = luminosity_adapt(src, 0.25);
+        assert!(
+            ((out[0] / out[1]) - (src[0] / src[1])).abs() < 1e-5,
+            "色相必须保持：{src:?} -> {out:?}"
+        );
+        // 已经落在中灰上的输入几乎不动。
+        let mid = luminosity_adapt([0.5, 0.5, 0.5], 0.25);
+        assert!((mid[0] - 0.5).abs() < 1e-6, "中灰不该被推动：{mid:?}");
+        // 极端输入不得产生负比例。
+        assert!(luminosity_adapt([1.0, 1.0, 1.0], 1.0).iter().all(|c| *c >= 0.0));
     }
 
     #[test]
@@ -656,6 +778,7 @@ mod tests {
             ("SURFACE_TILT", SURFACE_TILT),
             ("EDGE_NXY", EDGE_NXY),
             ("EDGE_FACTOR", EDGE_FACTOR),
+            ("LUMA_TARGET", LUMA_TARGET),
         ] {
             let decl = format!("const {name}: f32 = ");
             let at = src

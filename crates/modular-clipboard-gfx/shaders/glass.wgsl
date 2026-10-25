@@ -39,6 +39,9 @@
 // | `dist_edge` | `glass::dist_to_edge` |
 // | `dome_slope` | `glass::dome_slope` |
 // | `fresnel` | `glass::fresnel_edge` |
+// | `bevel_weight` | `glass::bevel_weight` |
+// | `specular`（内联） | `glass::specular_rim` |
+// | `luma` / `adapt_luma` | `glass::luminance` / `glass::luminosity_adapt` |
 //
 // # 坐标约定
 //
@@ -97,8 +100,37 @@ const FROST_SCALE: f32 = 36.0;
 /// 24px：视觉上彩边只出现在边缘一两毫米内，再往里看不出来。
 const DISPERSION_BAND: f32 = 24.0;
 
-/// Fresnel 亮边的 RGB 增益（冷白色，略偏蓝）。
+/// Fresnel 亮边的 RGB 增益（冷白色，略偏蓝）。宽而各向同性，是「环境反射」
+/// 那一层；方向性的镜面高光另算（见 [`SPEC_TINT`]）。
 const RIM_TINT: vec3<f32> = vec3<f32>(0.20, 0.23, 0.28);
+
+/// 镜面高光的颜色（冷白）与强度。
+///
+/// Apple：「一圈**镜面高光取代描边**，朝向光源的一侧最亮，背光一侧淡下去」。
+/// 这一层是**方向性**的（Blinn-Phong 的 `dot(N, L)`），与上面各向同性的
+/// Fresnel 相加：前者是光源的锐利反光，后者是环境的宽反射。
+const SPEC_TINT: vec3<f32> = vec3<f32>(0.85, 0.92, 1.0);
+const SPEC_GAIN: f32 = 0.45;
+/// 光源方向（屏幕空间，y 向下 ⇒ 左上打光）。必须是**单位**向量。
+const LIGHT_DIR: vec2<f32> = vec2<f32>(-0.6, -0.8);
+/// `glass_edge` 滑块到 Blinn-Phong 锐度的换算（滑块 0.5~12 ⇒ 锐度 4~96）。
+const SPEC_SHININESS: f32 = 8.0;
+
+/// 模糊底图跟随折射的比例（0 = 不跟，1 = 与清晰图同幅）。
+///
+/// Apple 的实现是把**位移图**作用在模糊之后的背景上（先把界面缩小、
+/// 再把边缘向外拉伸），各家移植 likewise 都是 `sample(blurredScene, uv + d)`。
+/// 只让清晰图位移、模糊图原地不动 ⇒ 中心（那里 `frost` 高、几乎全用模糊
+/// 图）完全没有透镜感，玻璃会退化成「糊底 + 一圈会动的贴图」。
+///
+/// 取 0.55 而不是 1.0：模糊图已经丢掉高频，位移太大只会让画面整体漂移。
+const BLUR_REFRACT: f32 = 0.55;
+
+/// 亮度自适应强度（Apple「regular」变体调整背景亮度以保住前景可读性）。
+/// 0 = 关闭。见 `glass::luminosity_adapt`。
+const LUMA_GAIN: f32 = 0.18;
+/// 亮度自适应的目标中灰。
+const LUMA_TARGET: f32 = 0.5;
 
 struct GlassUniforms {
     /// 卡片矩形，`xy = 中心`、`zw = 半尺寸`，单位是**目标像素**。
@@ -318,6 +350,33 @@ fn dome_offset(local: vec2<f32>, eta: f32, power: f32) -> vec2<f32> {
     return refract_uv(dome_slope(local), eta, power);
 }
 
+/// 斜角（bevel）带的折射权重：轮廓处 1、带内端 0。与 `glass::bevel_weight`
+/// 一致。
+///
+/// # 为什么不是 `exp(-de · 0.4)`
+///
+/// 指数衰减的尺度与形状无关，且带内端还剩 1.8% 时被 SDF 的零法线**突然
+/// 截断** ⇒ 平滑表面上留一条隐约的棱。Apple 的模型是「带斜边的板」：
+/// 斜边宽度 = 圆角半径，剖面在轮廓处最陡、在带内端水平。位移 ∝ 剖面斜率
+/// ⇒ 取 `(1 - x)²`（`x = de / radius`）：轮廓处 1、内端 0 且斜率为 0，
+/// 与平坦区严丝合缝，带宽还自动跟着圆角走。
+fn bevel_weight(de: f32, radius: f32) -> f32 {
+    let x = clamp(de / max(radius, 1.0), 0.0, 1.0);
+    let t = 1.0 - x;
+    return t * t;
+}
+
+/// 相对亮度（Rec.709）。
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+/// 亮度自适应：把底图亮度朝 `LUMA_TARGET` 收一点（三通道同比例 ⇒ 只动
+/// 亮度、不动色相）。与 `glass::luminosity_adapt` 一致，理由见那里。
+fn adapt_luma(c: vec3<f32>, gain: f32) -> vec3<f32> {
+    return c * max(1.0 + gain * (LUMA_TARGET - luma(c)), 0.0);
+}
+
 @fragment
 fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
     // 磨砂底图：不在任何卡片内的像素原样输出（与 Acrylic 逐字节一致）。
@@ -356,9 +415,15 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         let d = sn.d;
         let n = sn.n;
 
-        // ---- 距边距离 / 衰减 ----
+        // ---- 距边距离 / 斜角权重 ----
         let de = dist_edge(p, half, d);
-        let fall = exp(-de * 0.4);          // 边缘处 ≈1，深入内部 →0
+        // 斜角带：只在距边 `radius` 像素以内折，带外严格为 0。
+        //
+        // CAUTION: `u.radius` 目前取**第一张**面板的圆角（`GlassParams::uniform`
+        // 的注释有说明）。斜角带宽跟着它走，所以同一帧里的面板应当共用
+        // 同一档圆角——本项目实际如此（都走 `paint` 的圆角常量），差个
+        // 一两像素只表现为亮带宽一点，不会出错。
+        let w = bevel_weight(de, u.radius);
         let local = p / half;               // 归一化到 [-1,1]
         let slope = dome_slope(local);
 
@@ -369,16 +434,16 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // 色散的差异只体现在边缘轮廓折射上——那里位移大、差异才看得见。
         let dome_c = dome_offset(local, DEFAULT_ETA, u.refract * DOME_RATIO);
         // 参考位移（`dispersion = 0` 时三通道共用它）。
-        let dref = refract_uv(n, DEFAULT_ETA, u.refract) * fall + dome_c;
-        let dg = refract_uv(n, 1.0 / IOR_G, u.refract) * fall + dome_c;
+        let dref = refract_uv(n, DEFAULT_ETA, u.refract) * w + dome_c;
+        let dg = refract_uv(n, 1.0 / IOR_G, u.refract) * w + dome_c;
         // 色散只在**靠近边缘**时启用（见 `DISPERSION_BAND`）：内部三通道
         // 位移几乎重合，分开采样纯浪费带宽。
         let eff_disp = select(0.0, u.dispersion, de < DISPERSION_BAND);
 
         var sharp_rgb: vec3<f32>;
         if (eff_disp > 0.001) {
-            let dr = refract_uv(n, 1.0 / IOR_R, u.refract) * fall + dome_c;
-            let db = refract_uv(n, 1.0 / IOR_B, u.refract) * fall + dome_c;
+            let dr = refract_uv(n, 1.0 / IOR_R, u.refract) * w + dome_c;
+            let db = refract_uv(n, 1.0 / IOR_B, u.refract) * w + dome_c;
             let off_r = mix(dref, dr, eff_disp);
             let off_g = mix(dref, dg, eff_disp);
             let off_b = mix(dref, db, eff_disp);
@@ -396,22 +461,45 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // ---- 磨砂 / 清晰混合：边缘清晰、中心磨砂 ----
         //
         // `de` 是**距边距离**：贴边处 `frost → 0` 取折射后的清晰图，
-        // 深入内部 `frost → 0.85` 主要是磨砂。与折射衰减 `fall` 正好
+        // 深入内部 `frost → 0.85` 主要是磨砂。与斜角权重 `w` 正好
         // 反向——贴边处折射最强且最清晰（那是液态玻璃的辨识特征），
         // 内部折射归零、退回磨砂。
         //
         // CAUTION: 上限取 0.85 而不是 1.0：整片纯磨砂就退回 Acrylic，
         // 留 15% 的清晰分量让中心也有一点「玻璃感」而不是一块色块。
-        let frost = clamp(de / FROST_SCALE, 0.0, 1.0) * 0.85;
-        var rgb = mix(sharp_rgb, blurred.rgb, frost);
-
-        // ---- Fresnel 边缘光 ----
         //
-        // 用**斜率场**而不是 SDF 梯度：后者在内部恒 0、贴边为 1，
+        // 磨砂那一路**也**按折射位移采样（见 `BLUR_REFRACT`）：位移图在
+        // Apple 的实现里作用在模糊之后的背景上，只让清晰图位移会让占
+        // 面积大多数的中心完全没有透镜感。
+        let bref = mix(dref, dg, eff_disp) * BLUR_REFRACT;
+        let blur_rgb = textureSampleLevel(blur_tex, glass_sampler, in.uv + copy_pc.offset + bref, 0.0).rgb;
+        let frost = clamp(de / FROST_SCALE, 0.0, 1.0) * 0.85;
+        var rgb = mix(sharp_rgb, blur_rgb, frost);
+
+        // ---- 亮度自适应（Apple regular 变体）----
+        //
+        // 亮底压暗、暗底提亮：卡片上的前景文字对比度不随壁纸/桌面内容
+        // 漂移。放在混合**之后**、高光**之前**——高光是光源的反光，
+        // 不该被底图的亮度修正吃掉。
+        rgb = adapt_luma(rgb, LUMA_GAIN);
+
+        // ---- 轮廓：Fresnel（宽、各向同性）+ 镜面高光（锐、方向性）----
+        //
+        // Fresnel 用**斜率场**而不是 SDF 梯度：后者在内部恒 0、贴边为 1，
         // 用 `1-|n|` 形式的公式会让整片内部最亮（物理映射反了）。
-        // 见 `glass::fresnel_edge` 的 CAUTION。
+        // 见 `glass::fresnel_edge` 的 CAUTION。这一层是「环境反射」，
+        // 四边都有一点。
         let f = pow(clamp(length(slope), 0.0, 1.0), max(u.edge, 0.0));
         rgb = rgb + RIM_TINT * f;
+        //
+        // 镜面高光才是 Apple 那句「**用一圈高光取代描边**」：朝向光源的
+        // 一侧最亮、背光一侧为 0。关键在两点——
+        //   ① 用斜角带的**朝外法线** `n` 与光源方向点积（方向性）；
+        //   ② 再乘斜角权重 `w`：它只在轮廓带上成立，平坦区 `n = 0`
+        //      本来也不会有高光，乘 `w` 是为了让它在带内端平滑收尾。
+        // 少任何一点都会退回「四边一样亮的描边」。
+        let spec = pow(max(dot(n, LIGHT_DIR), 0.0), max(u.edge, 0.5) * SPEC_SHININESS);
+        rgb = rgb + SPEC_TINT * (spec * SPEC_GAIN * w);
 
         // ---- 输出：必须**预乘** ----
         //
