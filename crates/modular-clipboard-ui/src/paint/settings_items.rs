@@ -609,6 +609,11 @@ pub(super) fn item_hidden(
         "ui.card_opacity" => {
             cfg.ui.window_backdrop == WindowBackdrop::None && cfg.ui.card_blur == 0
         }
+        // 卡片磨砂：玻璃模式下**整项隐藏**（2026-10-25）。玻璃 pass 用
+        // 双底图折射充当卡片的身后内容（`row.rs` 跳过不透明补丁），每张
+        // 卡片各自的 CPU 模糊补丁不再绘制、捕获链也停了——这一项在玻璃
+        // 模式下是死的，铺在设置里就是「看得见但拖了没反应」。
+        "ui.card_blur" => cfg.ui.window_backdrop == WindowBackdrop::Glass,
         // 风格参数：二级主题选「无」时没有任何旋钮。
         "ui.secondary_theme_params" => cfg.ui.secondary_theme.knobs().is_empty(),
         // 迷你面板子项：总开关关闭时整组隐藏（总开关行恒显示）。

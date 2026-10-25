@@ -132,7 +132,21 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     f.push_glass(r, radius);
     // `Color32::a()` 给的是 0~255 的 u8，玻璃 pass 要 0~1 的 f32。
     f.set_glass_card_alpha(pal.card_bg.a() as f32 / 255.0);
-    if let Some(tex) = f.state.card_blur_tex.as_ref() {
+    // 卡片磨砂补丁：**玻璃模式下不画**（2026-10-25 修「玻璃参数无效」）。
+    //
+    // 病根：这层补丁是 GDI 捕获的**不透明**纹理，画在玻璃 pass 之后，
+    // 把卡片矩形内的折射产出**整个盖住**——玻璃模式下卡片看到的仍是
+    // 「不透明补丁 + 卡片色」，与磨砂模式逐字节一致，折射/色散/边缘光
+    // 三个参数于是无处生效（实测只变 refract：A/B 差异 0.02%，噪声级）。
+    //
+    // 玻璃模式下卡片的「身后内容」由玻璃 pass 提供（清晰+模糊双底图、
+    // 按卡片形状两级折射，输出 alpha = 卡片色 alpha），补丁属于被取代
+    // 的旧机制，继续画只会帮倒忙。磨砂/半透明模式照画（那里没有玻璃
+    // pass，补丁是卡片能透出身后桌面的唯一途径）。
+    if f.svc.state.config.ui.window_backdrop
+        != modular_clipboard_core::config::WindowBackdrop::Glass
+        && let Some(tex) = f.state.card_blur_tex.as_ref()
+    {
         let mut shape = egui::epaint::RectShape::filled(r, radius, egui::Color32::WHITE);
         // `brush` 是 `Option<Arc<Brush>>`——纹理刷子要能在图元之间
         // 共享（同一张底图被几十张卡片采样），所以是 Arc 而不是值。

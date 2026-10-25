@@ -735,11 +735,22 @@ pub(super) fn run_mode(
         // 捕获本身在渲染层按 30fps 节流，这里只是把结果交给 `UiState`。
         // 失败只用 warn：抓屏失败不该杀死界面（与磨砂背景同款取舍）。
         let want_card_blur = app.svc.state.config.ui.card_blur;
-        if want_card_blur != applied_card_blur {
-            painter.set_card_blur(want_card_blur);
-            applied_card_blur = want_card_blur;
+        // 玻璃模式下卡片磨砂补丁**不画**（身后内容由玻璃 pass 的双底图
+        // 折射提供，见 `row.rs` 2026-10-25 的注释）⇒ 把捕获级别压到 0，
+        // 省掉「CPU 降采样 + 纹理上传」整条链。切回磨砂/半透明时下面
+        // 的差值比对会自动恢复真实档位。
+        let effective_card_blur = if app.svc.state.config.ui.window_backdrop
+            == modular_clipboard_core::config::WindowBackdrop::Glass
+        {
+            0
+        } else {
+            want_card_blur
+        };
+        if effective_card_blur != applied_card_blur {
+            painter.set_card_blur(effective_card_blur);
+            applied_card_blur = effective_card_blur;
         }
-        if want_card_blur > 0 && !hidden && !window.is_minimized() {
+        if effective_card_blur > 0 && !hidden && !window.is_minimized() {
             // 背景是**磨砂**时抓屏由背景管线顺带做（共享一次 `BitBlt`），
             // 这里只把结果取走；否则才单独抓一次。
             let acrylic = app.svc.state.config.ui.window_backdrop

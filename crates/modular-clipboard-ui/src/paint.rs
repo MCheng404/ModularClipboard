@@ -5902,6 +5902,41 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
+    /// 玻璃模式下「卡片磨砂」行必须整项隐藏（2026-10-25 修「玻璃参数无效」）。
+    ///
+    /// 玻璃 pass 用「清晰 + 模糊」双底图折射充当卡片的身后内容
+    /// （`row.rs` 在玻璃模式下跳过不透明的每卡磨砂补丁，捕获链也停了）
+    /// ⇒ 这一项在玻璃模式下是死的。铺在设置里就是「看得见但拖了没
+    /// 反应」——与磨砂强度同一类依赖项：不可用即不存在。
+    #[test]
+    fn card_blur_row_hidden_in_glass_mode() {
+        use modular_clipboard_core::config::WindowBackdrop;
+        // 「行卡片」卡是外观第 5 张，高视口才装得下（同 card_shadow 测试）。
+        let mut h = Harness::new("cardblur-hide", vec2(780.0, 1600.0));
+        h.state.show_settings = true;
+        h.state.settings_cat = SettingsCat::Appearance;
+        // 玻璃：隐藏。
+        h.svc.state.config.ui.window_backdrop = WindowBackdrop::Glass;
+        h.settings_frame();
+        // CAUTION: 热键是 `"card_blur"` 而非 item key `"ui.card_blur"`——
+        // `draw_slider` 的 `id_suffix` 在该行是硬编码的（settings_rows.rs
+        // 的 CardBlur 臂），与其余行传 `it.key` 的惯例不一致（既有状况）。
+        assert!(
+            h.state.hit.get(HitNs::Settings, "card_blur").is_none(),
+            "玻璃模式下卡片磨砂行应整项隐藏（该机制已被玻璃 pass 取代）"
+        );
+        // 磨砂：显示（补丁是卡片透出身后桌面的唯一途径）。
+        h.svc.state.config.ui.window_backdrop = WindowBackdrop::Acrylic;
+        h.settings_frame();
+        assert!(
+            h.state
+                .hit
+                .get(HitNs::Settings, "card_blur")
+                .is_some_and(|r| r.width() > 0.0 && r.height() > 0.0),
+            "磨砂模式下卡片磨砂行应显示"
+        );
+    }
+
     /// 组标题行点一次收起、再点一次展开（快照语义）。
     ///
     /// 2026-10-24 用户反馈「液态玻璃无法展开」。根因是折叠状态用
