@@ -36,3 +36,7 @@ shot-*.png
 *.log
 *.err
 
+# 一次性验证产物（截图 + 脚本，仅供本地确认，不入库）
+settings_verify_*.png
+scripts/_verify_*.py
+
