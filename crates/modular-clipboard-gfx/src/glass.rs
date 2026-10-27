@@ -258,21 +258,66 @@ pub fn luminance(rgb: [f32; 3]) -> f32 {
 /// 亮度自适应的目标中灰，见 [`luminosity_adapt`]。
 pub const LUMA_TARGET: f32 = 0.5;
 
-/// Apple「regular」变体的亮度自适应：**压缩**背后内容的亮度范围。
+/// 亮底压暗的**上限**（相对亮度 1.0 处压暗多少）。
+///
+/// 取自 HIG Materials 对 clear 变体的规定：背景明亮时叠一层
+/// **35% 不透明度的暗色调光层**。这一档比「对称压缩」更狠，但它是
+/// 玻璃变透之后唯一的可读性保险——中心磨砂从 0.85 降到 0.5 之后，
+/// 白底壁纸上的深色文字全靠这一层撑住对比度。
+pub const LUMA_DIM_MAX: f32 = 0.35;
+
+/// 暗底提亮的**上限**（相对亮度 0.0 处提亮多少）。
+///
+/// 对应 Apple 玻璃的 exposure boost：暗底上玻璃要「透光」而不是发灰。
+/// 取 0.20 而不是与压暗对称的 0.35：提亮过多会把纯黑壁纸洗成中灰，
+/// 玻璃反而失去「透」的观感（暗色反而更该保持深）。
+pub const LUMA_LIFT_MAX: f32 = 0.20;
+
+/// 磨砂/清晰混合的距离尺度（像素）：离边超过这么多像素即算「内部」。
+///
+/// 2026-10-27 从 36 提到 56：列表行卡片只有 56~70pt 高，`36` 的尺度
+/// 意味着几乎整张卡片都落在「内部」档（满磨砂）——玻璃读起来是一块
+/// 半透明色块，而不是一块透镜。放大尺度让**边缘清晰带**占满卡片高度
+/// 的三分之一左右，才看得出「折射 + 通透」。
+pub const FROST_SCALE: f32 = 56.0;
+
+/// 内部（远离边缘）保留的磨砂比例上限。
+///
+/// 0 = 中心完全清晰（纯透镜），1 = 中心完全磨砂（退回 Acrylic）。
+/// 取 0.5：HIG 把「高度透明」的 clear 变体留给媒体背景，而 regular
+/// 变体的可读性由亮度自适应 + 卡片色承担。0.85 那档（2026-10-25 的
+/// 取值）在深色壁纸上会把玻璃读成一块发灰的色块——这正是「不够通透」
+/// 的来源。
+pub const FROST_MAX: f32 = 0.5;
+
+/// 亮度自适应：**非对称**地压缩底图亮度。
 ///
 /// HIG 写得很直接：regular 变体「blurs and **adjusts the luminosity of
 /// background content** to maintain legibility」；clear 变体在内容偏亮时
 /// 建议叠一层 35% 的暗色；visionOS 的 glass「limits the range of background
 /// color information so a window can continue to provide contrast」。
 ///
-/// 三者是同一件事的两面：亮底压暗、暗底提亮，把底图亮度往中灰收一点，
-/// 前景（本项目是卡片上的文字）的对比度就不随壁纸/桌面内容漂移。
+/// # 为什么不是对称的 `1 + gain·(target − luma)`
 ///
-/// 实现是**三通道同比例缩放** `k = 1 + gain·(target − luma)`：只动亮度、
-/// 不动色相与饱和（逐通道各自拉向中灰会把颜色一起洗掉）。`gain = 0`
-/// 时恒等。
-pub fn luminosity_adapt(rgb: [f32; 3], gain: f32) -> [f32; 3] {
-    let k = (1.0 + gain * (LUMA_TARGET - luminance(rgb))).max(0.0);
+/// 对称式在 `gain = 0.18` 时只把纯白压 9%、纯黑提 9%——对「白底上的
+/// 深色文字」这种最常见也最糟的组合不够。而玻璃变透之后，可读性全靠
+/// 这一层。所以按 HIG 的两条指引分开定档：
+///
+/// - 亮底：线性压暗，`luma = 1` 时压到 `1 - dim_max`（默认 0.35）；
+/// - 暗底：线性提亮，`luma = 0` 时提到 `1 + lift_max`（默认 0.20）。
+///
+/// 三通道**同比例**缩放：只动亮度，不动色相与饱和（逐通道各自拉向
+/// 中灰会把颜色一起洗掉）。
+pub fn luminosity_adapt(rgb: [f32; 3], dim_max: f32, lift_max: f32) -> [f32; 3] {
+    let l = luminance(rgb);
+    let k = if l > LUMA_TARGET {
+        // 亮底：l 从 target → 1 时，系数从 1 线性降到 1 - dim_max。
+        1.0 - dim_max * (l - LUMA_TARGET) / (1.0 - LUMA_TARGET).max(1e-3)
+    } else {
+        // 暗底：l 从 target → 0 时，系数从 1 线性升到 1 + lift_max。
+        1.0 + lift_max * (LUMA_TARGET - l) / LUMA_TARGET.max(1e-3)
+    }
+    .max(0.0);
     [rgb[0] * k, rgb[1] * k, rgb[2] * k]
 }
 
@@ -613,25 +658,40 @@ mod tests {
 
     #[test]
     fn luminosity_adapt_compresses_toward_mid_grey() {
-        // Apple regular 变体：亮底压暗、暗底提亮，前景对比度才不随壁纸漂移。
-        let bright = luminosity_adapt([0.9, 0.9, 0.9], 0.25);
-        let dark = luminosity_adapt([0.1, 0.1, 0.1], 0.25);
+        // 非对称压缩：亮底最多压 dim_max（HIG clear 变体的 35% 调光层），
+        // 暗底最多提 lift_max（Apple 的 exposure boost）。
+        let bright = luminosity_adapt([0.9, 0.9, 0.9], LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        let dark = luminosity_adapt([0.1, 0.1, 0.1], LUMA_DIM_MAX, LUMA_LIFT_MAX);
         assert!(bright[0] < 0.9, "亮底应被压暗，实际 {bright:?}");
         assert!(dark[0] > 0.1, "暗底应被提亮，实际 {dark:?}");
-        // gain = 0 恒等。
-        assert_eq!(luminosity_adapt([0.7, 0.2, 0.4], 0.0), [0.7, 0.2, 0.4]);
+        // 纯白压到 1 - dim_max、纯黑提到 1 + lift_max（两端的定档）。
+        let white = luminosity_adapt([1.0, 1.0, 1.0], LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        assert!(
+            (white[0] - (1.0 - LUMA_DIM_MAX)).abs() < 1e-5,
+            "纯白应压到 {}，实际 {}",
+            1.0 - LUMA_DIM_MAX,
+            white[0]
+        );
+        let black = luminosity_adapt([0.0, 0.0, 0.0], LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        assert!(black[0] == 0.0, "纯黑乘任何系数仍是 0：{black:?}");
+        // 关闭时恒等。
+        assert_eq!(luminosity_adapt([0.7, 0.2, 0.4], 0.0, 0.0), [0.7, 0.2, 0.4]);
         // 只动亮度、不动色相：三通道同比例 ⇒ 比值不变。
         let src = [0.8, 0.4, 0.2];
-        let out = luminosity_adapt(src, 0.25);
+        let out = luminosity_adapt(src, LUMA_DIM_MAX, LUMA_LIFT_MAX);
         assert!(
             ((out[0] / out[1]) - (src[0] / src[1])).abs() < 1e-5,
             "色相必须保持：{src:?} -> {out:?}"
         );
         // 已经落在中灰上的输入几乎不动。
-        let mid = luminosity_adapt([0.5, 0.5, 0.5], 0.25);
+        let mid = luminosity_adapt([0.5, 0.5, 0.5], LUMA_DIM_MAX, LUMA_LIFT_MAX);
         assert!((mid[0] - 0.5).abs() < 1e-6, "中灰不该被推动：{mid:?}");
-        // 极端输入不得产生负比例。
-        assert!(luminosity_adapt([1.0, 1.0, 1.0], 1.0).iter().all(|c| *c >= 0.0));
+        // 极端输入不得产生负比例（dim_max > 1 是配置外的输入，也不能出负数）。
+        assert!(
+            luminosity_adapt([1.0, 1.0, 1.0], 1.0, 1.0)
+                .iter()
+                .all(|c| *c >= 0.0)
+        );
     }
 
     #[test]
@@ -779,6 +839,10 @@ mod tests {
             ("EDGE_NXY", EDGE_NXY),
             ("EDGE_FACTOR", EDGE_FACTOR),
             ("LUMA_TARGET", LUMA_TARGET),
+            ("LUMA_DIM_MAX", LUMA_DIM_MAX),
+            ("LUMA_LIFT_MAX", LUMA_LIFT_MAX),
+            ("FROST_SCALE", FROST_SCALE),
+            ("FROST_MAX", FROST_MAX),
         ] {
             let decl = format!("const {name}: f32 = ");
             let at = src

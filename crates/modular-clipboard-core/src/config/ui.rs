@@ -13,6 +13,7 @@ use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
 use super::window::WindowPos;
 use super::window::default_card_blur;
+use super::window::default_backdrop_scale;
 use super::window::default_glass_blur;
 use super::window::default_glass_dispersion;
 use super::window::default_glass_edge;
@@ -151,6 +152,22 @@ pub struct UiConfig {
     /// Fresnel 边缘光幂次（0.5 ~ 12）。
     #[serde(default = "default_glass_edge")]
     pub glass_edge: f32,
+    /// 抓屏分辨率百分比（15 ~ 200，默认 50；>100 为超采样）。
+    ///
+    /// 磨砂与玻璃的底图都是 GDI `BitBlt` 抓的整窗客户区，再上传 GPU
+    /// 卷积。抓屏与上传是这条管线里最贵的两步（同步阻塞 + 每帧 MB 级
+    /// 上传），而底图最终会被高斯糊掉——分辨率越低越省。
+    ///
+    /// # 为什么是百分比而不是固定倍率
+    ///
+    /// 玻璃的「边缘清晰带」是**不模糊**的（`FROST_MAX` 之外那一圈），
+    /// 它对分辨率最敏感：1/2 抓屏在 4K 屏上放大回卡片尺寸后能看出台阶。
+    /// 固定倍率只有 1/2、1/3、1/4 这些整数档，表达不了「70%」；百分比
+    /// 让用户在「省资源」与「边缘锐度」之间连续取舍。
+    ///
+    /// 默认 50 与历史行为（1/2 降采样）逐像素一致，升级后观感不变。
+    #[serde(default = "default_backdrop_scale")]
+    pub backdrop_scale: u8,
     /// 磨砂强度档位（1 ~ 10，默认 7）。仅在 `window_backdrop == Acrylic`
     /// 时生效。
     ///

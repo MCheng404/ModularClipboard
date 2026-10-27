@@ -107,6 +107,19 @@ impl Store {
     }
 
     /// 启动时清理孤儿载荷文件（主库中无对应记录）。
+    ///
+    /// 回收两类残留：
+    /// 1. `{hash}.bin` —— 主库中已无任何行引用；
+    /// 2. `{hash}.bin.tmp` —— `blobs::write_blob_atomic` 的中间态。进程在
+    ///    `fs::write` 与 `rename` 之间被强杀/断电时会留下它，而它**永远
+    ///    不会被引用**（正常写入成功即被 rename 掉），所以启动时一律回收。
+    ///    早先只匹配 `.bin`，这类残留在长期运行的机器上会一直累积。
+    ///
+    /// CAUTION: 单个文件删不掉（被其它进程占用、权限不足）只记日志并继续，
+    /// 不上抛。早先 `remove_file(&p)?` 会让一个坏文件中断整轮 GC——后面
+    /// 的孤儿全留到下次启动，且调用方只看到一条 Err、误以为「什么都没清」。
+    ///
+    /// 返回实际删除的文件数。
     pub fn gc_orphan_blobs(&self) -> Result<usize> {
         let mut referenced: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -120,16 +133,43 @@ impl Store {
             }
         }
 
-        let mut removed = 0;
-        for entry in std::fs::read_dir(&self.blob_dir)? {
-            let p = entry?.path();
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.ends_with(".bin") && !referenced.contains(name) && p.is_file() {
-                std::fs::remove_file(&p)?;
-                removed += 1;
+        let entries = match std::fs::read_dir(&self.blob_dir) {
+            Ok(e) => e,
+            // 目录还没建（全新安装 / 刚被清空）：没有孤儿可清，不是错误。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut removed = 0usize;
+        let mut failed = 0usize;
+        for entry in entries {
+            let Ok(entry) = entry else {
+                failed += 1;
+                continue;
+            };
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let orphan = if name.ends_with(".bin") {
+                !referenced.contains(name)
+            } else {
+                name.ends_with(".bin.tmp")
+            };
+            if !orphan || !p.is_file() {
+                continue;
             }
+            match std::fs::remove_file(&p) {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(file = %name, error = %e, "孤儿载荷删除失败，下次启动重试");
+                }
+            }
+        }
+        if failed > 0 {
+            tracing::warn!(failed, removed, "部分孤儿载荷未能回收");
         }
         Ok(removed)
     }
-
 }

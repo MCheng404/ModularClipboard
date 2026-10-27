@@ -73,6 +73,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Cannot edit image: content was evicted ({e})", "無法編輯圖片：內容已被淘汰（{e}）"),
     ("Cannot edit image: missing dimensions", "無法編輯圖片：缺少尺寸資訊"),
     ("Cannot edit: content was evicted ({e})", "無法編輯：內容已被淘汰（{e}）"),
+    ("Capture resolution", "抓屏解析度"),
+    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "擷取桌面的解析度；超過 100% 為超取樣，越高越清晰、開銷越大"),
     ("Cannot open the image editor:", "無法開啟圖片編輯視窗："),
     ("Capacity and cleanup", "容量與清理"),
     ("Capture", "擷取"),

@@ -88,13 +88,17 @@ pub(super) fn build_preview(payload: &CapturedPayload) -> String {
     match payload.kind {
         // Markdown 的预览即**源码前 512 字符**：界面按 Markdown 渲染
         // 这一截（与 Text 同样的截断取舍，PF-5 / SEC-018）。
-        ClipKind::Text | ClipKind::Html | ClipKind::Markdown => {
-            let raw = payload
-                .text
-                .clone()
-                .unwrap_or_else(|| String::from_utf8_lossy(&payload.bytes).to_string());
-            truncate_chars(&raw, PREVIEW_MAX_CHARS)
-        }
+        //
+        // NOTE: 这里不能 `payload.text.clone()` 再截断——文本类载荷最大可达
+        // `max_payload_bytes`（默认 32MB），为拿 512 字预览先把全文复制一遍
+        // 是每次复制粘贴都要付的整份内存带宽。借引用传给截断函数即可。
+        ClipKind::Text | ClipKind::Html | ClipKind::Markdown => match &payload.text {
+            Some(raw) => truncate_chars(raw, PREVIEW_MAX_CHARS),
+            None => truncate_chars(
+                &String::from_utf8_lossy(&payload.bytes),
+                PREVIEW_MAX_CHARS,
+            ),
+        },
         ClipKind::Files => {
             let names: Vec<String> = payload
                 .files
@@ -146,13 +150,24 @@ pub(super) fn build_preview(payload: &CapturedPayload) -> String {
 }
 
 /// 按字符数截断（char boundary 安全），超长时追加省略号。
+///
+/// NOTE: 用 `char_indices().nth(max)` 一次定位边界，而不是
+/// 「先 `chars().count()` 数一遍、再 `chars().take()` 走第二遍」——
+/// 前者在 `max + 1` 个字符处就停，后者要扫完全文。剪贴板里出现
+/// 几 MB 的文本是常态（日志、JSON、导出文件），这一处省下的是
+/// **每次复制**都要付的全文扫描。
 pub(super) fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
+    match s.char_indices().nth(max) {
+        // 字符数不超过 max：原样返回。
+        None => s.to_string(),
+        // `nth(max)` 给的是第 max+1 个字符的起始字节，正好是切点。
+        Some((cut, _)) => {
+            let mut out = String::with_capacity(cut + 3);
+            out.push_str(&s[..cut]);
+            out.push('…');
+            out
+        }
     }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
 }
 
 /// 读取图片尺寸（仅解析文件头，不解码像素）。

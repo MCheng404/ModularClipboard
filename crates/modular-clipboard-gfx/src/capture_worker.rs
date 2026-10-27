@@ -29,6 +29,11 @@ pub(super) struct CaptureReq {
     pub hwnd: isize,
     /// 交换链为 RGBA 字节序时置真（DIB 恒 BGRA，需要 swap）。
     pub swap_rb: bool,
+    /// 抓屏分辨率百分比（15 ~ 200，见 `backdrop::capture_scaled_pct`）。
+    ///
+    /// 随请求传递而不是由工作线程持有：它是**用户配置**，改设置后
+    /// 下一次请求就该生效，不该要求重启工作线程。
+    pub scale_pct: u8,
 }
 
 /// 抓屏结果。
@@ -85,7 +90,11 @@ impl CaptureWorker {
                             }
                         }
                     }
-                    match cap.as_mut().expect("刚确保存在").capture_behind(req.hwnd) {
+                    match cap
+                        .as_mut()
+                        .expect("刚确保存在")
+                        .capture_behind_pct(req.hwnd, req.scale_pct)
+                    {
                         Ok(Some((bits, w, h))) => {
                             let _ = tx_out.send(CaptureOut::Ok(bits.to_vec(), w, h));
                         }
@@ -113,7 +122,7 @@ impl CaptureWorker {
     ///
     /// 上一次请求还没处理完时**丢弃本次**：堆积会让延迟线性累积，
     /// 而磨砂晚一帧完全无感，堆积晚十帧就是肉眼可见的拖影。
-    pub fn request(&self, hwnd: isize, swap_rb: bool) {
+    pub fn request(&self, hwnd: isize, swap_rb: bool, scale_pct: u8) {
         let n = self.pending.load(std::sync::atomic::Ordering::Relaxed);
         if n >= 1 {
             return;
@@ -121,7 +130,7 @@ impl CaptureWorker {
         if self
             .tx
             .as_ref()
-            .and_then(|tx| tx.send(CaptureReq { hwnd, swap_rb }).ok())
+            .and_then(|tx| tx.send(CaptureReq { hwnd, swap_rb, scale_pct }).ok())
             .is_some()
         {
             self.pending

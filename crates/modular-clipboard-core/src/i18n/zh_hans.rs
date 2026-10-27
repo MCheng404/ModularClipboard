@@ -89,6 +89,8 @@ Config:
     ("Cannot edit image: content was evicted ({e})", "无法编辑图片：内容已被淘汰（{e}）"),
     ("Cannot edit image: missing dimensions", "无法编辑图片：缺少尺寸信息"),
     ("Cannot edit: content was evicted ({e})", "无法编辑：内容已被淘汰（{e}）"),
+    ("Capture resolution", "抓屏分辨率"),
+    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "抓取桌面的分辨率；超过 100% 为超采样，越高越清晰、开销越大"),
     ("Cannot open the image editor:", "无法打开图片编辑窗口:"),
     ("Capacity and cleanup", "容量与清理"),
     ("Capture", "捕获"),

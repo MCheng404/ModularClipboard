@@ -13,6 +13,7 @@
 | 第一轮 | 2026-10-08/09 | 4 Agent，46 条 | 全部闭环 |
 | 第二轮 | 2026-10-12 | 6 Agent，分批修复 | 大部分闭环，未修项附理由 |
 | 第三轮 | 2026-10-23 | 3 Agent + 手动 UI 审查，23 条 | P0/P1 已修 8 条，其余列后续 |
+| 第四轮 | 2026-10-27 | 第三轮遗留项收口 + 两处热路径 | 4 条闭环，见文末 |
 
 ---
 
@@ -699,3 +700,42 @@ P2 的 6 条中，DL-05（补一个 `id DESC`）与 DL-09（返回真实删除�
 需实机验证的结论：GFX-01（验证层复现）、GFX-02（空闲 GPU 占用/功耗对比）、GFX-04/05（关窗与缩略图事件的停顿时长）。其余结论均有静态行号证据支撑。
 
 ---
+
+## 第四轮：2026-10-27（遗留项收口）
+
+> 不新增审查面，只把第三轮**未闭环**的条目做完，并顺手处理两处热路径。
+> 全部改动都有回归测试，`./scripts/build.sh --test` 1016 条全绿、
+> clippy 零警告。
+
+### 已闭环
+
+| 编号 | 结论 | 落地 |
+|---|---|---|
+| DL-07 | 孤儿回收遇错即中断、且从不回收 `.tmp` | `gc_orphan_blobs` 逐文件容错（失败计数 + 告警、继续循环），`*.bin.tmp` 一并回收，载荷目录不存在时返回 0。测试 `gc_reclaims_orphans_and_tmp_leftovers`、`gc_tolerates_missing_blob_dir` |
+| DL-08 | 写入侧无文件名校验（任意文件写原语） | 新增 `is_safe_blob_name`，读/删侧（`safe_blob_path`）与写侧（`write_blob_atomic`）共用；补上冒号（盘符 / NTFS 数据流）与 DOS 设备名两类漏网。测试 `write_blob_atomic_refuses_unsafe_names`、`safe_blob_path_rejects_device_names_and_streams` |
+| DL-09 | `delete_many` 返回 `ids.len()` 而非真实删除数 | 改取 `DELETE` 受影响行数。测试 `delete_many_reports_actual_deleted_rows` |
+| GFX-06 | `painter` 注释声称已 `device_wait_idle`，实际只等本窗口 | 三处注释与 `wait_own_inflight` 对齐，并写明「按旧注释推理会放宽别的销毁约束」 |
+
+### 顺带做的结构性改进
+
+1. **「引用计数删载荷」收敛为一处**（`Store::remove_blob_if_unreferenced`）。
+   原先 delete / delete_many / update_content / insert 失败回滚四处各写一遍，
+   而且**四份行为并不一致**：insert 失败路径查询出错时保守不删，另外三处
+   把错误上抛——对 `delete` 尤其错，行已经删掉了，再报错只会让调用方以为
+   没删成。现在统一为「查询失败 ⇒ 保留 + 告警，留给 GC」。
+2. **`capture::strip_html` 重写为单趟字节扫描**：去掉 `Vec<char>` 全量拷贝
+   （UTF-8 的 4 倍内存）与每标签两次 `String` 分配。实测 268KB / 12008 标签
+   的样本 3.68ms → 0.43ms（8.5x），输出与旧实现逐字节一致。
+3. **`decode_entities` 改单趟**：原先 7 次 `str::replace` 串联，后一轮会解码
+   前一轮的产出（`&amp;nbsp;` → 空格，规范要求保留为 `&nbsp;`）。
+4. **预览截断不再克隆全文**：`build_preview` 原先 `payload.text.clone()` 后
+   才截断（文本载荷上限默认 32MB）；`truncate_chars` 也从「数全文 + 第二遍
+   take」改成 `char_indices().nth(max)` 一次定位边界。
+5. **`hex_prefix` 改查表**：原先每字节一次 `format!`。
+
+### 仍然开着（不在本轮范围）
+
+- SEC-01（命名管道不校验客户端身份）、载荷未加密：都属「需要新机制」，
+  不是改代码能收口的，仍在 `ARCHITECTURE.md` 的已知缺口里。
+- GFX-03（重建风暴记账下沉）、GFX-04/05（关窗与内容事件的设备级等待）：
+  需实机测量停顿幅度后再动，避免为了「看起来更规范」引入新的同步 bug。

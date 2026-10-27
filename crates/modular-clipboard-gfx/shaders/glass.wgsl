@@ -84,12 +84,24 @@ const DOME_RATIO: f32 = 0.08;
 ///
 /// 液态玻璃的辨识度全在这个分布上：
 /// **边缘清晰**（能看见折射后的桌面，配合最强的折射与 Fresnel 亮边），
-/// **中心磨砂**（`de ≥ FROST_SCALE` 时 85% 磨砂 + 15% 清晰）。
+/// **中心磨砂**（`de ≥ FROST_SCALE` 时 `FROST_MAX` 磨砂 + 其余清晰）。
 ///
 /// CAUTION: 方向与早期注释相反——`frost` 随**距边距离**单调**递增**
 /// （`de = 0` 在边缘），所以是「越往里越糊」。整片清晰就只是「透明卡片」，
 /// 整片磨砂就退回 Acrylic，两者都不是玻璃。
-const FROST_SCALE: f32 = 36.0;
+///
+/// 2026-10-27：36 → 56。行卡片只有 56~70pt 高，36 的尺度让整张卡几乎
+/// 都落在「内部」档，玻璃读成一块半透明色块；放大后边缘清晰带占卡片
+/// 高度的三分之一左右，才看得出透镜感。
+const FROST_SCALE: f32 = 56.0;
+
+/// 内部（远离边缘）保留的磨砂比例上限。
+///
+/// 0 = 中心完全清晰（纯透镜），1 = 中心完全磨砂（退回 Acrylic）。
+/// 取 0.5：HIG 把「高度透明」的 clear 变体留给媒体背景，regular 变体的
+/// 可读性由亮度自适应 + 卡片色承担；0.85 那档在深色壁纸上会把玻璃读成
+/// 一块发灰的色块（2026-10-27「不够通透」）。
+const FROST_MAX: f32 = 0.5;
 
 /// 色散生效的**距边带宽**（像素）。
 ///
@@ -126,9 +138,16 @@ const SPEC_SHININESS: f32 = 8.0;
 /// 取 0.55 而不是 1.0：模糊图已经丢掉高频，位移太大只会让画面整体漂移。
 const BLUR_REFRACT: f32 = 0.55;
 
-/// 亮度自适应强度（Apple「regular」变体调整背景亮度以保住前景可读性）。
-/// 0 = 关闭。见 `glass::luminosity_adapt`。
-const LUMA_GAIN: f32 = 0.18;
+/// 亮底压暗的**上限**（相对亮度 1.0 处压暗多少）。
+///
+/// HIG Materials 对 clear 变体的规定：背景明亮时叠一层 **35% 不透明度
+/// 的暗色调光层**。玻璃变透之后，这是可读性唯一的保险。
+const LUMA_DIM_MAX: f32 = 0.35;
+/// 暗底提亮的**上限**（相对亮度 0.0 处提亮多少）。
+///
+/// 对应 Apple 玻璃的 exposure boost：暗底上玻璃要「透光」而不是发灰。
+/// 取 0.20 而不是与压暗对称的 0.35：提亮过多会把纯黑壁纸洗成中灰。
+const LUMA_LIFT_MAX: f32 = 0.20;
 /// 亮度自适应的目标中灰。
 const LUMA_TARGET: f32 = 0.5;
 
@@ -371,10 +390,21 @@ fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-/// 亮度自适应：把底图亮度朝 `LUMA_TARGET` 收一点（三通道同比例 ⇒ 只动
-/// 亮度、不动色相）。与 `glass::luminosity_adapt` 一致，理由见那里。
-fn adapt_luma(c: vec3<f32>, gain: f32) -> vec3<f32> {
-    return c * max(1.0 + gain * (LUMA_TARGET - luma(c)), 0.0);
+/// 亮度自适应：**非对称**地压缩底图亮度（三通道同比例 ⇒ 只动亮度、
+/// 不动色相）。与 `glass::luminosity_adapt` 一致，理由见那里。
+///
+/// 亮底线性压暗到 `1 - dim_max`、暗底线性提亮到 `1 + lift_max`。
+/// 对称式的 `1 + gain·(target − luma)` 对「白底 + 深色文字」压得不够，
+/// 而玻璃变透之后可读性全靠这一层。
+fn adapt_luma(c: vec3<f32>, dim_max: f32, lift_max: f32) -> vec3<f32> {
+    let l = luma(c);
+    var k = 1.0;
+    if (l > LUMA_TARGET) {
+        k = 1.0 - dim_max * (l - LUMA_TARGET) / max(1.0 - LUMA_TARGET, 1e-3);
+    } else {
+        k = 1.0 + lift_max * (LUMA_TARGET - l) / max(LUMA_TARGET, 1e-3);
+    }
+    return c * max(k, 0.0);
 }
 
 @fragment
@@ -461,19 +491,21 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // ---- 磨砂 / 清晰混合：边缘清晰、中心磨砂 ----
         //
         // `de` 是**距边距离**：贴边处 `frost → 0` 取折射后的清晰图，
-        // 深入内部 `frost → 0.85` 主要是磨砂。与斜角权重 `w` 正好
+        // 深入内部 `frost → FROST_MAX` 才是磨砂。与斜角权重 `w` 正好
         // 反向——贴边处折射最强且最清晰（那是液态玻璃的辨识特征），
         // 内部折射归零、退回磨砂。
         //
-        // CAUTION: 上限取 0.85 而不是 1.0：整片纯磨砂就退回 Acrylic，
-        // 留 15% 的清晰分量让中心也有一点「玻璃感」而不是一块色块。
+        // CAUTION: 上限取 `FROST_MAX`（0.5）而不是 1.0：整片纯磨砂就退回
+        // Acrylic。2026-10-27 之前是 0.85，只留 15% 清晰分量，在深色壁纸上
+        // 玻璃读成一块发灰色块——「通透」这件事一半靠这个上限，另一半靠
+        // 上面的 `FROST_SCALE`。
         //
         // 磨砂那一路**也**按折射位移采样（见 `BLUR_REFRACT`）：位移图在
         // Apple 的实现里作用在模糊之后的背景上，只让清晰图位移会让占
         // 面积大多数的中心完全没有透镜感。
         let bref = mix(dref, dg, eff_disp) * BLUR_REFRACT;
         let blur_rgb = textureSampleLevel(blur_tex, glass_sampler, in.uv + copy_pc.offset + bref, 0.0).rgb;
-        let frost = clamp(de / FROST_SCALE, 0.0, 1.0) * 0.85;
+        let frost = clamp(de / FROST_SCALE, 0.0, 1.0) * FROST_MAX;
         var rgb = mix(sharp_rgb, blur_rgb, frost);
 
         // ---- 亮度自适应（Apple regular 变体）----
@@ -481,7 +513,7 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // 亮底压暗、暗底提亮：卡片上的前景文字对比度不随壁纸/桌面内容
         // 漂移。放在混合**之后**、高光**之前**——高光是光源的反光，
         // 不该被底图的亮度修正吃掉。
-        rgb = adapt_luma(rgb, LUMA_GAIN);
+        rgb = adapt_luma(rgb, LUMA_DIM_MAX, LUMA_LIFT_MAX);
 
         // ---- 轮廓：Fresnel（宽、各向同性）+ 镜面高光（锐、方向性）----
         //

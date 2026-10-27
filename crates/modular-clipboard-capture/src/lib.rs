@@ -246,96 +246,175 @@ pub fn looks_like_markdown(text: &str) -> bool {
 /// - 解码常见 HTML 实体。
 ///
 /// 不追求与浏览器解析结果完全一致；剪贴板场景只需要可读文本。
+///
+/// # 为什么是单趟字节扫描
+///
+/// 旧实现把整份 HTML 收进 `Vec<char>`（UTF-8 的 4 倍内存）再逐字符推进，
+/// 且**每个标签**都要 `collect::<String>()` + `to_ascii_lowercase()`
+/// 各分配一次——一份带几百个 `<span style=...>` 的富文本复制（浏览器/
+/// Word 的常态）就是上千次小分配。这里改为在 `&str` 上按字节游走：
+/// 非标签文本整段 `push_str`，标签名用 `eq_ignore_ascii_case` 就地比较，
+/// 全程只有输出串与（可能的）实体解码会分配。
+///
+/// CAUTION: 所有下标都必须是 **UTF-8 字符边界**。本函数只按 ASCII 字节
+/// （`<`、`>`）切分，而 ASCII 字节在 UTF-8 里不可能是多字节序列的
+/// 续字节，因此切点天然落在边界上；不要改成按任意字节切分。
 pub fn strip_html(html: &str) -> String {
     let mut out = String::with_capacity(html.len() / 2);
+    let bytes = html.as_bytes();
     let mut idx = 0usize;
-    let bytes: Vec<char> = html.chars().collect();
 
     while idx < bytes.len() {
-        if bytes[idx] != '<' {
-            out.push(bytes[idx]);
-            idx += 1;
+        if bytes[idx] != b'<' {
+            // 整段普通文本一次拷走，直到下一个 '<'（或结尾）。
+            let next = find_byte(bytes, idx, b'<').unwrap_or(bytes.len());
+            out.push_str(&html[idx..next]);
+            idx = next;
             continue;
         }
 
-        // 找到标签结束
-        let mut end = idx + 1;
-        while end < bytes.len() && bytes[end] != '>' {
-            end += 1;
-        }
-        if end >= bytes.len() {
-            // 未闭合的 '<'，按普通字符处理
+        // 找标签结束。未闭合的 '<' 按普通字符处理。
+        let Some(end) = find_byte(bytes, idx + 1, b'>') else {
             out.push('<');
             idx += 1;
             continue;
-        }
-        let tag: String = bytes[idx + 1..end].iter().collect();
-        let lower = tag.to_ascii_lowercase();
+        };
+        let tag = &html[idx + 1..end];
 
-        if lower.starts_with("script") || lower.starts_with("style") {
+        let skip_to = if starts_with_ignore_ascii_case(tag, "script") {
+            Some("</script")
+        } else if starts_with_ignore_ascii_case(tag, "style") {
+            Some("</style")
+        } else {
+            None
+        };
+        if let Some(needle) = skip_to {
             // 跳过整个元素内容，直到对应的闭合标签。
             // 必须在「剩余 HTML」中查找，而不是在标签名里找 ——
             // 标签名只有 "style"/"script"，永远找不到 "</style>"。
-            let needle = if lower.starts_with("script") {
-                "</script"
-            } else {
-                "</style"
-            };
-            let rest: String = bytes[idx..].iter().collect();
-            let rest_lower = rest.to_ascii_lowercase();
-            match rest_lower.find(needle) {
-                Some(pos) => {
-                    // pos 是字节偏移，转换回 char 下标
-                    let char_pos = rest[..pos].chars().count();
-                    idx += char_pos;
-                }
-                None => {
-                    // 未闭合：丢弃其后全部内容
-                    idx = bytes.len();
-                }
+            match find_ignore_ascii_case(html, end, needle) {
+                Some(pos) => idx = pos,
+                // 未闭合：丢弃其后全部内容。
+                None => idx = bytes.len(),
             }
             continue;
         }
 
         // 块级/换行标签转成换行，其余标签直接丢弃。
-        if is_block_tag(&lower) {
+        if is_block_tag(tag) {
             out.push('\n');
         }
         idx = end + 1;
     }
 
     // 折叠多余空行，但保留段落结构。
-    let cleaned: Vec<&str> = out
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .collect();
-    decode_entities(&cleaned.join("\n"))
+    let mut cleaned = String::with_capacity(out.len());
+    for line in out.lines() {
+        let l = line.trim_end();
+        if l.is_empty() {
+            continue;
+        }
+        if !cleaned.is_empty() {
+            cleaned.push('\n');
+        }
+        cleaned.push_str(l);
+    }
+    decode_entities(&cleaned)
+}
+
+/// 从 `from` 起找第一个等于 `needle` 的字节，返回其绝对下标。
+///
+/// `needle` 必须是 ASCII：ASCII 字节不会出现在多字节字符内部，
+/// 因此返回的下标必然是 UTF-8 字符边界。
+fn find_byte(hay: &[u8], from: usize, needle: u8) -> Option<usize> {
+    hay.get(from..)?
+        .iter()
+        .position(|b| *b == needle)
+        .map(|i| from + i)
+}
+
+/// 在 `hay` 的 `from` 之后按 ASCII 大小写不敏感查找 `needle`。
+///
+/// `needle` 以 ASCII 开头（这里恒为 `</`），所以只需逐个候选 `<` 比较，
+/// 不必先构造整段小写副本——旧实现为此复制了「剩余全文」。
+fn find_ignore_ascii_case(hay: &str, from: usize, needle: &str) -> Option<usize> {
+    let hay_bytes = hay.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut at = from;
+    while let Some(pos) = find_byte(hay_bytes, at, b'<') {
+        let end = pos + needle_bytes.len();
+        if end <= hay_bytes.len() && hay_bytes[pos..end].eq_ignore_ascii_case(needle_bytes) {
+            return Some(pos);
+        }
+        at = pos + 1;
+    }
+    None
+}
+
+/// `s` 是否以 `prefix` 开头（仅 ASCII 大小写不敏感）。
+fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+    match s.as_bytes().get(..prefix.len()) {
+        Some(head) => head.eq_ignore_ascii_case(prefix.as_bytes()),
+        None => false,
+    }
 }
 
 /// 判断是否为需要保留换行的标签。
-fn is_block_tag(tag_lower: &str) -> bool {
+///
+/// 就地大小写不敏感比较：调用方传的是原始标签文本（可能带属性、可能
+/// 大写），不能再为它分配一份小写副本。
+fn is_block_tag(tag: &str) -> bool {
     const BLOCK: [&str; 12] = [
         "br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
     ];
-    let name = tag_lower
+    let name = tag
         .trim_start_matches('/')
         .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
         .next()
         .unwrap_or("");
-    BLOCK.contains(&name)
+    BLOCK.iter().any(|b| name.eq_ignore_ascii_case(b))
 }
 
-/// 常见 HTML 实体解码。
+/// 常见 HTML 实体解码（单趟）。
+///
+/// 早先是 7 次 `str::replace` 串起来：每轮都把整串复制一遍，且**后一轮
+/// 会解码前一轮产出的文本**——`&amp;nbsp;` 会被解成空格，而按 HTML
+/// 规范它应该原样保留为 `&nbsp;`。单趟扫描天然没有这个二次解码问题，
+/// 也把 7 次分配降到 1 次。
 fn decode_entities(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        // &amp; 必须最后替换，否则 "&amp;lt;" 会被二次解码
-        .replace("&amp;", "&")
-        .replace("&nbsp;", " ")
+    /// 长的在前：`&nbsp;` 与 `&amp;` 前缀不重叠，但保持「最长优先」的
+    /// 习惯可避免将来加入 `&amp` 这类前缀实体时踩坑。
+    const ENTITIES: [(&str, &str); 7] = [
+        ("&nbsp;", " "),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&#39;", "'"),
+        ("&amp;", "&"),
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+    ];
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find('&') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        match ENTITIES.iter().find(|(k, _)| tail.starts_with(k)) {
+            Some((k, v)) => {
+                out.push_str(v);
+                rest = &tail[k.len()..];
+            }
+            // 不是已知实体：原样保留 '&'，继续扫描后面。
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 // ---------- 平台相关 ----------
@@ -487,6 +566,50 @@ mod tests {
         assert!(text.contains('\n'));
         assert!(text.contains("one"));
         assert!(text.contains("two"));
+    }
+
+    #[test]
+    fn strip_html_keeps_multibyte_text_intact() {
+        // 单趟字节扫描的下标必须落在 UTF-8 边界上：中文/emoji 紧邻标签、
+        // 紧邻被跳过的 script 块时都不能切坏字符（旧实现按 char 下标走，
+        // 换实现时最容易在这里 panic 或产生替换字符）。
+        let html = "<p>剪贴板</p><script>var a='板';</script><div>emoji 😀 结尾</div>";
+        let text = strip_html(html);
+        assert!(text.contains("剪贴板"), "中文被切坏：{text:?}");
+        assert!(text.contains("emoji 😀 结尾"), "emoji 被切坏：{text:?}");
+        assert!(!text.contains("var a"), "script 内容不应保留");
+    }
+
+    #[test]
+    fn strip_html_handles_uppercase_tags_and_multiple_scripts() {
+        // 标签大小写不敏感（`<SCRIPT>` / `<STYLE>` / `<BR>`），
+        // 且多个 script/style 块要各自跳过——旧实现每个块都复制一遍
+        // 「剩余全文」，这里是同一行为的低成本版本。
+        let html = "<STYLE>a{}</STYLE><p>x<BR>y</p><SCRIPT>bad1</SCRIPT><script>bad2</script>尾巴";
+        let text = strip_html(html);
+        assert!(text.contains('x'));
+        assert!(text.contains('y'));
+        assert!(text.contains("尾巴"));
+        assert!(!text.contains("a{}"), "style 内容不应保留");
+        assert!(!text.contains("bad1") && !text.contains("bad2"), "script 内容不应保留");
+    }
+
+    #[test]
+    fn strip_html_unterminated_script_drops_rest() {
+        let text = strip_html("<p>keep</p><script>never closed");
+        assert!(text.contains("keep"));
+        assert!(!text.contains("never closed"));
+    }
+
+    #[test]
+    fn entity_double_escape_is_not_decoded_twice() {
+        // 单趟解码不会回头再解一遍自己产出的文本：`&amp;nbsp;` 按规范
+        // 应保留为字面量 `&nbsp;`（旧实现串联 7 次 replace 会解成空格）。
+        assert_eq!(decode_entities("&amp;nbsp;"), "&nbsp;");
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_entities("a &amp; b"), "a & b");
+        assert_eq!(decode_entities("裸 & 符号"), "裸 & 符号");
+        assert_eq!(decode_entities("结尾 &"), "结尾 &");
     }
 
     #[test]

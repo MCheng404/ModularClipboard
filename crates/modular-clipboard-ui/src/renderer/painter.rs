@@ -14,7 +14,7 @@ use modular_clipboard_gfx::backdrop::DesktopCapture;
 use modular_clipboard_gfx::backdrop::MotionPredictor;
 use modular_clipboard_gfx::backdrop::capture_due;
 use modular_clipboard_gfx::backdrop::downsample_box_blur;
-use modular_clipboard_gfx::backdrop::capture_size;
+use modular_clipboard_gfx::backdrop::capture_scaled_pct;
 use modular_clipboard_gfx::capture_worker::{CaptureOut, CaptureWorker};
 use modular_clipboard_gfx::backdrop::client_origin;
 use modular_clipboard_gfx::blur::BlurChain;
@@ -133,6 +133,15 @@ pub struct Painter<'a> {
     post: Option<PostFx>,
     /// 自研磨砂背景（懒创建，仅主窗口在 Acrylic 模式下存在）。
     backdrop: BackdropState,
+    /// 抓屏分辨率百分比（15 ~ 200），由帧循环每帧从配置灌入。
+    ///
+    /// 放在 `Painter` 而不是 [`BackdropState`] 里：它是**策略**（用户要
+    /// 多清晰），不是资源；`BackdropState` 里的东西都随窗口尺寸重建。
+    ///
+    /// 改档位不会立刻改变已捕获的图：工作线程下一次请求才按新比例抓，
+    /// 中间那一两帧沿用旧尺寸的底图——`record_backdrop_blur` 的尺寸
+    /// 比对会跳过它们，等新图到位再恢复（最多一帧背景不更新）。
+    backdrop_scale: u8,
     /// 卡片磨砂的 CPU 侧捕获（懒创建，仅 `ui.card_blur > 0` 时存在）。
     ///
     /// 与 `backdrop` 分开的理由：两者**用途不同、分辨率不同、开关不同**。
@@ -175,8 +184,9 @@ pub(super) enum BackdropWarn {
 /// 一帧后处理所需的全部 GPU 资源。
 ///
 /// 生命周期与「窗口的**渲染目标**尺寸」绑定：尺寸或超采样倍率变化时
-/// 整体重建。重建前必须 `device_wait_idle`——旧的 framebuffer 与
-/// 图像可能仍被在途命令引用。
+/// 整体重建。重建前必须等完**本窗口**的在途提交（`wait_own_inflight`，
+/// 见 `FrameRenderer::rebuild_swapchain`）——旧的 framebuffer 与图像
+/// 可能仍被本窗口的在途命令引用。
 pub(super) struct PostFx {
     pipeline: BlurPipeline,
     chain: BlurChain,
@@ -188,6 +198,16 @@ pub(super) struct BackdropFx {
     chain: BlurChain,
     /// 捕获的桌面纹理（窗口物理像素尺寸，交换链同格式）。
     capture_img: DeviceImage,
+    /// 目标尺寸已变、**等第一张新尺寸抓屏到位**再切换的新捕获图。
+    ///
+    /// 为什么不在 `ensure_backdrop` 里直接换掉：换图那一刻新图还没上传过，
+    /// 采样它是未定义行为；而把 `uploaded` 置假会让整窗背景空一帧
+    /// （拖完「抓屏分辨率」松手时闪一下）。保留旧图继续采样、等新数据
+    /// 到达再原子切换，两个问题一起消失。
+    ///
+    /// 生命周期：只会由 `ensure_backdrop` 创建、由 `record_backdrop_blur`
+    /// 消费（或在下一次尺寸变化时销毁——那时它从未被任何命令引用）。
+    pending: Option<DeviceImage>,
     /// 捕获图是否至少上传过一次。
     ///
     /// `DeviceImage::new` 只分配内存、不写数据：未上传就采样是未定义
@@ -264,13 +284,29 @@ impl Default for BackdropState {
     }
 }
 
+impl BackdropFx {
+    /// 销毁本结构的全部 GPU 资源，**含尚未切换的 `pending` 捕获图**。
+    ///
+    /// 前置条件：调用方已 `device_wait_idle`。
+    ///
+    /// 三个销毁点（关闭磨砂 / 交换链重建 / Drop）共用这一份：`pending`
+    /// 是 2026-10-27 加的字段，任何一处漏掉它就是一张泄漏的 DeviceImage
+    /// （`DeviceImage` 没有 `Drop`，不会自己回收）。
+    fn destroy(&mut self, gpu: &Gpu) {
+        self.chain.destroy(&gpu.device);
+        self.pipeline.destroy(gpu);
+        self.capture_img.destroy(&gpu.device);
+        if let Some(mut pending) = self.pending.take() {
+            pending.destroy(&gpu.device);
+        }
+    }
+}
+
 impl BackdropState {
     /// 销毁全部 GPU 资源。前置条件：调用方已 `device_wait_idle`。
     fn destroy(&mut self, gpu: &Gpu) {
         if let Some(mut fx) = self.fx.take() {
-            fx.chain.destroy(&gpu.device);
-            fx.pipeline.destroy(gpu);
-            fx.capture_img.destroy(&gpu.device);
+            fx.destroy(gpu);
         }
         // 玻璃管线同样销毁：它绑着 `render_pass`，而交换链重建会换通道。
         if let Some(mut g) = self.glass.take() {
@@ -358,6 +394,7 @@ impl<'a> Painter<'a> {
             // 后处理资源按需创建，见 `ensure_post`。
             post: None,
             backdrop: BackdropState::default(),
+            backdrop_scale: modular_clipboard_gfx::backdrop::CAPTURE_PCT_DEFAULT,
             card_blur: CardBlurState::default(),
             backdrop_warned: std::collections::HashSet::new(),
             stats: FrameStats::default(),
@@ -547,6 +584,15 @@ impl<'a> Painter<'a> {
     ///
     /// 停用时立即销毁 GPU 资源（用户在设置里关掉磨砂不应继续占显存）。
     /// 需 `device_wait_idle`——在飞命令可能仍引用旧图。
+    /// 设置抓屏分辨率百分比（15 ~ 200）。
+    ///
+    /// 越界值钳到区间内而不是报错：这是观感参数，配置写坏了最坏结果
+    /// 是「画面糊一点」，不该让渲染路径失败。
+    pub fn set_backdrop_scale(&mut self, pct: u8) {
+        self.backdrop_scale = (*modular_clipboard_gfx::backdrop::CAPTURE_PCT_RANGE.start())
+            .max(pct.min(*modular_clipboard_gfx::backdrop::CAPTURE_PCT_RANGE.end()));
+    }
+
     pub fn set_backdrop_enabled(&mut self, on: bool) {
         if on {
             // 资源在下一帧 paint_backdrop 里懒创建。
@@ -554,9 +600,7 @@ impl<'a> Painter<'a> {
         }
         if let Some(mut fx) = self.backdrop.fx.take() {
             self.gpu.wait_idle();
-            fx.chain.destroy(&self.gpu.device);
-            fx.pipeline.destroy(self.gpu);
-            fx.capture_img.destroy(&self.gpu.device);
+            fx.destroy(self.gpu);
         }
         if let Some(mut g) = self.backdrop.glass.take() {
             self.gpu.wait_idle();
@@ -1190,7 +1234,7 @@ impl<'a> Painter<'a> {
         // CAUTION: 请求必须在**节流放行后**才发（上面几个 early return
         // 之后）。每帧都发会让工作线程永远在抓屏、忙不过来，pending
         // 守卫随即开始丢请求。
-        capture_worker.request(hwnd, Self::needs_rb_swap(format));
+        capture_worker.request(hwnd, Self::needs_rb_swap(format), self.backdrop_scale);
         let (bits, w, h) = match capture_worker.poll() {
             Some(CaptureOut::Ok(b, w, h)) => {
                 // 抓屏链路的心跳：工作线程抓到 → 主线程收到。
@@ -1211,10 +1255,46 @@ impl<'a> Painter<'a> {
             }
             None => return Ok(()), // 本帧还没抓到：沿用上一帧底图
         };
-        if (w, h) != capture_size(swap_extent.width, swap_extent.height) {
+        // NOTE: 这里不能调 `self.capture_extent_for(..)`——本函数已把
+        // `self.backdrop` 拆借出去了，再整体借 `&self` 会 E0502。
+        // `backdrop_scale` 是另一个字段，直接读不冲突。
+        let want = capture_scaled_pct(
+            swap_extent.width,
+            swap_extent.height,
+            self.backdrop_scale,
+        );
+        if (w, h) != want {
             // resize 竞态：客户区已变、交换链还没重建。跳过本帧，
             // 等下一轮 swapchain 重建后尺寸自然对齐。
             return Ok(());
+        }
+
+        // ---- 换图：新尺寸的第一张抓屏到了 ----
+        //
+        // `ensure_backdrop` 只把新尺寸的图挂在 `pending` 上（不重建管线），
+        // 到这里才真正切换。切换时机必须**在上传之前**：本帧的像素要写进
+        // 新图，而 `record_texture_upload` 用的是 `fx.capture_img`。
+        //
+        // CAUTION: 销毁旧图前必须等本窗口排空——它可能仍被在途帧的
+        // 降采样命令采样。这是一次性代价（只在改分辨率时发生）。
+        // `uploaded` 先置假：新图此时还是未初始化内存，采样它是 UB；
+        // 下面的上传成功路径会在末尾把它置回真。
+        if fx
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.size == vk::Extent2D { width: w, height: h })
+        {
+            self.gpu.wait_idle();
+            let fresh = fx.pending.take().expect("刚判过存在");
+            // 先绑新视图、再替换字段：绑定失败就把新图放回 `pending`
+            // 下一帧重试，旧图与描述符都还完好（不做半截切换）。
+            if let Err(e) = fx.pipeline.bind_source(self.gpu, fresh.view) {
+                fx.pending = Some(fresh);
+                anyhow::bail!("切换捕获图失败（重新绑定描述符）: {e:#}");
+            }
+            let mut stale = std::mem::replace(&mut fx.capture_img, fresh);
+            stale.destroy(&self.gpu.device);
+            fx.uploaded = false;
         }
         // 捕获成功 ⇒ 记下快照对应的窗口位置。合成阶段用它算位移
         // （磨砂移动预测，见 [`Self::backdrop_uv_offset`]）。
@@ -1300,11 +1380,33 @@ impl<'a> Painter<'a> {
         self.synced = true;
     }
 
-    /// 确保磨砂资源存在且尺寸匹配，否则整体重建。
+    /// 捕获图的尺寸（按当前抓屏百分比，见 [`Self::set_backdrop_scale`]）。
+    ///
+    /// 三处必须用**同一份**推导：建纹理（`ensure_backdrop`）、比对
+    /// 「本帧抓到的尺寸对不对」（`record_backdrop_blur`）、以及工作线程
+    /// 自己的 `capture_scaled_pct`。任一处口径不同就会表现为
+    /// 「背景永久停更」——尺寸永远对不上，每帧都提前 return。
+    fn capture_extent_for(&self, swap_extent: vk::Extent2D) -> (u32, u32) {
+        capture_scaled_pct(swap_extent.width, swap_extent.height, self.backdrop_scale)
+    }
+
+    /// 确保磨砂资源存在且尺寸匹配，否则重建。
     ///
     /// 模糊链按 `render_extent`（超采样后）建，`divisor` 已乘过超采样
     /// 倍率——与 `ensure_post` 同一套口径，`blur_a` 恒为交换链 1/4。
-    /// 捕获图按**交换链**尺寸建（BitBlt 读的就是客户区物理像素）。
+    /// 捕获图按**抓屏百分比**建（BitBlt 读的就是客户区物理像素）。
+    ///
+    /// # 两级重建（2026-10-27 完善后处理）
+    ///
+    /// 「链变了」（窗口尺寸 / 超采样倍率）必须整体重建：卷积目标尺寸、
+    /// 描述符池、管线全部要换。但「只有捕获图尺寸变了」（用户拖抓屏
+    /// 分辨率）**不该**走这条路——管线与卷积链跟捕获图尺寸毫无关系，
+    /// 重建它们纯属浪费，而且每一步都要 `wait_idle`。
+    ///
+    /// 所以尺寸变化只做**换图**：新图先挂在 [`BackdropFx::pending`] 上，
+    /// 等第一张新尺寸抓屏到位再原子切换（见 `record_backdrop_blur`）。
+    /// 这样既不用重建管线，也不会出现「换图那一帧没有底图可采样」的
+    /// 整窗闪烁——旧图在切换前一直有效。
     fn ensure_backdrop(
         &mut self,
         fr: &FrameRenderer<'a>,
@@ -1313,31 +1415,62 @@ impl<'a> Painter<'a> {
         divisor: u32,
         format: vk::Format,
     ) -> anyhow::Result<()> {
-        let (cw, ch) = capture_size(swap_extent.width, swap_extent.height);
-        let up_to_date = self.backdrop.fx.as_ref().is_some_and(|fx| {
-            fx.chain.matches(render_extent, divisor)
-                && fx.capture_img.size == vk::Extent2D { width: cw, height: ch }
-        });
-        if up_to_date {
+        let (cw, ch) = self.capture_extent_for(swap_extent);
+        let want = vk::Extent2D {
+            width: cw,
+            height: ch,
+        };
+        let (chain_ok, size_ok, pending_ok) = self.backdrop.fx.as_ref().map_or(
+            (false, false, false),
+            |fx| {
+                (
+                    fx.chain.matches(render_extent, divisor),
+                    fx.capture_img.size == want,
+                    fx.pending.as_ref().is_some_and(|p| p.size == want),
+                )
+            },
+        );
+        if chain_ok {
+            if size_ok {
+                // 尺寸又变回当前捕获图（用户把滑块拖回去了）：`pending`
+                // 里那张已经没有意义，销毁掉——它从未被任何命令引用过
+                // （没绑定、没上传），不需要等待在途帧。
+                if let Some(fx) = self.backdrop.fx.as_mut()
+                    && let Some(mut stale) = fx.pending.take()
+                {
+                    stale.destroy(&self.gpu.device);
+                }
+                return Ok(());
+            }
+            if pending_ok {
+                // 已经挂了一张等抓屏的新图，别每帧重复分配。
+                return Ok(());
+            }
+            // 只换捕获图。`pending` 里若还挂着一张更早的目标尺寸，
+            // 同样直接销毁（从未被引用）。
+            if let Some(fx) = self.backdrop.fx.as_mut() {
+                if let Some(mut stale) = fx.pending.take() {
+                    stale.destroy(&self.gpu.device);
+                }
+                fx.pending = Some(DeviceImage::new(
+                    self.gpu,
+                    want,
+                    format,
+                    vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+                )?);
+            }
             return Ok(());
         }
         if let Some(mut old) = self.backdrop.fx.take() {
             self.gpu.wait_idle();
-            old.pipeline.destroy(self.gpu);
-            old.capture_img.destroy(&self.gpu.device);
+            old.destroy(self.gpu);
         }
         let render_pass = fr.render_pass();
         let mut pipeline = BlurPipeline::new(self.gpu, render_pass)?;
         let chain = BlurChain::new(self.gpu, render_pass, format, render_extent, divisor)?;
-        // 捕获图按**降采样后**的尺寸建（见 `CAPTURE_DOWNSCALE`）：
-        // 全分辨率上传会把 staging arena 撑满。
-        let (cw, ch) = capture_size(swap_extent.width, swap_extent.height);
         let capture_img = DeviceImage::new(
             self.gpu,
-            vk::Extent2D {
-                width: cw,
-                height: ch,
-            },
+            want,
             format,
             vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         )?;
@@ -1361,6 +1494,7 @@ impl<'a> Painter<'a> {
             pipeline,
             chain,
             capture_img,
+            pending: None,
             uploaded: false,
         });
         Ok(())
@@ -1385,13 +1519,16 @@ impl<'a> Painter<'a> {
         // 整体销毁，下一帧按新尺寸懒重建。
         //
         // IMPORTANT: 此处可以安全销毁——`rebuild_swapchain` 开头已
-        // `device_wait_idle`，在飞命令全部完成。
+        // `wait_own_inflight` 等完**本窗口**的全部在途提交；这些离屏目标
+        // 只会被本窗口的命令引用，因此本窗口排空即可（GFX-06：早先这里
+        // 写的是 `device_wait_idle`，2026-10-22 起实现已降级为本窗口等待，
+        // 注释随之修正——按旧注释推理会误以为「全局都排空了」）。
         if let Some(mut b) = self.post.take() {
             b.chain.destroy(&self.gpu.device);
             b.pipeline.destroy(self.gpu);
         }
         // 磨砂资源按交换链/渲染目标尺寸派生，同样整体销毁、下帧懒重建。
-        // `rebuild_swapchain` 已 `device_wait_idle`，销毁安全。
+        // 同上：`rebuild_swapchain` 已等完本窗口在途提交，销毁安全。
         self.backdrop.destroy(self.gpu);
         // 用户纹理的描述符集合必须整体重新分配。
         //

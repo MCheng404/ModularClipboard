@@ -1461,6 +1461,32 @@ mod tests {
         assert_eq!(build_preview(&payload(ClipKind::Text, "abc")), "abc");
     }
 
+    #[test]
+    fn preview_truncates_at_char_boundaries() {
+        use crate::ingest::truncate_chars;
+        // 恰好等于上限：不加省略号（`nth(max)` 返回 None 的那一支）。
+        assert_eq!(truncate_chars("abcde", 5), "abcde");
+        // 超一个字符：截到上限 + 省略号。
+        assert_eq!(truncate_chars("abcdef", 5), "abcde…");
+        // 多字节字符：切点必须落在字符边界上（按字节切会 panic）。
+        assert_eq!(truncate_chars("剪贴板历史", 3), "剪贴板…");
+        assert_eq!(truncate_chars("😀😀😀", 2), "😀😀…");
+        assert_eq!(truncate_chars("", 5), "");
+        // 与「字符数」口径一致，不是字节数：4 个汉字 = 12 字节。
+        assert_eq!(truncate_chars("剪贴板", 4), "剪贴板");
+    }
+
+    #[test]
+    fn preview_of_long_text_stops_at_limit() {
+        // 预览只取前 PREVIEW_MAX_CHARS 个字符 + 省略号；
+        // 这里同时守住「不再为截断而克隆全文」的语义（结果与长度无关）。
+        let long = "剪".repeat(PREVIEW_MAX_CHARS * 4);
+        let p = payload(ClipKind::Text, &long);
+        let preview = build_preview(&p);
+        assert_eq!(preview.chars().count(), PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
     /// 独占的临时目录名（进程 ID + 原子序号）。
     ///
     /// 不能用 `now_ms()`：毫秒精度下并发测试会拿到同名目录、互相删除。

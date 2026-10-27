@@ -49,10 +49,18 @@ pub fn fingerprint(bytes: &[u8]) -> String {
     hex_prefix(&digest, 16)
 }
 
+/// 取摘要前 `n` 字节的小写十六进制串。
+///
+/// NOTE: 用查表逐字节写入而不是 `format!("{b:02x}")`——后者每字节构造一次
+/// `Arguments` 并做一次格式化，32 字节摘要就是 32 次；指纹在每条剪贴板
+/// 内容上都要算一遍（含去重查询前的临时计算），是热路径。
 fn hex_prefix(bytes: &[u8], n: usize) -> String {
-    let mut s = String::with_capacity(n * 2);
-    for b in bytes.iter().take(n) {
-        s.push_str(&format!("{b:02x}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let take = bytes.len().min(n);
+    let mut s = String::with_capacity(take * 2);
+    for &b in &bytes[..take] {
+        s.push(HEX[usize::from(b >> 4)] as char);
+        s.push(HEX[usize::from(b & 0x0f)] as char);
     }
     s
 }
@@ -690,6 +698,35 @@ mod tests {
     }
 
     #[test]
+    fn safe_blob_path_rejects_device_names_and_streams() {
+        // 补 DL-08 附注的两类漏网：DOS 设备名（打开的是设备而不是文件）
+        // 与 NTFS 数据流 / 盘符冒号。
+        let dir = std::path::Path::new("/data/blobs");
+        for bad in ["NUL", "nul", "NUL.txt", "CON", "COM1", "lpt9.log", "a.bin:evil", "C:"] {
+            assert_eq!(safe_blob_path(dir, bad), None, "应拒绝：{bad}");
+        }
+        assert!(
+            safe_blob_path(dir, "0123456789abcdef.bin").is_some(),
+            "正常 hash 名必须放行"
+        );
+    }
+
+    #[test]
+    fn write_blob_atomic_refuses_unsafe_names() {
+        // DL-08：写入侧必须与读/删侧共用同一套判据。早先写入侧完全不校验，
+        // 而 `insert_with_dims` 是 pub API、文件名直接来自 `ClipItem.hash`，
+        // 于是「传一个含 .. 的 hash」就是任意文件写原语。
+        let (store, base) = temp_store();
+        let escaped = base.join("escaped.bin");
+        for bad in ["../escaped.bin", "a/b.bin", "a\\b.bin", "", "NUL", "x.bin:ads"] {
+            let r = super::blobs::write_blob_atomic(&store.blob_dir, bad, b"payload");
+            assert!(r.is_err(), "不合法文件名必须拒绝：{bad:?}");
+        }
+        assert!(!escaped.exists(), "不得写出 blobs 目录之外");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn retention_spares_pinned_items() {
         let (mut store, base) = temp_store();
         store.set_payload_limit(1 << 20);
@@ -751,6 +788,68 @@ mod tests {
         assert_eq!(fingerprint(b"abc"), fingerprint(b"abc"));
         assert_ne!(fingerprint(b"abc"), fingerprint(b"abd"));
         assert_eq!(fingerprint(b"abc").len(), 32);
+    }
+
+    #[test]
+    fn hex_prefix_matches_reference_formatting() {
+        // 查表实现的黄金值：必须与 `format!("{b:02x}")` 逐字节一致
+        // （小写、两位数、不足补零）。
+        let all: Vec<u8> = (0u8..=255).collect();
+        let want16: String = all.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex_prefix(&all, 16), want16);
+        let want_all: String = all.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex_prefix(&all, 999), want_all, "n 超长时应取全部字节");
+        assert_eq!(hex_prefix(&[], 8), "");
+    }
+
+    #[test]
+    fn delete_many_reports_actual_deleted_rows() {
+        // DL-09：不存在的 id 不得计入返回值，否则 enforce_retention 的
+        // 「删了几条」对任何调用方都不可信。
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let mut ids = Vec::new();
+        for i in 0..2 {
+            let item = ClipItem::new(
+                ClipKind::Text,
+                format!("dm{i}"),
+                format!("dm {i}"),
+                "a".into(),
+            );
+            ids.push(store.insert(item, format!("dm {i}").into_bytes()).unwrap().id);
+        }
+        let n = store.delete_many(&[ids[0], ids[1], 99_999]).unwrap();
+        assert_eq!(n, 2, "只应统计真正删掉的行");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn gc_reclaims_orphans_and_tmp_leftovers() {
+        // DL-07：`write_blob_atomic` 的 `.tmp` 中间态（进程在 write 与
+        // rename 之间被杀）永远不会被任何行引用，启动时必须回收；
+        // 同时被引用的正式载荷必须原样留下。
+        let (mut store, base) = temp_store();
+        store.set_payload_limit(1 << 20);
+        let item = ClipItem::new(ClipKind::Text, "keep".into(), "keep".into(), "a".into());
+        let saved = store.insert(item, b"keep".to_vec()).unwrap();
+        let live = saved.payload.as_ref().unwrap().file.clone();
+        std::fs::write(store.blob_dir.join("deadbeef.bin.tmp"), b"half").unwrap();
+        std::fs::write(store.blob_dir.join("cafebabe.bin"), b"orphan").unwrap();
+
+        let n = store.gc_orphan_blobs().unwrap();
+        assert_eq!(n, 2, "孤儿 .bin 与残留 .tmp 都应被回收");
+        assert!(store.blob_dir.join(&live).exists(), "被引用的载荷必须保留");
+        assert!(!store.blob_dir.join("deadbeef.bin.tmp").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn gc_tolerates_missing_blob_dir() {
+        // 全新安装 / 目录被用户清掉时，GC 不该把启动流程带崩。
+        let (store, base) = temp_store();
+        std::fs::remove_dir_all(&store.blob_dir).unwrap();
+        assert_eq!(store.gc_orphan_blobs().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

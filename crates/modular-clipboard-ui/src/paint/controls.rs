@@ -234,6 +234,29 @@ pub(super) fn draw_step_slider(
     range: std::ops::RangeInclusive<u8>,
     enabled: bool,
 ) -> bool {
+    draw_step_slider_settled(f, ui, id_suffix, v, range, enabled).0
+}
+
+/// [`draw_step_slider`] 的扩展版：除「本帧值变了」之外，再报告
+/// **本次交互是否已经结束**（松手 / 单击）。
+///
+/// # 为什么需要它
+///
+/// 大多数滑块改的是 uniform 级参数，逐帧落地无所谓。但**改动代价高**的
+/// 参数不能这样：抓屏分辨率一变，渲染层要 `wait_idle` + 重建捕获图与
+/// 描述符，拖动过程中逐档应用会把界面卡成幻灯片（25%→100% 是 75 次重建）。
+/// 这类参数只在松手时落地，拖动期间只更新本地显示值。
+///
+/// 返回 `(changed, settled)`：`settled` 覆盖「拖动结束」与「单击轨道」
+/// 两条路径——只判 `drag_stopped` 会让单击永远不生效。
+pub(super) fn draw_step_slider_settled(
+    f: &mut Frame<'_>,
+    ui: &mut Ui,
+    id_suffix: &'static str,
+    v: &mut u8,
+    range: std::ops::RangeInclusive<u8>,
+    enabled: bool,
+) -> (bool, bool) {
     let pal = f.pal;
     // 尺寸与 `draw_slider` 同源（随字号缩放）。
     let track_w = pal.font_sm * 10.0;
@@ -253,9 +276,25 @@ pub(super) fn draw_step_slider(
 
     let (lo, hi) = (*range.start() as f32, *range.end() as f32);
     let orig = *v;
+    // CAUTION: 「正在交互」必须把**松手那一帧**也算进来。
+    //
+    // 早先只判 `dragged() || is_pointer_button_down_on()`：egui 在松手帧
+    // 两者都为假（按钮已抬起），于是本帧不重算 `v`，`v` 保持从配置读来的
+    // 旧值 ⇒ `changed == false` ⇒ 依赖「松手才提交」的调用方（抓屏分辨率）
+    // **永远收不到提交**，滑块看着能拖、松手回弹，表现为「无法调节」。
+    // 单击轨道同理（`clicked()` 帧同样不满足前两个条件）。
+    let interacting = resp.dragged()
+        || resp.is_pointer_button_down_on()
+        || resp.drag_stopped()
+        || resp.clicked();
+    // CAUTION: 取坐标必须带兜底。`interact_pointer_pos()` 在**松手那一帧**
+    // 不保证有值（egui 在按钮抬起后可能已清掉交互指针），而这一帧正是
+    // 「提交」发生的地方——拿不到坐标就重算不出数值，滑块会静默回弹。
+    // `hover_pos()` 在松手帧通常仍有值（指针还在控件上），作为兜底。
+    let pos = resp.interact_pointer_pos().or_else(|| resp.hover_pos());
     if enabled
-        && (resp.dragged() || resp.is_pointer_button_down_on())
-        && let Some(pp) = resp.interact_pointer_pos()
+        && interacting
+        && let Some(pp) = pos
     {
         let t = ((pp.x - rect.min.x) / track_w).clamp(0.0, 1.0);
         // 指针位置 → 最近的整数档位（t=0 落 lo，t=1 落 hi）。
@@ -302,7 +341,10 @@ pub(super) fn draw_step_slider(
     );
 
     f.hit_insert(id_suffix, rect);
-    *v != orig
+    // `drag_stopped`：拖动在**本帧**结束；`clicked`：单击轨道（没有拖动
+    // 过程）。两者都意味着「用户已经定下这个值」。
+    let settled = resp.drag_stopped() || resp.clicked();
+    (*v != orig, settled)
 }
 
 /// MCP 总开关左侧的 ⓘ 详细按钮（打开 MCP 调用设置覆盖层）。

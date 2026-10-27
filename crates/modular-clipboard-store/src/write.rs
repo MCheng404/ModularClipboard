@@ -17,7 +17,7 @@ use rusqlite::params_from_iter;
 use super::Store;
 use super::{fingerprint, parse_kind};
 
-use super::blobs::{compute_dims, safe_blob_path, write_blob_atomic};
+use super::blobs::{compute_dims, write_blob_atomic};
 
 impl Store {
     /// 插入新条目。载荷按类型决定是否落文件。
@@ -136,18 +136,7 @@ impl Store {
                     // 只有**确认没有其它条目引用**时才删（DF-01 同款引用计数）。
                     // 查询本身失败 ⇒ 保守不删，留给 gc_orphan_blobs 回收；
                     // 反过来「查不到就删」会重复 DL-02 那个坑。
-                    let remaining: Option<i64> = self
-                        .conn
-                        .query_row(
-                            "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
-                            params![f],
-                            |r| r.get(0),
-                        )
-                        .optional()
-                        .unwrap_or(None);
-                    if remaining == Some(0) {
-                        let _ = std::fs::remove_file(self.blob_dir.join(f));
-                    }
+                    self.remove_blob_if_unreferenced(&f);
                 }
                 return Err(e);
             }
@@ -223,26 +212,9 @@ impl Store {
             // 同哈希多条目共享同一载荷文件（`{hash}.bin`）：置顶条目不参与
             // 去重，`dedup=false` 时每次复制也都插入一条。删文件会摧毁仍在
             // 引用它的条目——默认配置下「置顶 → 重复制 → 删重复项」即可触发，
-            // 保留策略的自动淘汰也会走到这里。只有最后一个引用消失后才删。
-            //
-            // 文件名先过 safe_blob_path：DB 行内容不可信，含目录分量的
-            // blob_file 会把删除操作变成任意文件删除原语（SEC-006）。
-            let Some(path) = safe_blob_path(&self.blob_dir, &f) else {
-                tracing::warn!(file = %f, "载荷文件名不合法，跳过删除");
-                return Ok(());
-            };
-            let remaining: i64 = self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
-                    params![f],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            if remaining == 0 && path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
+            // 保留策略的自动淘汰也会走到这里。只有最后一个引用消失后才删
+            // （含文件名合法性校验，SEC-006；详见该方法的文档）。
+            self.remove_blob_if_unreferenced(&f);
         }
         Ok(())
     }
@@ -350,22 +322,7 @@ impl Store {
         // 注意顺序——DB 已提交，这里的 COUNT 看到的是更新后的世界；
         // 若新旧同名（内容哈希未变），本行仍引用它，计数 ≥ 1，不会误删。
         if let Some(f) = old_file {
-            let Some(path) = safe_blob_path(&self.blob_dir, &f) else {
-                tracing::warn!(file = %f, "载荷文件名不合法，跳过删除");
-                return Ok(());
-            };
-            let remaining: i64 = self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
-                    params![f],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            if remaining == 0 && path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
+            self.remove_blob_if_unreferenced(&f);
         }
         Ok(())
     }
@@ -486,6 +443,7 @@ impl Store {
             }
         }
 
+        let deleted;
         {
             let tx = self.conn.transaction()?;
             for (id, text) in &texts {
@@ -503,7 +461,11 @@ impl Store {
                 &format!("DELETE FROM items_fts_map WHERE item_id IN ({marks})"),
                 params_from_iter(ids.iter()),
             )?;
-            tx.execute(
+            // 返回**实际**删除的行数（DL-09）：传入不存在的 id 时
+            // `DELETE ... WHERE id IN (...)` 影响 0 行，早先直接
+            // `Ok(ids.len())` 会把它们也算进去，使 `enforce_retention`
+            // 的「删了几条」口径对任何调用方都不可信。
+            deleted = tx.execute(
                 &format!("DELETE FROM items WHERE id IN ({marks})"),
                 params_from_iter(ids.iter()),
             )?;
@@ -511,25 +473,10 @@ impl Store {
         }
 
         for f in &files {
-            // 路径规范化（SEC-006）：DB 行内容不可信。
-            let Some(path) = safe_blob_path(&self.blob_dir, f) else {
-                tracing::warn!(file = %f, "载荷文件名不合法，跳过删除");
-                continue;
-            };
-            let remaining: i64 = self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM items WHERE blob_file = ?1",
-                    params![f],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            if remaining == 0 && path.exists() {
-                let _ = std::fs::remove_file(path);
-            }
+            // 引用计数 + 路径规范化（SEC-006）统一在 store 侧一处完成。
+            self.remove_blob_if_unreferenced(f);
         }
-        Ok(ids.len())
+        Ok(deleted)
     }
 
 }

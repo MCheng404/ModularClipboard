@@ -1126,6 +1126,10 @@ pub(super) fn run_mode(
             } else {
                 app.svc.state.config.ui.window_blur_strength
             };
+            // 抓屏分辨率百分比：磨砂与玻璃共用（同一份底图、同一条抓屏链）。
+            // 每帧灌一次而不是只在变化时灌——`set_backdrop_scale` 只是
+            // 写一个 u8，比维护「上次已应用值」的簿记便宜。
+            painter.set_backdrop_scale(app.svc.state.config.ui.backdrop_scale);
             painter.paint_backdrop(
                 &mut fr,
                 window.hwnd().0 as isize,

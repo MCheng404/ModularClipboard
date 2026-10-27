@@ -78,6 +78,11 @@ pub(super) fn default_card_blur() -> u8 {
     0
 }
 
+/// `backdrop_scale` 的 serde 缺省值：50%（与历史的 1/2 降采样一致）。
+pub(super) fn default_backdrop_scale() -> u8 {
+    50
+}
+
 /// 卡片磨砂档位 → 捕获**降采样倍率**。
 ///
 /// # 为什么「降采样」就是「模糊」

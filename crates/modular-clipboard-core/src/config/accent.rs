@@ -9,6 +9,7 @@ use super::panels::TypeRailConfig;
 use super::card_row::CardShadowConfig;
 use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
+use super::window::default_backdrop_scale;
 use super::window::default_glass_dispersion;
 use super::window::default_glass_blur;
 use super::window::default_glass_edge;
@@ -174,6 +175,7 @@ impl Default for UiConfig {
             glass_dispersion: default_glass_dispersion(),
             glass_blur: default_glass_blur(),
             glass_edge: default_glass_edge(),
+            backdrop_scale: default_backdrop_scale(),
             window_blur_strength: default_window_blur_strength(),
             card_shadow: CardShadowConfig::default(),
             row_meta: RowMetaConfig::default(),

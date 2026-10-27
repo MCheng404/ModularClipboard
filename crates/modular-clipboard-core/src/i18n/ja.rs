@@ -73,6 +73,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Cannot edit image: content was evicted ({e})", "画像を編集できません：内容は退避されました（{e}）"),
     ("Cannot edit image: missing dimensions", "画像を編集できません：サイズ情報がありません"),
     ("Cannot edit: content was evicted ({e})", "編集できません：内容は退避されました（{e}）"),
+    ("Capture resolution", "キャプチャ解像度"),
+    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "デスクトップの取り込み解像度。100% 超はスーパーサンプリング。高いほど鮮明で負荷も増えます"),
     ("Cannot open the image editor:", "画像編集ウィンドウを開けません："),
     ("Capacity and cleanup", "容量とクリーンアップ"),
     ("Capture", "キャプチャ"),

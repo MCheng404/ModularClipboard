@@ -103,6 +103,7 @@ use super::controls::draw_number_field;
 use super::controls::draw_segmented;
 use super::controls::draw_slider;
 use super::controls::draw_step_slider;
+use super::controls::draw_step_slider_settled;
 use super::controls::draw_switch;
 use super::controls::draw_text_field;
 use super::theme_editor::draw_accent_editor;
@@ -422,6 +423,33 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
         // 整个丢弃——滑杆动了、数值显示变了，一松手全部回弹。
         // 2026-10-24 用户反馈「玻璃参数无法拖动调整」正是这个：
         // 三个滑块全都在推旧值。
+        ItemKind::BackdropScale => {
+            let cfg = &f.svc.state.config.ui;
+            let mut v = cfg.backdrop_scale;
+            // 只在真的抓屏时才可拖（背景效果 = 无时不抓屏）。这一项在那种
+            // 情况下已被 `item_hidden` 整行隐藏，这里的判据是第二道保险：
+            // 键盘/自动化路径仍可能把操作送到隐藏行上。
+            let enabled = cfg.window_backdrop != WindowBackdrop::None;
+            let pal = f.pal;
+            let mut settled = false;
+            let changed = setting_row(ui, it.label, it.desc, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(format!("{v}%")).color(pal.text_dim),
+                ));
+                let (changed, done) =
+                    draw_step_slider_settled(f, ui, it.key, &mut v, 15..=200, enabled);
+                settled = done;
+                changed
+            });
+            // CAUTION: 只在**松手/单击**时落地，不在拖动过程中逐档落地。
+            // 这个参数一变，渲染层要 `wait_idle` + 重建捕获图与描述符；
+            // 25%→100% 逐档应用是 75 次重建，拖动会卡成幻灯片。
+            // 拖动期间 `v` 只是本地显示值（标签实时跟手），松手才写配置。
+            if changed && settled && enabled {
+                f.state.push(Op::SetBackdropScale(v));
+                record_recent(f, it.key);
+            }
+        }
         ItemKind::GlassBlur => {
             let cfg = &f.svc.state.config.ui;
             let mut v = cfg.glass_blur;

@@ -166,6 +166,11 @@ pub(super) enum ItemKind {
     CardBlur,
     /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
     BlurStrength,
+    /// 抓屏分辨率百分比滑块（15 ~ 200，磨砂与玻璃共用）。
+    ///
+    /// 独立成变体而不是 `Number`：它写的是 `u8` 百分比，且上下限与
+    /// 渲染层的 `CAPTURE_PCT_RANGE` 同源（越界会被渲染层再钳一次）。
+    BackdropScale,
     /// 卡片阴影：开关行 + （开启时）模糊 / 浓度 / 垂直偏移三个滑条。
     ///
     /// 与 [`ItemKind::Opacity`] 同理独立成变体——参数不止一个，
@@ -438,6 +443,13 @@ impl SettingsItem {
             ItemKind::CardOpacity => (cfg.ui.card_opacity - 1.0).abs() > f32::EPSILON,
             ItemKind::CardBlur => cfg.ui.card_blur != d.ui.card_blur,
             ItemKind::BlurStrength => cfg.ui.window_blur_strength != d.ui.window_blur_strength,
+            // 只在真的抓屏时才算「偏离默认」：背景效果为「无」时这一项
+            // 不参与任何渲染，把它的默认值当成脏状态会让整张卡一直挂着
+            // 「重置」——而用户点下去什么都不会变。
+            ItemKind::BackdropScale => {
+                cfg.ui.window_backdrop != WindowBackdrop::None
+                    && cfg.ui.backdrop_scale != d.ui.backdrop_scale
+            }
             ItemKind::CardShadow => cfg.ui.card_shadow != d.ui.card_shadow,
             ItemKind::RowMeta => cfg.ui.row_meta != d.ui.row_meta,
             ItemKind::TypeRail => cfg.ui.type_rail != d.ui.type_rail,
@@ -505,6 +517,7 @@ impl SettingsItem {
             ItemKind::CardOpacity => Some(Op::SetCardOpacity(d.ui.card_opacity)),
             ItemKind::CardBlur => Some(Op::SetCardBlur(d.ui.card_blur)),
             ItemKind::BlurStrength => Some(Op::SetBlurStrength(d.ui.window_blur_strength)),
+            ItemKind::BackdropScale => Some(Op::SetBackdropScale(d.ui.backdrop_scale)),
             // 四个玻璃参数共享一个 Op：重置其中任意一个，其余三个一并
             // 归位。`reset_op` 拿不到当前配置（只有默认值 `d`），而
             // 「重置这一项」的语义本就是「这张卡回到默认」——四个都是
@@ -604,6 +617,9 @@ pub(super) fn item_hidden(
         "ui.blur_strength" => cfg.ui.window_backdrop != WindowBackdrop::Acrylic,
         // 背景不透明度：背景效果为「无」时窗口底是不透明的，调节无效。
         "ui.window_opacity" => cfg.ui.window_backdrop == WindowBackdrop::None,
+        // 抓屏分辨率：背景效果为「无」时压根不抓屏（`paint_backdrop` 不跑），
+        // 这一项没有任何作用——按「不可用即不存在」隐藏而不是压暗。
+        "ui.backdrop_scale" => cfg.ui.window_backdrop == WindowBackdrop::None,
         // 卡片不透明度：没有可透的底图时（无背景效果且未开卡片磨砂）
         // 滑块无从表现——与磨砂强度同一判据。
         "ui.card_opacity" => {
@@ -856,6 +872,12 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 label: msg("Background opacity"),
                 desc: msg("Transparency of the background layer; text stays opaque"),
                 kind: ItemKind::Opacity,
+            },
+            SettingsItem {
+                key: "ui.backdrop_scale",
+                label: msg("Capture resolution"),
+                desc: msg("Resolution of the captured desktop; above 100% supersamples, higher costs more"),
+                kind: ItemKind::BackdropScale,
             },
         ],
     },

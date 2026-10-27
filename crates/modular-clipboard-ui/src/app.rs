@@ -619,6 +619,15 @@ impl App {
                     self.svc.state.config.ui.card_blur = level.min(10);
                     self.after_config_change();
                 }
+                Op::SetBackdropScale(pct) => {
+                    // 区间与 `gfx::backdrop::CAPTURE_PCT_RANGE` 同源：
+                    // 配置写坏（0 / 255）时渲染层还会再钳一次，这里钳是
+                    // 为了让「保存下来的配置」本身就是合法值。
+                    self.svc.state.config.ui.backdrop_scale =
+                        (*modular_clipboard_gfx::backdrop::CAPTURE_PCT_RANGE.start())
+                            .max(pct.min(*modular_clipboard_gfx::backdrop::CAPTURE_PCT_RANGE.end()));
+                    self.after_config_change();
+                }
                 Op::SetBlurStrength(level) => {
                     // 磨砂强度只改卷积半径，运行时下一帧卷积即生效（渲染层
                     // 检测到半径变化会强制重捕获，无需重建资源）。

@@ -75,6 +75,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Cannot edit image: content was evicted ({e})", "Нельзя изменить изображение: содержимое вытеснено ({e})"),
     ("Cannot edit image: missing dimensions", "Нельзя изменить изображение: нет данных о размере"),
     ("Cannot edit: content was evicted ({e})", "Нельзя изменить: содержимое вытеснено ({e})"),
+    ("Capture resolution", "Разрешение захвата"),
+    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "Разрешение захвата рабочего стола; выше 100% — суперсэмплинг, чем выше, тем дороже"),
     ("Cannot open the image editor:", "Не удалось открыть редактор изображений:"),
     ("Capacity and cleanup", "Ёмкость и очистка"),
     ("Capture", "Захват"),
