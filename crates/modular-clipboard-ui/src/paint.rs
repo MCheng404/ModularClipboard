@@ -697,6 +697,13 @@ pub struct UiState {
     /// 玻璃 pass 只改 RGB，覆盖度由这个 alpha 定——这样「卡片不透明度」
     /// 滑块对玻璃同样生效，且语义与磨砂路径一致。
     pub glass_card_alpha: f32,
+    /// 卡片底色的**原色**（sRGB 分量 0~1，未预乘）。
+    ///
+    /// 玻璃层自己合成「底图 + 卡片色」：玻璃模式下 egui **不再**画行卡片
+    /// 底色（否则两层 alpha 叠加成 `a + a(1-a)`，卡片色不透明时玻璃被
+    /// 整层盖死）。默认 0（黑）——万一某条路径忘了设，玻璃只是变暗，
+    /// 不会整片消失。
+    pub glass_tint: [f32; 3],
     /// 图片缩略图的**像素**缓存（第三轮：图片条目内嵌显示）。
     ///
     /// LRU + 字节预算，见 [`crate::thumbnail::ThumbnailCache`]。
@@ -1436,6 +1443,15 @@ impl<'a> Frame<'a> {
     /// 记录行卡片底色 alpha（供玻璃 pass 定覆盖度）。
     pub fn set_glass_card_alpha(&mut self, a: f32) {
         self.state.glass_card_alpha = a;
+    }
+
+    /// 记录卡片底色的**原色**（供玻璃 pass 的 tint 用）。
+    ///
+    /// CAUTION: 必须传**未预乘**的原色。传 `palette.card_bg` 的预乘分量
+    /// 会把「卡片不透明度」重复算一次（那个 alpha 已经通过
+    /// `gamma_multiply` 压进 RGB 了），tint 会随滑块变暗、双重衰减。
+    pub fn set_glass_tint(&mut self, rgb: [f32; 3]) {
+        self.state.glass_tint = rgb;
     }
 }
 

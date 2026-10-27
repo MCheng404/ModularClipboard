@@ -129,9 +129,18 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // `card_blur_uv`），因此每张卡片看到的是它自己身后那一块桌面。
     // 液态玻璃：本帧起这张卡片要参与折射合成（仅背景效果 = 玻璃时生效）。
     // 必须在画底色**之前**——玻璃 pass 跑在 egui 内容之前。
+    let glass_mode = f.svc.state.config.ui.window_backdrop
+        == modular_clipboard_core::config::WindowBackdrop::Glass;
     f.push_glass(r, radius);
     // `Color32::a()` 给的是 0~255 的 u8，玻璃 pass 要 0~1 的 f32。
     f.set_glass_card_alpha(pal.card_bg.a() as f32 / 255.0);
+    // 卡片底色交给玻璃层自己合成（`fs_glass` 的 tint）。
+    //
+    // CAUTION: 取**未预乘**的原色。当前调色板里的 `card_bg` 已经被
+    // `with_card_opacity` 用 `gamma_multiply` 把不透明度压进 RGB 了，
+    // 直接拿分量当 tint 会让「卡片不透明度」被算两次（色越调越暗）。
+    let [tr, tg, tb, _] = pal.card_bg.to_srgba_unmultiplied();
+    f.set_glass_tint([tr as f32 / 255.0, tg as f32 / 255.0, tb as f32 / 255.0]);
     // 卡片磨砂补丁：**玻璃模式下不画**（2026-10-25 修「玻璃参数无效」）。
     //
     // 病根：这层补丁是 GDI 捕获的**不透明**纹理，画在玻璃 pass 之后，
@@ -158,7 +167,18 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     }
     // 行卡片底色用 `card_bg` 而不是 `surface_raised`：前者是「卡片透明度」
     // 设置的作用对象，后者是浮层令牌（见 `Palette::with_card_opacity`）。
-    painter.rect_filled(r, radius, pal.card_bg);
+    //
+    // CAUTION: **玻璃模式下不画**（2026-10-27）。玻璃 pass 已经把
+    // 「底图 + 卡片色」合成好了（`GlassParams::tint`），这里再画一层
+    // 就是两次覆盖：
+    //   最终 alpha = a + a(1-a) = a(2-a)
+    // 卡片色不透明（a = 1）时玻璃整层被盖死——折射、色散、边缘光全部
+    // 看不见，用户只能看到一张实色卡片；半透明时又多叠一份桌面而发白。
+    // 这也是「玻璃参数拖了没反应」在 2026-10-25 修过一次、却仍不够通透的
+    // 根因：补丁被跳过了，底色没有。
+    if !glass_mode {
+        painter.rect_filled(r, radius, pal.card_bg);
+    }
     // 置顶标记：底色微亮。置顶条目就在同一个列表里，靠这个区分。
     //
     // NOTE: 只靠色差是不够的 —— 实测 7% 透明叠加几乎看不出差别。

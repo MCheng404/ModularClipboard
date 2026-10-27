@@ -250,6 +250,31 @@ pub fn specular_rim(normal: [f32; 2], light: [f32; 2], shininess: f32) -> f32 {
     d.max(0.0).powf(shininess.max(0.5))
 }
 
+/// 卡片色在玻璃层里的**最大**混合强度。
+///
+/// 玻璃层自己合成「底图 + 卡片色」（`fs_glass` 的 `tint`），所以这个值
+/// 决定卡片看起来有多像一张有色卡片、有多像一块纯玻璃。
+///
+/// # 为什么是 0.45 而不是 1.0
+///
+/// 1.0 就是「不透明卡片」，等于回到玻璃 pass 存在之前的样子——折射与
+/// 色散全被这层色盖住。0.45 让底图的明暗与色相仍然透得出来，同时把
+/// 卡片压到足够暗（深色主题）/足够亮（浅色主题），前景文字才有对比度：
+/// 亮壁纸上如果 tint 太低，浅色主题的深字与玻璃底图会撞在一起。
+///
+/// 与 `card_alpha`（覆盖度）**无关**：那个决定「透过多少真实桌面」，
+/// 这个决定「玻璃自身有多浓的色」。两者相乘得到最终观感。
+pub const CARD_TINT_MAX: f32 = 0.45;
+
+/// 由卡片不透明度推出 tint 强度：`card_opacity × CARD_TINT_MAX`。
+///
+/// 复用同一个滑块（「卡片不透明度」）做两件事是刻意的：用户调低它就是
+/// 想要「更通透」——覆盖度变低的同时卡片色也该变淡，否则会出现
+/// 「玻璃透了、但卡片色还糊在上面」的割裂。
+pub fn card_tint_strength(card_alpha: f32) -> f32 {
+    (card_alpha.clamp(0.0, 1.0)) * CARD_TINT_MAX
+}
+
 /// 相对亮度（Rec.709 权重）。
 pub fn luminance(rgb: [f32; 3]) -> f32 {
     0.212_6 * rgb[0] + 0.715_2 * rgb[1] + 0.072_2 * rgb[2]
@@ -654,6 +679,27 @@ mod tests {
         assert_eq!(specular_rim([0.0, 0.0], light, 8.0), 0.0);
         // 锐度越大高光越集中（斜射处衰减更快）。
         assert!(specular_rim([-1.0, 0.0], light, 32.0) < left);
+    }
+
+    #[test]
+    fn card_tint_strength_is_proportional_and_clamped() {
+        // 覆盖度与 tint 强度是**两个**概念，但共用同一个滑块：卡片越不
+        // 透明，卡片色越浓。两者都不得越界（配置写坏成 2.0 时不能出现
+        // 大于 1 的混合系数——mix 的 t 超过 1 会外插出负色）。
+        assert_eq!(card_tint_strength(0.0), 0.0);
+        assert!((card_tint_strength(1.0) - CARD_TINT_MAX).abs() < 1e-6);
+        assert!(card_tint_strength(2.0) <= CARD_TINT_MAX, "上界必须钳住");
+        assert_eq!(card_tint_strength(-1.0), 0.0, "负值钳到 0");
+        // 单调：卡片越不透明，色越浓。
+        let mut prev = -1.0;
+        for a in [0.0_f32, 0.25, 0.5, 0.75, 1.0] {
+            let k = card_tint_strength(a);
+            assert!(k > prev, "应单调递增：a={a} 得 {k}");
+            prev = k;
+        }
+        // 上限本身必须留出「底图透得出来」的余量：超过 0.6 就等于把玻璃
+        // 盖成一张实色卡（那正是这轮要修的 bug）。
+        assert!(card_tint_strength(1.0) <= 0.6, "tint 上限过高会把玻璃盖死");
     }
 
     #[test]

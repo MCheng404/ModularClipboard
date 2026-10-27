@@ -59,7 +59,7 @@ const OFFSET_SIZE: u32 = 8;
 
 /// 玻璃 uniform。布局必须与 `glass.wgsl` 的 `GlassUniforms` 逐字段一致。
 ///
-/// 大小 432 字节：`rects` 384 + `size` 8 + 6 个 f32 24 + `pad` 16。
+/// 大小 432 字节：`rects` 384 + `size` 8 + 6 个 f32 24 + `tint` 16。
 /// **无隐式填充**（每个字段都命名），这是 `bytemuck::Pod` 的要求。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -78,10 +78,19 @@ pub struct GlassUniforms {
     pub radius: f32,
     /// 有效卡片数。
     pub count: u32,
-    /// 卡片底色 alpha（玻璃层的覆盖度；着色器侧按预乘使用）。
+    /// 玻璃层的**覆盖度**（0 = 完全露出真实桌面，1 = 玻璃层不透明）。
+    ///
+    /// 着色器侧按预乘使用（`rgb * a, a`）。它是「这张卡片有多不透明」，
+    /// 与下面的 `tint_strength`（有多像一张有色卡片）是两件事。
     pub card_alpha: f32,
-    /// 尾部填充（与 WGSL 的 `pad: vec4<f32>` 对应）。
-    pub pad: [f32; 4],
+    /// 卡片底色（sRGB 分量，0~1）——玻璃层自己合成这层颜色。
+    ///
+    /// CAUTION: 必须是**未预乘**的原色。早前这层色由 egui 在玻璃 pass
+    /// 之后再画一个不透明矩形，两层的 alpha 叠加成 `a + a(1-a)`，卡片色
+    /// 100% 时玻璃整层被盖死（折射/色散全看不见）。
+    pub tint: [f32; 3],
+    /// 卡片色在玻璃层里的混合强度（0 = 纯玻璃，1 = 完全是卡片色）。
+    pub tint_strength: f32,
 }
 
 impl Default for GlassUniforms {
@@ -95,7 +104,8 @@ impl Default for GlassUniforms {
             radius: 8.0,
             count: 0,
             card_alpha: 1.0,
-            pad: [0.0; 4],
+            tint: [0.0; 3],
+            tint_strength: 0.0,
         }
     }
 }
@@ -349,12 +359,21 @@ pub struct GlassParams {
     pub dispersion: f32,
     /// Fresnel 幂次。
     pub edge: f32,
-    /// 卡片底色 alpha：玻璃层的覆盖度（0 = 完全露出真实桌面，1 = 不透明）。
+    /// 玻璃层的覆盖度（0 = 完全露出真实桌面，1 = 不透明）。
     ///
     /// CAUTION: `glass.wgsl` 拿它做**预乘**（`rgb * a, a`），不是只写进
     /// alpha 通道——交换链按 PRE_MULTIPLIED 合成，只写 alpha 会让半透明
     /// 卡片被额外叠一层桌面而发白。
     pub card_alpha: f32,
+    /// 卡片底色（sRGB 分量，0~1，**未预乘**）。
+    ///
+    /// 玻璃层自己把「底图 + 卡片色」合成完，egui 在玻璃模式下**不再画**
+    /// 行卡片底色（见 `paint::row` 的说明）。早前两层各画一次，alpha
+    /// 叠加成 `a + a(1-a)`：卡片色不透明时玻璃整层被盖死，折射/色散
+    /// 都看不见；半透明时又多叠一份桌面（发白）。
+    pub tint: [f32; 3],
+    /// 卡片色在玻璃层里的混合强度（0 = 纯玻璃，1 = 完全是卡片色）。
+    pub tint_strength: f32,
 }
 
 impl GlassParams {
@@ -377,6 +396,8 @@ impl GlassParams {
             dispersion: self.dispersion,
             edge: self.edge,
             card_alpha: self.card_alpha,
+            tint: self.tint,
+            tint_strength: self.tint_strength,
             ..GlassUniforms::default()
         };
         let n = self.rects.len().min(MAX_GLASS_CARDS);

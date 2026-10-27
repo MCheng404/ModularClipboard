@@ -1106,12 +1106,17 @@ pub(super) fn run_mode(
                 let cfg = &app.svc.state.config.ui;
                 let rects = std::mem::take(&mut app.paint_state.glass_rects);
                 let card_alpha = app.paint_state.glass_card_alpha;
+                let tint = app.paint_state.glass_tint;
+                let tint_strength =
+                    modular_clipboard_gfx::glass::card_tint_strength(card_alpha);
                 painter.set_glass(modular_clipboard_gfx::glass_pass::GlassParams {
                     rects,
                     refract: cfg.glass_refract,
                     dispersion: cfg.glass_dispersion,
                     edge: cfg.glass_edge,
                     card_alpha,
+                    tint,
+                    tint_strength,
                 });
             }
             // 模糊半径按模式取：磨砂用自己的档位，玻璃用**自有的**档位。
