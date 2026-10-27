@@ -2274,7 +2274,14 @@ mod tests {
             .expect("应按住组合并记录候选");
         assert_eq!(combo.key, "K", "主键应按名原样记录");
         assert!(combo.ctrl && combo.shift, "按住的修饰键应捕获：{combo:?}");
-        assert!(!combo.alt && !combo.win, "没按的修饰键不该被带上：{combo:?}");
+        // `alt` 来自事件里的 modifiers，与真实键盘无关，恒可断言。
+        assert!(!combo.alt, "没按的修饰键不该被带上：{combo:?}");
+        // CAUTION: `win` 不是来自事件，而是 `win_key_down()` 现场问
+        // `GetAsyncKeyState`——它读的是**物理键盘**。测试机上真按着 Win 键
+        // （或键卡住）时这条会红，与代码无关。只在键没按下时断言。
+        if !modular_clipboard_platform::win_key_down() {
+            assert!(!combo.win, "没按的修饰键不该被带上：{combo:?}");
+        }
         // 配置没被碰——应用发生在确认那一刻。
         assert_eq!(
             app.svc.state.config.hotkey_toggle.key, "V",

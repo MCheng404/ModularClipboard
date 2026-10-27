@@ -1370,6 +1370,16 @@ impl<'a> Frame<'a> {
     /// `gfx::glass_pass::MAX_GLASS_CARDS`。超出部分由 uniform 换算处静默
     /// 丢弃——列表可见行约 10 张 + 顶栏 + 搜索面板 + 类型栏，正常不会超。
     pub fn push_glass(&mut self, r: Rect, radius: f32) {
+        // CAUTION: 只有**主窗口**跑玻璃 pass。`glass_rects` 与 `drag_regions`
+        // 一样是主/子/设置三窗**共用**的一张表（同一个 `PaintState`），
+        // 而只有主窗口的帧循环会 `mem::take` 它并调 `set_glass`。附属窗口
+        // 若也往里 push，坐标属于另一个窗口的客户区，会被主窗口当成自己的
+        // 矩形——玻璃会画在完全错误的位置（而且不报错）。
+        //
+        // 判据用 `HitNs` 而不是 `card_id`：设置窗口的 `card_id` 也是 `None`。
+        if !matches!(self.hit_ns, HitNs::Main) {
+            return;
+        }
         // 与 `hit_insert` 同一套健全性检查：非有限坐标/零面积/不在客户区内
         // 的矩形不该进 uniform（NaN 会让 SDF 全程为假，整张卡片没玻璃）。
         let sane = r.min.x.is_finite()
@@ -1387,6 +1397,40 @@ impl<'a> Frame<'a> {
         self.state
             .glass_rects
             .push(modular_clipboard_gfx::glass_pass::GlassRect::new(r, radius));
+    }
+
+    /// 登记一个**高优先级**的玻璃矩形（顶栏 / 搜索面板 / 类型栏 / 通知）。
+    ///
+    /// # 为什么需要优先级
+    ///
+    /// 矩形上限是 [`MAX_GLASS_CARDS`](modular_clipboard_gfx::glass_pass::MAX_GLASS_CARDS)，
+    /// 超出部分静默丢弃。而绘制顺序是「列表行 → 顶栏 → 搜索 → 类型栏」，
+    /// 于是窗口一拉高、可见行超过预算时，被丢掉的恰恰是**最显眼的 chrome**
+    /// （顶栏没有玻璃，而第 20 行有）——反了。
+    ///
+    /// 高优先级矩形插到队首：着色器逐矩形遍历、命中即停，而 chrome 与行
+    /// 卡片**互不重叠**，因此顺序不影响命中结果，只影响「超限时谁被丢」。
+    pub fn push_glass_overlay(&mut self, r: Rect, radius: f32) {
+        if !matches!(self.hit_ns, HitNs::Main) {
+            return;
+        }
+        let sane = r.min.x.is_finite()
+            && r.min.y.is_finite()
+            && r.max.x.is_finite()
+            && r.max.y.is_finite()
+            && r.width() > 0.0
+            && r.height() > 0.0;
+        if !sane || !self.area.intersects(r) {
+            return;
+        }
+        // 满了就**挤掉队尾**（最低优先级）而不是丢弃自己：顶栏/搜索/类型栏
+        // 是最后画的，若按 push 顺序截断，被丢的正是它们。
+        if self.state.glass_rects.len() >= modular_clipboard_gfx::glass_pass::MAX_GLASS_CARDS {
+            self.state.glass_rects.pop();
+        }
+        self.state
+            .glass_rects
+            .insert(0, modular_clipboard_gfx::glass_pass::GlassRect::new(r, radius));
     }
 
     /// 记录行卡片底色 alpha（供玻璃 pass 定覆盖度）。
@@ -6784,6 +6828,90 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(
             old_w > inner,
             "旧单行拼接宽 {old_w} 应放不进 {inner}（放得进说明回归锁失效）"
+        );
+    }
+
+    #[test]
+    fn glass_overlay_evicts_rows_when_budget_is_full() {
+        // 覆盖范围回归（2026-10-27）：绘制顺序是「顶栏 → 行卡片 →
+        // 类型栏 → 搜索面板」，而行卡片数量随窗口高度增长。按 push 顺序
+        // 截断时被丢掉的恰是**最后画的 chrome**（类型栏、搜索面板），
+        // 于是高窗口里「第 20 行有玻璃、类型栏没有」。
+        //
+        // 判据：塞满 cap 个行矩形后再登记一个 chrome，它必须挤进来
+        // （插队首、挤掉队尾），且总数不超上限。
+        let mut h = Harness::new("glass-budget", vec2(720.0, 800.0));
+        let input = h.input(Vec::new());
+        h.clock += 1.0 / 60.0;
+        let area = h.area;
+        let cap = modular_clipboard_gfx::glass_pass::MAX_GLASS_CARDS;
+        let mut out = h.ctx.run_ui(input, |ui| {
+            let mut f = Frame {
+                ui,
+                state: &mut h.state,
+                svc: &mut h.svc,
+                ws: &h.ws,
+                pal: &h.pal,
+                scale: 1.0,
+                area,
+                card_id: None,
+                hit_ns: HitNs::Main,
+            };
+            for i in 0..cap {
+                let r = Rect::from_min_size(pos2(0.0, i as f32), vec2(120.0, 1.0));
+                f.push_glass(r, ROW_RADIUS);
+            }
+            assert_eq!(f.state.glass_rects.len(), cap, "前置条件：应恰好塞满");
+            // 第 cap+1 个行矩形被拒（行没有优先级）。
+            let extra_row = Rect::from_min_size(pos2(0.0, 0.0), vec2(120.0, 1.0));
+            f.push_glass(extra_row, ROW_RADIUS);
+            assert_eq!(f.state.glass_rects.len(), cap, "行矩形超限应被丢弃");
+
+            // chrome：必须挤进来。
+            let chrome = Rect::from_min_size(pos2(0.0, 0.0), vec2(area.width(), 40.0));
+            f.push_glass_overlay(chrome, 6.0);
+            assert_eq!(f.state.glass_rects.len(), cap, "不得超上限");
+            assert_eq!(
+                f.state.glass_rects[0].rect, chrome,
+                "chrome 应插到队首（着色器逐矩形遍历、命中即停）"
+            );
+        });
+        drop(std::mem::take(&mut out.shapes));
+    }
+
+    #[test]
+    fn glass_rects_are_not_collected_by_other_windows() {
+        // 主/子/设置三窗共用同一个 `PaintState`，而只有主窗口的帧循环会
+        // `take` 玻璃矩形。附属窗口若也往里 push，坐标属于另一个窗口的
+        // 客户区，会被主窗口当成自己的 —— 玻璃画在完全错误的位置。
+        let mut h = Harness::new("glass-ns", vec2(720.0, 800.0)).with_items(3);
+        h.frame();
+        let before = h.state.glass_rects.len();
+
+        // 以设置窗口身份画一帧：它的绘制路径里也有卡片/面板。
+        let input = h.input(Vec::new());
+        h.clock += 1.0 / 60.0;
+        let mut out = h.ctx.run_ui(input, |ui| {
+            let mut f = Frame {
+                ui,
+                state: &mut h.state,
+                svc: &mut h.svc,
+                ws: &h.ws,
+                pal: &h.pal,
+                scale: 1.0,
+                area: h.area,
+                card_id: None,
+                hit_ns: HitNs::Settings,
+            };
+            // 直接调登记入口：任何设置页控件将来想加玻璃都走这里。
+            f.push_glass(h.area, 12.0);
+            f.push_glass_overlay(h.area, 12.0);
+        });
+        drop(std::mem::take(&mut out.shapes));
+        assert_eq!(
+            h.state.glass_rects.len(),
+            before,
+            "非主窗口不得向主窗口的玻璃收集表里写矩形"
         );
     }
 }

@@ -40,7 +40,7 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     let pal = f.pal;
     let scale = f.scale;
     // 液态玻璃：顶栏也参与（圆角 0 = 直角矩形，SDF 退化为普通矩形）。
-    f.push_glass(bar, 0.0);
+    f.push_glass_overlay(bar, 0.0);
     let painter = f.ui.painter_at(bar);
     // 一体性：顶栏与卡片区**同色**（`bg`），整窗连成一片。
     // 早前这里用 `surface_variant`（第二种灰），与下面的卡片区
@@ -358,7 +358,7 @@ pub(super) fn set_search_expanded(f: &mut Frame<'_>, v: bool) {
 pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
     // 液态玻璃：搜索面板参与（圆角与它自己的底色一致）。
-    f.push_glass(r, pal.radius_md);
+    f.push_glass_overlay(r, pal.radius_md);
     let painter = f.ui.painter_at(r);
     // 纯平毛玻璃禁令同样适用于悬浮层：纯色底 + 1px 描边，禁渐变光泽。
     let radius = pal.radius_md;
@@ -692,7 +692,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     }
     let vertical = matches!(rail_cfg.pos, TypeRailPos::Left | TypeRailPos::Right);
     // 液态玻璃：类型栏参与。圆角取面板档（与搜索面板同源）。
-    f.push_glass(rail, pal.radius_md);
+    f.push_glass_overlay(rail, pal.radius_md);
     // 文字标签的排版（labels 开启时）：竖直排下方、水平排右侧。
     let label_font = sized(pal.font_xs, f.scale);
     let label_h = label_font.size.max(10.0) * 1.25;

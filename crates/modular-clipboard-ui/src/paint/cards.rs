@@ -126,6 +126,18 @@ pub(super) fn draw_card_frame(f: &mut Frame<'_>, r: Rect) {
 
 /// 展开态：卡片外框 + 头部 + 内容。
 pub(super) fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
+    // 液态玻璃覆盖：**详情卡与停靠的类型栏整卡**参与折射。
+    //
+    // 为什么历史卡不在这里登记：它内部每张行卡片各有自己的玻璃矩形
+    // （`row.rs` 的 `push_glass`，圆角 = 行圆角）。整卡再登记一次会
+    // 盖住所有行——着色器逐矩形遍历、**命中即停**，整卡在前 ⇒ 行卡片
+    // 的独立折射带全部失效，列表会变成「一整块大透镜」。
+    //
+    // 详情卡/侧栏卡内部没有更小的玻璃单元，整卡登记是唯一选择。
+    // `push_glass` 自带「仅主窗口」闸门，附属窗口不会污染主窗口的收集表。
+    if matches!(card.kind, CardKind::Detail | CardKind::Rail) {
+        f.push_glass(r, CARD_RADIUS);
+    }
     draw_card_frame(f, r);
     let pal = f.pal;
 

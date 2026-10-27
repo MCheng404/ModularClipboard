@@ -36,7 +36,17 @@ use crate::Gpu;
 /// 两侧漂移的后果：CPU 写进 uniform 的矩形数超过着色器声明的数组长度，
 /// 多出的那些被**静默忽略**（WGSL 越界访问在 uniform 里是实现定义的），
 /// 表现为「有的卡片没有玻璃」且不报任何错。
-pub const MAX_GLASS_CARDS: usize = 16;
+///
+/// # 为什么从 16 提到 24（2026-10-27）
+///
+/// 16 只够「约 10 张可见行 + 顶栏 + 搜索面板 + 类型栏」。窗口一拉高
+/// （或字号调小让行变多）可见行就到 18~20，末尾几张卡直接没有玻璃——
+/// 用户看到的是「有的卡片是玻璃、有的是磨砂」，而不是报错。
+///
+/// 24 覆盖 800~1200px 高的窗口；每像素多 8 次 AABB 比较（4 个分量），
+/// uniform 从 304 涨到 432 字节，代价可忽略。再往上就要改成按行索引的
+/// 空间结构（着色器里逐矩形遍历是 O(n)），不值当。
+pub const MAX_GLASS_CARDS: usize = 24;
 
 /// push constant 的阶段掩码（只有片元读 UV 位移）。
 const OFFSET_STAGE: vk::ShaderStageFlags = vk::ShaderStageFlags::FRAGMENT;
@@ -49,7 +59,7 @@ const OFFSET_SIZE: u32 = 8;
 
 /// 玻璃 uniform。布局必须与 `glass.wgsl` 的 `GlassUniforms` 逐字段一致。
 ///
-/// 大小 304 字节：`rects` 256 + `size` 8 + 6 个 f32 24 + `pad` 16。
+/// 大小 432 字节：`rects` 384 + `size` 8 + 6 个 f32 24 + `pad` 16。
 /// **无隐式填充**（每个字段都命名），这是 `bytemuck::Pod` 的要求。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
