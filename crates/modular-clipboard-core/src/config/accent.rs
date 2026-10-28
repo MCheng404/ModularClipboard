@@ -164,6 +164,7 @@ impl Default for UiConfig {
             font_path: None,
             font_scale: 1.0,
             language: crate::i18n::LANG_SYSTEM.to_string(),
+            gpu_adapter: "auto".to_string(),
             layout: None,
             window_pos: None,
             pinned_window_pos: None,

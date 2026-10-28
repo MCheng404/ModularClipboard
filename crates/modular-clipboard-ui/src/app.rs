@@ -580,6 +580,22 @@ impl App {
                     modular_clipboard_app::apply_language(lang);
                     self.after_config_change();
                 }
+                Op::SetGpuAdapter(value) => {
+                    // 只写配置。**不**尝试热切换：`Gpu` 持有 instance /
+                    // device / surface，所有纹理与管线都挂在上面，换卡等于
+                    // 重建整个渲染栈——代价与重启相同却多一堆中间态。
+                    // 设置页的说明文字负责讲清「重启生效」。
+                    //
+                    // 顺手把选择与实况一起记进日志：用户反馈「选了核显没反应」
+                    // 时，这一行就是第一手证据。
+                    self.svc.state.config.ui.gpu_adapter = value.clone();
+                    tracing::info!(
+                        selected = %value,
+                        in_use = ?self.paint_state.gpu_current,
+                        "GPU 适配器选择已保存（重启后生效）"
+                    );
+                    self.after_config_change();
+                }
                 Op::CopyMcpPairPrompt => {
                     // 把按当前 MCP 配置动态拼接的接入说明复制到剪贴板。
                     //

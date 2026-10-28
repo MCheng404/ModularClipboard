@@ -334,6 +334,13 @@ pub enum Op {
     /// 由 `App::apply_ops` 落地：写配置 + 立即 `i18n::set_locale`
     /// （界面语言是全局状态，不等下一帧）。
     SetLanguage(&'static str),
+    /// 改 GPU 适配器选择（`"auto"` / `"discrete"` / `"integrated"` /
+    /// `"name:<设备名>"`）。**重启生效**。
+    ///
+    /// 与 [`Op::SetBackdrop`] 等「立即生效」的项不同：`Gpu` 持有
+    /// instance / device / surface，换卡等于重建整个渲染栈。这里只写配置，
+    /// 界面上的说明文字负责把「重启生效」讲清楚。
+    SetGpuAdapter(String),
     /// 改一个文本配置字段（MCP 服务地址 / 密钥）。
     SetText {
         group: ConfigGroup,
@@ -692,6 +699,21 @@ pub struct UiState {
     /// CAUTION: 帧循环取走时会 `mem::take` 清空。若某条绘制路径没跑
     /// （窗口最小化、跳过渲染），下一帧重新收集，不会累积陈旧矩形。
     pub glass_rects: Vec<modular_clipboard_gfx::glass_pass::GlassRect>,
+    /// 本机全部 Vulkan 适配器（**启动时枚举一次**）。
+    ///
+    /// # 为什么缓存而不是每次画设置页都枚举
+    ///
+    /// `enumerate_adapters` 每次都要 `Entry::load` + `create_instance`
+    /// （实测 10~50ms）。设置页每帧都要画这一行，逐帧枚举会直接卡住界面。
+    /// 而适配器列表在一次运行期间不会变（插拔显卡坞要重启才生效），
+    /// 所以启动时取一次就够。
+    pub gpu_adapters: Vec<modular_clipboard_gfx::AdapterInfo>,
+    /// 当前**实际**在用的适配器名（`Gpu` 选中的那张）。
+    ///
+    /// 与配置项 `ui.gpu_adapter` 是两件事：配置是「用户想要哪张」，
+    /// 这里是「实际拿到哪张」。两者不一致时（`name:` 没匹配上、回退 Auto）
+    /// 设置页要能看出来——否则用户会以为设置生效了。
+    pub gpu_current: Option<String>,
     /// 图片缩略图的**像素**缓存（第三轮：图片条目内嵌显示）。
     ///
     /// LRU + 字节预算，见 [`crate::thumbnail::ThumbnailCache`]。

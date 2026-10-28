@@ -78,6 +78,30 @@
   `pad` vec4，净增 0）。Rust 与 WGSL 两侧 `GlassUniforms` 逐字段对齐，
   `shader_constants_match_rust` 已把 `CARD_TINT_MAX` 纳入比对。
 
+### 新增（GPU 适配器选择 + 探针）
+
+- **设置 → 显卡 → GPU 适配器**（默认「自动」）：双显卡机器上可以直接指定
+  用哪张卡渲染界面，不必再靠环境变量。
+  - 配置项 `ui.gpu_adapter`，取值 `"auto"` / `"discrete"` / `"integrated"` /
+    `"name:<设备名>"`（宽松解析，未知值退回 auto）；
+  - **重启生效**：`Gpu` 持有 instance / device / surface，换卡等于重建整个
+    渲染栈——代价与重启相同却多一堆中间态。设置页的说明文字写明这一点。
+  - 该行同时显示「当前：<实际在用的卡>」，与配置值不一致时用警告色。
+    不一致的典型原因：`name:` 里的设备名换了驱动就匹配不上（回退 Auto）、
+    显卡坞没插、手改配置写错名字。
+  - 优先级：环境变量 `MODULARCLIPBOARD_GPU` **高于**配置（运维/排查入口），
+    未设置时走配置。
+- **GPU 探针**（`modular-clipboard-gfx::probe`）：
+  - 启动时自动跑一次：枚举全部适配器 → 按同一套打分选中 → **真的建一次
+    `vkDevice`**（验证这张卡能用）→ 立刻销毁。结果写日志：
+    `RUST_LOG=info` 一行摘要，`debug` 输出完整列表；
+  - 设置页的适配器列表来自同一次枚举（缓存进 `UiState`，不逐帧枚举——
+    每次枚举要建一个临时 Vulkan 实例，实测 10~50ms）；
+  - 新增命令行 `--gpu-probe`：跑一次探针并弹窗显示完整报告后退出。
+    用户反馈「玻璃没效果」时，这是第一手证据。
+  - 探针**不校验呈现能力**（那需要 surface），所以「实际在用」以
+    `Gpu::device_name()` 为准，而不是探针结论。
+
 ### 优化（玻璃 alpha 通道）
 
 - **底色与覆盖度改为逐矩形**（`GlassUniforms::tints` / `alphas`）：早前

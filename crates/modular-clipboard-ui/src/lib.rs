@@ -71,6 +71,22 @@ pub fn activate_running_instance() -> bool {
     modular_clipboard_gfx::window::request_show_main_window(crate::renderer::WINDOW_TITLE)
 }
 
+/// 跑一次 GPU 自检并返回可读报告（`--gpu-probe` 用）。
+///
+/// # 为什么在这里转发
+///
+/// 同 [`activate_running_instance`]：分层约定是「bin 只依赖 core / app / ui」，
+/// 而探针在 `gfx` 层。`main.rs` 需要这个能力（用户排查「玻璃没效果」
+/// 时先看显卡），但不该为此直接依赖 gfx。
+///
+/// 适配器选择读的是配置里的 `ui.gpu_adapter`——探针报告要与实际启动
+/// 走同一套解析，否则「探针说选了核显、界面却跑独显」只会更让人困惑。
+pub fn gpu_probe_report(config: &modular_clipboard_core::Config) -> String {
+    let selection = modular_clipboard_gfx::GpuSelection::parse(&config.ui.gpu_adapter);
+    let report = modular_clipboard_gfx::probe::probe(&selection);
+    modular_clipboard_gfx::probe::format_report(&report)
+}
+
 /// 默认数据目录的展示字符串。
 ///
 /// 从 store 层转发，让 `main.rs` 不必为了打印一行帮助文本而直接依赖

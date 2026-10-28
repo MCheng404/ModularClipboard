@@ -115,7 +115,24 @@ pub(super) fn run_mode(
     );
 
     // ---- Vulkan 设备 ----------------------------------------------------
-    let gpu = Gpu::new(WINDOW_TITLE, window.hinstance(), window.hwnd())?;
+    //
+    // 适配器选择来自配置（默认 `auto` = 独显优先）。**只在启动时读一次**：
+    // `Gpu` 持有 instance / device / surface，换卡等于重建整个渲染栈，
+    // 所以设置页只写配置并提示「重启生效」。
+    //
+    // 优先级：**环境变量 > 配置**。
+    //
+    // 环境变量 `MODULARCLIPBOARD_GPU` 是运维/排查入口——临时指定一张卡
+    // 跑一次，不该被界面上保存过的值按住。普通用户不设它，走配置。
+    //
+    // CAUTION: 不能用 `GpuSelection::from_env()` 来判断「有没有设」——
+    // 它在未设置时返回 `Auto`，与「显式设成 auto」无法区分。直接读
+    // `std::env::var` 才知道有没有这个变量。
+    let selection = match std::env::var(modular_clipboard_gfx::ENV_GPU_PREF) {
+        Ok(v) => modular_clipboard_gfx::GpuSelection::parse(&v),
+        Err(_) => modular_clipboard_gfx::GpuSelection::parse(&config.ui.gpu_adapter),
+    };
+    let gpu = Gpu::new(WINDOW_TITLE, window.hinstance(), window.hwnd(), selection.clone())?;
     // IMPORTANT: 必须在**第一次 `egui_input` 之前**告知纹理上限。
     //
     // egui 用这个值决定字体图集能长多大；缺省 2048 在超采样下不够
@@ -193,6 +210,27 @@ pub(super) fn run_mode(
         modular_clipboard_app::apply_language(&config.ui.language);
     let mut app = App::from_service(config, svc);
     let ctx = app.ctx.clone();
+
+    // ---- GPU 自检与适配器列表 -------------------------------------------
+    //
+    // 启动时跑一次探针：枚举适配器 + 验证选中的那张能建逻辑设备。结果写
+    // 日志（`RUST_LOG=info` 一行摘要，debug 出完整列表），并缓存进
+    // `paint_state` 供设置页展示。
+    //
+    // CAUTION: 必须缓存而不是让设置页每次枚举——`enumerate_adapters`
+    // 每次都要 `Entry::load` + `create_instance`（实测 10~50ms），
+    // 而设置页每帧都要画这一行，逐帧枚举会把界面卡死。
+    //
+    // 探针**不校验呈现能力**（那需要 surface）。所以「实际在用」以
+    // `gpu.device_name()` 为准，而不是探针的结论——真正建表面时
+    // `select_device` 可能选到另一张。
+    {
+        let report = modular_clipboard_gfx::probe::probe(&selection);
+        tracing::info!("{}", report.summary());
+        tracing::debug!("{}", modular_clipboard_gfx::probe::format_report(&report));
+        app.paint_state.gpu_adapters = report.adapters;
+        app.paint_state.gpu_current = Some(gpu.device_name());
+    }
 
     // 恢复上次退出时的置顶窗口位置。
     //

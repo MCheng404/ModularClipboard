@@ -56,6 +56,26 @@ pub struct UiConfig {
     /// 自定义中文字体路径，`None` 时自动探测系统字体。
     pub font_path: Option<String>,
     pub font_scale: f32,
+    /// GPU 适配器选择。**重启生效**。
+    ///
+    /// 取值（宽松解析，未知值退回 `"auto"`）：
+    /// - `"auto"`：自动挑（独显优先）；
+    /// - `"discrete"` / `"integrated"`：按类型偏好；
+    /// - `"name:<设备名>"`：锁定某一张适配器（名字来自 Vulkan 的
+    ///   `deviceName`，设置页的下拉框写入这个形式）。
+    ///
+    /// # 为什么是字符串
+    ///
+    /// 与 [`UiConfig::language`] 同一取舍：配置文件用户可手改，写错一个值
+    /// 不该让整份配置回退。解析在 `modular_clipboard_gfx::GpuSelection::parse`
+    /// （那里有往返测试）。
+    ///
+    /// # 为什么重启生效
+    ///
+    /// `Gpu` 持有 instance / device / surface，所有纹理、管线、交换链都挂在
+    /// 它上面。运行期换卡等于销毁重建整个渲染栈——代价与「重启」相同，却
+    /// 多了一堆中间态。设置页因此只写配置并提示「重启生效」。
+    pub gpu_adapter: String,
     /// 界面语言：`"system"`（跟随系统）/ `"zh-CN"` / `"en-US"`。
     ///
     /// 用字符串而不是枚举：配置文件是用户可手改的，宽松解析 + 明确

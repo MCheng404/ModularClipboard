@@ -101,6 +101,8 @@ fn query_descriptor_update_caps(
     }
 }
 
+pub mod probe;
+
 /// 首选 GPU 类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuPreference {
@@ -129,7 +131,245 @@ impl GpuPreference {
 }
 
 /// GPU 选择偏好环境变量。
+///
+/// 只作为**兼容入口**：配置文件里的 `ui.gpu_adapter` 优先（见
+/// [`GpuSelection::parse`]）。两者都缺省时走 `Auto`。
 pub const ENV_GPU_PREF: &str = "MODULARCLIPBOARD_GPU";
+
+/// 适配器选择的配置前缀：`"name:NVIDIA GeForce RTX 4090"`。
+const NAMED_PREFIX: &str = "name:";
+
+/// GPU 适配器选择（`ui.gpu_adapter` 的解析结果）。
+///
+/// # 为什么不是只有 [`GpuPreference`]
+///
+/// 双显卡机器上「独显 / 核显」两个标签不够用：
+/// - 有些机器有**两张独显**（核显 + 独显 + 外接显卡坞）；
+/// - `Preference::Discrete` 在两张独显之间只能靠枚举顺序决定，用户无从选择；
+/// - 虚拟 GPU / 软件渲染（`lavapipe`）也会出现在列表里，标签对不上。
+///
+/// 所以加 `Named`：直接锁定某一张适配器。名字来自
+/// [`enumerate_adapters`]，用户从设置页的下拉框里选。
+///
+/// # 名字而不是索引
+///
+/// `vkEnumeratePhysicalDevices` 的顺序**不保证稳定**（驱动更新、外接显卡
+/// 插拔、多显示器变化都会改变顺序）。用索引会在下次启动时静默选错设备，
+/// 而名字至少能「找不到就回退 Auto」。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum GpuSelection {
+    /// 按打分自动挑（独显优先）。默认。
+    #[default]
+    Auto,
+    /// 按设备类型偏好。
+    Preference(GpuPreference),
+    /// 按适配器名字精确选择（`enumerate_adapters()` 给出的名字）。
+    Named(String),
+}
+
+impl GpuSelection {
+    /// 解析配置字符串。无法识别时返回 `Auto`。
+    ///
+    /// 宽松解析是刻意的：配置文件用户可手改，写错一个值不该让整个
+    /// 配置回退（同 `i18n::parse_lang` 的取舍）。
+    ///
+    /// | 输入 | 结果 |
+    /// |---|---|
+    /// | `""` / `"auto"` / 未知值 | `Auto` |
+    /// | `"discrete"` / `"d"` / `"独显"` | `Preference(Discrete)` |
+    /// | `"integrated"` / `"i"` / `"核显"` | `Preference(Integrated)` |
+    /// | `"name:<设备名>"` | `Named(<设备名>)` |
+    ///
+    /// 整串先 trim（配置手写时两端常有空白），`name:` 前缀大小写不敏感。
+    /// 设备名两端若真有空白会被一并去掉——实测各驱动都不带，而「配置里
+    /// 多敲了个空格」倒是常见，取舍上选后者。
+    pub fn parse(s: &str) -> Self {
+        let t = s.trim();
+        if let Some(rest) = t
+            .get(..NAMED_PREFIX.len())
+            .filter(|p| p.eq_ignore_ascii_case(NAMED_PREFIX))
+            .and_then(|_| t.get(NAMED_PREFIX.len()..))
+        {
+            // 前缀后再 trim 一次：`"name:  NVIDIA RTX 4090 "` 这种手写
+            // 习惯很常见（整串 trim 管不到冒号后面的空白）。
+            let rest = rest.trim();
+            // `name:` 后面为空 = 配置写坏，退回 Auto。
+            if rest.is_empty() {
+                return GpuSelection::Auto;
+            }
+            return GpuSelection::Named(rest.to_string());
+        }
+        match t.to_ascii_lowercase().as_str() {
+            "discrete" | "d" | "独显" => GpuSelection::Preference(GpuPreference::Discrete),
+            "integrated" | "i" | "核显" => GpuSelection::Preference(GpuPreference::Integrated),
+            _ => GpuSelection::Auto,
+        }
+    }
+
+    /// 序列化回配置字符串（[`Self::parse`] 的逆）。
+    ///
+    /// 往返有守门测试：`parse(to_config(x)) == x`（`Auto` 与 `Named("")`
+    /// 例外——后者本身是非法值，解析时就归一成 `Auto` 了）。
+    pub fn to_config(&self) -> String {
+        match self {
+            GpuSelection::Auto => "auto".to_string(),
+            GpuSelection::Preference(GpuPreference::Discrete) => "discrete".to_string(),
+            GpuSelection::Preference(GpuPreference::Integrated) => "integrated".to_string(),
+            GpuSelection::Preference(GpuPreference::Auto) => "auto".to_string(),
+            GpuSelection::Named(n) => format!("{NAMED_PREFIX}{n}"),
+        }
+    }
+
+    /// 环境变量入口（兼容旧配置）。无法识别时 `Auto`。
+    pub fn from_env() -> Self {
+        match std::env::var(ENV_GPU_PREF) {
+            Ok(v) => GpuSelection::parse(&v),
+            Err(_) => GpuSelection::Auto,
+        }
+    }
+}
+
+/// 一个可用 Vulkan 适配器的摘要（设置页展示 + 探针报告用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterInfo {
+    /// 驱动报告的设备名（`VkPhysicalDeviceProperties::deviceName`）。
+    pub name: String,
+    /// Vulkan 的设备类型分类。
+    pub device_type: vk::PhysicalDeviceType,
+    /// 支持的最高 Vulkan 版本（major, minor）。
+    pub api: (u32, u32),
+    /// 是否有支持 `GRAPHICS` 的队列族。
+    ///
+    /// CAUTION: 不是「能否呈现」——呈现能力要 surface 才能查，而
+    /// [`enumerate_adapters`] 刻意不建窗口（设置页随时要枚举）。
+    /// 没有图形队列的设备一定不能用，没有呈现队列的（如纯计算卡）
+    /// 要等真正建表面时才会被 [`select_device`] 排除。
+    pub graphics: bool,
+}
+
+impl AdapterInfo {
+    /// 设备类型的中文短标签（日志与设置页共用，避免两处各写一份）。
+    pub fn kind_label(&self) -> &'static str {
+        match self.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => "独显",
+            vk::PhysicalDeviceType::INTEGRATED_GPU => "核显",
+            vk::PhysicalDeviceType::VIRTUAL_GPU => "虚拟 GPU",
+            vk::PhysicalDeviceType::CPU => "软件渲染",
+            _ => "其它",
+        }
+    }
+
+    /// 设置页显示的一行文字：`NVIDIA GeForce RTX 4090（独显）`。
+    pub fn display(&self) -> String {
+        format!("{}（{}）", self.name, self.kind_label())
+    }
+}
+
+/// 枚举本机全部 Vulkan 适配器。
+///
+/// # 为什么不需要窗口
+///
+/// `vkEnumeratePhysicalDevices` 只要实例，不碰 surface。所以设置页可以在
+/// 任意时刻调用它列设备——不必等主窗口建好，也不必为每个候选建设备。
+///
+/// 代价是**每次调用都建一个临时 Vulkan 实例**（约 10~50ms）。调用方
+/// （设置页）应当缓存结果，不要每帧枚举。
+///
+/// 无 Vulkan 运行时（没装驱动 / 只有 DX 的虚拟机）时返回 `Err`，调用方
+/// 应当把它当成「列表为空」处理，而不是崩。
+pub fn enumerate_adapters() -> anyhow::Result<Vec<AdapterInfo>> {
+    // `_entry` 必须活到 `destroy_instance` 之后：`Entry` 的 `Drop` 会
+    // `FreeLibrary`，而 `Instance::destroy_instance` 要调 loader 里的函数。
+    // 让 Entry 先于 Instance 析构就是 STATUS_ACCESS_VIOLATION
+    // （实测：探针单测直接 0xc0000005）。
+    let (_entry, instance) = create_headless_instance()?;
+    let out = {
+        let devices = unsafe { instance.enumerate_physical_devices() }
+            .map_err(|e| anyhow::anyhow!("枚举物理设备失败: {e}"))?;
+        devices
+            .iter()
+            .map(|d| adapter_info(&instance, *d))
+            .collect()
+    };
+    // SAFETY：`instance` 是本函数刚建的，没有别的对象挂在上面。
+    unsafe { instance.destroy_instance(None) };
+    Ok(out)
+}
+
+/// 建一个**不带任何扩展**的 Vulkan 实例（枚举与自检用）。
+///
+/// 返回 `(Entry, Instance)`：**调用方必须把 Entry 一起持有到
+/// `destroy_instance` 之后**。`Entry` 的 `Drop` 会 `FreeLibrary` 掉
+/// Vulkan loader，而 `Instance::destroy_instance` 还要调 loader 里的
+/// 函数——Entry 先析构就是 `STATUS_ACCESS_VIOLATION`（实测踩过）。
+/// 早期写成「只返回 Instance」，`Entry` 在函数返回时就没了。
+///
+/// # 为什么不复用主实例
+///
+/// 主实例（[`Gpu::new`] 里那个）绑定了主窗口的 surface 与 win32 扩展，
+/// 而且它的生命周期贯穿整个进程。设置页/探针只想「看一眼有哪些卡」，
+/// 拿主实例来查会把「查询」和「渲染」两件事的存活期绑在一起——
+/// 主窗口重建时查询也会跟着失效。
+///
+/// 代价是每次调用都要 `Entry::load` + `create_instance`（约 10~50ms）。
+/// 调用方应当缓存结果（设置页只在打开时枚举一次）。
+pub(crate) fn create_headless_instance() -> anyhow::Result<(Entry, AshInstance)> {
+    let entry = unsafe { Entry::load()? };
+    let app_info = vk::ApplicationInfo::default()
+        // 不启用任何扩展：枚举设备不需要 surface，也不需要校验层。
+        .api_version(vk::API_VERSION_1_2);
+    let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    // SAFETY：`create_info` 只引用栈上的 `app_info`，调用期间有效。
+    let instance = unsafe { entry.create_instance(&create_info, None)? };
+    Ok((entry, instance))
+}
+
+/// 读一个物理设备的摘要（枚举与探针共用）。
+pub(crate) fn adapter_info(instance: &AshInstance, dev: vk::PhysicalDevice) -> AdapterInfo {
+    let props = unsafe { instance.get_physical_device_properties(dev) };
+    let families = unsafe { instance.get_physical_device_queue_family_properties(dev) };
+    AdapterInfo {
+        name: device_name_of(&props),
+        device_type: props.device_type,
+        api: (
+            vk::api_version_major(props.api_version),
+            vk::api_version_minor(props.api_version),
+        ),
+        graphics: families
+            .iter()
+            .any(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS)),
+    }
+}
+
+/// 给一个适配器打分（纯函数，便于单测）。
+///
+/// 分数语义只有「谁更大」，绝对值无意义。规则：
+/// - `Named` 命中 → 1000（锁定，压过一切偏好）；
+/// - `Named` 未命中 → 0（调用方见「全场 0 分」时回退 `Auto` 重扫）；
+/// - `Preference` 命中 → 100；
+/// - `Auto` 下独显 60、其余 50（独显优先，但不像 `Preference` 那样排他）；
+/// - 偏好未命中时独显 40、其余 10（尽量给个可用设备，别选不出东西）。
+pub fn score_adapter(sel: &GpuSelection, device_type: vk::PhysicalDeviceType, name: &str) -> i32 {
+    match sel {
+        GpuSelection::Named(want) => {
+            if want == name {
+                1000
+            } else {
+                0
+            }
+        }
+        GpuSelection::Preference(pref) => match (pref, device_type) {
+            (GpuPreference::Discrete, vk::PhysicalDeviceType::DISCRETE_GPU) => 100,
+            (GpuPreference::Integrated, vk::PhysicalDeviceType::INTEGRATED_GPU) => 100,
+            (_, vk::PhysicalDeviceType::DISCRETE_GPU) => 40,
+            _ => 10,
+        },
+        GpuSelection::Auto => match device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => 60,
+            _ => 50,
+        },
+    }
+}
 
 /// 超采样倍率环境变量。
 pub const ENV_RENDER_SCALE: &str = "MODULARCLIPBOARD_SSAA";
@@ -261,11 +501,18 @@ pub struct Gpu {
 impl Gpu {
     /// 创建实例、表面并选择物理设备与逻辑设备。
     ///
-    /// `hinstance` / `hwnd` 为 Win32 句柄。
+    /// `hinstance` / `hwnd` 为 Win32 句柄；`selection` 决定用哪张显卡
+    /// （见 [`GpuSelection`]，默认 [`GpuSelection::Auto`]）。
+    ///
+    /// # 选择结果会写进日志
+    ///
+    /// `Named` 找不到对应适配器时**回退 Auto** 并 `warn`——静默换卡会让
+    /// 用户以为设置没生效。
     pub fn new(
         app_name: &str,
         hinstance: windows::Win32::Foundation::HINSTANCE,
         hwnd: windows::Win32::Foundation::HWND,
+        selection: GpuSelection,
     ) -> anyhow::Result<Self> {
         let entry = unsafe { Entry::load()? };
         tracing::debug!("Vulkan 动态库加载成功");
@@ -322,17 +569,10 @@ impl Gpu {
             anyhow::bail!("未找到可用的 Vulkan 物理设备。请确认显卡驱动已包含 Vulkan 支持。");
         }
 
-        let pref = GpuPreference::from_env();
         let (physical_device, properties, device_type, queue_family) =
-            select_device(&instance, &surface_loader, surface, &candidates, pref)?;
+            select_device(&instance, &surface_loader, surface, &candidates, &selection)?;
 
-        let name: Vec<u8> = properties
-            .device_name
-            .iter()
-            .map(|c| *c as u8)
-            .take_while(|b| *b != 0)
-            .collect();
-        let name = String::from_utf8_lossy(&name).to_string();
+        let name = device_name_of(&properties);
         let kind = match device_type {
             vk::PhysicalDeviceType::DISCRETE_GPU => "独显",
             vk::PhysicalDeviceType::INTEGRATED_GPU => "核显",
@@ -416,6 +656,11 @@ impl Gpu {
             present_modes,
             desc_caps,
         })
+    }
+
+    /// 当前物理设备的名称（设置页「实际在用」用）。
+    pub fn device_name(&self) -> String {
+        device_name_of(&self.properties)
     }
 
     /// 表面句柄。
@@ -557,15 +802,22 @@ fn clamp_axis(v: u32, lo: u32, hi: u32) -> u32 {
     v.clamp(lo, hi)
 }
 
-/// 按偏好选择物理设备与队列族。
+/// 按选择挑物理设备与队列族。
 ///
 /// 队列族必须同时支持 `GRAPHICS` 与 `PRESENT`，否则无法把画面显示到窗口。
+///
+/// # `Named` 找不到时的回退
+///
+/// 打分全是 0 说明没有任何适配器名字匹配（用户换了卡、拔了显卡坞、
+/// 驱动改了设备名）。此时**回退 `Auto` 重扫一遍**并 `warn`：
+/// 直接报错会让程序起不来，而静默选第一张卡又会让用户以为设置生效了。
+/// 两害相权，选「能启动 + 明确日志」。
 fn select_device(
     instance: &AshInstance,
     surface_loader: &SurfaceLoader,
     surface: vk::SurfaceKHR,
     devices: &[vk::PhysicalDevice],
-    pref: GpuPreference,
+    selection: &GpuSelection,
 ) -> anyhow::Result<(
     vk::PhysicalDevice,
     vk::PhysicalDeviceProperties,
@@ -596,25 +848,44 @@ fn select_device(
             continue;
         };
 
-        // 评分：偏好匹配最高，其次独显
-        let score = match (pref, props.device_type) {
-            (GpuPreference::Discrete, vk::PhysicalDeviceType::DISCRETE_GPU) => 100,
-            (GpuPreference::Integrated, vk::PhysicalDeviceType::INTEGRATED_GPU) => 100,
-            (GpuPreference::Auto, vk::PhysicalDeviceType::DISCRETE_GPU) => 60,
-            (GpuPreference::Auto, _) => 50,
-            (_, vk::PhysicalDeviceType::DISCRETE_GPU) => 40,
-            _ => 10,
-        };
-
+        let name = device_name_of(&props);
+        let score = score_adapter(selection, props.device_type, &name);
         if best.as_ref().is_none_or(|(s, ..)| score > *s) {
             best = Some((score, *dev, props, queue_family));
         }
+    }
+
+    // `Named` 全场 0 分 ⇒ 没有匹配的适配器，回退 Auto 重扫。
+    if matches!(selection, GpuSelection::Named(_)) && best.as_ref().is_none_or(|(s, ..)| *s == 0) {
+        let want = match selection {
+            GpuSelection::Named(n) => n.as_str(),
+            _ => "",
+        };
+        tracing::warn!(
+            want,
+            "找不到名为该值的 Vulkan 适配器，回退到自动选择（请到设置里重选）"
+        );
+        return select_device(instance, surface_loader, surface, devices, &GpuSelection::Auto);
     }
 
     let (_, pd, props, qf) =
         best.ok_or_else(|| anyhow::anyhow!("没有同时支持图形与呈现的 Vulkan 设备"))?;
     let dtype = props.device_type;
     Ok((pd, props, dtype, qf))
+}
+
+/// 从设备属性里取出 NUL 结尾的设备名。
+///
+/// `device_name` 是定长 `[c_char; 256]`，必须截到第一个 NUL。
+/// 三个调用点（选择 / 枚举 / 日志）共用一份，避免各写一遍 `take_while`。
+fn device_name_of(props: &vk::PhysicalDeviceProperties) -> String {
+    let bytes: Vec<u8> = props
+        .device_name
+        .iter()
+        .map(|c| *c as u8)
+        .take_while(|b| *b != 0)
+        .collect();
+    String::from_utf8_lossy(&bytes).to_string()
 }
 
 /// 交换链。
@@ -1192,5 +1463,89 @@ mod tests {
         assert_eq!(b.dst_queue_family_index, vk::QUEUE_FAMILY_IGNORED);
         assert_eq!(b.subresource_range.layer_count, 1);
         assert_eq!(b.subresource_range.level_count, 1);
+    }
+
+    /// `GpuSelection` 的字符串往返必须稳定。
+    ///
+    /// 配置项是用户可手改的，往返不稳定意味着「设置里选完、重启变回默认」。
+    #[test]
+    fn gpu_selection_round_trips() {
+        for (raw, want) in [
+            ("auto", GpuSelection::Auto),
+            ("", GpuSelection::Auto),
+            ("  AUTO  ", GpuSelection::Auto),
+            ("discrete", GpuSelection::Preference(GpuPreference::Discrete)),
+            ("独显", GpuSelection::Preference(GpuPreference::Discrete)),
+            ("integrated", GpuSelection::Preference(GpuPreference::Integrated)),
+            ("核显", GpuSelection::Preference(GpuPreference::Integrated)),
+            ("name:NVIDIA GeForce RTX 4090", GpuSelection::Named("NVIDIA GeForce RTX 4090".into())),
+            ("NAME:Intel UHD 770", GpuSelection::Named("Intel UHD 770".into())),
+            // 未知值一律 Auto（宽松解析，不让一个错值废掉整份配置）。
+            ("whatever", GpuSelection::Auto),
+            // `name:` 后为空是写坏了，也归 Auto。
+            ("name:", GpuSelection::Auto),
+        ] {
+            assert_eq!(GpuSelection::parse(raw), want, "解析 {raw:?}");
+        }
+        // 往返：to_config 的结果必须能解析回原值。
+        for sel in [
+            GpuSelection::Auto,
+            GpuSelection::Preference(GpuPreference::Discrete),
+            GpuSelection::Preference(GpuPreference::Integrated),
+            GpuSelection::Named("NVIDIA GeForce RTX 4090".into()),
+        ] {
+            assert_eq!(GpuSelection::parse(&sel.to_config()), sel);
+        }
+    }
+
+    /// 配置手写时常有多余空白，两端必须 trim 掉。
+    ///
+    /// 反过来「设备名自带尾随空格」实测各驱动都不存在，为此保留空白反而
+    /// 让「配置里多敲了个空格」匹配不上——取舍见 `parse` 的文档。
+    #[test]
+    fn named_selection_trims_surrounding_whitespace() {
+        assert_eq!(
+            GpuSelection::parse("name:  Weird GPU  "),
+            GpuSelection::Named("Weird GPU".into())
+        );
+        // 名字**中间**的空格必须原样保留（`GeForce RTX 4090` 就是这种）。
+        assert_eq!(
+            GpuSelection::parse("name:NVIDIA GeForce RTX 4090"),
+            GpuSelection::Named("NVIDIA GeForce RTX 4090".into())
+        );
+    }
+
+    /// 打分的语义：Named 压过一切；Named 未命中是 0（触发回退）。
+    #[test]
+    fn adapter_scoring_prefers_the_requested_one() {
+        use vk::PhysicalDeviceType as T;
+        let named = GpuSelection::Named("B".into());
+        assert_eq!(score_adapter(&named, T::DISCRETE_GPU, "A"), 0, "未命中必须 0 分");
+        assert_eq!(score_adapter(&named, T::INTEGRATED_GPU, "B"), 1000, "命中压过类型");
+        // 命中分必须高于任何类型偏好（否则「指定了核显却拿到独显」）。
+        assert!(1000 > score_adapter(&GpuSelection::Preference(GpuPreference::Discrete), T::DISCRETE_GPU, "A"));
+
+        // 类型偏好：命中 100，未命中独显 40 / 其余 10（仍能选出设备）。
+        let integ = GpuSelection::Preference(GpuPreference::Integrated);
+        assert_eq!(score_adapter(&integ, T::INTEGRATED_GPU, "A"), 100);
+        assert_eq!(score_adapter(&integ, T::DISCRETE_GPU, "A"), 40);
+        assert_eq!(score_adapter(&integ, T::CPU, "A"), 10);
+
+        // Auto：独显优先，但差距不足以让核显「不可用」。
+        let auto = GpuSelection::Auto;
+        assert!(score_adapter(&auto, T::DISCRETE_GPU, "A") > score_adapter(&auto, T::INTEGRATED_GPU, "A"));
+        assert!(score_adapter(&auto, T::INTEGRATED_GPU, "A") > 0);
+    }
+
+    /// 设置页那一行文字必须带类型标签（「独显 / 核显」是用户唯一的线索）。
+    #[test]
+    fn adapter_display_includes_kind() {
+        let a = AdapterInfo {
+            name: "NVIDIA GeForce RTX 4090".to_string(),
+            device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
+            api: (1, 3),
+            graphics: true,
+        };
+        assert_eq!(a.display(), "NVIDIA GeForce RTX 4090（独显）");
     }
 }

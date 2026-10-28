@@ -37,6 +37,8 @@ struct Args {
     no_capture: bool,
     /// 打印版本后退出。
     version: bool,
+    /// 跑一次 GPU 自检并弹窗显示报告，然后退出。
+    gpu_probe: bool,
     /// 以 stdio 传输运行 MCP 服务（由 MCP 客户端 spawn）。
     mcp_server: bool,
     /// 以 Streamable HTTP 传输运行 MCP 服务（监听 host:port）。
@@ -54,6 +56,7 @@ fn parse_args() -> Result<Args, String> {
         data_dir: None,
         no_capture: false,
         version: false,
+        gpu_probe: false,
         mcp_server: false,
         mcp_http: false,
         daemon: false,
@@ -74,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
             "--ui" => args.ui = true,
             "--single" => args.single = true,
             "-V" | "--version" => args.version = true,
+            "--gpu-probe" => args.gpu_probe = true,
             "-h" | "--help" => {
                 show_message_box("模块化剪贴板 - 帮助", HELP_TEXT);
                 std::process::exit(0);
@@ -102,6 +106,7 @@ const HELP_TEXT: &str = "ModularClipboard 剪贴板管理器
 选项:
       --data-dir <路径>   指定数据目录
       --no-capture         启动时不监听剪贴板（调试用）
+      --gpu-probe          跑一次 GPU 自检并显示报告（排查渲染问题用）
       --daemon             只启动后台常驻进程（不弹界面）
       --ui                 只启动界面进程（由后台拉起，一般不用手敲）
       --single             单进程模式（界面与后台同进程，排查用）
@@ -201,6 +206,19 @@ fn main() {
         // 所以版本信息弹窗——这是唯一能让用户看到它的途径。
         // （从控制台启动调试时也弹窗，可接受。）
         show_message_box("模块化剪贴板", &format!("版本 {}", env!("CARGO_PKG_VERSION")));
+        return;
+    }
+
+    if args.gpu_probe {
+        // GUI 子系统没有 stdout，报告只能弹窗（同 `--version`）。
+        //
+        // 配置可能读不到（首次运行 / 路径写坏）——探针不依赖配置正确，
+        // 读不到就用默认值（Auto），报告里会显示实际选中的是哪张卡。
+        let cfg = Config::load(&config_path(args.data_dir.as_deref())).unwrap_or_default();
+        show_message_box(
+            "模块化剪贴板 - GPU 探针",
+            &modular_clipboard_ui::gpu_probe_report(&cfg),
+        );
         return;
     }
 

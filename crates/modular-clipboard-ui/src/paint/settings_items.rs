@@ -122,6 +122,11 @@ pub(super) enum ItemKind {
     PinnedMode,
     /// 主题单选（跟随系统 / 深色 / 浅色）。
     Theme,
+    /// GPU 适配器选择（下拉框，**重启生效**）。
+    ///
+    /// 独立成变体而不是 `Text`：候选值来自运行时枚举（`enumerate_adapters`），
+    /// 不是静态列表；且要显示「当前正在用哪张卡」。
+    GpuAdapter,
     /// 主题强调色：预设色板 + HSV 滑条 + 十六进制输入 + 恢复默认。
     ///
     /// 独立成变体：这是「一个配置字段 + 三种调节方式」的富编辑器，
@@ -468,6 +473,7 @@ impl SettingsItem {
                 get_number(cfg, ConfigGroup::Mcp, "port") != get_number(&d, ConfigGroup::Mcp, "port")
             }
             ItemKind::Language => cfg.ui.language != d.ui.language,
+            ItemKind::GpuAdapter => cfg.ui.gpu_adapter != d.ui.gpu_adapter,
             ItemKind::Group
             | ItemKind::OpenDataDir
             | ItemKind::Link(_)
@@ -502,6 +508,7 @@ impl SettingsItem {
             ItemKind::Language => Some(Op::SetLanguage(
                 modular_clipboard_core::i18n::LANG_SYSTEM,
             )),
+            ItemKind::GpuAdapter => Some(Op::SetGpuAdapter(d.ui.gpu_adapter.clone())),
             ItemKind::PinnedMode => Some(Op::SetPinnedMode(PinnedMode::SharedColumn)),
             ItemKind::Theme => Some(Op::SetThemeMode(crate::theme::ThemeMode::FollowSystem)),
             ItemKind::Accent => Some(Op::SetAccent(None)),
@@ -845,6 +852,22 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 kind: ItemKind::RowMeta,
             },
         ],
+    },
+    // 「显卡」卡：只有一项，但必须独立成卡。
+    //
+    // 它是**启动期**决定且**重启生效**的——混进「窗口背景」会让用户以为
+    // 拖一下就能看到变化。放在背景卡之前，是因为玻璃/磨砂的观感全都建立
+    // 在「用的是哪张卡」之上（核显跑 200% 超采样会掉帧）。
+    SettingsCard {
+        cat: SettingsCat::Appearance,
+        title: msg("Graphics"),
+        cond: None,
+        items: &[SettingsItem {
+            key: "ui.gpu_adapter",
+            label: msg("GPU adapter"),
+            desc: msg("Which graphics card renders the UI; takes effect after a restart"),
+            kind: ItemKind::GpuAdapter,
+        }],
     },
     // 「窗口背景」卡：背景效果 + 两个依赖项。
     //
@@ -2125,4 +2148,41 @@ mod fold_arrow_tests {
         assert_eq!(p1.caps, p2.caps);
         assert_eq!(p1.radius, p2.radius);
     }
+
 }
+
+/// 设置项接线的守门测试（与折叠箭头的几何测试分开）。
+#[cfg(test)]
+mod gpu_adapter_tests {
+    use super::*;
+
+    /// GPU 适配器这一行必须：在列表里、能报「改过」、能重置回 auto。
+    ///
+    /// 三个断言各对应一条真实故障：
+    /// - 不在列表里 → 用户找不到这个设置（加了变体却忘了挂条目）；
+    /// - 不报 changed → 选了不保存（`changed()` 漏分支会静默不落盘）；
+    /// - 重置成空串 → 解析成 Auto 虽然能用，但配置里留个空值会让
+    ///   下次读配置的人困惑。
+    #[test]
+    fn gpu_adapter_item_wires_change_and_reset() {
+        let item = SETTINGS_CARDS
+            .iter()
+            .flat_map(|c| c.items.iter())
+            .find(|it| it.key == "ui.gpu_adapter")
+            .expect("设置里必须有一行 ui.gpu_adapter");
+        assert!(matches!(item.kind, ItemKind::GpuAdapter));
+
+        let ws = crate::workspace::Workspace::default();
+        let mut cfg = modular_clipboard_core::Config::default();
+        assert!(
+            !item.is_changed(&cfg, &ws),
+            "默认配置下不该显示为「已修改」"
+        );
+        cfg.ui.gpu_adapter = "name:NVIDIA GeForce RTX 4090".to_string();
+        assert!(item.is_changed(&cfg, &ws), "改过之后必须报 changed");
+
+        match item.reset_op() {
+            Some(Op::SetGpuAdapter(v)) => assert_eq!(v, "auto"),
+            other => panic!("重置应回到 auto，实际 {other:?}"),
+        }
+    }}

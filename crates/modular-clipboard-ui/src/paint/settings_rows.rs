@@ -25,6 +25,12 @@ use super::settings_items::FONT_SCALE_PRESETS;
 /// 折行数跳变、行高抖动）。最长选项 `Русский` 也放得下。
 const LANG_COMBO_W: f32 = 132.0;
 
+/// GPU 适配器下拉框的宽度。
+///
+/// 比语言下拉宽一档：设备名（`NVIDIA GeForce RTX 4090`）远长于语言名，
+/// 132pt 会把每一项都截成「NVIDIA Ge...」——用户根本分不清两张同型号卡。
+const GPU_COMBO_W: f32 = 200.0;
+
 /// 语言菜单里要列出的选项下标——**不含当前选中项**。
 ///
 /// 已选中的那项再列一遍没有意义（用户已经在那里了），只多占一行、
@@ -34,6 +40,100 @@ const LANG_COMBO_W: f32 = 132.0;
 /// 跟 egui 的 Ui 缠在一起，单测跑不起来。
 fn lang_menu_indices(sel: usize) -> impl Iterator<Item = usize> {
     (0..LANG_CHOICES.len()).filter(move |i| *i != sel)
+}
+
+/// GPU 适配器选择行：下拉框 + 「当前实际在用」小字。
+///
+/// # 为什么必须显示「实际在用」
+///
+/// 配置项存的是「用户想要哪张」，而实际拿到哪张由启动时的枚举决定。
+/// 两者可能不一致：`name:` 里的设备名换了驱动就匹配不上（回退 Auto）、
+/// 用户手改配置写错名字、显卡坞没插。不显示实际值，用户会对着「已选核显」
+/// 却跑在独显上的界面反复点保存。
+///
+/// 不一致时文字用 `warn` 色——这是本行唯一需要用户注意的状态。
+///
+/// # 为什么下拉框宽度单列一个常量
+///
+/// 设备名（`NVIDIA GeForce RTX 4090`）远长于语言名，语言下拉的 132pt
+/// 会把每一项截成「NVIDIA Ge...」，两张同型号卡就分不出来了。
+fn draw_gpu_adapter(f: &mut Frame<'_>, ui: &mut Ui, label: Msg, desc: Msg) -> bool {
+    use modular_clipboard_gfx::{GpuPreference, GpuSelection};
+
+    let pal = f.pal;
+    // 先把要用的状态取出来：`setting_row` 的闭包会再次借用 `f`
+    // （`f.state.push`），同时读 `f.state.gpu_adapters` 就是二借用。
+    let adapters = f.state.gpu_adapters.clone();
+    let current = f.state.gpu_current.clone();
+    let cur = GpuSelection::parse(&f.svc.state.config.ui.gpu_adapter);
+
+    // 下拉框上显示的文字：与「当前实际在用」是两回事，这里显示的是**选择**。
+    let shown = match &cur {
+        GpuSelection::Named(n) => adapters
+            .iter()
+            .find(|a| &a.name == n)
+            .map(|a| a.display())
+            .unwrap_or_else(|| n.clone()),
+        GpuSelection::Preference(GpuPreference::Discrete) => {
+            modular_clipboard_core::i18n::t("Discrete GPU").to_string()
+        }
+        GpuSelection::Preference(GpuPreference::Integrated) => {
+            modular_clipboard_core::i18n::t("Integrated GPU").to_string()
+        }
+        _ => modular_clipboard_core::i18n::t("Auto").to_string(),
+    };
+
+    let mut picked: Option<String> = None;
+    setting_row(ui, label, desc, |ui| {
+        // 小字在右对齐布局里后加的靠左 ⇒ 先加它，它出现在下拉框左侧。
+        if let Some(name) = &current {
+            let mismatch = matches!(&cur, GpuSelection::Named(n) if n != name);
+            let text = format!(
+                "{}: {name}",
+                modular_clipboard_core::i18n::t("In use")
+            );
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .color(if mismatch { pal.warn } else { pal.text_dim })
+                        .size(pal.font_xs),
+                )
+                .truncate(),
+            );
+        }
+        let resp = egui::ComboBox::from_id_salt("gpu_adapter")
+            .selected_text(shown.clone())
+            .width(GPU_COMBO_W)
+            .popup_style(lang_menu_style.into())
+            .show_ui(ui, |ui| {
+                let mut hit = false;
+                if ui
+                    .selectable_label(
+                        cur == GpuSelection::Auto,
+                        modular_clipboard_core::i18n::t("Auto (discrete preferred)"),
+                    )
+                    .clicked()
+                {
+                    picked = Some(GpuSelection::Auto.to_config());
+                    hit = true;
+                }
+                for a in &adapters {
+                    let sel = GpuSelection::Named(a.name.clone());
+                    if ui.selectable_label(cur == sel, a.display()).clicked() {
+                        picked = Some(sel.to_config());
+                        hit = true;
+                    }
+                }
+                hit
+            });
+        resp.inner == Some(true)
+    });
+    if let Some(v) = picked {
+        f.state.push(Op::SetGpuAdapter(v));
+        true
+    } else {
+        false
+    }
 }
 
 /// 语言菜单弹层的一体化样式：**没有分界线**。
@@ -273,6 +373,11 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     false
                 }
             });
+        }
+        ItemKind::GpuAdapter => {
+            if draw_gpu_adapter(f, ui, it.label, it.desc) {
+                record_recent(f, it.key);
+            }
         }
         ItemKind::Theme => {
             setting_row(ui, it.label, it.desc, |ui| {
