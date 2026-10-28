@@ -692,18 +692,6 @@ pub struct UiState {
     /// CAUTION: 帧循环取走时会 `mem::take` 清空。若某条绘制路径没跑
     /// （窗口最小化、跳过渲染），下一帧重新收集，不会累积陈旧矩形。
     pub glass_rects: Vec<modular_clipboard_gfx::glass_pass::GlassRect>,
-    /// 行卡片底色的 alpha（`palette.card_bg.a()`）。
-    ///
-    /// 玻璃 pass 只改 RGB，覆盖度由这个 alpha 定——这样「卡片不透明度」
-    /// 滑块对玻璃同样生效，且语义与磨砂路径一致。
-    pub glass_card_alpha: f32,
-    /// 卡片底色的**原色**（sRGB 分量 0~1，未预乘）。
-    ///
-    /// 玻璃层自己合成「底图 + 卡片色」：玻璃模式下 egui **不再**画行卡片
-    /// 底色（否则两层 alpha 叠加成 `a + a(1-a)`，卡片色不透明时玻璃被
-    /// 整层盖死）。默认 0（黑）——万一某条路径忘了设，玻璃只是变暗，
-    /// 不会整片消失。
-    pub glass_tint: [f32; 3],
     /// 图片缩略图的**像素**缓存（第三轮：图片条目内嵌显示）。
     ///
     /// LRU + 字节预算，见 [`crate::thumbnail::ThumbnailCache`]。
@@ -1376,7 +1364,30 @@ impl<'a> Frame<'a> {
     ///
     /// `gfx::glass_pass::MAX_GLASS_CARDS`。超出部分由 uniform 换算处静默
     /// 丢弃——列表可见行约 10 张 + 顶栏 + 搜索面板 + 类型栏，正常不会超。
-    pub fn push_glass(&mut self, r: Rect, radius: f32) {
+    /// 当前背景效果是否为「液态玻璃」。
+    ///
+    /// 玻璃模式下**不能画自己的底色**：玻璃 pass 已经把「底图 + 底色」
+    /// 合成好了（`GlassRect::new` 的 `fill` 参数），再画一层就是两次
+    /// 覆盖——底色 alpha = 1 时玻璃整层被盖死，折射/色散/边缘光全部
+    /// 看不见（2026-10-27 行卡片的病根，2026-10-28 推广到 chrome）。
+    pub fn glass_mode(&self) -> bool {
+        self.svc.state.config.ui.window_backdrop
+            == modular_clipboard_core::config::WindowBackdrop::Glass
+    }
+
+    /// 玻璃强度（= 「卡片不透明度」滑块，0.3~1.0）。
+    ///
+    /// 它同时决定**覆盖度**与**底色浓度**：调低它，玻璃既更透、底色也更
+    /// 淡。一个滑块管住所有玻璃（行卡片 / 顶栏 / 搜索 / 类型栏）——早前
+    /// 各面板按自己底色的 alpha 取强度，顶栏只有卡片的六成。
+    ///
+    /// 钳位 0.3 与 `App::pal` 的 `card_alpha` 同源：再低玻璃就几乎消失，
+    /// 用户会以为效果坏了。
+    pub fn glass_strength(&self) -> f32 {
+        self.svc.state.config.ui.card_opacity.clamp(0.3, 1.0)
+    }
+
+    pub fn push_glass(&mut self, r: Rect, radius: f32, fill: egui::Color32) {
         // CAUTION: 只有**主窗口**跑玻璃 pass。`glass_rects` 与 `drag_regions`
         // 一样是主/子/设置三窗**共用**的一张表（同一个 `PaintState`），
         // 而只有主窗口的帧循环会 `mem::take` 它并调 `set_glass`。附属窗口
@@ -1403,7 +1414,12 @@ impl<'a> Frame<'a> {
         }
         self.state
             .glass_rects
-            .push(modular_clipboard_gfx::glass_pass::GlassRect::new(r, radius));
+            .push(modular_clipboard_gfx::glass_pass::GlassRect::new(
+                r,
+                radius,
+                fill,
+                self.glass_strength(),
+            ));
     }
 
     /// 登记一个**高优先级**的玻璃矩形（顶栏 / 搜索面板 / 类型栏 / 通知）。
@@ -1417,7 +1433,7 @@ impl<'a> Frame<'a> {
     ///
     /// 高优先级矩形插到队首：着色器逐矩形遍历、命中即停，而 chrome 与行
     /// 卡片**互不重叠**，因此顺序不影响命中结果，只影响「超限时谁被丢」。
-    pub fn push_glass_overlay(&mut self, r: Rect, radius: f32) {
+    pub fn push_glass_overlay(&mut self, r: Rect, radius: f32, fill: egui::Color32) {
         if !matches!(self.hit_ns, HitNs::Main) {
             return;
         }
@@ -1437,22 +1453,17 @@ impl<'a> Frame<'a> {
         }
         self.state
             .glass_rects
-            .insert(0, modular_clipboard_gfx::glass_pass::GlassRect::new(r, radius));
+            .insert(
+                0,
+                modular_clipboard_gfx::glass_pass::GlassRect::new(
+                    r,
+                    radius,
+                    fill,
+                    self.glass_strength(),
+                ),
+            );
     }
 
-    /// 记录行卡片底色 alpha（供玻璃 pass 定覆盖度）。
-    pub fn set_glass_card_alpha(&mut self, a: f32) {
-        self.state.glass_card_alpha = a;
-    }
-
-    /// 记录卡片底色的**原色**（供玻璃 pass 的 tint 用）。
-    ///
-    /// CAUTION: 必须传**未预乘**的原色。传 `palette.card_bg` 的预乘分量
-    /// 会把「卡片不透明度」重复算一次（那个 alpha 已经通过
-    /// `gamma_multiply` 压进 RGB 了），tint 会随滑块变暗、双重衰减。
-    pub fn set_glass_tint(&mut self, rgb: [f32; 3]) {
-        self.state.glass_tint = rgb;
-    }
 }
 
 /// 画一个**独立子窗口**的整帧内容。
@@ -1559,10 +1570,9 @@ pub fn draw(f: &mut Frame<'_>) {
     let area = f.area;
     // 玻璃收集器每帧重置：帧循环取走后是空的，而「没取走」的帧
     // （跳过渲染）也不该把上一帧的矩形留到下一帧——面板可能已收起。
-    // 默认 alpha 给 1.0（不透明）：万一某条路径忘了设，玻璃至少是
-    // 实底的，不会整片消失。
+    // 底色与覆盖度随每个 `GlassRect` 走（见 `GlassRect::new`），
+    // 不再有需要重置的全局状态。
     f.state.glass_rects.clear();
-    f.state.glass_card_alpha = 1.0;
     // 背景必须铺满整个客户区，否则窗口边缘会露出 clear color。
     f.ui.painter().rect_filled(area, 0.0, f.pal.bg);
 
@@ -6848,6 +6858,41 @@ fn with_pinned(mut self, n: usize) -> Self {
     }
 
     #[test]
+    fn glass_strength_is_uniform_across_panels() {
+        // 2026-10-28：覆盖度曾经取自各面板自己的底色 alpha —— 行卡片是
+        // 「卡片不透明度」（默认 1.0），而顶栏/搜索/类型栏是
+        // `with_backdrop_alpha` 算出的背景透明度（默认约 0.57）。
+        // 同一屏里于是有两种强度的玻璃：chrome 的折射只有卡片六成，
+        // 且没有任何报错。
+        //
+        // 判据：所有参与玻璃的矩形 alpha **必须相同**，且等于
+        // 「卡片不透明度」。
+        let mut h = Harness::new("glass-strength", vec2(720.0, 900.0)).with_items(6);
+        h.svc.state.config.ui.window_backdrop =
+            modular_clipboard_core::config::WindowBackdrop::Glass;
+        h.svc.state.config.ui.type_rail.always = true;
+        h.svc.state.config.ui.card_opacity = 0.7;
+        h.frame();
+
+        let rects = &h.state.glass_rects;
+        assert!(rects.len() >= 2, "前置条件：应有多块面板参与玻璃");
+        let want = 0.7_f32;
+        for g in rects {
+            assert!(
+                (g.alpha - want).abs() < 1e-5,
+                "每块玻璃的覆盖度都应等于卡片不透明度 {want}，实际 {}",
+                g.alpha
+            );
+        }
+        // 底色必须**各不相同**（行卡片 card_bg / 顶栏 bg / 面板 surface）。
+        let distinct = rects
+            .iter()
+            .filter(|g| g.tint != rects[0].tint)
+            .count();
+        assert!(distinct > 0, "前置条件：应存在不同底色的面板");
+    }
+
+    #[test]
     fn glass_overlay_evicts_rows_when_budget_is_full() {
         // 覆盖范围回归（2026-10-27）：绘制顺序是「顶栏 → 行卡片 →
         // 类型栏 → 搜索面板」，而行卡片数量随窗口高度增长。按 push 顺序
@@ -6873,19 +6918,20 @@ fn with_pinned(mut self, n: usize) -> Self {
                 card_id: None,
                 hit_ns: HitNs::Main,
             };
+            let fill = egui::Color32::from_gray(40);
             for i in 0..cap {
                 let r = Rect::from_min_size(pos2(0.0, i as f32), vec2(120.0, 1.0));
-                f.push_glass(r, ROW_RADIUS);
+                f.push_glass(r, ROW_RADIUS, fill);
             }
             assert_eq!(f.state.glass_rects.len(), cap, "前置条件：应恰好塞满");
             // 第 cap+1 个行矩形被拒（行没有优先级）。
             let extra_row = Rect::from_min_size(pos2(0.0, 0.0), vec2(120.0, 1.0));
-            f.push_glass(extra_row, ROW_RADIUS);
+            f.push_glass(extra_row, ROW_RADIUS, fill);
             assert_eq!(f.state.glass_rects.len(), cap, "行矩形超限应被丢弃");
 
             // chrome：必须挤进来。
             let chrome = Rect::from_min_size(pos2(0.0, 0.0), vec2(area.width(), 40.0));
-            f.push_glass_overlay(chrome, 6.0);
+            f.push_glass_overlay(chrome, 6.0, egui::Color32::from_gray(20));
             assert_eq!(f.state.glass_rects.len(), cap, "不得超上限");
             assert_eq!(
                 f.state.glass_rects[0].rect, chrome,
@@ -6920,8 +6966,9 @@ fn with_pinned(mut self, n: usize) -> Self {
                 hit_ns: HitNs::Settings,
             };
             // 直接调登记入口：任何设置页控件将来想加玻璃都走这里。
-            f.push_glass(h.area, 12.0);
-            f.push_glass_overlay(h.area, 12.0);
+            let fill = egui::Color32::from_gray(40);
+            f.push_glass(h.area, 12.0, fill);
+            f.push_glass_overlay(h.area, 12.0, fill);
         });
         drop(std::mem::take(&mut out.shapes));
         assert_eq!(

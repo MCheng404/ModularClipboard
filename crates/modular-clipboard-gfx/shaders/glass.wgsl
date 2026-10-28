@@ -158,6 +158,26 @@ struct GlassUniforms {
     /// `vec4<f32>` 数组：WGSL uniform 空间要求数组元素步长为 16 的倍数，
     /// `vec4` 正好满足（用 `vec2` 会因 8 字节步长被 naga 判非法布局）。
     rects: array<vec4<f32>, MAX_GLASS_CARDS>,
+    /// 逐矩形的底色：`rgb` = 未预乘原色（0~1），`a` = 混合强度。
+    ///
+    /// 与 `alphas` 分开是因为一个 `vec4` 装不下五个分量
+    /// （rgb + tint_strength + alpha）。两者都按 `rects` 的索引取。
+    tints: array<vec4<f32>, MAX_GLASS_CARDS>,
+    /// 逐矩形的**覆盖度**（0 = 完全透出桌面，1 = 不透明），取 `.x`。
+    ///
+    /// 与 `tints[i].a` 分工：这个决定「透过多少真实桌面」，那个决定
+    /// 「看起来像不像一张有色卡片」。两者独立——覆盖度 1 + tint 0 就是
+    /// 一块完全不透明、但完全通透的纯折射玻璃。
+    ///
+    /// CAUTION: 必须用 `vec4` 而不是 `f32`。uniform 空间要求数组元素
+    /// 的**步长是 16 的倍数**，`array<f32, N>` 步长 4，naga 直接报
+    /// `ArrayStride { stride: 4, alignment: Alignment(16) }` 校验失败。
+    /// 只有 `x` 有意义。
+    ///
+    /// CAUTION: 它参与的是 `rgb * a` 的**预乘**，不是只写进 alpha 通道。
+    /// 交换链按 PRE_MULTIPLIED 合成，只改 alpha 不改 RGB 会让半透明
+    /// 卡片被额外叠一层桌面（见 `fs_glass` 末尾的 CAUTION）。
+    alphas: array<vec4<f32>, MAX_GLASS_CARDS>,
     /// 目标图的像素尺寸 `(w, h)`。
     size: vec2<f32>,
     /// 折射强度（0 = 不折射，只剩磨砂）。
@@ -170,25 +190,11 @@ struct GlassUniforms {
     radius: f32,
     /// 有效卡片数（`rects` 前多少项有意义）。
     count: u32,
-    /// 玻璃层的**覆盖度**（0 = 完全露出真实桌面，1 = 玻璃层不透明）。
+    /// 尾部填充：把结构体补到 16 的倍数。
     ///
-    /// 与 `tint_strength` 分工：这个决定「透过多少真实桌面」，那个决定
-    /// 「看起来像不像一张有色卡片」。两者独立——覆盖度 1 + tint 0 就是
-    /// 一块完全不透明、但完全通透的纯折射玻璃。
-    ///
-    /// CAUTION: 它参与的是 `rgb * a` 的**预乘**，不是只写进 alpha 通道。
-    /// 交换链按 PRE_MULTIPLIED 合成，只改 alpha 不改 RGB 会让半透明
-    /// 卡片被额外叠一层桌面（见 `fs_glass` 末尾的 CAUTION）。
-    card_alpha: f32,
-    /// 卡片底色（sRGB 分量，0~1，**未预乘**）。
-    ///
-    /// 玻璃层自己把「底图 + 卡片色」合成完。早前这层色是 egui 在玻璃
-    /// pass **之后**再画的一个矩形：两层 alpha 叠加成 `a + a(1-a)`，
-    /// 卡片色不透明时玻璃整层被盖死（折射/色散全看不见），半透明时
-    /// 又多叠一份桌面（发白）。
-    tint: vec3<f32>,
-    /// 卡片色的混合强度（0 = 纯玻璃，1 = 完全是卡片色）。
-    tint_strength: f32,
+    /// CAUTION: 必须与 Rust 侧 `GlassUniforms::_pad` 对应。少写它会让
+    /// WGSL 认为结构体比 Rust 小 4 字节，naga 报布局不匹配。
+    _pad: f32,
 };
 
 // 合成时的 UV 位移（push constant，8 字节）。
@@ -530,7 +536,12 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         //
         // 早前这一层由 egui 在玻璃 pass 之后再画一个矩形——那是**两次
         // 覆盖**：卡片色不透明时玻璃被整个盖死，半透明时又多叠一份桌面。
-        rgb = mix(rgb, u.tint, clamp(u.tint_strength, 0.0, 1.0));
+        //
+        // 底色与覆盖度都是**本矩形自己的**（`tints[i]` / `alphas[i]`）：
+        // 行卡片、顶栏、搜索面板、类型栏各有各的底色，不能共用一份
+        // （共用时只有最后画的那块生效，其余面板被串色）。
+        let tint = u.tints[i];
+        rgb = mix(rgb, tint.rgb, clamp(tint.a, 0.0, 1.0));
 
         // ---- 轮廓：Fresnel（宽、各向同性）+ 镜面高光（锐、方向性）----
         //
@@ -565,7 +576,7 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // `blurred.a` 恒为 1（GDI 捕获已强制 alpha=255，卷积保持），
         // 它在这里只是「底图自身的覆盖度」，与卡片透明度相乘即为
         // 玻璃层最终覆盖度。
-        let a = clamp(u.card_alpha, 0.0, 1.0) * blurred.a;
+        let a = clamp(u.alphas[i].x, 0.0, 1.0) * blurred.a;
         out = vec4<f32>(rgb * a, a);
         break;
     }

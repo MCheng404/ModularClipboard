@@ -59,13 +59,41 @@ const OFFSET_SIZE: u32 = 8;
 
 /// 玻璃 uniform。布局必须与 `glass.wgsl` 的 `GlassUniforms` 逐字段一致。
 ///
-/// 大小 432 字节：`rects` 384 + `size` 8 + 6 个 f32 24 + `tint` 16。
+/// 大小 1184 字节：`rects` 384 + `tints` 384 + `alphas` 384 + `size` 8 +
+/// 5 个 f32 20 + `_pad` 4。
 /// **无隐式填充**（每个字段都命名），这是 `bytemuck::Pod` 的要求。
+///
+/// # 为什么 tint / alpha 是**逐矩形**的（2026-10-28）
+///
+/// 早前全局只有一份 `tint` / `card_alpha`，由绘制层「最后一次设置」决定。
+/// 而参与玻璃的面板底色并不相同：行卡片是 `card_bg`（受「卡片不透明度」
+/// 滑块影响）、顶栏是 `bg`、搜索面板与类型栏是 `surface`。绘制顺序是
+/// 「顶栏 → 行卡片 → 类型栏 → 搜索面板」⇒ 最终生效的是**最后画的
+/// chrome**，行卡片被染成面板色（或反过来），且没有任何报错。
+///
+/// 改成逐矩形后每块区域用自己的底色，语义也统一了：
+/// **覆盖度 = 该区域底色的 alpha**。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlassUniforms {
     /// 卡片矩形：`xy = 中心`、`zw = 半尺寸`，单位是**目标像素**。
     pub rects: [[f32; 4]; MAX_GLASS_CARDS],
+    /// 逐矩形的底色：`rgb` = 未预乘原色（0~1），`a` = 混合强度。
+    ///
+    /// CAUTION: `rgb` 必须是**未预乘**的原色。早前这层色由 egui 在玻璃
+    /// pass 之后再画一个矩形，两层的 alpha 叠加成 `a + a(1-a)`：底色
+    /// 不透明时玻璃整层被盖死（折射/色散全看不见）。
+    pub tints: [[f32; 4]; MAX_GLASS_CARDS],
+    /// 逐矩形的**覆盖度**（0 = 完全露出真实桌面，1 = 不透明），取 `.x`。
+    ///
+    /// 着色器按预乘使用（`rgb * a, a`）。与 `tints[i].a`（有多像一张
+    /// 有色卡片）是两件事：覆盖度 1 + tint 0 = 不透明但完全通透的玻璃。
+    ///
+    /// CAUTION: 必须用 `vec4` 而不是 `f32`。WGSL uniform 空间要求数组
+    /// 元素的**步长是 16 的倍数**，`array<f32, N>` 的步长是 4，naga 直接
+    /// 报 `ArrayStride { stride: 4, alignment: Alignment(16) }` 校验失败。
+    /// 只有 `x` 有意义，其余三个分量是填充。
+    pub alphas: [[f32; 4]; MAX_GLASS_CARDS],
     /// 目标图的像素尺寸 `(w, h)`（uv → 像素用）。
     pub size: [f32; 2],
     /// 折射强度（0 = 只剩磨砂）。
@@ -78,34 +106,25 @@ pub struct GlassUniforms {
     pub radius: f32,
     /// 有效卡片数。
     pub count: u32,
-    /// 玻璃层的**覆盖度**（0 = 完全露出真实桌面，1 = 玻璃层不透明）。
-    ///
-    /// 着色器侧按预乘使用（`rgb * a, a`）。它是「这张卡片有多不透明」，
-    /// 与下面的 `tint_strength`（有多像一张有色卡片）是两件事。
-    pub card_alpha: f32,
-    /// 卡片底色（sRGB 分量，0~1）——玻璃层自己合成这层颜色。
-    ///
-    /// CAUTION: 必须是**未预乘**的原色。早前这层色由 egui 在玻璃 pass
-    /// 之后再画一个不透明矩形，两层的 alpha 叠加成 `a + a(1-a)`，卡片色
-    /// 100% 时玻璃整层被盖死（折射/色散全看不见）。
-    pub tint: [f32; 3],
-    /// 卡片色在玻璃层里的混合强度（0 = 纯玻璃，1 = 完全是卡片色）。
-    pub tint_strength: f32,
+    /// 尾部填充：把结构体补到 16 的倍数（WGSL uniform 的规则）。
+    pub _pad: f32,
 }
 
 impl Default for GlassUniforms {
     fn default() -> Self {
         Self {
             rects: [[0.0; 4]; MAX_GLASS_CARDS],
+            tints: [[0.0; 4]; MAX_GLASS_CARDS],
+            // 默认覆盖度 1：万一某条路径忘了给 alpha，玻璃是**不透明**
+            // 而不是「整片透出桌面」——后者会让界面看起来像坏了。
+            alphas: [[1.0, 0.0, 0.0, 0.0]; MAX_GLASS_CARDS],
             size: [0.0; 2],
             refract: 0.0,
             dispersion: 0.0,
             edge: 5.0,
             radius: 8.0,
             count: 0,
-            card_alpha: 1.0,
-            tint: [0.0; 3],
-            tint_strength: 0.0,
+            _pad: 0.0,
         }
     }
 }
@@ -359,21 +378,12 @@ pub struct GlassParams {
     pub dispersion: f32,
     /// Fresnel 幂次。
     pub edge: f32,
-    /// 玻璃层的覆盖度（0 = 完全露出真实桌面，1 = 不透明）。
-    ///
-    /// CAUTION: `glass.wgsl` 拿它做**预乘**（`rgb * a, a`），不是只写进
-    /// alpha 通道——交换链按 PRE_MULTIPLIED 合成，只写 alpha 会让半透明
-    /// 卡片被额外叠一层桌面而发白。
-    pub card_alpha: f32,
-    /// 卡片底色（sRGB 分量，0~1，**未预乘**）。
-    ///
-    /// 玻璃层自己把「底图 + 卡片色」合成完，egui 在玻璃模式下**不再画**
-    /// 行卡片底色（见 `paint::row` 的说明）。早前两层各画一次，alpha
-    /// 叠加成 `a + a(1-a)`：卡片色不透明时玻璃整层被盖死，折射/色散
-    /// 都看不见；半透明时又多叠一份桌面（发白）。
-    pub tint: [f32; 3],
-    /// 卡片色在玻璃层里的混合强度（0 = 纯玻璃，1 = 完全是卡片色）。
-    pub tint_strength: f32,
+    // 覆盖度与底色**不在这里**：它们是逐矩形的（见 `GlassRect`）。
+    //
+    // 早前这里有一组全局的 `card_alpha` / `tint` / `tint_strength`，由
+    // 绘制层「最后一次设置」决定。而各面板底色并不相同（行卡片
+    // `card_bg`、顶栏 `bg`、搜索/类型栏 `surface`），最终生效的只是最后
+    // 画的那一块 ⇒ 其余面板被串色，且不报错。
 }
 
 impl GlassParams {
@@ -395,9 +405,6 @@ impl GlassParams {
             refract: self.refract,
             dispersion: self.dispersion,
             edge: self.edge,
-            card_alpha: self.card_alpha,
-            tint: self.tint,
-            tint_strength: self.tint_strength,
             ..GlassUniforms::default()
         };
         let n = self.rects.len().min(MAX_GLASS_CARDS);
@@ -405,6 +412,8 @@ impl GlassParams {
             let c = g.rect.center() * ppp;
             let h = g.rect.size() * 0.5 * ppp;
             u.rects[i] = [c.x, c.y, h.x, h.y];
+            u.tints[i] = [g.tint[0], g.tint[1], g.tint[2], g.tint_strength];
+            u.alphas[i] = [g.alpha, 0.0, 0.0, 0.0];
             // 圆角半径取**第一张**的：同一帧里各面板的圆角通常同源
             // （都走 `paint` 的圆角常量），差别在一两像素内，而折射
             // 边缘对圆角误差不敏感（差 1px 只是亮边宽一点）。
@@ -425,10 +434,152 @@ pub struct GlassRect {
     /// 圆角半径（逻辑点）——必须与 egui 画出来的圆角一致，否则折射
     /// 边缘会和卡片描边错开。
     pub radius: f32,
+    /// 这一块的底色（sRGB 0~1，**未预乘**）。
+    pub tint: [f32; 3],
+    /// 底色在玻璃层里的混合强度（0 = 纯玻璃，1 = 完全是底色）。
+    pub tint_strength: f32,
+    /// 这一块的覆盖度（0 = 完全透出桌面，1 = 不透明）。
+    pub alpha: f32,
 }
 
 impl GlassRect {
-    pub fn new(rect: egui::Rect, radius: f32) -> Self {
-        Self { rect, radius }
+    /// 由「矩形 + 圆角 + 该区域的底色 + 玻璃强度」构造。
+    ///
+    /// # 为什么强度是**独立参数**而不是取 `fill.a()`
+    ///
+    /// 各面板底色的 alpha 语义并不统一：行卡片 `card_bg` 的 alpha 来自
+    /// 「卡片不透明度」滑块（正是用户口中的「玻璃强度」），而顶栏 `bg` /
+    /// 搜索面板 `surface` 的 alpha 来自 `with_backdrop_alpha`（磨砂模式下
+    /// 「窗口背景有多透」，默认约 0.57）。若直接拿 `fill.a()` 当覆盖度，
+    /// 顶栏玻璃只有卡片的六成强度——同一屏里两种玻璃，且没有任何报错。
+    ///
+    /// 所以：**`fill` 只决定颜色，`strength` 决定覆盖度**。后者由绘制层
+    /// 统一取「卡片不透明度」，一个滑块管住所有玻璃。
+    ///
+    /// `tint_strength` 也由 `strength` 派生（而非 `fill.a()`）：卡片越不
+    /// 透明，底色越浓——用户调低它就是要「更通透」，覆盖度与色浓一起降。
+    pub fn new(
+        rect: egui::Rect,
+        radius: f32,
+        fill: egui::Color32,
+        strength: f32,
+    ) -> Self {
+        let strength = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        // 预乘存储 ⇒ 必须用 `to_srgba_unmultiplied` 还原原色，否则
+        // 「不透明度」会被算两次（色越调越暗）。
+        let [r, g, b, _] = fill.to_srgba_unmultiplied();
+        Self {
+            rect,
+            radius,
+            tint: [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0],
+            tint_strength: crate::glass::card_tint_strength(strength),
+            alpha: strength,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{pos2, Rect, vec2};
+
+    /// uniform 大小必须与 `glass.wgsl` 的 `GlassUniforms` 逐字节一致。
+    ///
+    /// # 为什么钉死数字而不是「对着着色器算」
+    ///
+    /// 着色器没法在 Rust 里反射布局，naga 的校验（`build.rs`）只保证
+    /// **WGSL 自己**合法，不保证与 Rust 侧相等。两侧漂移的后果是
+    /// `cmd_push_constants`/`write_buffer` 写进去的字节被按另一种结构
+    /// 解读——所有参数都变成垃圾，但**不报错**（只表现为「玻璃看起来
+    /// 完全不对」）。
+    ///
+    /// 1184 = rects 384 + tints 384 + alphas 384 + size 8 + 5×f32 20 + pad 4。
+    /// 改字段时这个数字必须同步改，并回去改 `glass.wgsl` 的 `_pad`。
+    #[test]
+    fn uniform_size_is_pinned_to_wgsl_layout() {
+        assert_eq!(std::mem::size_of::<GlassUniforms>(), 1184);
+        // 16 的倍数：WGSL uniform 结构体的 size 必须是最大成员对齐的倍数。
+        assert_eq!(std::mem::size_of::<GlassUniforms>() % 16, 0);
+    }
+
+    /// 每块面板的底色**互不串染**（2026-10-28 的核心回归）。
+    ///
+    /// 早前全局只有一份 `tint` / `card_alpha`，由绘制层「最后一次设置」
+    /// 决定。而各面板底色不同（行卡片 `card_bg`、顶栏 `bg`、搜索/类型栏
+    /// `surface`），最终生效的只是最后画的那一块 ⇒ 其余面板被串色，
+    /// 且不报错。
+    #[test]
+    fn per_rect_tint_is_not_shared() {
+        let row_fill = egui::Color32::from_rgb(0x2F, 0x35, 0x40);
+        let bar_fill = egui::Color32::from_rgb(0x10, 0x12, 0x15);
+        let params = GlassParams {
+            rects: vec![
+                GlassRect::new(
+                    Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 50.0)),
+                    8.0,
+                    row_fill,
+                    1.0,
+                ),
+                GlassRect::new(
+                    Rect::from_min_size(pos2(0.0, 60.0), vec2(100.0, 40.0)),
+                    6.0,
+                    bar_fill,
+                    0.5,
+                ),
+            ],
+            refract: 0.3,
+            dispersion: 0.2,
+            edge: 5.0,
+        };
+        let u = params.uniform(1.0, vk::Extent2D { width: 800, height: 600 });
+
+        let want_row = GlassRect::new(Rect::NOTHING, 0.0, row_fill, 1.0);
+        let want_bar = GlassRect::new(Rect::NOTHING, 0.0, bar_fill, 0.5);
+        assert_eq!(u.tints[0][..3], want_row.tint[..], "第一块的底色被串染");
+        assert_eq!(u.tints[1][..3], want_bar.tint[..], "第二块的底色被串染");
+        assert_ne!(
+            u.tints[0][..3],
+            u.tints[1][..3],
+            "前置条件：两块底色应不同"
+        );
+        assert_eq!(u.alphas[0][0], want_row.alpha);
+        assert_eq!(u.alphas[1][0], want_bar.alpha);
+        assert_eq!(u.count, 2);
+    }
+
+    /// `GlassRect::new` 的派生关系：tint 取**非预乘**原色，alpha 取覆盖度。
+    ///
+    /// # 为什么这条重要
+    ///
+    /// `Color32` 是预乘存储。半透明底色若直接拿预乘分量当 tint，
+    /// 颜色会随「卡片不透明度」二次变暗（预乘一次 + 混合一次）。
+    /// 必须走 `to_srgba_unmultiplied` 还原色相。
+    #[test]
+    fn glass_rect_derives_unmultiplied_tint() {
+        // 半透明红：预乘分量约为 (128, 0, 0)，非预乘应是 (255, 0, 0)。
+        let fill = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 128);
+        let g = GlassRect::new(Rect::NOTHING, 4.0, fill, 128.0 / 255.0);
+        assert!((g.alpha - 128.0 / 255.0).abs() < 1e-6, "覆盖度应等于底色 alpha");
+        assert!(g.tint[0] > 0.95, "tint 应是未预乘的原色，实际 {}", g.tint[0]);
+        assert!(g.tint[1] < 0.01 && g.tint[2] < 0.01);
+        // tint 强度随覆盖度单调：半透明 → 约半个上限。
+        let full = GlassRect::new(Rect::NOTHING, 4.0, egui::Color32::from_rgb(255, 0, 0), 1.0);
+        assert!(g.tint_strength < full.tint_strength);
+        assert!((full.tint_strength - crate::glass::CARD_TINT_MAX).abs() < 1e-6);
+    }
+
+    /// 默认值必须「不透明」而不是「全透」。
+    ///
+    /// 万一某条路径漏写 alpha，玻璃退化成实底还能看；退化成全透会让
+    /// 界面像坏掉（整窗透出桌面、没有卡片）。
+    #[test]
+    fn default_alpha_is_opaque() {
+        let u = GlassUniforms::default();
+        assert!(u.alphas.iter().all(|a| a[0] == 1.0));
+        assert_eq!(u.count, 0);
     }
 }

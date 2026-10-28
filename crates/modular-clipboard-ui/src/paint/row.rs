@@ -129,18 +129,13 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // `card_blur_uv`），因此每张卡片看到的是它自己身后那一块桌面。
     // 液态玻璃：本帧起这张卡片要参与折射合成（仅背景效果 = 玻璃时生效）。
     // 必须在画底色**之前**——玻璃 pass 跑在 egui 内容之前。
-    let glass_mode = f.svc.state.config.ui.window_backdrop
-        == modular_clipboard_core::config::WindowBackdrop::Glass;
-    f.push_glass(r, radius);
-    // `Color32::a()` 给的是 0~255 的 u8，玻璃 pass 要 0~1 的 f32。
-    f.set_glass_card_alpha(pal.card_bg.a() as f32 / 255.0);
-    // 卡片底色交给玻璃层自己合成（`fs_glass` 的 tint）。
+    let glass_mode = f.glass_mode();
+    // 底色**作为参数**交给玻璃层：玻璃层用它算 tint 与覆盖度。
     //
-    // CAUTION: 取**未预乘**的原色。当前调色板里的 `card_bg` 已经被
-    // `with_card_opacity` 用 `gamma_multiply` 把不透明度压进 RGB 了，
-    // 直接拿分量当 tint 会让「卡片不透明度」被算两次（色越调越暗）。
-    let [tr, tg, tb, _] = pal.card_bg.to_srgba_unmultiplied();
-    f.set_glass_tint([tr as f32 / 255.0, tg as f32 / 255.0, tb as f32 / 255.0]);
+    // 早前是「先 push 再 set_tint / set_alpha」的两步式，而 tint 全局只有
+    // 一份 ⇒ 顶栏、搜索面板、类型栏都被行卡片的底色染一遍。现在每块
+    // 区域自带底色，语义也统一了：**覆盖度 = 底色的 alpha**。
+    f.push_glass(r, radius, pal.card_bg);
     // 卡片磨砂补丁：**玻璃模式下不画**（2026-10-25 修「玻璃参数无效」）。
     //
     // 病根：这层补丁是 GDI 捕获的**不透明**纹理，画在玻璃 pass 之后，
@@ -152,8 +147,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // 按卡片形状两级折射，输出 alpha = 卡片色 alpha），补丁属于被取代
     // 的旧机制，继续画只会帮倒忙。磨砂/半透明模式照画（那里没有玻璃
     // pass，补丁是卡片能透出身后桌面的唯一途径）。
-    if f.svc.state.config.ui.window_backdrop
-        != modular_clipboard_core::config::WindowBackdrop::Glass
+    if !glass_mode
         && let Some(tex) = f.state.card_blur_tex.as_ref()
     {
         let mut shape = egui::epaint::RectShape::filled(r, radius, egui::Color32::WHITE);

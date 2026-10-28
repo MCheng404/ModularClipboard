@@ -136,7 +136,10 @@ pub(super) fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
     // 详情卡/侧栏卡内部没有更小的玻璃单元，整卡登记是唯一选择。
     // `push_glass` 自带「仅主窗口」闸门，附属窗口不会污染主窗口的收集表。
     if matches!(card.kind, CardKind::Detail | CardKind::Rail) {
-        f.push_glass(r, CARD_RADIUS);
+        // 底色取 `bg`：`HISTORY_UNITY` 下卡片**不画自己的底**
+        // （`draw_card_frame` 早退），看到的就是整窗底色。
+        // 传 `surface` 会让详情卡的玻璃比周围深一档。
+        f.push_glass(r, CARD_RADIUS, f.pal.bg);
     }
     draw_card_frame(f, r);
     let pal = f.pal;

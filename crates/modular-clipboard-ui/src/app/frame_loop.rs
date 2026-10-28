@@ -1104,19 +1104,15 @@ pub(super) fn run_mode(
                 == modular_clipboard_core::config::WindowBackdrop::Glass
             {
                 let cfg = &app.svc.state.config.ui;
+                // 底色与覆盖度**随每个矩形走**（`GlassRect` 自带），
+                // 这里只剩审美三项。早前全局的 tint / card_alpha 会让
+                // 顶栏、搜索面板、类型栏被行卡片的底色串染。
                 let rects = std::mem::take(&mut app.paint_state.glass_rects);
-                let card_alpha = app.paint_state.glass_card_alpha;
-                let tint = app.paint_state.glass_tint;
-                let tint_strength =
-                    modular_clipboard_gfx::glass::card_tint_strength(card_alpha);
                 painter.set_glass(modular_clipboard_gfx::glass_pass::GlassParams {
                     rects,
                     refract: cfg.glass_refract,
                     dispersion: cfg.glass_dispersion,
                     edge: cfg.glass_edge,
-                    card_alpha,
-                    tint,
-                    tint_strength,
                 });
             }
             // 模糊半径按模式取：磨砂用自己的档位，玻璃用**自有的**档位。

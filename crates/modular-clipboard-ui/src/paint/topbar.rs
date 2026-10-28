@@ -39,15 +39,21 @@ use modular_clipboard_core::i18n::msg;
 pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     let pal = f.pal;
     let scale = f.scale;
-    // 液态玻璃：顶栏也参与（圆角 0 = 直角矩形，SDF 退化为普通矩形）。
-    f.push_glass_overlay(bar, 0.0);
     let painter = f.ui.painter_at(bar);
     // 一体性：顶栏与卡片区**同色**（`bg`），整窗连成一片。
     // 早前这里用 `surface_variant`（第二种灰），与下面的卡片区
     // （第三种灰 `list_bg`）相邻 —— 两种灰 + 一条描边，界面就读成
     // 「三块拼的」。现在顶栏只靠底部那条 1px 分隔线区分。
     let bar_bg = if HISTORY_UNITY { pal.bg } else { pal.surface_variant };
-    painter.rect_filled(bar, CornerRadius::ZERO, bar_bg);
+    // 液态玻璃：顶栏也参与（圆角 0 = 直角矩形，SDF 退化为普通矩形）。
+    // 底色随矩形一起交给玻璃层——顶栏是 `bg`，行卡片是 `card_bg`，
+    // 两者不同，不能共用一份全局 tint。
+    f.push_glass_overlay(bar, 0.0, bar_bg);
+    // CAUTION: 玻璃模式下**不画**底色（见 `Frame::glass_mode`）——
+    // 画了就把玻璃 pass 的输出整层盖住，顶栏看起来和没开玻璃一样。
+    if !f.glass_mode() {
+        painter.rect_filled(bar, CornerRadius::ZERO, bar_bg);
+    }
     painter.hline(
         bar.x_range(),
         bar.max.y,
@@ -357,12 +363,16 @@ pub(super) fn set_search_expanded(f: &mut Frame<'_>, v: bool) {
 /// 与旧 `draw_search` 完全一致，行为可无缝对拍。
 pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     let pal = f.pal;
-    // 液态玻璃：搜索面板参与（圆角与它自己的底色一致）。
-    f.push_glass_overlay(r, pal.radius_md);
     let painter = f.ui.painter_at(r);
     // 纯平毛玻璃禁令同样适用于悬浮层：纯色底 + 1px 描边，禁渐变光泽。
     let radius = pal.radius_md;
-    painter.rect_filled(r, radius, pal.surface);
+    // 液态玻璃：搜索面板参与（圆角与它自己的底色一致）。
+    // 底色 `surface` 与行卡片 `card_bg` 不同，逐矩形传下去才不会串色。
+    f.push_glass_overlay(r, radius, pal.surface);
+    // 玻璃模式下底色交给玻璃层（画了就盖住折射）。
+    if !f.glass_mode() {
+        painter.rect_filled(r, radius, pal.surface);
+    }
     painter.rect_stroke(
         r,
         radius,
@@ -692,7 +702,8 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     }
     let vertical = matches!(rail_cfg.pos, TypeRailPos::Left | TypeRailPos::Right);
     // 液态玻璃：类型栏参与。圆角取面板档（与搜索面板同源）。
-    f.push_glass_overlay(rail, pal.radius_md);
+    // 底色随矩形走（`surface`），见 `Frame::push_glass_overlay`。
+    f.push_glass_overlay(rail, pal.radius_md, pal.surface);
     // 文字标签的排版（labels 开启时）：竖直排下方、水平排右侧。
     let label_font = sized(pal.font_xs, f.scale);
     let label_h = label_font.size.max(10.0) * 1.25;
@@ -744,7 +755,11 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     // 缝隙会透出投影的纯黑（实机「类型栏是一块黑色背景」）。
     let radius = pal.radius_md;
     let painter = f.ui.painter_at(rail);
-    painter.rect_filled(rail, radius, pal.surface);
+    // CAUTION: 玻璃模式下不画底色（会盖住折射），但**描边保留**——
+    // 它是按钮组的形状线索，且 1pt 半透明描边不遮挡折射产出。
+    if !f.glass_mode() {
+        painter.rect_filled(rail, radius, pal.surface);
+    }
     painter.rect_stroke(
         rail,
         radius,

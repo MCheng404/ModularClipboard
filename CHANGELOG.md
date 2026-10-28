@@ -78,6 +78,39 @@
   `pad` vec4，净增 0）。Rust 与 WGSL 两侧 `GlassUniforms` 逐字段对齐，
   `shader_constants_match_rust` 已把 `CARD_TINT_MAX` 纳入比对。
 
+### 优化（玻璃 alpha 通道）
+
+- **底色与覆盖度改为逐矩形**（`GlassUniforms::tints` / `alphas`）：早前
+  全局只有一份 `tint` / `card_alpha`，由绘制层「最后一次设置」决定。而
+  参与玻璃的面板底色并不相同——行卡片 `card_bg`（受「卡片不透明度」滑块
+  影响）、顶栏 `bg`、搜索面板与类型栏 `surface`。绘制顺序是「顶栏 →
+  行卡片 → 类型栏 → 搜索面板」⇒ 最终生效的只是**最后画的那一块**，
+  其余面板被串色，且没有任何报错。
+- **chrome 的底色在玻璃模式下不再绘制**：上一轮把玻璃覆盖范围扩到了顶栏 /
+  搜索面板 / 类型栏，但它们仍各自画一层**不透明**底色——玻璃 pass 的输出
+  被整层盖住，等于「登记了矩形但一点玻璃都没有」。现在三处都按
+  `Frame::glass_mode()` 跳过填充（描边保留：它是形状线索，1pt 半透明
+  不遮挡折射）。
+- **玻璃强度统一由「卡片不透明度」控制**（`Frame::glass_strength`）：
+  覆盖度原先取自各面板底色的 alpha，而行卡片是 1.0、顶栏是
+  `with_backdrop_alpha` 算出的 ~0.57 ⇒ 同一屏里两种强度的玻璃（chrome 的
+  折射只有卡片六成）。现在 `GlassRect::new` 的 `fill` 只决定**颜色**，
+  覆盖度与色浓统一由该滑块派生。
+- **uniform 432 → 1184 字节**：`rects` 384 + `tints` 384 + `alphas` 384 +
+  其余 32。每帧多传 752 字节，可忽略。
+  - CAUTION: `alphas` 必须声明成 `array<vec4<f32>, N>` 而不是
+    `array<f32, N>`——WGSL uniform 空间要求数组元素**步长是 16 的倍数**，
+    `f32` 的步长 4 会被 naga 直接判非法
+    （`ArrayStride { stride: 4, alignment: Alignment(16) }`）。只有 `.x`
+    有意义，其余三分量是填充。
+  - 新增 `uniform_size_is_pinned_to_wgsl_layout` 守门：大小钉死 1184 且
+    必须是 16 的倍数。两侧漂移的后果是写入的字节被按另一种结构解读，
+    所有参数变成垃圾但**不报错**。
+- **新增三条回归测试**：`per_rect_tint_is_not_shared`（两块不同底色互不
+  串染）、`glass_rect_derives_unmultiplied_tint`（半透明底色的 tint 必须是
+  未预乘原色，否则色相随滑块二次变暗）、
+  `glass_strength_is_uniform_across_panels`（所有参与玻璃的矩形覆盖度相同）。
+
 ### 优化（数据与捕获路径）
 
 - **HTML 剪贴板降级为纯文本的速度提升 8.5 倍**（`capture::strip_html`）：
