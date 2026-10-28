@@ -627,11 +627,12 @@ pub(super) fn item_hidden(
         // 抓屏分辨率：背景效果为「无」时压根不抓屏（`paint_backdrop` 不跑），
         // 这一项没有任何作用——按「不可用即不存在」隐藏而不是压暗。
         "ui.backdrop_scale" => cfg.ui.window_backdrop == WindowBackdrop::None,
-        // 卡片不透明度：没有可透的底图时（无背景效果且未开卡片磨砂）
-        // 滑块无从表现——与磨砂强度同一判据。
-        "ui.card_opacity" => {
-            cfg.ui.window_backdrop == WindowBackdrop::None && cfg.ui.card_blur == 0
-        }
+        // 卡片不透明度**恒显示**（2026-10-28 修「卡片透明度失效」）。
+        //
+        // 早前在「无背景效果且未开卡片磨砂」时整行隐藏，理由是「没有
+        // 可透的底图，滑块无从表现」。这个理由只对了一半：卡片半透明
+        // 还会与**窗口底色**混合（卡片变淡），那本身就是用户要的效果。
+        // 隐藏的后果是用户配了 `card_opacity=0.6` 却永远看不到变化。
         // 卡片磨砂：玻璃模式下**整项隐藏**（2026-10-25）。玻璃 pass 用
         // 双底图折射充当卡片的身后内容（`row.rs` 跳过不透明补丁），每张
         // 卡片各自的 CPU 模糊补丁不再绘制、捕获链也停了——这一项在玻璃
@@ -951,7 +952,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             SettingsItem {
                 key: "ui.card_opacity",
                 label: msg("Card opacity"),
-                desc: msg("Opacity of entry cards; lower it to reveal the blurred background"),
+                desc: msg("Opacity of entry cards; without a background effect they blend into the window fill"),
                 kind: ItemKind::CardOpacity,
             },
             SettingsItem {
@@ -2155,6 +2156,39 @@ mod fold_arrow_tests {
 #[cfg(test)]
 mod gpu_adapter_tests {
     use super::*;
+
+    /// 「卡片不透明度」**任何配置下都不得被隐藏**（2026-10-28 修失效）。
+    ///
+    /// 早前在「无背景效果且未开卡片磨砂」时整行隐藏，理由是「没有可透的
+    /// 底图，滑块无从表现」。但卡片半透明还会与窗口底色混合（卡片变淡），
+    /// 那本身就是用户要的效果——隐藏的后果是用户配了 `card_opacity=0.6`
+    /// 却永远看不到变化，还以为设置坏了。
+    #[test]
+    fn card_opacity_item_is_never_hidden() {
+        use modular_clipboard_core::config::WindowBackdrop;
+        let item = SETTINGS_CARDS
+            .iter()
+            .flat_map(|c| c.items.iter())
+            .find(|it| it.key == "ui.card_opacity")
+            .expect("设置里必须有一行 ui.card_opacity");
+
+        for backdrop in [
+            WindowBackdrop::None,
+            WindowBackdrop::Acrylic,
+            WindowBackdrop::Translucent,
+            WindowBackdrop::Glass,
+        ] {
+            for card_blur in [0u8, 5] {
+                let mut cfg = modular_clipboard_core::Config::default();
+                cfg.ui.window_backdrop = backdrop;
+                cfg.ui.card_blur = card_blur;
+                assert!(
+                    !item_hidden(item, &cfg),
+                    "背景 {backdrop:?} + 卡片磨砂 {card_blur} 时这一行被隐藏了"
+                );
+            }
+        }
+    }
 
     /// GPU 适配器这一行必须：在列表里、能报「改过」、能重置回 auto。
     ///

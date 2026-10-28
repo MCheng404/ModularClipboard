@@ -388,13 +388,25 @@ impl App {
         } else {
             backdrop
         };
-        // 卡片不透明度：磨砂 / 半透明下把行卡片底色也降 alpha，让模糊底图
-        // 透过卡片显示（否则只有行间缝隙能看出磨砂，卡片本身仍是实底）。
-        // 无背景时不生效——不透明底图后面没有东西可透。
+        // 卡片不透明度：把行卡片底色的 alpha 与 RGB 同比例降下来
+        // （`gamma_multiply` 是预乘语义，只降 alpha 会偏色）。
+        //
+        // # 为什么**所有**背景模式都应用它（2026-10-28 修「卡片透明度失效」）
+        //
+        // 早前「无背景效果」分支直接返回 `self.pal`，理由是「不透明底图
+        // 后面没有东西可透」。但「卡片半透明」并不只有「透出桌面」一种
+        // 表现——它会与**窗口底色**（`list_bg`）混合，观感是卡片变淡。
+        // 那正是用户拖这个滑块想要的（2026-10-28 用户配置
+        // `window_backdrop=None, card_blur=0, card_opacity=0.6`，滑块
+        // 被整行隐藏、配置从未生效）。
+        //
+        // 「透出桌面」仍然需要背景效果或卡片磨砂——那是另一回事，说明
+        // 文字里已讲清。
         let card_alpha = (self.svc.state.config.ui.card_opacity.clamp(0.3, 1.0) * 255.0)
             .round() as u8;
         let is_dark = self.pal.is_dark;
         let backdrop_pal;
+        let plain_card_pal;
         let pal_ref: &theme::Palette = match backdrop {
             modular_clipboard_core::config::WindowBackdrop::Acrylic => {
                 let base = opacity.clamp(0.3, 1.0) * 0.6;
@@ -414,27 +426,16 @@ impl App {
                     .with_card_opacity(card_alpha);
                 &backdrop_pal
             }
-            modular_clipboard_core::config::WindowBackdrop::None => &self.pal,
+            modular_clipboard_core::config::WindowBackdrop::None => {
+                // 只降卡片色，不动背景层（窗口底仍不透明）。
+                plain_card_pal = self.pal.with_card_opacity(card_alpha);
+                &plain_card_pal
+            }
             // 值永远不会到这里：上方已把玻璃并入 Acrylic。Rust 的穷尽性
             // 检查基于**类型**而非值，所以必须显式写这个分支。
             modular_clipboard_core::config::WindowBackdrop::Glass => unreachable!(
                 "背景玻璃已在上方并入 Acrylic，不该走到这里"
             ),
-        };
-        // 卡片透明度在**窗口背景无底图**时也要能生效——只要开了卡片磨砂。
-        //
-        // 早前的判据是「有没有背景效果」，理由是「不透明底图后面没有东西
-        // 可透」。但卡片磨砂给每张卡片自带了一层模糊的身后内容，卡片后面
-        // 于是**有东西可透**了；继续禁用这个滑块，用户开了磨砂却调不动
-        // 透明度，会以为设置没保存。
-        let card_blur_pal;
-        let pal_ref = if backdrop == modular_clipboard_core::config::WindowBackdrop::None
-            && self.svc.state.config.ui.card_blur > 0
-        {
-            card_blur_pal = pal_ref.with_card_opacity(card_alpha);
-            &card_blur_pal
-        } else {
-            pal_ref
         };
 
         {

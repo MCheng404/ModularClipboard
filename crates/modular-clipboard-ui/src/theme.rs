@@ -1208,6 +1208,38 @@ mod tests {
         assert_eq!(l.shadow.a(), 128, "浅色阴影 alpha 应提到 0.5");
     }
 
+    /// `with_card_opacity` 必须**同时**降 alpha 与 RGB（预乘语义）。
+    ///
+    /// 只降 alpha 会让卡片「变亮发白」（预乘值不合法），只降 RGB 会让
+    /// 它「变暗但完全不透明」——后者正是「卡片透明度失效」的另一种形态：
+    /// 滑块拖到底，卡片只是变暗，透不出任何东西。
+    #[test]
+    fn card_opacity_lowers_alpha_and_keeps_hue() {
+        for p in [Palette::dark(), Palette::light()] {
+            let base = p.card_bg;
+            let half = p.with_card_opacity(128).card_bg;
+            assert!(
+                half.a() < base.a(),
+                "[{}] 不透明度没降：{} vs {}",
+                mode_of(&p),
+                half.a(),
+                base.a()
+            );
+            // 非预乘色相不变（允许 ±2 的量化误差）。
+            let [r0, g0, b0, _] = base.to_srgba_unmultiplied();
+            let [r1, g1, b1, _] = half.to_srgba_unmultiplied();
+            for (i, (a, b)) in [(r0, r1), (g0, g1), (b0, b1)].iter().enumerate() {
+                assert!(
+                    (*a as i32 - *b as i32).abs() <= 2,
+                    "[{}] 通道 {i} 色相被改了：{a} -> {b}",
+                    mode_of(&p)
+                );
+            }
+            // 255 = 原样返回（`gamma_multiply(1.0)` 早退）。
+            assert_eq!(p.with_card_opacity(255).card_bg, base);
+        }
+    }
+
     /// 卡片顶部受光高光：深色主题有（alpha 0.20 的白色渐变），浅色
     /// 主题透明（卡片自身最亮，不再叠加）。
     #[test]
