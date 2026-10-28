@@ -29,7 +29,12 @@ const LANG_COMBO_W: f32 = 132.0;
 ///
 /// 比语言下拉宽一档：设备名（`NVIDIA GeForce RTX 4090`）远长于语言名，
 /// 132pt 会把每一项都截成「NVIDIA Ge...」——用户根本分不清两张同型号卡。
-const GPU_COMBO_W: f32 = 200.0;
+///
+/// CAUTION: 早前写 200 且**不截断**，`selected_text` 把按钮撑到 400pt，
+/// 左侧「GPU 适配器」标签被压住、说明文字折成三行（2026-10-28 实机
+/// 截图确认）。egui 的 `ComboBox::width` 是**最小宽度**，文字更长时它
+/// 会自己撑开——不截断就等于没有上限。
+const GPU_COMBO_W: f32 = 168.0;
 
 /// 语言菜单里要列出的选项下标——**不含当前选中项**。
 ///
@@ -40,6 +45,57 @@ const GPU_COMBO_W: f32 = 200.0;
 /// 跟 egui 的 Ui 缠在一起，单测跑不起来。
 fn lang_menu_indices(sel: usize) -> impl Iterator<Item = usize> {
     (0..LANG_CHOICES.len()).filter(move |i| *i != sel)
+}
+
+/// 让 `ComboBox` 的**按钮**与自绘控件同语言：胶囊 + 控件高度 + `font_sm`。
+///
+/// # 为什么必须包一层样式作用域
+///
+/// egui 的 `ComboBox` 按钮走 `visuals.widgets`：默认是 `radius_sm`（本项目
+/// 4pt）的小圆角、`interact_size.y`（约 18pt）的矮按钮、`Button` 字号的
+/// 大号文字。而本项目的控件全是**胶囊**（半径 = 半高，见 `draw_segmented`
+/// / `draw_text_field` / `draw_mini_button` 的「全圆角改版」）。
+///
+/// 不改的后果就是同一行里混着两种形状：左边一枚 30pt 高的胶囊分段控件、
+/// 右边一枚 18pt 高的小圆角按钮——2026-10-28 用户反馈「适配器按钮不符合
+/// 设计语言」。
+///
+/// 弹层**不受影响**：`ComboBox::popup_style` 会显式覆盖菜单自己的 style
+/// （见 `lang_menu_style`），所以这里只改按钮。
+fn pill_combo<R>(f: &Frame<'_>, ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let pal = f.pal;
+    // 与 `draw_segmented` / `draw_text_field` 同一个高度口径。
+    let h = pal.control_height + 2.0;
+    // `ui.style()` 返回 `&Arc<Style>`：要改必须深拷贝成 `Style`
+    // （`(*...).clone()` 只会克隆那个 Arc，改不动里面的字段）。
+    let mut style: egui::Style = (**ui.style()).clone();
+    style.spacing.interact_size.y = h;
+    // 左右 10pt：介于 `draw_mini_button` 的 8pt 与分段的 20pt 之间。
+    // 垂直内边距交给 `interact_size` 与居中布局，写 0 以免撑高按钮。
+    style.spacing.button_padding = egui::vec2(10.0, 0.0);
+    // 字号对齐 `font_sm`：egui 的 `Button` 默认字号比设置页正文大一档，
+    // 同一行里两个控件字号不同会读成「不是一个层级」。
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::proportional(pal.font_sm),
+    );
+    let pill = egui::CornerRadius::same((h * 0.5).round() as u8);
+    for wv in [
+        &mut style.visuals.widgets.inactive,
+        &mut style.visuals.widgets.hovered,
+        &mut style.visuals.widgets.active,
+        &mut style.visuals.widgets.open,
+    ] {
+        wv.corner_radius = pill;
+    }
+    // 描边降到 `border_subtle`：分段控件无描边，输入框与小按钮用细边，
+    // ComboBox 默认的 `border` 在同一行里偏重。
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, pal.border_subtle);
+    ui.scope(|ui| {
+        ui.set_style(style);
+        add(ui)
+    })
+    .inner
 }
 
 /// GPU 适配器选择行：下拉框 + 「当前实际在用」小字。
@@ -85,47 +141,82 @@ fn draw_gpu_adapter(f: &mut Frame<'_>, ui: &mut Ui, label: Msg, desc: Msg) -> bo
 
     let mut picked: Option<String> = None;
     setting_row(ui, label, desc, |ui| {
-        // 小字在右对齐布局里后加的靠左 ⇒ 先加它，它出现在下拉框左侧。
-        if let Some(name) = &current {
-            let mismatch = matches!(&cur, GpuSelection::Named(n) if n != name);
-            let text = format!(
-                "{}: {name}",
-                modular_clipboard_core::i18n::t("In use")
-            );
+        // 宽度按字号缩放：`GPU_COMBO_W` 是按基础字号（15pt）量的，
+        // 字号放大到 2× 时 200pt 装不下设备名。上限取可用宽度的六成，
+        // 避免把左侧说明文字挤成窄条。
+        // 上限取可用宽度的 **45%**：再宽就把左侧标签与说明挤成窄条
+        // （实机截图里「用哪张显卡渲染界面」折成了三行）。
+        let avail = ui.available_width().max(0.0);
+        let want_w = GPU_COMBO_W * (pal.font_sm / 15.0).max(0.6);
+        let w = if avail > 0.0 {
+            want_w.min(avail * 0.45).max(pal.font_sm * 5.0)
+        } else {
+            want_w
+        };
+        // 按钮上放不下完整设备名，必须截断——否则 `ComboBox` 会按文字
+        // 宽度撑开（`.width()` 只是**下限**）。
+        // 减 34：左右 padding 各 10 + 右侧箭头约 14。
+        let font = egui::FontId::proportional(pal.font_sm);
+        let elided = elide_to_width(ui, &shown, &font, w - 34.0);
+        // CAUTION: `right_to_left` 布局里**先加的靠右**。下拉框必须是最右
+        // 那一枚（用户预期），所以它先加；警告小字后加，落在它左侧。
+        let resp = pill_combo(f, ui, |ui| {
+            egui::ComboBox::from_id_salt("gpu_adapter")
+                .selected_text(elided)
+                .width(w)
+                .popup_style(lang_menu_style.into())
+                .show_ui(ui, |ui| {
+                    let mut hit = false;
+                    if ui
+                        .selectable_label(
+                            cur == GpuSelection::Auto,
+                            modular_clipboard_core::i18n::t("Auto (discrete preferred)"),
+                        )
+                        .clicked()
+                    {
+                        picked = Some(GpuSelection::Auto.to_config());
+                        hit = true;
+                    }
+                    for a in &adapters {
+                        let sel = GpuSelection::Named(a.name.clone());
+                        if ui.selectable_label(cur == sel, a.display()).clicked() {
+                            picked = Some(sel.to_config());
+                            hit = true;
+                        }
+                    }
+                    hit
+                })
+        });
+
+        // 悬停给出「实际在用」的完整信息（按钮上放不下长设备名）。
+        let hover = current
+            .as_ref()
+            .map(|n| format!("{}: {n}", modular_clipboard_core::i18n::t("In use")));
+        if let Some(text) = hover {
+            resp.response.on_hover_text(text);
+        }
+
+        // 小字**只在配置值与实际值不一致时**出现。
+        //
+        // 常态下不显示是刻意的：设置卡片右侧本就拥挤，而「当前用哪张」
+        // 在 99% 的情况下等于配置值（选什么用什么），天天显示只是噪声。
+        // 真正需要提醒的是「选了核显却跑在独显上」——那种不一致必须一眼
+        // 看见，否则用户会反复点保存。
+        if let Some(name) = &current
+            && matches!(&cur, GpuSelection::Named(n) if n != name)
+        {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(text)
-                        .color(if mismatch { pal.warn } else { pal.text_dim })
-                        .size(pal.font_xs),
+                    egui::RichText::new(format!(
+                        "{}: {name}",
+                        modular_clipboard_core::i18n::t("In use")
+                    ))
+                    .color(pal.warn)
+                    .size(pal.font_xs),
                 )
                 .truncate(),
             );
         }
-        let resp = egui::ComboBox::from_id_salt("gpu_adapter")
-            .selected_text(shown.clone())
-            .width(GPU_COMBO_W)
-            .popup_style(lang_menu_style.into())
-            .show_ui(ui, |ui| {
-                let mut hit = false;
-                if ui
-                    .selectable_label(
-                        cur == GpuSelection::Auto,
-                        modular_clipboard_core::i18n::t("Auto (discrete preferred)"),
-                    )
-                    .clicked()
-                {
-                    picked = Some(GpuSelection::Auto.to_config());
-                    hit = true;
-                }
-                for a in &adapters {
-                    let sel = GpuSelection::Named(a.name.clone());
-                    if ui.selectable_label(cur == sel, a.display()).clicked() {
-                        picked = Some(sel.to_config());
-                        hit = true;
-                    }
-                }
-                hit
-            });
         resp.inner == Some(true)
     });
     if let Some(v) = picked {
@@ -199,6 +290,7 @@ use super::settings_items::get_opt_number;
 use super::settings_items::get_text;
 use super::settings_items::shadow_param_row;
 use super::controls::draw_mini_button;
+use super::controls::elide_to_width;
 use super::controls::draw_number_field;
 use super::controls::draw_segmented;
 use super::controls::draw_slider;
@@ -350,11 +442,14 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // `resp.response.changed()`，恒为 false ⇒ `Op::SetLanguage`
                 // 永远不推送 ⇒ 语言永远是「跟随系统」，且界面上看不出任何
                 // 异常（下拉框确实划过、确实高亮了，只是没落地）。
-                let resp = egui::ComboBox::from_id_salt("ui_language")
-                    .selected_text(t(LANG_CHOICES[sel].1))
-                    .width(LANG_COMBO_W)
-                    .popup_style(lang_menu_style.into())
-                    .show_ui(ui, |ui| {
+                // 与自绘控件同语言（胶囊 + 控件高度）：egui 的 ComboBox
+                // 默认是 4pt 小圆角的矮按钮，在这一页里格格不入。
+                let resp = pill_combo(f, ui, |ui| {
+                    egui::ComboBox::from_id_salt("ui_language")
+                        .selected_text(t(LANG_CHOICES[sel].1))
+                        .width(LANG_COMBO_W)
+                        .popup_style(lang_menu_style.into())
+                        .show_ui(ui, |ui| {
                         let mut picked = false;
                         // 已选中的不列出来：语言菜单里「当前项再出现一次」
                         // 没有意义，只多占一行；剩下的每一项都能真正切换。
@@ -364,7 +459,8 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                             }
                         }
                         picked
-                    });
+                        })
+                });
                 // `inner == None` = 本帧菜单没打开，不可能发生点选。
                 if resp.inner == Some(true) {
                     f.state.push(Op::SetLanguage(LANG_CHOICES[sel].0));
