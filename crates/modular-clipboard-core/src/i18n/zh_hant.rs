@@ -198,8 +198,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Glass rim light", "玻璃邊緣光"),
     ("Exclude content from glass", "元素不參與玻璃計算"),
     (
-        "Keep text and icons over a clean, unfrosted backdrop: the content area only refracts",
-        "卡片內容區只保留折射，不做磨砂與混色：文字與圖示背後是乾淨可比的底圖",
+        "The content area goes fully clear - no backdrop at all, so text and icons float over real glass",
+        "卡片內容區完全透空：不畫任何底圖，文字與圖示浮在真玻璃上",
     ),
     ("Graphite", "石墨"),
     ("Green tint", "綠意濃度"),

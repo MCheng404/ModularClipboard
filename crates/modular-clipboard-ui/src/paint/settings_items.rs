@@ -944,7 +944,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             SettingsItem {
                 key: "ui.glass_skip_content",
                 label: msg("Exclude content from glass"),
-                desc: msg("Keep text and icons over a clean, unfrosted backdrop: the content area only refracts"),
+                desc: msg("The content area goes fully clear - no backdrop at all, so text and icons float over real glass"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "glass_skip_content"),
             },
         ],

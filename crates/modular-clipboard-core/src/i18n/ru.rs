@@ -200,8 +200,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Glass rim light", "Кромочная подсветка"),
     ("Exclude content from glass", "Не обрабатывать содержимое стеклом"),
     (
-        "Keep text and icons over a clean, unfrosted backdrop: the content area only refracts",
-        "Область содержимого только преломляет: текст и значки остаются на чистом фоне",
+        "The content area goes fully clear - no backdrop at all, so text and icons float over real glass",
+        "Область содержимого полностью прозрачна: фон не рисуется, текст и значки парят над стеклом",
     ),
     ("Graphite", "Графитовый"),
     ("Green tint", "Плотность зелёного"),

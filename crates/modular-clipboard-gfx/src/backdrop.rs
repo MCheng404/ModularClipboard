@@ -42,9 +42,9 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, ClientToScreen, CreateCompatibleDC, CreateDIBSection,
-    DeleteDC, DeleteObject, DIB_RGB_COLORS, GetDC, HALFTONE, HDC, HGDIOBJ, ReleaseDC,
-    SelectObject, SetStretchBltMode, SRCCOPY, StretchBlt,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, ClientToScreen, CreateCompatibleDC,
+    CreateDIBSection, DeleteDC, DeleteObject, DIB_RGB_COLORS, GetDC, HALFTONE, HDC, HGDIOBJ,
+    ReleaseDC, SelectObject, SetStretchBltMode, SRCCOPY, StretchBlt,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, IsIconic};
 
@@ -664,27 +664,53 @@ impl DesktopCapture {
 
             // HALFTONE：缩放时做盒式平均而非最近邻采样。底图最终会被
             // 高斯糊掉，最近邻的锯齿本来看不见，但 HALFTONE 能避免
-            // 桌面上的细线（1px 分隔线、文字笔画）产生摩尔纹，
-            // 代价只是多一次 GDI 内部卷积——30fps 下可忽略。
+            // 桌面上的细线（1px 分隔线、文字笔画）产生摩尔纹。
+            //
+            // # CAUTION: 只在**真的要缩放**时才走 StretchBlt + HALFTONE
+            //
+            // HALFTONE 是 GDI 里最慢的拉伸模式（内部做完整重采样）。
+            // 100% 抓屏（w == cw 且 h == ch）时它纯属白付：实测 892×1236
+            // 一次抓屏 7ms，改成 1:1 的 `BitBlt` 后只剩一次内存拷贝。
+            // 而抓屏跑在 30Hz 的专用线程上，7ms = 四分之一核，与渲染线程
+            // 抢核正是「磨砂模式异常卡顿」的来源之一。
+            //
             // SAFETY: 两个 DC 与位图均由本结构持有且已 `ensure_size` 就绪。
-            let _ = SetStretchBltMode(self.mem_dc, HALFTONE);
-            // `StretchBlt` 在 windows 0.62 里返回 `BOOL`（不是 `Result`），
-            // 因此不能用 `?`——显式判假并给出带上下文的错误。
-            let ok = StretchBlt(
-                self.mem_dc,
-                0,
-                0,
-                w as i32,
-                h as i32,
-                Some(self.screen_dc),
-                origin.x,
-                origin.y,
-                cw as i32,
-                ch as i32,
-                SRCCOPY,
-            );
-            if !ok.as_bool() {
-                anyhow::bail!("StretchBlt 抓取桌面区域失败（区域可能在虚拟屏幕之外）");
+            // 两条分支都归一成 `bool`：`BitBlt` 在 windows 0.62 里返回
+            // `Result<()>`，`StretchBlt` 返回 `BOOL`，签名不同。
+            let ok = if w == cw && h == ch {
+                BitBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    Some(self.screen_dc),
+                    origin.x,
+                    origin.y,
+                    SRCCOPY,
+                )
+                .is_ok()
+            } else {
+                let _ = SetStretchBltMode(self.mem_dc, HALFTONE);
+                // `StretchBlt` 在 windows 0.62 里返回 `BOOL`（不是 `Result`），
+                // 因此不能用 `?`——显式判假并给出带上下文的错误。
+                StretchBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    Some(self.screen_dc),
+                    origin.x,
+                    origin.y,
+                    cw as i32,
+                    ch as i32,
+                    SRCCOPY,
+                )
+                .as_bool()
+            };
+            if !ok {
+                anyhow::bail!("抓取桌面区域失败（区域可能在虚拟屏幕之外）");
             }
 
             let len = (w * h * 4) as usize;

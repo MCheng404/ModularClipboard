@@ -610,7 +610,7 @@ fn thin_line(de: f32, at: f32, width: f32) -> f32 {
     return x * x * (3.0 - 2.0 * x);
 }
 
-/// 内容区「退出玻璃计算」的掩码（0 = 照常做玻璃，1 = 完全跳过）。
+/// 内容区「退出玻璃计算」的掩码（0 = 照常做玻璃，1 = **完全透空**）。
 /// 与 `glass::content_clear` 逐行对应。
 ///
 /// 判定用**内缩矩形**而不是逐元素的真实包围盒：绘制层要区分文字 / 图标 /
@@ -910,11 +910,19 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // ---- 内容区退出玻璃计算（可开关，默认关）----
         //
-        // `clear = 1` 的像素只保留「折射之后的清晰底图」，磨砂 / 混色 /
-        // 亮度自适应 / 色散一律不做：文字与图标背后因此是干净、可比对的
-        // 真实背景，而不是一块糊底。默认 `u.content_inset = 0` ⇒ `clear`
-        // 恒为 0，与改造前逐点一致。
+        // `clear = 1` 的像素**完全透空**：玻璃层在这里什么都不输出——
+        // 连底图都不画。真桌面直接透上来，文字与图标因此浮在一块干净的
+        // 透明玻璃上，而不是叠在一张被抓屏/折射/磨砂处理过的图上。
+        //
+        // 默认 `u.content_inset = 0` ⇒ `clear` 恒为 0，与关闭时逐点一致。
         let clear = content_clear(rel, half, u.content_inset);
+        if (clear >= 1.0) {
+            // 元素区：整块不参与玻璃计算。
+            //
+            // CAUTION: 这里**不能** `continue` 到 `bg_layer`——那张就是
+            // 「底图」，会把捕获内容画回来（正是要去掉的东西）。
+            return vec4<f32>(0.0);
+        }
 
         // ---- 两级折射：穹顶（中心）+ 边缘轮廓（贴边）----
         //
@@ -927,7 +935,7 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // 色散只在**靠近边缘**时启用（见 `DISPERSION_BAND`）：内部三通道
         // 位移几乎重合，分开采样纯浪费带宽。开启内容区排除后它同样退出。
-        let disp_px = select(0.0, u.dispersion, de < DISPERSION_BAND) * w * (1.0 - clear);
+        let disp_px = select(0.0, u.dispersion, de < DISPERSION_BAND) * w;
 
         var sharp_rgb: vec3<f32>;
         if (disp_px > 0.001) {
@@ -957,7 +965,7 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // Apple 的实现里作用在模糊之后的背景上，只让清晰图位移会让占
         // 面积大多数的中心完全没有透镜感。模糊图**不做色散**：它已经没有
         // 高频，三通道分开采样的差值在一张糊图上不可见。
-        let frost = frost_mix(de, half) * (1.0 - clear);
+        let frost = frost_mix(de, half);
         let blur_rgb = textureSampleLevel(
             blur_tex,
             glass_sampler,
@@ -971,7 +979,7 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // 亮底压暗、暗底提亮：卡片上的前景文字对比度不随壁纸/桌面内容
         // 漂移。放在混合**之后**、高光**之前**——高光是光源的反光，
         // 不该被底图的亮度修正吃掉。内容区按 `clear` 线性退回原色。
-        rgb = mix(adapt_luma(rgb, LUMA_DIM_MAX, LUMA_LIFT_MAX), rgb, clear);
+        rgb = adapt_luma(rgb, LUMA_DIM_MAX, LUMA_LIFT_MAX);
 
         // ---- 卡片底色（tint）：玻璃层自己合成 ----
         //
@@ -983,7 +991,7 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // 底色与覆盖度都是**本矩形自己的**（`tints[i]` / `alphas[i]`）：
         // 行卡片、顶栏、搜索面板、类型栏各有各的底色，不能共用一份。
         let tint = u.tints[i];
-        rgb = glass_tint(rgb, tint.rgb, clamp(tint.a, 0.0, 1.0) * (1.0 - clear));
+        rgb = glass_tint(rgb, tint.rgb, clamp(tint.a, 0.0, 1.0));
 
         // ---- 轮廓：Fresnel（宽、各向同性）+ 镜面高光（锐、方向性）----
         //
@@ -1036,7 +1044,9 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         //
         // 内缘高光线与外缘接触线都写在预乘**之前**：它们属于玻璃自身的
         // 颜色，乘 alpha 之后才是「这块玻璃盖住桌面多少」。
-        let a = clamp(u.alphas[i].x, 0.0, 1.0) * aa;
+        // 元素区（`clear`）只在这里起作用：整块按 `(1 - clear)` 折叠到
+        // 透明，羽化带因此是「玻璃边框 → 透空」的平滑过渡。
+        let a = clamp(u.alphas[i].x, 0.0, 1.0) * aa * (1.0 - clear);
         if (a > 0.0) {
             return vec4<f32>(rgb * a, a);
         }

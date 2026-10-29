@@ -430,6 +430,11 @@ pub(super) fn run_mode(
     let mut pending_delta = egui::TexturesDelta::default();
 
     while !quit {
+        // 帧计时（进「帧统计」日志）：`frame_ms` 是整轮迭代，`paint_ms` 是
+        // 「抓屏上传 + 模糊链 + 玻璃 + egui 绘制 + 提交」这一段。两者之差
+        // 主要是 acquire 的栅栏等待与事件泵——**优化前先看这两个数**，
+        // 别凭感觉猜瓶颈。
+        let frame_t0 = std::time::Instant::now();
         // 本帧的背景效果：**每帧只读一次**，全帧共用。
         //
         // 这个字段在这一帧里被七八处判断引用（卡片磨砂档位、渲染闸门
@@ -1218,6 +1223,7 @@ pub(super) fn run_mode(
             }
         }
 
+        let paint_t0 = std::time::Instant::now();
         if matches!(
             app.svc.state.config.ui.window_backdrop,
             modular_clipboard_core::config::WindowBackdrop::Acrylic
@@ -1306,6 +1312,7 @@ pub(super) fn run_mode(
                 &mut textures_delta.0,
             )?;
         }
+        let paint_ms = paint_t0.elapsed().as_secs_f32() * 1000.0;
 
         if fr.present(acquired)? == PresentResult::Outdated {
             // 呈现时才发现过期：下一轮 acquire 会返回 None 再重建。
@@ -1386,6 +1393,8 @@ pub(super) fn run_mode(
         if frame_no.is_multiple_of(crate::multiwindow::FRAME_LOG_INTERVAL) {
             tracing::debug!(
                 frame = frame_no,
+                frame_ms = frame_t0.elapsed().as_secs_f32() * 1000.0,
+                paint_ms,
                 vertices = painter.stats.vertices,
                 draw_calls = painter.stats.draw_calls,
                 rebuilds = painter.stats.rebuilds,
@@ -1457,11 +1466,20 @@ pub(super) fn run_mode(
         //
         // NOTE: `Some(ZERO)` 是「立即重绘」，直接传给 `poll_for` 会走
         // 纯自旋分支（`Some(d) if !d.is_zero()` 不成立），CPU 占用 100%。
-        // 但也不能当成「无限等待」——那样聚焦的输入框光标不会闪、
-        // 刚输入的字符不会立刻上屏。这里给 1ms 下限：
-        // 既避免忙等，又保证输入延迟感知不到。
+        //
+        // # 为什么下限是 16ms 而不是 1ms（2026-10-29 实测）
+        //
+        // 「立即重绘」在本项目里来自**动画续帧**（星点闪烁、通知入场、
+        // hover 补间、搜索框光标）而不是输入。1ms 下限让主循环以 ~300fps
+        // 空转：实测 `frame_ms ≈ 2ms` × 300 = 六成单核，而 `paint_ms` 只有
+        // 0.02ms——绝大部分 CPU 花在「跑一遍没有任何变化的帧」上，
+        // 与抓屏线程抢核，表现为磨砂模式**异常卡顿**。
+        //
+        // 16ms = 60fps，是动画该有的帧率；**输入延迟不受影响**：
+        // `poll_for` 内部是 `MsgWaitForMultipleObjects(QS_ALLINPUT)`，
+        // 鼠标/键盘一动就立刻返回并把消息交给下一轮。
         let wait = match delay {
-            Some(d) if d.is_zero() => Some(std::time::Duration::from_millis(1)),
+            Some(d) if d.is_zero() => Some(std::time::Duration::from_millis(16)),
             // CAUTION: **`None` 必须给一个下限，不能原样传下去。**
             //
             // `None` 是 egui **空闲时**的常态：`Context::run` 在没有
@@ -1482,7 +1500,9 @@ pub(super) fn run_mode(
             //
             // 8ms ≈ 120Hz，既不会让输入有可感延迟，也不会忙等。
             None => Some(std::time::Duration::from_millis(8)),
-            other => other,
+            // 延时重绘也给 8ms 下限：`request_repaint_after(1ms)` 这类
+            // 极短延时同样会把循环拉到 100fps 以上，而画面本来没变化。
+            Some(d) => Some(d.max(std::time::Duration::from_millis(8))),
         };
         events.poll_for(wait);
     }

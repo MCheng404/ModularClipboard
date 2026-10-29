@@ -170,8 +170,14 @@ pub(super) fn draw_theme_texture(f: &mut Frame<'_>) {
             //
             // 必须在绘制闭包内调用：egui 只在 pass 结束时把请求写进
             // `FullOutput.repaint_delay`，闸门读的正是这个值。
+            //
+            // 用 `request_repaint_after(16ms)` 而不是 `request_repaint()`：
+            // 后者把 `repaint_delay` 置成 ZERO，主循环会按「立即重绘」跑
+            // 满速（2026-10-29 实测 ~300fps 空转、六成单核）。闪烁是慢
+            // 动画，60fps 绰绰有余。
             if params.star_twinkle > 0.004 {
-                f.ui.ctx().request_repaint();
+                f.ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
             }
         }
         _ => {}

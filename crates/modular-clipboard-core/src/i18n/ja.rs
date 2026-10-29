@@ -198,8 +198,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Glass rim light", "ガラスの縁の光"),
     ("Exclude content from glass", "要素をガラス計算から除外"),
     (
-        "Keep text and icons over a clean, unfrosted backdrop: the content area only refracts",
-        "カード内容部は屈折のみ：文字とアイコンの背後がすりガラスで濁らない",
+        "The content area goes fully clear - no backdrop at all, so text and icons float over real glass",
+        "カード内容部は完全に透明：背景画像は描かず、文字とアイコンがガラスの上に浮く",
     ),
     ("Graphite", "グラファイト"),
     ("Green tint", "緑の濃さ"),

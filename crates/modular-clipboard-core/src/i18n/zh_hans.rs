@@ -214,8 +214,8 @@ Config:
     ("Glass rim light", "玻璃边缘光"),
     ("Exclude content from glass", "元素不参与玻璃计算"),
     (
-        "Keep text and icons over a clean, unfrosted backdrop: the content area only refracts",
-        "卡片内容区只保留折射，不做磨砂与混色：文字与图标背后是干净可比的底图",
+        "The content area goes fully clear - no backdrop at all, so text and icons float over real glass",
+        "卡片内容区完全透空：不画任何底图，文字与图标浮在真玻璃上",
     ),
     ("Graphite", "石墨"),
     ("Green tint", "绿意浓度"),

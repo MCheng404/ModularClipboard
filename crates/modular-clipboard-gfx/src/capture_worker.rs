@@ -104,6 +104,21 @@ impl CaptureWorker {
         let handle = std::thread::Builder::new()
             .name("clipboard-capture".to_string())
             .spawn(move || {
+                // 抓屏是**后台**任务：晚一帧完全无感（磨砂对 33ms 延迟
+                // 本来就不敏感），却会和渲染线程抢核。降到低于正常优先级，
+                // 让渲染线程在争用时先走——这是「磨砂模式异常卡顿」的
+                // 一处廉价止血（2026-10-29）。
+                //
+                // 用 Win32 而不是 `thread::Builder` 的调度参数：后者在
+                // Windows 上没有「低于正常」这一档，只有 normal/low/idle。
+                // SAFETY: `GetCurrentThread` 返回伪句柄，只作用于当前线程；
+                // `SetThreadPriority` 对伪句柄是安全的（不会悬垂）。
+                unsafe {
+                    use windows::Win32::System::Threading::{
+                        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                    };
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                }
                 // `DesktopCapture` 归本线程所有：GDI 对象只在创建它的线程
                 // 上用最稳妥（虽然 HDC 本身可以跨线程，但 DIB 的 bits 指针
                 // 与 mem_dc 的生命周期绑在一起，没必要跨）。
@@ -112,6 +127,10 @@ impl CaptureWorker {
                 // 比较都重新分配；静止时它只读不写，等于零成本。
                 let mut last_px: Vec<u8> = Vec::new();
                 let mut last_dims: (u32, u32) = (0, 0);
+                // 分段计时（进 debug 日志，每 60 次一条）：`bitblt_ms` 是
+                // GDI 抓屏 + alpha 修正，`cmp_ms` 是「内容有没有变」的比对，
+                // `copy_ms` 是为了下次比较/上传做的拷贝。优化前先看这三段。
+                let mut n_captures: u64 = 0;
                 while let Ok(req) = rx_req.recv() {
                     p2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     // 「必须返回像素」合并进来：本请求自己带 `force`，或者
@@ -126,25 +145,52 @@ impl CaptureWorker {
                             }
                         }
                     }
+                    let t0 = std::time::Instant::now();
                     match cap
                         .as_mut()
                         .expect("刚确保存在")
                         .capture_behind_pct(req.hwnd, req.scale_pct)
                     {
                         Ok(Some((bits, w, h))) => {
+                            let bitblt_ms = t0.elapsed().as_secs_f32() * 1000.0;
                             // 尺寸变了（改抓屏百分比 / 改窗口大小）一律
                             // 当作「变了」：此时 `last_px` 的字节数对不上，
                             // 逐字节比较也没有意义。
+                            let t_cmp = std::time::Instant::now();
                             let same = last_dims == (w, h)
                                 && last_px.len() == bits.len()
                                 && last_px == bits;
+                            let cmp_ms = t_cmp.elapsed().as_secs_f32() * 1000.0;
                             if !force && same {
+                                n_captures += 1;
+                                if n_captures.is_multiple_of(60) {
+                                    tracing::debug!(
+                                        bitblt_ms,
+                                        cmp_ms,
+                                        same = true,
+                                        bytes = bits.len(),
+                                        "抓屏分段计时"
+                                    );
+                                }
                                 let _ = tx_out.send(CaptureOut::Unchanged);
                                 continue;
                             }
+                            let t_copy = std::time::Instant::now();
                             last_dims = (w, h);
                             last_px.clear();
                             last_px.extend_from_slice(bits);
+                            let copy_ms = t_copy.elapsed().as_secs_f32() * 1000.0;
+                            n_captures += 1;
+                            if n_captures.is_multiple_of(60) {
+                                tracing::debug!(
+                                    bitblt_ms,
+                                    cmp_ms,
+                                    copy_ms,
+                                    same = false,
+                                    bytes = bits.len(),
+                                    "抓屏分段计时"
+                                );
+                            }
                             let _ = tx_out.send(CaptureOut::Ok(bits.to_vec(), w, h));
                         }
                         Ok(None) => {
