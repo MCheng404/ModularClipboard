@@ -82,7 +82,7 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("In use", "使用中"),
     ("Integrated GPU", "内蔵 GPU"),
     ("Opacity of entry cards; without a background effect they blend into the window fill", "エントリカードの不透明度。背景効果がない場合はウィンドウの下地と混ざります"),
-    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "デスクトップの取り込み解像度。100% 超はスーパーサンプリング。高いほど鮮明で負荷も増えます"),
+    ("Percentage of the window size to capture; 100% matches screen pixels exactly, lower costs less", "ウィンドウサイズに対するキャプチャ領域の割合。100% で画面のピクセルと一致し、低いほど負荷が下がります"),
     ("Cannot open the image editor:", "画像編集ウィンドウを開けません："),
     ("Capacity and cleanup", "容量とクリーンアップ"),
     ("Capture", "キャプチャ"),

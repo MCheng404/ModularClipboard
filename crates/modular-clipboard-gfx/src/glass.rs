@@ -298,22 +298,144 @@ pub const LUMA_DIM_MAX: f32 = 0.35;
 /// 玻璃反而失去「透」的观感（暗色反而更该保持深）。
 pub const LUMA_LIFT_MAX: f32 = 0.20;
 
-/// 磨砂/清晰混合的距离尺度（像素）：离边超过这么多像素即算「内部」。
+/// 磨砂尺度的**相对系数**：以卡片短半轴为基准的倍数。
 ///
-/// 2026-10-27 从 36 提到 56：列表行卡片只有 56~70pt 高，`36` 的尺度
-/// 意味着几乎整张卡片都落在「内部」档（满磨砂）——玻璃读起来是一块
-/// 半透明色块，而不是一块透镜。放大尺度让**边缘清晰带**占满卡片高度
-/// 的三分之一左右，才看得出「折射 + 通透」。
-pub const FROST_SCALE: f32 = 56.0;
+/// # 为什么不再是绝对像素（2026-10-28 修）
+///
+/// 早前是常量 56px（更早 36px），注释两次都在「卡片太糊 / 卡片太透」
+/// 之间来回调。根因是**量纲错了**：磨砂梯度是按「距边距离」展开的，
+/// 而这个距离的**上限是卡片短半轴**——一个随窗口高度、字号、DPI 一起
+/// 变的量。用绝对像素定尺度，等于把「边缘清晰带占卡片高度的比例」
+/// 交给运气：
+///
+/// - 行卡片 58pt 高、DPI 100% ⇒ 短半轴 29px，56 的尺度让中心只到
+///   `0.5 × 29/56 = 0.26` ——整张卡片近乎全清晰，背景条纹直接穿透
+///   文字区，观感是「一块带扭曲的半透明板」而不是玻璃；
+/// - 同一张卡片在 150% DPI 下短半轴 43.5px ⇒ 中心到 `0.39`，糊度
+///   凭空多一半。**同一份配置在两个 DPI 上不是同一个效果**。
+///
+/// 改成比例后，任何尺寸、任何 DPI 的卡片都得到同一条归一化曲线：
+/// 边缘清晰、中心满磨砂，梯度铺满整个半高。
+///
+/// # 为什么是 1.0 而不是更小（2026-10-28 实测校准）
+///
+/// 0.667 那版让「清晰带」只占卡片高度的三分之一，其余三分之二直接
+/// 满档磨砂——实测行卡片读成一块**糊卡**，折射带只剩贴边十几个像素，
+/// 玻璃的辨识度（能看见身后内容被弯折）反而丢了。1.0 让 `de` 在整个
+/// 半高上爬升：边缘 0、四分之一处约 0.22、正中心才 0.5。
+pub const FROST_RATIO: f32 = 1.0;
+
+/// 自适应磨砂尺度的下限（像素）。
+///
+/// 极小的玻璃矩形（类型栏的 96px 见方弹窗、行内小卡）若按比例算出
+/// 个位数尺度，`de / scale` 会在零点几个像素内冲到 1，磨砂梯度退化成
+/// 硬边。给一个下限，让这类小面板保留一条可见的清晰带。
+pub const FROST_SCALE_MIN: f32 = 8.0;
+
+/// 自适应磨砂尺度的上限（像素）。
+///
+/// 详情卡、设置卡这类大面板的短半轴可达数百像素，按比例会算出比
+/// 屏幕还大的尺度 ⇒ 中心永远到不了满磨砂 ⇒ 大面板反而最「生」（背景
+/// 全清晰、文字最难读）。封顶后大面板在离边 120px 处即达满档，与
+/// 行卡片的观感一致。
+pub const FROST_SCALE_MAX: f32 = 120.0;
 
 /// 内部（远离边缘）保留的磨砂比例上限。
 ///
 /// 0 = 中心完全清晰（纯透镜），1 = 中心完全磨砂（退回 Acrylic）。
-/// 取 0.5：HIG 把「高度透明」的 clear 变体留给媒体背景，而 regular
-/// 变体的可读性由亮度自适应 + 卡片色承担。0.85 那档（2026-10-25 的
-/// 取值）在深色壁纸上会把玻璃读成一块发灰的色块——这正是「不够通透」
-/// 的来源。
-pub const FROST_MAX: f32 = 0.5;
+///
+/// # 为什么从 0.5 降到 0.32（2026-10-28「背景玻璃要通透」）
+///
+/// 0.85（2026-10-25）在深色壁纸上把玻璃读成发灰色块；降到 0.5 之后
+/// 「通透」够了，但卡片中心仍有**一半**像素来自磨砂链——那张图是
+/// 1/4 分辨率三趟高斯的产物，混进来就把身后的内容糊掉一半，玻璃与
+/// Acrylic 的差别只剩边缘那一圈折射。
+///
+/// 0.32 的含义是：卡片最深处仍有 **68% 的清晰底图**（带折射位移）
+/// 透出来，磨砂只负责压平高频噪点（壁纸纹理、桌面上的小字），保证
+/// 文字可读。玻璃的辨识特征——「能看清身后是什么，同时看见它被弯折」
+/// ——正是这个比例撑住的；再往下（≤ 0.2）文字会直接坐在桌面内容上。
+pub const FROST_MAX: f32 = 0.32;
+
+/// **背景层不透明度**的默认档（再乘 `window_opacity`）。
+///
+/// # 为什么不是 1.0（2026-10-28 修「无法渲染透明效果」）
+///
+/// 玻璃 pass 早前让背景层沿用捕获图的 alpha（恒为 1）⇒ 整窗**不透明**，
+/// 真实桌面一点都透不出来。玻璃模式于是在窗口大部分面积上与「不透明
+/// 窗口」没有区别，用户拖任何透明度滑块都看不到变化——报障的原话是
+/// 「alpha 通道异常、渲染不正确、无法渲染透明效果」。
+///
+/// 0.35 的含义：捕获底图只占三分之一权重（`src.rgb + (1-a)·桌面`），
+/// 合成结果 ≈ 真桌面 + 一档亮度自适应。**看得见桌面**，而可读性由
+/// 亮度自适应与 egui 那层半透明 `bg` 兜住——比把窗口糊死好，也比
+/// 完全不铺（等同 Translucent）多一点「玻璃压在桌面上」的分量。
+pub const BG_ALPHA_DEFAULT: f32 = 0.35;
+
+/// **窗口背景层**（不属于任何卡片的那些像素）的磨砂比例。
+///
+/// # 为什么背景层不能沿用磨砂的结果（2026-10-28）
+///
+/// 早前 `fs_glass` 的初值直接是 `blurred`——也就是 Acrylic 那张模糊
+/// 底图。于是玻璃模式下整窗背景与磨砂模式**逐字节相同**，只有卡片
+/// 里才有玻璃。用户看到的是「背景玻璃没渲染」：玻璃模式开不开，窗口
+/// 大部分面积毫无变化（而且糊）。
+///
+/// 玻璃的背景层应当**清晰**：它要表达的是「一块架在桌面上的透明
+/// 玻璃」，不是「一层毛玻璃滤镜」。取 0.18 而不是 0：完全不柔化的话，
+/// 桌面上的高频（文字、图标边缘、壁纸纹理）会与前景文字抢注意力，
+/// 而这一层之上只有 egui 的半透明 `bg`，压不住。0.18 相当于把底图
+/// 的高频削掉约两成，细节与通透都在。
+///
+/// 卡片的磨砂仍走 [`frost_mix`]（边缘清晰、中心 [`FROST_MAX`]）——
+/// 那是**卡片**的语义，与背景层无关。
+pub const BG_FROST: f32 = 0.18;
+
+/// 窗口背景层的合成：清晰桌面为主 + [`BG_FROST`] 比例的柔化，再过
+/// 亮度自适应。
+///
+/// 与 `glass.wgsl` 的 `fs_glass` 里 `out` 初值的计算逐行对应。
+/// 抽成函数是为了能单测「背景层到底有多透」——着色器里那几行没法测，
+/// 而「玻璃模式看起来就是磨砂」这种故障恰恰只能靠数值判据发现。
+pub fn background_glass(sharp: [f32; 3], blur: [f32; 3]) -> [f32; 3] {
+    let mut mixed = [0.0; 3];
+    for i in 0..3 {
+        mixed[i] = sharp[i] + (blur[i] - sharp[i]) * BG_FROST;
+    }
+    luminosity_adapt(mixed, LUMA_DIM_MAX, LUMA_LIFT_MAX)
+}
+
+/// 磨砂爬升的曲线指数。
+///
+/// 取 0.9（略小于 1，即中段稍早饱和）：卡片正中间是文字最密、最需要
+/// 「背景被压平」的位置，线性曲线在 `x = 0.5` 时只给到 0.5 的磨砂量
+/// （乘 `FROST_MAX` 后 0.25），中段仍偏清晰。0.9 把它提到 0.27，
+/// 而边缘那条清晰的折射带几乎不受影响（`x` 小时两条曲线差几个百分点）。
+///
+/// NOTE: 不要再往 0.75 以下走——0.75 实测把中段压成糊块，折射带消失。
+pub const FROST_GAMMA: f32 = 0.9;
+
+/// 按卡片短半轴算出磨砂尺度（像素）。
+///
+/// 与 `glass.wgsl` 的 `frost_scale` 逐行对应。`half` 是**物理像素**
+/// 的半尺寸（uniform 里的 `rects[i].zw`）。
+///
+/// 取 `min(half.x, half.y)`：磨砂沿「最薄的那个方向」展开，因为
+/// [`dist_to_edge`] 本身就在两个方向取最小值——用长边会让长条卡片
+/// 的清晰带宽度远超卡片自身高度。
+pub fn frost_scale(half: [f32; 2]) -> f32 {
+    let m = half[0].abs().min(half[1].abs());
+    (m * FROST_RATIO).clamp(FROST_SCALE_MIN, FROST_SCALE_MAX)
+}
+
+/// 某一点应有的磨砂比例（0 = 全清晰，`FROST_MAX` = 满档）。
+///
+/// `de` 是 [`dist_to_edge`] 的结果；`half` 是物理像素半尺寸。
+/// 与 `glass.wgsl` 的 `frost_mix` 逐行对应。
+pub fn frost_mix(de: f32, half: [f32; 2]) -> f32 {
+    let x = (de.max(0.0) / frost_scale(half)).clamp(0.0, 1.0);
+    x.powf(FROST_GAMMA) * FROST_MAX
+}
 
 /// 亮度自适应：**非对称**地压缩底图亮度。
 ///
@@ -346,6 +468,94 @@ pub fn luminosity_adapt(rgb: [f32; 3], dim_max: f32, lift_max: f32) -> [f32; 3] 
     [rgb[0] * k, rgb[1] * k, rgb[2] * k]
 }
 
+// ---- 卡片底色混色（tint）：吸收 + 散射 ------------------------------
+
+/// 吸收强度：`tint` 作为**透过率**被拉向自身颜色的程度。
+///
+/// 0 = 完全不吸收（玻璃全透），1 = 透过率就是 `tint` 本身。
+pub const TINT_ABSORB: f32 = 0.45;
+
+/// 色度放大：把 `tint` 除以自身亮度得到「均值 1 的色度」，再按这个比例
+/// 放大通道间的差距。
+///
+/// 深色主题的 `card_bg` 是冷蓝灰（R < G < B），透过率带上这个色偏后卡片
+/// 会明显**泛冷调**而不是单纯变暗——「混色」的可见度主要来自它。浅色
+/// 主题的 `card_bg` 是纯白（色度恒为 1）⇒ 这一项自动失效。
+pub const TINT_CHROMA: f32 = 0.5;
+
+/// 散射（乳光）的基准增益。
+pub const TINT_SCATTER: f32 = 0.18;
+
+/// 浅色 tint 的散射衰减（乘在 [`TINT_SCATTER`] 上）。
+///
+/// 散射是加性的，浅色 tint 接近纯白 ⇒ 加的是白光，会把亮底推到饱和、
+/// 把折射带与彩边冲平。按 tint 亮度线性衰减：深色 1.0、浅色 0.55。
+pub const TINT_SCATTER_LIGHT_DAMP: f32 = 0.55;
+
+/// 深色 tint 的**透过率地板**。
+///
+/// 深色玻璃一路按 `mix(1, tint, ABSORB)` 算下去，暗底图会连同高光一起
+/// 被吃掉 ⇒ 卡片变成「黑玻璃」，折射与边缘光全消失。给透过率一个下限，
+/// 保证身后内容始终可见。按 `1 - t_lum` 缩放（浅色主题地板为 0）。
+pub const TINT_FLOOR_DARK: f32 = 0.28;
+
+/// 两段式模型相对「替换式」的占比。
+pub const TINT_MIX: f32 = 0.9;
+
+/// 有色玻璃混色。与 `glass.wgsl` 的 `glass_tint` 逐行对应。
+///
+/// `rgb` 是折射 + 磨砂 + 亮度自适应之后的底图，`tint` 是卡片底色，
+/// `a` 是覆盖度（[`card_tint_strength`] 的结果，≤ [`CARD_TINT_MAX`]）。
+///
+/// # 为什么不是一句 `mix`
+///
+/// 替换式覆盖把底图的明暗层次与高频一起压平，且观感随主题分裂：
+/// 浅色主题 `card_bg = #FFFFFF` ⇒ **洗白**（折射与彩边被冲掉）；深色主题
+/// `card_bg = #2F3540`（luma 0.20）⇒ **压暗**（深色壁纸上糊成灰板）。
+///
+/// 真实有色玻璃是两件事同时发生：**吸收**（乘法，`rgb × transmit`，保留
+/// 底图结构）与**散射**（加性，`+ scatter`，乳白雾度的质感来源）。
+///
+/// # 端点语义不变
+///
+/// `a = 0` → 原样返回底图；`a = 1` → 精确返回 `tint`。两段式只在中间区间
+/// 生效（权重 `a(1-a)×4`，峰值在 `a = 0.5`），所以「卡片不透明度」滑块的
+/// 语义与旧实现连续。
+pub fn glass_tint(rgb: [f32; 3], tint: [f32; 3], a: f32) -> [f32; 3] {
+    let lerp3 = |x: [f32; 3], y: [f32; 3], t: f32| -> [f32; 3] {
+        [
+            x[0] + (y[0] - x[0]) * t,
+            x[1] + (y[1] - x[1]) * t,
+            x[2] + (y[2] - x[2]) * t,
+        ]
+    };
+    let base = lerp3(rgb, tint, a);
+    let t_lum = luminance(tint).clamp(0.0, 1.0);
+    // 色度：`tint / luma` 的加权均值为 1 ⇒ `mix(1, chroma, k)` 是围绕
+    // 中性色的色偏放大。纯白 / 纯灰色度恒为 1 ⇒ 不染色。
+    let denom = t_lum.max(1e-3);
+    let chroma = [
+        1.0 + (tint[0] / denom - 1.0) * TINT_CHROMA,
+        1.0 + (tint[1] / denom - 1.0) * TINT_CHROMA,
+        1.0 + (tint[2] / denom - 1.0) * TINT_CHROMA,
+    ];
+    let floor = TINT_FLOOR_DARK * (1.0 - t_lum);
+    let absorb = lerp3([1.0, 1.0, 1.0], tint, TINT_ABSORB);
+    let transmit = [
+        (absorb[0] * chroma[0]).max(floor),
+        (absorb[1] * chroma[1]).max(floor),
+        (absorb[2] * chroma[2]).max(floor),
+    ];
+    let scatter_gain = TINT_SCATTER * (1.0 + (TINT_SCATTER_LIGHT_DAMP - 1.0) * t_lum);
+    let tinted = [
+        rgb[0] * transmit[0] + tint[0] * scatter_gain,
+        rgb[1] * transmit[1] + tint[1] * scatter_gain,
+        rgb[2] * transmit[2] + tint[2] * scatter_gain,
+    ];
+    let k = (TINT_MIX * (a * (1.0 - a) * 4.0)).clamp(0.0, 1.0);
+    lerp3(base, tinted, k)
+}
+
 /// 点到卡片边缘的**真实距离**（像素）。
 ///
 /// 为什么不能直接用 [`glass_sdf`]：圆角矩形 SDF 在内部是平坦的
@@ -361,6 +571,70 @@ pub fn dist_to_edge(p: [f32; 2], half: [f32; 2], sdf: f32) -> f32 {
     } else {
         (half[0] - p[0].abs()).min(half[1] - p[1].abs()).max(0.0)
     }
+}
+
+/// 边缘覆盖率过渡带的**半宽**（像素）。
+///
+/// # 为什么玻璃层必须自己做抗锯齿
+///
+/// 卡片形状由 SDF 描述，而 SDF 只回答「在里还是在外」——`fs_glass` 早前
+/// 就是硬判 `d > 0 → 丢弃`。于是**圆角与斜边是像素级阶梯**：整窗 2× 超
+/// 采样（SSAA）能缓解，但玻璃 pass 是**全屏三角形 + 逐像素 SDF**，它的
+/// 边界频率不受几何超采样保护——超采样只放大目标分辨率，SDF 判据仍然
+/// 在放大后的像素格上二值化，阶梯只是变细，不会消失。
+///
+/// 而 egui 那层（文字、圆角填充）有自己的 feathering，两者边缘一旦错开
+/// 半个像素，玻璃的硬边就会从卡片底下露出来一圈毛刺。
+///
+/// 0.5px ⇒ 过渡带总宽 1px（物理像素）。与 egui 的 1px feathering 同量级。
+pub const EDGE_AA_HALF_WIDTH: f32 = 0.5;
+
+/// 点到边缘的**内部深度**（内部为正、外部为负）。
+///
+/// # 为什么不能直接用 SDF
+///
+/// 圆角矩形 SDF 在**平坦区恒为 `-radius`**——它是「形状内还是外」的
+/// 判定式，不是真实距离。两个后果：
+///
+/// - 直角面板（`r = 0`）内部 `d == 0`，拿它算覆盖率会得到 0.5 ⇒
+///   **整块顶栏变半透明**（正是 2026-10-28 那次「整窗玻璃消失」的同一个
+///   陷阱换了个入口）；
+/// - 圆角面板内部 `d` 被截断在 `-r`，深一点的像素与贴边一像素的像素
+///   得到相同的覆盖率。
+///
+/// # CAUTION: 「到直边的距离」**只能用在内部**
+///
+/// 早前内外都用 `max(-sdf, 到直边距离)`，结果**圆角被填成直角**
+/// （2026-10-28 用户报障，且只有玻璃模式有——其他背景模式的圆角由
+/// egui 自己画，不走这条路径）。
+///
+/// 病根：圆角切掉的那一小块角落，点虽然落在**两条直边的内侧**（于是
+/// 「到直边距离」为正），却已经被圆角弧切到形状外了。取 `max` 就把它
+/// 判成内部 ⇒ 覆盖率 1 ⇒ 角落被填实。
+///
+/// 例：`half = [300, 29]`、`r = 12`，取角落 `p = (-299, -28)`：
+/// `sdf = +3.56`（外部），而 `min(300-299, 29-28) = 1.0`（两条直边的
+/// 内侧）⇒ `max(-3.56, 1.0) = 1.0` ⇒ 覆盖率 1。圆角越大填得越多。
+///
+/// 只有 SDF 知道弧在哪里，所以**外部一律用 `-sdf`**。
+pub fn edge_depth(p: [f32; 2], half: [f32; 2], sdf: f32) -> f32 {
+    if sdf > 0.0 {
+        // 外部：含圆角切掉的角落，只有 SDF 是对的。
+        -sdf
+    } else {
+        // 内部：SDF 被截断在 `-r`，深处与贴边同值，改用真实距离兜底。
+        (-sdf).max((half[0] - p[0].abs()).min(half[1] - p[1].abs()))
+    }
+}
+
+/// 由内部深度算出覆盖率（0 = 完全在外，1 = 完全在内）。
+///
+/// 与 `glass.wgsl` 的 `edge_coverage` 逐行对应。映射：
+/// `depth = +0.5` → 1；`depth = 0`（正好在边上）→ 0.5；`depth = -0.5` → 0。
+/// 线性即够——真实覆盖面积在 1px 带内与深度近似线性，再上 smoothstep
+/// 只会让边缘发虚。
+pub fn edge_coverage(depth: f32) -> f32 {
+    (EDGE_AA_HALF_WIDTH + depth).clamp(0.0, 1.0)
 }
 
 /// 径向穹顶折射的 UV 位移（bergice 的第一级折射）。
@@ -444,6 +718,36 @@ pub const IOR_B: f32 = 1.54;
 
 /// 默认 IOR 比值（`eta = 1 / ior`）。
 pub const DEFAULT_ETA: f32 = 1.0 / 1.5;
+
+/// 色散位移的**独立基准幅度**。
+///
+/// # 为什么色散不能乘在折射强度上（2026-10-28 修）
+///
+/// 早前三个通道各自按自己的 IOR 算 `refract_offset(n, 1/ior, refract)`，
+/// 通道间的位移差 ≈ `refract × (ior 差带来的相对差)`。于是：
+///
+/// - 用户把「折射强度」调到 0.15（默认 0.35，实测确实有人这么调，
+///   因为默认值的边缘会把背景撕成条）时，**色散也一起缩到 43%**，
+///   色散滑块从 0 拖到 1 几乎看不出变化；
+/// - 反过来把折射拉到 1.0，色散强到像显卡坏了。
+///
+/// 两个滑块表达的是两件事：折射是「玻璃有多弯」，色散是「不同波长
+/// 弯得差多少」。后者应该有自己的基准，而不是寄生前者的幅值。
+///
+/// 取 0.35 = 旧默认折射强度：在默认配置下色散幅度与改造前**逐点一致**，
+/// 只是不再随折射滑块漂移。
+pub const DISPERSION_POWER: f32 = 0.35;
+
+/// 某个 IOR 相对默认 IOR 的**附加位移**（色散分量）。
+///
+/// 与 `glass.wgsl` 的 `dispersion_delta` 逐行对应。返回值在
+/// `dispersion = 1` 时直接加到基础折射位移上；`dispersion = 0` 时
+/// 整个式子归零，三通道共用基础位移（老行为）。
+pub fn dispersion_delta(normal: [f32; 2], eta: f32) -> [f32; 2] {
+    let a = refract_offset(normal, eta, DISPERSION_POWER);
+    let b = refract_offset(normal, DEFAULT_ETA, DISPERSION_POWER);
+    [a[0] - b[0], a[1] - b[1]]
+}
 
 #[cfg(test)]
 mod tests {
@@ -887,8 +1191,21 @@ mod tests {
             ("LUMA_TARGET", LUMA_TARGET),
             ("LUMA_DIM_MAX", LUMA_DIM_MAX),
             ("LUMA_LIFT_MAX", LUMA_LIFT_MAX),
-            ("FROST_SCALE", FROST_SCALE),
+            ("FROST_RATIO", FROST_RATIO),
+            ("FROST_SCALE_MIN", FROST_SCALE_MIN),
+            ("FROST_SCALE_MAX", FROST_SCALE_MAX),
             ("FROST_MAX", FROST_MAX),
+            ("FROST_GAMMA", FROST_GAMMA),
+            ("BG_FROST", BG_FROST),
+            ("BG_ALPHA_DEFAULT", BG_ALPHA_DEFAULT),
+            ("DISPERSION_POWER", DISPERSION_POWER),
+            ("EDGE_AA_HALF_WIDTH", EDGE_AA_HALF_WIDTH),
+            ("TINT_ABSORB", TINT_ABSORB),
+            ("TINT_CHROMA", TINT_CHROMA),
+            ("TINT_SCATTER", TINT_SCATTER),
+            ("TINT_SCATTER_LIGHT_DAMP", TINT_SCATTER_LIGHT_DAMP),
+            ("TINT_FLOOR_DARK", TINT_FLOOR_DARK),
+            ("TINT_MIX", TINT_MIX),
         ] {
             let decl = format!("const {name}: f32 = ");
             let at = src
@@ -920,5 +1237,345 @@ mod tests {
             b >= g && g >= r,
             "色散顺序错：R={r} G={g} B={b}（应 B ≥ G ≥ R）"
         );
+    }
+
+    /// 磨砂分布必须**与卡片尺寸无关**地保持「边缘清晰、中心满档」。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// 早前尺度是绝对像素 56，而行卡片的短半轴只有 29px（100% DPI）
+    /// ——中心只到 `0.5 × 29/56 ≈ 0.26`，整张卡近乎全清晰，背景条纹
+    /// 直接穿透文字区。同一份配置在 150% DPI 下又变成 0.39。用户看到
+    /// 的是「玻璃时好时坏」，而代码里没有一个常量是错的。
+    #[test]
+    fn frost_profile_is_scale_invariant() {
+        let cards = [[300.0_f32, 29.0], [450.0, 43.5], [400.0, 200.0]];
+        for half in cards {
+            let centre = frost_mix(half[1], half);
+            assert!(
+                (centre - FROST_MAX).abs() < 1e-3,
+                "中心必须满档：half={half:?} 得到 {centre}，期望 {FROST_MAX}"
+            );
+            assert_eq!(frost_mix(0.0, half), 0.0, "贴边处必须全清晰");
+            let mid = frost_mix(half[1] * 0.5, half);
+            assert!(
+                mid > FROST_MAX * 0.3 && mid < FROST_MAX,
+                "中段应处于清晰与满档之间：half={half:?} 得到 {mid}"
+            );
+            let mut prev = -1.0;
+            for i in 0..=20 {
+                let de = half[1] * (i as f32) / 20.0;
+                let v = frost_mix(de, half);
+                assert!(v >= prev - 1e-6, "磨砂量应随距边距离单调不减");
+                prev = v;
+            }
+        }
+    }
+
+    /// 背景层必须是「清晰为主」，不是整片磨砂。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// `fs_glass` 的 `out` 初值早前直接是模糊底图（`blurred`），于是玻璃
+    /// 模式的整窗背景与 Acrylic 逐字节相同——用户报的是「背景玻璃没
+    /// 渲染」，而日志里一次错误都没有（2026-10-28）。
+    ///
+    /// 判据用「清晰占比 ≥ 0.75」而不是具体数字：BG_FROST 是审美常量，
+    /// 会微调；但一旦有人把它推到 0.5 以上，玻璃背景就退回磨砂了。
+    #[test]
+    fn background_is_clear_not_frosted() {
+        // 清晰占比：`BG_FROST` 一旦被推到 0.5 以上，玻璃背景就退回磨砂。
+        // 判据挂在**函数结果**上而不是常量本身——常量断言会被编译器
+        // 折叠，clippy 也会直接拒绝（`assertions_on_constants`）。
+        let sharp = [1.0_f32, 0.0, 0.0];
+        let blur = [0.0_f32, 0.0, 0.0];
+        let got = background_glass(sharp, blur);
+        let pure_sharp = luminosity_adapt(sharp, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        assert!(
+            got[0] > pure_sharp[0] * 0.75,
+            "背景层清晰分量只剩 {:.0}%，玻璃背景会退回磨砂",
+            got[0] / pure_sharp[0] * 100.0
+        );
+        // 两端一致：清晰图与模糊图相同时，柔化不该改变任何东西。
+        let same = [0.4_f32, 0.45, 0.5];
+        assert_eq!(
+            background_glass(same, same),
+            luminosity_adapt(same, LUMA_DIM_MAX, LUMA_LIFT_MAX)
+        );
+        // 清晰图与模糊图不同时，结果必须**不等于**纯磨砂那一侧——
+        // 否则就是又退回「整窗铺模糊底图」。
+        let sharp = [0.90_f32, 0.10, 0.20];
+        let blur = [0.10_f32, 0.90, 0.20];
+        let got = background_glass(sharp, blur);
+        let pure_blur = luminosity_adapt(blur, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        assert!(
+            got.iter()
+                .zip(pure_blur.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "背景层与纯磨砂结果相同，说明清晰分量没进来: {got:?}"
+        );
+        // 且应当明显偏向清晰那一侧。
+        let pure_sharp = luminosity_adapt(sharp, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        let d_sharp: f32 = got.iter().zip(pure_sharp.iter()).map(|(a, b)| (a - b).abs()).sum();
+        let d_blur: f32 = got.iter().zip(pure_blur.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(
+            d_sharp < d_blur,
+            "背景层应更接近清晰图：d_sharp={d_sharp} d_blur={d_blur}"
+        );
+    }
+
+    /// 卡片中心的磨砂占比必须留出足够的清晰分量（「通透」的下限）。
+    #[test]
+    fn card_centre_keeps_most_of_the_sharp_layer() {
+        let half = [300.0_f32, 29.0];
+        let centre = frost_mix(half[1], half);
+        assert!((centre - FROST_MAX).abs() < 1e-3);
+        assert!(
+            1.0 - centre >= 0.65,
+            "卡片中心应保留 ≥65% 清晰分量，实际只有 {:.0}%（磨砂 {centre}）",
+            (1.0 - centre) * 100.0
+        );
+    }
+
+    /// 极小的玻璃矩形不能把尺度压成零（会让梯度变硬边）。
+    #[test]
+    fn frost_scale_has_floor_and_ceiling() {
+        assert_eq!(frost_scale([2.0, 1.0]), FROST_SCALE_MIN);
+        assert_eq!(frost_scale([5000.0, 5000.0]), FROST_SCALE_MAX);
+        let s = frost_scale([300.0, 43.5]);
+        assert!((s - 43.5 * FROST_RATIO).abs() < 1e-4, "应取短半轴，实际 {s}");
+    }
+
+    /// 色散幅度**不能**随折射强度漂移。
+    ///
+    /// 早前色散位移 = `refract_offset(1/ior, refract)` 之差，与 `refract`
+    /// 成正比 ⇒ 用户把折射调到 0.15 后色散滑块几乎失效。现在色散有自己的
+    /// 基准 `DISPERSION_POWER`，签名里根本不接收折射强度。
+    #[test]
+    fn dispersion_is_independent_of_refract_strength() {
+        let n = glass_normal([95.0, 25.0], HALF, 8.0, 1.0);
+        let d = dispersion_delta(n, 1.0 / IOR_B);
+        let mag = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        assert!(mag > 1e-5, "色散分量不应为零（否则彩边恒不可见）");
+        let zero = dispersion_delta(n, DEFAULT_ETA);
+        assert!(
+            zero[0].abs() < 1e-9 && zero[1].abs() < 1e-9,
+            "默认 IOR 的色散分量必须为零，实际 {zero:?}"
+        );
+    }
+
+    /// 直角面板内部必须**满覆盖**。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// 圆角矩形 SDF 在平坦区恒为 `-r`。直角面板 `r = 0` ⇒ 内部 `d == 0`。
+    /// 若直接拿 `d` 算覆盖率（`0.5 - d`），**整块顶栏会变成 50% 透明的
+    /// 玻璃**——它不重叠任何卡片，用户看到的是「顶栏比卡片淡一截」，
+    /// 而日志与验证层都没有任何提示。
+    ///
+    /// [`edge_depth`] 用「到直边的距离」兜底正是为这条。
+    #[test]
+    fn right_angle_panel_is_fully_opaque_inside() {
+        let half = [300.0_f32, 22.0];
+        for p in [[0.0, 0.0], [120.0, 8.0], [-299.0, 0.0]] {
+            let sdf = glass_sdf(p, half, 0.0);
+            assert_eq!(sdf, 0.0, "前置条件：直角矩形内部 SDF 恒为 0");
+            let cov = edge_coverage(edge_depth(p, half, sdf));
+            assert!(
+                (cov - 1.0).abs() < 1e-6,
+                "直角面板内部必须满覆盖：p={p:?} 得到 {cov}"
+            );
+        }
+    }
+
+    /// 圆角**切掉的角落**必须完全透明。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// [`edge_depth`] 里的「到直边距离」在角落里为正（那一点确实落在两条
+    /// 直边的内侧），却已被圆角弧切到形状外。若让它参与 `max`，角落会被
+    /// 判成内部、覆盖率 1 ⇒ **圆角被填成直角**（2026-10-28 用户报障）。
+    ///
+    /// 四个角都要扫：只守左上角的话，另外三个角会静默复发。
+    #[test]
+    fn corner_cut_by_rounding_is_transparent() {
+        let half = [300.0_f32, 29.0];
+        let r = 12.0;
+        // 四角的符号组合；每角扫 40×40 个 0.5px 步进的点（20×20 像素）。
+        let mut lying_checked = 0;
+        for (sx, sy) in [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+            for ix in 0..40 {
+                for iy in 0..40 {
+                    let p = [
+                        sx * (half[0] - ix as f32 * 0.5),
+                        sy * (half[1] - iy as f32 * 0.5),
+                    ];
+                    let sdf = glass_sdf(p, half, r);
+                    if sdf <= EDGE_AA_HALF_WIDTH {
+                        continue; // 形状内或过渡带内，不属本条守的范围
+                    }
+                    let cov = edge_coverage(edge_depth(p, half, sdf));
+                    assert!(
+                        cov == 0.0,
+                        "圆角切掉的角落必须完全透明：p={p:?} sdf={sdf} \
+                         却得到覆盖率 {cov}"
+                    );
+                    // 只统计「撒谎点」：到直边距离为正（点在两条直边内侧）
+                    // 却已被弧切到外面——这才是 `max` 会误判的那一类。
+                    let flat = (half[0] - p[0].abs()).min(half[1] - p[1].abs());
+                    if flat > 0.0 {
+                        lying_checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            lying_checked > 100,
+            "应扫到足够多会让直边距离撒谎的点（否则这条测试守不到东西），\
+             实际只有 {lying_checked}"
+        );
+    }
+
+    /// 混色的**端点语义**必须与旧的替换式一致。
+    ///
+    /// `a = 0`（没有玻璃）→ 原样返回底图；`a = 1`（实心卡片）→ 精确返回
+    /// 卡片色。否则「卡片不透明度」滑块的语义会变：用户从旧的半透明
+    /// 配置升级上来，卡片观感会跳变。
+    #[test]
+    fn glass_tint_keeps_endpoints() {
+        let tints = [
+            ("深色", [47.0 / 255.0, 53.0 / 255.0, 64.0 / 255.0]),
+            ("浅色", [1.0, 1.0, 1.0]),
+        ];
+        for (name, tint) in tints {
+            let src = [0.7, 0.5, 0.3];
+            let none = glass_tint(src, tint, 0.0);
+            for (i, (got, want)) in none.iter().zip(src).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "{name} a=0 应原样返回底图：通道{i} 得到 {got} 期望 {want}"
+                );
+            }
+            let solid = glass_tint(src, tint, 1.0);
+            for (i, (got, want)) in solid.iter().zip(tint).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "{name} a=1 应精确返回卡片色：通道{i} 得到 {got} 期望 {want}"
+                );
+            }
+        }
+    }
+
+    /// 深色 tint 必须**保留底图的明暗结构**，而不是把它压平。
+    ///
+    /// 替换式 `mix` 会把亮底与暗底一起拉向卡片色 ⇒ 对比被压掉。乘法吸收
+    /// 按同一比例缩放两个亮度 ⇒ 对比大体保留。这条守的是「深色主题下
+    /// 卡片不再糊成一块灰板」。
+    #[test]
+    fn dark_tint_keeps_backdrop_structure() {
+        let tint = [47.0 / 255.0, 53.0 / 255.0, 64.0 / 255.0];
+        let a = 0.45;
+        let lerp = |x: f32, y: f32| x + (y - x) * a;
+        let hi = glass_tint([0.9, 0.9, 0.9], tint, a)[1];
+        let lo = glass_tint([0.2, 0.2, 0.2], tint, a)[1];
+        let old_hi = lerp(0.9, tint[1]);
+        let old_lo = lerp(0.2, tint[1]);
+        assert!(
+            hi - lo > old_hi - old_lo,
+            "混色后底图对比必须高于替换式：新 {:.3} 旧 {:.3}",
+            hi - lo,
+            old_hi - old_lo
+        );
+    }
+
+    /// 深色 tint 必须把**冷调色偏**带上玻璃（混色的可见度来源）。
+    ///
+    /// `card_bg = #2F3540` 是冷蓝灰（R < G < B）。替换式把这点色偏几乎
+    /// 抹平（0.03），两段式放大到约 0.12——玻璃「泛冷」而不是单纯变暗。
+    #[test]
+    fn dark_tint_carries_cool_cast() {
+        let tint = [47.0 / 255.0, 53.0 / 255.0, 64.0 / 255.0];
+        let a = 0.45;
+        let out = glass_tint([0.9, 0.9, 0.9], tint, a);
+        let cast = out[2] - out[0];
+        let old_cast = {
+            let lerp = |x: f32, y: f32| x + (y - x) * a;
+            lerp(0.9, tint[2]) - lerp(0.9, tint[0])
+        };
+        assert!(
+            cast > old_cast * 2.0,
+            "冷调色偏应被明显放大：新 {cast:.3} 旧 {old_cast:.3}"
+        );
+        assert!(cast > 0.0, "深色卡片色是冷调，B 必须高于 R，实际 {cast}");
+    }
+
+    /// 浅色 tint（纯白卡片色）**不得把暗底洗白**。
+    ///
+    /// 浅色主题的 `card_bg = #FFFFFF`，替换式 `mix` 会把暗底一路顶到
+    /// `0.56`（中灰）——那就是「浅色主题下玻璃发灰」的病根。散射是限幅
+    /// 的，暗底应保持暗。
+    #[test]
+    fn light_tint_does_not_wash_out_dark_backdrop() {
+        let white = [1.0, 1.0, 1.0];
+        let a = 0.45;
+        let out = glass_tint([0.2, 0.2, 0.2], white, a)[1];
+        let old = 0.2 + (1.0 - 0.2) * a;
+        assert!(
+            out < old - 0.1,
+            "暗底不应被洗白：新 {out:.3} 旧(替换) {old:.3}"
+        );
+        // 亮底那端也不能被推过 1.0（否则整片饱和，彩边与折射全被冲掉）。
+        let bright = glass_tint([0.9, 0.9, 0.9], white, a)[1];
+        assert!(bright <= 1.0, "亮底不得溢出：{bright}");
+    }
+
+    /// 浅色 tint 是**中性色**，不得凭空给底图染色。
+    #[test]
+    fn neutral_tint_does_not_shift_hue() {
+        let gray_tint = [0.9, 0.9, 0.9];
+        let out = glass_tint([0.7, 0.5, 0.3], gray_tint, 0.45);
+        // 底图的 R > G > B 顺序必须保持，且中性 tint 不引入新的色偏。
+        assert!(out[0] > out[1] && out[1] > out[2], "通道顺序应保持：{out:?}");
+        let in_cast = 0.7f32 - 0.3;
+        assert!(
+            (out[0] - out[2]) > in_cast * 0.5,
+            "中性 tint 不应大幅改变底图色偏：{out:?}"
+        );
+    }
+
+    /// 深色玻璃**不能变成黑玻璃**：透过率有地板，身后内容始终可见。
+    ///
+    /// 极端情形：卡片色取纯黑。若没有地板，`transmit → 0` ⇒ 底图与高光
+    /// 一起被吃掉，卡片变成一块死黑（2026-10-25「整卡平板化」的观感）。
+    #[test]
+    fn dark_tint_never_becomes_black_glass() {
+        let black = [0.0, 0.0, 0.0];
+        let out = glass_tint([0.8, 0.8, 0.8], black, 0.45);
+        assert!(
+            out[0] > 0.1,
+            "纯黑卡片色下底图仍须可见（透过率地板），实际 {out:?}"
+        );
+    }
+
+    /// 边缘覆盖率必须在 **1px 内**完成 1 → 0，且以边缘为 0.5 对称。
+    #[test]
+    fn rounded_edge_fades_within_one_pixel() {
+        let half = [300.0_f32, 60.0];
+        let r = 12.0;
+        let cov_at = |dx: f32| {
+            // 右直边：x 方向偏移 dx（正 = 外侧）。
+            let p = [half[0] + dx, 0.0];
+            edge_coverage(edge_depth(p, half, glass_sdf(p, half, r)))
+        };
+        assert!((cov_at(-2.0) - 1.0).abs() < 1e-6, "内侧 2px 应满覆盖");
+        assert!((cov_at(0.0) - 0.5).abs() < 1e-6, "边缘处应为 0.5");
+        assert!((cov_at(2.0) - 0.0).abs() < 1e-6, "外侧 2px 应完全透明");
+        // 单调递减，且中间不跳变（线性）。
+        let mut prev = 2.0;
+        for i in -8..=8 {
+            let c = cov_at(i as f32 * 0.125);
+            assert!(c <= prev + 1e-6, "覆盖率应随外移单调不增");
+            prev = c;
+        }
     }
 }

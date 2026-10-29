@@ -98,7 +98,7 @@ Config:
     ("In use", "当前"),
     ("Integrated GPU", "集成显卡"),
     ("Opacity of entry cards; without a background effect they blend into the window fill", "行卡片底色的不透明度；无背景效果时与窗口底色混合"),
-    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "抓取桌面的分辨率；超过 100% 为超采样，越高越清晰、开销越大"),
+    ("Percentage of the window size to capture; 100% matches screen pixels exactly, lower costs less", "抓屏区域占窗口尺寸的百分比；100% 与屏幕像素一一对应，越低越省资源"),
     ("Cannot open the image editor:", "无法打开图片编辑窗口:"),
     ("Capacity and cleanup", "容量与清理"),
     ("Capture", "捕获"),

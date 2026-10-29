@@ -84,7 +84,7 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("In use", "Используется"),
     ("Integrated GPU", "Встроенная GPU"),
     ("Opacity of entry cards; without a background effect they blend into the window fill", "Непрозрачность карточек; без фонового эффекта они смешиваются с фоном окна"),
-    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "Разрешение захвата рабочего стола; выше 100% — суперсэмплинг, чем выше, тем дороже"),
+    ("Percentage of the window size to capture; 100% matches screen pixels exactly, lower costs less", "Доля области захвата от размера окна; 100% соответствует пикселям экрана, меньшее значение снижает нагрузку"),
     ("Cannot open the image editor:", "Не удалось открыть редактор изображений:"),
     ("Capacity and cleanup", "Ёмкость и очистка"),
     ("Capture", "Захват"),

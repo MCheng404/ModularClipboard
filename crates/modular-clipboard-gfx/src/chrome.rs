@@ -150,7 +150,19 @@ pub fn panel_shape(hwnd: HWND) -> Option<Rect> {
 /// 段数预算：顶栏左/右 2 段 + 共用单栏时内嵌置顶区左/右 2 段 +
 /// 历史主栏左/右 2 段 = 6 段。当初只按顶栏估了 4，共用单栏下
 /// 列表边距段被截断，表现为「列表左右留白拖不动窗口」。
-const MAX_DRAG_SEGS: usize = 8;
+///
+/// 2026-10-28 再从 8 提到 32：**列表的「行间缝隙」是逐行上报的**
+/// 可见行数随窗口高度/滚动位置浮动，一屏十几行就是十几段——它们
+/// push 在顶栏**之前**，于是段数一到上限，被截掉的正是顶栏那几段
+/// （2026-10-28「主窗口点击拖动有概率拖不了」的真根因：顶栏——最
+/// 像标题栏的地方——恒为 `HTCLIENT`，只有恰好按在行间缝隙上才拖得动）。
+///
+/// 32 覆盖「两个列表 × (2 边距 + ~12 缝隙 + 1 底部空白) + 顶栏/卡片头」，
+/// 且 `hit_test` 只是逐段做矩形包含判定，32 段的代价可以忽略。
+///
+/// CAUTION: 截断**保头不保尾**，所以上层必须把「最重要的段」排在最前
+/// ——顶栏段由 `draw_topbar` 用 `splice(0..0, ..)` 插到最前，正是为此。
+pub const MAX_DRAG_SEGS: usize = 32;
 
 /// 一个窗口的边框与拖动区。
 ///
@@ -242,6 +254,9 @@ pub fn forget(hwnd: HWND) {
 ///
 /// 每帧调一次即可：只改内存里的一个小 Vec，没有系统调用。
 pub fn set_drag_regions(hwnd: HWND, rects: &[Rect]) {
+    // CAUTION: 超预算时截断**尾部**（`take` 保头）。上层必须按重要性
+    // 排序：顶栏 / 卡片标题头在最前，列表的逐行缝隙在后——反过来就是
+    // 「顶栏恒为 HTCLIENT、只有按准缝隙才拖得动」（2026-10-28）。
     let segs: Vec<Rect> = rects
         .iter()
         .take(MAX_DRAG_SEGS)
@@ -1129,6 +1144,42 @@ fn popup_panel_outside_is_click_through() {
             HitZone::Client,
             "两段之间的控件区必须判 Client，否则实机点不动"
         );
+    }
+
+    /// 超预算时**截尾保头**：前 `MAX_DRAG_SEGS` 段必须原样留下。
+    ///
+    /// 这是「顶栏拖不动」的守门（2026-10-28）：列表的逐行缝隙是一行
+    /// 一段，数量随可见行数浮动；一旦段数越过上限，被丢的必须是缝隙
+    /// 那批，而不是顶栏那一两段——所以顶栏段由上层排在**最前**
+    /// （`draw_topbar` 的 `splice(0..0, ..)`），这里守住「前 N 段存活」。
+    #[test]
+    fn segment_cap_keeps_the_head() {
+        const H: HWND = HWND(0x4D41 as *mut std::ffi::c_void);
+        // 第 0 段当作顶栏段（y 0..32），其余是逐行缝隙（越往后越低）。
+        let mut rects = vec![Rect::from_min_max(p(0.0, 0.0), p(300.0, 32.0))];
+        for i in 0..MAX_DRAG_SEGS + 12 {
+            let y = 40.0 + i as f32 * 40.0;
+            rects.push(Rect::from_min_max(p(0.0, y), p(300.0, y + 8.0)));
+        }
+        set_drag_regions(H, &rects);
+        let kept = drag_regions(H);
+        assert_eq!(
+            kept.len(),
+            MAX_DRAG_SEGS,
+            "应恰好保留 {MAX_DRAG_SEGS} 段，实际 {}",
+            kept.len()
+        );
+        assert_eq!(
+            kept[0],
+            rects[0],
+            "排在最前的顶栏段被截掉了 —— 实机上就是「顶栏拖不动」"
+        );
+        // 顶栏段仍然可拖。
+        assert_eq!(
+            hit_test(p(150.0, 16.0), Vec2::new(300.0, 3000.0), 0.0, &kept),
+            HitZone::Caption
+        );
+        set_drag_regions(H, &[]);
     }
 
     #[test]

@@ -159,6 +159,10 @@ pub struct Painter<'a> {
     ///
     /// 按原因去重则每个原因各记一次，既不刷屏也不丢信息。
     backdrop_warned: std::collections::HashSet<BackdropWarn>,
+    /// 首帧捕获图是否已导出（`MC_DUMP_CAPTURE` 排障开关，见用它的地方）。
+    dumped_capture: bool,
+    /// 成功抓屏的次数（只服务于 `MC_DUMP_CAPTURE` 的「跳过前几帧」）。
+    capture_frames: u32,
     /// 累计统计，供上层显示与诊断。
     pub stats: FrameStats,
     /// 「已经有人等过本窗口的在途帧」标记，见 [`Self::mark_synced`]。
@@ -179,6 +183,11 @@ pub(super) enum BackdropWarn {
     SetRadius,
     /// 录制高斯卷积命令失败。
     Record,
+    /// 玻璃参数已就绪，但本帧**没有**走玻璃 pass（退化成磨砂合成）。
+    ///
+    /// 这是「玻璃模式看起来就是磨砂」的唯一线索：管线创建失败、矩形
+    /// 表为空都会落到这里，而两者都不产生任何 GPU 错误。
+    GlassInactive,
 }
 
 /// 一帧后处理所需的全部 GPU 资源。
@@ -397,6 +406,8 @@ impl<'a> Painter<'a> {
             backdrop_scale: modular_clipboard_gfx::backdrop::CAPTURE_PCT_DEFAULT,
             card_blur: CardBlurState::default(),
             backdrop_warned: std::collections::HashSet::new(),
+            dumped_capture: false,
+            capture_frames: 0,
             stats: FrameStats::default(),
             synced: false,
         })
@@ -632,6 +643,21 @@ impl<'a> Painter<'a> {
     /// 当前是否配了玻璃参数（诊断/测试用）。
     pub fn has_glass(&self) -> bool {
         self.backdrop.glass_params.is_some()
+    }
+
+    /// 清除玻璃参数（背景效果**不是**玻璃时每帧调用）。
+    ///
+    /// # 为什么必须显式清（2026-10-28）
+    ///
+    /// 参数只在玻璃模式下写入，且 `paint_inner` 只在「底图已上传」的帧
+    /// 里消费它。于是从玻璃切到磨砂时，最后一份参数会**留在字段里**：
+    /// 磨砂模式仍然满足 `glass_params.is_active()`，且玻璃管线没被销毁
+    /// （两个模式都算「背景启用」）⇒ 磨砂模式会继续按**上一帧的矩形**
+    /// 跑玻璃 pass，直到用户切回玻璃把它覆盖。
+    ///
+    /// 症状是「磨砂看起来像玻璃、且矩形是旧的」，日志里没有任何错误。
+    pub fn clear_glass(&mut self) {
+        self.backdrop.glass_params = None;
     }
 
     /// 懒创建玻璃管线。
@@ -883,6 +909,18 @@ impl<'a> Painter<'a> {
                 )?;
                 Some(pipe.blit(slot, offset))
             } else {
+                // 玻璃模式却没走玻璃 pass：唯一的解释是「参数为空」或
+                // 「管线没建起来」，两者都不报错，只表现为「玻璃看起来
+                // 就是磨砂」。这是排障时唯一的线索，按原因去重记一次。
+                if let Some(n) = self.backdrop.glass_params.as_ref().map(|g| g.rects.len()) {
+                    let has_pipe = self.backdrop.glass.is_some();
+                    self.warn_backdrop(
+                        BackdropWarn::GlassInactive,
+                        &format!(
+                            "玻璃参数已就绪（{n} 个矩形）但本帧未走玻璃 pass（管线已建={has_pipe}）"
+                        ),
+                    );
+                }
                 Some(
                     self.backdrop
                         .fx
@@ -893,6 +931,21 @@ impl<'a> Painter<'a> {
                 )
             }
         } else {
+            // 玻璃/磨砂模式下**没有底图**是异常状态：交换链上会留下透明
+            // 区域，窗口看起来「整片透出桌面、卡片全没了」，而没有任何
+            // 报错。首帧正常（抓屏还没回来），持续出现就是抓屏链断了。
+            //
+            // 这条日志是唯一的线索，所以用 `info`（默认级别可见）而不是
+            // `debug`（`RUST_LOG=warn,modular_clipboard=info` 会过滤掉 ui
+            // crate 的 debug）。
+            if use_backdrop {
+                tracing::info!(
+                    has_fx = self.backdrop.fx.is_some(),
+                    uploaded = self.backdrop.fx.as_ref().is_some_and(|fx| fx.uploaded),
+                    glass = self.backdrop.glass.is_some(),
+                    "背景底图未就绪：本帧不铺底图"
+                );
+            }
             None
         };
 
@@ -1187,6 +1240,13 @@ impl<'a> Painter<'a> {
         }
         // 节流：未到间隔、强度未变、且窗口没在动时直接复用上一帧的
         // 模糊结果。窗口移动时放行——见方法文档第 2 条。
+        //
+        // NOTE: 这里**不能**用 DWM 的合成帧号（`cFrame`）判断「场景静止」。
+        // 实测 38 次/秒的抓屏说明帧号一直在递增——因为**本程序自己就是
+        // 持续重绘的窗口**（egui 每帧提交，动画/光标都会触发 repaint）。
+        // 帧号是整屏级的，分不出「是我在画」还是「身后在变」。
+        // 真正的「内容没变」只能在像素层面判断，见工作线程的
+        // `CaptureOut::Unchanged`。
         let moving = self.backdrop.predictor.is_moving();
         if !radius_changed && !moving && !capture_due(self.backdrop.last_capture, now, CAPTURE_INTERVAL) {
             return Ok(());
@@ -1234,7 +1294,13 @@ impl<'a> Painter<'a> {
         // CAUTION: 请求必须在**节流放行后**才发（上面几个 early return
         // 之后）。每帧都发会让工作线程永远在抓屏、忙不过来，pending
         // 守卫随即开始丢请求。
-        capture_worker.request(hwnd, Self::needs_rb_swap(format), self.backdrop_scale);
+        //
+        // `force`：接收端还没有可用的底图（首帧、交换链重建后、
+        // 抓屏强度变化要重跑卷积）时，即使像素与上一帧相同也必须把数据
+        // 送回来——否则工作线程报 `Unchanged`，主线程永远不上传，
+        // 窗口一片空白。
+        let force = !fx.uploaded || radius_changed;
+        capture_worker.request(hwnd, Self::needs_rb_swap(format), self.backdrop_scale, force);
         let (bits, w, h) = match capture_worker.poll() {
             Some(CaptureOut::Ok(b, w, h)) => {
                 // 抓屏链路的心跳：工作线程抓到 → 主线程收到。
@@ -1247,6 +1313,29 @@ impl<'a> Painter<'a> {
                     "抓屏结果已就绪"
                 );
                 (b, w, h)
+            }
+            Some(CaptureOut::Unchanged) => {
+                // 像素与上一帧逐字节相同：底图与卷积结果**都还有效**，
+                // 直接沿用。这一分支省掉的是 to_vec（4~8MB 分配拷贝）、
+                // staging 上传与三趟全屏卷积——换来的画面与现在屏幕上
+                // 那张逐位相同。
+                //
+                // CAUTION: **没有可用底图时不能沿用**。首帧/交换链重建/
+                // 改档位之后 `fx.uploaded` 是假，那张「上一帧的模糊结果」
+                // 根本不存在——沿用就等于整窗不铺底图（清屏色透明，看
+                // 起来是「玻璃/磨砂没渲染」）。这时必须**不更新
+                // `last_capture`**，让节流条件下一帧立刻再要一次像素。
+                //
+                // 代价是有界的：只在 `uploaded` 为假的那一两帧里每帧发
+                // 一次请求（`CaptureWorker::request` 的 pending 守卫仍在，
+                // 不会堆积），拿到像素即恢复 33ms 节流。
+                if !fx.uploaded {
+                    tracing::debug!("尚无可用底图：忽略 Unchanged，下一帧继续强制抓屏");
+                    return Ok(());
+                }
+                tracing::debug!("抓屏内容与上一帧相同，跳过上传与卷积");
+                *last_capture = Some(now);
+                return Ok(());
             }
             Some(CaptureOut::Skipped) => return Ok(()), // 最小化
             Some(CaptureOut::Failed(e)) => {
@@ -1267,6 +1356,49 @@ impl<'a> Painter<'a> {
             // resize 竞态：客户区已变、交换链还没重建。跳过本帧，
             // 等下一轮 swapchain 重建后尺寸自然对齐。
             return Ok(());
+        }
+
+        // ---- 排障：首帧捕获图导出 ----
+        //
+        // `MC_DUMP_CAPTURE=<路径>` 时把第一张**成功抓到**的桌面底图写成
+        // PNG。玻璃/磨砂的「卡片里什么都没有」有两类互斥的原因：
+        //
+        //   a) GDI 真的没抓到（BitBlt 全黑/全白）——驱动、
+        //      `WDA_EXCLUDEFROMCAPTURE` 与 DWM 合成路径的问题；
+        //   b) 抓到了，但玻璃 pass 没把它画上去——着色器/uniform 的问题。
+        //
+        // 两者的界面表现一模一样（卡片里是纯色），而日志里也都没有错误。
+        // 导出一张图就能一刀切开：底图有内容 ⇒ 问题在 (b)，底图纯色 ⇒ (a)。
+        //
+        // 只在首帧写一次（后续每帧都写会拖慢抓屏节流），且只在显式设置
+        // 环境变量时生效——正常使用不产生任何 IO。
+        // 只在第 `DUMP_AFTER` 次成功抓屏时导出：首帧的抓屏可能发生在
+        // `WDA_EXCLUDEFROMCAPTURE` 生效之前（那个竞态见 `frame_loop` 的
+        // 「背景效果必须在抓屏之前同步」），抓到的会是窗口自己——用它
+        // 取证会把「时序竞态」误判成「抓屏坏了」。抓屏节流 33ms，
+        // 8 次约 0.3 秒，足够进入稳态。
+        if let Some(path) = std::env::var_os("MC_DUMP_CAPTURE")
+            && !self.dumped_capture
+        {
+            self.capture_frames = self.capture_frames.saturating_add(1);
+            if self.capture_frames < 8 {
+                // 继续等，见上。
+            } else {
+                self.dumped_capture = true;
+                match image::RgbaImage::from_raw(w, h, bits.to_vec()) {
+                    Some(img) => match img.save(&path) {
+                        Ok(()) => tracing::info!(
+                            path = ?path,
+                            w,
+                            h,
+                            frames = self.capture_frames,
+                            "已导出桌面捕获图（排障用）"
+                        ),
+                        Err(e) => tracing::warn!("导出捕获图失败: {e}"),
+                    },
+                    None => tracing::warn!("捕获图尺寸与像素数不匹配，无法导出"),
+                }
+            }
         }
 
         // ---- 换图：新尺寸的第一张抓屏到了 ----

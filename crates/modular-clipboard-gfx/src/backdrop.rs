@@ -64,25 +64,34 @@ pub const CAPTURE_DOWNSCALE: u32 = 2;
 ///
 /// 下限 15：再低就只剩色块（清晰折射带彻底糊掉），但确实有人愿意用
 /// 观感换 CPU——给到 15 而不是 25。
-/// 上限 200：**超采样**。抓回来的图比客户区还大，玻璃的「边缘清晰带」
-/// 与色散彩边因此有真实的高频信息可用（1/2 抓屏在 4K 屏上放大回卡片
-/// 尺寸后能看出台阶）。代价是上传量按面积平方增长，见
-/// [`MAX_CAPTURE_PIXELS`]。
-pub const CAPTURE_PCT_RANGE: std::ops::RangeInclusive<u8> = 15..=200;
+///
+/// 上限 **100**（2026-10-28 从 200 收回）。曾经的 200 档被注释成
+/// 「超采样：抓回来的图比客户区还大，玻璃的边缘清晰带有真实的高频
+/// 信息可用」——**这个说法是错的**。`StretchBlt` 的源区域永远是
+/// `cw × ch`（客户区物理像素），放大到 2×2 只是双线性插值：
+///
+/// - 不可能产生任何新信息，反而让边缘更软（插值钝化）；
+/// - 上传量按面积**四倍**增长（用户实测配置正是 200%：每帧 1176×1574
+///   ≈ 7.4MB、33ms 一次 ⇒ 约 224MB/s 的 staging 与 PCIe 流量）；
+/// - `BitBlt` + 放大插值本身更慢，工作线程更容易跟不上 33ms 节流。
+///
+/// 100% 已经是「屏幕物理像素 1:1」，这是拿得到的最清晰结果。再高的
+/// 档位在物理上不存在。
+pub const CAPTURE_PCT_RANGE: std::ops::RangeInclusive<u8> = 15..=100;
 
 /// 默认抓屏分辨率百分比（50 = 1/2，与 [`CAPTURE_DOWNSCALE`] 等价）。
 pub const CAPTURE_PCT_DEFAULT: u8 = 50;
 
 /// 捕获图的**像素预算**（约 48MB RGBA）。
 ///
-/// 200% 超采样在大窗口上会翻倍边长、四倍面积：4K 客户区抓 200% 是
-/// 7680×4320 ≈ 132MB/帧，一帧就把 staging 与显存预算吃穿（而且每 33ms
-/// 传一次）。超出预算时按面积**等比缩小**——用户拿到的仍是「比 100%
-/// 清晰」的结果，只是拿不到满 200%。
+/// 按 [`CAPTURE_PCT_RANGE`] 的上限 100% 计算，客户区面积就已经是捕获
+/// 像素数——这个预算只对**超大客户区**生效（8K 屏上的全屏窗口
+/// ≈ 33M 像素）。超出时按面积等比缩小，避免一帧就把 staging 与显存
+/// 预算吃穿（而且每 33ms 传一次）。
 ///
 /// CAUTION: 预算的**地板是客户区自身**（见 [`capture_scaled_pct`]）：
 /// 4K 客户区的 100% 已经是 8.3M 像素，若把预算定死成更小的值，用户选
-/// 100% 也会被悄悄降采样——那等于「设置骗人」。所以只压超采样那一部分。
+/// 100% 也会被悄悄降采样——那等于「设置骗人」。
 pub const MAX_CAPTURE_PIXELS: u64 = 12_000_000;
 
 /// 捕获尺寸：客户区尺寸除以 [`CAPTURE_DOWNSCALE`]，向上取整且至少为 1。
@@ -96,7 +105,7 @@ pub fn capture_scaled(width: u32, height: u32, downscale: u32) -> (u32, u32) {
     ((width.div_ceil(d)).max(1), (height.div_ceil(d)).max(1))
 }
 
-/// 按**百分比**算捕获尺寸（`100` = 原分辨率，`200` = 2× 超采样）。
+/// 按**百分比**算捕获尺寸（`100` = 与屏幕像素 1:1，也是上限）。
 ///
 /// 为什么不是「降采样倍数」：倍数只有 1/2、1/3、1/4 这些整数档，
 /// 而用户要的是「分辨率占客户区的百分比」——70%、150% 这种档位用倍数
@@ -110,15 +119,20 @@ pub fn capture_scaled_pct(width: u32, height: u32, pct: u8) -> (u32, u32) {
     // 让「捕获尺寸 == 期望尺寸」的比对失败（那会让背景永久停更）。
     let mut w = (u64::from(width) * p).div_ceil(100).max(1);
     let mut h = (u64::from(height) * p).div_ceil(100).max(1);
-    // 预算地板 = 客户区自身：100% 永远原样放行（否则「选了 100% 却被降采样」
-    // 就是设置骗人）。超采样部分才按面积等比压缩。
-    let budget = MAX_CAPTURE_PIXELS.max(u64::from(width) * u64::from(height));
+    // 预算**固定**，不再取 `max(预算, 客户区面积)`。
+    //
+    // 早前那层地板是为了「选了 100% 却被降采样 = 设置骗人」，但它让
+    // 预算在 pct ≤ 100 的新区间里永远不触发——8K 屏全屏窗口的 100% 是
+    // 7680×4320 ≈ 132MB/帧，33ms 一次就是 4GB/s，当场把 staging 与
+    // 显存打穿。固定预算是 12M 像素（≈48MB）：4K 全屏（8.3M）照常
+    // 原样放行，只有 8K 这类极端尺寸才等比压缩。
+    let budget = MAX_CAPTURE_PIXELS;
     if w * h > budget {
         let k = (budget as f64 / (w * h) as f64).sqrt();
         w = ((w as f64 * k).floor() as u64).max(1);
         h = ((h as f64 * k).floor() as u64).max(1);
     }
-    // 上限来自客户区尺寸 × 2（pct ≤ 200），远小于 u32::MAX。
+    // 上限来自客户区尺寸自身（pct ≤ 100），远小于 u32::MAX。
     (w as u32, h as u32)
 }
 
@@ -787,10 +801,11 @@ mod tests {
 
     #[test]
     fn capture_pct_clamps_and_never_zero() {
-        // 100% = 原分辨率；200% = 2× 超采样（边长翻倍）。
+        // 100% = 与屏幕像素 1:1，也是**上限**（2026-10-28 从 200 收回：
+        // 放大不产生信息，只多传四倍数据）。
         assert_eq!(capture_scaled_pct(720, 800, 100), (720, 800));
-        assert_eq!(capture_scaled_pct(720, 800, 200), (1440, 1600));
-        // 越界（配置写坏成 0 / 255）钳到区间端点，不得产生 0 尺寸纹理。
+        // 越界（配置写坏成 0 / 255，或旧配置里存着 200）钳到区间端点，
+        // 不得产生 0 尺寸纹理、也不得重新放大。
         assert_eq!(
             capture_scaled_pct(720, 800, 0),
             capture_scaled_pct(720, 800, 15),
@@ -798,17 +813,22 @@ mod tests {
         );
         assert_eq!(
             capture_scaled_pct(720, 800, 255),
+            capture_scaled_pct(720, 800, 100),
+            "高于上限应钳到 100%"
+        );
+        assert_eq!(
             capture_scaled_pct(720, 800, 200),
-            "高于上限应钳到 200%"
+            (720, 800),
+            "旧的 200% 配置必须被钳回 1:1，而不是继续放大"
         );
         // 极小窗口在任何档位下都至少 1 像素。
-        for pct in [15u8, 33, 50, 100, 150, 200] {
+        for pct in [15u8, 33, 50, 100, 200] {
             let (w, h) = capture_scaled_pct(1, 1, pct);
             assert!(w >= 1 && h >= 1, "{pct}% 下 1×1 窗口给出了 {w}×{h}");
         }
         // 单调：百分比越高，尺寸不减。
         let mut prev = (0, 0);
-        for pct in [15u8, 40, 70, 100, 150, 200] {
+        for pct in [15u8, 40, 70, 100] {
             let cur = capture_scaled_pct(1000, 1000, pct);
             assert!(cur.0 >= prev.0 && cur.1 >= prev.1, "{pct}% 时尺寸回退了");
             prev = cur;
@@ -817,24 +837,22 @@ mod tests {
 
     #[test]
     fn capture_pct_respects_pixel_budget() {
-        // 超采样在大窗口上会翻倍边长、四倍面积：4K 客户区 200% 是
-        // 7680×4320 ≈ 132MB/帧。必须按面积等比缩到预算内，而不是
-        // 把 staging / 显存打爆。
-        let (w, h) = capture_scaled_pct(3840, 2160, 200);
+        // 超大客户区（8K 全屏）在 100% 下就会撞预算，必须按面积等比缩到
+        // 预算内，而不是把 staging / 显存打爆。
+        let (w, h) = capture_scaled_pct(7680, 4320, 100);
         assert!(
             u64::from(w) * u64::from(h) <= MAX_CAPTURE_PIXELS,
-            "4K@200% 应被压到预算内，实际 {w}×{h}"
+            "8K@100% 应被压到预算内，实际 {w}×{h}"
         );
-        assert!(w > 3840, "压缩后仍应比原分辨率清晰（超采样）");
-        // 预算的**地板**是客户区：100% 永远原样放行，不能被悄悄降采样。
+        // 常见尺寸（4K 全屏 ≈ 8.3M 像素）的 100% 必须原样放行，
+        // 不能被悄悄降采样。
         assert_eq!(capture_scaled_pct(3840, 2160, 100), (3840, 2160));
-        assert_eq!(capture_scaled_pct(7680, 4320, 100), (7680, 4320));
         // 保持长宽比（±1px 舍入）。
         let ratio_in = 3840.0 / 2160.0;
         let ratio_out = w as f64 / h as f64;
         assert!((ratio_in - ratio_out).abs() < 0.01, "长宽比被拉歪：{w}×{h}");
         // 预算内的小窗口不该被压。
-        assert_eq!(capture_scaled_pct(720, 800, 200), (1440, 1600));
+        assert_eq!(capture_scaled_pct(720, 800, 100), (720, 800));
     }
 
     #[test]

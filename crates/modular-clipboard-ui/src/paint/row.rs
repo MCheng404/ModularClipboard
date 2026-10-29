@@ -129,7 +129,11 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // `card_blur_uv`），因此每张卡片看到的是它自己身后那一块桌面。
     // 液态玻璃：本帧起这张卡片要参与折射合成（仅背景效果 = 玻璃时生效）。
     // 必须在画底色**之前**——玻璃 pass 跑在 egui 内容之前。
-    let glass_mode = f.glass_mode();
+    // CAUTION: 判据是 `glass_covers()`（本窗口真的被玻璃 pass 覆盖），
+    // 不是全局的 `glass_mode()`。子窗口/弹窗配置同样是玻璃，却没有
+    // 任何东西替它们铺背景——用错判据会让那些窗口整块透出桌面
+    // （见 `Frame::glass_covers`）。
+    let glass_mode = f.glass_covers();
     // 底色**作为参数**交给玻璃层：玻璃层用它算 tint 与覆盖度。
     //
     // 早前是「先 push 再 set_tint / set_alpha」的两步式，而 tint 全局只有
@@ -194,10 +198,34 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
         crate::anim::Ease::OutCubic,
     );
     if sel > 0.004 {
-        fill_rounded_border(&painter, r, radius, 2.0 * sel, pal.accent, |p, inner, inner_r| {
-            p.rect_filled(inner, inner_r, pal.card_bg);
-            p.rect_filled(inner, inner_r, fade_color(pal.row_selected, sel));
-        });
+        if glass_mode {
+            // 玻璃模式下**不能**重填卡片底色（2026-10-28 修）。
+            //
+            // 原路径是 `fill_rounded_border(...)`：它先把整块填成描边色、
+            // 再用闭包把内部覆盖回 `pal.card_bg`。在磨砂/半透明模式下
+            // 这是对的——那里卡片本来就该是一块实底。
+            //
+            // 但玻璃模式下 `pal.card_bg` 的 alpha 来自「卡片不透明度」
+            // （缺省 1.0，完全不透明），于是**被选中的那一行整个丢失玻璃**：
+            // 折射、色散、磨砂、边缘光全被一层实色盖死。列表默认总是选中
+            // 第一行，用户看到的是「三张玻璃卡里最上面那张是实心板」——
+            // 割裂感极强，且不报任何错。
+            //
+            // 这里改成「只叠色 + 只描边」：底色由玻璃 pass 合成，选中态
+            // 只额外增加一层 accent 半透明（预乘缩放，不引入第二次覆盖）。
+            painter.rect_filled(r, radius, fade_color(pal.row_selected, sel));
+            painter.rect_stroke(
+                r,
+                radius,
+                Stroke::new(2.0 * sel, pal.accent),
+                egui::StrokeKind::Inside,
+            );
+        } else {
+            fill_rounded_border(&painter, r, radius, 2.0 * sel, pal.accent, |p, inner, inner_r| {
+                p.rect_filled(inner, inner_r, pal.card_bg);
+                p.rect_filled(inner, inner_r, fade_color(pal.row_selected, sel));
+            });
+        }
     }
     // 悬停底色**补间**（110ms OutCubic）：
     // 目标值由本帧是否悬停给出，补间从当前显示值续接——鼠标划过时

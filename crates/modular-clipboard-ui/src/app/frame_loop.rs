@@ -1131,6 +1131,47 @@ pub(super) fn run_mode(
         // 玻璃与磨砂**同路**：都要先铺身后桌面的底图再叠界面。差别只在
         // 铺那一趟是「拷模糊结果」还是「按卡片折射」（见 painter 的
         // `backdrop_blit` 分派）。
+        // ---- 背景效果必须在**抓屏之前**同步（4.4b 提前到这里）----
+        //
+        // 三个动作全是「本帧 `paint_backdrop` 的前置条件」：
+        //   1. Win32：`WDA_EXCLUDEFROMCAPTURE` 自排除；
+        //   2. 渲染层：启用/释放桌面捕获与模糊资源；
+        //   3. 清屏色：透明（有底图）或实底（无背景效果）。
+        //
+        // CAUTION: 这三件**原先放在帧末**，于是首帧的 `paint_backdrop`
+        // 跑在「自排除尚未生效」的状态下——`BitBlt(GetDC(NULL))` 抓到的
+        // 是**窗口自己**，玻璃/磨砂的底图就是自家那片浅色底。
+        //
+        // 症状正是用户报的「玻璃渲染异常、无法抓捕背景」：启动后卡片里
+        // 一片纯白、身后桌面完全不可见。第二帧起自愈，但第一眼看到的就是
+        // 坏画面；切换背景模式时同样多错一帧。实测双进程模式（双击启动
+        // 的默认路径）必现，单进程偶发——取决于抓屏工作线程与
+        // `SetWindowDisplayAffinity` 的先后，是典型的竞态。
+        //
+        // 放这里之后，抓屏永远在正确设置下发生。
+        {
+            let backdrop = app.svc.state.config.ui.window_backdrop;
+            if backdrop != applied_backdrop {
+                applied_backdrop = backdrop;
+                presence::apply_backdrop(window.hwnd(), backdrop);
+                // CAUTION: 玻璃也必须算「启用」。它复用磨砂的抓屏 + 模糊链，
+                // 判成 false 会把那些资源整套销毁，玻璃立刻只剩透明。
+                let backdrop_on = matches!(
+                    backdrop,
+                    modular_clipboard_core::config::WindowBackdrop::Acrylic
+                        | modular_clipboard_core::config::WindowBackdrop::Glass
+                );
+                painter.set_backdrop_enabled(backdrop_on);
+                fr.set_clear_color(if backdrop
+                    == modular_clipboard_core::config::WindowBackdrop::None
+                {
+                    DEFAULT_CLEAR_COLOR
+                } else {
+                    TRANSPARENT_CLEAR_COLOR
+                });
+            }
+        }
+
         if matches!(
             app.svc.state.config.ui.window_backdrop,
             modular_clipboard_core::config::WindowBackdrop::Acrylic
@@ -1151,7 +1192,20 @@ pub(super) fn run_mode(
                     refract: cfg.glass_refract,
                     dispersion: cfg.glass_dispersion,
                     edge: cfg.glass_edge,
+                    // 背景层不透明度：随「窗口不透明度」滑块走。
+                    //
+                    // 玻璃模式下整个窗口的透明感就靠这一项——早前背景层
+                    // 沿用捕获图的 alpha（恒为 1），整窗被不透明底图糊死，
+                    // 真实桌面一点都透不出来（2026-10-28 报障「无法渲染
+                    // 透明效果」）。
+                    bg_alpha: modular_clipboard_gfx::glass::BG_ALPHA_DEFAULT
+                        * cfg.window_opacity.clamp(0.3, 1.0),
                 });
+            } else {
+                // 磨砂模式：必须清掉上一份玻璃参数。它只在「底图已上传」
+                // 的帧里被消费，切到磨砂时会残留，于是磨砂模式继续按旧
+                // 矩形跑玻璃 pass（见 `Painter::clear_glass`）。
+                painter.clear_glass();
             }
             // 模糊半径按模式取：磨砂用自己的档位，玻璃用**自有的**档位。
             //
@@ -1206,32 +1260,13 @@ pub(super) fn run_mode(
             presence::set_topmost(window.hwnd(), applied_topmost);
         }
 
-        // ---- 4.4b 背景效果同步（自研磨砂 / 半透明）----
+        // ---- 4.4b 背景效果 ----
         //
-        // 与置顶同一模式：配置变了才调 Win32（捕获排除 + 样式归位）。
-        // 同时同步渲染层：磨砂开 → 启用桌面捕获 + 模糊资源；关 → 释放。
-        // 清屏色也要跟上：半透明模式的背景层带 alpha，若清屏 alpha=1，
-        // 未被背景层覆盖的像素会变成不透明（磨砂/半透明失效）。
-        let backdrop = app.svc.state.config.ui.window_backdrop;
-        if backdrop != applied_backdrop {
-            applied_backdrop = backdrop;
-            presence::apply_backdrop(window.hwnd(), backdrop);
-            // CAUTION: 玻璃也必须算「启用」。它复用磨砂的抓屏 + 模糊链，
-            // 判成 false 会把那些资源整套销毁，玻璃立刻只剩透明。
-            let backdrop_on = matches!(
-                backdrop,
-                modular_clipboard_core::config::WindowBackdrop::Acrylic
-                    | modular_clipboard_core::config::WindowBackdrop::Glass
-            );
-            painter.set_backdrop_enabled(backdrop_on);
-            fr.set_clear_color(if backdrop
-                == modular_clipboard_core::config::WindowBackdrop::None
-            {
-                DEFAULT_CLEAR_COLOR
-            } else {
-                TRANSPARENT_CLEAR_COLOR
-            });
-        }
+        // 已提前到本帧 `paint_backdrop` 之前执行（见上文「背景效果必须在
+        // 抓屏之前同步」）。放在帧末会让首帧抓到自己，并在切换模式时
+        // 让底图晚一帧——那是「玻璃抓不到背景」的根因之一。
+        //
+        // 这里只保留「置顶」那半段（4.4 在上方），不再重复同步背景。
 
         // ---- 4.4c 全局热键与迷你面板（仅单进程模式）----
         //

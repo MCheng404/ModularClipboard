@@ -59,9 +59,23 @@ const OFFSET_SIZE: u32 = 8;
 
 /// 玻璃 uniform。布局必须与 `glass.wgsl` 的 `GlassUniforms` 逐字段一致。
 ///
-/// 大小 1184 字节：`rects` 384 + `tints` 384 + `alphas` 384 + `size` 8 +
-/// 5 个 f32 20 + `_pad` 4。
+/// 大小 1568 字节：`rects` 384 + `tints` 384 + `alphas` 384 + `radii` 384
+/// + `size` 8 + `refract`/`dispersion`/`edge` 12 + `count` 4
+/// + `bg_alpha` 4 + `_pad` 4。
+///
 /// **无隐式填充**（每个字段都命名），这是 `bytemuck::Pod` 的要求。
+///
+/// # 为什么有两个 pad（2026-10-28）
+///
+/// WGSL 的 uniform 结构体大小要向上对齐到 16 的倍数：着色器侧写到
+/// `_pad` 之后只有 1564，naga 自动 roundup 到 1568。而 Rust 的
+/// `#[repr(C)]` 不做这件事——结构体对齐只有 4（`[[f32; 4]; 24]` 的对齐
+/// 是 4，不是 16），于是 `size_of` 停在 1564，`write_buffer` 每次
+/// **少写 4 字节**。
+///
+/// 少写的那 4 字节恰好是着色器不读的填充，画面不会错；但它是「Rust
+/// 认为的大小 ≠ 着色器认为的大小」——一旦以后往 `_pad` 后面加字段就
+/// 会真的错位。显式补第二个 pad，让两边逐字段对齐。
 ///
 /// # 为什么 tint / alpha 是**逐矩形**的（2026-10-28）
 ///
@@ -94,6 +108,19 @@ pub struct GlassUniforms {
     /// 报 `ArrayStride { stride: 4, alignment: Alignment(16) }` 校验失败。
     /// 只有 `x` 有意义，其余三个分量是填充。
     pub alphas: [[f32; 4]; MAX_GLASS_CARDS],
+    /// 逐矩形的圆角半径（像素），取 `.x`。
+    ///
+    /// # 为什么必须逐矩形（2026-10-28 修「玻璃整窗失效」）
+    ///
+    /// 早前只有一份全局 `radius`，取**第一张**矩形的圆角。而
+    /// `push_glass_overlay` 会把顶栏插到队首——顶栏是**直角**（半径 0）。
+    /// 于是整帧的 `radius = 0`，SDF 退化成普通矩形：内部处处 `d == 0`，
+    /// 而着色器用 `d >= 0` 判「在圆角切掉的角上」直接跳过 ⇒ **一个像素
+    /// 都不命中**，整窗只输出模糊底图，所有卡片与 chrome 的玻璃全部消失
+    /// （且不报任何错）。
+    ///
+    /// 用 `vec4` 而不是 `f32`：uniform 数组元素步长必须是 16 的倍数。
+    pub radii: [[f32; 4]; MAX_GLASS_CARDS],
     /// 目标图的像素尺寸 `(w, h)`（uv → 像素用）。
     pub size: [f32; 2],
     /// 折射强度（0 = 只剩磨砂）。
@@ -102,10 +129,21 @@ pub struct GlassUniforms {
     pub dispersion: f32,
     /// Fresnel 幂次。
     pub edge: f32,
-    /// 卡片圆角半径（像素）。
-    pub radius: f32,
     /// 有效卡片数。
     pub count: u32,
+    /// **背景层的不透明度**（不属于任何卡片的那些像素，0~1）。
+    ///
+    /// # 为什么它取代了原来的 `_pad`（2026-10-28 修「无法渲染透明」）
+    ///
+    /// 玻璃 pass 早前把背景层的 alpha 取成捕获图的 alpha（恒为 1）⇒
+    /// 整窗**不透明**，真实桌面一点都透不出来：玻璃模式与「不透明窗口」
+    /// 在窗口大部分面积上没有区别，任何透明度滑块都失效。
+    ///
+    /// 默认按 [`crate::glass::BG_ALPHA_DEFAULT`] 走，并随
+    /// `window_opacity` 缩放：0.35 意味着捕获底图只占三分之一权重，
+    /// 合成结果与「真桌面 + 一档亮度自适应」等价——看得见桌面，又有
+    /// 可读性兜底。
+    pub bg_alpha: f32,
     /// 尾部填充：把结构体补到 16 的倍数（WGSL uniform 的规则）。
     pub _pad: f32,
 }
@@ -118,12 +156,16 @@ impl Default for GlassUniforms {
             // 默认覆盖度 1：万一某条路径忘了给 alpha，玻璃是**不透明**
             // 而不是「整片透出桌面」——后者会让界面看起来像坏了。
             alphas: [[1.0, 0.0, 0.0, 0.0]; MAX_GLASS_CARDS],
+            radii: [[0.0; 4]; MAX_GLASS_CARDS],
             size: [0.0; 2],
             refract: 0.0,
             dispersion: 0.0,
             edge: 5.0,
-            radius: 8.0,
             count: 0,
+            // 背景层默认**不透明**而不是全透：万一某条路径忘了给
+            // `bg_alpha`，退化成「铺底图」只是不通透，退化成全透会让
+            // 界面看起来像坏了（与 `alphas` 默认 1 同一条理由）。
+            bg_alpha: 1.0,
             _pad: 0.0,
         }
     }
@@ -378,6 +420,11 @@ pub struct GlassParams {
     pub dispersion: f32,
     /// Fresnel 幂次。
     pub edge: f32,
+    /// 背景层的不透明度（0 = 完全透出真实桌面，1 = 铺满捕获底图）。
+    ///
+    /// 见 [`GlassUniforms::bg_alpha`]。由帧循环按 `window_opacity` 算出，
+    /// 默认 [`crate::glass::BG_ALPHA_DEFAULT`]。
+    pub bg_alpha: f32,
     // 覆盖度与底色**不在这里**：它们是逐矩形的（见 `GlassRect`）。
     //
     // 早前这里有一组全局的 `card_alpha` / `tint` / `tint_strength`，由
@@ -405,6 +452,11 @@ impl GlassParams {
             refract: self.refract,
             dispersion: self.dispersion,
             edge: self.edge,
+            bg_alpha: if self.bg_alpha.is_finite() {
+                self.bg_alpha.clamp(0.0, 1.0)
+            } else {
+                crate::glass::BG_ALPHA_DEFAULT
+            },
             ..GlassUniforms::default()
         };
         let n = self.rects.len().min(MAX_GLASS_CARDS);
@@ -414,12 +466,10 @@ impl GlassParams {
             u.rects[i] = [c.x, c.y, h.x, h.y];
             u.tints[i] = [g.tint[0], g.tint[1], g.tint[2], g.tint_strength];
             u.alphas[i] = [g.alpha, 0.0, 0.0, 0.0];
-            // 圆角半径取**第一张**的：同一帧里各面板的圆角通常同源
-            // （都走 `paint` 的圆角常量），差别在一两像素内，而折射
-            // 边缘对圆角误差不敏感（差 1px 只是亮边宽一点）。
-            if i == 0 {
-                u.radius = g.radius * ppp;
-            }
+            // 半径**逐矩形**：顶栏是直角（0），行卡片是 `ROW_RADIUS`，
+            // 面板是 `radius_md`——共用一份会让直角面板把全帧的斜角带
+            // 压成 0（见字段文档）。
+            u.radii[i] = [g.radius * ppp, 0.0, 0.0, 0.0];
         }
         u.count = n as u32;
         u
@@ -497,11 +547,13 @@ mod tests {
     /// 解读——所有参数都变成垃圾，但**不报错**（只表现为「玻璃看起来
     /// 完全不对」）。
     ///
-    /// 1184 = rects 384 + tints 384 + alphas 384 + size 8 + 5×f32 20 + pad 4。
-    /// 改字段时这个数字必须同步改，并回去改 `glass.wgsl` 的 `_pad`。
+    /// 1568 = rects 384 + tints 384 + alphas 384 + radii 384 + size 8
+    /// + refract/dispersion/edge 12 + count 4 + `_pad` 4 + `_pad2` 4。
+    ///
+    /// 改字段时这个数字必须同步改，并回去改 `glass.wgsl` 的 `_pad`/`_pad2`。
     #[test]
     fn uniform_size_is_pinned_to_wgsl_layout() {
-        assert_eq!(std::mem::size_of::<GlassUniforms>(), 1184);
+        assert_eq!(std::mem::size_of::<GlassUniforms>(), 1568);
         // 16 的倍数：WGSL uniform 结构体的 size 必须是最大成员对齐的倍数。
         assert_eq!(std::mem::size_of::<GlassUniforms>() % 16, 0);
     }
@@ -534,6 +586,7 @@ mod tests {
             refract: 0.3,
             dispersion: 0.2,
             edge: 5.0,
+            bg_alpha: crate::glass::BG_ALPHA_DEFAULT,
         };
         let u = params.uniform(1.0, vk::Extent2D { width: 800, height: 600 });
 
@@ -549,6 +602,34 @@ mod tests {
         assert_eq!(u.alphas[0][0], want_row.alpha);
         assert_eq!(u.alphas[1][0], want_bar.alpha);
         assert_eq!(u.count, 2);
+    }
+
+    /// 圆角必须**逐矩形**，不能被「第一张」污染。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// `push_glass_overlay` 把顶栏（直角，半径 0）插到队首。早前 uniform
+    /// 只取第一张的半径 ⇒ 整帧 `radius = 0` ⇒ SDF 内部处处 `d == 0`
+    /// ⇒ 着色器按 `d >= 0` 全部跳过 ⇒ **整窗一个像素都没画玻璃**，
+    /// 只输出模糊底图。症状是「玻璃模式看起来就是磨砂」，且不报错。
+    #[test]
+    fn radius_is_per_rect_not_taken_from_the_first() {
+        let bar = egui::Color32::from_rgb(0x10, 0x12, 0x15);
+        let params = GlassParams {
+            rects: vec![
+                // 队首是直角顶栏（`push_glass_overlay` 的插入位置）。
+                GlassRect::new(Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 44.0)), 0.0, bar, 1.0),
+                // 行卡片：圆角 12。
+                GlassRect::new(Rect::from_min_size(pos2(0.0, 60.0), vec2(200.0, 56.0)), 12.0, bar, 1.0),
+            ],
+            refract: 0.4,
+            dispersion: 0.5,
+            edge: 5.0,
+            bg_alpha: crate::glass::BG_ALPHA_DEFAULT,
+        };
+        let u = params.uniform(1.0, vk::Extent2D { width: 800, height: 600 });
+        assert_eq!(u.radii[0][0], 0.0, "直角面板的半径必须是 0");
+        assert_eq!(u.radii[1][0], 12.0, "行卡片的半径不能被队首的 0 覆盖");
     }
 
     /// `GlassRect::new` 的派生关系：tint 取**非预乘**原色，alpha 取覆盖度。
@@ -570,6 +651,48 @@ mod tests {
         let full = GlassRect::new(Rect::NOTHING, 4.0, egui::Color32::from_rgb(255, 0, 0), 1.0);
         assert!(g.tint_strength < full.tint_strength);
         assert!((full.tint_strength - crate::glass::CARD_TINT_MAX).abs() < 1e-6);
+    }
+
+    /// 背景层必须留出**透出真实桌面**的分量。
+    ///
+    /// # 这条守的是什么（2026-10-28「无法渲染透明效果」）
+    ///
+    /// 背景层的 alpha 早前取 `blurred.a`（GDI 捕获强制 255 ⇒ 恒为 1），
+    /// 于是玻璃 pass 把整窗铺成**不透明底图**：真实桌面一点都透不出来，
+    /// 玻璃模式与不透明窗口在大部分面积上没有区别，透明度滑块全部失效。
+    /// 而它不报任何错——只能靠这条断言钉住。
+    #[test]
+    fn background_alpha_lets_the_desktop_through() {
+        let bar = egui::Color32::from_rgb(0x10, 0x12, 0x15);
+        let params = GlassParams {
+            rects: vec![GlassRect::new(
+                Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 44.0)),
+                0.0,
+                bar,
+                1.0,
+            )],
+            refract: 0.35,
+            dispersion: 0.5,
+            edge: 5.0,
+            bg_alpha: crate::glass::BG_ALPHA_DEFAULT,
+        };
+        let u = params.uniform(1.0, vk::Extent2D { width: 800, height: 600 });
+        assert!(
+            u.bg_alpha > 0.0 && u.bg_alpha < 1.0,
+            "背景层必须半透（留出真实桌面），实际 {}",
+            u.bg_alpha
+        );
+        // 兜底方向是「不透明」而不是「全透」：漏设参数时只是不通透，
+        // 不会让界面看起来像坏了。
+        assert_eq!(
+            GlassUniforms::default().bg_alpha,
+            1.0,
+            "兜底必须是不透明底图"
+        );
+        // 非有限值回落默认档，不能把 NaN 写进 uniform。
+        let mut bad = params;
+        bad.bg_alpha = f32::NAN;
+        assert!(bad.uniform(1.0, vk::Extent2D { width: 8, height: 8 }).bg_alpha > 0.0);
     }
 
     /// 默认值必须「不透明」而不是「全透」。

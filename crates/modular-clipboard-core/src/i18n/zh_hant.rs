@@ -82,7 +82,7 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("In use", "目前"),
     ("Integrated GPU", "整合顯卡"),
     ("Opacity of entry cards; without a background effect they blend into the window fill", "列卡片底色的不透明度；無背景效果時與視窗底色混合"),
-    ("Resolution of the captured desktop; above 100% supersamples, higher costs more", "擷取桌面的解析度；超過 100% 為超取樣，越高越清晰、開銷越大"),
+    ("Percentage of the window size to capture; 100% matches screen pixels exactly, lower costs less", "擷取區域佔視窗尺寸的百分比；100% 與螢幕像素一一對應，越低越省資源"),
     ("Cannot open the image editor:", "無法開啟圖片編輯視窗："),
     ("Capacity and cleanup", "容量與清理"),
     ("Capture", "擷取"),

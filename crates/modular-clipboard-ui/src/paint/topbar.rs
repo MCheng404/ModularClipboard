@@ -49,9 +49,11 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 底色随矩形一起交给玻璃层——顶栏是 `bg`，行卡片是 `card_bg`，
     // 两者不同，不能共用一份全局 tint。
     f.push_glass_overlay(bar, 0.0, bar_bg);
-    // CAUTION: 玻璃模式下**不画**底色（见 `Frame::glass_mode`）——
+    // CAUTION: 玻璃模式下**不画**底色（见 `Frame::glass_covers`）——
     // 画了就把玻璃 pass 的输出整层盖住，顶栏看起来和没开玻璃一样。
-    if !f.glass_mode() {
+    // 判据必须是 `glass_covers()`：弹窗/子窗口配置同样是玻璃却没有
+    // 玻璃 pass 覆盖，那里必须照常画底色，否则整块透出桌面。
+    if !f.glass_covers() {
         painter.rect_filled(bar, CornerRadius::ZERO, bar_bg);
     }
     painter.hline(
@@ -175,7 +177,17 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 拖动区是**累加**而不是赋值：列表（`draw_history_body`）先于顶栏
     // 画，已经 push 了自己的矩形；赋值会把它们全丢掉（左右留白、行间
     // 缝隙都拖不动）。清零在 `draw()` 开头统一做。
-    f.state.drag_regions.extend(drag);
+    //
+    // CAUTION: 必须插到**最前**（`splice(0..0, ..)`），不能 `extend`。
+    //
+    // `chrome::set_drag_regions` 只保留前 `MAX_DRAG_SEGS` 段（截断尾部），
+    // 而列表的「行间缝隙」是**逐行**上报的——可见行数随窗口高度与滚动
+    // 位置浮动，一屏十几行就是十几段。顶栏若排在末尾，段数一到上限
+    // 被截掉的就是它 ⇒ 顶栏恒为 `HTCLIENT`，用户按住顶栏拖不动窗口，
+    // 只有恰好按在行间缝隙/左右留白上才拖得动——「有概率拖不了」的
+    // 手感正来自「行数变化 ⇒ 段数变化 ⇒ 顶栏时有时无」
+    // （2026-10-28 实测：拖动区 14 段，上限 8，顶栏段被截）。
+    f.state.drag_regions.splice(0..0, drag);
 
     let _ = scale;
     icon_resp
@@ -370,7 +382,13 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     // 底色 `surface` 与行卡片 `card_bg` 不同，逐矩形传下去才不会串色。
     f.push_glass_overlay(r, radius, pal.surface);
     // 玻璃模式下底色交给玻璃层（画了就盖住折射）。
-    if !f.glass_mode() {
+    //
+    // CAUTION: 判据是 `glass_covers()` 而不是 `glass_mode()`——搜索面板
+    // 是**独立窗口**，主窗口的玻璃 pass 铺不到它（`push_glass_overlay`
+    // 的 `hit_ns == Main` 闸门会把它拦下）。用全局判据的话，玻璃模式下
+    // 这块面板只剩描边与文字、内部透出桌面（2026-10-28「玻璃有概率不
+    // 渲染」的病根之一）。
+    if !f.glass_covers() {
         painter.rect_filled(r, radius, pal.surface);
     }
     painter.rect_stroke(
@@ -757,7 +775,11 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     let painter = f.ui.painter_at(rail);
     // CAUTION: 玻璃模式下不画底色（会盖住折射），但**描边保留**——
     // 它是按钮组的形状线索，且 1pt 半透明描边不遮挡折射产出。
-    if !f.glass_mode() {
+    //
+    // 判据用 `glass_covers()`：类型栏是独立弹窗，主窗口的玻璃 pass 不
+    // 覆盖它（见 `Frame::glass_covers`）。这一层还额外承担「盖住投影」
+    // ——投影是外扩的实心矩形，少了不透明底，按钮缝隙会透出纯黑。
+    if !f.glass_covers() {
         painter.rect_filled(rail, radius, pal.surface);
     }
     painter.rect_stroke(

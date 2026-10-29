@@ -40,3 +40,8 @@ shot-*.png
 settings_verify_*.png
 scripts/_verify_*.py
 
+
+# 一次性排障脚本与截图（本地确认用，不入库）
+scripts/_*.py
+docs/glass_*.png
+docs/_probe_*.png

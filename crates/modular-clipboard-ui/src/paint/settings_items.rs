@@ -171,7 +171,7 @@ pub(super) enum ItemKind {
     CardBlur,
     /// 磨砂强度档位滑块（1 ~ 10，仅磨砂模式有意义）。
     BlurStrength,
-    /// 抓屏分辨率百分比滑块（15 ~ 200，磨砂与玻璃共用）。
+    /// 抓屏分辨率百分比滑块（15 ~ 100，磨砂与玻璃共用）。
     ///
     /// 独立成变体而不是 `Number`：它写的是 `u8` 百分比，且上下限与
     /// 渲染层的 `CAPTURE_PCT_RANGE` 同源（越界会被渲染层再钳一次）。
@@ -900,7 +900,7 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
             SettingsItem {
                 key: "ui.backdrop_scale",
                 label: msg("Capture resolution"),
-                desc: msg("Resolution of the captured desktop; above 100% supersamples, higher costs more"),
+                desc: msg("Percentage of the window size to capture; 100% matches screen pixels exactly, lower costs less"),
                 kind: ItemKind::BackdropScale,
             },
         ],

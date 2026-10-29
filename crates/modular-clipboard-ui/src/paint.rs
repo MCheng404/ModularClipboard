@@ -1392,9 +1392,31 @@ impl<'a> Frame<'a> {
     /// 合成好了（`GlassRect::new` 的 `fill` 参数），再画一层就是两次
     /// 覆盖——底色 alpha = 1 时玻璃整层被盖死，折射/色散/边缘光全部
     /// 看不见（2026-10-27 行卡片的病根，2026-10-28 推广到 chrome）。
+    ///
+    /// CAUTION: 判断「要不要画底色」请用 [`Self::glass_covers`] 而不是
+    /// 这个方法。见那里的说明——用错会让弹窗与子窗口没有背景。
     pub fn glass_mode(&self) -> bool {
         self.svc.state.config.ui.window_backdrop
             == modular_clipboard_core::config::WindowBackdrop::Glass
+    }
+
+    /// 本窗口**本帧**是否真的会被玻璃 pass 覆盖。
+    ///
+    /// # 为什么不能直接用 [`Self::glass_mode`]（2026-10-28 修「玻璃有概率不渲染」）
+    ///
+    /// 玻璃 pass 是**主窗口独享**的：`Frame::push_glass*` 有
+    /// `hit_ns == Main` 闸门（弹窗/子窗口的坐标属于另一个客户区，混进
+    /// 来会被画到错误位置），而底图铺的也只是主窗口的交换链。
+    ///
+    /// 于是「玻璃模式下不画底色」这条规则**只对主窗口成立**。弹窗（搜索
+    /// 面板 / 类型过滤栏）与卡片子窗口拿到的 `glass_mode()` 同样为真，
+    /// 却没有任何东西替它们铺背景 ⇒ 面板只剩一圈描边与文字，内部透出
+    /// 桌面（深色壁纸上就是一块黑）。而它们是**按需创建、按需开帧**的
+    /// ——用户看到的是「玻璃有时候不渲染」，实际是「弹窗一出现就没底」。
+    ///
+    /// 判据因此必须是「配置是玻璃 **且** 本窗口是主窗口」。
+    pub fn glass_covers(&self) -> bool {
+        self.glass_mode() && matches!(self.hit_ns, HitNs::Main)
     }
 
     /// 玻璃强度（= 「卡片不透明度」滑块，0.3~1.0）。
@@ -4683,6 +4705,47 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
+    /// 顶栏拖动区必须**挤不掉**：段数上限截的是尾，顶栏段得排在前面。
+    ///
+    /// # 这条测试补的是什么缺口
+    ///
+    /// `chrome::set_drag_regions` 只保留前 `MAX_DRAG_SEGS` 段。列表的
+    /// 行间缝隙是**一行一段**，段数随可见行数浮动；顶栏段原来是
+    /// `extend` 上去的（排在末尾），行数一多就被截掉 ⇒ 顶栏恒为
+    /// `HTCLIENT`，按住顶栏拖不动窗口，只有恰好按在行间缝隙/左右留白
+    /// 上才拖得动——用户感知就是「有概率拖不了」（2026-10-28 实测：
+    /// 拖动区 14 段，上限 8）。
+    ///
+    /// 判据直接对着**真实常量**取前 N 段，复刻 `set_drag_regions` 的
+    /// 截断语义，而不是另写一套「应该有几段」的期望值。
+    #[test]
+    fn topbar_drag_region_survives_the_segment_cap() {
+        let cap = modular_clipboard_gfx::chrome::MAX_DRAG_SEGS;
+        // 窄而高的窗口：行数最多 ⇒ 缝隙段最多，最容易把预算吃光。
+        let mut h = Harness::new("drag-cap", vec2(320.0, 1000.0)).with_items(40);
+        h.frame();
+
+        let all = h.state.drag_regions.clone();
+        assert!(!all.is_empty(), "一帧下来总该有拖动区");
+        let top = all
+            .iter()
+            .take(cap)
+            .filter(|d| d.max.y <= crate::solver::TOPBAR_HEIGHT + 0.5)
+            .count();
+        assert!(
+            top >= 1,
+            "前 {cap} 段里没有顶栏段（共 {} 段）⇒ 顶栏会被判成 HTCLIENT，\
+             按住顶栏拖不动窗口：{all:?}",
+            all.len()
+        );
+        // 顶栏段确实排在最前（`splice(0..0, ..)`），不是碰巧挤进去的。
+        assert!(
+            all.first()
+                .is_some_and(|d| d.max.y <= crate::solver::TOPBAR_HEIGHT + 0.5),
+            "顶栏段必须排在首位——截尾语义下只有最前才一定存活：{all:?}"
+        );
+    }
+
     /// 搜索框折叠式：默认折叠、**悬停图标**展开、离开后**延迟**收起。
     ///
     /// 交互契约：
@@ -6998,5 +7061,93 @@ fn with_pinned(mut self, n: usize) -> Self {
             before,
             "非主窗口不得向主窗口的玻璃收集表里写矩形"
         );
+    }
+
+    /// 玻璃 pass 只覆盖主窗口，因此**只有主窗口**能省掉自己的底色。
+    ///
+    /// # 这条守的是什么（2026-10-28「玻璃有概率不渲染」）
+    ///
+    /// 弹窗（搜索面板 / 类型过滤栏）是**独立 HWND**：`push_glass*` 的
+    /// `hit_ns == Main` 闸门会拦下它们，主窗口玻璃 pass 铺的底图也到不了
+    /// 它们的交换链。而底色判据曾写成全局 `glass_mode()` ⇒ 玻璃模式下
+    /// 这些面板**既不画底色、又没有玻璃**——只剩一圈描边与文字，内部
+    /// 整块透出桌面（深色壁纸上就是一块黑）。它们按需创建、按需开帧，
+    /// 于是表现为「玻璃有时候不渲染」。
+    #[test]
+    fn popup_keeps_its_own_background_in_glass_mode() {
+        let mut h = Harness::new("glass-popup-bg", vec2(720.0, 800.0)).with_items(3);
+        h.svc.state.config.ui.window_backdrop =
+            modular_clipboard_core::config::WindowBackdrop::Glass;
+        let panel = Rect::from_min_size(pos2(20.0, 20.0), vec2(300.0, 48.0));
+        let input = h.input(Vec::new());
+        h.clock += 1.0 / 60.0;
+        let mut out = h.ctx.run_ui(input, |ui| {
+            let mut f = Frame {
+                ui,
+                state: &mut h.state,
+                svc: &mut h.svc,
+                ws: &h.ws,
+                pal: &h.pal,
+                scale: 1.0,
+                area: panel,
+                card_id: None,
+                hit_ns: HitNs::Popup(crate::popup::PopupKind::Search),
+            };
+            assert!(f.glass_mode(), "前置条件：配置是玻璃");
+            assert!(
+                !f.glass_covers(),
+                "弹窗是独立窗口，主窗口的玻璃 pass 覆盖不到它"
+            );
+            draw_search_panel(&mut f, panel);
+        });
+        let filled = out.shapes.iter().any(|cs| match &cs.shape {
+            egui::epaint::Shape::Rect(r) => {
+                r.rect.width() >= panel.width() - 1.0 && r.fill != egui::Color32::TRANSPARENT
+            }
+            _ => false,
+        });
+        assert!(
+            filled,
+            "玻璃模式下弹窗必须画自己的底色——否则面板整块透出桌面"
+        );
+        out.textures_delta.clear();
+        drop(std::mem::take(&mut out.shapes));
+    }
+
+    /// `glass_covers` 的身份判据：主窗口为真，其余窗口恒为假。
+    #[test]
+    fn glass_covers_only_the_main_window() {
+        let mut h = Harness::new("glass-covers", vec2(720.0, 800.0)).with_items(1);
+        h.svc.state.config.ui.window_backdrop =
+            modular_clipboard_core::config::WindowBackdrop::Glass;
+        for (ns, want) in [
+            (HitNs::Main, true),
+            (HitNs::Settings, false),
+            (HitNs::Child(crate::card::CardId(1)), false),
+            (HitNs::Popup(crate::popup::PopupKind::Rail), false),
+        ] {
+            let input = h.input(Vec::new());
+            h.clock += 1.0 / 60.0;
+            let mut out = h.ctx.run_ui(input, |ui| {
+                let f = Frame {
+                    ui,
+                    state: &mut h.state,
+                    svc: &mut h.svc,
+                    ws: &h.ws,
+                    pal: &h.pal,
+                    scale: 1.0,
+                    area: h.area,
+                    card_id: None,
+                    hit_ns: ns,
+                };
+                assert_eq!(
+                    f.glass_covers(),
+                    want,
+                    "glass_covers 对 {ns:?} 的判断错了（配置是玻璃）"
+                );
+            });
+            out.textures_delta.clear();
+            drop(std::mem::take(&mut out.shapes));
+        }
     }
 }

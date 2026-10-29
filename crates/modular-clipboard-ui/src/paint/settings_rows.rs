@@ -626,7 +626,10 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
         // 三个滑块全都在推旧值。
         ItemKind::BackdropScale => {
             let cfg = &f.svc.state.config.ui;
-            let mut v = cfg.backdrop_scale;
+            // clamp 而不是直接取配置值：旧配置里可能存着 200（取消超采样
+            // 之前的上限）。滑块区间是 15..=100，传入超范围值会让 egui 的
+            // 步进滑块画出越界把手；显示与写回都按新区间走。
+            let mut v = cfg.backdrop_scale.clamp(15, 100);
             // 只在真的抓屏时才可拖（背景效果 = 无时不抓屏）。这一项在那种
             // 情况下已被 `item_hidden` 整行隐藏，这里的判据是第二道保险：
             // 键盘/自动化路径仍可能把操作送到隐藏行上。
@@ -638,7 +641,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     egui::RichText::new(format!("{v}%")).color(pal.text_dim),
                 ));
                 let (changed, done) =
-                    draw_step_slider_settled(f, ui, it.key, &mut v, 15..=200, enabled);
+                    draw_step_slider_settled(f, ui, it.key, &mut v, 15..=100, enabled);
                 settled = done;
                 changed
             });

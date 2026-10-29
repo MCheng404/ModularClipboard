@@ -63,7 +63,7 @@ pub(crate) use boot::is_sane_window_pos;
 pub(crate) use frame_loop::pick_surface_format;
 pub(crate) use resize::WidthRequest;
 
-use boot::{backdrop_alpha, env_flag};
+use boot::{GLASS_BACKDROP_BASE, backdrop_alpha, env_flag};
 use config_write::{set_bool_field, set_number_field, set_opt_number_field, set_text_field};
 use resize::resize_width_target;
 
@@ -380,14 +380,6 @@ impl App {
         // 无模式用原 palette。
         let backdrop = self.svc.state.config.ui.window_backdrop;
         let opacity = self.svc.state.config.ui.window_opacity;
-        // 玻璃复用磨砂的**背景层**（同一套 alpha 计算），光学层（折射/色散/
-        // Fresnel）由渲染层的玻璃 pass 叠上去。所以这里把它并到 Acrylic 分支。
-        let backdrop_is_glass = backdrop == modular_clipboard_core::config::WindowBackdrop::Glass;
-        let backdrop = if backdrop_is_glass {
-            modular_clipboard_core::config::WindowBackdrop::Acrylic
-        } else {
-            backdrop
-        };
         // 卡片不透明度：把行卡片底色的 alpha 与 RGB 同比例降下来
         // （`gamma_multiply` 是预乘语义，只降 alpha 会偏色）。
         //
@@ -431,11 +423,18 @@ impl App {
                 plain_card_pal = self.pal.with_card_opacity(card_alpha);
                 &plain_card_pal
             }
-            // 值永远不会到这里：上方已把玻璃并入 Acrylic。Rust 的穷尽性
-            // 检查基于**类型**而非值，所以必须显式写这个分支。
-            modular_clipboard_core::config::WindowBackdrop::Glass => unreachable!(
-                "背景玻璃已在上方并入 Acrylic，不该走到这里"
-            ),
+            // 玻璃：光学层（折射 / 色散 / Fresnel）由渲染层的玻璃 pass 叠
+            // 上，这里只管**背景层该多实**——而且必须比磨砂**更透**，
+            // 见 [`GLASS_BACKDROP_BASE`]。
+            modular_clipboard_core::config::WindowBackdrop::Glass => {
+                let base = opacity.clamp(0.3, 1.0) * GLASS_BACKDROP_BASE;
+                let alpha = backdrop_alpha(base, self.backdrop_lum, is_dark);
+                backdrop_pal = self
+                    .pal
+                    .with_backdrop_alpha(alpha)
+                    .with_card_opacity(card_alpha);
+                &backdrop_pal
+            }
         };
 
         {
@@ -1695,6 +1694,37 @@ mod tests {
         assert!(
             dark_on_white > dark_on_black + 60,
             "暗色配白底({dark_on_white}) 应明显比配黑底({dark_on_black}) 更实"
+        );
+    }
+
+    /// 玻璃的背景层必须比磨砂**明显更透**。
+    ///
+    /// # 这条守的是什么
+    ///
+    /// 玻璃曾与磨砂共用 `base = window_opacity × 0.6`（「玻璃并入 Acrylic」
+    /// 那行注释）。于是玻璃模式下背景层不透明度约 0.6~0.9，底图只透出
+    /// 一成到四成——`fs_glass` 铺的清晰桌面被一层灰纱盖住，玻璃模式与
+    /// 磨砂模式在窗口大部分面积上**看不出差别**（2026-10-28 用户报
+    /// 「背景玻璃没渲染」）。
+    #[test]
+    fn glass_backdrop_is_clearer_than_frosted() {
+        // 中间亮度、浅色主题：两种模式的典型工况。
+        let frosted = backdrop_alpha(0.6, Some(0.5), false);
+        let glass = backdrop_alpha(GLASS_BACKDROP_BASE, Some(0.5), false);
+        assert!(
+            glass + 25 < frosted,
+            "玻璃背景层 {glass} 应明显比磨砂 {frosted} 更透（差 ≥25/255）"
+        );
+        // 但也不能透到没底：卡片区之外的文字仍要落在可见的背景上。
+        assert!(
+            glass >= (0.30_f32 * 255.0).round() as u8,
+            "玻璃背景层 {glass} 低于下限，文字会直接压在桌面上"
+        );
+        // 最坏情况（浅色主题压纯黑桌面）仍要被推回可读区间。
+        let worst = backdrop_alpha(GLASS_BACKDROP_BASE, Some(0.0), false);
+        assert!(
+            worst > glass,
+            "明暗冲突时玻璃背景层也该上调实度（{worst} vs {glass}）"
         );
     }
 

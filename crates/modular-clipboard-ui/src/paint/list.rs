@@ -57,6 +57,16 @@ pub(super) fn first_visible_row(offsets: &[f32], heights: &[f32], scroll: f32) -
         .count()
 }
 
+/// 单个列表最多上报多少段「行间缝隙」拖动区。
+///
+/// 缝隙是一行一段的，段数随可见行数浮动；不设上限的话，高窗口 +
+/// 短行可以把 `chrome::MAX_DRAG_SEGS` 的预算吃光，把顶栏 / 左右留白 /
+/// 底部空白这些**更该拖得动**的段挤出去（截尾语义）。
+///
+/// 8 段足够覆盖首屏（用户够得着的就那几条缝），剩下的留给优先级更高
+/// 的段。与顶栏「插到最前」一起构成双保险，见 `draw_topbar` 的注释。
+const GAP_SEG_BUDGET: usize = 8;
+
 pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
     // 自报列表可视区。
     //
@@ -532,6 +542,16 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
                 }            }
 
             // ---- 第二遍：缝隙拖动区 + 行内容 ----
+            //
+            // CAUTION: 缝隙段必须有**预算**（`GAP_SEG_BUDGET`）。
+            //
+            // 它们是一行一段的，数量随可见行数浮动；而
+            // `chrome::set_drag_regions` 只保留前 `MAX_DRAG_SEGS` 段
+            // （截尾），最多缝隙的那一帧会把优先级更高的段（顶栏、
+            // 列表左右留白、底部空白）全部挤出预算——2026-10-28「主窗口
+            // 有概率拖不动」就是这样来的。设了预算，总段数就不再随行数
+            // 失控，且与顶栏段的「插到最前」一起构成双保险。
+            let mut gap_segs = 0usize;
             for (k, i, r) in frames {
                 // ---- 卡片缝隙 = 拖动区 ------------------------------------
                 // 卡片与卡片之间的空白横带（含首行顶部的半条缝）同样上报
@@ -545,11 +565,12 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
                 // 滑块旁按住会同时命中两个区域。
                 let gap_top = if i == 0 { content.min.y } else { r.min.y - row_gap };
                 let gap_bottom = r.min.y.min(content.max.y);
-                if gap_bottom > gap_top {
+                if gap_bottom > gap_top && gap_segs < GAP_SEG_BUDGET {
                     f.state.drag_regions.push(Rect::from_min_max(
                         pos2(content.min.x, gap_top.max(content.min.y)),
                         pos2(content.max.x - SCROLLBAR_RESERVE - SCROLLBAR_GAP, gap_bottom),
                     ));
+                    gap_segs += 1;
                 }
                 draw_item_row(f, ui, r, &visible[k]);
             }
