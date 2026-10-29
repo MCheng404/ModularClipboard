@@ -216,13 +216,6 @@ impl Workspace {
         self.cards.iter().filter(|c| c.host == CardHost::Window)
     }
 
-    /// 把卡片移到Z 序的某一层（`to_front` 传卡片当前索引）。
-    pub fn raise(&mut self, index: usize) {
-        if index + 1 < self.cards.len() {
-            let c = self.cards.remove(index);
-            self.cards.push(c);
-        }
-    }
 
     /// 把卡片上移一层。返回是否真的移动了。
     pub fn move_up(&mut self, index: usize) -> bool {

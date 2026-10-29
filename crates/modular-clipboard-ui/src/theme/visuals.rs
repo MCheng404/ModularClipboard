@@ -211,7 +211,7 @@ pub(super) fn other_theme(t: egui::Theme) -> egui::Theme {
 /// 解析主题并灌入 egui，返回生效的调色板。
 ///
 /// 这是上层只需调用的一句入口：拿到返回值即可用于自绘。
-/// 读取 `dark_mode` 时应传 [`crate::app::UiLocal`] 之外已解析的
+/// 读取 `dark_mode` 时应传 `crate::app::UiLocal` 之外已解析的
 /// `Option<bool>`；`None` 表示跟随系统。
 pub fn set_theme(ctx: &egui::Context, mode: ThemeMode) -> Palette {
     let system = detect_system_theme();
@@ -222,7 +222,7 @@ pub fn set_theme(ctx: &egui::Context, mode: ThemeMode) -> Palette {
 
 /// source-over alpha 合成：把半透明 `fg` 叠在不透明 `bg` 上，返回不透明色。
 ///
-/// 委托给 [`egui::Color32::blend`]——[`Color32`] 内部按**预乘 alpha**
+/// 委托给 [`egui::Color32::blend`]——`Color32` 内部按**预乘 alpha**
 /// 存储（`r()` 返回的是预乘后的通道），手写 `f*a + b*(1-a)` 会把
 /// alpha 算两遍，得到偏深的错误结果。合成语义与 egui 实际绘制一致，
 /// 这点很关键：对比度必须针对**真正画出来的那个像素**计算。

@@ -57,7 +57,7 @@ pub fn icon_font_data() -> egui::FontData {
 ///
 /// # 校准方法
 ///
-/// 不是拍脑袋，是 [`tests::report_ink_geometry`] 在 16 / 32 / 64 三个字号下
+/// 不是拍脑袋，是 `tests::report_ink_geometry` 在 16 / 32 / 64 三个字号下
 /// 实测「墨迹中心 − 框心」的均值，取其反号。换字号时因为补偿正比于字号，
 /// 三个字号会同时收敛—— 单个字号碰巧居中不算数。
 pub const BASELINE_FACTOR: f32 = 0.0553;

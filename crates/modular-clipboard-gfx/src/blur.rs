@@ -334,10 +334,6 @@ impl BlurChain {
         })
     }
 
-    /// 本帧实际要用几级降采样链（受已建资源上限约束）。
-    pub fn usable_levels(&self, want: usize) -> usize {
-        want.min(self.mips.len())
-    }
 
     /// 尺寸是否与给定全分辨率一致。
     pub fn matches(&self, full_extent: vk::Extent2D, divisor: u32) -> bool {

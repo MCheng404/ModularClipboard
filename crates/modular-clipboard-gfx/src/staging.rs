@@ -225,12 +225,12 @@ const FREE: u64 = u64::MAX;
 ///    [`StagingArena::retire`] 查询栅栏确认，**不靠帧号差值猜测**。
 ///    猜测会在某帧栅栏没等到时静默覆写GPU 正在读的数据。
 /// 3. 块数 ≥ 在飞帧数（初始块数之外还可能在单帧上传量超预期时**追加**，
-///    见 [`StagingArena::push_chunk`]）。
+///    见 `StagingArena::push_chunk`）。
 ///
 /// # 逻辑与资源分离
 ///
 /// 「该复用哪一块/ 该扩容哪一块」这层**决策**是纯逻辑，不碰 Vulkan 对象，
-/// 因此可在单测里由 [`ArenaDecider`] 直接驱动，无需真实 GPU。
+/// 因此可在单测里由 `ArenaDecider` 直接驱动，无需真实 GPU。
 /// 真正建缓冲的动作只发生在 [`StagingArena::allocate`] 里。
 pub struct StagingArena<'a> {
     gpu: &'a Gpu,
@@ -246,7 +246,7 @@ impl<'a> StagingArena<'a> {
     /// 建成，避免小图集场景白占 12 MiB 主机可见内存。
     ///
     /// 这只是**初始**块数：单帧上传量超过它时 `allocate` 会追加新块
-    /// （见 [`StagingArena::push_chunk`]），不会因此失败。
+    /// （见 `StagingArena::push_chunk`），不会因此失败。
     pub fn new(gpu: &'a Gpu, frame_count: usize) -> anyhow::Result<Self> {
         anyhow::ensure!(frame_count > 0, "staging 块数必须大于 0");
         let chunks = (0..frame_count)
@@ -309,9 +309,9 @@ impl<'a> StagingArena<'a> {
     ///   确认 GPU 读完）才会被本帧接管。
     /// - **在途**的块（属于别的帧）默认不复用；只有当 arena 里连一块
     ///   空闲都没有时，才**等最老那块的在途栅栏 signal 后接管**
-    ///   （见 [`StagingArena::wait_and_reclaim_oldest`]）；连可等的块都
+    ///   （见 `StagingArena::wait_and_reclaim_oldest`）；连可等的块都
     ///   没有（首帧，全部块都属于当前帧）就**新加一块**
-    ///   （见 [`StagingArena::push_chunk`]）。等 = 让出 CPU 掉一帧，
+    ///   （见 `StagingArena::push_chunk`）。等 = 让出 CPU 掉一帧，
     ///   加块 = 多占一份显存，报错 = 界面进程启动失败——2026-10-17 起
     ///   只选前两者。
     ///
@@ -733,16 +733,16 @@ pub enum ArenaPlan {
     /// [`StagingArena::allocate`] 是**三级兜底**、永不失败：
     ///
     /// 1. 本帧已占用的块（追加）→ 真正空闲的块（`owner_frame == FREE`）；
-    /// 2. 都没有 ⇒ [`StagingArena::wait_and_reclaim_oldest`]：等**最老**
+    /// 2. 都没有 ⇒ `StagingArena::wait_and_reclaim_oldest`：等**最老**
     ///    在途块的栅栏（2s 超时）后接管它；
     /// 3. 连可等的都没有（首帧全部块属当前帧且未提交）⇒
-    ///    [`StagingArena::push_chunk`] 新加一块（块表只增不减，收敛到
+    ///    `StagingArena::push_chunk` 新加一块（块表只增不减，收敛到
     ///    单帧峰值）。
     ///
     /// 理由：上传是**观感增强**（缩略图 / 字体图集 / 磨砂底图），它没有
     /// 让程序启动失败的权限。
     ///
-    /// 这个变体**只由测试替身 [`ArenaDecider`] 产出**——它保留了
+    /// 这个变体**只由测试替身 `ArenaDecider` 产出**——它保留了
     /// 「所有块都在途」这一真实存在（但已被兜底覆盖）的状态，让单测能
     /// 断言决策器的选择规则，而不必假装生产代码会失败。
     Blocked { chunk: usize, owner_frame: u64 },

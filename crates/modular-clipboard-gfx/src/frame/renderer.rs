@@ -149,14 +149,17 @@ struct Pending {
     frame: AcquiredFrame,
     /// 使用的帧槽位下标。
     slot: usize,
-    suboptimal: bool,
+    // 这里**不存** acquire 的 `suboptimal` 标志：它唯一的作用是「提示重建
+    // 交换链」，而 `present` 侧的同类结果已经映射成
+    // `PresentResult::Outdated`（见 `map_present_result`），上层据此重建。
+    // 早前存了一份却无人读——「两个信号源、只消费一个」正是漏处理的温床。
 }
 
 impl<'a> FrameRenderer<'a> {
     /// 创建帧渲染器并建立初始交换链。
     ///
     /// 尺寸取自表面能力的 `current_extent`（Windows 上恒为有效值），
-    /// 不可用时退化为 [`FALLBACK_EXTENT`]。窗口尺寸确定后调用方应主动
+    /// 不可用时退化为 `FALLBACK_EXTENT`。窗口尺寸确定后调用方应主动
     /// [`FrameRenderer::rebuild_swapchain`] 一次。
     ///
     /// `pipeline_bundle` 的渲染通道格式必须与表面选中的格式一致，
@@ -395,10 +398,6 @@ impl<'a> FrameRenderer<'a> {
             .map(|s| s.command_buffer)
     }
 
-    /// acquire 是否返回了 suboptimal（画面能出，但表面已不匹配）。
-    pub fn last_acquire_was_suboptimal(&self) -> bool {
-        self.pending.as_ref().is_some_and(|p| p.suboptimal)
-    }
 
     /// 设置清屏颜色（线性空间 RGBA）。
     pub fn set_clear_color(&mut self, rgba: [f32; 4]) {
@@ -817,10 +816,12 @@ impl<'a> FrameRenderer<'a> {
 
         self.cursor += 1;
         self.open_command_buffer(slot, &frame)?;
+        // `suboptimal` 只在这里用来判断「是否需要立刻重建」——交给 present
+        // 侧统一处理（见 `Pending` 的注释）。
+        let _ = suboptimal;
         self.pending = Some(Pending {
             frame: frame.clone(),
             slot,
-            suboptimal,
         });
         Ok(Some(frame))
     }
@@ -1156,7 +1157,7 @@ impl<'a> FrameRenderer<'a> {
     ///
     /// 必须在 [`FrameRenderer::acquire`] 成功之后、
     /// [`FrameRenderer::present`] 之前调用。若该槽位的命令缓冲仍在GPU
-    /// 执行中，返回错误而非静默重复录制（见 [`FrameSlot::in_flight`]）。
+    /// 执行中，返回错误而非静默重复录制（见 `FrameSlot::in_flight`）。
     pub fn record_texture_upload(
         &mut self,
         image: &mut crate::texture::DeviceImage,

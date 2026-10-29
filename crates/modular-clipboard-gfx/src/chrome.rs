@@ -18,7 +18,7 @@
 //! 系统拿到的返回值是 0（`HTNOWHERE`），命中测试静默失效——
 //! 表现为「无边框窗口哪都拖不动、哪都拉不动」，且不报任何错。
 //!
-//! 所以 [`handle_non_client`] 从 `wnd_proc` 调用，
+//! 所以 `handle_non_client` 从 `wnd_proc` 调用，
 //! `poll()` 对 `WM_NCHITTEST` **不做任何事**（照常 `DispatchMessageW`）。
 //!
 //! # 拖动方案：命中测试仍借系统，移动由我们自己驱动（非模态）
@@ -32,7 +32,7 @@
 //! 于是窗口在动、**背景磨砂却停在拖动开始前那一帧**：自研磨砂每帧都要
 //! 重新抓取窗口身后的桌面，帧循环一停，捕获内容就过期。
 //!
-//! 因此 [`handle_non_client`] 拦截 `WM_NCLBUTTONDOWN(HTCAPTION)`：
+//! 因此 `handle_non_client` 拦截 `WM_NCLBUTTONDOWN(HTCAPTION)`：
 //! 不转发 `DefWindowProcW`（杜绝模态循环），改用 `SetCapture` 接管指针；
 //! 随后的 `WM_NCMOUSEMOVE` / `WM_MOUSEMOVE` 走**普通消息队列**，
 //! 我们在其中按光标位移 `SetWindowPos` 移动窗口。这样主帧循环每轮照常
@@ -49,7 +49,7 @@
 //!
 //! ## 光标指示：WM_SETCURSOR + 帧循环防覆盖
 //!
-//! resize 边/角的光标由本模块在 [`handle_non_client`] 里显式接管
+//! resize 边/角的光标由本模块在 `handle_non_client` 里显式接管
 //! （`WM_SETCURSOR` 分支按命中码设 `IDC_SIZEWE` / `IDC_SIZENS` 等）。
 //! 两层原因：无 `WS_THICKFRAME` 的 `WS_POPUP` 窗口上，系统默认
 //! 处理不保证显示 resize 光标；且主窗口帧循环每帧都会用 egui 的

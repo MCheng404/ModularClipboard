@@ -5,7 +5,7 @@ use serde::Serialize;
 
 /// 存储与保留策略。
 ///
-/// NOTE: 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。没有它，
+/// NOTE: 容器级 `#[serde(default)]`：语义同 `Hotkey`。没有它，
 /// 新增一个容量字段就会让旧配置整体失效，用户的保留策略被默认值覆盖。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -33,7 +33,7 @@ impl Default for StorageConfig {
 
 /// 捕获行为。
 ///
-/// IMPORTANT: 容器级 `#[serde(default)]`：语义同 [`Hotkey`]。这一条尤其关键——
+/// IMPORTANT: 容器级 `#[serde(default)]`：语义同 `Hotkey`。这一条尤其关键——
 /// `blocked_apps` 是用户的**安全边界**（密码管理器名单）。缺了它，
 /// 一次无关的格式调整就会让名单退回代码默认值，
 /// 用户的自定义屏蔽项被静默丢弃，且用户以为自己仍有屏蔽保护。

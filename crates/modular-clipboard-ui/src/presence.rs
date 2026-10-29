@@ -23,7 +23,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow, SetWindowPos,
-    ShowWindow, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SW_HIDE, SW_MINIMIZE,
+    ShowWindow, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SW_HIDE,
     SW_RESTORE, IDC_ARROW, IDC_IBEAM, IDC_HAND,
 };
 use windows::core::PCWSTR;
@@ -116,7 +116,7 @@ pub enum CloseDecision {
 ///
 /// `gfx::window` 把两者都翻译成同一个 `WindowEvent::CloseRequested`
 /// （刻意如此：它不替应用决定去留）。区分依据是
-/// [`gfx::window::EventLoop::quit_requested`],它**只在** `WM_QUIT` 时置位。
+/// `gfx::window::EventLoop::quit_requested`,它**只在** `WM_QUIT` 时置位。
 /// 纯逻辑层因此把该标志作为独立入参——若靠「事件类型」判断，
 /// 就必须去读 `EventLoop` 的内部状态，测不了。
 ///
@@ -426,7 +426,7 @@ pub fn hide_window(hwnd: HWND) {    if !unsafe { IsWindow(Some(hwnd)) }.as_bool(
 ///    egui 0.36 没有 `Resize*` 系列变体，指针悬停在边缘时它报
 ///    `Default`；直接套用下面的映射会把它覆盖回箭头——
 ///    这正是「调整窗口大小时无任何光标指示」的根因。
-///    缩放光标由 `chrome` 模块（`WM_SETCURSOR` + [`shell_cursor_id`]）
+///    缩放光标由 `chrome` 模块（`WM_SETCURSOR` + `shell_cursor_id`）
 ///    决定，这里只负责把外壳没接管的客户区光标映射成 Win32 资源。
 ///
 /// 设置窗口/主窗口的客户区光标（egui 形状 → Win32 资源 ID）。
@@ -447,7 +447,7 @@ pub fn hide_window(hwnd: HWND) {    if !unsafe { IsWindow(Some(hwnd)) }.as_bool(
 ///
 /// 现在**无条件 `SetCursor`**。两道天然闸门已经够用，不会互相抢：
 ///
-/// - [`chrome::pointer_is_over`]：指针不在本窗口上时本函数直接返回，
+/// - `chrome::pointer_is_over`：指针不在本窗口上时本函数直接返回，
 ///   不会碰全局光标（所以两个窗口的帧循环同时跑也不会打架）；
 /// - `SetCursor` 只是设置**线程光标句柄**，同值设置系统会立刻返回，
 ///   125Hz 的调用没有实际开销。
@@ -679,14 +679,6 @@ unsafe fn set_layered(hwnd: HWND, on: bool) -> windows::core::Result<()> {
     Ok(())
 }
 
-pub fn minimize_window(hwnd: HWND) {
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
-        tracing::warn!("最小化失败：主窗口句柄已失效");
-        return;
-    }
-    let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
-    tracing::info!("窗口已最小化");
-}
 
 #[cfg(test)]
 mod tests {

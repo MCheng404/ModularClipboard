@@ -7,7 +7,7 @@ use serde::Serialize;
 ///
 /// NOTE: 容器级 `#[serde(default)]`：字段缺失时用 `Hotkey::default()` 补齐。
 /// 缺了它，任何新增字段都会让旧config.json 解析失败，
-/// 而 [`Config::load`] 会静默回退默认值——用户的快捷键**直接消失**。
+/// 而 `Config::load` 会静默回退默认值——用户的快捷键**直接消失**。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Hotkey {

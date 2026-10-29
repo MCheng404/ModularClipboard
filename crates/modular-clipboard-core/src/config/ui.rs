@@ -36,7 +36,7 @@ pub(super) fn default_idle_exit_secs() -> u32 {
 
 /// UI 偏好。
 ///
-/// NOTE: 容器级 `#[serde(default)]`：语义同 [`Config`]。下面若干字段另有
+/// NOTE: 容器级 `#[serde(default)]`：语义同 `Config`。下面若干字段另有
 /// 字段级标注（历史原因），容器级这条保证**将来新增**的字段也不会
 /// 再触发整体回退——字段级标注管不到新字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,7 +93,7 @@ pub struct UiConfig {
     ///
     /// NOTE: `#[serde(default)]` 不是可选的：没有它，serde 会要求这个
     /// 字段**必须存在**，于是任何旧版config.json 解析失败，
-    /// [`Config::load`] 静默回退到 `Config::default()`——
+    /// `Config::load` 静默回退到 `Config::default()`——
     /// 用户的窗口尺寸、主题、屏蔽名单**全部被抹掉**，且没有任何提示。
     #[serde(default)]
     pub layout: Option<LayoutConfig>,

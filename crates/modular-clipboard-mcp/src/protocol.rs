@@ -48,17 +48,16 @@ pub struct RpcError {
 }
 
 /// JSON-RPC 标准错误码。
+///
+/// 只定义**实际会发**的两个：解析失败（-32700）与方法不存在（-32601）。
+/// 参数错误与内部错误按 MCP 约定走 `tools/call` 的 `isError: true`
+/// （业务级错误，不中断 JSON-RPC），因此不定义 `INVALID_PARAMS` /
+/// `INTERNAL_ERROR`——定义了也没人发，只会让读者以为存在另一条错误路径。
 pub mod code {
     /// 服务端收到无法解析的 JSON。
     pub const PARSE_ERROR: i32 = -32700;
-    /// 发送的不是合法 Request 对象。
-    pub const INVALID_REQUEST: i32 = -32600;
     /// 方法不存在 / 未实现。
     pub const METHOD_NOT_FOUND: i32 = -32601;
-    /// 方法参数无效。
-    pub const INVALID_PARAMS: i32 = -32602;
-    /// 方法内部错误。
-    pub const INTERNAL_ERROR: i32 = -32603;
 }
 
 impl Message {

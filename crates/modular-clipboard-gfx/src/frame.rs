@@ -38,7 +38,7 @@
 //!
 //! # 布局转换为什么必须逐图像跟踪
 //!
-//! 交换链的图像在两次 [`acquire_next_image`] 之间**不会**被重置布局——
+//! 交换链的图像在两次 `acquire_next_image` 之间**不会**被重置布局——
 //! 上一帧结束时它们停在 `PRESENT_SRC_KHR`，下次 acquire 拿到的可能还是
 //! 同一张。因此不能用 `UNDEFINED` 一刀切，必须为每张图像单独记当前布局。
 //! 见 [`LayoutTracker`]。
@@ -166,7 +166,7 @@ pub enum PresentResult {
     /// 该**图像**的信号量可以安全复用——但复用的前提是**重新 acquire
     /// 到同一image_index**，而不是「槽位轮转回来了」。
     /// 呈现信号量按图像分配正是为此，见
-    /// [`FrameRenderer::image_semaphores`]。
+    /// `FrameRenderer::image_semaphores`。
     Presented,
     /// **不能继续用本帧的槽位**，调用方必须重建交换链后再 acquire。
     ///

@@ -78,7 +78,7 @@ pub enum Request {
     Cmd(Command),
 }
 
-/// 业务命令。与 [`modular_clipboard_app::Service`] 的方法一一对应。
+/// 业务命令。与 `modular_clipboard_app::Service` 的方法一一对应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // `large_enum_variant`：这些类型是**跨进程消息**，一次构造一次消费，
 // 不驻留在集合里。装箱大变体只会多一次堆分配，换不来任何收益；

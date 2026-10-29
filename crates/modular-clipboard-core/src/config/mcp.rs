@@ -5,7 +5,7 @@ use serde::Serialize;
 
 /// 动作规则：当条目匹配条件时，可一键执行的动作。
 ///
-/// 这是「软件联动」的扩展点。新增动作只需实现 [`Action`] trait 并注册，
+/// 这是「软件联动」的扩展点。新增动作只需实现 `Action` trait 并注册，
 /// 不需要改动捕获、存储或界面的任何代码。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ActionRule {
@@ -17,7 +17,7 @@ pub struct ActionRule {
     /// 匹配到的条目类型，`None` 表示不限。
     #[serde(default)]
     pub kind: Option<crate::item::ClipKind>,
-    /// 动作标识，交由 [`ActionRegistry`] 解析为具体实现。
+    /// 动作标识，交由 `ActionRegistry` 解析为具体实现。
     pub action: String,
     /// 动作参数，例如命令行模板 `{selection}`。
     #[serde(default)]
@@ -34,7 +34,7 @@ pub struct ActionRule {
 /// `enabled=false` 时所有 MCP 调用不可用；其余 8 个布尔字段是
 /// **逐项可调用开关**，默认全部开启。
 ///
-/// NOTE: 容器级 `#[serde(default)]`：语义同 [`Hotkey`]——缺字段时用
+/// NOTE: 容器级 `#[serde(default)]`：语义同 `Hotkey`——缺字段时用
 /// 默认值补齐，不会让旧 config.json 整体失效。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,7 +96,7 @@ impl Default for McpConfig {
 /// NOTE: 容器级 `#[serde(default)]`：**这是整个配置文件的最后一道防线**。
 ///
 /// 没有它，任意一个子结构新增字段 → serde 报 "missing field" →
-/// [`Config::load`] 静默回退 `Config::default()` → 用户的窗口尺寸、
+/// `Config::load` 静默回退 `Config::default()` → 用户的窗口尺寸、
 /// 主题、快捷键、屏蔽名单**一次性全部归零**，且界面上没有任何提示
 /// （只有一行 `tracing::warn`）。有了它，缺失字段由各自结构的
 /// `Default` 补齐，其余字段**原样保留**。

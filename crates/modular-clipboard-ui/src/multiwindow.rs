@@ -23,7 +23,7 @@
 //! | [`Gpu`] | **共享** | Vulkan 设备/队列/内存分配器，创建代价高 |
 //! | [`PipelineBundle`] | **共享** | 管线与渲染通道与窗口无关 |
 //! | [`FrameRenderer`] | **每窗独有** | 交换链/帧缓冲绑定窗口尺寸 |
-//! | [`Painter`] | **每窗独有** | 见下方「为什么不共享 Painter」 |
+//! | `Painter` | **每窗独有** | 见下方「为什么不共享 Painter」 |
 //!
 //! # 为什么不共享 `Painter`
 //!
@@ -259,13 +259,6 @@ impl<'a> WindowGfx<'a> {
         })
     }
 
-    /// 客户区尺寸为 0（最小化 / 被 resize 到 0）时返回 true。
-    ///
-    /// 此时不能acquire——交换链拿不到可呈现的图像。
-    pub fn is_degenerate(&self) -> bool {
-        let (w, h) = self.extent();
-        w == 0 || h == 0
-    }
 
     /// 当前交换链尺寸。
     pub fn extent(&self) -> (u32, u32) {

@@ -11,7 +11,7 @@
 //!
 //! 所以这里的规则是硬的：
 //!
-//! 1. **矩形只从 [`Card::rect`] 读**，不在这里算宽度、不做降级判断。
+//! 1. **矩形只从 `Card::rect` 读**，不在这里算宽度、不做降级判断。
 //! 2. **每张停靠卡片都必须被画**——折叠的画成把手，展开的画成卡片，
 //!    没有「要不要画」这种分支。
 //! 3. **任何文字都必须 `painter_at(所属矩形)`**。`ui.painter()` 是根
@@ -593,7 +593,7 @@ pub enum SearchOpenCause {
 /// 编辑前的**原文备份**（撤销按钮的数据源，单级）。
 ///
 /// 只存「还原所需的最小集」：kind + 载荷字节 + 尺寸。预览文案在
-/// 还原时由 `Service::update_content` 按 [`build_preview`] 同款规则
+/// 还原时由 `Service::update_content` 按 `build_preview` 同款规则
 /// 重建，不备份——两处各存一份文案必然漂移。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditBackup {
@@ -630,7 +630,7 @@ pub struct UiState {
     pub type_filter_multi: std::collections::BTreeSet<modular_clipboard_core::ClipKind>,
     /// 通知弹窗的面板矩形（主窗口客户区坐标，y 可为负 = 窗口上方）。
     ///
-    /// 由 [`draw_notice_toast`] 每帧算好——文字宽度要用**主窗口 ctx**
+    /// 由 `draw_notice_toast` 每帧算好——文字宽度要用**主窗口 ctx**
     /// 的字体度量，而弹窗定位发生在 `drive_attach_windows`（那里没有
     /// painter）。两个模式都算：toast 模式算了不用（成本一次文本排版，
     /// 仅通知存续期间发生），换来切换设置的那一帧几何就是对的。
@@ -675,18 +675,18 @@ pub struct UiState {
     ///
     /// 破坏性操作（清空全部历史）从「单击即触发」改成「长按 5 秒」，
     /// 防误触。动画（摇晃 + 渐红）按 `elapsed() / 5s` 推进，
-    /// 见 [`draw_clear_button`]。
+    /// 见 `draw_clear_button`。
     pub clear_hold_start: Option<std::time::Instant>,
     /// 本次检查到的更新是否**已经弹过**面板。
     ///
     /// 没有它的话，状态停在 `Outdated` 就会每帧重开一次面板——用户
     /// 点掉还会再弹回来。弹过就置位，下次「检查更新」拿到新的
-    /// `Outdated` 时由 [`draw_update_popup`] 的调用方重置。
+    /// `Outdated` 时由 `draw_update_popup` 的调用方重置。
     pub update_popup_shown: bool,
     /// 类型栏**实测**面板尺寸（上一帧弹窗绘制时量的，逻辑点）。
     ///
     /// 为什么需要它：`labels`（按钮带文字）下面板尺寸取决于文字宽度，
-    /// 而 [`FloatLayout::compute`] 是无 ctx 的纯函数，排不出文字。
+    /// 而 `FloatLayout::compute` 是无 ctx 的纯函数，排不出文字。
     /// 由 `draw_type_rail` 量好后写这里，布局侧下一帧按它定弹窗尺寸
     /// （首帧用估算值，一帧内修正）。`None` = 还没量过。
     pub rail_panel_size: Option<Vec2>,
@@ -765,7 +765,7 @@ pub struct UiState {
     ///
     /// 2026-10-17 改：原先与 `thumb_tex` 一起 retain，结果滚出屏就丢
     /// ——而行高缓存以它的 `len()` 作为失效判据之一（见
-    /// [`RowHeightCache::dims_known`]），丢一次就让整份行高缓存失效一次，
+    /// `RowHeightCache::dims_known`），丢一次就让整份行高缓存失效一次，
     /// 滚动时等于每帧重算全部行高。尺寸一条只有 16 字节，常驻更划算，
     /// 而且它是**行高**的输入：老条目（`payload.dims` 缺失）全靠它排图。
     pub thumb_dims: std::collections::HashMap<modular_clipboard_core::EntryId, (u32, u32)>,
@@ -799,7 +799,7 @@ pub struct UiState {
     /// 打字）绝不能覆写，否则输一个字符就被打回原色。
     ///
     /// 打字中途的非法输入（如只敲了 `#F`）不清除已选颜色：
-    /// [`AccentColor::from_hex`] 返回 `None` 时保持原值。
+    /// `AccentColor::from_hex` 返回 `None` 时保持原值。
     pub accent_hex: String,
     /// 「高级微调」令牌编辑器是否展开（默认收起）。
     ///
@@ -857,7 +857,7 @@ pub struct UiState {
     pub search_hover_suppressed: bool,
     /// 搜索面板**本次展开**的时刻（`input.time` 秒）。
     ///
-    /// 展开后给一段宽限期（[`SEARCH_OPEN_GRACE`]），期间不判折叠。
+    /// 展开后给一段宽限期（`SEARCH_OPEN_GRACE`），期间不判折叠。
     /// 起因（2026-10-19 用户反馈「点一下搜索，闪一下就关闭」）：点击
     /// 展开的那几帧里，焦点还没从弹窗回报回来、指针又可能已经离开图标
     /// ⇒ 折叠条件短暂全部成立，0.35s 宽限一到面板就自己收回去。
@@ -871,7 +871,7 @@ pub struct UiState {
     /// 不抢焦点、用户点到列表/别的应用时 egui 内存里输入框**仍然持有
     /// 焦点** ⇒ `search_popup_focus` 恒真 ⇒ 面板一旦获焦就再也收不
     /// 回去（「搜索框打开后无法自动关闭」）。改为**打字活跃**判据：
-    /// 最近 [`SEARCH_TYPING_GRACE`] 内输入变过才钉住，停手后放行
+    /// 最近 `SEARCH_TYPING_GRACE` 内输入变过才钉住，停手后放行
     /// 宽限折叠。真正「打字打到一半」不会被收（每次键入都刷新时间戳）。
     pub search_last_input_at: Option<f64>,
     /// 搜索面板是**怎么**打开的（图标点击的切换语义要区分）。
@@ -1220,7 +1220,7 @@ impl UiState {
     /// 单选与多选两个字段的**唯一汇合点**：行筛选、空状态文案、
     /// 行高缓存键都从这里取。CAUTION: 不要在新代码里直接读
     /// `type_filter` / `type_filter_multi`——两处各判一次，
-    /// 改了模式切换就会漏一处（历史教训见 [`RowFilterKey`]）。
+    /// 改了模式切换就会漏一处（历史教训见 `RowFilterKey`）。
     pub fn active_type_kinds(&self) -> Vec<modular_clipboard_core::ClipKind> {
         if !self.type_filter_multi.is_empty() {
             self.type_filter_multi.iter().copied().collect()
@@ -1355,7 +1355,7 @@ impl<'a> Frame<'a> {
     /// 露出来的那一部分。
     ///
     /// `key` 收 `impl Into<String>`（2026-10-25）：分段控件的命名空间键
-    /// （`"{控件名}/{选项英文键}"`）是运行时拼的，见 [`HitMap`] 的说明。
+    /// （`"{控件名}/{选项英文键}"`）是运行时拼的，见 `HitMap` 的说明。
     pub fn hit_insert(&mut self, key: impl Into<String>, r: Rect) {
         let sane = r.min.x.is_finite()
             && r.min.y.is_finite()

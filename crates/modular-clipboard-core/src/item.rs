@@ -57,7 +57,7 @@ impl ClipKind {
 
 /// 一条剪贴板历史记录。
 ///
-/// 大字段（图片字节、大段文本）不直接存在这里，而是由 [`EntryPayload`]
+/// 大字段（图片字节、大段文本）不直接存在这里，而是由 `EntryPayload`
 /// 在存储层落盘，内存中仅保留指纹与摘要，避免长驻内存膨胀。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipItem {

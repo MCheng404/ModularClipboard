@@ -17,7 +17,7 @@
 //!
 //! 图像创建后处于 `UNDEFINED`，拷入数据前需转到
 //! `TRANSFER_DST_OPTIMAL`，拷完再转到 `SHADER_READ_ONLY_OPTIMAL`。
-//! 两次过渡都用 [`crate::image_barrier`] 构造，队列族设为 `IGNORED`
+//! 两次过渡都用 `crate::image_barrier` 构造，队列族设为 `IGNORED`
 //! 表示不变换归属。
 //!
 //! # 销毁顺序
@@ -941,32 +941,6 @@ impl FontTexture {
         self.image.upload(gpu, cmd, staging, bytes, offset, patch)
     }
 
-    /// 按 egui 的整图/局部增量更新纹理。
-    ///
-    /// `delta.pos` 为 `None` 时整图覆盖；`Some((x, y))` 时只更新该矩形。
-    ///
-    /// `staging` 必须来自 [`crate::frame::StagingArena`]。
-    pub fn apply_delta(
-        &mut self,
-        gpu: &Gpu,
-        cmd: vk::CommandBuffer,
-        staging: crate::frame::StagingSlice,
-        delta: &egui::epaint::ImageDelta,
-    ) -> anyhow::Result<()> {
-        let patch_size = delta.image.size();
-        let (w, h) = (patch_size[0] as u32, patch_size[1] as u32);
-        let offset = delta.pos.map(|p| (p[0] as u32, p[1] as u32));
-
-        // 整图更新要求尺寸完全一致——尺寸变化意味着图集扩容，
-        // 那种情况必须重建纹理而非覆盖。
-        if offset.is_none() {
-            self.image.ensure_size_matches(patch_size)?;
-        }
-
-        let bytes = DeviceImage::coverage_bytes(&delta.image);
-        self.image
-            .upload(gpu, cmd, staging, &bytes, offset, (w, h))
-    }
 
     /// 销毁纹理。
     ///

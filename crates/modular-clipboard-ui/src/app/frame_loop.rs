@@ -1019,6 +1019,9 @@ pub(super) fn run_mode(
                 || img_edit.is_some();
             let idle_limit = app.svc.state.config.ui.idle_exit_secs;
             if should_idle_exit(idle_limit, since.elapsed(), attach_alive) {
+                if env_flag("MC_MEM_TRACE") {
+                    crate::mem::trace_stage("idle_exit");
+                }
                 tracing::info!(
                     secs = since.elapsed().as_secs(),
                     limit = idle_limit,
@@ -1352,7 +1355,7 @@ pub(super) fn run_mode(
         );
 
         frame_no += 1;
-        if frame_no.is_multiple_of(300) {
+        if frame_no.is_multiple_of(crate::multiwindow::FRAME_LOG_INTERVAL) {
             tracing::debug!(
                 frame = frame_no,
                 vertices = painter.stats.vertices,
@@ -1360,6 +1363,11 @@ pub(super) fn run_mode(
                 rebuilds = painter.stats.rebuilds,
                 "帧统计"
             );
+            // 内存账目（`MC_MEM_TRACE=1`）：与帧统计同一节奏，
+            // 「增量」那一列直接回答「这 N 帧吃了多少」。
+            if env_flag("MC_MEM_TRACE") {
+                crate::mem::trace_stage("frame");
+            }
         }
         if env_flag("MC_DIAG") && frame_no.is_multiple_of(30) {
             let (pw, ph) = window.inner_size_physical();

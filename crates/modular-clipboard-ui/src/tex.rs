@@ -231,7 +231,7 @@ pub struct StarField {
 }
 
 impl StarField {
-    /// 密度参数 → 星星数量（0..1 → 0..[`STAR_COUNT_MAX`]）。
+    /// 密度参数 → 星星数量（0..1 → 0..`STAR_COUNT_MAX`）。
     ///
     /// 上限 220 是 draw call 预算：每颗星一个 quad，220 个 image shape
     /// 经 tessellator 同纹理合批后仍是一批，但 CPU 侧每帧要算 220 次
@@ -393,7 +393,7 @@ fn star_sprite_pixels() -> Vec<u8> {
 
 /// 惰性加载星点精灵（每个 `Context` 一份）。语义同 [`paper_tile`]。
 ///
-/// 采样器用默认 LINEAR + Clamp：精灵的 UV 恒为 [0,1]（不超出），
+/// 采样器用默认 LINEAR + Clamp：精灵的 UV 恒为 0,1（不超出），
 /// 不需要 Repeat。
 pub fn star_sprite(ctx: &egui::Context) -> egui::TextureHandle {
     ctx.load_texture(
@@ -409,12 +409,12 @@ pub fn star_sprite(ctx: &egui::Context) -> egui::TextureHandle {
 ///
 /// egui 的 `image` tint 对纹理的 **rgb 与 alpha 逐通道相乘**：
 /// - 纸质感 tile 是白底、alpha 起伏 ⇒ tint = 纸墨色 + 强度 alpha；
-///   深浅两套共用一份纹理，只换 tint（见 [`paper_pixels`]）。
+///   深浅两套共用一份纹理，只换 tint（见 `paper_pixels`）。
 /// - 星空 tile 同理 ⇒ tint = 白色 + 密度 alpha。
 ///
 /// # UV 与重复
 ///
-/// UV 取 `[0, w/TILE_PT] × [0, h/TILE_PT]`（**超出 [0,1]**），靠
+/// UV 取 `[0, w/TILE_PT] × [0, h/TILE_PT]`（**超出 0,1**），靠
 /// `TextureWrapMode::Repeat` 环绕。`tile_pt` 是 tile 的逻辑尺寸：
 /// 窗口 720pt 宽 ⇒ 横向重复 30 次。传 0 或非有限值按 1 处理
 /// （至少不画飞）。

@@ -129,7 +129,7 @@ impl AccentColor {
 /// 用户对单个主题令牌的覆盖——「界面上任何元素、任何参数都可调」
 /// 的落地机制。
 ///
-/// 键是 ui 侧 [`Palette`](crate::ui 不可见，见 `modular-clipboard-ui`
+/// 键是 ui 侧 `Palette`(crate::ui 不可见，见 `modular-clipboard-ui`
 /// 的 `theme::Palette::tokens`) 的字段名；值是**非预乘** RGBA（颜色）
 /// 或数值（几何 / 字号 / 描边宽度）。覆盖在一级主题、二级主题、
 /// 强调色**之后**应用——用户显式改的旋钮优先级最高。

@@ -17,6 +17,13 @@
 //!
 //! 优化要看提交；只把工作集压下去属于**自欺**：攒在自己手里的内存
 //! 系统并没能拿去给别人用。
+//!
+//! # 怎么用
+//!
+//! 环境变量 `MC_MEM_TRACE=1` 打开打点（[`trace_stage`] 只在开关打开时
+//! 被调用）：帧循环每 [`crate::multiwindow::FRAME_LOG_INTERVAL`] 帧记一条
+//! `frame`，隐藏空闲退出前记一条 `idle_exit`。日志 target 是 `mem`，
+//! 可用 `RUST_LOG=mem=info` 单独过滤。
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::ProcessStatus::{
     GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,

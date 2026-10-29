@@ -17,7 +17,7 @@ pub mod tray;
 pub const UI_WINDOW_TITLE: &str = "ModularClipboard";
 
 /// 复用捕获层的窗口探测能力，避免重复实现 Win32 调用。
-use modular_clipboard_capture::{foreground_class_name, source_process_name};
+use modular_clipboard_capture::foreground_class_name;
 
 /// Win 键当前是否按下。
 ///
@@ -616,10 +616,6 @@ pub fn is_autostart_enabled() -> bool {
     false
 }
 
-/// 前台进程名。
-pub fn foreground_process() -> String {
-    source_process_name()
-}
 
 #[cfg(test)]
 mod tests {

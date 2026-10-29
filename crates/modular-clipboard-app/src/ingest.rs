@@ -237,7 +237,7 @@ pub(super) fn decode_to_rgba(item: &ClipItem, bytes: &[u8]) -> Result<(Vec<u8>, 
 
 /// 时间格式化，用于界面显示。
 ///
-/// 计数短语一律走 [`tp`]：英文要 `1 hour ago` 而不是 `1 hours ago`，
+/// 计数短语一律走 `tp`：英文要 `1 hour ago` 而不是 `1 hours ago`，
 /// 俄语要 `1 час назад / 2 часа назад / 5 часов назад` 三种形态。
 pub fn format_time(ts_ms: i64, now_ms: i64) -> String {
     use modular_clipboard_core::i18n::tp;

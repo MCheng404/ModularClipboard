@@ -8,7 +8,7 @@ use crate::i18n::msg;
 
 /// 二级主题：叠加在一级（深浅）模式之上的**风格层**。
 ///
-/// 与 [`WindowBackdrop`] 的分工：背景效果改的是「窗口怎么透出桌面」，
+/// 与 `WindowBackdrop` 的分工：背景效果改的是「窗口怎么透出桌面」，
 /// 二级主题改的是「整套配色与质感」。每个二级主题在深浅两种基底下
 /// 各有一套取值（见 ui 侧 `theme::SecondaryTheme::apply`），一级切换时
 /// 自动落到对应变体，不需要用户选两遍。
@@ -73,7 +73,7 @@ impl SecondaryTheme {
 
     /// 本主题可调的参数旋钮（设置界面据此生成滑块）。
     ///
-    /// 键名与 [`ThemeParams`] 的字段一一对应；`None` 主题没有旋钮。
+    /// 键名与 `ThemeParams` 的字段一一对应；`None` 主题没有旋钮。
     pub fn knobs(self) -> &'static [ThemeKnob] {
         match self {
             SecondaryTheme::None => &[],

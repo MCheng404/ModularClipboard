@@ -17,7 +17,7 @@ pub type ActionId = &'static str;
 /// 可执行动作。
 ///
 /// 实现者只描述「我能做什么、是否接受该条目、生成什么计划」，
-/// 真正的系统调用由上层 [`ActionRegistry::dispatch`] 统一执行。
+/// 真正的系统调用由上层 `ActionRegistry::dispatch` 统一执行。
 pub trait Action: Send + Sync {
     /// 稳定标识，用于配置持久化。
     fn id(&self) -> ActionId;

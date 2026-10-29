@@ -116,7 +116,7 @@ fn post_to_main(msg: u32) -> bool {
 ///
 /// 实现是投递 [`WM_SHOW_MAIN`]：界面进程在自己的消息循环里
 /// `ShowWindow` + 抢前台（见 `gfx::window` 的 `ShowRequested`）。
-/// 不在这里跨进程直接改窗口状态，原因见 [`post_to_main`]。
+/// 不在这里跨进程直接改窗口状态，原因见 `post_to_main`。
 pub fn request_show_ui() -> bool {
     post_to_main(WM_SHOW_MAIN)
 }
@@ -175,7 +175,7 @@ pub fn ui_window_visible() -> bool {
 /// `ShowWindow(SW_HIDE)`（同线程，立即返回）。界面进程的帧循环仍在
 /// 跑（隐藏态只轮询消息、不渲染），下一次唤起由 [`request_show_ui`]
 /// 完成。不能在常驻进程跨进程直接 `ShowWindow`，原因见
-/// [`post_to_main`]（会与 IPC 同步等待构成死锁）。
+/// `post_to_main`（会与 IPC 同步等待构成死锁）。
 pub fn hide_ui_window() -> bool {
     post_to_main(WM_HIDE_MAIN)
 }

@@ -44,7 +44,8 @@ pub const STABLE_VERSION: &str = "0.2.1";
 ///
 /// commit 短 hash 是编译期注入的 `&'static str`（`env!`），但两条分支
 /// 的拼接结果不同长度，没法直接返回同一个静态引用。设置项的
-/// [`ItemKind`](crate::paint::ItemKind) 也为此改成了动态行而不是静态 `Info`。
+/// 设置项的种类（`settings_items::ItemKind`）也为此改成了动态行，
+/// 而不是静态的 `Info`。
 pub fn version_label() -> String {
     let hash = env!("GIT_SHORT_HASH");
     if hash.trim().is_empty() {

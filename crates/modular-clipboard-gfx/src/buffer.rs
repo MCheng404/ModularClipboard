@@ -268,10 +268,6 @@ impl Buffer {
         self.usage
     }
 
-    /// 内存是否主机相干。非相干时 [`Buffer::flush`] 不可省。
-    pub fn is_coherent(&self) -> bool {
-        self.coherent
-    }
 
     /// 当前是否处于映射状态。
     pub fn is_mapped(&self) -> bool {
@@ -626,16 +622,6 @@ impl UniformBuffer {
         self.buffer.write(device, 0, bytes)
     }
 
-    /// 直接写入原始字节，供 frame 层做批量更新。
-    pub fn write_raw(&mut self, device: &Device, bytes: &[u8]) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            bytes.len() as vk::DeviceSize <= self.buffer.size(),
-            "写入 {} 字节超出 uniform 缓冲容量 {}",
-            bytes.len(),
-            self.buffer.size()
-        );
-        self.buffer.write(device, 0, bytes)
-    }
 
     /// CPU 侧的副本。
     pub fn data(&self) -> &Uniforms {

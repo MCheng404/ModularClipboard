@@ -7,7 +7,7 @@ use serde::Serialize;
 ///
 /// # 为什么在 core 而不在 ui
 ///
-/// 它是**用户配置的一部分**，必须与 [`UiConfig`] 的其余字段同处一个
+/// 它是**用户配置的一部分**，必须与 `UiConfig` 的其余字段同处一个
 /// crate：`Config` 被 core 定义，ui 反过来依赖 core。若把 `LayoutConfig`
 /// 留在 ui crate，`UiConfig` 就没法持有它——要么 core 依赖 ui（形成
 /// 循环依赖），要么配置里存不成布局。

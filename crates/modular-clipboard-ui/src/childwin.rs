@@ -150,16 +150,6 @@ impl<'a> ChildWindows<'a> {
         self.windows.iter_mut()
     }
 
-    /// 按卡片 Id找窗口。
-    pub fn by_card(&self, id: CardId) -> Option<&ChildWindow<'a>> {
-        self.windows.iter().find(|w| w.card_id == id)
-    }
-
-    /// 按卡片 Id 找窗口（可变）。
-    pub fn by_card_mut(&mut self, id: CardId) -> Option<&mut ChildWindow<'a>> {
-        self.windows.iter_mut().find(|w| w.card_id == id)
-    }
-
     /// 窗口数量。
     pub fn len(&self) -> usize {
         self.windows.len()

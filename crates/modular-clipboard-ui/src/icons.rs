@@ -54,9 +54,9 @@
 //! 强行逐个对齐等于把设计意图抹平。实测最差偏差 2px/64px（3.1%），
 //! 肉眼不可见。
 //!
-//! 校准方法与实测数值见 [`tests::report_ink_geometry`]（16/32/64 三个字号，
+//! 校准方法与实测数值见 `tests::report_ink_geometry`（16/32/64 三个字号，
 //! 屏幕空间光栅化口径）。改动 [`BASELINE_FACTOR`] 前先看它；
-//! 回归判据是 [`tests::glyph_ink_is_centred_in_its_box`]。
+//! 回归判据是 `tests::glyph_ink_is_centred_in_its_box`。
 
 use egui::{Align2, Color32, Rect};
 
@@ -180,7 +180,7 @@ impl Icon {
     /// 该图标在字体中的码位（PUA区）。
     ///
     /// 与 `assets/modular-clipboard-icons.ttf` 的 cmap 一一对应；改动必须同步重新生成
-    /// 字体，否则 [`tests::every_icon_codepoint_has_ink`] 会失败。
+    /// 字体，否则 `tests::every_icon_codepoint_has_ink` 会失败。
     pub fn codepoint(self) -> char {
         match self {
             Icon::Close => '\u{e000}',   // x-lg
@@ -220,7 +220,7 @@ impl Icon {
     /// 用于列表左侧的条目类型标识。`ClipKind` 属于业务层，
     /// 这里用穷举匹配避免依赖它。
     ///
-    /// NOTE: [`ClipKind::Markdown`] **没有**对应字形（PUA 码位已占满），
+    /// NOTE: `ClipKind::Markdown` **没有**对应字形（PUA 码位已占满），
     /// 调用方应走 [`paint_kind_icon`] 而不是本方法。
     pub fn for_kind(kind: modular_clipboard_core::ClipKind) -> Self {
         use modular_clipboard_core::ClipKind;

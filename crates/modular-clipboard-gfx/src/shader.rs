@@ -41,8 +41,6 @@ pub const UPSAMPLE_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_upsample";
 /// 且要读两张源纹理 + 一份带数组的 uniform，描述符布局与模糊不同。
 const GLASS_SPIRV_WORDS: &[u32] = &include!(concat!(env!("OUT_DIR"), "/glass.rs"));
 
-/// `glass.wgsl` 的全屏三角形顶点入口。
-pub const GLASS_VERTEX_ENTRY: &std::ffi::CStr = c"vs_fullscreen";
 /// `glass.wgsl` 的液态玻璃合成片元入口。
 pub const GLASS_FRAGMENT_ENTRY: &std::ffi::CStr = c"fs_glass";
 

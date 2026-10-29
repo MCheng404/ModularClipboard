@@ -136,7 +136,7 @@ pub const TYPE_RAIL_SIZE_MAX: f32 = 48.0;
 
 /// 把任意来源的尺寸值收敛到合法区间（非有限值回落 32.0）。
 ///
-/// 与 [`clamp_font_scale`] 同构：手改 config.json 是常态，
+/// 与 `clamp_font_scale` 同构：手改 config.json 是常态，
 /// 不能让一个越界值把图标画成 0 或 480。
 pub fn clamp_type_rail_size(v: f32) -> f32 {
     if v.is_finite() {

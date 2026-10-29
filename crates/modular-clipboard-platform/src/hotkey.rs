@@ -245,12 +245,6 @@ pub fn register(hwnd: windows::Win32::Foundation::HWND, id: i32, spec: HotkeySpe
         .with_context(|| format!("注册全局快捷键 {}失败（可能已被其它软件占用）", describe(spec)))
 }
 
-/// 注销先前注册的快捷键。
-#[cfg(windows)]
-pub fn unregister(hwnd: windows::Win32::Foundation::HWND, id: i32) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::UnregisterHotKey;
-    let _ = unsafe { UnregisterHotKey(Some(hwnd), id) };
-}
 
 /// 非Windows 平台的占位实现。
 #[cfg(not(windows))]

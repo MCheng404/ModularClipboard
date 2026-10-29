@@ -148,7 +148,7 @@ fn install_bold_companion(defs: &mut FontDefinitions, cjk_name: &str) -> bool {
 /// # 字体族与顺序
 ///
 /// 挂在 [`FontFamily::Proportional`]，**排在已有字体之后**
-/// （[`FontPriority::Lowest`]）。
+/// （`FontPriority::Lowest`）。
 ///
 /// - 排在之后：CJK 字体被 `insert_font` 放在首位且字体庞大，
 ///   让图标字体抢在前面会让每个图标的排版都先去问一遍 CJK 字体。
@@ -311,7 +311,7 @@ static BOLD_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 ///
 /// 只用于**纯文本**的标题类文字（设置窗导航选中项等）。不要把图标字形
 /// 放进强调文本——粗体族没有挂图标字体回退，理由见
-/// [`install_bold_companion`] 的文档。
+/// `install_bold_companion` 的文档。
 ///
 /// # 没有粗体字体时
 ///

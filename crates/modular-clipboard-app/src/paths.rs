@@ -21,7 +21,7 @@ pub(super) fn default_config_path() -> Option<std::path::PathBuf> {
 
 /// 数据目录内的配置文件路径。
 ///
-/// 与 [`default_config_path`] 分开而不是「有data_dir 就 join、否则 ProjectDirs」：
+/// 与 `default_config_path` 分开而不是「有data_dir 就 join、否则 ProjectDirs」：
 /// `--data-dir` 指定的是**数据**目录，配置跟着走才能保证
 /// 「读配置」与「写配置」在同一处（`save_config` 的读回逻辑依赖这一点）。
 pub fn config_path_in(data_dir: &std::path::Path) -> std::path::PathBuf {

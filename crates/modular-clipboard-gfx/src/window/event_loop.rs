@@ -137,7 +137,7 @@ impl EventLoop {
     /// 主窗口专用：额外负责收取 [`WM_QUIT`]。
     ///
     /// 全进程**只能有一个**这样的循环。`WM_QUIT` 是线程级消息，谁先
-    /// `poll` 谁摘走（见 [`Self::owns_quit`] 的说明），所以这个归属必须
+    /// `poll` 谁摘走（见 `Self::owns_quit` 的说明），所以这个归属必须
     /// 显式指定，不能靠「谁先跑」碰运气。
     pub fn new_primary(window: &Window) -> Self {
         Self::build(window, true)
@@ -203,15 +203,11 @@ impl EventLoop {
         }
         (w / s, h / s)    }
 
-    /// 本帧事件缓冲（供调试与测试）。
-    pub fn pending_events(&self) -> &[WindowEvent] {
-        &self.pending
-    }
 
     /// 取走累积的全部未交付事件，并清空缓冲。
     ///
     /// 主循环用它把「本帧新读到的事件」与「此前节流路径读到但尚未
-    /// 交付的事件」一起取走，保证 [`Self::CloseRequested`] 之类
+    /// 交付的事件」一起取走，保证 `Self::CloseRequested` 之类
     /// 低频但关键的事件不会在两次交付之间被丢掉。
     pub fn take_pending(&mut self) -> Vec<WindowEvent> {
         std::mem::take(&mut self.pending)

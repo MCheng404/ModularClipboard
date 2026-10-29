@@ -4,7 +4,7 @@
 //! `mcp.enabled == true` 且对应能力为 `true` 的工具才会出现在
 //! `tools/list` 里、才能被 `tools/call` 调用。
 //!
-//! 工具的实际后端在 [`crate::automation`]（Windows 实现）。
+//! 工具的实际后端在 `crate::automation`（Windows 实现）。
 
 use modular_clipboard_core::config::McpConfig;
 use serde_json::{Value, json};

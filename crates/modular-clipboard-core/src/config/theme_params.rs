@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-/// 二级主题的一个可调参数（[`SecondaryTheme::knobs`] 的元素）。
+/// 二级主题的一个可调参数（`SecondaryTheme::knobs` 的元素）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThemeKnob {
     /// [`ThemeParams`] 里的字段名（稳定键）。
@@ -123,7 +123,7 @@ fn default_param_mid() -> f32 {
 impl ThemeParams {
     /// 按键名读参数（找不到返回 `None`）。
     ///
-    /// 与 [`SecondaryTheme::knobs`] 的键名对应，供设置界面与绘制侧
+    /// 与 `SecondaryTheme::knobs` 的键名对应，供设置界面与绘制侧
     /// 用同一套字符串寻址。
     pub fn get(&self, key: &str) -> Option<f32> {
         Some(match key {

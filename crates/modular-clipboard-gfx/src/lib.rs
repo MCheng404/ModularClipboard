@@ -243,7 +243,7 @@ pub struct AdapterInfo {
     /// CAUTION: 不是「能否呈现」——呈现能力要 surface 才能查，而
     /// [`enumerate_adapters`] 刻意不建窗口（设置页随时要枚举）。
     /// 没有图形队列的设备一定不能用，没有呈现队列的（如纯计算卡）
-    /// 要等真正建表面时才会被 [`select_device`] 排除。
+    /// 要等真正建表面时才会被 `select_device` 排除。
     pub graphics: bool,
 }
 
@@ -677,7 +677,7 @@ impl Gpu {
     /// # 为什么需要这个方法
     ///
     /// [`Gpu`] 在 [`Self::new`] 里为传入的 `hwnd` 建了一个表面，
-    /// 而 [`crate::frame::Swapchain`] 建交换链时固定用
+    /// 而 `crate::frame::Swapchain` 建交换链时固定用
     /// [`Self::surface`]。于是「新窗口复用这个 `Gpu`」会撞上
     /// `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`——同一个 `hwnd` 只能
     /// 绑定一个表面。
@@ -727,26 +727,6 @@ impl Gpu {
         }
     }
 
-    /// 本机所有可用的 Vulkan 设备，供设置页展示。
-    pub fn enumerate_devices(
-        _entry: &Entry,
-        instance: AshInstance,
-    ) -> Vec<(String, vk::PhysicalDeviceType)> {
-        unsafe { instance.enumerate_physical_devices() }
-            .unwrap_or_default()
-            .iter()
-            .map(|d| {
-                let p = unsafe { instance.get_physical_device_properties(*d) };
-                let name: Vec<u8> = p
-                    .device_name
-                    .iter()
-                    .map(|c| *c as u8)
-                    .take_while(|b| *b != 0)
-                    .collect();
-                (String::from_utf8_lossy(&name).to_string(), p.device_type)
-            })
-            .collect()
-    }
 
     /// 等待设备空闲。交换链重建前后必须调用。
     pub fn wait_idle(&self) {
@@ -1178,7 +1158,7 @@ fn pick_present_mode(modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
 /// 已在 crate 内做了 `pub(crate)` 例外处理。
 /// 供探针与示例使用：录一条**一次性**图像布局屏障。
 ///
-/// 与 crate 内部的 [`image_barrier`] 的区别：调用方**自己**保证
+/// 与 crate 内部的 `image_barrier` 的区别：调用方**自己**保证
 /// 布局状态正确（典型场景是探针手工驱动整个流程，不持有
 /// [`texture::DeviceImage`]）。
 ///

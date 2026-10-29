@@ -327,10 +327,18 @@ impl Tray {
         self.rx.recv_timeout(timeout).ok()
     }
 
+
     /// 托盘窗口句柄（原始地址）。
     ///
-    /// 供探针用 `PostMessageW` 注入回调消息，从而在无人值守环境下
-    /// 真正走通「消息 → 窗口过程 → 事件回传」全链路。
+    /// # 为什么必须留着（不是死代码）
+    ///
+    /// 托盘窗口是 **message-only 窗口**：没有标题、`FindWindow` 找不到它，
+    /// 因此探针（`scripts/verify_*.ps1`）唯一的注入手段就是拿这个句柄
+    /// `PostMessageW` 一条 `WM_APP+…`，让整条「消息 → 窗口过程 → 事件回传」
+    /// 链路在无人值守下也能走通。删掉它等于让托盘交互不可自动化验证。
+    ///
+    /// 主程序自己不用它，所以调用点为零——这是**为诊断保留的接口**，
+    /// 不是遗留。
     #[cfg(windows)]
     pub fn hwnd_raw(&self) -> isize {
         self.hwnd

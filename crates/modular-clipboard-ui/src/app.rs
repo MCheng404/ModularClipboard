@@ -130,7 +130,7 @@ pub struct App {
     /// 窗口身后桌面的平均亮度（0~1），由帧循环从渲染器取来。
     ///
     /// `None` = 本帧没有成功捕获（磨砂未开 / 最小化 / 首帧）。
-    /// 只影响「背景层画多实」这一个决策，见 [`backdrop_alpha`]。
+    /// 只影响「背景层画多实」这一个决策，见 `backdrop_alpha`。
     pub backdrop_lum: Option<f32>,
     /// MCP 服务连通性探测器（后台线程 + 原子状态）。
     ///
@@ -1518,7 +1518,7 @@ impl App {
     ///
     /// CAUTION: 必须**按请求语义**判断，不能无脑设成目标宽度——
     /// `AtLeast` 无脑设的话每次切换模式窗口都会跳一下，来回切两次
-    /// 就晃（见 [`resize_width_target`]）。
+    /// 就晃（见 `resize_width_target`）。
     pub fn take_resize_width_to(&mut self, current_px: (u32, u32), scale: f32) -> Option<u32> {
         resize_width_target(self.paint_state.resize_width_to.take(), current_px, scale)
     }

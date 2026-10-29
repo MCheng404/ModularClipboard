@@ -129,7 +129,7 @@ pub const EDGE_NXY: f32 = 0.894_427_2;
 /// `shader_constants_match_rust`（后者扫 `glass.wgsl` 的同一批字面量）。
 pub const EDGE_FACTOR: f32 = 0.504_630_6;
 
-/// 折射造成的 UV 位移（单位：UV，即 [0,1] 纹理空间）。
+/// 折射造成的 UV 位移（单位：UV，即 0,1 纹理空间）。
 ///
 /// `normal` 是薄片表面的 2D 斜率（SDF 法线为单位长，穹顶斜率 ≤ 1），
 /// `eta = 1 / ior`。

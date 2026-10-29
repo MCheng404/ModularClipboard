@@ -7,7 +7,6 @@
 use ash::{Device, vk};
 
 use crate::shader::ShaderModule;
-use crate::Swapchain;
 
 /// uniform 缓冲区的绑定槽。
 pub const BINDING_UNIFORM: u32 = 0;
@@ -676,10 +675,6 @@ impl GraphicsPipeline {
     }
 }
 
-/// 渲染通道的附件格式需与交换链一致。供测试与文档引用。
-pub fn swapchain_format(swapchain: &Swapchain) -> vk::Format {
-    swapchain.format
-}
 
 #[cfg(test)]
 mod tests {

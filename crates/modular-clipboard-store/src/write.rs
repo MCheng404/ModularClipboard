@@ -35,12 +35,12 @@ impl Store {
     ///
     /// 本项目图片载荷的规范形态是**裸 RGBA8 像素**（arboard 在 Windows 上
     /// 把 CF_DIBV5/CF_PNG 解码成 RGBA 后交出，字节里没有文件头），
-    /// [`compute_dims`] 的格式嗅探对它必然失败——曾因此整条图片链路
+    /// `compute_dims` 的格式嗅探对它必然失败——曾因此整条图片链路
     /// （预览文案 / dims 列 / 缩略图渲染）全部退化成「图片 N 字节」。
-    /// 尺寸只能在捕获侧拿到（[`CapturedPayload::dims`]，arboard 白给
+    /// 尺寸只能在捕获侧拿到（`CapturedPayload::dims`，arboard 白给
     /// `ImageData::width/height`，零成本），经此入口透传。
     ///
-    /// `dims` 为 `None` 时（文本类 / 旧调用方）仍走 [`compute_dims`]
+    /// `dims` 为 `None` 时（文本类 / 旧调用方）仍走 `compute_dims`
     /// 兜底，兼容历史编码格式数据。
     pub fn insert_with_dims(
         &mut self,

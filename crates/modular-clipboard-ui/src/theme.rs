@@ -21,7 +21,7 @@
 //!
 //! # 对比度
 //!
-//! 所有取值经 [`tests`] 中的 WCAG 校验：正文 4.5:1、非文本组件 3:1。
+//! 所有取值经 `tests` 中的 WCAG 校验：正文 4.5:1、非文本组件 3:1。
 //! 半透明令牌（`row_alt` / `row_hover` / `overlay_scrim`）的对比度
 //! 一律**先合成到实际背景**再计算——面板叠在窗口底色上，
 //! 直接拿半透明值算会高估。唯一豁免是 `border_subtle`：
@@ -227,7 +227,7 @@ macro_rules! palette {
                 vec![$((stringify!($name), palette_token!($kind, self.$name))),*]
             }
 
-            /// 按名字写单个令牌（[`ThemeOverrides`] 的落地入口）。
+            /// 按名字写单个令牌（`ThemeOverrides` 的落地入口）。
             ///
             /// 与 [`Palette::tokens`] 互为逆操作：设置界面的「高级微调」
             /// 用 `tokens()` 列出全部可调项，用本函数落地。返回 `false`
@@ -252,7 +252,7 @@ macro_rules! palette {
             /// 审美下，背景模糊内容不变而全部前景色瞬换尤其刺眼。
             ///
             /// 只插值颜色字段；几何/时长令牌取目标值（见
-            /// [`palette_lerp`] 的理由）。`is_dark` 在中点翻转，
+            /// `palette_lerp` 的理由）。`is_dark` 在中点翻转，
             /// 避免出现「深色文字配浅色底」的中间态。
             pub fn lerp(&self, other: &Palette, t: f32) -> Palette {
                 let t = t.clamp(0.0, 1.0);

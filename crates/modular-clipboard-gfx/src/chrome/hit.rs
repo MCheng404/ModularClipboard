@@ -40,7 +40,7 @@ pub(crate) const WM_SETCURSOR: u32 = 0x0020;
 /// 边缘 resize 区的默认宽度，**逻辑点**。
 ///
 /// 取6 是 Windows 11 原生无边框窗口的观感值。物理像素由
-/// [`GetDpiForWindow`] 换算，所以高分屏上不会细得点不中。
+/// `GetDpiForWindow` 换算，所以高分屏上不会细得点不中。
 pub const DEFAULT_RESIZE_BORDER: f32 = 6.0;
 
 // ---------------------------------------------------------------------------

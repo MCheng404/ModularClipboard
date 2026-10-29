@@ -25,7 +25,7 @@ use modular_clipboard_core::EntryId;
 /// 原图保留在 blob 里按需查看，这里只给界面显示用的小图。
 ///
 /// 2026-10-17 从 256 提到 512：列表缩略图限高 160pt
-/// （[`crate::paint::list::IMG_MAX_H_LIST`]），200%/250% 缩放的屏上折算成
+/// （`crate::paint::list::IMG_MAX_H_LIST`），200%/250% 缩放的屏上折算成
 /// 320~400 物理像素，256px 的纹理被放大显示就是糊的——缩略图的分辨率
 /// 必须按「显示尺寸 × DPI」给，不能按 1x 给。
 ///
@@ -133,7 +133,7 @@ pub fn fit_within(w: u32, h: u32, max_edge: u32) -> Option<(u32, u32)> {
 /// 因为前者通常是正常情况（如载荷已被淘汰），后者才是异常。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThumbError {
-    /// 输入为空或超过 [`MAX_INPUT_BYTES`]，不值得尝试解码。
+    /// 输入为空或超过 `MAX_INPUT_BYTES`，不值得尝试解码。
     TooLarge,
     /// 不是任何受支持的图片格式。
     NotAnImage,
@@ -452,11 +452,11 @@ impl ThumbnailCache {
     ///
     /// # 失败会被短时抑制
     ///
-    /// 失败结果记入 `failures` 并抑制 [`FAILURE_SUPPRESS_MS`] 毫秒，
+    /// 失败结果记入 `failures` 并抑制 `FAILURE_SUPPRESS_MS` 毫秒，
     /// 期间直接返回同一个错误而**不再读盘**。到期后自动重试，
     /// 因此载荷被修复后能自行恢复，不必重启程序。
     ///
-    /// 抑制表本身也有上限（[`MAX_TRACKED_FAILURES`]），
+    /// 抑制表本身也有上限（`MAX_TRACKED_FAILURES`），
     /// 防止大量坏条目把内存撑大。
     ///
     /// 预算为 0 时仍会解码并返回，只是不留存——调用方拿到的

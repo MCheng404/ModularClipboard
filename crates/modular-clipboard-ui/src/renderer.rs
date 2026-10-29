@@ -5,7 +5,7 @@
 //! | 层 | 负责 |
 //! |----|------|
 //! | [`modular_clipboard_gfx::frame::FrameRenderer`] | 交换链、渲染通道开启、命令录制与提交、呈现、重建 |
-//! | 本模块（[`Painter`]） | 顶点数据构造、缓冲上传、uniform、描述符绑定 |
+//! | 本模块（`Painter`） | 顶点数据构造、缓冲上传、uniform、描述符绑定 |
 //! | `modular-clipboard-gfx` 资源层 | 缓冲/纹理的创建、销毁、显存分配 |
 //!
 //! 本模块**不含 Win32 代码**，也不持有 [`egui::Context`]——输入由
@@ -313,7 +313,7 @@ pub fn pack_color(c: egui::Color32) -> u32 {
 ///
 /// # IMPORTANT: 坐标系不变式（务必与 `EventLoop::egui_input` 成对阅读）
 ///
-/// * `size_in_pixels` = **物理像素**（交换链尺寸），来自 [`Painter::paint`] 的
+/// * `size_in_pixels` = **物理像素**（交换链尺寸），来自 `Painter::paint` 的
 ///   `fr.extent()`；
 /// * `pixels_per_point` = egui 的**逻辑点→物理像素**比例，即
 ///   [`egui::FullOutput::pixels_per_point`]；
@@ -349,7 +349,7 @@ pub struct UniformKey {
     /// egui 的逻辑点→物理像素比例。
     ///
     /// NOTE: 注意命名不一致：本字段叫 `pixels_per_point`，而它写进去的
-    /// [`crate::pipeline::Uniforms`] 里对应字段叫 **`dpr`**。
+    /// `crate::pipeline::Uniforms` 里对应字段叫 **`dpr`**。
     /// 同一个值两个名字，改动时容易写错。
     pub pixels_per_point: f32,
 }

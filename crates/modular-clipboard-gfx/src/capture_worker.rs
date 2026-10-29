@@ -2,7 +2,7 @@
 //!
 //! # 为什么要把抓屏搬出主线程
 //!
-//! [`DesktopCapture::capture_behind`] 是 **GDI `BitBlt`**：同步阻塞、
+//! `DesktopCapture::capture_behind` 是 **GDI `BitBlt`**：同步阻塞、
 //! 毫秒级（1080p 一帧 8MB，实测 20~50ms 量级）。它跑在帧循环里时，
 //! 每一轮抓屏（30fps 节流）都会让主线程停摆——滚动列表时的「一顿一顿」
 //! 有它一份，而它跟 GPU 一点关系都没有。
