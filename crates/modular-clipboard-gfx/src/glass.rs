@@ -280,6 +280,22 @@ pub fn luminance(rgb: [f32; 3]) -> f32 {
     0.212_6 * rgb[0] + 0.715_2 * rgb[1] + 0.072_2 * rgb[2]
 }
 
+/// 饱和度（HSV 口径）：`(max - min) / max`。
+///
+/// 纯白 / 纯灰 / 纯黑都是 0——与「色度向量 `tint / luma` 偏离 1 多少」
+/// 不同，它衡量的是**这块颜色本身有多「彩」**，与明暗无关。
+///
+/// 用途见 [`TINT_CHROMA`]：色度放大必须按它缩放，否则近中性的深色
+/// 卡面（`#2F3540`）会被当成「有彩色」而染出蓝色滤镜。
+pub fn saturation(rgb: [f32; 3]) -> f32 {
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    if max <= 1e-6 {
+        return 0.0;
+    }
+    ((max - min) / max).clamp(0.0, 1.0)
+}
+
 /// 亮度自适应的目标中灰，见 [`luminosity_adapt`]。
 pub const LUMA_TARGET: f32 = 0.5;
 
@@ -481,6 +497,17 @@ pub const TINT_ABSORB: f32 = 0.45;
 /// 深色主题的 `card_bg` 是冷蓝灰（R < G < B），透过率带上这个色偏后卡片
 /// 会明显**泛冷调**而不是单纯变暗——「混色」的可见度主要来自它。浅色
 /// 主题的 `card_bg` 是纯白（色度恒为 1）⇒ 这一项自动失效。
+///
+/// # CAUTION: 实际放大量还要乘 [`saturation`]（2026-10-29 修「偏蓝」）
+///
+/// 这里只是**上限**，不是实乘系数。深色主题的 `card_bg = #2F3540` 是
+/// 一块近中性的冷灰（饱和仅 0.27），但 `tint / luma` 对它的通道比偏差
+/// 是 +24% / −9%（蓝/红）——拿满 0.5 去放大后透过率里蓝比红高 22%，
+/// 整张卡明显偏蓝。用户报的「玻璃混色偏蓝」就是这条。
+///
+/// 按 tint **自身饱和度**缩放后：这块灰只放大 0.13（蓝红差降到 +8%，
+/// 是一层「冷调」而不是「蓝色滤镜」），真正饱和的 tint（主题色卡片）
+/// 才拿满上限。
 pub const TINT_CHROMA: f32 = 0.5;
 
 /// 散射（乳光）的基准增益。
@@ -533,11 +560,16 @@ pub fn glass_tint(rgb: [f32; 3], tint: [f32; 3], a: f32) -> [f32; 3] {
     let t_lum = luminance(tint).clamp(0.0, 1.0);
     // 色度：`tint / luma` 的加权均值为 1 ⇒ `mix(1, chroma, k)` 是围绕
     // 中性色的色偏放大。纯白 / 纯灰色度恒为 1 ⇒ 不染色。
+    //
+    // CAUTION: 放大系数必须**按 tint 自身饱和度缩放**（见 [`TINT_CHROMA`]）。
+    // 近中性的深色卡面（`#2F3540`，饱和 0.27）若拿满 `TINT_CHROMA`，
+    // 透过率里蓝比红高 22% ⇒ 整卡偏蓝（2026-10-29 用户报障）。
     let denom = t_lum.max(1e-3);
+    let chroma_k = TINT_CHROMA * saturation(tint);
     let chroma = [
-        1.0 + (tint[0] / denom - 1.0) * TINT_CHROMA,
-        1.0 + (tint[1] / denom - 1.0) * TINT_CHROMA,
-        1.0 + (tint[2] / denom - 1.0) * TINT_CHROMA,
+        1.0 + (tint[0] / denom - 1.0) * chroma_k,
+        1.0 + (tint[1] / denom - 1.0) * chroma_k,
+        1.0 + (tint[2] / denom - 1.0) * chroma_k,
     ];
     let floor = TINT_FLOOR_DARK * (1.0 - t_lum);
     let absorb = lerp3([1.0, 1.0, 1.0], tint, TINT_ABSORB);
@@ -1488,12 +1520,17 @@ mod tests {
         );
     }
 
-    /// 深色 tint 必须把**冷调色偏**带上玻璃（混色的可见度来源）。
+    /// 深色 tint 的冷调色偏必须**存在但有界**（不是滤镜）。
     ///
-    /// `card_bg = #2F3540` 是冷蓝灰（R < G < B）。替换式把这点色偏几乎
-    /// 抹平（0.03），两段式放大到约 0.12——玻璃「泛冷」而不是单纯变暗。
+    /// # 为什么要有上界（2026-10-29 用户报「混色偏蓝」）
+    ///
+    /// `card_bg = #2F3540` 只是一块**近中性的冷灰**（饱和 0.267）。色度
+    /// 放大若按满额 `TINT_CHROMA` 生效，透过率里蓝比红高 22%——整张卡
+    /// 读起来是「蓝色滤镜」而不是「带一点冷调的灰玻璃」。现在放大量
+    /// 按饱和度缩放到 0.13，蓝红比落在 +8%~+12%：仍然比替换式更冷（用户
+    /// 能读出卡片色相），但不会失真。
     #[test]
-    fn dark_tint_carries_cool_cast() {
+    fn dark_tint_keeps_a_bounded_cool_cast() {
         let tint = [47.0 / 255.0, 53.0 / 255.0, 64.0 / 255.0];
         let a = 0.45;
         let out = glass_tint([0.9, 0.9, 0.9], tint, a);
@@ -1503,10 +1540,61 @@ mod tests {
             lerp(0.9, tint[2]) - lerp(0.9, tint[0])
         };
         assert!(
-            cast > old_cast * 2.0,
-            "冷调色偏应被明显放大：新 {cast:.3} 旧 {old_cast:.3}"
+            cast > old_cast,
+            "深色卡片的冷调仍应比替换式明显（否则玻璃读不出卡片色）：\
+             新 {cast:.3} 旧 {old_cast:.3}"
+        );
+        // 上界：蓝/红比不得超过 1.12（22% 那档就是「偏蓝」）。
+        let ratio = out[2] / out[0].max(1e-3);
+        assert!(
+            ratio <= 1.12,
+            "蓝红比 {ratio:.3} 过高——色度放大没按饱和度收住，卡片会读成蓝色滤镜"
         );
         assert!(cast > 0.0, "深色卡片色是冷调，B 必须高于 R，实际 {cast}");
+    }
+
+    /// 饱和度判据本身：中性色为 0，彩色按 HSV 口径。
+    #[test]
+    fn saturation_is_zero_for_neutrals() {
+        assert_eq!(saturation([0.0, 0.0, 0.0]), 0.0, "纯黑无饱和度");
+        assert_eq!(saturation([1.0, 1.0, 1.0]), 0.0, "纯白无饱和度");
+        for g in [0.25_f32, 0.5, 0.75] {
+            assert_eq!(saturation([g, g, g]), 0.0, "灰色 {g} 不应有饱和度");
+        }
+        // #2F3540：冷灰，饱和 ≈ 0.267。
+        let dark_card = [47.0 / 255.0, 53.0 / 255.0, 64.0 / 255.0];
+        let s = saturation(dark_card);
+        assert!(
+            (0.20..0.32).contains(&s),
+            "深色卡面的饱和度应落在 0.20~0.32，实际 {s:.3}"
+        );
+        // 纯蓝：饱和 1.0。
+        assert!((saturation([0.0, 0.0, 1.0]) - 1.0).abs() < 1e-6);
+    }
+
+    /// 真正**饱和**的 tint 仍然要带出颜色（别把「修偏蓝」做成「去色」）。
+    ///
+    /// 近中性色按饱和度收住放大量之后，饱和色的放大量必须接近
+    /// `TINT_CHROMA` 上限——否则主题色卡片的玻璃会变得毫无色调。
+    #[test]
+    fn saturated_tint_still_carries_its_hue() {
+        let a = 0.45;
+        let src = [0.55, 0.55, 0.55];
+        // 饱和蓝：饱和 0.78 ⇒ 放大量 0.39（接近上限 0.5）。
+        let blue = [0.16, 0.35, 0.75];
+        let out = glass_tint(src, blue, a);
+        let ratio = out[2] / out[0].max(1e-3);
+        assert!(
+            ratio > 1.30,
+            "饱和 tint 的色相应被明显带出：蓝红比仅 {ratio:.3}"
+        );
+        // 与中性 tint 对照：中性那档必须明显更淡。
+        let neutral = glass_tint(src, [0.55, 0.55, 0.55], a);
+        let neutral_ratio = neutral[2] / neutral[0].max(1e-3);
+        assert!(
+            (neutral_ratio - 1.0).abs() < 1e-3,
+            "中性 tint 不应染色，实际蓝红比 {neutral_ratio:.4}"
+        );
     }
 
     /// 浅色 tint（纯白卡片色）**不得把暗底洗白**。

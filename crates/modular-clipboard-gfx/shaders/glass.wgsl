@@ -553,6 +553,20 @@ fn luma(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+/// 饱和度（HSV 口径）：`(max - min) / max`。纯白/灰/黑都是 0。
+///
+/// 与「色度向量偏离 1 多少」不同：它衡量这块颜色本身有多「彩」，
+/// 与明暗无关。色度放大按它缩放，见 `glass_tint`（与 `glass::saturation`
+/// 逐行对应）。
+fn saturation(c: vec3<f32>) -> f32 {
+    let hi = max(c.r, max(c.g, c.b));
+    let lo = min(c.r, min(c.g, c.b));
+    if (hi <= 1e-6) {
+        return 0.0;
+    }
+    return clamp((hi - lo) / hi, 0.0, 1.0);
+}
+
 /// 亮度自适应：**非对称**地压缩底图亮度（三通道同比例 ⇒ 只动亮度、
 /// 不动色相）。与 `glass::luminosity_adapt` 一致，理由见那里。
 ///
@@ -602,6 +616,10 @@ const TINT_ABSORB: f32 = 0.45;
 /// 卡片会明显**泛冷调**而不是单纯变暗——「混色」的可见度主要来自它。
 /// 浅色主题的 `card_bg` 是纯白（色度恒为 1）⇒ 这一项自动失效，不会
 /// 给浅色凭空染色。
+///
+/// CAUTION: 实乘量还要乘 `saturation(tint)`（见 `glass_tint`）。深色
+/// 卡面 `#2F3540` 是近中性冷灰（饱和 0.27），拿满这个值会让透过率里
+/// 蓝比红高 22%，整卡偏蓝（2026-10-29 用户报障）。
 const TINT_CHROMA: f32 = 0.5;
 
 /// 散射（乳光）的基准增益。
@@ -639,7 +657,11 @@ fn glass_tint(rgb: vec3<f32>, tint: vec3<f32>, a: f32) -> vec3<f32> {
     let t_lum = clamp(luma(tint), 0.0, 1.0);
     // 色度：`tint / luma` 的加权均值为 1，于是 `mix(1, chroma, k)` 是
     // 「围绕中性色的色偏放大」。纯白/纯灰的色度恒为 1 ⇒ 不染色。
-    let chroma = mix(vec3<f32>(1.0), tint / max(t_lum, 1e-3), TINT_CHROMA);
+    //
+    // CAUTION: 放大系数按 tint **自身饱和度**缩放——近中性的深色卡面
+    // 拿满 `TINT_CHROMA` 会把透过率染成蓝色滤镜（2026-10-29）。
+    let chroma_k = TINT_CHROMA * saturation(tint);
+    let chroma = mix(vec3<f32>(1.0), tint / max(t_lum, 1e-3), chroma_k);
     let floor = TINT_FLOOR_DARK * (1.0 - t_lum);
     let absorb = mix(vec3<f32>(1.0), tint, TINT_ABSORB) * chroma;
     let transmit = max(absorb, vec3<f32>(floor));

@@ -59,11 +59,12 @@ mod resize;
 // （lib.rs 的 `pub use app::{run, ...}` 依赖这四个名字）。
 pub use boot::{run, run_remote, run_with_capture_override, run_with_options};
 pub(crate) use boot::DeltaGuard;
+pub(crate) use boot::env_flag;
 pub(crate) use boot::is_sane_window_pos;
 pub(crate) use frame_loop::pick_surface_format;
 pub(crate) use resize::WidthRequest;
 
-use boot::{GLASS_BACKDROP_BASE, backdrop_alpha, env_flag};
+use boot::{GLASS_BACKDROP_BASE, backdrop_alpha};
 use config_write::{set_bool_field, set_number_field, set_opt_number_field, set_text_field};
 use resize::resize_width_target;
 

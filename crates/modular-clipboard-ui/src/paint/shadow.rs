@@ -181,44 +181,151 @@ pub(super) fn card_shadow_layers(blur: f32, c: f32) -> Vec<(f32, f32)> {
     out
 }
 
+/// 投影的**分主题 / 分背景模式**形状参数。
+///
+/// # 为什么投影不能只有一套参数（2026-10-29 重构）
+///
+/// 同一组参数在两种背景下表达的是**相反**的东西：
+///
+/// - 浅色底（`list_bg` 接近白）：黑投影有明度差，「浮起」直接由它
+///   表达，宽而柔的一圈是对的。
+/// - 深色底（`#0E1014` 近黑）：黑投影**没有明度差**，只会把卡片
+///   四周压成一圈脏黑边——用户看到的「阴影不正常」就是它。深色下
+///   真实的立体感来自**贴地的窄接触影**（明度差集中在下缘一条线上）
+///   与卡片自己的顶部受光高光，而不是一圈 8pt 的黑色晕。
+///
+/// 因此深色把强度压到 42%、模糊收到 60%、并整体下移 2pt：可见部分
+/// 从「四周均匀晕」变成「下缘一道干净的接触影」。
+///
+/// # 玻璃模式：**不许画进卡片内部**
+///
+/// 玻璃模式下卡片自身不铺底色（`row.rs` 把底色交给玻璃 pass），而投影
+/// 的每一层都是「外扩 k 点的实心圆角矩形」——它**必然覆盖整个卡片内部**，
+/// 累加后约 `0.4 × c` 的黑。不透明模式下这层被卡片填充盖住（无感），
+/// 玻璃模式下它直接叠在折射产出上 ⇒ 卡片内部发灰发暗、玻璃「不通透」。
+/// 这里用 `inside: false` 把绘制裁到卡片**之外**的四条边上。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ShadowStyle {
+    /// 乘在主题令牌 alpha 上的强度系数。
+    pub strength: f32,
+    /// 乘在用户「模糊」上的系数。
+    pub blur_scale: f32,
+    /// 额外下移（逻辑点）：让可见部分集中到下缘。
+    pub offset: f32,
+    /// 是否允许画到卡片矩形内部。
+    ///
+    /// `true` = 直接画外扩矩形（不透明卡片会盖住内部那部分，零额外
+    /// 形状）；`false` = 裁到卡片外侧的四条边带（玻璃模式必须）。
+    pub inside: bool,
+}
+
+/// 按主题明暗与背景模式给出投影形状。
+///
+/// 纯函数，便于单测直接核对四组取值的关系（深色必须比浅色轻、
+/// 玻璃必须不画内部）。
+pub(super) fn card_shadow_style(is_dark: bool, glass: bool) -> ShadowStyle {
+    match (is_dark, glass) {
+        // 浅色 + 不透明：原参数（预览页验收过的那套）。
+        (false, false) => ShadowStyle {
+            strength: 1.0,
+            blur_scale: 1.0,
+            offset: 0.0,
+            inside: true,
+        },
+        // 浅色 + 玻璃：卡片半透明，浅色底上黑投影透进去会把卡片压灰，
+        // 只留边缘一圈淡淡的接触影。
+        (false, true) => ShadowStyle {
+            strength: 0.55,
+            blur_scale: 0.75,
+            offset: 0.5,
+            inside: false,
+        },
+        // 深色 + 不透明：窄而淡的接触影（见结构体文档）。
+        (true, false) => ShadowStyle {
+            strength: 0.42,
+            blur_scale: 0.60,
+            offset: 2.0,
+            inside: true,
+        },
+        // 深色 + 玻璃：最轻的一档——玻璃 pass 的 Fresnel 边缘已经给出
+        // 卡片轮廓，投影只补一道下缘的「贴地」暗线。
+        (true, true) => ShadowStyle {
+            strength: 0.30,
+            blur_scale: 0.55,
+            offset: 1.5,
+            inside: false,
+        },
+    }
+}
+
+/// 把一次绘制裁到**卡片矩形之外**（四条边带），用于 [`ShadowStyle::inside`]
+/// 为 `false` 的场合。
+///
+/// 为什么不用「先画全部、再用卡片色盖住内部」：玻璃模式下卡片内部
+/// 是玻璃产出，盖一层底色等于把折射杀掉。
+///
+/// 四条边带恰好铺满「卡片外扩 `pad`」的环，互不重叠（左上/右下各
+/// 让开一格），所以每条带各画一遍图层不会叠加出更深的角。
+fn paint_outside_card(
+    painter: &egui::Painter,
+    r: Rect,
+    pad: f32,
+    mut draw: impl FnMut(&egui::Painter),
+) {
+    for band in outside_bands(r.expand(pad.max(1.0)), r) {
+        if band.width() <= 0.0 || band.height() <= 0.0 {
+            continue;
+        }
+        draw(&painter.with_clip_rect(band));
+    }
+}
+
+/// 「卡片外扩一圈」的环切成四条互不重叠的边带（上 / 下 / 左 / 右）。
+///
+/// 四条带**恰好铺满** `outer` 减去 `card` 的环：既没有缝隙（否则投影
+/// 会出现断口），也不重叠（否则同一层画两遍，角上出现更深的方块）。
+/// 抽成纯函数是为了能直接验证这两条不变量。
+fn outside_bands(outer: Rect, card: Rect) -> [Rect; 4] {
+    [
+        // 上：整条宽
+        Rect::from_min_max(outer.min, egui::pos2(outer.max.x, card.min.y)),
+        // 下：整条宽
+        Rect::from_min_max(egui::pos2(outer.min.x, card.max.y), outer.max),
+        // 左：只取上下之间那一段（角已归上下两条）
+        Rect::from_min_max(
+            egui::pos2(outer.min.x, card.min.y),
+            egui::pos2(card.min.x, card.max.y),
+        ),
+        // 右：同上
+        Rect::from_min_max(
+            egui::pos2(card.max.x, card.min.y),
+            egui::pos2(outer.max.x, card.max.y),
+        ),
+    ]
+}
+
 pub(super) fn draw_card_shadow(
     painter: &egui::Painter,
     r: Rect,
     radius: f32,
     cfg: &modular_clipboard_core::config::CardShadowConfig,
     pal: &Palette,
+    style: ShadowStyle,
 ) {
     if !cfg.enabled || cfg.opacity <= 0.0 {
         return;
     }
-    let blur = cfg.blur.clamp(0.0, 24.0);
+    let blur = (cfg.blur * style.blur_scale).clamp(0.0, 24.0);
     if blur <= 0.0 {
         return;
     }
     // 主题推荐强度（`Palette::shadow` 的 alpha）为基准，用户浓度
     // 滑块是倍率：默认 0.16 → 1.0×；拖到 0 → 无阴影。
     let strength = (cfg.opacity / 0.16).clamp(0.0, 1.0 / 0.16);
-    let c = pal.shadow.a() as f32 / 255.0 * strength;
-    let offset_y = cfg.offset_y.clamp(-8.0, 16.0);
+    let c = (pal.shadow.a() as f32 / 255.0 * strength * style.strength).clamp(0.0, 0.95);
+    let offset_y = (cfg.offset_y.clamp(-8.0, 16.0) + style.offset).clamp(-8.0, 16.0);
     let base = r.translate(vec2(0.0, offset_y));
     let [sr, sg, sb, _] = pal.shadow.to_array();
-
-    // 主投影：用户调节的模糊/偏移。
-    for (grow, a) in card_shadow_layers(blur, c) {
-        let rr = base.expand(grow);
-        // 半径随外扩同步增大：矩形与圆角始终同心，
-        // 且 radius+k ≤ (h+2k)/2 恒成立（由 radius ≤ h/2 保证）。
-        painter.rect_filled(
-            rr,
-            radius + grow,
-            egui::Color32::from_rgba_unmultiplied(
-                sr,
-                sg,
-                sb,
-                (a * 255.0).round().clamp(0.0, 255.0) as u8,
-            ),
-        );
-    }
 
     // 近投影（接触阴影）：紧贴卡片的第二组高斯层——更小模糊、更小
     // 偏移、浓度更高，让卡片边缘有「贴地」的锐利过渡。这是立体感的
@@ -230,18 +337,46 @@ pub(super) fn draw_card_shadow(
     let near_offset = (offset_y * 0.25).max(0.5);
     let near_c = (c * 1.15).clamp(0.0, 0.95);
     let near_base = r.translate(vec2(0.0, near_offset));
-    for (grow, a) in card_shadow_layers(near_blur, near_c) {
-        let rr = near_base.expand(grow);
-        painter.rect_filled(
-            rr,
-            radius + grow,
-            egui::Color32::from_rgba_unmultiplied(
-                sr,
-                sg,
-                sb,
-                (a * 255.0).round().clamp(0.0, 255.0) as u8,
-            ),
-        );
+
+    // 两组图层合成一次绘制：`inside = false` 时整个绘制要在四条边带里
+    // 各跑一遍，分层调用会把形状数翻倍。
+    let layers: Vec<(Rect, f32, f32)> = card_shadow_layers(blur, c)
+        .into_iter()
+        .map(|(grow, a)| (base.expand(grow), radius + grow, a))
+        .chain(
+            card_shadow_layers(near_blur, near_c)
+                .into_iter()
+                .map(|(grow, a)| (near_base.expand(grow), radius + grow, a)),
+        )
+        .collect();
+
+    let paint = |p: &egui::Painter| {
+        for &(rr, rad, a) in &layers {
+            // 半径随外扩同步增大：矩形与圆角始终同心，
+            // 且 radius+k ≤ (h+2k)/2 恒成立（由 radius ≤ h/2 保证）。
+            p.rect_filled(
+                rr,
+                rad,
+                egui::Color32::from_rgba_unmultiplied(
+                    sr,
+                    sg,
+                    sb,
+                    (a * 255.0).round().clamp(0.0, 255.0) as u8,
+                ),
+            );
+        }
+    };
+
+    if style.inside {
+        paint(painter);
+    } else {
+        // 外扩距离上限 = 最大 grow + 圆角，留 1pt 余量给抗锯齿。
+        let pad = layers
+            .iter()
+            .map(|&(rr, _, _)| (rr.width() - r.width()).max(0.0) * 0.5)
+            .fold(0.0_f32, f32::max)
+            + 1.0;
+        paint_outside_card(painter, r, pad, paint);
     }
 }
 
@@ -567,6 +702,97 @@ mod tests {
                 got[i],
                 want[i]
             );
+        }
+    }
+
+    /// 分主题投影的**顺序关系**：深色必须比浅色轻，玻璃必须裁到卡片外。
+    ///
+    /// 这几条是 2026-10-29 重构的核心主张：
+    /// 1. 深色底上黑投影没有明度差，越浓越像脏边 ⇒ `strength` 必须更低；
+    /// 2. 深色要把可见部分压到下缘 ⇒ `offset` 必须为正且更大；
+    /// 3. 玻璃模式卡片自身不铺底色 ⇒ 一律 `inside = false`，否则投影
+    ///    直接叠在折射产出上（卡片内部发灰）。
+    #[test]
+    fn dark_and_glass_shadow_styles_are_lighter_and_clipped() {
+        let light = card_shadow_style(false, false);
+        let light_glass = card_shadow_style(false, true);
+        let dark = card_shadow_style(true, false);
+        let dark_glass = card_shadow_style(true, true);
+
+        assert!(
+            dark.strength < light.strength,
+            "深色投影必须比浅色轻，否则在近黑底上只会读成一圈脏边：{:?}",
+            (dark, light)
+        );
+        assert!(
+            dark.strength <= 0.5,
+            "深色强度 {:.2} 过大——明度差本来就不存在，加浓补不回来",
+            dark.strength
+        );
+        assert!(
+            dark.offset > light.offset,
+            "深色必须更下沉（把可见部分集中到下缘）：{:?}",
+            (dark, light)
+        );
+        assert!(
+            dark.blur_scale < 1.0,
+            "深色模糊应收窄（{:.2}），宽晕在深底上就是脏边",
+            dark.blur_scale
+        );
+        // 玻璃：两套主题都必须裁到卡片外。
+        assert!(!light_glass.inside, "浅色玻璃也必须裁到卡片外");
+        assert!(!dark_glass.inside, "深色玻璃也必须裁到卡片外");
+        // 最轻的一档是「深色 + 玻璃」。
+        assert!(
+            dark_glass.strength < dark.strength
+                && dark_glass.strength < light_glass.strength,
+            "深色玻璃应是最轻的一档：{:?}",
+            dark_glass
+        );
+    }
+
+    /// 「卡片外的四条边带」必须**恰好**铺满外环：无缝、不重叠。
+    ///
+    /// 有缝 ⇒ 投影出现断口；重叠 ⇒ 角上同一层被画两遍，出现更深的方块
+    /// （正是 `fill_rounded_border` 文档里那类「圆角处更暗」的瑕疵）。
+    #[test]
+    fn outside_bands_tile_the_ring_exactly() {
+        let card = Rect::from_min_max(pos2(100.0, 200.0), pos2(400.0, 260.0));
+        let pad = 9.0;
+        let outer = card.expand(pad);
+        let bands = outside_bands(outer, card);
+
+        // 1) 每条带都在外环内、且不与卡片相交。
+        for (i, b) in bands.iter().enumerate() {
+            assert!(
+                b.min.x >= outer.min.x - 1e-3
+                    && b.min.y >= outer.min.y - 1e-3
+                    && b.max.x <= outer.max.x + 1e-3
+                    && b.max.y <= outer.max.y + 1e-3,
+                "第 {i} 条带 {b:?} 越出外环 {outer:?}"
+            );
+            let overlap_w = (b.max.x.min(card.max.x) - b.min.x.max(card.min.x)).max(0.0);
+            let overlap_h = (b.max.y.min(card.max.y) - b.min.y.max(card.min.y)).max(0.0);
+            assert!(
+                overlap_w * overlap_h <= 1e-3,
+                "第 {i} 条带 {b:?} 与卡片 {card:?} 相交，投影会画进卡片内部"
+            );
+        }
+        // 2) 面积守恒：四带之和 == 外环面积（无重叠即无重复计数）。
+        let sum: f32 = bands.iter().map(|b| b.width() * b.height()).sum();
+        let ring = outer.width() * outer.height() - card.width() * card.height();
+        assert!(
+            (sum - ring).abs() <= 1e-2,
+            "四条边带总面积 {sum:.1} 应等于外环 {ring:.1}（有缝或重叠）"
+        );
+        // 3) 两两不重叠。
+        for i in 0..bands.len() {
+            for j in (i + 1)..bands.len() {
+                let (a, b) = (bands[i], bands[j]);
+                let w = (a.max.x.min(b.max.x) - a.min.x.max(b.min.x)).max(0.0);
+                let h = (a.max.y.min(b.max.y) - a.min.y.max(b.min.y)).max(0.0);
+                assert!(w * h <= 1e-3, "第 {i} 与第 {j} 条带重叠 {}×{}", w, h);
+            }
         }
     }
 }

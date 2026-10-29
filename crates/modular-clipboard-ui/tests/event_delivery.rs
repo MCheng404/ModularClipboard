@@ -161,10 +161,25 @@ fn hidden_branch_continues_instead_of_breaking() {
         code.contains(&"continue;"),
         "隐藏态分支必须以 `continue;` 回到循环顶部，         否则隐藏后关闭请求等事件无人交付。实际代码行：{code:?}"
     );
+    // 唯一允许的 `break`：隐藏空闲退出（`should_idle_exit`）。
+    //
+    // 它是**显式**的退出路径（隐藏够久 + 无附属窗口 ⇒ 退出界面进程回收
+    // 内存，见 `frame_loop::should_idle_exit`），与「隐藏后无条件退出」
+    // 是两件事。判据：break 至多一条，且同一分支里必须有
+    // `if should_idle_exit(` 这条前置条件——把条件删掉改回裸 break 时，
+    // 本断言立刻红。
+    let breaks: Vec<&&str> = code.iter().filter(|l| l.starts_with("break")).collect();
     assert!(
-        !code.iter().any(|l| l.starts_with("break")),
-        "隐藏态分支里不能有 `break`：那会让程序隐藏后直接退出循环，         事件随之丢失。实际代码行：{code:?}"
+        breaks.len() <= 1,
+        "隐藏态分支里至多一条 `break`（只能是隐藏空闲退出），实际：{breaks:?}"
     );
+    if !breaks.is_empty() {
+        assert!(
+            body.contains("if should_idle_exit("),
+            "隐藏态分支出现 `break` 却没有 `if should_idle_exit(` 前置判定：\
+             那会让程序隐藏后直接退出循环，事件随之丢失。实际代码行：{code:?}"
+        );
+    }
 }
 
 /// 守卫：附属窗口（卡片子窗口 / 设置窗口）的每个 `take_pending()` 之前

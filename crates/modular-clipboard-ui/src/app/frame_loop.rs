@@ -380,6 +380,13 @@ pub(super) fn run_mode(
     // CPU 与 GPU 全部白烧；且 `hidden` 与 Win32 真实可见性长期不一致，
     // 后续任何依赖它的判断都会错。
     let mut hidden = start_minimized && resident.is_some();
+    // 隐藏起点（用于「隐藏空闲退出」，见 [`should_idle_exit`]）。
+    //
+    // 惰性打点：每次进入隐藏态的第一帧才记时间戳，`hidden == false`
+    // 时清空。这样「✕ 收起」「热键 toggle 收起」「失焦自动收起」三条
+    // 路径都不用各自补一句打点——早前这类「每加一条入口就要改一处」
+    // 的计数正是最容易漏成 bug 的地方。
+    let mut hidden_since: Option<std::time::Instant> = None;
     // 窗口是否处于最小化。由 `WindowEvent::Minimized` 维护。
     //
     // 最小化时客户区变成 0x0，第3 步的尺寸检查会跳过渲染；但那个检查
@@ -482,6 +489,10 @@ pub(super) fn run_mode(
         } else if !hidden && !visible_now {
             // 被外部隐藏：转入隐藏态（不渲染，只轮询等下一次唤起）。
             hidden = true;
+        }
+        if !hidden {
+            // 可见时清空隐藏计时（惰性打点在下面的隐藏分支里）。
+            hidden_since = None;
         }
 
         // ---- 1. 事件 ----
@@ -986,6 +997,39 @@ pub(super) fn run_mode(
         // 却仍在跑完整的 tessellate + queue_submit + device_wait_idle，
         // 等于纯烧 CPU 与带宽。
         if hidden {
+            // ---- 隐藏空闲退出（内存）----------------------------------
+            //
+            // 界面进程常驻 250~290MB：Vulkan 设备/管线、字体图集、
+            // 抓屏与超采样离屏目标、egui 字形缓存。窗口收起后这些资源
+            // 一目不用，却会一直占着内存——这就是用户看到的「无窗口时
+            // 后台占用 200MB 左右」。
+            //
+            // 界面本来就由常驻进程按需拉起（`Core::show_ui`），所以这里
+            // 直接退出：下次热键/托盘会重新 spawn（冷启动 200~400ms）。
+            // 阈值 `ui.idle_exit_secs`（默认 20 秒）保证短时反复开合
+            // 仍是零延迟。
+            //
+            // CAUTION: 附属窗口还活着时**不能退**——弹窗/子窗/设置窗是
+            // 同进程的独立 HWND，退出会把它们一起带走。卡片磨砂、搜索
+            // 面板都可能在主窗口收起后继续用。
+            let since = *hidden_since.get_or_insert_with(std::time::Instant::now);
+            // CAUTION: 弹窗判据是「显示中」而不是「已创建」——弹窗收起后
+            // 只是 `set_visible(false)`，`Option` 仍然非空（隐藏保留）。
+            let attach_alive = !children.is_empty()
+                || settings_win.is_some()
+                || popups.has_visible()
+                || img_edit.is_some();
+            let idle_limit = app.svc.state.config.ui.idle_exit_secs;
+            if should_idle_exit(idle_limit, since.elapsed(), attach_alive) {
+                tracing::info!(
+                    secs = since.elapsed().as_secs(),
+                    limit = idle_limit,
+                    "窗口已隐藏 {:.0}s，退出界面进程以回收内存（常驻进程与热键不受影响）",
+                    since.elapsed().as_secs_f32()
+                );
+                break;
+            }
+
             // 增量**不能丢**：收进积压，等下一次真正渲染时一起上传。
             // 理由见 `pending_delta` 的声明处——egui 不重发增量，
             // 清掉就等于让字体图集永久缺一块。
@@ -1810,4 +1854,54 @@ pub(super) fn rebuild<'a>(
         height: extent.1,
     })?;
     painter.on_swapchain_rebuilt(fr)
+}
+
+/// 隐藏空闲判定：主窗口收起够久、且没有附属窗口时要退出界面进程。
+///
+/// # 为什么是纯函数
+///
+/// 这条判据直接决定「后台还占不占 250MB」，而它的三个输入（阈值、
+/// 隐藏时长、附属窗口是否存在）在真实帧循环里很难构造——尤其「隐藏
+/// 20 秒」这种事没法在单测里等。抽成纯函数后三个边界都能钉住。
+///
+/// # 判据
+///
+/// - `limit_secs == 0` ⇒ 永不退出（用户显式关掉这条优化，唤起零延迟）；
+/// - 附属窗口还在 ⇒ 不退（同进程的独立 HWND 会被一起带走）；
+/// - 否则「隐藏时长 ≥ 阈值」即退出。
+pub(super) fn should_idle_exit(
+    limit_secs: u32,
+    hidden_for: std::time::Duration,
+    attach_windows: bool,
+) -> bool {
+    if limit_secs == 0 || attach_windows {
+        return false;
+    }
+    hidden_for >= std::time::Duration::from_secs(u64::from(limit_secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_idle_exit;
+    use std::time::Duration;
+
+    /// 阈值 0 = 关闭该行为（唤起零延迟是用户明确要的，不能偷偷退出）。
+    #[test]
+    fn zero_limit_disables_idle_exit() {
+        assert!(!should_idle_exit(0, Duration::from_secs(3600), false));
+    }
+
+    /// 附属窗口还在就**不能**退——弹窗/子窗是同进程的独立 HWND。
+    #[test]
+    fn attach_windows_block_idle_exit() {
+        assert!(!should_idle_exit(20, Duration::from_secs(600), true));
+    }
+
+    /// 边界：差一毫秒不退，到点就退。
+    #[test]
+    fn idle_exit_fires_at_the_threshold() {
+        assert!(!should_idle_exit(20, Duration::from_millis(19_999), false));
+        assert!(should_idle_exit(20, Duration::from_secs(20), false));
+        assert!(should_idle_exit(20, Duration::from_secs(21), false));
+    }
 }

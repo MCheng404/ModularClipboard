@@ -15,6 +15,7 @@ use crate::theme::sized;
 use super::{Frame, RowHeightCache, RowFilterKey, ROW_RADIUS};
 
 use super::detail::draw_empty;
+use super::shadow::card_shadow_style;
 use super::shadow::draw_card_shadow;
 use super::row::draw_item_row;
 use super::row::preview_is_image;
@@ -524,6 +525,22 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
                 }
             }
 
+            // ---- 缩略图并行预热（实验性，`MC_PARALLEL_THUMBS=1`）----
+            //
+            // 放在行绘制之前：把本帧可见图片条目的解码**并行**做掉，
+            // 随后逐行取缩略图全部命中缓存，首帧不再被串行解码拖住。
+            // 关闭时这一行什么都不做，行为与从前逐位相同。
+            if crate::app::env_flag("MC_PARALLEL_THUMBS") {
+                let imgs: Vec<&ClipItem> = frames
+                    .iter()
+                    .map(|&(k, _, _)| &visible[k])
+                    .filter(|it| preview_is_image(it))
+                    .collect();
+                if imgs.len() > 1 {
+                    super::row::prefetch_thumbs(f, &imgs);
+                }
+            }
+
             // ---- 第一遍：所有行的卡片阴影（统一在内容之前） ----
             //
             // 必须用视口级 painter（不能用 `painter_at(r)`，否则外扩
@@ -531,14 +548,19 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
             // 内的阴影随后会被该行的不透明填充盖住，于是投影只在行间
             // 缝隙与列表边缘可见，后一行的阴影也不会压暗前一行的文字。
             // 几何细节与反混合公式见 `draw_card_shadow`。
+            //
+            // 玻璃模式下**没有**那层不透明填充兜底，投影的内部那部分
+            // 会直接叠在折射产出上 ⇒ 由 `ShadowStyle::inside = false`
+            // 裁到卡片外侧（见 `card_shadow_style` 的文档）。
             {
                 let shadow_painter = ui.painter();
                 let shadow_cfg = &f.svc.state.config.ui.card_shadow;
+                let style = card_shadow_style(f.pal.is_dark, f.glass_covers());
                 for &(_, _, r) in &frames {
                     // CAUTION: `ui.painter()` 返回的就是 `&Painter`，不要再
                     // 套一层 `&`——clippy 的 needless_borrow 会报，且
                     // `&&Painter` 靠自动解引用勉强能编译，属于暗坑。
-                    draw_card_shadow(shadow_painter, r, ROW_RADIUS, shadow_cfg, f.pal);
+                    draw_card_shadow(shadow_painter, r, ROW_RADIUS, shadow_cfg, f.pal, style);
                 }            }
 
             // ---- 第二遍：缝隙拖动区 + 行内容 ----

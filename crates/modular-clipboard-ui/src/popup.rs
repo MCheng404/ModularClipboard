@@ -264,6 +264,14 @@ pub struct Popup<'a> {
 }
 
 impl<'a> Popup<'a> {
+    /// 上一次同步时它是否处于展开态。
+    ///
+    /// `was_open` 在 `sync_and_render` 入口按本帧的 `want_open` 更新，
+    /// 所以它表示「此刻是否显示着」——不是「用户想不想让它显示」。
+    pub fn is_open(&self) -> bool {
+        self.was_open
+    }
+
     /// 按**面板**的逻辑点尺寸创建弹窗（客户区自动加一圈 [`SHADOW_MARGIN`]）。
     pub fn create(
         kind: PopupKind,
@@ -600,6 +608,23 @@ pub struct Popups<'a> {
 }
 
 impl<'a> Popups<'a> {
+    /// 是否有弹窗**正显示着**（已创建但收起的不算）。
+    ///
+    /// 用途只有一个：主窗口隐藏后的「空闲退出」必须等到没有**可见的**
+    /// 附属窗口才动手——弹窗是独立 HWND，退出界面进程会把它们一起带走，
+    /// 而用户可能正开着搜索面板在别的窗口里找东西。
+    ///
+    /// CAUTION: 判据必须是「显示中」而不是「已创建」。弹窗是**隐藏保留**
+    /// 的（`sync_one`：懒创建、收起时只 `set_visible(false)`），所以一旦
+    /// 用过一次，`Option` 就永远非空——用「存在即占用」当判据，空闲退出
+    /// 永远不会触发（实测：隐藏 24 秒后进程照旧 290MB）。
+    pub fn has_visible(&self) -> bool {
+        [&self.search, &self.rail, &self.notice]
+            .into_iter()
+            .flatten()
+            .any(|p| p.is_open())
+    }
+
     /// 同步搜索面板弹窗（`want_open` = 搜索框应展开）。
     ///
     /// `panel_rect` 是**主窗口客户区坐标系**下的面板矩形（逻辑点，

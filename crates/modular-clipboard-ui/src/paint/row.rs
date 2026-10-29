@@ -1109,6 +1109,112 @@ pub(super) fn load_image_bytes(svc: &mut Service, item: &ClipItem) -> anyhow::Re
     std::fs::read(&path).map_err(|e| anyhow::anyhow!("读取图片文件失败 {path}: {e}"))
 }
 
+/// 实验性并行预热：把本帧**可见但缓存未命中**的图片缩略图并行解码。
+///
+/// # 开关
+///
+/// 环境变量 `MC_PARALLEL_THUMBS=1`（默认关）。关掉时行为与从前逐位
+/// 相同，开与不开的**画面也相同**——这里只是把「绘制过程中逐个同步
+/// 解码」提前到绘制之前并并行完成，随后 [`preview_image_thumb`] 全部
+/// 命中缓存。
+///
+/// # 为什么字节读取仍然是顺序的
+///
+/// `load_image_bytes` 走 `Service`（rusqlite 连接 + 文件读），那条连接
+/// **不跨线程**（`Service` 不是 `Send`）。真正的热点是解码本身（PNG /
+/// JPEG 解码 + 缩放），它是纯函数、无共享状态，正好切出去并行。
+///
+/// # 为什么至少要 2 张才并行
+///
+/// 单张时开线程的代价（约几十微秒）与解码同量级，纯粹白烧；而列表
+/// 一屏滚进多张图片时，串行解码会把首帧拖出肉眼可见的卡顿。
+pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
+    /// 并行度上限：解码是 CPU 密集，超过核数只会互相抢占。
+    const MAX_PARALLEL: usize = 4;
+
+    /// 一条待解码任务：`(缓存键, 载荷尺寸, 原始字节)`。
+    type Job = (crate::thumbnail::CacheKey, Option<(u32, u32)>, Vec<u8>);
+
+    // 1) 顺序准备：命中缓存直接跳过；否则读字节（含 DB/文件 IO）。
+    let mut jobs: Vec<Job> = Vec::new();
+    for item in items {
+        let key = crate::thumbnail::CacheKey::new(item.id, item.hash.clone());
+        if f.state.thumb_cache.get(&key).is_some() {
+            continue;
+        }
+        let dims = item
+            .payload
+            .as_ref()
+            .and_then(|p| p.dims)
+            .filter(|(w, h)| *w > 0 && *h > 0);
+        match load_image_bytes(f.svc, item) {
+            Ok(bytes) => jobs.push((key, dims, bytes)),
+            Err(e) => tracing::debug!(id = item.id, %e, "预热缩略图：字节读取失败"),
+        }
+    }
+    if jobs.len() < 2 {
+        return;
+    }
+
+    // 2) 并行解码：纯 CPU、无共享状态，结果按下标回填。
+    let mut decoded: Vec<Option<std::sync::Arc<crate::thumbnail::Thumbnail>>> =
+        vec![None; jobs.len()];
+    let started = std::time::Instant::now();
+    let chunk = jobs.len().div_ceil(MAX_PARALLEL.min(jobs.len()));
+    std::thread::scope(|s| {
+        let handles: Vec<_> = jobs
+            .chunks(chunk)
+            .enumerate()
+            .map(|(ci, part)| {
+                s.spawn(move || {
+                    part.iter()
+                        .enumerate()
+                        .map(|(i, (_, dims, bytes))| {
+                            (
+                                ci * chunk + i,
+                                crate::thumbnail::decode_auto(
+                                    bytes,
+                                    *dims,
+                                    crate::thumbnail::THUMB_MAX_EDGE,
+                                )
+                                .ok()
+                                .map(std::sync::Arc::new),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            // 线程 panic 时放弃这一批（缩略图是可选的，不该杀死界面）。
+            if let Ok(rows) = h.join() {
+                for (i, t) in rows {
+                    if let Some(slot) = decoded.get_mut(i) {
+                        *slot = t;
+                    }
+                }
+            }
+        }
+    });
+
+    // 3) 顺序回填缓存（LRU + 字节预算的淘汰在 `insert` 里）。
+    let total = jobs.len();
+    let mut ok = 0usize;
+    for ((key, _, _), thumb) in jobs.into_iter().zip(decoded) {
+        if let Some(t) = thumb {
+            f.state.thumb_cache.insert(key, t);
+            ok += 1;
+        }
+    }
+    tracing::debug!(
+        decoded = ok,
+        total,
+        threads = total.div_ceil(chunk),
+        ms = started.elapsed().as_secs_f32() * 1000.0,
+        "并行预热缩略图完成"
+    );
+}
+
 /// 解码并上传缩略图纹理；命中已上传的纹理时直接返回。
 ///
 /// 上传成功后把**尺寸**写进 `state.thumb_dims`：文件型图片没有

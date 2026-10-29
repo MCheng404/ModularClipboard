@@ -13,6 +13,7 @@ use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
 use super::window::WindowPos;
 use super::window::default_card_blur;
+use super::window::default_idle_exit_secs;
 use super::window::default_backdrop_scale;
 use super::window::default_glass_blur;
 use super::window::default_glass_dispersion;
@@ -103,6 +104,22 @@ pub struct UiConfig {
     /// 置顶窗口位置（屏幕逻辑点）。语义同 [`UiConfig::window_pos`]。
     #[serde(default)]
     pub pinned_window_pos: Option<WindowPos>,
+    /// 主窗口隐藏多少秒后**退出界面进程**（0 = 永不退出）。
+    ///
+    /// # 为什么要退出（2026-10-29）
+    ///
+    /// 界面进程是 Vulkan + 一整套字体/纹理资源：实测常驻约 250~290MB
+    /// （`PrivateUsage`）。窗口收起后这些资源一分钱也用不上，却会一直
+    /// 占着内存——用户看到的「无窗口时后台占用 200MB 左右」就是它。
+    ///
+    /// 界面本来就由常驻进程**按需拉起**（`Core::show_ui`：没在跑就
+    /// `spawn --ui`），所以退出的代价只是下次唤起的冷启动（约 200~400ms，
+    /// 含设备与字体初始化）。取 20 秒是「短时反复开合保持零延迟」与
+    /// 「闲置就还内存」的折中：`✕` 收起后 20 秒内再唤仍是瞬时的。
+    ///
+    /// 常驻进程（捕获/托盘/热键）不受影响——它本来就只占 3~16MB。
+    #[serde(default = "default_idle_exit_secs")]
+    pub idle_exit_secs: u32,
     /// 窗口背景效果（无 / 磨砂 / 半透明）。
     ///
     /// `#[serde(default)]` 保证旧版 config.json 缺字段时解析为

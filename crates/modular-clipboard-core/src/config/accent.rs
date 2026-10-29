@@ -168,6 +168,7 @@ impl Default for UiConfig {
             layout: None,
             window_pos: None,
             pinned_window_pos: None,
+            idle_exit_secs: super::window::default_idle_exit_secs(),
             window_backdrop: WindowBackdrop::None,
             window_opacity: 1.0,
             card_opacity: 1.0,
