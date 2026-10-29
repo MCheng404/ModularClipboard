@@ -304,6 +304,29 @@ fn outside_bands(outer: Rect, card: Rect) -> [Rect; 4] {
     ]
 }
 
+/// 一组高斯投影的**几何层**：`(矩形, 圆角, alpha)`，从外到内（绘制顺序）。
+///
+/// 两个调用方共用同一套几何与 alpha 算法，只在「怎么画」上不同：
+/// [`draw_card_shadow`] 直接进 painter（列表行卡片），
+/// [`push_halo_layers`] 造 `Shape` 交给占位符（设置窗悬浮卡，因为卡片高度
+/// 由内容决定、投影必须早于填充）。早前各自 `expand + radius + grow`
+/// 展开一遍——改一处忘另一处就会让两种卡片的高斯轮廓悄悄分叉。
+fn expanded_layers(
+    r: Rect,
+    radius: f32,
+    blur: f32,
+    c: f32,
+    offset_y: f32,
+) -> Vec<(Rect, f32, f32)> {
+    let base = r.translate(vec2(0.0, offset_y));
+    card_shadow_layers(blur, c)
+        .into_iter()
+        // 半径随外扩同步增大：矩形与圆角始终同心，且
+        // `radius + grow ≤ (h + 2·grow)/2` 恒成立（由 radius ≤ h/2 保证）。
+        .map(|(grow, a)| (base.expand(grow), radius + grow, a))
+        .collect()
+}
+
 pub(super) fn draw_card_shadow(
     painter: &egui::Painter,
     r: Rect,
@@ -324,7 +347,6 @@ pub(super) fn draw_card_shadow(
     let strength = (cfg.opacity / 0.16).clamp(0.0, 1.0 / 0.16);
     let c = (pal.shadow.a() as f32 / 255.0 * strength * style.strength).clamp(0.0, 0.95);
     let offset_y = (cfg.offset_y.clamp(-8.0, 16.0) + style.offset).clamp(-8.0, 16.0);
-    let base = r.translate(vec2(0.0, offset_y));
     let [sr, sg, sb, _] = pal.shadow.to_array();
 
     // 近投影（接触阴影）：紧贴卡片的第二组高斯层——更小模糊、更小
@@ -336,19 +358,11 @@ pub(super) fn draw_card_shadow(
     let near_blur = (blur * 0.35).max(0.5);
     let near_offset = (offset_y * 0.25).max(0.5);
     let near_c = (c * 1.15).clamp(0.0, 0.95);
-    let near_base = r.translate(vec2(0.0, near_offset));
 
     // 两组图层合成一次绘制：`inside = false` 时整个绘制要在四条边带里
     // 各跑一遍，分层调用会把形状数翻倍。
-    let layers: Vec<(Rect, f32, f32)> = card_shadow_layers(blur, c)
-        .into_iter()
-        .map(|(grow, a)| (base.expand(grow), radius + grow, a))
-        .chain(
-            card_shadow_layers(near_blur, near_c)
-                .into_iter()
-                .map(|(grow, a)| (near_base.expand(grow), radius + grow, a)),
-        )
-        .collect();
+    let mut layers = expanded_layers(r, radius, blur, c, offset_y);
+    layers.extend(expanded_layers(r, radius, near_blur, near_c, near_offset));
 
     let paint = |p: &egui::Painter| {
         for &(rr, rad, a) in &layers {
@@ -370,7 +384,8 @@ pub(super) fn draw_card_shadow(
     if style.inside {
         paint(painter);
     } else {
-        // 外扩距离上限 = 最大 grow + 圆角，留 1pt 余量给抗锯齿。
+        // 外扩距离上限 = 最大 grow + 1pt 抗锯齿余量。
+        // 每层是 `r.expand(grow)` ⇒ 宽差恰好是 `2·grow`，取一半反算。
         let pad = layers
             .iter()
             .map(|&(rr, _, _)| (rr.width() - r.width()).max(0.0) * 0.5)
@@ -490,17 +505,14 @@ fn push_halo_layers(
     color: egui::Color32,
     radius: f32,
 ) {
-    let layers = card_shadow_layers(blur, c);
+    let layers = expanded_layers(r, radius, blur, c, offset_y);
     let [cr, cg, cb, _] = color.to_srgba_unmultiplied();
-    let colors = diffuse_halo_color(&layers, [cr, cg, cb]);
-    let base = r.translate(vec2(0.0, offset_y));
-    for ((grow, a), fill) in layers.iter().zip(colors) {
+    let alphas: Vec<f32> = layers.iter().map(|&(_, _, a)| a).collect();
+    let colors = diffuse_halo_color(&alphas, [cr, cg, cb]);
+    for (&(rect, rad, _), fill) in layers.iter().zip(colors) {
         out.push(egui::Shape::Rect(egui::epaint::RectShape::filled(
-            base.expand(*grow),
-            radius + grow,
-            fill,
+            rect, rad, fill,
         )));
-        let _ = a;
     }
 }
 
@@ -529,11 +541,11 @@ fn push_halo_layers(
 /// NOTE: 该误差只影响**彩色**投影（深色主题色光晕）。浅色三层是纯黑
 /// 投影，通道恒 0，与 alpha 无关，完全不受量化影响。
 ///
-/// `layers` 是 `(grow, alpha)`，**从外到内**（绘制顺序）。
-fn diffuse_halo_color(layers: &[(f32, f32)], rgb: [u8; 3]) -> Vec<egui::Color32> {
-    let mut out = Vec::with_capacity(layers.len());
+/// `alphas` 是逐层 alpha，**从外到内**（绘制顺序）；几何不参与计算。
+fn diffuse_halo_color(alphas: &[f32], rgb: [u8; 3]) -> Vec<egui::Color32> {
+    let mut out = Vec::with_capacity(alphas.len());
     let mut debt = [0.0f32; 3]; // 每通道未摊销完的余数
-    for &(_, a) in layers {
+    for &a in alphas {
         let alpha_u8 = (a * 255.0).round().clamp(0.0, 255.0) as u8;
         let mut ch = [0u8; 3];
         for i in 0..3 {

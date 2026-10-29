@@ -49,10 +49,8 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 底色随矩形一起交给玻璃层——顶栏是 `bg`，行卡片是 `card_bg`，
     // 两者不同，不能共用一份全局 tint。
     f.push_glass_overlay(bar, 0.0, bar_bg);
-    // CAUTION: 玻璃模式下**不画**底色（见 `Frame::glass_covers`）——
-    // 画了就把玻璃 pass 的输出整层盖住，顶栏看起来和没开玻璃一样。
-    // 判据必须是 `glass_covers()`：弹窗/子窗口配置同样是玻璃却没有
-    // 玻璃 pass 覆盖，那里必须照常画底色，否则整块透出桌面。
+    // 底色交给玻璃层；只有本窗口不被玻璃 pass 覆盖时才自己画
+    // （判据见 `Frame::glass_covers`——画了就盖住折射）。
     if !f.glass_covers() {
         painter.rect_filled(bar, CornerRadius::ZERO, bar_bg);
     }
@@ -381,13 +379,8 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
     // 液态玻璃：搜索面板参与（圆角与它自己的底色一致）。
     // 底色 `surface` 与行卡片 `card_bg` 不同，逐矩形传下去才不会串色。
     f.push_glass_overlay(r, radius, pal.surface);
-    // 玻璃模式下底色交给玻璃层（画了就盖住折射）。
-    //
-    // CAUTION: 判据是 `glass_covers()` 而不是 `glass_mode()`——搜索面板
-    // 是**独立窗口**，主窗口的玻璃 pass 铺不到它（`push_glass_overlay`
-    // 的 `hit_ns == Main` 闸门会把它拦下）。用全局判据的话，玻璃模式下
-    // 这块面板只剩描边与文字、内部透出桌面（2026-10-28「玻璃有概率不
-    // 渲染」的病根之一）。
+    // 底色交给玻璃层；搜索面板是**独立窗口**，主窗口的玻璃 pass 铺不到
+    // 它，所以这里照常自己画（判据见 `Frame::glass_covers`）。
     if !f.glass_covers() {
         painter.rect_filled(r, radius, pal.surface);
     }
@@ -773,12 +766,9 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
     // 缝隙会透出投影的纯黑（实机「类型栏是一块黑色背景」）。
     let radius = pal.radius_md;
     let painter = f.ui.painter_at(rail);
-    // CAUTION: 玻璃模式下不画底色（会盖住折射），但**描边保留**——
-    // 它是按钮组的形状线索，且 1pt 半透明描边不遮挡折射产出。
-    //
-    // 判据用 `glass_covers()`：类型栏是独立弹窗，主窗口的玻璃 pass 不
-    // 覆盖它（见 `Frame::glass_covers`）。这一层还额外承担「盖住投影」
-    // ——投影是外扩的实心矩形，少了不透明底，按钮缝隙会透出纯黑。
+    // 底色只在「本窗口不被玻璃 pass 覆盖」时自己画（判据见
+    // `Frame::glass_covers`），但**描边保留**——它是按钮组的形状线索，
+    // 1pt 半透明描边不遮挡折射。这一层还负责盖住外扩的投影。
     if !f.glass_covers() {
         painter.rect_filled(rail, radius, pal.surface);
     }

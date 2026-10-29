@@ -1375,34 +1375,20 @@ impl<'a> Frame<'a> {
         self.state.hit_get_from(self.hit_ns, key)
     }
 
-    /// 登记一个参与**液态玻璃**合成的矩形。
-    ///
-    /// # 调用时机
-    ///
-    /// 必须在画该面板/卡片的**底色之前**：玻璃 pass 在 egui 内容之前跑
-    /// （它是背景层），矩形只用于「这个像素属于哪张卡片」。
-    ///
-    /// # 为什么上限是 16 张
-    ///
-    /// `gfx::glass_pass::MAX_GLASS_CARDS`。超出部分由 uniform 换算处静默
-    /// 丢弃——列表可见行约 10 张 + 顶栏 + 搜索面板 + 类型栏，正常不会超。
     /// 当前背景效果是否为「液态玻璃」。
     ///
-    /// 玻璃模式下**不能画自己的底色**：玻璃 pass 已经把「底图 + 底色」
-    /// 合成好了（`GlassRect::new` 的 `fill` 参数），再画一层就是两次
-    /// 覆盖——底色 alpha = 1 时玻璃整层被盖死，折射/色散/边缘光全部
-    /// 看不见（2026-10-27 行卡片的病根，2026-10-28 推广到 chrome）。
-    ///
-    /// CAUTION: 判断「要不要画底色」请用 [`Self::glass_covers`] 而不是
-    /// 这个方法。见那里的说明——用错会让弹窗与子窗口没有背景。
-    pub fn glass_mode(&self) -> bool {
+    /// 这是**全局配置**，不区分窗口身份：弹窗、设置窗、卡片子窗口读到的
+    /// 都是同一个值。判断「本窗口这一帧会不会被玻璃 pass 覆盖」必须用
+    /// [`Self::glass_covers`]——两者差一个 `hit_ns == Main` 闸门。
+    fn glass_mode(&self) -> bool {
         self.svc.state.config.ui.window_backdrop
             == modular_clipboard_core::config::WindowBackdrop::Glass
     }
 
-    /// 本窗口**本帧**是否真的会被玻璃 pass 覆盖。
+    /// 本窗口**本帧**是否真的会被玻璃 pass 覆盖——即「这里该不该把底色
+    /// 交给玻璃层、自己不画」的唯一判据。
     ///
-    /// # 为什么不能直接用 [`Self::glass_mode`]（2026-10-28 修「玻璃有概率不渲染」）
+    /// # 为什么不能直接用 `glass_mode`（2026-10-28 修「玻璃有概率不渲染」）
     ///
     /// 玻璃 pass 是**主窗口独享**的：`Frame::push_glass*` 有
     /// `hit_ns == Main` 闸门（弹窗/子窗口的坐标属于另一个客户区，混进
@@ -1414,8 +1400,13 @@ impl<'a> Frame<'a> {
     /// 桌面（深色壁纸上就是一块黑）。而它们是**按需创建、按需开帧**的
     /// ——用户看到的是「玻璃有时候不渲染」，实际是「弹窗一出现就没底」。
     ///
-    /// 判据因此必须是「配置是玻璃 **且** 本窗口是主窗口」。
+    /// 判据因此必须是「配置是玻璃 **且** 本窗口是主窗口」。所有
+    /// 「玻璃模式下不画底色」的调用点（行卡片、顶栏、搜索面板、类型栏）
+    /// 都只引用本方法，不再各自解释一遍原因。
     pub fn glass_covers(&self) -> bool {
+        // 与 `glass_rect_ok` 的 `hit_ns == Main` 必须是**同一个**闸门：
+        // 前者决定「这里要不要自己画底色」，后者决定「矩形进不进 uniform」，
+        // 两者失配就会出现「以为有玻璃、其实没有」或反之。
         self.glass_mode() && matches!(self.hit_ns, HitNs::Main)
     }
 
@@ -1431,26 +1422,22 @@ impl<'a> Frame<'a> {
         self.svc.state.config.ui.card_opacity.clamp(0.3, 1.0)
     }
 
+    /// 登记一个参与**液态玻璃**合成的矩形（列表行 / 整卡等普通优先级）。
+    ///
+    /// # 调用时机
+    ///
+    /// 必须在画该面板/卡片的**底色之前**：玻璃 pass 在 egui 内容之前跑
+    /// （它是背景层），矩形只用于「这个像素属于哪张卡片」。玻璃模式下
+    /// **不能**再自己画一层底色——底色随 `GlassRect` 一起交给着色器，
+    /// 再画一层会把折射/色散/边缘光整层盖死（2026-10-27 行卡片的病根）。
+    ///
+    /// # 超限行为
+    ///
+    /// 上限是 [`MAX_GLASS_CARDS`](modular_clipboard_gfx::glass_pass::MAX_GLASS_CARDS)，
+    /// 满了就**丢弃自己**（列表行是低优先级，chrome 那批走
+    /// [`Self::push_glass_overlay`]）。
     pub fn push_glass(&mut self, r: Rect, radius: f32, fill: egui::Color32) {
-        // CAUTION: 只有**主窗口**跑玻璃 pass。`glass_rects` 与 `drag_regions`
-        // 一样是主/子/设置三窗**共用**的一张表（同一个 `PaintState`），
-        // 而只有主窗口的帧循环会 `mem::take` 它并调 `set_glass`。附属窗口
-        // 若也往里 push，坐标属于另一个窗口的客户区，会被主窗口当成自己的
-        // 矩形——玻璃会画在完全错误的位置（而且不报错）。
-        //
-        // 判据用 `HitNs` 而不是 `card_id`：设置窗口的 `card_id` 也是 `None`。
-        if !matches!(self.hit_ns, HitNs::Main) {
-            return;
-        }
-        // 与 `hit_insert` 同一套健全性检查：非有限坐标/零面积/不在客户区内
-        // 的矩形不该进 uniform（NaN 会让 SDF 全程为假，整张卡片没玻璃）。
-        let sane = r.min.x.is_finite()
-            && r.min.y.is_finite()
-            && r.max.x.is_finite()
-            && r.max.y.is_finite()
-            && r.width() > 0.0
-            && r.height() > 0.0;
-        if !sane || !self.area.intersects(r) {
+        if !self.glass_rect_ok(r) {
             return;
         }
         if self.state.glass_rects.len() >= modular_clipboard_gfx::glass_pass::MAX_GLASS_CARDS {
@@ -1466,6 +1453,33 @@ impl<'a> Frame<'a> {
             ));
     }
 
+    /// 玻璃矩形的准入判据：**主窗口**、坐标有限、面积为正、落在客户区内。
+    ///
+    /// # 为什么必须收成一个函数
+    ///
+    /// [`Self::push_glass`] 与 [`Self::push_glass_overlay`] 是两条入口，
+    /// 判据必须逐条一致；各写一遍时，只改一处就会出现「行卡片进得去、
+    /// 顶栏进不去」这类只在特定窗口尺寸下才暴露的偏差。
+    ///
+    /// - 主窗口闸门用 `hit_ns` 而不是 `card_id`：设置窗口的 `card_id` 也是
+    ///   `None`。`glass_rects` 是主/子/设置三窗**共用**的一张表，而只有
+    ///   主窗口的帧循环会取走它——附属窗口若也 push，坐标属于另一个客户区，
+    ///   会被主窗口画到完全错误的位置（且不报错）。
+    /// - 健全性检查同 `hit_insert`：NaN 会让 SDF 全程为假，整张卡片没玻璃；
+    ///   零面积或完全在客户区外的矩形纯浪费 uniform 名额。
+    fn glass_rect_ok(&self, r: Rect) -> bool {
+        // 先判数值健全性再看交集：`Rect::intersects` 对 NaN 的比较恒假，
+        // 依赖它「顺手挡住 NaN」属于隐式行为，换成显式检查更稳。
+        matches!(self.hit_ns, HitNs::Main)
+            && r.min.x.is_finite()
+            && r.min.y.is_finite()
+            && r.max.x.is_finite()
+            && r.max.y.is_finite()
+            && r.width() > 0.0
+            && r.height() > 0.0
+            && self.area.intersects(r)
+    }
+
     /// 登记一个**高优先级**的玻璃矩形（顶栏 / 搜索面板 / 类型栏 / 通知）。
     ///
     /// # 为什么需要优先级
@@ -1478,16 +1492,7 @@ impl<'a> Frame<'a> {
     /// 高优先级矩形插到队首：着色器逐矩形遍历、命中即停，而 chrome 与行
     /// 卡片**互不重叠**，因此顺序不影响命中结果，只影响「超限时谁被丢」。
     pub fn push_glass_overlay(&mut self, r: Rect, radius: f32, fill: egui::Color32) {
-        if !matches!(self.hit_ns, HitNs::Main) {
-            return;
-        }
-        let sane = r.min.x.is_finite()
-            && r.min.y.is_finite()
-            && r.max.x.is_finite()
-            && r.max.y.is_finite()
-            && r.width() > 0.0
-            && r.height() > 0.0;
-        if !sane || !self.area.intersects(r) {
+        if !self.glass_rect_ok(r) {
             return;
         }
         // 满了就**挤掉队尾**（最低优先级）而不是丢弃自己：顶栏/搜索/类型栏

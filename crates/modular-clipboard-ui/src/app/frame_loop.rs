@@ -428,6 +428,15 @@ pub(super) fn run_mode(
     let mut pending_delta = egui::TexturesDelta::default();
 
     while !quit {
+        // 本帧的背景效果：**每帧只读一次**，全帧共用。
+        //
+        // 这个字段在这一帧里被七八处判断引用（卡片磨砂档位、渲染闸门
+        // 的已应用值比对、玻璃参数/清参数、模糊档位）。各处分别去
+        // `config` 里读一遍时，一次改动要改七八处、且很容易出现
+        // 「玻璃分支用新值、磨砂分支还在用旧值」这种只在切换瞬间暴露
+        // 的错位——收成一处，口径自然同源。
+        let backdrop = app.svc.state.config.ui.window_backdrop;
+
         // ---- 0. 退出标志（必须在**所有** continue 之前）----------
         //
         // NOTE: 早前这个判断在循环末尾（第 4 步之后），而本循环有三条
@@ -788,9 +797,7 @@ pub(super) fn run_mode(
         // 折射提供，见 `row.rs` 2026-10-25 的注释）⇒ 把捕获级别压到 0，
         // 省掉「CPU 降采样 + 纹理上传」整条链。切回磨砂/半透明时下面
         // 的差值比对会自动恢复真实档位。
-        let effective_card_blur = if app.svc.state.config.ui.window_backdrop
-            == modular_clipboard_core::config::WindowBackdrop::Glass
-        {
+        let effective_card_blur = if backdrop == modular_clipboard_core::config::WindowBackdrop::Glass {
             0
         } else {
             want_card_blur
@@ -802,8 +809,7 @@ pub(super) fn run_mode(
         if effective_card_blur > 0 && !hidden && !window.is_minimized() {
             // 背景是**磨砂**时抓屏由背景管线顺带做（共享一次 `BitBlt`），
             // 这里只把结果取走；否则才单独抓一次。
-            let acrylic = app.svc.state.config.ui.window_backdrop
-                == modular_clipboard_core::config::WindowBackdrop::Acrylic;
+            let acrylic = backdrop == modular_clipboard_core::config::WindowBackdrop::Acrylic;
             let got = if acrylic {
                 painter.take_card_blur()
             } else {
@@ -844,7 +850,7 @@ pub(super) fn run_mode(
             && last_delay.is_none()
             && !crate::anim::busy(&ctx)
             && app.svc.state.config.ui.always_on_top == applied_topmost
-            && app.svc.state.config.ui.window_backdrop == applied_backdrop;
+            && backdrop == applied_backdrop;
         if skip_render {
             // 睡固定间隔：没有要画的内容，8ms 轮询足以让输入延迟感知不到。
             events.poll_for(Some(std::time::Duration::from_millis(8)));
@@ -999,22 +1005,14 @@ pub(super) fn run_mode(
         if hidden {
             // ---- 隐藏空闲退出（内存）----------------------------------
             //
-            // 界面进程常驻 250~290MB：Vulkan 设备/管线、字体图集、
-            // 抓屏与超采样离屏目标、egui 字形缓存。窗口收起后这些资源
-            // 一目不用，却会一直占着内存——这就是用户看到的「无窗口时
-            // 后台占用 200MB 左右」。
+            // 界面进程常驻 250~290MB（Vulkan 设备/字体图集/离屏目标），
+            // 窗口收起后一分钱用不上。判据与阈值取舍见 [`should_idle_exit`]；
+            // 这里只负责「收集本帧事实」：藏了多久、有没有附属窗口还开着。
             //
-            // 界面本来就由常驻进程按需拉起（`Core::show_ui`），所以这里
-            // 直接退出：下次热键/托盘会重新 spawn（冷启动 200~400ms）。
-            // 阈值 `ui.idle_exit_secs`（默认 20 秒）保证短时反复开合
-            // 仍是零延迟。
-            //
-            // CAUTION: 附属窗口还活着时**不能退**——弹窗/子窗/设置窗是
-            // 同进程的独立 HWND，退出会把它们一起带走。卡片磨砂、搜索
-            // 面板都可能在主窗口收起后继续用。
+            // CAUTION: 附属窗口还活着时不能退——它们是同进程的独立 HWND。
+            // 弹窗判据用 `has_visible()` 而不是 `Option::is_some()`：弹窗
+            // 收起后只是 `set_visible(false)`，字段仍然非空。
             let since = *hidden_since.get_or_insert_with(std::time::Instant::now);
-            // CAUTION: 弹窗判据是「显示中」而不是「已创建」——弹窗收起后
-            // 只是 `set_visible(false)`，`Option` 仍然非空（隐藏保留）。
             let attach_alive = !children.is_empty()
                 || settings_win.is_some()
                 || popups.has_visible()
@@ -1194,7 +1192,6 @@ pub(super) fn run_mode(
         //
         // 放这里之后，抓屏永远在正确设置下发生。
         {
-            let backdrop = app.svc.state.config.ui.window_backdrop;
             if backdrop != applied_backdrop {
                 applied_backdrop = backdrop;
                 presence::apply_backdrop(window.hwnd(), backdrop);
@@ -1223,9 +1220,7 @@ pub(super) fn run_mode(
         ) {
             // 玻璃参数：矩形由绘制层收集（`Frame::push_glass`），审美三项
             // 来自配置。取走即清，下一帧重新收集。
-            if app.svc.state.config.ui.window_backdrop
-                == modular_clipboard_core::config::WindowBackdrop::Glass
-            {
+            if backdrop == modular_clipboard_core::config::WindowBackdrop::Glass {
                 let cfg = &app.svc.state.config.ui;
                 // 底色与覆盖度**随每个矩形走**（`GlassRect` 自带），
                 // 这里只剩审美三项。早前全局的 tint / card_alpha 会让
@@ -1236,12 +1231,9 @@ pub(super) fn run_mode(
                     refract: cfg.glass_refract,
                     dispersion: cfg.glass_dispersion,
                     edge: cfg.glass_edge,
-                    // 背景层不透明度：随「窗口不透明度」滑块走。
-                    //
-                    // 玻璃模式下整个窗口的透明感就靠这一项——早前背景层
-                    // 沿用捕获图的 alpha（恒为 1），整窗被不透明底图糊死，
-                    // 真实桌面一点都透不出来（2026-10-28 报障「无法渲染
-                    // 透明效果」）。
+                    // 背景层不透明度：默认档 × 「窗口不透明度」滑块。
+                    // 整个窗口的透明感就靠这一项（为什么不是 1.0，见
+                    // `BG_ALPHA_DEFAULT` 的文档）。
                     bg_alpha: modular_clipboard_gfx::glass::BG_ALPHA_DEFAULT
                         * cfg.window_opacity.clamp(0.3, 1.0),
                 });
@@ -1256,9 +1248,7 @@ pub(super) fn run_mode(
             // 早先两者共用 `window_blur_strength`，玻璃用户想调模糊时
             // 设置里唯一相关的滑块（磨砂强度）在玻璃模式下是禁用态——
             // 2026-10-24 用户反馈「玻璃模糊度用的是磨砂的参数」。
-            let blur_strength = if app.svc.state.config.ui.window_backdrop
-                == modular_clipboard_core::config::WindowBackdrop::Glass
-            {
+            let blur_strength = if backdrop == modular_clipboard_core::config::WindowBackdrop::Glass {
                 app.svc.state.config.ui.glass_blur
             } else {
                 app.svc.state.config.ui.window_blur_strength
@@ -1857,6 +1847,18 @@ pub(super) fn rebuild<'a>(
 }
 
 /// 隐藏空闲判定：主窗口收起够久、且没有附属窗口时要退出界面进程。
+///
+/// # 为什么退出（2026-10-29，`ui.idle_exit_secs`）
+///
+/// 界面进程的 250~290MB 是 **Vulkan 设备/管线 + 字体图集 + egui 字形
+/// 缓存 + 离屏目标**的固定成本，与背景效果无关（实测 backdrop=None 时
+/// 仍有 253MB），窗口收起后一分钱用不上。而界面本来就由常驻进程按需
+/// 拉起（`Core::show_ui`：没在跑就 `spawn --ui`），退出后下次热键/托盘
+/// 会重新启动它（窗口 52ms 可见、完整初始化约 0.4s）。
+///
+/// 默认 20 秒是「短时反复开合保持零延迟」与「闲置就还内存」的折中；
+/// 退出走普通 `break`，**不能**走 `should_quit`——那条会 `request_quit()`
+/// 把常驻进程（捕获/托盘/热键）一起退掉。
 ///
 /// # 为什么是纯函数
 ///

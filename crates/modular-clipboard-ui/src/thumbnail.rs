@@ -427,6 +427,14 @@ impl ThumbnailCache {
         Some(hit)
     }
 
+    /// 只读探测：命中**不**改变 LRU 顺序。
+    ///
+    /// 给「预热前先看有没有」用：`get` 会把键挪到最近使用端，预热一次
+    /// 却把整屏条目都标成刚用过，真正在用却被挤出预算的会是别人。
+    pub fn peek(&self, key: &CacheKey) -> Option<&Arc<Thumbnail>> {
+        self.map.get(key)
+    }
+
     /// 直接插入（若已存在则替换并记账）。
     pub fn insert(&mut self, key: CacheKey, thumb: Arc<Thumbnail>) {
         if let Some(old) = self.map.insert(key.clone(), thumb) {

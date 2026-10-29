@@ -640,11 +640,6 @@ impl<'a> Painter<'a> {
         self.backdrop.glass_params = Some(params);
     }
 
-    /// 当前是否配了玻璃参数（诊断/测试用）。
-    pub fn has_glass(&self) -> bool {
-        self.backdrop.glass_params.is_some()
-    }
-
     /// 清除玻璃参数（背景效果**不是**玻璃时每帧调用）。
     ///
     /// # 为什么必须显式清（2026-10-28）

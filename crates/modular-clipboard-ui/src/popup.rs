@@ -268,7 +268,7 @@ impl<'a> Popup<'a> {
     ///
     /// `was_open` 在 `sync_and_render` 入口按本帧的 `want_open` 更新，
     /// 所以它表示「此刻是否显示着」——不是「用户想不想让它显示」。
-    pub fn is_open(&self) -> bool {
+    fn is_open(&self) -> bool {
         self.was_open
     }
 

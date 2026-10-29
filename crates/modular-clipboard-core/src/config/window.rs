@@ -40,13 +40,6 @@ pub(super) fn default_window_opacity() -> f32 {
     1.0
 }
 
-/// `idle_exit_secs` 的 serde 缺省值：隐藏 20 秒后退出界面进程。
-///
-/// 与 [`UiConfig::default`] 必须一致——两处不一致时，旧配置（缺字段）
-/// 与新建配置会得到不同行为，而用户完全看不出差异来自哪里。
-pub(super) fn default_idle_exit_secs() -> u32 {
-    20
-}
 
 /// `card_opacity` 的 serde 缺省值（与 [`UiConfig::default`] 一致）。
 pub(super) fn default_card_opacity() -> f32 {

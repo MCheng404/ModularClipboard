@@ -60,12 +60,9 @@ pub(super) fn first_visible_row(offsets: &[f32], heights: &[f32], scroll: f32) -
 
 /// 单个列表最多上报多少段「行间缝隙」拖动区。
 ///
-/// 缝隙是一行一段的，段数随可见行数浮动；不设上限的话，高窗口 +
-/// 短行可以把 `chrome::MAX_DRAG_SEGS` 的预算吃光，把顶栏 / 左右留白 /
-/// 底部空白这些**更该拖得动**的段挤出去（截尾语义）。
-///
-/// 8 段足够覆盖首屏（用户够得着的就那几条缝），剩下的留给优先级更高
-/// 的段。与顶栏「插到最前」一起构成双保险，见 `draw_topbar` 的注释。
+/// 缝隙是一行一段、段数随可见行数浮动，因此必须有**预算**：不设上限时
+/// 高窗口 + 短行能把 `chrome::MAX_DRAG_SEGS` 吃光，把顶栏/边距/底部空白
+/// 挤出预算（那边是截尾语义）。8 段足够覆盖首屏够得着的那几条缝。
 const GAP_SEG_BUDGET: usize = 8;
 
 pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Option<bool>) {
@@ -536,9 +533,9 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
                     .map(|&(k, _, _)| &visible[k])
                     .filter(|it| preview_is_image(it))
                     .collect();
-                if imgs.len() > 1 {
-                    super::row::prefetch_thumbs(f, &imgs);
-                }
+                // 是否需要并行（未命中数 ≥ 2）由 `prefetch_thumbs` 内部判定：
+                // 这里只知道「有几张图」，不知道「有几张没缓存」。
+                super::row::prefetch_thumbs(f, &imgs);
             }
 
             // ---- 第一遍：所有行的卡片阴影（统一在内容之前） ----

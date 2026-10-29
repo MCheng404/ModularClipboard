@@ -13,7 +13,6 @@ use super::card_row::RowMetaConfig;
 use super::window::WindowBackdrop;
 use super::window::WindowPos;
 use super::window::default_card_blur;
-use super::window::default_idle_exit_secs;
 use super::window::default_backdrop_scale;
 use super::window::default_glass_blur;
 use super::window::default_glass_dispersion;
@@ -26,6 +25,14 @@ use super::secondary::SecondaryTheme;
 use super::theme_params::ThemeParams;
 use super::accent::AccentColor;
 use super::accent::ThemeOverrides;
+
+/// `idle_exit_secs` 的 serde 缺省值：隐藏 20 秒后退出界面进程。
+///
+/// 必须与 [`UiConfig::default`] 一致——两处不一致时，旧配置（缺字段）
+/// 与新建配置会得到不同行为，而用户完全看不出差异来自哪里。
+pub(super) fn default_idle_exit_secs() -> u32 {
+    20
+}
 
 /// UI 偏好。
 ///

@@ -477,6 +477,10 @@ pub fn render_scale_for(dpi_scale: f32) -> f32 {
 
 /// 已初始化的 Vulkan 设备上下文。
 pub struct Gpu {
+    /// Vulkan 入口点。**字段本身从不被读取**，但必须持有到设备销毁之后：
+    /// `Entry` 负责 `vkDestroyInstance` 所需的函数指针与实例所有权，
+    /// 先于 `instance` 丢弃会让销毁调用走到已释放的函数表上。
+    /// 这是 `dead_code` 的正当理由，不是遗留。
     #[allow(dead_code)]
     entry: Entry,
     pub instance: AshInstance,

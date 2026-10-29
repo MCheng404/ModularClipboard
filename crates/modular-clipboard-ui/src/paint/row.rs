@@ -127,12 +127,9 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     //
     // 纹理是**整窗客户区**的底图，按卡片矩形取其中一块（见
     // `card_blur_uv`），因此每张卡片看到的是它自己身后那一块桌面。
-    // 液态玻璃：本帧起这张卡片要参与折射合成（仅背景效果 = 玻璃时生效）。
-    // 必须在画底色**之前**——玻璃 pass 跑在 egui 内容之前。
-    // CAUTION: 判据是 `glass_covers()`（本窗口真的被玻璃 pass 覆盖），
-    // 不是全局的 `glass_mode()`。子窗口/弹窗配置同样是玻璃，却没有
-    // 任何东西替它们铺背景——用错判据会让那些窗口整块透出桌面
-    // （见 `Frame::glass_covers`）。
+    // 液态玻璃：这张卡片本帧是否参与折射合成（必须在画底色**之前**，
+    // 玻璃 pass 跑在 egui 内容之前）。判据用 `glass_covers()` 而不是全局
+    // 配置——原因见 `Frame::glass_covers`。
     let glass_mode = f.glass_covers();
     // 底色**作为参数**交给玻璃层：玻璃层用它算 tint 与覆盖度。
     //
@@ -1129,17 +1126,19 @@ pub(super) fn load_image_bytes(svc: &mut Service, item: &ClipItem) -> anyhow::Re
 /// 单张时开线程的代价（约几十微秒）与解码同量级，纯粹白烧；而列表
 /// 一屏滚进多张图片时，串行解码会把首帧拖出肉眼可见的卡顿。
 pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
-    /// 并行度上限：解码是 CPU 密集，超过核数只会互相抢占。
+    // 并行度上限：解码是 CPU 密集，超过核数只会互相抢占。
     const MAX_PARALLEL: usize = 4;
 
-    /// 一条待解码任务：`(缓存键, 载荷尺寸, 原始字节)`。
+    // 一条待解码任务：`(缓存键, 载荷尺寸, 原始字节)`。
     type Job = (crate::thumbnail::CacheKey, Option<(u32, u32)>, Vec<u8>);
 
     // 1) 顺序准备：命中缓存直接跳过；否则读字节（含 DB/文件 IO）。
     let mut jobs: Vec<Job> = Vec::new();
     for item in items {
         let key = crate::thumbnail::CacheKey::new(item.id, item.hash.clone());
-        if f.state.thumb_cache.get(&key).is_some() {
+        // 用 `peek` 而不是 `get`：探测不能刷新 LRU 顺序（预热一次就把
+        // 整屏条目标成刚用过的话，真正在用的条目反而先被淘汰）。
+        if f.state.thumb_cache.peek(&key).is_some() {
             continue;
         }
         let dims = item
@@ -1160,10 +1159,10 @@ pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
     let mut decoded: Vec<Option<std::sync::Arc<crate::thumbnail::Thumbnail>>> =
         vec![None; jobs.len()];
     let started = std::time::Instant::now();
-    let chunk = jobs.len().div_ceil(MAX_PARALLEL.min(jobs.len()));
+    let batch = jobs.len().div_ceil(MAX_PARALLEL.min(jobs.len()));
     std::thread::scope(|s| {
         let handles: Vec<_> = jobs
-            .chunks(chunk)
+            .chunks(batch)
             .enumerate()
             .map(|(ci, part)| {
                 s.spawn(move || {
@@ -1171,7 +1170,7 @@ pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
                         .enumerate()
                         .map(|(i, (_, dims, bytes))| {
                             (
-                                ci * chunk + i,
+                                ci * batch + i,
                                 crate::thumbnail::decode_auto(
                                     bytes,
                                     *dims,
@@ -1197,11 +1196,16 @@ pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
         }
     });
 
-    // 3) 顺序回填缓存（LRU + 字节预算的淘汰在 `insert` 里）。
+    // 3) 顺序回填：缓存（LRU + 字节预算的淘汰在 `insert` 里）+ 尺寸表。
+    //
+    // 尺寸必须在这里就记——文件型图片没有 `payload.dims`，行高只能靠
+    // 解码得到的真实尺寸算。只写缓存不写尺寸的话，预热这一帧的图片行
+    // 仍按「文本高度」排，下一帧才跳高（可见的抖动）。
     let total = jobs.len();
     let mut ok = 0usize;
     for ((key, _, _), thumb) in jobs.into_iter().zip(decoded) {
         if let Some(t) = thumb {
+            f.state.thumb_dims.insert(key.id, (t.width, t.height));
             f.state.thumb_cache.insert(key, t);
             ok += 1;
         }
@@ -1209,7 +1213,7 @@ pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
     tracing::debug!(
         decoded = ok,
         total,
-        threads = total.div_ceil(chunk),
+        threads = total.div_ceil(batch),
         ms = started.elapsed().as_secs_f32() * 1000.0,
         "并行预热缩略图完成"
     );
