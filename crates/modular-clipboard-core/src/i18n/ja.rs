@@ -196,6 +196,11 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Blur strength in glass mode, independent of frosted blur", "ガラスモードのぼかし強度。すりガラスとは独立"),
     ("Glass refraction", "ガラスの屈折"),
     ("Glass rim light", "ガラスの縁の光"),
+    ("Exclude content from glass", "要素をガラス計算から除外"),
+    (
+        "Keep text and icons over a clean, unfrosted backdrop: the content area only refracts",
+        "カード内容部は屈折のみ：文字とアイコンの背後がすりガラスで濁らない",
+    ),
     ("Graphite", "グラファイト"),
     ("Green tint", "緑の濃さ"),
     // 上下文：HSV 取色器的 S 分量（不是整体饱和度）。

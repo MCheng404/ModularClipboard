@@ -82,6 +82,36 @@ pub const CAPTURE_PCT_RANGE: std::ops::RangeInclusive<u8> = 15..=100;
 /// 默认抓屏分辨率百分比（50 = 1/2，与 [`CAPTURE_DOWNSCALE`] 等价）。
 pub const CAPTURE_PCT_DEFAULT: u8 = 50;
 
+/// 玻璃模式下抓屏比例的**下限**。
+///
+/// # 为什么玻璃需要另设下限
+///
+/// 两种背景模式对这张图的用法完全不同：
+///
+/// - 磨砂（Acrylic）：捕获图只喂给模糊链，最终屏幕上是**卷积结果**，
+///   15% 的图与 100% 的图模糊之后几乎一样；
+/// - 玻璃（Glass）：捕获图就是着色器里的 `sharp_tex`，**直接参与折射、
+///   色散与磨砂混合**。15% 在 878×1211 的窗口上只有 132×182，被放大
+///   6.7 倍当「清晰底图」用 ⇒ 卡片里全是马赛克色块（2026-10-29 用户
+///   报的「玻璃看着有点脏」的直接原因）。
+///
+/// 75% 是「1.33× 双线性」：文字与图标已经看不出插值痕迹，BitBlt 与
+/// 上传仍只有 100% 的 56%。再往下（60% 以下）放大倍数进入 1.7× 以上，
+/// 边缘开始发糊。
+///
+/// CAUTION: 这是**下限**而不是默认值——用户设 100% 时照旧用 100%，
+/// 只有低于下限时才抬到 75%。被抬时会记一条 info 日志（见帧循环），
+/// 不做静默改写。
+pub const GLASS_MIN_CAPTURE_PCT: u8 = 75;
+
+/// 玻璃模式下的有效抓屏比例：用户值与 [`GLASS_MIN_CAPTURE_PCT`] 取大。
+///
+/// 入参先钳到 [`CAPTURE_PCT_RANGE`]（配置写坏时也不会越界）。
+pub fn glass_capture_pct(pct: u8) -> u8 {
+    pct.clamp(*CAPTURE_PCT_RANGE.start(), *CAPTURE_PCT_RANGE.end())
+        .max(GLASS_MIN_CAPTURE_PCT)
+}
+
 /// 捕获图的**像素预算**（约 48MB RGBA）。
 ///
 /// 按 [`CAPTURE_PCT_RANGE`] 的上限 100% 计算，客户区面积就已经是捕获
@@ -776,6 +806,26 @@ mod tests {
         assert_eq!(capture_extent(720, 800), (720, 800));
         assert_eq!(capture_extent(0, 0), (1, 1), "最小化窗口的 0×0 钳到 1");
         assert_eq!(capture_extent(-5, 100), (1, 100), "负值钳到 1");
+    }
+
+    /// 玻璃模式必须把抓屏比例抬到下限之上；磨砂模式原样保留。
+    ///
+    /// 这条守的是「玻璃里全是马赛克」那类回归：`sharp_tex` 直接就是这个
+    /// 比例的图，掉到 15% 之后放大 6.7 倍，卡片内部读作一块脏色块。
+    #[test]
+    fn glass_capture_has_a_floor() {
+        assert_eq!(glass_capture_pct(15), GLASS_MIN_CAPTURE_PCT);
+        assert_eq!(glass_capture_pct(0), GLASS_MIN_CAPTURE_PCT, "配置写坏也要抬");
+        assert_eq!(glass_capture_pct(GLASS_MIN_CAPTURE_PCT), GLASS_MIN_CAPTURE_PCT);
+        assert_eq!(glass_capture_pct(100), 100, "用户选 100% 时不得降采样");
+        assert_eq!(glass_capture_pct(200), 100, "越界值要钳到区间上限");
+        // 下限本身必须落在合法区间内。
+        assert!(CAPTURE_PCT_RANGE.contains(&GLASS_MIN_CAPTURE_PCT));
+        // 判据挂在**放大倍数**上而不是常量字面量上（clippy 的
+        // `assertions_on_constants` 会拦住后者）：超过 1.5× 双线性之后
+        // 文字边缘就发糊了。
+        let upsample = 100.0 / f32::from(glass_capture_pct(0));
+        assert!(upsample <= 1.5, "放大 {upsample:.2}× 会让文字边缘发糊");
     }
 
     #[test]

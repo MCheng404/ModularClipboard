@@ -181,27 +181,35 @@ pub const EDGE_FACTOR: f32 = 0.504_630_6;
 /// **不要**在别处再乘一次衰减，也不要拿这个值当「全局位移上限」
 /// ——它不是。
 pub fn refract_offset(normal: [f32; 2], eta: f32, power: f32) -> [f32; 2] {
-    // 抬起成 3D 法线。|normal| 已知量级（0~1），无需先归一化：
-    // `t = |n|·TILT`，归一化系数 `inv = 1/sqrt(t² + 1)` 一次算出
-    // `N.xy` 与 `N.z` 两者。
-    let t = (normal[0] * normal[0] + normal[1] * normal[1]).sqrt() * SURFACE_TILT;
-    let inv = 1.0 / (t * t + 1.0).sqrt();
-    let nx = normal[0] * SURFACE_TILT * inv;
-    let ny = normal[1] * SURFACE_TILT * inv;
-    let nz = inv;
     // refract(I, N, eta) 的标准实现（WGSL 内建同一套），I = (0,0,-1)：
     //   d = dot(N, I) = -N.z
     //   k = 1 - eta^2 * (1 - d^2)
     //   T = eta*I - (eta*d + sqrt(k)) * N
     // 取 xy 分量（I.xy = 0）：
     //   T.xy = -(eta*d + s) * N.xy = -(s - eta*N.z) * N.xy
-    let d = -nz;
-    let k = (1.0 - eta * eta * (1.0 - d * d)).max(0.0);
-    let s = k.sqrt();
-    let f = s - eta * nz;
-    // 归一到「边缘 + 参考 eta ⇒ 模长 = power」。
-    let scale = (f / EDGE_FACTOR) / EDGE_NXY;
-    [-nx * scale * power, -ny * scale * power]
+    //
+    // 归一到「边缘 + 参考 eta ⇒ 模长 = power」。`power` 的单位由调用方
+    // 决定；玻璃 pass 里是**物理像素**（见 [`REFRACT_MAX_PT`]）。
+    let (nxy, nz) = raise_normal(normal);
+    let scale = (refract_f(nz, eta) / EDGE_FACTOR) / EDGE_NXY;
+    [-nxy[0] * scale * power, -nxy[1] * scale * power]
+}
+
+/// 2D 斜率场抬起成 3D 单位法线后的两个分量：`(N.xy, N.z)`。
+///
+/// # 为什么要拆开返回（延迟优化）
+///
+/// 玻璃片元里 `N.xy` 被三处共用：基础折射、三个色散通道、2.5D 受光。
+/// 早前每处各走一遍 `length` + 归一化 + `sqrt`——色散那三个通道甚至各调
+/// 两次 `refract_offset`，单像素最多 6 次开方。拆开之后只推一次，
+/// 色散降到每通道一次标量开方。
+pub fn raise_normal(normal: [f32; 2]) -> ([f32; 2], f32) {
+    let t = (normal[0] * normal[0] + normal[1] * normal[1]).sqrt() * SURFACE_TILT;
+    let inv = 1.0 / (t * t + 1.0).sqrt();
+    (
+        [normal[0] * SURFACE_TILT * inv, normal[1] * SURFACE_TILT * inv],
+        inv,
+    )
 }
 
 /// 斜角（bevel）带的折射权重：轮廓处 1、带内端 0。
@@ -248,6 +256,106 @@ pub fn bevel_weight(dist_to_edge: f32, radius: f32) -> f32 {
 pub fn specular_rim(normal: [f32; 2], light: [f32; 2], shininess: f32) -> f32 {
     let d = normal[0] * light[0] + normal[1] * light[1];
     d.max(0.0).powf(shininess.max(0.5))
+}
+
+// ---- 2.5D 立体斜边 ----------------------------------------------------
+//
+// 玻璃卡片的「厚度」不是靠描边，而是靠**斜边受光**：一块边缘倒角的板，
+// 朝光的一侧把光反到眼睛里（亮棱），背光一侧只剩环境光（暗棱），内缘
+// 再有一道细高光（斜边与平面交界处的折线），外缘一道极窄的暗接触线
+// （板与桌面之间的缝）。四层叠起来，二维矩形就有了厚度。
+//
+// 全部按**物理像素**表达（在 uniform 换算时乘 ppp），与 DPI 无关：细线
+// 宽度必须与 1px 同量级，用逻辑点会让 2× 屏上的「细线」变成 2px 粗边。
+
+/// 光源的 Z 分量（灯在玻璃前方多高）。与 `LIGHT_DIR`（xy）共同定义光向量。
+///
+/// 取 0.55 而不是 1.0：太正的光会让「迎光面」与「平面」的差变小，斜边
+/// 读不出来；太小则只在极小角度上亮，亮棱会断成几段。
+pub const LIGHT_Z: f32 = 0.55;
+
+/// 受光侧亮棱的增益（乘在 `RIM_TINT` 上）。
+pub const BEVEL_LIT_GAIN: f32 = 1.0;
+
+/// 背光侧暗棱的增益，按亮度**乘性**压暗而不是加黑。
+///
+/// 加黑会在亮卡片上糊一块灰；乘 0.7 只是「这一侧没接到光」，颜色仍属于
+/// 卡片自己。
+pub const BEVEL_DARK_GAIN: f32 = 0.45;
+
+/// 轮廓亮/暗棱的**半宽**（像素）。
+///
+/// 浅色主题的卡片底接近 255，任何正增量都会直接顶到白：按 `w` 的幂收窄
+/// 后亮棱仍有 5~6px 的纯白带，读作「一圈发光的边」。改成显式宽度门控后
+/// 亮棱是一条 1~3px 的边，斜边面的柔和受光交给 `fresnel_edge` 那层。
+pub const BEVEL_LIT_WIDTH: f32 = 3.0;
+
+/// 内缘高光线的位置（距边像素）与半宽。
+pub const BEVEL_HAIRLINE_AT: f32 = 1.4;
+pub const BEVEL_HAIRLINE_WIDTH: f32 = 1.1;
+
+/// 内缘高光线的亮度增益（乘在 `RIM_TINT` 上）。细线要「亮而窄」。
+pub const BEVEL_HAIRLINE_GAIN: f32 = 0.22;
+
+/// 外缘暗接触线的半宽（像素）与压暗增益。
+pub const BEVEL_CONTACT_WIDTH: f32 = 1.2;
+pub const BEVEL_CONTACT_GAIN: f32 = 0.22;
+
+/// 内容区「退出玻璃计算」的羽化宽度（像素）。
+///
+/// 内容区边界若硬切，卡片内部会出现一条直角矩形接缝（比玻璃本身还显眼）。
+pub const CONTENT_FEATHER: f32 = 6.0;
+
+/// 斜边带的受光差：`dot(N3, L) - L.z`，**平面处恰好为 0**。
+///
+/// 与 `glass.wgsl` 的 `bevel_lambert` 逐行对应。减去 `L.z` 是必要的：
+/// `w = 0`（斜边带以内）时 3D 法线是 `(0, 0, 1)`，`dot = L.z`——不减这一
+/// 项，整块卡片平面都会拿到一个正的「受光」偏移（等于整体加亮），斜边的
+/// 层次反而没了。减去之后：迎光斜边为正（亮棱）、背光斜边为负（暗棱）、
+/// 平面为 0。
+///
+/// `w`（斜边权重）参与抬升：外缘最陡、带内端水平，与 [`bevel_weight`]
+/// 的剖面同源，所以受光强度沿带内自然衰减，调用方不必再乘一次。
+pub fn bevel_lambert(normal: [f32; 2], w: f32, light: [f32; 2]) -> f32 {
+    let lx = light[0];
+    let ly = light[1];
+    let lz = LIGHT_Z;
+    let inv_l = 1.0 / (lx * lx + ly * ly + lz * lz).sqrt();
+    let (lx, ly, lz) = (lx * inv_l, ly * inv_l, lz * inv_l);
+    let t = w.clamp(0.0, 1.0) * SURFACE_TILT;
+    let inv = 1.0 / (t * t + 1.0).sqrt();
+    let nx = normal[0] * (t * inv);
+    let ny = normal[1] * (t * inv);
+    let nz = inv;
+    (nx * lx + ny * ly + nz * lz) - lz
+}
+
+/// 细线凸起：`d = at` 处为 1、偏离 `width` 后为 0，两端斜率也为 0。
+///
+/// 与 `glass.wgsl` 的 `thin_line` 逐行对应。用 smoothstep 三角窗而不是
+/// 高斯：`exp` 在 GPU 上是 4~6 条指令，而这条线只值 1px 的观感；三角窗
+/// 的平顶窄、两侧收得干净，亮度剖面与 1px 高斯几乎重合。
+pub fn thin_line(d: f32, at: f32, width: f32) -> f32 {
+    let x = (1.0 - (d - at).abs() / width.max(1e-3)).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// 内容区「退出玻璃计算」的掩码（0 = 照常做玻璃，1 = 完全跳过）。
+///
+/// 与 `glass.wgsl` 的 `content_clear` 逐行对应。
+///
+/// 判定用**内缩矩形**而不是逐元素的真实包围盒：绘制层要区分文字 / 图标 /
+/// 缩略图，得把每个图元的矩形都送进 uniform（装不下，且每帧要重传），
+/// 而「卡片四周留 padding、中间是内容」这个格局对所有卡片都成立。
+pub fn content_clear(p: [f32; 2], half: [f32; 2], inset: f32) -> f32 {
+    if inset <= 0.0 {
+        return 0.0;
+    }
+    let ix = (half[0] - inset).max(0.0);
+    let iy = (half[1] - inset).max(0.0);
+    let cd = (ix - p[0].abs()).min(iy - p[1].abs());
+    let x = (cd / CONTENT_FEATHER).clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
 }
 
 /// 卡片色在玻璃层里的**最大**混合强度。
@@ -405,7 +513,7 @@ pub const BG_ALPHA_DEFAULT: f32 = 0.35;
 ///
 /// 卡片的磨砂仍走 [`frost_mix`]（边缘清晰、中心 [`FROST_MAX`]）——
 /// 那是**卡片**的语义，与背景层无关。
-pub const BG_FROST: f32 = 0.18;
+pub const BG_FROST: f32 = 0.10;
 
 /// 窗口背景层的合成：清晰桌面为主 + [`BG_FROST`] 比例的柔化，再过
 /// 亮度自适应。
@@ -745,34 +853,61 @@ pub const IOR_B: f32 = 1.54;
 /// 默认 IOR 比值（`eta = 1 / ior`）。
 pub const DEFAULT_ETA: f32 = 1.0 / 1.5;
 
-/// 色散位移的**独立基准幅度**。
+/// 折射强度的像素基准：`glass_refract` 滑块 1.0 对应的最大位移（**逻辑点**）。
 ///
-/// # 为什么色散不能乘在折射强度上（2026-10-28 修）
+/// # CAUTION: 位移是像素量纲，不是 UV（2026-10-29）
 ///
-/// 早前三个通道各自按自己的 IOR 算 `refract_offset(n, 1/ior, refract)`，
-/// 通道间的位移差 ≈ `refract × (ior 差带来的相对差)`。于是：
+/// 早前 `refract` 滑块的值直接当 UV 乘进位移：`0.35` 在 878px 宽的窗口上
+/// 就是 307px 的位移。卡片边缘于是把**离它三百像素远**的桌面内容拉进来，
+/// 与身后真实背景完全对不上——观感是「玻璃里糊着一张不相干的文字」，
+/// 也就是用户报的「玻璃看着有点脏」。
 ///
-/// - 用户把「折射强度」调到 0.15（默认 0.35，实测确实有人这么调，
-///   因为默认值的边缘会把背景撕成条）时，**色散也一起缩到 43%**，
-///   色散滑块从 0 拖到 1 几乎看不出变化；
-/// - 反过来把折射拉到 1.0，色散强到像显卡坏了。
+/// 真实斜边的位移量级由斜边宽度决定（`bevel_weight` 的带宽 = 圆角半径，
+/// 十几像素 ⇒ 位移也是十几像素）。改成像素量纲后同一份参数在任何窗口
+/// 尺寸与 DPI 下都是同一个物理位移，滑块语义才稳定。
 ///
-/// 两个滑块表达的是两件事：折射是「玻璃有多弯」，色散是「不同波长
-/// 弯得差多少」。后者应该有自己的基准，而不是寄生前者的幅值。
-///
-/// 取 0.35 = 旧默认折射强度：在默认配置下色散幅度与改造前**逐点一致**，
-/// 只是不再随折射滑块漂移。
-pub const DISPERSION_POWER: f32 = 0.35;
+/// 40 点：滑块 1.0 时边缘位移 40px，默认 0.35 时 14px——能看出「内容被
+/// 玻璃边缘压弯」，又不会把卡片变成一张缩放过的桌面。
+pub const REFRACT_MAX_PT: f32 = 40.0;
 
-/// 某个 IOR 相对默认 IOR 的**附加位移**（色散分量）。
+/// 色散单通道附加位移的像素基准（**逻辑点**，滑块 1.0 的量）。
 ///
-/// 与 `glass.wgsl` 的 `dispersion_delta` 逐行对应。返回值在
-/// `dispersion = 1` 时直接加到基础折射位移上；`dispersion = 0` 时
-/// 整个式子归零，三通道共用基础位移（老行为）。
-pub fn dispersion_delta(normal: [f32; 2], eta: f32) -> [f32; 2] {
-    let a = refract_offset(normal, eta, DISPERSION_POWER);
-    let b = refract_offset(normal, DEFAULT_ETA, DISPERSION_POWER);
-    [a[0] - b[0], a[1] - b[1]]
+/// 三个 IOR 的 `refract_f` 差约 2%（1.50 vs 1.54），乘 48 点在滑块 1.0 时
+/// 给出约 1px 的通道分离——刚好是「边缘有一道彩边」的量级。早前按 UV
+/// 算出来是 6~13px，一条随桌面内容变化的粗彩带，读作「脏」。
+pub const DISPERSION_PT: f32 = 48.0;
+
+/// 穹顶折射相对边缘轮廓折射的强度比。与 `glass.wgsl` 的 `DOME_RATIO` 一致。
+///
+/// 两级的位移都是像素量纲，所以这个比值是纯比例：行卡片（半高 29px）在
+/// 默认滑块下穹顶约 3.5px、边缘约 14px。
+pub const DOME_RATIO: f32 = 0.25;
+
+/// 折射率项 `f(eta) = sqrt(1 - eta²(1 - nz²)) - eta·nz`。
+///
+/// 与 `glass.wgsl` 的 `refract_f` 逐行对应。抽成标量是为了色散：
+/// 三个 IOR 只差在这一项，方向（`N.xy`）三者共用。
+pub fn refract_f(nz: f32, eta: f32) -> f32 {
+    let k = (1.0 - eta * eta * (1.0 - nz * nz)).max(0.0);
+    k.sqrt() - eta * nz
+}
+
+/// 某通道相对默认 IOR 的**色散系数**（无量纲）。
+///
+/// 与 `glass.wgsl` 的 `dispersion_scale` 逐行对应。乘上 `-N.xy · 像素`
+/// 就是该通道比绿通道多走的位移。
+pub fn dispersion_scale(nz: f32, eta: f32) -> f32 {
+    (refract_f(nz, eta) - refract_f(nz, DEFAULT_ETA)) / EDGE_FACTOR / EDGE_NXY
+}
+
+/// 某个 IOR 相对默认 IOR 的**附加位移**（色散分量，单位与 `power` 相同）。
+///
+/// `dispersion = 1` 时加到基础折射位移上；`dispersion = 0` 时整个式子
+/// 归零，三通道共用基础位移。
+pub fn dispersion_delta(normal: [f32; 2], eta: f32, power: f32) -> [f32; 2] {
+    let (nxy, nz) = raise_normal(normal);
+    let k = dispersion_scale(nz, eta) * power;
+    [-nxy[0] * k, -nxy[1] * k]
 }
 
 #[cfg(test)]
@@ -1224,8 +1359,18 @@ mod tests {
             ("FROST_GAMMA", FROST_GAMMA),
             ("BG_FROST", BG_FROST),
             ("BG_ALPHA_DEFAULT", BG_ALPHA_DEFAULT),
-            ("DISPERSION_POWER", DISPERSION_POWER),
             ("EDGE_AA_HALF_WIDTH", EDGE_AA_HALF_WIDTH),
+            ("DOME_RATIO", DOME_RATIO),
+            ("LIGHT_Z", LIGHT_Z),
+            ("BEVEL_LIT_GAIN", BEVEL_LIT_GAIN),
+            ("BEVEL_DARK_GAIN", BEVEL_DARK_GAIN),
+            ("BEVEL_LIT_WIDTH", BEVEL_LIT_WIDTH),
+            ("BEVEL_HAIRLINE_AT", BEVEL_HAIRLINE_AT),
+            ("BEVEL_HAIRLINE_WIDTH", BEVEL_HAIRLINE_WIDTH),
+            ("BEVEL_HAIRLINE_GAIN", BEVEL_HAIRLINE_GAIN),
+            ("BEVEL_CONTACT_WIDTH", BEVEL_CONTACT_WIDTH),
+            ("BEVEL_CONTACT_GAIN", BEVEL_CONTACT_GAIN),
+            ("CONTENT_FEATHER", CONTENT_FEATHER),
             ("TINT_ABSORB", TINT_ABSORB),
             ("TINT_CHROMA", TINT_CHROMA),
             ("TINT_SCATTER", TINT_SCATTER),
@@ -1247,6 +1392,116 @@ mod tests {
                 (got - want).abs() < 1e-6,
                 "glass.wgsl 的 {name}={got} 与 Rust 侧的 {want} 不一致"
             );
+        }
+    }
+
+    /// 斜边受光必须**有方向**：迎光侧为正（亮棱）、背光侧为负（暗棱）、
+    /// 平面（`w = 0`）恰好为 0。
+    ///
+    /// 这是 2.5D 立体感的全部依据。写错（比如忘了减 `L.z`）时平面也会拿到
+    /// 一个正的偏移 ⇒ 整块卡片被均匀加亮，斜边层次消失，而画面**看起来
+    /// 只是「有点发白」**——没有测试根本不会怀疑到这里。
+    #[test]
+    fn bevel_lambert_is_directional_and_flat_zero() {
+        let light = [-0.6, -0.8];
+        // 上缘（法线朝上）与左缘迎光 ⇒ 正；下缘与右缘背光 ⇒ 负。
+        assert!(
+            bevel_lambert([0.0, -1.0], 1.0, light) > 0.2,
+            "上缘应明显受光"
+        );
+        assert!(
+            bevel_lambert([-1.0, 0.0], 1.0, light) > 0.05,
+            "左缘应受光"
+        );
+        assert!(
+            bevel_lambert([0.0, 1.0], 1.0, light) < -0.5,
+            "下缘应背光"
+        );
+        assert!(
+            bevel_lambert([1.0, 0.0], 1.0, light) < -0.2,
+            "右缘应背光"
+        );
+        // 平面：任何法线在 w = 0 时都必须精确为 0（斜边带以外不受影响）。
+        assert!(bevel_lambert([0.0, -1.0], 0.0, light).abs() < 1e-6);
+        assert!(bevel_lambert([1.0, 0.0], 0.0, light).abs() < 1e-6);
+    }
+
+    /// 内缘高光线：峰值必须落在 `at` 上、半宽以外严格为 0。
+    ///
+    /// 「严格为 0」很重要——拖一条正数长尾会让整片卡片都亮一点点，
+    /// 正是那种「说不上哪里脏但就是脏」的成因。
+    #[test]
+    fn thin_line_peaks_at_offset_and_vanishes() {
+        let at = 1.4;
+        let w = 1.1;
+        assert!((thin_line(at, at, w) - 1.0).abs() < 1e-6, "峰值应在 at 上");
+        assert!((thin_line(0.0, at, w) - 0.0).abs() < 1e-6, "外缘不应有高光");
+        assert_eq!(thin_line(at + w, at, w), 0.0, "半宽外必须严格为 0");
+        assert_eq!(thin_line(at + w * 3.0, at, w), 0.0, "远处必须严格为 0");
+        // 对称且单峰。
+        let a = thin_line(at - 0.4, at, w);
+        let b = thin_line(at + 0.4, at, w);
+        assert!((a - b).abs() < 1e-6, "三角窗应左右对称");
+        assert!(a > 0.0 && a < 1.0);
+    }
+
+    /// 内容区掩码：内缩边界处为 0、往里 `CONTENT_FEATHER` 之后满 1。
+    #[test]
+    fn content_clear_fades_at_the_inset_border() {
+        let half = [300.0, 29.0];
+        let inset = 10.0;
+        // 卡片正中：完全退出玻璃计算。
+        assert!((content_clear([0.0, 0.0], half, inset) - 1.0).abs() < 1e-6);
+        // 正好在内缩边界上：0（还属于玻璃边框）。
+        assert!(content_clear([290.0, 0.0], half, inset).abs() < 1e-6);
+        // 边界往里羽化宽度处：1。
+        assert!(
+            (content_clear([290.0 - CONTENT_FEATHER, 0.0], half, inset) - 1.0).abs() < 1e-6
+        );
+        // 斜边带里（距边 < inset）恒为 0 —— 玻璃边框永远是玻璃。
+        assert_eq!(content_clear([295.0, 25.0], half, inset), 0.0);
+        // inset = 0（开关关闭）时整块都不退出。
+        assert_eq!(content_clear([0.0, 0.0], half, 0.0), 0.0);
+    }
+
+    /// 色散的三个通道必须给出**不同**的系数，且 B > G > R。
+    ///
+    /// `dispersion_scale` 是「相对默认 IOR 的差」，所以与基础位移无关：
+    /// 折射滑块拖到 0 时彩边仍然存在（两个滑块表达两件事）。
+    #[test]
+    fn dispersion_scale_is_channel_separated() {
+        let (_, nz) = raise_normal([0.0, 1.0]);
+        let (r, g, b) = (
+            dispersion_scale(nz, 1.0 / IOR_R),
+            dispersion_scale(nz, 1.0 / IOR_G),
+            dispersion_scale(nz, 1.0 / IOR_B),
+        );
+        // R 的 IOR 恰好等于默认 IOR ⇒ 它就是基准通道，系数恒为 0。
+        assert!(r.abs() < 1e-9, "R 是基准通道，系数应为 0：{r}");
+        assert!(g > 1e-4, "G 应比基准弯得多：{g}");
+        assert!(b > g, "B 应比 G 弯得更多：G={g} B={b}");
+        // 与默认 IOR 同值时系数恒为 0（否则「dispersion = 0」仍有彩边）。
+        assert!(dispersion_scale(nz, DEFAULT_ETA).abs() < 1e-9);
+    }
+
+    /// 像素量纲的换算：`refract_offset` 在边缘处的模长**恰好等于 power**。
+    ///
+    /// 这条把「位移 = 用户给的像素数」钉死。早前 power 是 UV，同一个 0.35
+    /// 在 585px 和 3840px 宽的窗口上是完全不同的物理位移——那正是「同一
+    /// 份参数在小窗口里正常、大窗口里糊成一团」的原因。
+    #[test]
+    fn refract_offset_magnitude_equals_power_in_pixels() {
+        let (nxy, nz) = raise_normal([0.0, -1.0]);
+        let _ = (nxy, nz);
+        for power in [6.0_f32, 14.0, 40.0] {
+            let o = refract_offset([0.0, -1.0], DEFAULT_ETA, power);
+            let mag = (o[0] * o[0] + o[1] * o[1]).sqrt();
+            assert!(
+                (mag - power).abs() < 1e-3,
+                "边缘位移模长应为 {power}px，实际 {mag}"
+            );
+            // 方向必须朝内（把身后的内容「推」出来），即与法线反向。
+            assert!(o[1] > 0.0, "上缘的位移应朝下（法线朝上 ⇒ 位移反向）");
         }
     }
 
@@ -1376,14 +1631,14 @@ mod tests {
     ///
     /// 早前色散位移 = `refract_offset(1/ior, refract)` 之差，与 `refract`
     /// 成正比 ⇒ 用户把折射调到 0.15 后色散滑块几乎失效。现在色散有自己的
-    /// 基准 `DISPERSION_POWER`，签名里根本不接收折射强度。
+    /// 像素基准 `DISPERSION_PT`，调用方传的是色散幅度而不是折射强度。
     #[test]
     fn dispersion_is_independent_of_refract_strength() {
         let n = glass_normal([95.0, 25.0], HALF, 8.0, 1.0);
-        let d = dispersion_delta(n, 1.0 / IOR_B);
+        let d = dispersion_delta(n, 1.0 / IOR_B, DISPERSION_PT);
         let mag = (d[0] * d[0] + d[1] * d[1]).sqrt();
         assert!(mag > 1e-5, "色散分量不应为零（否则彩边恒不可见）");
-        let zero = dispersion_delta(n, DEFAULT_ETA);
+        let zero = dispersion_delta(n, DEFAULT_ETA, DISPERSION_PT);
         assert!(
             zero[0].abs() < 1e-9 && zero[1].abs() < 1e-9,
             "默认 IOR 的色散分量必须为零，实际 {zero:?}"

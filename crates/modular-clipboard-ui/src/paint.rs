@@ -118,6 +118,16 @@ const CARD_RADIUS: f32 = 16.0;
 /// 行卡片圆角（逻辑点）。略小于 [`CARD_RADIUS`]，避免与卡片圆角重复。
 const ROW_RADIUS: f32 = 12.0;
 
+/// 「元素不参与玻璃计算」时，卡片内容区相对卡片边缘的内缩量（逻辑点）。
+///
+/// 直接取行卡片的横向内边距（`list::ROW_PAD_H`）：玻璃边框保住一条与
+/// 文字起点同宽的带，中间才是「干净底图」区。两处用同一个常量，改内边距
+/// 时玻璃边框不会与文字错位。
+///
+/// 只有 `ui.glass_skip_content` 打开时才被送进着色器（关闭时传 0），
+/// 见 `app::frame_loop` 的 `GlassParams::content_inset`。
+pub(crate) const GLASS_CONTENT_INSET: f32 = list::ROW_PAD_H;
+
 /// 一帧内要执行的操作。
 ///
 /// 绘制层**只识别操作、不改布局**：`Workspace` 的改动由上层在

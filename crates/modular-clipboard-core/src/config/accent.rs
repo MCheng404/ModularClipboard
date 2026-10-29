@@ -177,6 +177,7 @@ impl Default for UiConfig {
             glass_dispersion: default_glass_dispersion(),
             glass_blur: default_glass_blur(),
             glass_edge: default_glass_edge(),
+            glass_skip_content: false,
             backdrop_scale: default_backdrop_scale(),
             window_blur_strength: default_window_blur_strength(),
             card_shadow: CardShadowConfig::default(),

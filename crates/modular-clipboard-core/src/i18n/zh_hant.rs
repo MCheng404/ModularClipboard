@@ -196,6 +196,11 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Blur strength in glass mode, independent of frosted blur", "玻璃模式的模糊強度，與磨砂強度相互獨立"),
     ("Glass refraction", "玻璃折射"),
     ("Glass rim light", "玻璃邊緣光"),
+    ("Exclude content from glass", "元素不參與玻璃計算"),
+    (
+        "Keep text and icons over a clean, unfrosted backdrop: the content area only refracts",
+        "卡片內容區只保留折射，不做磨砂與混色：文字與圖示背後是乾淨可比的底圖",
+    ),
     ("Graphite", "石墨"),
     ("Green tint", "綠意濃度"),
     // 上下文：HSV 取色器的 S 分量（不是整体饱和度）。

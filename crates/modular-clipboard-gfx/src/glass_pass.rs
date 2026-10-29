@@ -61,21 +61,25 @@ const OFFSET_SIZE: u32 = 8;
 ///
 /// 大小 1568 字节：`rects` 384 + `tints` 384 + `alphas` 384 + `radii` 384
 /// + `size` 8 + `refract`/`dispersion`/`edge` 12 + `count` 4
-/// + `bg_alpha` 4 + `_pad` 4。
+/// + `bg_alpha` 4 + `content_inset` 4。
 ///
 /// **无隐式填充**（每个字段都命名），这是 `bytemuck::Pod` 的要求。
 ///
-/// # 为什么有两个 pad（2026-10-28）
+/// # 为什么刚好还是 1568（2026-10-29）
 ///
-/// WGSL 的 uniform 结构体大小要向上对齐到 16 的倍数：着色器侧写到
-/// `_pad` 之后只有 1564，naga 自动 roundup 到 1568。而 Rust 的
-/// `#[repr(C)]` 不做这件事——结构体对齐只有 4（`[[f32; 4]; 24]` 的对齐
-/// 是 4，不是 16），于是 `size_of` 停在 1564，`write_buffer` 每次
-/// **少写 4 字节**。
+/// 1568 = 98 × 16，满足 WGSL uniform 结构体「大小必须是最大成员对齐
+/// （vec4 ⇒ 16）的倍数」。原来的 `_pad` 是纯填充，`content_inset` 这个
+/// 真实字段正好把它吃掉：**加功能没有增加一个字节**的常量缓冲，
+/// `uniform_size_is_pinned_to_wgsl_layout` 的期望值一个字都不用改。
 ///
-/// 少写的那 4 字节恰好是着色器不读的填充，画面不会错；但它是「Rust
-/// 认为的大小 ≠ 着色器认为的大小」——一旦以后往 `_pad` 后面加字段就
-/// 会真的错位。显式补第二个 pad，让两边逐字段对齐。
+/// 「元素不参与玻璃计算」的开关就编码在 `content_inset` 上（0 = 关）：
+/// 再塞一个 `content_mix` 会把结构体顶到 1572，naga 要 roundup 到 1584，
+/// 白多 16 字节的常量缓冲换一个本来可以推导出来的布尔值。
+///
+/// 历史：2026-10-28 那一版因为 Rust `#[repr(C)]` 的对齐只有 4（
+/// `[[f32; 4]; 24]` 的对齐是 4 而不是 16），`size_of` 停在 1564 而
+/// naga 把 WGSL 结构体 roundup 到 1568，`write_buffer` 每次少写 4 字节。
+/// 补了显式 pad 之后两边逐字段对齐。
 ///
 /// # 为什么 tint / alpha 是**逐矩形**的（2026-10-28）
 ///
@@ -123,9 +127,14 @@ pub struct GlassUniforms {
     pub radii: [[f32; 4]; MAX_GLASS_CARDS],
     /// 目标图的像素尺寸 `(w, h)`（uv → 像素用）。
     pub size: [f32; 2],
-    /// 折射强度（0 = 只剩磨砂）。
+    /// 边缘轮廓折射的最大位移（**物理像素**）。
+    ///
+    /// CAUTION: 像素而不是 UV。早前这个字段直接是滑块值（0~1），被当成
+    /// UV 用：`0.35` 在 878px 宽的窗口上是 307px 的位移，卡片边缘会把
+    /// 三百像素外的桌面内容拉进来——玻璃里糊着一张不相干的文字，即用户
+    /// 报的「玻璃看着有点脏」。换算见 [`GlassParams::uniform`]。
     pub refract: f32,
-    /// 色散差异量（0 = 无彩边，1 = 完全按各通道 IOR 分开）。
+    /// 色散的单通道附加位移（**物理像素**，0 = 无彩边）。
     pub dispersion: f32,
     /// Fresnel 幂次。
     pub edge: f32,
@@ -144,8 +153,11 @@ pub struct GlassUniforms {
     /// 合成结果与「真桌面 + 一档亮度自适应」等价——看得见桌面，又有
     /// 可读性兜底。
     pub bg_alpha: f32,
-    /// 尾部填充：把结构体补到 16 的倍数（WGSL uniform 的规则）。
-    pub _pad: f32,
+    /// 内容区向内收缩的距离（**物理像素**）。见 [`crate::glass::content_clear`]。
+    ///
+    /// **0 = 关闭**。由 `GlassParams::content_inset`（逻辑点）乘 `ppp` 得到；
+    /// 开关状态就编码在这里，不另占字段——结构体因此正好 1568 字节。
+    pub content_inset: f32,
 }
 
 impl Default for GlassUniforms {
@@ -166,7 +178,9 @@ impl Default for GlassUniforms {
             // `bg_alpha`，退化成「铺底图」只是不通透，退化成全透会让
             // 界面看起来像坏了（与 `alphas` 默认 1 同一条理由）。
             bg_alpha: 1.0,
-            _pad: 0.0,
+            // 内容区排除默认**关闭**：`content_inset = 0` 让
+            // `content_clear` 直接返回 0，整块照常做玻璃处理。
+            content_inset: 0.0,
         }
     }
 }
@@ -414,10 +428,15 @@ impl std::fmt::Debug for GlassPipeline {
 pub struct GlassParams {
     /// 参与玻璃合成的矩形（列表卡片 / 顶栏 / 搜索面板 / 类型栏）。
     pub rects: Vec<GlassRect>,
-    /// 折射强度（0 = 只剩磨砂）。
+    /// 折射强度（0 = 只剩磨砂）。滑块值 0~1，换算见 [`Self::uniform`]。
     pub refract: f32,
-    /// 色散差异量（0 = 无彩边）。
+    /// 色散强度（0 = 无彩边）。滑块值 0~1，换算见 [`Self::uniform`]。
     pub dispersion: f32,
+    /// 内容区向内收缩量（**逻辑点**）。**0 = 关闭**（整块都做玻璃处理）。
+    ///
+    /// 由帧循环按 `ui.glass_skip_content` 决定：开关关闭时传 0；打开时传
+    /// 行卡片的内边距（见 `app::frame_loop` 的 `GLASS_CONTENT_INSET`）。
+    pub content_inset: f32,
     /// Fresnel 幂次。
     pub edge: f32,
     /// 背景层的不透明度（0 = 完全透出真实桌面，1 = 铺满捕获底图）。
@@ -447,11 +466,16 @@ impl GlassParams {
         // 构造式初始化而不是 `default()` 后逐字段赋值（clippy 的
         // `field_reassign_with_default`）：少一次中间状态，也免得以后
         // 加字段时漏拷。
+        // 位移量纲换算：滑块 0~1 → **物理像素**。两处都乘 `ppp`，
+        // 于是同一份配置在任何 DPI 下都是同一个物理位移。
+        let refract_px = self.refract.clamp(0.0, 1.0) * crate::glass::REFRACT_MAX_PT * ppp;
+        let dispersion_px = self.dispersion.clamp(0.0, 1.0) * crate::glass::DISPERSION_PT * ppp;
         let mut u = GlassUniforms {
             size: [target.width as f32, target.height as f32],
-            refract: self.refract,
-            dispersion: self.dispersion,
+            refract: refract_px,
+            dispersion: dispersion_px,
             edge: self.edge,
+            content_inset: self.content_inset.max(0.0) * ppp,
             bg_alpha: if self.bg_alpha.is_finite() {
                 self.bg_alpha.clamp(0.0, 1.0)
             } else {
@@ -548,9 +572,9 @@ mod tests {
     /// 完全不对」）。
     ///
     /// 1568 = rects 384 + tints 384 + alphas 384 + radii 384 + size 8
-    /// + refract/dispersion/edge 12 + count 4 + `_pad` 4 + `_pad2` 4。
+    /// + refract/dispersion/edge 12 + count 4 + bg_alpha 4 + content_inset 4。
     ///
-    /// 改字段时这个数字必须同步改，并回去改 `glass.wgsl` 的 `_pad`/`_pad2`。
+    /// 改字段时这个数字必须同步改，并回去改 `glass.wgsl` 的同名字段。
     #[test]
     fn uniform_size_is_pinned_to_wgsl_layout() {
         assert_eq!(std::mem::size_of::<GlassUniforms>(), 1568);
@@ -587,6 +611,7 @@ mod tests {
             dispersion: 0.2,
             edge: 5.0,
             bg_alpha: crate::glass::BG_ALPHA_DEFAULT,
+            ..GlassParams::default()
         };
         let u = params.uniform(1.0, vk::Extent2D { width: 800, height: 600 });
 
@@ -626,6 +651,7 @@ mod tests {
             dispersion: 0.5,
             edge: 5.0,
             bg_alpha: crate::glass::BG_ALPHA_DEFAULT,
+            ..GlassParams::default()
         };
         let u = params.uniform(1.0, vk::Extent2D { width: 800, height: 600 });
         assert_eq!(u.radii[0][0], 0.0, "直角面板的半径必须是 0");
@@ -675,6 +701,7 @@ mod tests {
             dispersion: 0.5,
             edge: 5.0,
             bg_alpha: crate::glass::BG_ALPHA_DEFAULT,
+            ..GlassParams::default()
         };
         let u = params.uniform(1.0, vk::Extent2D { width: 800, height: 600 });
         assert!(

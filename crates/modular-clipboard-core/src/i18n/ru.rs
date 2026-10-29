@@ -198,6 +198,11 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("Blur strength in glass mode, independent of frosted blur", "Интенсивность размытия в режиме стекла, независимо от матового"),
     ("Glass refraction", "Преломление стекла"),
     ("Glass rim light", "Кромочная подсветка"),
+    ("Exclude content from glass", "Не обрабатывать содержимое стеклом"),
+    (
+        "Keep text and icons over a clean, unfrosted backdrop: the content area only refracts",
+        "Область содержимого только преломляет: текст и значки остаются на чистом фоне",
+    ),
     ("Graphite", "Графитовый"),
     ("Green tint", "Плотность зелёного"),
     // 上下文：HSV 取色器的 S 分量（不是整体饱和度）。

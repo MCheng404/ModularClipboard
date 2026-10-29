@@ -43,7 +43,11 @@
 // | `specular`（内联） | `glass::specular_rim` |
 // | `luma` / `adapt_luma` | `glass::luminance` / `glass::luminosity_adapt` |
 // | `frost_scale` / `frost_mix` | `glass::frost_scale` / `glass::frost_mix` |
-// | `dispersion_delta` | `glass::dispersion_delta` |
+// | `dispersion_scale` | `glass::dispersion_scale` |
+// | `refract_f` / `raise_normal` | `glass::refract_f` / `glass::raise_normal` |
+// | `bevel_lambert` | `glass::bevel_lambert` |
+// | `thin_line` | `glass::thin_line` |
+// | `content_clear` | `glass::content_clear` |
 //
 // # 坐标约定
 //
@@ -68,17 +72,18 @@ const IOR_B: f32 = 1.54;
 /// 默认折射率比值 `eta = 1 / ior`（ior = 1.5）。
 const DEFAULT_ETA: f32 = 1.0 / 1.5;
 
-/// 色散位移的**独立基准幅度**。与 `glass::DISPERSION_POWER` 一致。
-///
-/// CAUTION: 色散**不能**乘在折射强度上。早前三个通道各自按自己的 IOR 算
-/// `refract_uv(n, 1/ior, u.refract)`，通道差 ≈ `refract × 相对差`：用户把
-/// 折射调到 0.15（默认 0.35，因为默认值的边缘会把背景撕成条）时，色散
-/// 也一起缩到 43%，色散滑块从 0 拖到 1 几乎无变化。
-///
-/// 两个滑块表达两件事：折射是「玻璃有多弯」，色散是「不同波长弯得差多少」。
-/// 后者有自己的基准，取 0.35 = 旧默认折射强度，于是**默认配置下色散幅度
-/// 与改造前逐点一致**，只是不再随折射滑块漂移。
-const DISPERSION_POWER: f32 = 0.35;
+// ---- 位移量纲（像素，不是 UV）------------------------------------------
+//
+// CAUTION: `u.refract` / `u.dispersion` / `u.content_inset` 都是**物理像素**，
+// 由 `GlassParams::uniform` 换算好再送进来；着色器只按 `u.size` 逐轴折成 UV。
+//
+// 早前 `u.refract` 直接当 UV 用：`0.35` 在 878px 宽的窗口上是 307px 的
+// 位移，卡片边缘把**三百像素外**的桌面内容拉进来，与身后真实背景完全对
+// 不上——观感就是「玻璃里糊着一张不相干的文字」（2026-10-29「玻璃看着有
+// 点脏」的根因之二）。真实斜边的位移量级由斜边宽度决定（`radius` 十几
+// 像素 ⇒ 位移也是十几像素）。
+//
+// 像素基准由 Rust 侧的 `glass::{REFRACT_MAX_PX, DISPERSION_PX}` 定义。
 
 /// 2D 斜率场抬起成 3D 表面法线时 xy 分量的放大倍数。与 `glass::SURFACE_TILT` 一致。
 const SURFACE_TILT: f32 = 2.0;
@@ -89,11 +94,13 @@ const EDGE_NXY: f32 = 0.8944272;
 /// 「`power` = 边缘最大位移」。
 const EDGE_FACTOR: f32 = 0.5046306;
 
-/// 穹顶折射相对边缘轮廓折射的强度比。
+/// 穹顶折射相对边缘轮廓折射的强度比（两者都按像素算，见上）。
 ///
-/// Rust 侧的测试用 `dome power = 0.03`、`edge power = 0.35`，比值 0.086。
-/// 取 0.08：穹顶只负责「中心也有折射」，主角是边缘轮廓。
-const DOME_RATIO: f32 = 0.08;
+/// 边缘轮廓折射只在 `radius` 宽的斜边带里成立；穹顶负责「整卡也有轻微
+/// 透镜感」，位移沿归一化坐标径向展开。取 0.25：行卡片（半高 29px）在
+/// 1.0 滑块下约 10px、默认 0.35 滑块下约 3.5px——够看出「有厚度」，
+/// 又不会把内容整体挪走。
+const DOME_RATIO: f32 = 0.25;
 
 /// 磨砂尺度的**相对系数**：以卡片短半轴为基准的倍数。与 `glass::FROST_RATIO` 一致。
 ///
@@ -144,9 +151,10 @@ const FROST_MAX: f32 = 0.32;
 /// 看到的就是「背景玻璃没渲染」（2026-10-28 报障）。
 ///
 /// 玻璃的背景该是**清晰**的：一块架在桌面上的透明玻璃，不是一层毛玻璃
-/// 滤镜。0.18 只削掉约两成高频（桌面上的文字、图标边缘、壁纸纹理会与
-/// 前景抢注意力），细节与通透都在。
-const BG_FROST: f32 = 0.18;
+/// 滤镜。只留一成柔化：模糊链是 1/4 分辨率的双滤波结果，混多了会在清晰
+/// 底图上叠一层低分辨率的「纱」——桌面上的文字周围出现晕圈，整窗发灰
+/// （2026-10-29「玻璃看着有点脏」的成因之一）。0.18 → 0.10。
+const BG_FROST: f32 = 0.10;
 
 /// 背景层不透明度的**默认档**（实际值由 `u.bg_alpha` 逐帧给出，这个常量
 /// 只是文档与守门用的基准）。理由同 `glass::BG_ALPHA_DEFAULT`：恒为 1.0
@@ -183,6 +191,74 @@ const SPEC_GAIN: f32 = 0.45;
 const LIGHT_DIR: vec2<f32> = vec2<f32>(-0.6, -0.8);
 /// `glass_edge` 滑块到 Blinn-Phong 锐度的换算（滑块 0.5~12 ⇒ 锐度 4~96）。
 const SPEC_SHININESS: f32 = 8.0;
+
+// ---- 2.5D 立体斜边 ----------------------------------------------------
+//
+// 玻璃卡片的「厚度」不是靠描边，而是靠**斜边受光**：一块边缘倒角的板，
+// 朝光的一侧把光反到眼睛里（亮棱），背光一侧只剩环境光（暗棱），
+// 内缘再有一道细高光（斜边与平面交界处的折线），外缘一道极窄的暗接触
+// 线（板与桌面之间的缝）。四层叠起来，二维矩形就有了厚度。
+//
+// 全部按**物理像素**表达，与 DPI 无关——细线宽度必须与 1px 同量级，
+// 用 pt 会让 2× 屏上的「细线」变成 2px 的粗边。
+
+/// 光源的 Z 分量（灯在玻璃前方多高）。与 `LIGHT_DIR`（xy）共同定义
+/// 单位光向量：`normalize(vec3(LIGHT_DIR, LIGHT_Z))`。
+///
+/// 取 0.55 而不是 1.0：太正的光会让「迎光面」与「平面」的差变小，
+/// 斜边读不出来；太小则只在极小角度上亮，亮棱会断成几段。
+const LIGHT_Z: f32 = 0.55;
+
+/// 受光侧亮棱的增益。乘在 [`SPEC_TINT`]（冷白）上。
+///
+/// # 为什么不用 [`RIM_TINT`]
+///
+/// 它是暗冷灰（0.20/0.23/0.28），叠在接近纯白的浅色卡片上几乎看不出
+/// 变化——第一版就是这样，2.5D 立体感在浅色主题下完全消失。亮棱是
+/// **光的反射**，得用接近白的颜色才有明度差。
+const BEVEL_LIT_GAIN: f32 = 1.0;
+
+/// 背光侧暗棱的增益（按亮度**乘性压暗**，不是加黑）。
+///
+/// 乘性而不是减性：加黑会在亮卡片上糊一块灰，乘 0.6 只是「这一侧没接到
+/// 光」，颜色仍属于卡片自己。
+const BEVEL_DARK_GAIN: f32 = 0.45;
+
+/// 轮廓亮/暗棱的**半宽**（像素）。
+///
+/// # 为什么不用「`w` 的幂」收窄（第一版的做法）
+///
+/// `w = (1 - de/radius)²` 铺满整条斜边带（行卡片上是 18px）。浅色主题的
+/// 卡片底已经接近 255，任何正增量都会**直接顶到白**：按 `w²` 收窄后亮棱
+/// 仍有 5~6px 的纯白带，读作「一圈发光的边」——正是要避免的廉价感。
+///
+/// 改成显式宽度门控（3px 内从 1 收到 0）后，亮棱是**一条边**，宽度与
+/// 圆角、DPI 都解耦。斜边面的柔和受光由上面那层 Fresnel 承担。
+const BEVEL_LIT_WIDTH: f32 = 3.0;
+
+/// 内缘高光线的位置（距边像素）与半宽。
+///
+/// 1.4px：紧贴轮廓内侧，正好在斜边与平面交界附近。位置取 0 会与外缘
+/// 抗锯齿的过渡带打架（那半条带本来就半透明）。
+const BEVEL_HAIRLINE_AT: f32 = 1.4;
+const BEVEL_HAIRLINE_WIDTH: f32 = 1.1;
+
+/// 内缘高光线的亮度增益（乘在 [`SPEC_TINT`] 上）。细线要「亮而窄」，
+/// 加太浓就成了描边。
+const BEVEL_HAIRLINE_GAIN: f32 = 0.22;
+
+/// 外缘暗接触线的半宽（像素）与压暗增益。
+///
+/// 它承担「卡片压在桌面上」的分离感：没有它，浅色桌面上浅色卡片的
+/// 轮廓会糊在一起（投影在玻璃模式下被裁到卡片外侧，帮不上这一层）。
+const BEVEL_CONTACT_WIDTH: f32 = 1.2;
+const BEVEL_CONTACT_GAIN: f32 = 0.22;
+
+/// 「元素不参与玻璃计算」的羽化宽度（像素）。
+///
+/// 内容区边界若硬切，卡片内部会出现一条直角矩形接缝（比玻璃本身还显眼）。
+/// 6px 的 smoothstep 让「玻璃处理」到「干净底图」之间看不出分界线。
+const CONTENT_FEATHER: f32 = 6.0;
 
 /// 模糊底图跟随折射的比例（0 = 不跟，1 = 与清晰图同幅）。
 ///
@@ -247,9 +323,11 @@ struct GlassUniforms {
     radii: array<vec4<f32>, MAX_GLASS_CARDS>,
     /// 目标图的像素尺寸 `(w, h)`。
     size: vec2<f32>,
-    /// 折射强度（0 = 不折射，只剩磨砂）。
+    /// 边缘轮廓折射的最大位移（**物理像素**，`|n| = 1` 处的量）。
+    ///
+    /// CAUTION: 像素，不是 UV。见上面「位移量纲」那一段。
     refract: f32,
-    /// 色散宽度（0 = 关掉彩色描边，1 = 全强度）。
+    /// 色散的单通道附加位移（**物理像素**，0 = 关掉彩色描边）。
     dispersion: f32,
     /// Fresnel 幂次（越小光晕越铺开，越大越集中在边缘一两像素）。
     edge: f32,
@@ -268,6 +346,12 @@ struct GlassUniforms {
     /// 底图（等同 Acrylic）。默认 0.35：捕获底图只占三分之一权重，合成
     /// 结果 ≈ 真桌面 + 一档亮度自适应——**看得见桌面，又有可读性兜底**。
     bg_alpha: f32,
+    /// 内容区向内收缩的距离（**物理像素**）。见 `content_clear`。
+    ///
+    /// **0 = 关闭**（整块都做玻璃处理）——`content_clear` 对 `inset <= 0`
+    /// 直接返回 0。开关不单独占字段：少一个 `f32` 让结构体正好停在
+    /// 1568（98×16），常量缓冲一个字节都不用加。
+    content_inset: f32,
 };
 
 // 合成时的 UV 位移（push constant，8 字节）。
@@ -392,7 +476,40 @@ fn glass_normal(p: vec2<f32>, half: vec2<f32>, r: f32, eps: f32) -> vec2<f32> {
     return g / l;
 }
 
-/// `refract(I, N, eta)` 的 2D 投影，返回 UV 位移。
+/// 2D 斜率场抬起成 3D 单位法线后的两个分量。
+///
+/// `nxy` = `N.xy`（已含 `SURFACE_TILT` 与归一化系数），`nz` = `N.z`。
+/// 分开返回是因为折射的三个用途（基础位移、色散、2.5D 受光）都只要其中
+/// 一部分，重复做 `length` + `sqrt` 是单像素成本里的大头。
+struct RaisedNormal {
+    nxy: vec2<f32>,
+    nz: f32,
+};
+
+/// 斜率场 → 3D 法线。与 `glass::raise_normal` 逐行对应。
+fn raise_normal(n: vec2<f32>) -> RaisedNormal {
+    // `inv = 1/sqrt(t² + 1)` 一次给出 `N.xy`（乘 TILT·inv）与 `N.z`（= inv），
+    // 省一次 normalize。
+    let t = length(n) * SURFACE_TILT;
+    let inv = inverseSqrt(t * t + 1.0);
+    return RaisedNormal(n * (SURFACE_TILT * inv), inv);
+}
+
+/// 折射率项 `f(eta) = sqrt(1 - eta²(1 - N.z²)) - eta·N.z`。
+/// 与 `glass::refract_f` 逐行对应。
+///
+/// # 为什么单独抽出来（延迟优化）
+///
+/// 色散要算三个 IOR 的**差值**，而三者只差在这个标量上。早前每个通道各
+/// 调两次 `refract_uv`（每次都重做 `length` + 归一化 + `sqrt`）⇒ 单像素
+/// 最多 6 次开方。抽成标量后：基础位移 1 次 + 每通道 1 次 = 4 次，且
+/// `nxy` 只推导一次。
+fn refract_f(nz: f32, eta: f32) -> f32 {
+    let k = max(1.0 - eta * eta * (1.0 - nz * nz), 0.0);
+    return sqrt(k) - eta * nz;
+}
+
+/// `refract(I, N, eta)` 的 2D 投影，返回**像素**位移。
 ///
 /// 与 `glass::refract_offset` 逐行对应。**入射是正对玻璃的视线**
 /// `I = (0, 0, -1)`，法线是 2D 斜率场抬起成的 3D 法线
@@ -413,23 +530,12 @@ fn glass_normal(p: vec2<f32>, half: vec2<f32>, r: f32, eps: f32) -> vec2<f32> {
 ///
 /// # 归一化
 ///
-/// 上式再乘 `(f / EDGE_FACTOR) / EDGE_NXY`（`f = s - eta·N.z`）归一：
-/// 于是 `|n| = 1` 且 `eta = DEFAULT_ETA` 时位移模长恰好等于 `power`，
-/// 与旧模型的幅值逐点对齐（实测 `|n| = 0.5` 处旧 0.632·power、
-/// 新 0.643·power）。这次改的是「eta 有没有用」，不是「折射多强」。
+/// 上式再乘 `(f / EDGE_FACTOR) / EDGE_NXY` 归一：
+/// 于是 `|n| = 1` 且 `eta = DEFAULT_ETA` 时位移模长恰好等于 `power`。
 fn refract_uv(n: vec2<f32>, eta: f32, power: f32) -> vec2<f32> {
-    // 抬起：|n| 已知量级（0~1），`inv = 1/sqrt(t² + 1)` 一次给出
-    // `N.xy`（乘 TILT·inv）与 `N.z`（= inv），省一次 normalize。
-    let t = length(n) * SURFACE_TILT;
-    let inv = 1.0 / sqrt(t * t + 1.0);
-    let nxy = n * (SURFACE_TILT * inv);
-    let nz = inv;
-    // d = dot(N, I) = -N.z（I = (0,0,-1)）
-    let k = max(1.0 - eta * eta * (1.0 - nz * nz), 0.0);
-    let s = sqrt(k);
-    let f = s - eta * nz;
-    let scale = (f / EDGE_FACTOR) / EDGE_NXY;
-    return -nxy * scale * power;
+    let r = raise_normal(n);
+    let scale = (refract_f(r.nz, eta) / EDGE_FACTOR) / EDGE_NXY;
+    return -r.nxy * (scale * power);
 }
 
 /// 穹顶（半球透镜）法线的斜率场：`normalize(local) * min(|local|, 1)`。
@@ -468,6 +574,59 @@ fn bevel_weight(de: f32, radius: f32) -> f32 {
     let x = clamp(de / max(radius, 1.0), 0.0, 1.0);
     let t = 1.0 - x;
     return t * t;
+}
+
+// ---- 2.5D 立体斜边 ----------------------------------------------------
+
+/// 斜边带的受光差：`dot(N3, L) - L.z`，**平面处恰好为 0**。
+/// 与 `glass::bevel_lambert` 逐行对应。
+///
+/// # 为什么减去 `L.z`
+///
+/// `w = 0`（斜边带以内）时 3D 法线是 `(0, 0, 1)`，`dot = L.z`。不减这一项，
+/// 整块卡片平面都会拿到一个正的「受光」偏移（等于给卡片整体加亮），
+/// 斜边的层次反而没了。减去之后：迎光斜边为正（亮棱）、背光斜边为负
+/// （暗棱）、平面为 0。
+///
+/// `w`（斜边权重）本身也参与抬升：外缘最陡、带内端水平，与
+/// [`bevel_weight`] 的剖面同源，所以受光强度沿带内自然衰减，不需要再
+/// 乘一次权重。
+fn bevel_lambert(n: vec2<f32>, w: f32, light: vec2<f32>) -> f32 {
+    let l = normalize(vec3<f32>(light.x, light.y, LIGHT_Z));
+    let t = clamp(w, 0.0, 1.0) * SURFACE_TILT;
+    let inv = inverseSqrt(t * t + 1.0);
+    let n3 = vec3<f32>(n * (t * inv), inv);
+    return dot(n3, l) - l.z;
+}
+
+/// 细线凸起：`de = at` 处为 1、偏离 `width` 后为 0，两端斜率也为 0。
+/// 与 `glass::thin_line` 逐行对应。
+///
+/// 用 `smoothstep` 三角窗而不是高斯：`exp` 在 GPU 上是 4~6 条指令，而
+/// 这条线只值 1px 的观感；三角窗的平顶窄、两侧收得干净，实测亮度剖面
+/// 与 1px 高斯几乎重合。
+fn thin_line(de: f32, at: f32, width: f32) -> f32 {
+    let x = clamp(1.0 - abs(de - at) / max(width, 1e-3), 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
+}
+
+/// 内容区「退出玻璃计算」的掩码（0 = 照常做玻璃，1 = 完全跳过）。
+/// 与 `glass::content_clear` 逐行对应。
+///
+/// 判定用**内缩矩形**而不是逐元素的真实包围盒：绘制层要区分文字 / 图标 /
+/// 缩略图得把每个图元的矩形都送进来（uniform 装不下、每帧还要重传），
+/// 而「卡片四周留 padding、中间是内容」这个格局对所有卡片都成立。
+///
+/// 边界必须羽化：内容区是直角矩形，硬切会在卡片内部留一条直角接缝，
+/// 比玻璃本身还显眼（见 [`CONTENT_FEATHER`]）。
+fn content_clear(p: vec2<f32>, half: vec2<f32>, inset: f32) -> f32 {
+    if (inset <= 0.0) {
+        return 0.0;
+    }
+    let inner = max(half - vec2<f32>(inset, inset), vec2<f32>(0.0));
+    let cd = min(inner.x - abs(p.x), inner.y - abs(p.y));
+    let x = clamp(cd / CONTENT_FEATHER, 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
 }
 
 /// 边缘覆盖率过渡带的**半宽**（像素）。与 `glass::EDGE_AA_HALF_WIDTH` 一致。
@@ -536,16 +695,14 @@ fn frost_mix(de: f32, half: vec2<f32>) -> f32 {
     return pow(x, FROST_GAMMA) * FROST_MAX;
 }
 
-/// 某个 IOR 相对默认 IOR 的**附加位移**（色散分量）。
-/// 与 `glass::dispersion_delta` 逐行对应。
+/// 某通道相对默认 IOR 的**色散系数**（无量纲）。
+/// 与 `glass::dispersion_scale` 逐行对应。
 ///
-/// 返回「差值」而不是整段位移：基础位移由外层算一次，三个通道只多付
-/// 两次 `refract_uv`（无分支，成本可忽略）。`dispersion = 0` 时整项
-/// 归零，三通道共用基础位移——与老行为逐点一致。
-fn dispersion_delta(n: vec2<f32>, eta: f32) -> vec2<f32> {
-    let a = refract_uv(n, eta, DISPERSION_POWER);
-    let b = refract_uv(n, DEFAULT_ETA, DISPERSION_POWER);
-    return a - b;
+/// 乘上 `-N.xy · 像素` 就是该通道比绿通道多走的位移。返回标量而不是向量
+/// 是为了让调用方只推导一次 `N.xy`——早前三个通道各调两次 `refract_uv`，
+/// 6 次开方里有 5 次算的是同一个方向。
+fn dispersion_scale(nz: f32, eta: f32) -> f32 {
+    return (refract_f(nz, eta) - refract_f(nz, DEFAULT_ETA)) / EDGE_FACTOR / EDGE_NXY;
 }
 
 /// 相对亮度（Rec.709）。
@@ -672,43 +829,47 @@ fn glass_tint(rgb: vec3<f32>, tint: vec3<f32>, a: f32) -> vec3<f32> {
     return mix(base, tinted, k);
 }
 
-@fragment
-fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
-    // ---- 背景层（不属于任何卡片的像素）----
-    //
-    // CAUTION: 这里**不能**直接铺模糊底图。早前就是这么写的，于是玻璃
-    // 模式的整窗背景与 Acrylic 逐字节相同——用户看到的是「背景玻璃没
-    // 渲染」（2026-10-28 报障）。
-    //
-    // 玻璃的背景是「清晰桌面 + 一层极轻的柔化」：能看清身后是什么，
-    // 同时把高频噪点压掉两成，避免与前景文字抢注意力。UV 位移与
-    // Acrylic 共用一套（磨砂移动预测，见 CopyOffset 的注释）。
-    let blurred = textureSampleLevel(blur_tex, glass_sampler, in.uv + copy_pc.offset, 0.0);
-    let sharp_bg = textureSampleLevel(sharp_tex, glass_sampler, in.uv + copy_pc.offset, 0.0);
+/// 背景层（不属于任何卡片的像素）。
+///
+/// # 为什么抽成函数、并且**在卡片循环之后**才调（延迟优化）
+///
+/// 早前 `fs_glass` 一进来就为**每个像素**采两次底图（清晰 + 模糊）作为
+/// `out` 的初值，而卡片像素随后会把它整个覆盖掉——列表卡片覆盖了窗口的
+/// 大部分面积，那两次采样对它们纯属浪费。挪到循环之后、并且用 `return`
+/// 直接结束，卡片像素一次底图都不采。
+fn bg_layer(uv: vec2<f32>) -> vec4<f32> {
+    let blurred = textureSampleLevel(blur_tex, glass_sampler, uv, 0.0);
+    let sharp = textureSampleLevel(sharp_tex, glass_sampler, uv, 0.0);
     // 亮度自适应同样作用在背景层上：它是整窗面积最大的一块，亮壁纸
     // 下不压一档的话前景文字的对比度全靠 egui 那层半透明 `bg` 撑着。
-    let bg_rgb = adapt_luma(
-        mix(sharp_bg.rgb, blurred.rgb, BG_FROST),
+    let rgb = adapt_luma(
+        mix(sharp.rgb, blurred.rgb, BG_FROST),
         LUMA_DIM_MAX,
         LUMA_LIFT_MAX,
     );
     // CAUTION: 背景层的 alpha **不能**取 `blurred.a`（恒为 1）。那会把
     // 整个窗口铺成不透明底图，真实桌面一点都透不出来——用户报的
-    // 「alpha 异常、渲染不出透明」就是这一行（2026-10-28）。
+    // 「alpha 异常、渲染不出透明」就是这一处（2026-10-28）。
     //
     // 输出必须**预乘**（交换链是 PRE_MULTIPLIED），所以 RGB 也要乘同一
     // 个 alpha——只改 alpha 会把底图凭空叠一层桌面，越透明越亮。
-    let bg_a = clamp(u.bg_alpha, 0.0, 1.0) * blurred.a;
-    var out = vec4<f32>(bg_rgb * bg_a, bg_a);
+    let a = clamp(u.bg_alpha, 0.0, 1.0) * blurred.a;
+    return vec4<f32>(rgb * a, a);
+}
 
+@fragment
+fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
     // uv → 物理像素（egui y-down 同向，见模块头「坐标约定」）。
-    let pixel = vec2<f32>(in.uv.x * u.size.x, in.uv.y * u.size.y);
+    let pixel = in.uv * u.size;
+    // 位移在着色器内部一律是**像素**，折成 UV 只在这里做一次除法
+    // （逐轴，所以横竖位移的物理长度一致）。
+    let inv_size = vec2<f32>(1.0) / max(u.size, vec2<f32>(1.0));
+    let uv_src = in.uv + copy_pc.offset;
 
     for (var i: u32 = 0u; i < u.count; i = i + 1u) {
         let rc = u.rects[i];
-        let center = rc.xy;
         let half = rc.zw;
-        let rel = pixel - center;
+        let rel = pixel - rc.xy;
 
         // ---- AABB 粗判（先于 SDF）----
         //
@@ -728,17 +889,9 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // ---- SDF 与解析法线一次算出 ----
         //
         // 列表卡片互不重叠，第一张命中的就是最终结果；顶栏/搜索面板/
-        // 类型栏同样不重叠。命中的卡片处理完即结束。
-        // 半径**逐矩形**（直角面板是 0，行卡片是 `ROW_RADIUS`）。
+        // 类型栏同样不重叠。
         let r = u.radii[i].x;
         let sn = sdf_rr_n(rel, half, r);
-        // ---- 边缘覆盖率（抗锯齿）----
-        //
-        // CAUTION: 早前是硬判 `d > 0 → continue`。SDF 的边界在像素格上
-        // 二值化，圆角与斜边因此是阶梯——而玻璃 pass 是全屏三角形，
-        // **不受几何超采样保护**（SSAA 只放大目标分辨率，判据仍按放大后
-        // 的像素格二值化）。现在按**内部深度**给 1px 线性覆盖率。
-        //
         // 覆盖率为 0 才跳过（等价于深度 ≤ -0.5px）。圆角切掉的角上自然
         // 为 0；直角矩形内部深度为正（见 `edge_depth`），覆盖率恒为 1
         // ——不会重演「顶栏整块半透明」。
@@ -746,48 +899,51 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         if (aa <= 0.0) {
             continue;   // 完全在形状外
         }
-        let p = rel;
-        let d = sn.d;
-        let n = sn.n;
 
         // ---- 距边距离 / 斜角权重 ----
-        let de = dist_edge(p, half, d);
+        let de = dist_edge(rel, half, sn.d);
         // 斜角带：只在距边 `r` 像素以内折，带外严格为 0。
         // 直角面板（r = 0）的带只有 1px——它本来就不该有斜角。
         let w = bevel_weight(de, r);
-        let local = p / half;               // 归一化到 [-1,1]
+        let local = rel / max(half, vec2<f32>(1e-3, 1e-3));
         let slope = dome_slope(local);
+
+        // ---- 内容区退出玻璃计算（可开关，默认关）----
+        //
+        // `clear = 1` 的像素只保留「折射之后的清晰底图」，磨砂 / 混色 /
+        // 亮度自适应 / 色散一律不做：文字与图标背后因此是干净、可比对的
+        // 真实背景，而不是一块糊底。默认 `u.content_inset = 0` ⇒ `clear`
+        // 恒为 0，与改造前逐点一致。
+        let clear = content_clear(rel, half, u.content_inset);
 
         // ---- 两级折射：穹顶（中心）+ 边缘轮廓（贴边）----
         //
-        // 穹顶**只算一次**（用默认 IOR）：三个 IOR 对穹顶位移的影响不到
-        // 一个纹素的 1%，分通道算纯属浪费（每次 refract 含一个 sqrt）。
-        // 色散的差异只体现在边缘轮廓折射上——那里位移大、差异才看得见。
-        let dome_c = dome_offset(local, DEFAULT_ETA, u.refract * DOME_RATIO);
-        // 基础位移（`dispersion = 0` 时三通道共用它）。
-        let base = refract_uv(n, DEFAULT_ETA, u.refract) * w + dome_c;
+        // `N.xy` 只推导一次，基础折射与三个色散通道共用（见
+        // `raise_normal` / `dispersion_scale` 的注释）。
+        let raised = raise_normal(sn.n);
+        let base_scale = (refract_f(raised.nz, DEFAULT_ETA) / EDGE_FACTOR) / EDGE_NXY;
+        let dome_px = refract_uv(slope, DEFAULT_ETA, u.refract * DOME_RATIO);
+        let base_px = -raised.nxy * (base_scale * u.refract * w) + dome_px;
+
         // 色散只在**靠近边缘**时启用（见 `DISPERSION_BAND`）：内部三通道
-        // 位移几乎重合，分开采样纯浪费带宽。
-        let eff_disp = select(0.0, u.dispersion, de < DISPERSION_BAND);
+        // 位移几乎重合，分开采样纯浪费带宽。开启内容区排除后它同样退出。
+        let disp_px = select(0.0, u.dispersion, de < DISPERSION_BAND) * w * (1.0 - clear);
 
         var sharp_rgb: vec3<f32>;
-        if (eff_disp > 0.001) {
-            // 三个通道 = 基础位移 + **独立基准**的色散分量（见
-            // `DISPERSION_POWER` 的 CAUTION）。色散分量同样乘斜角权重：
-            // 平坦区 `n = 0` ⇒ 分量为 0 ⇒ 三通道重合。
-            let k = eff_disp * w;
-            let off_r = base + dispersion_delta(n, 1.0 / IOR_R) * k;
-            let off_g = base + dispersion_delta(n, 1.0 / IOR_G) * k;
-            let off_b = base + dispersion_delta(n, 1.0 / IOR_B) * k;
-            // 三次采样重合成一帧。清晰图采样同样带 UV 位移（与磨砂同步）。
-            let sr = textureSampleLevel(sharp_tex, glass_sampler, in.uv + copy_pc.offset + off_r, 0.0);
-            let sg = textureSampleLevel(sharp_tex, glass_sampler, in.uv + copy_pc.offset + off_g, 0.0);
-            let sb = textureSampleLevel(sharp_tex, glass_sampler, in.uv + copy_pc.offset + off_b, 0.0);
+        if (disp_px > 0.001) {
+            // 每通道一个标量系数（见 `dispersion_scale`），方向共用
+            // 上面的 `raised.nxy`：早前要 6 次开方，现在 4 次。
+            let kr = dispersion_scale(raised.nz, 1.0 / IOR_R);
+            let kg = dispersion_scale(raised.nz, 1.0 / IOR_G);
+            let kb = dispersion_scale(raised.nz, 1.0 / IOR_B);
+            let uv_c = uv_src + base_px * inv_size;
+            let sr = textureSampleLevel(sharp_tex, glass_sampler, uv_c + (-raised.nxy * (kr * disp_px)) * inv_size, 0.0);
+            let sg = textureSampleLevel(sharp_tex, glass_sampler, uv_c + (-raised.nxy * (kg * disp_px)) * inv_size, 0.0);
+            let sb = textureSampleLevel(sharp_tex, glass_sampler, uv_c + (-raised.nxy * (kb * disp_px)) * inv_size, 0.0);
             sharp_rgb = vec3<f32>(sr.r, sg.g, sb.b);
         } else {
             // 单次采样：位移取绿通道（三通道的中间值）。
-            let sg = textureSampleLevel(sharp_tex, glass_sampler, in.uv + copy_pc.offset + base, 0.0);
-            sharp_rgb = sg.rgb;
+            sharp_rgb = textureSampleLevel(sharp_tex, glass_sampler, uv_src + base_px * inv_size, 0.0).rgb;
         }
 
         // ---- 磨砂 / 清晰混合：边缘清晰、中心磨砂 ----
@@ -797,29 +953,25 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // 反向——贴边处折射最强且最清晰（那是液态玻璃的辨识特征），
         // 内部折射归零、退回磨砂。
         //
-        // CAUTION: 上限取 `FROST_MAX`（0.5）而不是 1.0：整片纯磨砂就退回
-        // Acrylic。2026-10-27 之前是 0.85，只留 15% 清晰分量，在深色壁纸上
-        // 玻璃读成一块发灰色块——「通透」这件事一半靠这个上限，另一半靠
-        // 上面的 `FROST_SCALE_MAX`。
-        // `frost_mix` 那条归一化曲线（见 `FROST_RATIO` 的 CAUTION）。
-        //
         // 磨砂那一路**也**按折射位移采样（见 `BLUR_REFRACT`）：位移图在
         // Apple 的实现里作用在模糊之后的背景上，只让清晰图位移会让占
-        // 面积大多数的中心完全没有透镜感。
-        //
-        // 模糊图**不做色散**：它已经没有高频，三通道分开采样的差值在一张
-        // 糊图上不可见——那两次采样纯浪费带宽。用基础位移即可。
-        let bref = base * BLUR_REFRACT;
-        let blur_rgb = textureSampleLevel(blur_tex, glass_sampler, in.uv + copy_pc.offset + bref, 0.0).rgb;
-        let frost = frost_mix(de, half);
+        // 面积大多数的中心完全没有透镜感。模糊图**不做色散**：它已经没有
+        // 高频，三通道分开采样的差值在一张糊图上不可见。
+        let frost = frost_mix(de, half) * (1.0 - clear);
+        let blur_rgb = textureSampleLevel(
+            blur_tex,
+            glass_sampler,
+            uv_src + base_px * (inv_size * BLUR_REFRACT),
+            0.0,
+        ).rgb;
         var rgb = mix(sharp_rgb, blur_rgb, frost);
 
         // ---- 亮度自适应（Apple regular 变体）----
         //
         // 亮底压暗、暗底提亮：卡片上的前景文字对比度不随壁纸/桌面内容
         // 漂移。放在混合**之后**、高光**之前**——高光是光源的反光，
-        // 不该被底图的亮度修正吃掉。
-        rgb = adapt_luma(rgb, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        // 不该被底图的亮度修正吃掉。内容区按 `clear` 线性退回原色。
+        rgb = mix(adapt_luma(rgb, LUMA_DIM_MAX, LUMA_LIFT_MAX), rgb, clear);
 
         // ---- 卡片底色（tint）：玻璃层自己合成 ----
         //
@@ -828,21 +980,16 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         //   拽着走（亮壁纸下卡片不该被一起提亮成灰白）；
         // - 在高光之前：高光是光源的反光，叠在 tinted 玻璃之上。
         //
-        // 早前这一层由 egui 在玻璃 pass 之后再画一个矩形——那是**两次
-        // 覆盖**：卡片色不透明时玻璃被整个盖死，半透明时又多叠一份桌面。
-        //
         // 底色与覆盖度都是**本矩形自己的**（`tints[i]` / `alphas[i]`）：
-        // 行卡片、顶栏、搜索面板、类型栏各有各的底色，不能共用一份
-        // （共用时只有最后画的那块生效，其余面板被串色）。
+        // 行卡片、顶栏、搜索面板、类型栏各有各的底色，不能共用一份。
         let tint = u.tints[i];
-        rgb = glass_tint(rgb, tint.rgb, clamp(tint.a, 0.0, 1.0));
+        rgb = glass_tint(rgb, tint.rgb, clamp(tint.a, 0.0, 1.0) * (1.0 - clear));
 
         // ---- 轮廓：Fresnel（宽、各向同性）+ 镜面高光（锐、方向性）----
         //
         // Fresnel 用**斜率场**而不是 SDF 梯度：后者在内部恒 0、贴边为 1，
         // 用 `1-|n|` 形式的公式会让整片内部最亮（物理映射反了）。
-        // 见 `glass::fresnel_edge` 的 CAUTION。这一层是「环境反射」，
-        // 四边都有一点。
+        // 见 `fresnel_edge` 的 CAUTION。这一层是「环境反射」，四边都有一点。
         let f = pow(clamp(length(slope), 0.0, 1.0), max(u.edge, 0.0));
         rgb = rgb + RIM_TINT * f;
         //
@@ -851,9 +998,24 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         //   ① 用斜角带的**朝外法线** `n` 与光源方向点积（方向性）；
         //   ② 再乘斜角权重 `w`：它只在轮廓带上成立，平坦区 `n = 0`
         //      本来也不会有高光，乘 `w` 是为了让它在带内端平滑收尾。
-        // 少任何一点都会退回「四边一样亮的描边」。
-        let spec = pow(max(dot(n, LIGHT_DIR), 0.0), max(u.edge, 0.5) * SPEC_SHININESS);
+        let spec = pow(max(dot(sn.n, LIGHT_DIR), 0.0), max(u.edge, 0.5) * SPEC_SHININESS);
         rgb = rgb + SPEC_TINT * (spec * SPEC_GAIN * w);
+
+        // ---- 2.5D：斜边受光 / 背光 + 内缘高光线 + 外缘接触线 ----
+        //
+        // 这四层合起来才是「一块有厚度的玻璃板」：
+        //   · `lam > 0`（迎光斜边）⇒ 把光反进眼睛，加亮；
+        //   · `lam < 0`（背光斜边）⇒ 只剩环境光，**乘性**压暗；
+        //   · 内缘细线 ⇒ 斜边与平面的折线（厚度的直接线索）；
+        //   · 外缘暗线 ⇒ 板与桌面之间的缝，浅色桌面上把轮廓分开。
+        // 全部乘 `w`（或按距边定位）⇒ 只在轮廓一带成立，平面区严格为 0。
+        let lam = bevel_lambert(sn.n, w, LIGHT_DIR);
+        let gate = thin_line(de, 0.0, BEVEL_LIT_WIDTH);
+        let lit = gate * max(lam, 0.0) * BEVEL_LIT_GAIN;
+        let dark = gate * max(-lam, 0.0) * BEVEL_DARK_GAIN;
+        let hair = thin_line(de, BEVEL_HAIRLINE_AT, BEVEL_HAIRLINE_WIDTH) * BEVEL_HAIRLINE_GAIN;
+        let contact = thin_line(de, 0.0, BEVEL_CONTACT_WIDTH) * BEVEL_CONTACT_GAIN;
+        rgb = rgb * (1.0 - dark - contact) + SPEC_TINT * (lit + hair);
 
         // ---- 输出：必须**预乘** ----
         //
@@ -867,18 +1029,19 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         // 0.25 份桌面），表现为半透明卡片发白、发灰，且调低不透明度
         // 反而更亮——与「越透明越淡」的直觉相反，且**不报任何错**。
         //
-        // `blurred.a` 恒为 1（GDI 捕获已强制 alpha=255，卷积保持），
-        // 它在这里只是「底图自身的覆盖度」，与卡片透明度相乘即为
-        // 玻璃层最终覆盖度。
-        //
         // `aa`（边缘覆盖率）无条件乘进来：它只在那 1px 过渡带里小于 1，
-        // 带内像素因此按覆盖率把玻璃混到**底图**上（`out` 的初值就是
-        // 模糊底图），正是抗锯齿要的结果。预乘关系不变（RGB 与 alpha
-        // 同乘），所以不会重演下面 CAUTION 说的「越透明越亮」。
-        let a = clamp(u.alphas[i].x, 0.0, 1.0) * blurred.a * aa;
-        out = vec4<f32>(rgb * a, a);
-        break;
+        // 带内像素因此按覆盖率把玻璃混到**底图**上（`bg_layer` 的输出），
+        // 正是抗锯齿要的结果。预乘关系不变（RGB 与 alpha 同乘），所以不会
+        // 重演上面 CAUTION 说的「越透明越亮」。
+        //
+        // 内缘高光线与外缘接触线都写在预乘**之前**：它们属于玻璃自身的
+        // 颜色，乘 alpha 之后才是「这块玻璃盖住桌面多少」。
+        let a = clamp(u.alphas[i].x, 0.0, 1.0) * aa;
+        if (a > 0.0) {
+            return vec4<f32>(rgb * a, a);
+        }
+        // 覆盖度为 0（矩形完全透明）：什么都不做，交给背景层。
     }
 
-    return out;
+    return bg_layer(uv_src);
 }

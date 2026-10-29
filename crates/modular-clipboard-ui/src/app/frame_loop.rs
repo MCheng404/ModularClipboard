@@ -380,6 +380,8 @@ pub(super) fn run_mode(
     // CPU 与 GPU 全部白烧；且 `hidden` 与 Win32 真实可见性长期不一致，
     // 后续任何依赖它的判断都会错。
     let mut hidden = start_minimized && resident.is_some();
+    // 「玻璃抓屏下限」日志去重（见下面的 `eff_pct != want_pct` 分支）。
+    let mut capture_floor_logged = false;
     // 隐藏起点（用于「隐藏空闲退出」，见 [`should_idle_exit`]）。
     //
     // 惰性打点：每次进入隐藏态的第一帧才记时间戳，`hidden == false`
@@ -1239,6 +1241,14 @@ pub(super) fn run_mode(
                     // `BG_ALPHA_DEFAULT` 的文档）。
                     bg_alpha: modular_clipboard_gfx::glass::BG_ALPHA_DEFAULT
                         * cfg.window_opacity.clamp(0.3, 1.0),
+                    // 「元素不参与玻璃计算」：开关打开时把行卡片的内容区
+                    // （按内边距内缩）交给着色器，让文字/图标背后保持
+                    // 干净底图。关闭时传 0 = 整块照常做玻璃。
+                    content_inset: if cfg.glass_skip_content {
+                        crate::paint::GLASS_CONTENT_INSET
+                    } else {
+                        0.0
+                    },
                 });
             } else {
                 // 磨砂模式：必须清掉上一份玻璃参数。它只在「底图已上传」
@@ -1256,10 +1266,28 @@ pub(super) fn run_mode(
             } else {
                 app.svc.state.config.ui.window_blur_strength
             };
-            // 抓屏分辨率百分比：磨砂与玻璃共用（同一份底图、同一条抓屏链）。
-            // 每帧灌一次而不是只在变化时灌——`set_backdrop_scale` 只是
-            // 写一个 u8，比维护「上次已应用值」的簿记便宜。
-            painter.set_backdrop_scale(app.svc.state.config.ui.backdrop_scale);
+            // 抓屏分辨率百分比：磨砂与玻璃共用同一份底图，但**下限不同**
+            // ——玻璃把这张图当 `sharp_tex` 直接折射，磨砂只取卷积结果
+            // （见 `GLASS_MIN_CAPTURE_PCT`）。每帧灌一次而不是只在变化时
+            // 灌：`set_backdrop_scale` 只是写一个 u8，比维护「上次已应用
+            // 值」的簿记便宜。
+            let want_pct = app.svc.state.config.ui.backdrop_scale;
+            let eff_pct = if backdrop == modular_clipboard_core::config::WindowBackdrop::Glass {
+                modular_clipboard_gfx::backdrop::glass_capture_pct(want_pct)
+            } else {
+                want_pct
+            };
+            if eff_pct != want_pct && !capture_floor_logged {
+                // 只记一次：这是「设置被抬高了」的唯一线索，每帧刷屏没有
+                // 额外信息。静默改写用户设置是这里最坏的做法。
+                capture_floor_logged = true;
+                tracing::info!(
+                    want = want_pct,
+                    used = eff_pct,
+                    "玻璃模式把抓屏比例抬到下限（低于下限时清晰图会被放大成马赛克）"
+                );
+            }
+            painter.set_backdrop_scale(eff_pct);
             painter.paint_backdrop(
                 &mut fr,
                 window.hwnd().0 as isize,

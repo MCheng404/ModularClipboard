@@ -29,6 +29,8 @@ pub(super) fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate:
         (G::Ui, "md_rendered") => cfg.ui.md_rendered = v,
         // 通知呈现：弹窗（true）/ 窗口内 toast（false）。
         (G::Ui, "notice_popup") => cfg.ui.notice_popup = v,
+        // 元素不参与玻璃计算（卡片内容区退出磨砂/混色/亮度自适应）。
+        (G::Ui, "glass_skip_content") => cfg.ui.glass_skip_content = v,
         // NOTE: type_rail 的参数走 `Op::SetTypeRail` 整包落地，
         // 没有按字段名的写入方。
     (G::Ui, "autostart") => cfg.ui.autostart = v,
