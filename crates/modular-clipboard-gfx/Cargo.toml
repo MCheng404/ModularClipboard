@@ -20,6 +20,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
     "Win32_Graphics_Gdi",
+    # capture_worker.rs 的 SetThreadPriority：抓屏线程降到低于正常优先级。
+    # 缺这一项时单独构建本 crate（-p modular-clipboard-gfx）会报 E0432，
+    # 全 workspace 构建则靠其它 crate 的 feature 合并掩盖。
+    "Win32_System_Threading",
     # window.rs 的键鼠事件转换需要
     "Win32_UI_Input_KeyboardAndMouse",
     # IME：顶栏搜索框要能输入中文。没有这一项时
