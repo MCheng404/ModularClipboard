@@ -143,7 +143,7 @@ pub(super) fn draw_slider(
     // 为什么需要它：egui 的 horizontal **不重排先放置的控件**——若滑条
     // 比左列文字高，左列被顶部对齐，文字相对滑条偏高；150% DPI 下
     // font_xs=21（galley 高 27pt）而左列格子写死 18pt 时还会把字形
-    // 上下裁掉（用户实机反馈「文字向上且渲染不完整」，2026-10-19）。
+    // 上下裁掉。
     // 三列同高 + 本参数兜底，两个病一起治。
     cell_h: f32,
 ) -> bool {
@@ -376,9 +376,9 @@ pub(super) fn seg_hit_id(id_suffix: &'static str, i: usize) -> egui::Id {
 /// 选中项用 surface 实底 + accent 文字，未选中 text_dim。
 ///
 /// 替代 egui 的 `selectable_label`——后者选中态是半透明 row_selected，
-/// 多个胶囊标签挨着时半透明叠半透明，显脏（2026-10-11 用户反馈）。
+/// 多个胶囊标签挨着时半透明叠半透明，显脏。
 ///
-/// # 选中指示器滑动（2026-10-17 动效）
+/// # 选中指示器滑动
 ///
 /// 早前选中块是「哪项选中就往哪项画一个实底」——切换时旧块消失、
 /// 新块出现，观感上是**跳变**。现在选中块的位置按**段索引**补间
@@ -389,7 +389,7 @@ pub(super) fn seg_hit_id(id_suffix: &'static str, i: usize) -> egui::Id {
 ///
 /// 返回 `Some(value)` 表示本帧点击了某项。
 ///
-/// # 热区键（2026-10-25 起两枚）
+/// # 热区键
 ///
 /// 1. `"{id_suffix}/{选项英文键}"`——命名空间键，**优先用它**。设置
 ///    重组（主题并入外观）后同一分类里会出现同文选项，译文键互相覆盖；
@@ -421,7 +421,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
         seg_w = seg_w.max(w + pad);
     }
     // 自适应可用宽度：字体放大后自然宽度会超过卡片，必须等比压缩，
-    // 否则控件被画到卡片之外（用户反馈「字体调整太大导致布局错乱」）。
+    // 否则控件被画到卡片之外（「字体调整太大导致布局错乱」）。
     // 压到每段不足 1 个汉字宽时就不再压——宁可溢出，也不能把选项挤成
     // 不可辨认的窄条。
     let avail = ui.available_width().max(0.0);
@@ -433,7 +433,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
     let total_w = seg_w * options.len() as f32;
     let (r, _) = ui.allocate_exact_size(vec2(total_w, h), egui::Sense::empty());
     let painter = ui.painter_at(r);
-    // 全圆角改版（2026-10-25）：容器从 `radius_md`(6) 改**胶囊**
+    // 全圆角改版：容器从 `radius_md`(6) 改**胶囊**
     // （半径 = 控件高一半）——分段控件整体读作一枚胶囊，选中段是胶囊
     // 里的一枚小胶囊。
     painter.rect_filled(r, h * 0.5, pal.surface_variant);
@@ -453,8 +453,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
         std::time::Duration::from_millis(160),
         crate::anim::Ease::OutCubic,
     );
-    // 指示器左右各内缩 2pt（与原实现一致），圆角改**胶囊**（2026-10-25
-    // 全圆角改版：radius_sm → (h-4)/2，与容器同语言）。
+    // 指示器左右各内缩 2pt（与原实现一致），圆角改**胶囊**（radius_sm → (h-4)/2，与容器同语言）。
     let pill = Rect::from_min_max(
         pos2(r.min.x + seg_w * pill_idx + 2.0, r.min.y + 2.0),
         pos2(r.min.x + seg_w * (pill_idx + 1.0) - 2.0, r.max.y - 2.0),
@@ -499,7 +498,7 @@ pub(super) fn draw_segmented<T: Copy + PartialEq>(
         if resp.clicked() {
             picked = Some(*value);
         }
-        // 登记热区（两枚键，2026-10-25）：
+        // 登记热区：
         //
         // 1. `"{控件名}/{选项英文键}"`——**命名空间键**。设置重组后同一
         //    分类里会出现同文选项（外观的风格主题与背景效果都有
@@ -555,7 +554,7 @@ pub(super) fn elide_to_width(ui: &Ui, text: &str, font: &egui::FontId, max_w: f3
 /// 可见边界，文字起点不明，看起来「没有对齐右边」。改为先 allocate 固定
 /// 宽度区域、画背景，再在内部放 TextEdit；聚焦时边框变 accent。
 ///
-/// 2026-10-25 全圆角改版：圆角从 `radius_md`(6) 改**胶囊**（半高）。
+/// 全圆角改版：圆角从 `radius_md`(6) 改**胶囊**（半高）。
 pub(super) fn draw_text_field(
     f: &mut Frame<'_>,
     ui: &mut Ui,
@@ -623,7 +622,7 @@ pub(super) fn draw_text_field(
     resp.changed()
 }
 
-/// 数字输入的胶囊外壳（2026-10-25 全圆角改版）。
+/// 数字输入的胶囊外壳。
 ///
 /// 先铺胶囊底（`surface_variant` + 发丝边），再把调用方的控件
 /// （`DragValue`）放进内区 child。存在理由：`DragValue` 没有
@@ -705,7 +704,7 @@ pub(super) fn draw_mini_button(
     // 先铺不透明底再叠半透明提亮（与类型栏按钮同一个理由：半透明
     // 令牌不能直接当填充，见 `draw_type_rail` 的 CAUTION）。
     //
-    // 全圆角改版（2026-10-25）：radius_sm → 胶囊（半高）。
+    // 全圆角改版：radius_sm → 胶囊（半高）。
     let pill = r.height() * 0.5;
     p.rect_filled(r, pill, pal.surface_variant);
     if hover > 0.004 {
@@ -747,7 +746,7 @@ mod tests {
     fn seg_ids_are_unique_across_controls() {
         // 回归：风格主题与背景效果的第 0 项都叫「无」。ID 掺了选项译文
         // 时两者逐位相同 ⇒ 先注册的行（风格主题）点不动，egui 还会画
-        // 红色 ID 冲突告警框（2026-10-25 用户报「风格主题无法选择 无」）。
+        // 红色 ID 冲突告警框。
         let a = seg_hit_id("secondary_theme", 0);
         let b = seg_hit_id("window_backdrop", 0);
         assert_ne!(a, b, "不同控件的同一下标必须给出不同 ID");

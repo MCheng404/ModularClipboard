@@ -27,7 +27,7 @@
 //!    `view::draw` 按本帧布局算出，顺序反了会用到上一帧的矩形；
 //!    只在启动时设一次则会在窗口 resize / 模块折叠后错位。
 //!
-//! # 模块地图（2026-10-22 拆分）
+//! # 模块地图
 //!
 //! 本文件是模块根：`App` 结构体与它的 `impl`（业务状态 + 每帧入口
 //! `draw_frame` + 操作落地 `apply_ops` + 各窗口的帧入口）。
@@ -287,8 +287,8 @@ impl App {
         // CAUTION: 必须**只打开一次**。早期实现每帧置 `true`，带该环境
         // 变量启动的实例里设置窗口永远关不掉——点 ✕ / 齿轮把
         // `show_settings` 置回 `false`，下一帧这里又改回 `true`，
-        // 用户实测「设置窗口无法关闭，从主窗口点击也无法关闭」
-        // （2026-10-11）。首帧打开一次后置位，之后关闭走正常逻辑。
+        // 「设置窗口无法关闭，从主窗口点击也无法关闭」
+        // 首帧打开一次后置位，之后关闭走正常逻辑。
         if env_flag("MC_SETTINGS") && !self.paint_state.settings_startup_opened {
             self.paint_state.show_settings = true;
             self.paint_state.settings_startup_opened = true;
@@ -341,7 +341,7 @@ impl App {
         // IMPORTANT: 必须传真实的 `ppp`：落位要对齐**设备**像素栅格，
         // 否则高DPI 下卡片边界落在半像素上，描边发虚。
         //
-        // 2026-10-15 第三轮：悬浮搜索面板与类型过滤栏已改为**独立弹窗**
+        // 悬浮搜索面板与类型过滤栏是**独立弹窗**
         // （`crate::popup`），漂在窗口外，卡片区因此**不再需要让位**
         // ——恢复满宽（`solve_scaled_inset` 已随之删除）。
         let sol = crate::solver::solve_scaled(&self.ws, area, ppp);
@@ -384,14 +384,12 @@ impl App {
         // 卡片不透明度：把行卡片底色的 alpha 与 RGB 同比例降下来
         // （`gamma_multiply` 是预乘语义，只降 alpha 会偏色）。
         //
-        // # 为什么**所有**背景模式都应用它（2026-10-28 修「卡片透明度失效」）
+        // # 为什么**所有**背景模式都应用它
         //
         // 早前「无背景效果」分支直接返回 `self.pal`，理由是「不透明底图
         // 后面没有东西可透」。但「卡片半透明」并不只有「透出桌面」一种
         // 表现——它会与**窗口底色**（`list_bg`）混合，观感是卡片变淡。
-        // 那正是用户拖这个滑块想要的（2026-10-28 用户配置
-        // `window_backdrop=None, card_blur=0, card_opacity=0.6`，滑块
-        // 被整行隐藏、配置从未生效）。
+        // 那正是用户拖这个滑块想要的。
         //
         // 「透出桌面」仍然需要背景效果或卡片磨砂——那是另一回事，说明
         // 文字里已讲清。
@@ -523,7 +521,7 @@ impl App {
         let ops = self.paint_state.take_ops();
         // 有 Op 被上报 = 用户确实做过交互（Op 只在交互时 push）。
         let mut changed = !ops.is_empty();
-        // 「任意操作取消选中」（2026-10-15 第三轮原型定稿）：
+        // 「任意操作取消选中」：
         // 选中是临时状态，任何**行操作**（置顶 / 删除 / 复制 / 打开 /
         // 清空）之后都不该继续高亮——否则用户会以为选中项还有后续
         // 作用（实际下一帧它就只是背景高亮）。
@@ -564,7 +562,7 @@ impl App {
                     // 字体缩放必须在运行时立即生效：配置写进去只是记账，
                     // 真正让界面变大变小的是「基础调色板 × 缩放」这一派生
                     // （早前 `font_scale` **只有写入方、没有读取方**，
-                    // 改它完全没反应——用户反馈「字体缩放修改失效」）。
+                    // 改它完全没反应——「字体缩放修改失效」）。
                     if matches!(group, crate::paint::ConfigGroup::Ui) && field == "font_scale" {
                         self.apply_font_scale();
                     }
@@ -587,7 +585,7 @@ impl App {
                     // 重建整个渲染栈——代价与重启相同却多一堆中间态。
                     // 设置页的说明文字负责讲清「重启生效」。
                     //
-                    // 顺手把选择与实况一起记进日志：用户反馈「选了核显没反应」
+                    // 顺手把选择与实况一起记进日志：「选了核显没反应」
                     // 时，这一行就是第一手证据。
                     self.svc.state.config.ui.gpu_adapter = value.clone();
                     tracing::info!(
@@ -874,15 +872,14 @@ impl App {
                 Op::Copy(id) => {
                     // 成功也要反馈：旧实现只在失败时 notify，用户点「复制」
                     // 成功时界面**毫无变化」——剪贴板管理器最核心的动作
-                    // 反而最没有确认感（2026-10-20 用户反馈「复制没反应」，
-                    // 排查后发现是成功路径无反馈）。提示走 toast/弹窗通道
+                    // 反而最没有确认感（成功路径无反馈）。提示走 toast/弹窗通道
                     // （`ui.notice_popup` 决定呈现），3 秒自消。
                     match self.svc.copy_item(id) {
                         Ok(()) => self.svc.notify(modular_clipboard_core::i18n::t("Copied").into()),
                         Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Copy failed:"))),
                     }
                 }
-                // ---- 内容编辑（2026-10-21）----
+                // ---- 内容编辑 ----
                 Op::BeginEdit(id) => {
                     // 读**完整载荷**（不是 preview——那最多 512 字符），
                     // 编辑器里要看到并能改全文。失败（载荷被淘汰 / IPC
@@ -1056,7 +1053,7 @@ impl App {
                             self.paint_state.clear_all_edit_state();
                             // 成功也给通知：长按 5 秒是重操作，用户需要
                             // 明确的「生效了」反馈——没有反馈时会以为
-                            // 「没反应」而反复重试（2026-10-22 反馈链）。
+                            // 「没反应」而反复重试。
                             self.svc.notify(modular_clipboard_core::i18n::t("All history cleared").to_string());
                         }
                         Err(e) => self.svc.notify(format!("{} {e}", modular_clipboard_core::i18n::t("Clear failed:"))),
@@ -1165,7 +1162,7 @@ impl App {
         changed
     }
 
-    /// 编辑落地：备份原文 → 写新内容 → 关编辑器 → 通知（2026-10-21）。
+    /// 编辑落地：备份原文 → 写新内容 → 关编辑器 → 通知。
     ///
     /// # 为什么备份放在这里而不是调用方
     ///
@@ -1250,7 +1247,7 @@ impl App {
             egui::pos2(client.min.x + margin, client.min.y + margin),
             egui::pos2(client.max.x - margin, client.max.y - margin),
         );
-        // ---- 入场动效（2026-10-17）：面板从停靠方向滑入 6pt --------------
+        // ---- 入场动效：面板从停靠方向滑入 6pt --------------
         //
         // 弹窗窗口跨展开/收起**存活**（`Popup::sync_and_render` 只切
         // `set_visible`），ctx 里的补间条目不会自己重置 ⇒ 只有程序生命周期
@@ -1299,7 +1296,7 @@ impl App {
         // `crate::popup::Popup::sync_and_render`），因此这里也没有底图可画。
         // 背景层不能降 alpha——降了就只剩一圈描边、内部全透。
         let pal_ref: &crate::theme::Palette = &self.pal;
-        // ---- 自研投影（画在**客户区级** painter 上）----
+        // ---- 自研投影（画在**客户区级** painter 上） ----
         //
         // 窗口 = 内容 + 一圈 `SHADOW_MARGIN`，那圈是透明的；高斯投影画在
         // 内容矩形外围、向外渐隐到全透明 ⇒ 不需要 DWM，也不需要抓桌面。
@@ -1354,7 +1351,7 @@ impl App {
         if self.apply_ops() {
             self.ctx.request_repaint();
         }
-        // ---- 补间续帧（弹窗闸门不统计 anim）------------------------------
+        // ---- 补间续帧（弹窗闸门不统计 anim） ------------------------------
         //
         // `RedrawGate` 的判据里没有「有补间在飞」这一项（主窗口闸门有），
         // 而入场滑移、类型栏悬停/激活、清除按钮悬停全是自绘补间 ⇒ 不主动
@@ -1579,7 +1576,7 @@ impl App {
     /// 二级主题参数（[`Op::SetThemeParams`]）、令牌覆盖
     /// （[`Op::SetTokenOverride`] 一族）。五者共一条路径是刻意的：
     /// 解析链只有一份（`theme::resolve_palette`）、补间机制只有一份
-    /// （`pal_mix`）——分头写必然漂移，2026-10-14 的「切主题没反应」
+    /// （`pal_mix`）——分头写必然漂移，「切主题没反应」
     /// 就是这么来的（只灌了 `Visuals`，没更新 `App.pal`）。
     ///
     /// # 为什么强调色 / 二级主题也要补间
@@ -1605,7 +1602,7 @@ impl App {
         // 从当下续接，不会跳。
         self.pal_from = self.pal.clone();
         self.pal_to = self.pal_base.with_font_scale(scale);
-        // CAUTION（「主题切换失效」的根因，2026-10-14）：`pal_mix` 这个
+        // CAUTION：`pal_mix` 这个
         // 补间的目标恒为 1.0，而 `anim::tween_f32` 在目标不变时是
         // **惰性**的——首帧插入即 from == to == 1.0，之后永远返回 1.0，
         // `draw_frame` 里 `if pal_mix < 1.0` 的分支再也不会执行
@@ -1705,8 +1702,7 @@ mod tests {
     /// 玻璃曾与磨砂共用 `base = window_opacity × 0.6`（「玻璃并入 Acrylic」
     /// 那行注释）。于是玻璃模式下背景层不透明度约 0.6~0.9，底图只透出
     /// 一成到四成——`fs_glass` 铺的清晰桌面被一层灰纱盖住，玻璃模式与
-    /// 磨砂模式在窗口大部分面积上**看不出差别**（2026-10-28 用户报
-    /// 「背景玻璃没渲染」）。
+    /// 磨砂模式在窗口大部分面积上**看不出差别**（表现为「背景玻璃没渲染」）。
     #[test]
     fn glass_backdrop_is_clearer_than_frosted() {
         // 中间亮度、浅色主题：两种模式的典型工况。
@@ -1968,7 +1964,7 @@ mod tests {
     /// 字体缩放必须**运行时**生效（配置 → 调色板 → egui 三层同源）。
     ///
     /// 守着实机缺陷：`UiConfig::font_scale` 早前**只有写入方、没有读取方**，
-    /// 改它完全没反应（用户反馈「字体缩放修改失效」）。
+    /// 改它完全没反应（「字体缩放修改失效」）。
     #[test]
     fn font_scale_takes_effect_at_runtime() {
         let dir = std::env::temp_dir().join(format!("mc-ui-fontscale-{}", std::process::id()));
@@ -1993,7 +1989,7 @@ mod tests {
             app.palette().font_md
         );
         // 承载文字的几何**必须**跟着放大：固定 28pt 高的输入框装不下
-        // 25.5pt 的字（文字被裁 = 用户反馈的「布局错乱」）。
+        // 25.5pt 的字（文字被裁 = 的「布局错乱」）。
         assert!(
             (app.palette().control_height
                 - crate::theme::Palette::dark().control_height * 1.5)
@@ -2199,7 +2195,7 @@ mod tests {
 
     #[test]
     fn app_construction_does_not_touch_locale() {
-        // 守门（2026-10-22 连翻两次车）：App 构造链里绝不能解析/设置
+        // 守门：App 构造链里绝不能解析/设置
         // 全局语言。CI runner 是英文系统，构造时一翻转，所有假定中文
         // 断言/热区 key 的并行测试全线阵亡——而本机中文系统永远复现不到。
         // 语言只允许在生产 UI 入口 `run()` 与 `Op::SetLanguage` 里改。
@@ -2408,7 +2404,7 @@ mod tests {
     /// `Event::Key::modifiers` 里，两者都会产生事件。不过滤的后果：
     /// 用户按字母 → 按 Ctrl → 录到的是「ControlLeft」→ 弹
     /// 「不支持把 ControlLeft 设为快捷键」并**退出录制态**，
-    /// 后面的组合再也录不进去（2026-10-13 用户实测反馈）。
+    /// 后面的组合再也录不进去。
     #[test]
     fn recording_ignores_modifier_key_presses() {
         let dir = std::env::temp_dir().join(format!("mc-ui-hk-mods-{}", std::process::id()));

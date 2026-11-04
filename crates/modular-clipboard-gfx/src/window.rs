@@ -156,7 +156,7 @@ pub const WM_SHOW_MAIN: u32 = 0x8000 + 1;
 /// 常驻进程同时是 IPC 服务端；它若在主循环里**同步**跨进程
 /// `ShowWindow(SW_HIDE)`，会阻塞等待界面线程泵消息，而界面线程那
 /// 一刻正同步阻塞在命名管道 `ReadFile` 上等常驻进程回响应——
-/// 双向等待死锁（2026-10-13 dump 实锤：常驻线程卡在
+/// 双向等待死锁（常驻线程卡在
 /// `NtUserShowWindow`、界面线程卡在 `NtReadFile`）。投递消息只入队、
 /// 立即返回，由界面进程在自己的消息循环里隐藏自己，彻底断开死锁。
 pub const WM_HIDE_MAIN: u32 = 0x8000 + 2;
@@ -457,7 +457,7 @@ impl Window {
     /// 弹窗与主窗口同在界面线程，用本函数安全。
     /// 显示 / 隐藏窗口。
     ///
-    /// # CAUTION: 必须幂等（2026-10-22 修复）
+    /// # CAUTION: 必须幂等
     ///
     /// 早前这里无条件 `ShowWindow`，而调用方（弹窗、编辑窗、设置窗）都是
     /// **每帧**调 `set_visible(true)`——主循环空转约 125Hz，等于每秒一百
@@ -467,7 +467,6 @@ impl Window {
     /// 借这次调用**重新应用属主（owner）约束**，把属主连带推到置顶组前
     /// 面。类型栏弹窗的 owner 是主窗口 ⇒ 主窗口被反复抬到编辑窗口之上
     /// ⇒ 两个窗口以几百毫秒的间隔反复互换上下层，表现为**闪烁**
-    /// （2026-10-22 用户反馈，实测 6 秒内 46 次 Z 序翻转）。
     ///
     /// 「打开设置窗口后不闪」正是因为它会收起类型栏，那条每帧
     /// `ShowWindow` 没了；「搜索框打开后也闪」是因为搜索面板同属主于
@@ -776,7 +775,7 @@ fn clamp_i32(v: u32) -> i32 {
 /// `dpi / 96`。查询失败（`dpi == 0`，窗口无效/销毁瞬间）返回 `fallback`
 /// 而不是硬编码 `1.0`。
 ///
-/// CAUTION（2026-10-19 DPI 治理）：把查询失败静默当 100% DPI 会让 scale
+/// CAUTION：把查询失败静默当 100% DPI 会让 scale
 /// 从 2.0 瞬跳 1.0——当帧 ppp 与 render_extent 双双跳变（布局突变一帧）
 /// 并误报 `ScaleFactorChanged`。调用方传入 last-good 值兜底即可。
 fn dpi_scale_factor(dpi: u32, fallback: f32) -> f32 {
@@ -1129,7 +1128,7 @@ mod tests {
         assert_eq!(key_from_vk(vk(VK_INSERT)), Some(Key::Insert));
     }
 
-    /// Escape 必须映射到 egui（2026-10-21 实机回归守卫）。
+    /// Escape 必须映射到 egui。
     ///
     /// 漏了这条映射时，`key_pressed(Key::Escape)` 在实机上恒为假——
     /// 搜索面板的 Esc 收起（弹窗与主窗口两条路径都判 Escape）全部失效。
@@ -1731,8 +1730,7 @@ mod tests {
     #[test]
     fn dpi_scale_factor_guards_zero() {
         // 窗口无效时 GetDpiForWindow 返回 0：不能除出 NaN，也不能硬编码
-        // 1.0（那会让 200% 屏瞬跳 100%，当帧布局突变——P2-3，2026-10-19
-        // DPI 治理）。必须返回调用方的 last-good fallback。
+        // 1.0（那会让 200% 屏瞬跳 100%，当帧布局突变——P2-3，DPI 治理）。必须返回调用方的 last-good fallback。
         assert_eq!(dpi_scale_factor(0, 0.5), 0.5, "查询失败应回 fallback");
         assert_eq!(dpi_scale_factor(0, 2.0), 2.0, "fallback 随调用方上下文");
         assert_eq!(dpi_scale_factor(96, 9.9), 1.0);

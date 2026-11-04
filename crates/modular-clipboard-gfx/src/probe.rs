@@ -96,7 +96,7 @@ pub fn probe(selection: &GpuSelection) -> ProbeReport {
         error: None,
     };
 
-    // ---- 建临时实例（无扩展：枚举与建设备都不需要 surface）----
+    // ---- 建临时实例（无扩展：枚举与建设备都不需要 surface） ----
     //
     // `_entry` 必须活到 `destroy_instance` 之后（见 `create_headless_instance`
     // 的文档：Entry 先析构 = STATUS_ACCESS_VIOLATION）。

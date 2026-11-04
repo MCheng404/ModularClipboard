@@ -54,7 +54,7 @@ pub(super) fn run_mode(
     // `Window::new` 的宽高是**物理像素**——`UiConfig::window_width/height`
     // 也是物理像素（见 config.rs 的字段文档），两者同口径，直接透传。
     //
-    // NOTE（P2-8 口径澄清，2026-10-19）：这里曾写「配置里存的是逻辑点」，
+    // NOTE：这里曾写「配置里存的是逻辑点」，
     // 与 config.rs 直接矛盾。以 config.rs 为准：width/height 物理像素、
     // window_pos 屏幕**逻辑点**（历史语义，保留兼容）。
     let window = Window::new(
@@ -71,7 +71,7 @@ pub(super) fn run_mode(
     // 不能用它当「未设置」的哨兵值。
     if let Some(p) = config.ui.window_pos {
         let s = window.scale_factor();
-        // P1-2（2026-10-19 DPI 治理）：位置以「退出时那台显示器 DPI 下的
+        // P1-2：位置以「退出时那台显示器 DPI 下的
         // 逻辑点」持久化，恢复时乘**当前** scale——混合 DPI 换屏/换机后
         // 物理位置按比例漂移（200% 屏存的 500，100% 屏恢复成 250）。
         // 彻底修法是持久化物理像素（需 config 语义迁移），这里先加护栏：
@@ -185,7 +185,7 @@ pub(super) fn run_mode(
     let mut painter = Painter::new(&gpu, fr.slot_count())?;
     tracing::info!(extent = ?fr.extent(), slots = fr.slot_count(), "渲染器就绪");
 
-    // ---- 共享渲染资源（供卡片子窗口复用）------------------------------
+    // ---- 共享渲染资源（供卡片子窗口复用） ------------------------------
     //
     // 子窗口与主窗口**共用同一个 `Gpu`**（Vulkan 设备创建代价高，
     // 且多设备会多占显存），但各自持有一条交换链。
@@ -239,7 +239,7 @@ pub(super) fn run_mode(
     let ui_cfg = app.svc.state.config.ui.clone();
     app.ws.apply_saved_positions(&ui_cfg);
 
-    // ---- 托盘常驻--------------------------------------------------------
+    // ---- 托盘常驻 --------------------------------------------------------
     //
     // 托盘自带独立线程与消息循环（见 `presence` 模块文档），
     // 这里只是每帧收一次事件。启动失败**不阻断应用**：
@@ -313,7 +313,7 @@ pub(super) fn run_mode(
         }
     }
 
-    // ---- 显示窗口（PF-3）------------------------------------------------
+    // ---- 显示窗口（PF-3） ------------------------------------------------
     //
     // 刻意放在全部初始化**之后**：Vulkan 设备、管线、共享渲染资源、
     // DB 打开、35MB 字体读入、托盘启动全排在前面。早前窗口在
@@ -364,7 +364,7 @@ pub(super) fn run_mode(
     //
     // 失败也不致命——设置打不开不该让主程序起不来（降级为无设置）。
     let mut settings_win: Option<crate::settingswin::SettingsWindow<'_>> = None;
-    // 图片编辑窗口（懒创建，2026-10-21）：与设置窗口同款「即关即毁」。
+    // 图片编辑窗口：与设置窗口同款「即关即毁」。
     // `paint_state.image_editor` 决定它该不该存在，原图字节在
     // `paint_state.image_editor_src`（由 `Op::OpenImageEditor` 备好）。
     let mut img_edit: Option<crate::imgedit::ImageEditor<'_>> = None;
@@ -422,7 +422,7 @@ pub(super) fn run_mode(
     // 永远缺那一块 ⇒ 恢复显示后文字渲染错乱/缺失，而数据层完全不受
     // 影响（复制粘贴照旧，于是极难联想到渲染层）。
     //
-    // 完整故障链（2026-10-23 用户实测）：主窗口最小化 / 隐藏到托盘
+    // 完整故障链：主窗口最小化 / 隐藏到托盘
     // → 后台复制内容 → `svc.pump()` 返回 true ⇒ `request_repaint_after`
     // ⇒ 渲染闸门放行 ⇒ `run_ui` 排版新预览文字 ⇒ 新字形入图集 ⇒ 增量
     // 产生 → 但窗口不可见（`hidden` / 客户区 0×0）⇒ 增量被
@@ -444,7 +444,7 @@ pub(super) fn run_mode(
         // 的错位——收成一处，口径自然同源。
         let backdrop = app.svc.state.config.ui.window_backdrop;
 
-        // ---- 0. 退出标志（必须在**所有** continue 之前）----------
+        // ---- 0. 退出标志（必须在**所有** continue 之前） ----------
         //
         // NOTE: 早前这个判断在循环末尾（第 4 步之后），而本循环有三条
         // `continue`（隐藏态 / 客户区 0×0 / `acquire` 过期）会绕开它。
@@ -520,7 +520,7 @@ pub(super) fn run_mode(
         let mut saw_close = false;
         // 另一个进程请求唤起主窗口（单实例：用户又双击了一次图标）。
         let mut saw_show = false;
-        // 2026-10-17：尺寸变更只打标记，不在事件循环里逐条重建交换链。
+        // 尺寸变更只打标记，不在事件循环里逐条重建交换链。
         // 拖动窗口时 WM_SIZE 每几毫秒来一次，同一轮循环里可能积压多条
         // → 逐条 `rebuild` 每次都 `device_wait_idle` + 销毁重建全部帧
         // 资源（实测拖动一次十几次重建）。标记在事件循环结束后统一消费
@@ -584,7 +584,7 @@ pub(super) fn run_mode(
                     // ⚠️ 判据**不能**只写 `resident.is_some()`：常驻进程
                     // 模式下界面进程自己不建托盘（托盘归 daemon），那个
                     // 判断恒为 false——开关在默认的双进程启动下永远失效
-                    // （2026-10-13 用户实测）。托盘在**本进程**（单进程
+                    // 托盘在**本进程**（单进程
                     // 模式）或在**常驻进程**（远端模式）都算有兜底。
                     let gained = *gained;
                     // 设置窗口开着时不躲：它是本进程的附属顶层窗口，
@@ -631,7 +631,7 @@ pub(super) fn run_mode(
 
         // ---- 1.4 尺寸变更合帧重建 ----
         //
-        // 2026-10-17：拖动时一轮循环可能收到多条 Resized（WM_SIZE 高频）。
+        // 拖动时一轮循环可能收到多条 Resized（WM_SIZE 高频）。
         // 全部合并成**一次**重建：以最新查询到的客户区尺寸为准，与
         // `fr.extent()` 相同则跳过（不带真实变化的重复 WM_SIZE 很常见）。
         // 放在 `run_ui` 之前，让本帧布局就用上新尺寸——否则会用旧
@@ -740,7 +740,7 @@ pub(super) fn run_mode(
         // 常驻进程模式下界面进程自己不建托盘（托盘归 daemon），那个
         // 判断恒为 false ⇒ 远端模式点 ✕ 会走 Quit 分支，而 Quit 的
         // 上半段还会 `request_quit()` 把常驻进程一起退掉——**点一下
-        // 关闭整个程序消失，托盘白建**（2026-10-13 探针实测：
+        // 关闭整个程序消失，托盘白建**（
         // WM_CLOSE 后窗口销毁 + daemon 退出）。与 `should_quit` 注释里
         // 「远端模式下只退出界面进程，常驻进程继续干活」的既定语义矛盾。
         //
@@ -801,7 +801,7 @@ pub(super) fn run_mode(
         // 失败只用 warn：抓屏失败不该杀死界面（与磨砂背景同款取舍）。
         let want_card_blur = app.svc.state.config.ui.card_blur;
         // 玻璃模式下卡片磨砂补丁**不画**（身后内容由玻璃 pass 的双底图
-        // 折射提供，见 `row.rs` 2026-10-25 的注释）⇒ 把捕获级别压到 0，
+        // 折射提供，见 `row.rs` 的说明）⇒ 把捕获级别压到 0，
         // 省掉「CPU 降采样 + 纹理上传」整条链。切回磨砂/半透明时下面
         // 的差值比对会自动恢复真实档位。
         let effective_card_blur = if backdrop == modular_clipboard_core::config::WindowBackdrop::Glass {
@@ -834,7 +834,7 @@ pub(super) fn run_mode(
             }
         }
 
-        // ---- 1.9 渲染闸门（PF-4）----
+        // ---- 1.9 渲染闸门（PF-4） ----
         //
         // 空闲时整套 `run_ui + tessellate + acquire/paint/present` 产出
         // 与上一帧完全相同的画面，纯浪费：静态界面以 ~120Hz 重绘，
@@ -960,7 +960,7 @@ pub(super) fn run_mode(
             // 判据必须与 WM_CLOSE 路径一致为 `resident.is_some() || remote`：
             // 远端（双进程）模式下本进程不建托盘（resident 恒 None），
             // 只写 resident.is_some() 会误判「无托盘兜底」→ 直接退出整个
-            // 界面进程（2026-10-13 日志曾出现「无托盘兜底，直接退出」）。
+            // 界面进程。
             match presence::decide_on_close(resident.is_some() || remote, false) {
                 CloseDecision::HideToTray => {
                     presence::hide_window(window.hwnd());
@@ -1010,7 +1010,7 @@ pub(super) fn run_mode(
         // 却仍在跑完整的 tessellate + queue_submit + device_wait_idle，
         // 等于纯烧 CPU 与带宽。
         if hidden {
-            // ---- 隐藏空闲退出（内存）----------------------------------
+            // ---- 隐藏空闲退出（内存） ----------------------------------
             //
             // 界面进程常驻 250~290MB（Vulkan 设备/字体图集/离屏目标），
             // 窗口收起后一分钱用不上。判据与阈值取舍见 [`should_idle_exit`]；
@@ -1183,7 +1183,7 @@ pub(super) fn run_mode(
         // 玻璃与磨砂**同路**：都要先铺身后桌面的底图再叠界面。差别只在
         // 铺那一趟是「拷模糊结果」还是「按卡片折射」（见 painter 的
         // `backdrop_blit` 分派）。
-        // ---- 背景效果必须在**抓屏之前**同步（4.4b 提前到这里）----
+        // ---- 背景效果必须在**抓屏之前**同步（4.4b 提前到这里） ----
         //
         // 三个动作全是「本帧 `paint_backdrop` 的前置条件」：
         //   1. Win32：`WDA_EXCLUDEFROMCAPTURE` 自排除；
@@ -1266,7 +1266,7 @@ pub(super) fn run_mode(
             //
             // 早先两者共用 `window_blur_strength`，玻璃用户想调模糊时
             // 设置里唯一相关的滑块（磨砂强度）在玻璃模式下是禁用态——
-            // 2026-10-24 用户反馈「玻璃模糊度用的是磨砂的参数」。
+            // 「玻璃模糊度用的是磨砂的参数」。
             let blur_strength = if backdrop == modular_clipboard_core::config::WindowBackdrop::Glass {
                 app.svc.state.config.ui.glass_blur
             } else {
@@ -1340,7 +1340,7 @@ pub(super) fn run_mode(
         //
         // 这里只保留「置顶」那半段（4.4 在上方），不再重复同步背景。
 
-        // ---- 4.4c 全局热键与迷你面板（仅单进程模式）----
+        // ---- 4.4c 全局热键与迷你面板（仅单进程模式） ----
         //
         // 常驻进程模式下这两件事由常驻进程做（见 `app::daemon` 的
         // `SaveConfig` 分支），界面这边不能碰——热键注册必须发生在
@@ -1374,7 +1374,7 @@ pub(super) fn run_mode(
             }
         }
 
-        // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口）----
+        // ---- 4.5 附属窗口（卡片子窗口 + 设置窗口） ----
         let topmost = app.svc.state.config.ui.always_on_top;
         drive_attach_windows(
             &mut app,
@@ -1418,7 +1418,7 @@ pub(super) fn run_mode(
             );
         }
 
-        // ---- 4.6 窗口位置实时记忆（防抖落盘）----
+        // ---- 4.6 窗口位置实时记忆（防抖落盘） ----
         //
         // 只靠退出路径保存的话，强杀/崩溃（任务管理器、断电、蓝屏）
         // 会丢掉用户最后的拖动结果。这里每帧比对一次主窗口位置：
@@ -1467,7 +1467,7 @@ pub(super) fn run_mode(
         // NOTE: `Some(ZERO)` 是「立即重绘」，直接传给 `poll_for` 会走
         // 纯自旋分支（`Some(d) if !d.is_zero()` 不成立），CPU 占用 100%。
         //
-        // # 为什么下限是 16ms 而不是 1ms（2026-10-29 实测）
+        // # 为什么下限是 16ms 而不是 1ms
         //
         // 「立即重绘」在本项目里来自**动画续帧**（星点闪烁、通知入场、
         // hover 补间、搜索框光标）而不是输入。1ms 下限让主循环以 ~300fps
@@ -1590,7 +1590,7 @@ pub(super) fn drive_attach_windows<'a>(
     topmost: bool,
     main_visible: bool,
 ) {
-    // 悬浮弹窗（搜索面板 / 类型过滤栏）--------------------------------------
+    // 悬浮弹窗（搜索面板 / 类型过滤栏） --------------------------------------
     //
     // 位置来自 `FloatLayout`（主窗口客户区坐标，允许负值 = 窗外），
     // 加主窗口屏幕位置得到屏幕坐标。**在卡片之后驱动**：弹窗要读
@@ -1643,8 +1643,7 @@ pub(super) fn drive_attach_windows<'a>(
             // IMPORTANT: 折叠判据（悬停面板 / 折叠倒计时）活在主窗口的
             // `draw()`（状态机）里，而指针在弹窗与桌面之间移动时主窗口
             // **收不到任何事件** ⇒ 渲染闸门（skip_render）把状态机冻结
-            // 在旧值上——「指针已经离开面板了但面板不收」（2026-10-21
-            // 用户反馈「无法自动关闭」的根因之一）。翻转时对主 ctx
+            // 在旧值上——「指针已经离开面板了但面板不收」。翻转时对主 ctx
             // 请求一帧，让状态机有机会走一拍。
             if hover != app.paint_state.search_popup_hover
                 || focus != app.paint_state.search_popup_focus
@@ -1674,7 +1673,7 @@ pub(super) fn drive_attach_windows<'a>(
             topmost,
             owner,
         );
-        // ---- 通知弹窗（`ui.notice_popup` 开启时的通知呈现）----
+        // ---- 通知弹窗（`ui.notice_popup` 开启时的通知呈现） ----
         //
         // 生命周期判据与另两个弹窗不同：它跟着**通知本身**存活
         // （NOTICE_TTL），不是用户状态。因此：
@@ -1724,7 +1723,7 @@ pub(super) fn drive_attach_windows<'a>(
         }
     }
 
-// 设置窗口---------------------------------------------
+// 设置窗口 ---------------------------------------------
     //
     // 懒创建：第一次需要时才建窗口（每次都建会泄漏交换链）。
     //
@@ -1759,7 +1758,7 @@ Ok(w) => {
     //
     // 早前关闭只是 `SW_HIDE`，窗口与其全部资源**永远留着**：它自带一个
     // `egui::Context`（含一份中文字体数据与字形图集）与一条交换链。
-    // 实测（2026-10-12，私有提交）：打开设置 244MB / 不打开 179MB ——
+    // 实测：打开设置 244MB / 不打开 179MB ——
     // 那 65MB 在关闭后**一分钱都没还**，因为对象还在。
     //
     // 取舍：重建要付一次「读字体 + 建交换链」的代价（百毫秒量级），
@@ -1799,7 +1798,7 @@ Ok(w) => {
         tracing::debug!("设置窗口资源已释放");
     }
 
-    // 图片编辑窗口（2026-10-21）------------------------------------------
+    // 图片编辑窗口 ------------------------------------------
     //
     // 生命周期与设置窗口同款「即关即毁」：编辑是一次性动作，关掉不该
     // 留着一套交换链 + 字体图集（实测同类窗口 65MB 量级）。
@@ -1888,7 +1887,7 @@ pub(super) fn rebuild<'a>(
     painter: &mut Painter<'a>,
     extent: (u32, u32),
 ) -> anyhow::Result<()> {
-    // IMPORTANT: **必须**传目标尺寸（2026-10-22 修复）。
+    // IMPORTANT: **必须**传目标尺寸。
     //
     // 早前这里传 `Default::default()`（零尺寸），`rebuild_swapchain`
     // 于是走 `FALLBACK_EXTENT`(1280x800) 分支——只有 `caps.current_extent`
@@ -1904,7 +1903,7 @@ pub(super) fn rebuild<'a>(
 
 /// 隐藏空闲判定：主窗口收起够久、且没有附属窗口时要退出界面进程。
 ///
-/// # 为什么退出（2026-10-29，`ui.idle_exit_secs`）
+/// # 为什么退出（`ui.idle_exit_secs`）
 ///
 /// 界面进程的 250~290MB 是 **Vulkan 设备/管线 + 字体图集 + egui 字形
 /// 缓存 + 离屏目标**的固定成本，与背景效果无关（实测 backdrop=None 时

@@ -62,7 +62,7 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
 
     let inner = bar.shrink2(vec2(pal.space_md, 0.0));
 
-    // ---- 右侧：清空 + 置顶 + 设置（图标按钮）--------------------------
+    // ---- 右侧：清空 + 置顶 + 设置（图标按钮） --------------------------
     //
     // 从底部状态栏搬上来的。按钮用**图标**而非文字：顶栏高度只有
     // 44pt，中文「清空」两个字排在那里会又高又挤；图标在小尺寸下
@@ -99,7 +99,7 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 左侧拖动区不再需要随展开收缩。
     let sq = btn * 0.62;
 
-    // ---- 最左：隐藏窗口（2026-10-22 用户要求「移到最左边」）----------
+    // ---- 最左：隐藏窗口 ----------
     //
     // 独立于右侧功能组，放在顶栏最左缘（类似 macOS 红绿灯的位置直觉：
     // 「把窗口收起来」是与内容无关的窗口操作，不该混进功能按钮里）。
@@ -184,7 +184,6 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
     // 被截掉的就是它 ⇒ 顶栏恒为 `HTCLIENT`，用户按住顶栏拖不动窗口，
     // 只有恰好按在行间缝隙/左右留白上才拖得动——「有概率拖不了」的
     // 手感正来自「行数变化 ⇒ 段数变化 ⇒ 顶栏时有时无」
-    // （2026-10-28 实测：拖动区 14 段，上限 8，顶栏段被截）。
     f.state.drag_regions.splice(0..0, drag);
 
     let _ = scale;
@@ -193,20 +192,20 @@ pub(super) fn draw_topbar(f: &mut Frame<'_>, bar: Rect) -> egui::Response {
 
 /// 搜索状态机：悬停展开 / 点击开合 / 宽限折叠 / 打字活跃钉住。
 ///
-/// 交互契约（2026-10-21 修订，与旧版的差别见各分支注释）：
+/// 交互契约：
 /// - 光标**停在**图标上 >= [`SEARCH_HOVER_DELAY`] => 展开（来源记为
 ///   [`SearchOpenCause::Hover`]）；
 /// - 点击图标：折叠态 => 展开 + 聚焦输入框；展开态且**是点击打开的**
 ///   => 收起；展开态但由悬停打开 => 本次点击只「确认」（聚焦 + 把
 ///   来源改为 Click），**下一次**点击才收起——避免「悬停已开、点击
-///   反而闪关」（2026-10-19 反馈）又保留明确的开合切换；
+///   反而闪关」又保留明确的开合切换；
 /// - 离开图标与**面板** => **宽限** [`SEARCH_COLLAPSE_DELAY`] 后折叠；
 ///   打字活跃（[`SEARCH_TYPING_GRACE`]）与刚展开（[`SEARCH_OPEN_GRACE`]）
 ///   期间不判折叠；
 /// - Esc：弹窗持有键盘焦点时由 `draw_search_panel` 消费，主窗口持有
 ///   键盘焦点时由本函数消费——两个窗口各管各的焦点场景，互为兜底。
 ///
-/// # 2026-10-21 用户反馈「搜索框打开后无法自动关闭和手动关闭」的根因
+/// # 搜索面板收起契约
 ///
 /// 1. 旧 hold_open 把「egui 焦点在输入框」当**无条件**钉住：egui 的
 ///    焦点不因用户点到列表/切到别的应用而释放（generic interact 不
@@ -240,10 +239,10 @@ pub(super) fn run_search_state_machine(f: &mut Frame<'_>, icon_resp: &egui::Resp
         f.state.search_opened_by = SearchOpenCause::Hover;
     }
 
-    // ---- 点击图标 = 显式开合（手动关闭的主路径）----
+    // ---- 点击图标 = 显式开合（手动关闭的主路径） ----
     //
     // 三分支见函数头。悬停展开后的首次点击只「确认」——用户可能还没
-    // 察觉面板已开（悬停 0.18s 就展开），点击即关会重现 2026-10-19 的
+    // 察觉面板已开（悬停 0.18s 就展开），点击即关会重现
     // 「点一下、闪一下、关了」。
     if icon_resp.clicked() {
         match (f.state.search_expanded, f.state.search_opened_by) {
@@ -461,8 +460,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
 
     // 「正在打字」时间戳：内容每变一次就刷新（见
     // [`UiState::search_last_input_at`]）。状态机的打字活跃钉住靠它——
-    // egui 焦点不能当「正在打字」的判据（点别处也不释放，2026-10-21
-    // 用户反馈「面板收不回去」的根因之一）。
+    // egui 焦点不能当「正在打字」的判据（点别处也不释放）。
     if edit_resp.changed() {
         f.state.search_last_input_at = Some(f.ui.ctx().input(|i| i.time));
     }
@@ -627,7 +625,7 @@ pub const POPUP_SHADOW_OFFSET_Y: f32 = 2.0;
 /// 黑色会把底图压成灰绿；白遮罩是「蒙一层光」，与浅色界面的观感一致。
 /// 这是 [`draw_recording_overlay`] 与 MCP 覆盖层既有的规范，新弹层
 /// 必须走同一套——四处遮罩各写各的，用户在弹层间切换就会看到压暗程度
-/// 或色相突变（2026-10-22 用户反馈「自绘面板要跟随主题」）。
+/// 或色相突变。
 ///
 /// alpha 取 96 而不是更重的 128：96 是「压暗但不糊死」，面板才是
 /// 视觉主体；糊太重会让背后的内容彻底消失，失去「这是个弹层」的感觉。
@@ -683,7 +681,7 @@ pub fn draw_popup_shadow(painter: &egui::Painter, panel: Rect, pal: &Palette) {
     }
 }
 
-/// 画悬浮类型过滤栏的内容（2026-10-15 第三轮新增，待移植设置联动）。
+/// 画悬浮类型过滤栏的内容。
 ///
 /// 由**弹窗**调用（`crate::popup`），`rail` 是弹窗客户区中央的**面板**
 /// 矩形（= 按钮组 + 四周 [`RAIL_PAD`]）——[`FloatLayout::compute`] 已把
@@ -693,7 +691,7 @@ pub fn draw_popup_shadow(painter: &egui::Painter, panel: Rect, pal: &Palette) {
 /// `accent` 底 + `text_on_accent` 图标。点击过滤、再点一次取消
 /// （`Op::SetTypeFilter`）。
 ///
-/// 2026-10-20 两个新选项（`TypeRailConfig`）：
+/// 两个新选项（`TypeRailConfig`）：
 /// - `multi`：多选组合过滤，按钮变成开关，可同时点亮多个类型；
 /// - `labels`：图标旁/下显示类型名称——竖直停靠时文字在图标下方，
 ///   水平停靠时在右侧。文字宽度要字体度量，而 [`FloatLayout::compute`]
@@ -759,7 +757,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         panel_h = size + RAIL_PAD * 2.0;
     }
     f.state.rail_panel_size = Some(vec2(panel_w, panel_h));
-    // ---- 面板底（不透明）----
+    // ---- 面板底（不透明） ----
     //
     // 必须在按钮**之前**画，且必须不透明：投影是「面板外扩」的实心矩形，
     // 天然覆盖面板内部，只有不透明底能把它盖住。少了这一层，按钮之间的
@@ -829,7 +827,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         // 的深色桌面，实机就是「鼠标一放上去图标变黑」。
         // 所以半透明态一律**先铺不透明底、再叠色调**。
         //
-        // ---- 动效（2026-10-17）：激活交叉淡入 + 悬停补间 -----------------
+        // ---- 动效：激活交叉淡入 + 悬停补间 -----------------
         //
         // 底色目标按「是否激活」取，`tween_color` 从当前显示值向目标
         // 续接 ⇒ 点下过滤时方块从 surface_raised 平滑染到 accent，
@@ -1003,7 +1001,7 @@ pub(super) fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
 
     // 自左向右：清空 / 窗口置顶 / 设置。
     //
-    // **隐藏按钮不在这里**（2026-10-22 移到顶栏最左，见 `draw_topbar`）。
+    // **隐藏按钮不在这里**（移到顶栏最左，见 `draw_topbar`）。
     let slot = |i: f32| Rect::from_center_size(pos2(r.min.x + step * (i + 0.5), center_y), vec2(sq, sq));
     let r_clear = slot(0.0);
     let r_pin = slot(1.0);
@@ -1014,7 +1012,7 @@ pub(super) fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
     f.hit_insert("topbar_clear", r_clear);
     f.hit_insert("topbar_pin", r_pin);
     f.hit_insert("topbar_settings", r_set);
-    // 破坏性操作（清空）：**长按 5 秒**才触发（2026-10-22 用户要求），
+    // 破坏性操作（清空）：**长按 5 秒**才触发，
     // 长按期间图标摇晃并渐红。误点一下不会再清空历史。
     draw_clear_button(f, r_clear);
     // 窗口置顶：切换「始终显示在最上层、不被其它应用遮住」。
@@ -1046,7 +1044,7 @@ pub(super) fn draw_topbar_icons(f: &mut Frame<'_>, r: Rect, center_y: f32) {
 /// 顶栏右侧的图标按钮数量。
 ///
 /// 清空 / 窗口置顶 / 设置。**隐藏按钮不在这里**——它独立放在顶栏
-/// 最左（2026-10-22 用户要求），所以不计入右侧组的宽度分母。
+/// 最左，所以不计入右侧组的宽度分母。
 ///
 /// # 为什么是常量而不是两处各写一个数字
 ///
@@ -1129,14 +1127,14 @@ pub(super) fn draw_clear_button(f: &mut Frame<'_>, r: Rect) {
     //
     // CAUTION: 后者受 Button 的 sense 影响，松手那一帧容易变 false，
     // 而触发条件 `pressed && p >= 1.0` 正好卡在那儿——症状是
-    // 「动画跑满、松手却不触发」（2026-10-22 用户反馈）。
+    // 「动画跑满、松手却不触发」。
     // `hovered() && primary_down()` 语义直白，与控件种类无关。
     // 长按状态机。**语义对齐手机长按**：
     //
     // - **开始**：指针在按钮上 + 主键**刚按下**（`primary_pressed`）；
     // - **继续**：主键仍按住（**不要求 hover**）——按住后手指/指针
     //   轻微移出按钮就归零是错的，那样 5 秒内一点抖动就前功尽弃，
-    //   表现为「动画一直在跑、却永远触发不了」（2026-10-22 反馈）；
+    //   表现为「动画一直在跑、却永远触发不了」；
     // - **结束**：主键松开，此时若已蓄满仍要触发（按够了就该生效）。
     //
     // CAUTION: `Op` 要等 `hold` 的借用**释放后**再 push——两者都在
@@ -1336,8 +1334,7 @@ pub(super) fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response
         &f.ui.painter_at(r),
         Rect::from_center_size(r.center(), vec2(pal.icon_size, pal.icon_size)),
         // 过滤生效（查询词非空）时图标走强调色：面板收起后查询仍然
-        // 过滤着列表，图标是唯一的「当前在过滤」指示（2026-10-21 起
-        // 查询词不再钉住面板，收起后要能看出过滤还开着）。
+        // 过滤着列表，图标是唯一的「当前在过滤」指示（查询词不再钉住面板，收起后要能看出过滤还开着）。
         if !f.state.query.is_empty() {
             pal.accent
         } else if resp.hovered() {
@@ -1362,7 +1359,7 @@ pub(super) fn search_toggle_button(f: &mut Frame<'_>, r: Rect) -> egui::Response
 ///
 /// 图标字体子集只有 18 个码位、源字体不在仓库（只有 pyftsubset 的
 /// 4KB 子集），**无法新增**码位。而现有的 `U+E003` 字形笔画偏粗、
-/// 圆环与手柄比例失衡，在搜索框这种小尺寸下显得笨重（用户反馈"太丑"）。
+/// 圆环与手柄比例失衡，在搜索框这种小尺寸下显得笨重（"太丑"）。
 ///
 /// 放大镜本来就只有两条线——圆 + 斜杠，用几何画反而更可控：
 /// - **线宽可调**，不受字体设计限制；
@@ -1399,7 +1396,7 @@ pub(super) fn draw_topbar_icon(painter: &egui::Painter, icon: Icon, r: Rect, col
     // 自绘图标（设置/置顶/清空/复制）走 `Icon::paint` 的矢量覆盖——
     // 那是唯一一份设计稿，行内与顶栏共用。**这里不能各画一份**：
     // 早前顶栏在本函数里画旧版 Trash/Pinned/Settings，而 `Icon::paint`
-    // 里是新版，于是「行内换了新图标、顶栏还是旧的」（2026-10-22 反馈）。
+    // 里是新版，于是「行内换了新图标、顶栏还是旧的」。
     if icon.is_vector() {
         icon.paint(painter, r, color);
         return;

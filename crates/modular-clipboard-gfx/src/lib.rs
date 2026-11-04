@@ -1277,8 +1277,7 @@ mod tests {
     /// 钉住「脏输入不产生脏倍率」这条性质。
     #[test]
     fn render_ppp_never_exceeds_cap_at_any_dpi() {
-        // 量程含 s > MAX_RENDER_PPP/0.25 = 9 的理论极端（P2-2，2026-10-19
-        // DPI 治理）：该区间下限必须**贴住上限**（ceiling.min(0.25)），
+        // 量程含 s > MAX_RENDER_PPP/0.25 = 9 的理论极端（P2-2，DPI 治理）：该区间下限必须**贴住上限**（ceiling.min(0.25)），
         // 不能再硬抬到 0.25——否则 ppp = 0.25·s 突破 MAX_RENDER_PPP，
         // 恰好落进图标字形画坏区间。
         for s in [

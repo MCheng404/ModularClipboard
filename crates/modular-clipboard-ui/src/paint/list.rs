@@ -150,7 +150,7 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
     // `docked()` 内部已经处理了「置顶内嵌时不参与 dock」这个规则，
     // 它才是「这张卡片会不会真的被画出来」的准确来源。
     let pinned_drawn_separately = f.ws.docked().any(|c| c.kind == CardKind::Pinned);
-    // 类型过滤（2026-10-15 第三轮：悬浮类型栏；2026-10-20 多选）。
+    // 类型过滤。
     // 与 `query` 一样是**界面本地**过滤——不进 store 查询、不进 IPC
     // 快照，绘制时筛行。置顶条目同样参与类型过滤：置顶只是一个排序
     // 权重，不是豁免。
@@ -199,7 +199,7 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
     // 行高：足够放两行文字（预览 + 来源/时间），让内容**完整可读**。
     //
     // 早前版本是 40pt 单行 + `elide_text` 截断，长路径/长文本只能看到
-    // 一小段（截图里 `miniz_oxide-36a1…` 就是这样）。用户要求「完整
+    // 一小段（截图里 `miniz_oxide-36a1…` 就是这样）。「完整
     // 显示内容」，因此改成两行：上行给预览（最多两行），下行给来源时间。
     // ---- 动态行高 -------------------------------------------------
     //
@@ -436,7 +436,6 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
             //
             // 让出量 = 滚动条热区（`SCROLLBAR_RESERVE`）+ 呼吸空间
             // （`SCROLLBAR_GAP`）：滑块与卡片之间不再零距相贴
-            // （2026-10-17 用户反馈「滑动条容易和卡片挤在一起」）。
             let row_w = if content_h > content.height() {
                 content.width() - SCROLLBAR_RESERVE - SCROLLBAR_GAP
             } else {
@@ -522,7 +521,7 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
                 }
             }
 
-            // ---- 缩略图并行预热（实验性，`MC_PARALLEL_THUMBS=1`）----
+            // ---- 缩略图并行预热（实验性，`MC_PARALLEL_THUMBS=1`） ----
             //
             // 放在行绘制之前：把本帧可见图片条目的解码**并行**做掉，
             // 随后逐行取缩略图全部命中缓存，首帧不再被串行解码拖住。
@@ -567,8 +566,7 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
             // 它们是一行一段的，数量随可见行数浮动；而
             // `chrome::set_drag_regions` 只保留前 `MAX_DRAG_SEGS` 段
             // （截尾），最多缝隙的那一帧会把优先级更高的段（顶栏、
-            // 列表左右留白、底部空白）全部挤出预算——2026-10-28「主窗口
-            // 有概率拖不动」就是这样来的。设了预算，总段数就不再随行数
+            // 列表左右留白、底部空白）全部挤出预算——优先级更高的段会被挤出预算。设了预算，总段数就不再随行数
             // 失控，且与顶栏段的「插到最前」一起构成双保险。
             let mut gap_segs = 0usize;
             for (k, i, r) in frames {
@@ -645,7 +643,7 @@ pub(super) fn preview_width(body_w: f32, pal: &Palette) -> f32 {
 ///
 /// 早前预览与顶部 meta 共用 [`preview_width`]（减掉了整个按钮列宽），
 /// 于是**每一行**预览右侧都白空出一列：长文本（URL、路径）明明还有
-/// 位置却被迫折行或截断。用户反馈的「内容显示不到右侧」就是它。
+/// 位置却被迫折行或截断。的「内容显示不到右侧」就是它。
 pub(super) fn preview_full_width(body_w: f32) -> f32 {
     (body_w - ROW_PAD_H * 2.0).max(20.0)
 }
@@ -716,7 +714,7 @@ pub(super) const ROW_ACTS_DROP: f32 = 4.0;
 /// 合计 ≈ 55pt，取下限 58 兜底按钮区域。
 ///
 /// NOTE: 这是**下限**不是固定值：早前用固定 40pt 时预览只够放一行半，
-/// 长内容被省略号截断（用户反馈「需要完整显示内容」）。
+/// 长内容被省略号截断（「需要完整显示内容」）。
 /// 实际行高由 [`row_height_for`] 按每条内容的折行数动态算出。
 pub(super) const ROW_HEIGHT_MIN: f32 = 58.0;
 
@@ -784,7 +782,7 @@ pub(super) const SEARCH_OPEN_GRACE: f64 = 0.6;
 ///
 /// # 为什么不是焦点、也不是查询词非空
 ///
-/// 2026-10-21 用户反馈「搜索框打开后无法自动关闭」，根因是旧判据
+/// 「搜索框打开后无法自动关闭」，根因是旧判据
 /// 「输入框有 egui 焦点 ⇒ 永不折叠」：egui 的焦点不因用户点到窗口
 /// 别处、切到别的应用而释放（generic interact 不抢焦点），面板一旦
 /// 获焦就永远收不回去。查询词非空同理——搜完就走的用户永远收不掉。
@@ -811,7 +809,7 @@ pub(super) const SCROLLBAR_RESERVE: f32 = crate::theme::SCROLLBAR_WIDTH;
 
 /// 滚动条热区与行卡片之间的**呼吸空间**（逻辑点）。
 ///
-/// # 为什么需要它（2026-10-17 用户反馈「滑动条容易和卡片挤在一起」）
+/// # 为什么需要它
 ///
 /// egui 0.36 默认 `ScrollStyle` 是 **floating**：滚动条不占布局宽度，
 /// 而是浮在 `[content.max.x - bar_width, content.max.x]` 上。行矩形按
@@ -840,8 +838,8 @@ pub(super) const LINE_H: f32 = 1.35;
 /// 仅作为列表行内嵌缩略图的默认上限；详情面板在
 /// [`draw_image_preview`] 里另行传更大的值（图占满整宽）。
 ///
-/// 2026-10-17 从 108 提到 160：108pt 下 16:9 的截图只有 192pt 宽，
-/// 在 400+pt 的列表里只占不到一半宽度，用户反馈「尺寸太小」。
+/// 从 108 提到 160：108pt 下 16:9 的截图只有 192pt 宽，
+/// 在 400+pt 的列表里只占不到一半宽度，「尺寸太小」。
 /// 160 是「看得清」与「一屏还能放三四条」之间的折中——再往上
 /// 一条记录就会占掉半屏，列表信息密度崩塌。
 ///
@@ -861,7 +859,7 @@ pub const IMG_MAX_H_LIST: f32 = 160.0;
 ///
 /// [`row_height_for`] 用它量出行高，[`draw_image_preview`] 按那个行高
 /// 画——两处各写一份算式的后果是**图片被压扁**：
-/// 2026-10-17 修的就是这个（`row_height_for` 的文件型分支没走图片算式，
+/// 修的就是这个（`row_height_for` 的文件型分支没走图片算式，
 /// 行高按文件名文本算成 ~24pt，图被 `band.height()` 压成一条细带）。
 /// 想改显示规则只能改这里。
 pub fn image_display_size(dims: (u32, u32), band_w: f32, max_h: f32) -> (f32, f32) {
@@ -891,17 +889,17 @@ pub fn image_display_size(dims: (u32, u32), band_w: f32, max_h: f32) -> (f32, f3
 /// 这里只取「实际用了几行」——比按字符数估算准得多，
 /// 中英文混排、全角半角混排都能正确处理。
 ///
-/// 2026-10-15 第三轮起有三种内容形态，行高各按各的算：
+/// 第三轮起有三种内容形态，行高各按各的算：
 /// - 图片（`image_inline` 开）= 缩略图显示高（限高 [`IMG_MAX_H_LIST`]）；
 /// - Markdown（`md_rendered` 开）= 排版实测高；
 /// - 其余 = 折行文本高。
 ///
 /// # 图片分支的判据必须是 [`preview_is_image`]
 ///
-/// 2026-10-17 修：这里原先写 `item.kind == ClipKind::Image`，于是从资源
+/// 修：这里原先写 `item.kind == ClipKind::Image`，于是从资源
 /// 管理器复制的图片**文件**（`ClipKind::Files`）走的是文本分支——行高按
 /// 文件名那一行算（~24pt），而绘制侧 [`draw_image_preview`] 受
-/// `band.height()` 约束，图就被压成一条细带（用户反馈「尺寸太小」）。
+/// `band.height()` 约束，图就被压成一条细带（「尺寸太小」）。
 /// 判据与绘制侧**必须同源**，两类条目共用 [`image_display_size`]。
 ///
 /// `known_dims` 是 [`UiState::thumb_dims`] 里已解码得到的尺寸：老条目

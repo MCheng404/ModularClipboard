@@ -115,7 +115,7 @@ pub fn key_from_vk(code: u16) -> Option<Key> {
         c if c == vk(VK_TAB) => Key::Tab,
         c if c == vk(VK_RETURN) => Key::Enter,
         // IMPORTANT: Escape 必须映射——漏了它，`key_pressed(Key::Escape)`
-        // 在实机上恒为假（2026-10-21 用户反馈「搜索面板按 Esc 关不掉」）。
+        // 在实机上恒为假。
         // 单测拦不住这条：测试直接注入 `egui::Event::Key`，绕过了
         // Win32 → egui 的键位翻译。
         c if c == vk(VK_ESCAPE) => Key::Escape,

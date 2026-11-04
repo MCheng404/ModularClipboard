@@ -443,7 +443,7 @@ pub fn hide_window(hwnd: HWND) {    if !unsafe { IsWindow(Some(hwnd)) }.as_bool(
 /// 2. **`LAST` 跨窗口共享**：主窗口与设置窗口是两个 HWND，却共用一个
 ///    计数器。指针从主窗口 resize 边移进设置窗口时，若主窗口的帧循环
 ///    恰被渲染闸门跳过（`skip_render`），`LAST` 还是旧值，设置窗口的
-///    恢复就被短路——用户反馈「移到设置窗口里光标状态没有恢复」。
+///    恢复就被短路——「移到设置窗口里光标状态没有恢复」。
 ///
 /// 现在**无条件 `SetCursor`**。两道天然闸门已经够用，不会互相抢：
 ///
@@ -507,7 +507,7 @@ pub fn set_cursor_icon(hwnd: HWND, icon: egui::CursorIcon) {
 /// - `true`：抬进**置顶组**最上（`HWND_TOPMOST`）；
 /// - `false`：抬进**普通组**最上（`HWND_TOP`）。
 ///
-/// # 为什么必须带这个参数（2026-10-21 用户反馈修复）
+/// # 为什么必须带这个参数
 ///
 /// 早前本函数**无条件**用 `HWND_TOPMOST`。弹窗/设置窗口的打开流程是
 /// 「先 `apply_topmost(配置值)` → 再 `sync_and_render`（内部 `just_opened`
@@ -534,7 +534,7 @@ pub fn raise_to_top(hwnd: HWND, topmost: bool) {
 ///
 /// 用于把窗口钳制在屏幕内：主窗口被「记住位置」恢复到屏幕右侧时，
 /// 锚定其右上角的设置窗口会整体摆到屏幕外——右上角的关闭按钮
-/// 直接点在屏外，表现为「点击关闭没反应」（2026-10-11 实测）。
+/// 直接点在屏外，表现为「点击关闭没反应」。
 pub fn work_area_of(_hwnd: HWND) -> (i32, i32, i32, i32) {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{

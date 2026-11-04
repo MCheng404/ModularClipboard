@@ -21,7 +21,7 @@ use super::controls::draw_slider;
 
 /// 主题强调色编辑器（「主题色」设置项）。
 ///
-/// 三种调节方式（对应用户要求的「多中自定义调节颜色方式」）：
+/// 三种调节方式（对应的「多中自定义调节颜色方式」）：
 /// 1. **预设色板**：10 个色块，单击即用——最常见的路径；
 /// 2. **HSV 滑条**：色相 / 饱和度 / 明度各一条——精细调节；
 /// 3. **十六进制输入**：`#RRGGBB`——从设计稿抄色。
@@ -44,7 +44,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
         // 行同款病，见 token_row_h 的 CAUTION）。
         let swatch_h = (pal.font_sm * 1.7).max(22.0);
         let (r, _) = ui.allocate_exact_size(vec2(48.0, swatch_h), Sense::empty());
-        // 全圆角改版（2026-10-25）：预览块 radius_sm → 胶囊（半高）。
+        // 全圆角改版：预览块 radius_sm → 胶囊（半高）。
         ui.painter_at(r)
             .rect_filled(r, swatch_h * 0.5, egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
         ui.add_space(8.0);
@@ -76,7 +76,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
             let resp = ui.interact(r, egui::Id::unique(("accent_preset", i)), Sense::click());
             let selected = cur.is_some_and(|c| c.to_rgb() == *prgb);
             let p = ui.painter_at(r);
-            // 全圆角改版（2026-10-25）：色板从圆角方块改**正圆**
+            // 全圆角改版：色板从圆角方块改**正圆**
             // （半径 = 边长一半）——HTML 原型里色板就是圆点。
             let dot = s * 0.5;
             p.rect_filled(
@@ -175,7 +175,7 @@ pub(super) fn draw_accent_editor(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
             egui::Sense::empty(),
         );
         let painter = ui.painter_at(r);
-        // 全圆角改版（2026-10-25）：radius_md → 胶囊（半高）。
+        // 全圆角改版：radius_md → 胶囊（半高）。
         painter.rect_filled(r, pill, pal.surface_variant);
         painter.rect_stroke(
             r,
@@ -264,7 +264,7 @@ pub(super) fn token_num_range(name: &str) -> std::ops::RangeInclusive<f32> {
 
 /// 「高级微调」入口行（主题卡片内）。
 ///
-/// 2026-10-19 起令牌编辑器从「卡片内联长列表」升级为**二级面板**：
+/// 起令牌编辑器从「卡片内联长列表」升级为**二级面板**：
 /// 点击本行把设置窗口右侧内容区整体切换为令牌面板（占一大半区域），
 /// 近 60 行令牌终于有地方完整铺开。 rationale：
 /// - 内联在主题卡里时，55 行把主题卡撑到五屏，滚半天才能滚完，
@@ -290,7 +290,7 @@ pub(super) fn draw_token_entry(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
     );
     let p = ui.painter_at(r);
     if resp.hovered() {
-        // 全圆角改版（2026-10-25）：radius_sm → 胶囊（半高）。
+        // 全圆角改版：radius_sm → 胶囊（半高）。
         p.rect_filled(r, r.height() * 0.5, pal.row_hover);
     }
     p.text(
@@ -316,8 +316,7 @@ pub(super) fn draw_token_entry(f: &mut Frame<'_>, ui: &mut Ui) -> bool {
 
 /// 令牌行的统一行高（逻辑点）。
 ///
-/// # 为什么不能写死 18pt（2026-10-19 用户实机反馈「文字向上且渲染
-/// 不完整」的根因）
+/// # 为什么不能写死 18pt
 ///
 /// 令牌行是 horizontal 三列：左列（118pt 文字格）、滑条、数值。
 /// egui 的 horizontal **不重排先放置的控件**——行高被后放的高控件
@@ -418,7 +417,7 @@ pub(super) fn draw_token_panel(f: &mut Frame<'_>, ui: &mut Ui) {
     });
     ui.add_space(6.0);
 
-    // ---- 逐令牌（按类型分组）----
+    // ---- 逐令牌（按类型分组） ----
     //
     // CAUTION: ops 先收集后统一 push——`f.state.push` 要 `&mut Frame`，
     // 而循环里还要读 `f.svc.state.config`（是否已覆盖）。边读边写在

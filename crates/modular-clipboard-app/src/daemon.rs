@@ -392,8 +392,7 @@ fn set_hotkey_error(core: &Core, failed: Vec<String>) {
 /// 公开：单进程模式的界面进程也要维护同一份快照。
 pub fn sync_mini_items(service: &Service, cell: &tray::MiniItems) {
     let n = service.state.config.mini_panel.effective_count();
-    // 只显示内容预览，**不带序号前缀**（2026-10-22 用户要求去掉
-    // `1.` / `2.` / `3.` 这类标记）。置顶项用 `*` 前缀标记——
+    // 只显示内容预览，**不带序号前缀**。置顶项用 `*` 前缀标记——
     // 这是识别置顶的唯一通道（菜单只有一行文本，没有图标/副标题）。
     //
     // 预览截断到 48 字符：系统菜单不会自己省略号，文本过长会被

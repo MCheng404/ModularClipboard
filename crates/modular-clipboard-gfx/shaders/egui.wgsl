@@ -7,7 +7,7 @@
 //
 // 顶点位置以「像素」传入，乘以 dpr 转成物理像素，再换算成 NDC。
 //
-// 2026-10-17：删掉了 `clip_from_uv`（恒为单位矩阵的 mat4x4）——它从来
+// 删掉了 `clip_from_uv`（恒为单位矩阵的 mat4x4）——它从来
 // 只有一个值，而像素→NDC 由本着色器自己完成，留下它等于每顶点白算
 // 16 个 FMA，还埋着「谁设成非单位矩阵就二次变换」的陷阱。裁剪现在
 // 完全由 uniform 的 `size_in_pixels` + CPU 侧 scissor 负责。
@@ -30,7 +30,7 @@ struct Uniforms {
 // 用户纹理（图片缩略图）。字体图集是单通道覆盖率，
 // 缩略图是 RGBA 彩色图——两者语义不同，故各用一张。
 @group(0) @binding(3) var user_tex: texture_2d<f32>;
-// 用户纹理的采样器（linear，2026-10-17 起与字体图集分开）。
+// 用户纹理的采样器。
 //
 // 为什么必须是 linear：缩略图的**显示尺寸与纹理尺寸几乎从不相等的**：
 // 512² 纹理要显示成 320pt（100% DPI 下 320px）或 696pt 大图，都是
@@ -72,7 +72,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let ndc_y = 1.0 - 2.0 * scaled.y / u.size_in_pixels.y;
     let ndc_x = 2.0 * scaled.x / u.size_in_pixels.x - 1.0;
 
-    // 直接输出 NDC（2026-10-17 起不再乘 clip_from_uv，见头注释）。
+    // 直接输出 NDC。
     out.clip_position = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
     out.uv = in.uv;
     // egui 把颜色打包为 ABGR 小端序的 u32
@@ -118,7 +118,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // ——egui 逐纹理指定 wrap，renderer 按 `ImageDelta::options` 选采样
     // 器并绑进本纹理的描述符集合（见 `UserTexture::wrap_repeat`）。
     let c = textureSampleLevel(user_tex, user_sampler, in.uv, 0.0);
-    // CAUTION（2026-10-18 修，两个错误都被「不透明 + 白 tint」掩盖）：
+    // CAUTION：
     //
     // ① 上传的字节是**预乘**的：egui 的 `ColorImage.pixels` 是 `Color32`，
     //    `to_array()` 返回预乘分量，renderer 原样送进 GPU（见

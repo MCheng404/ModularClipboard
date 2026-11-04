@@ -11,7 +11,7 @@ pub type EntryId = i64;
 
 /// 剪贴板内容的分类。决定预览渲染方式与可执行动作。
 ///
-/// `Ord`：类型过滤的**多选集合**用它做 `BTreeSet`（2026-10-20）。
+/// `Ord`：类型过滤的**多选集合**用它做 `BTreeSet`。
 /// 声明顺序即排序序，无其它语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

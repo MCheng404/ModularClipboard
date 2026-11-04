@@ -123,7 +123,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     //
     // 没有这一层时，把卡片调透只能透出窗口自己的 `list_bg`（比卡片更暗）
     // ⇒ 观感是「卡片变暗」而不是「卡片变透」。玻璃的关键不是能透多少，
-    // 而是**透过来的是什么**（2026-10-23 用户反馈）。
+    // 而是**透过来的是什么**。
     //
     // 纹理是**整窗客户区**的底图，按卡片矩形取其中一块（见
     // `card_blur_uv`），因此每张卡片看到的是它自己身后那一块桌面。
@@ -137,7 +137,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // 一份 ⇒ 顶栏、搜索面板、类型栏都被行卡片的底色染一遍。现在每块
     // 区域自带底色，语义也统一了：**覆盖度 = 底色的 alpha**。
     f.push_glass(r, radius, pal.card_bg);
-    // 卡片磨砂补丁：**玻璃模式下不画**（2026-10-25 修「玻璃参数无效」）。
+    // 卡片磨砂补丁：**玻璃模式下不画**。
     //
     // 病根：这层补丁是 GDI 捕获的**不透明**纹理，画在玻璃 pass 之后，
     // 把卡片矩形内的折射产出**整个盖住**——玻璃模式下卡片看到的仍是
@@ -163,13 +163,13 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // 行卡片底色用 `card_bg` 而不是 `surface_raised`：前者是「卡片透明度」
     // 设置的作用对象，后者是浮层令牌（见 `Palette::with_card_opacity`）。
     //
-    // CAUTION: **玻璃模式下不画**（2026-10-27）。玻璃 pass 已经把
+    // CAUTION: **玻璃模式下不画**。玻璃 pass 已经把
     // 「底图 + 卡片色」合成好了（`GlassParams::tint`），这里再画一层
     // 就是两次覆盖：
     //   最终 alpha = a + a(1-a) = a(2-a)
     // 卡片色不透明（a = 1）时玻璃整层被盖死——折射、色散、边缘光全部
     // 看不见，用户只能看到一张实色卡片；半透明时又多叠一份桌面而发白。
-    // 这也是「玻璃参数拖了没反应」在 2026-10-25 修过一次、却仍不够通透的
+    // 这也是「玻璃参数拖了没反应」却仍不够通透的
     // 根因：补丁被跳过了，底色没有。
     if !glass_mode {
         painter.rect_filled(r, radius, pal.card_bg);
@@ -196,7 +196,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     );
     if sel > 0.004 {
         if glass_mode {
-            // 玻璃模式下**不能**重填卡片底色（2026-10-28 修）。
+            // 玻璃模式下**不能**重填卡片底色。
             //
             // 原路径是 `fill_rounded_border(...)`：它先把整块填成描边色、
             // 再用闭包把内部覆盖回 `pal.card_bg`。在磨砂/半透明模式下
@@ -261,7 +261,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
         painter.rect_filled(r, radius, fade_color(pal.row_active, press));
     }
 
-    // ---- 顶部受光高光（在卡片填充之上）----
+    // ---- 顶部受光高光（在卡片填充之上） ----
     //
     // 深色主题下卡片顶部 3pt 白色渐变亮边（alpha 0.20 → 0），模拟
     // 上方光源——深色卡片在近黑列表底上靠它「浮」起来（立体阴影的
@@ -300,7 +300,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     // 右上：置顶 / 复制 / 删除 三个小图标按钮
     //
     // NOTE: 类型徽标放在**右下角**与「类型 · 大小」文字组合成一组
-    // （2026-10-15 用户定稿）：不再占用左侧文本宽度，预览/测量两侧
+    // 不再占用左侧文本宽度，预览/测量两侧
     // 都不需要为它让位。
     //
     // NOTE: 目标是「**完整显示内容**」：预览**不再截断**，而是按宽度
@@ -403,7 +403,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
         );
     }
 
-    // ---- 左下角：编辑 / 撤销（2026-10-21）----
+    // ---- 左下角：编辑 / 撤销 ----
     //
     // 位置选在底部 meta 行的**左端空白**：预览带在它上方、右侧是
     // 右对齐的类型/大小文字——两者都不与它重叠，因此它**不占用显示
@@ -532,7 +532,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     let size_on = meta_cfg.visible(RowMetaPart::Size) && size_text.is_some();
     let n = icon_on as u32 + type_on as u32 + size_on as u32;
     // 编辑模式下整组隐去：编辑时这些元信息没有意义（内容正在被改），
-    // 且右端要为编辑器让出空间（2026-10-22 用户要求）。
+    // 且右端要为编辑器让出空间。
     if n > 0 && !editing_this {
         // 固定占位（徽标宽 + 元素间 gap）；余下全部给文字。
         let fixed = if icon_on { badge_side } else { 0.0 }
@@ -634,7 +634,6 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
     for (i, (icon, op, enabled)) in acts.iter().enumerate() {
         // 编辑模式下让位：这三个按钮（置顶/复制/删除）在编辑时会与
         // 编辑器抢右上角空间，且「改到一半去删除」是误操作温床
-        // （2026-10-22 用户要求）。
         if editing_this {
             break;
         }
@@ -745,7 +744,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
 
 // ---------------------------------------------------------------- 内联编辑
 
-/// 内联编辑器：预览带**就地**换成多行输入框 + 确认 / 取消（2026-10-21）。
+/// 内联编辑器：预览带**就地**换成多行输入框 + 确认 / 取消。
 ///
 /// # 交互契约
 ///
@@ -759,7 +758,7 @@ pub(super) fn draw_item_row(f: &mut Frame<'_>, ui: &egui::Ui, r: Rect, item: &Cl
 ///
 /// `FontId::proportional(pal.font_md)` 不乘 `f.scale`：egui 计算可用
 /// 高度时会再乘一次 `pixels_per_point`，传乘过的值会把行高放大到
-/// 远超框高、文字被裁成半截（搜索面板 2026-10-17 踩过，见
+/// 远超框高、文字被裁成半截（见
 /// `draw_search_panel` 的注释）。
 pub(super) fn draw_inline_editor(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, item: &ClipItem) {
     let pal = f.pal;
@@ -897,7 +896,7 @@ pub(super) fn draw_editor_buttons(f: &mut Frame<'_>, ui: &egui::Ui, band: Rect, 
 /// 早前这里用的是 `f.ui`（根 Ui），它的裁剪矩形是**整个窗口** ⇒ 列表滚动时
 /// 预览文字会画到列表之外：越过卡片上缘、直接盖在顶栏上（图标被文字压住），
 /// 而卡片底色由滚动区的 `ui.painter_at` 画、被正确裁剪 —— 于是「只剩文字
-/// 浮在顶栏上，没有遮蔽」（2026-10-19 用户反馈）。
+/// 浮在顶栏上，没有遮蔽」。
 ///
 /// `Ui::painter_at` 的裁剪 = 自身矩形 ∩ **本 Ui 的裁剪矩形**，所以只要
 /// 传入滚动区的内容 Ui，越界的行自动被裁掉，与「看得见才画得出」一致。
@@ -1297,7 +1296,7 @@ pub(super) fn preview_image_thumb(
     })
 }
 
-/// 双击列表行的目标操作（2026-10-15 第三轮定稿）：
+/// 双击列表行的目标操作：
 ///
 /// - 链接型文本（`https?://…`）⇒ 浏览器打开（尊重 `ui.browser_path`）；
 /// - 文件型条目 / 形似路径的文本 ⇒ 资源管理器定位（尊重 `ui.explorer_path`）；

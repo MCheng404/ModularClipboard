@@ -88,7 +88,7 @@ pub struct MiniPanelConfig {
     /// 预览文本最大字符数（控制面板宽度）。默认 48。
     ///
     /// 系统菜单不支持直接设像素宽度，字符数是唯一的宽度杠杆
-    /// （2026-10-22 用户要求「限制宽度」）。范围 10..=100。
+    /// 范围 10..=100。
     pub preview_chars: usize,
 }
 
@@ -146,7 +146,7 @@ impl Default for Config {
             hotkey_toggle: Hotkey::default(),
             // 粘贴上一条：默认 **Ctrl+Alt+V**。
             //
-            // 不选 `Ctrl+Win+V`——2026-10-13 在本机实测，
+            // 不选 `Ctrl+Win+V`——
             // `Ctrl+Win+V` 与 `Win+Shift+V` 都被系统/外部软件占着
             // （RegisterHotKey 回 ERROR_HOTKEY_ALREADY_REGISTERED），
             // 照它出厂必然有一个槽位是死的。`Ctrl+Alt+V` 实测可用，
@@ -198,7 +198,7 @@ impl Config {
     ///
     /// # `Ctrl+Win+V` → `Ctrl+Alt+V`（paste 槽位）
     ///
-    /// 2026-10-13 之前「粘贴上一条」的默认值是 `Ctrl+Win+V`，实测它在本机
+    /// 之前「粘贴上一条」的默认值是 `Ctrl+Win+V`，实测它在本机
     /// （也很可能在多数 Windows 上）被系统/外部软件占用——
     /// `RegisterHotKey` 回 `ERROR_HOTKEY_ALREADY_REGISTERED`，照它出厂的
     /// 用户这个快捷键是死的，按了只会「弹个软件窗口出来」（实际触发了
@@ -723,7 +723,7 @@ mod tests {
         assert!((-8.0..=16.0).contains(&d.offset_y));
     }
 
-    /// 2026-10-15 预览页验收后用户定稿的默认参数：blur 8 / 浓度 20% /
+    /// 预览页验收后用户定稿的默认参数：blur 8 / 浓度 20% /
     /// 偏移 0 / 阴影默认开启。锁死这批数值，防止后续改动悄悄改掉观感。
     #[test]
     fn card_shadow_defaults_match_2026_10_15_final() {
@@ -748,7 +748,7 @@ mod tests {
         }
     }
 
-    /// 2026-10-15 第三轮原型的默认值：图片直显 / Markdown 渲染 /
+    /// 默认值：图片直显 / Markdown 渲染 /
     /// 类型栏可见但仅显示已有类型 / 停靠右侧 / 32pt / 调用路径留空。
     #[test]
     fn proto_round3_defaults() {
@@ -763,7 +763,7 @@ mod tests {
         assert!(d.explorer_path.is_empty(), "资源管理器默认走系统");
     }
 
-    /// 旧版 config.json 缺第三轮字段时必须补默认值，不能让整个配置
+    /// 旧版 config.json 缺这些字段时必须补默认值，不能让整个配置
     /// 解析失败（那会静默抹掉用户的全部设置，见 UiConfig 注释）。
     ///
     /// NOTE: 只测「键缺失」——显式 `null` 不在 `#[serde(default)]` 语义内，

@@ -8,7 +8,7 @@
 //! 未实现 SSE 长连接 / 服务端主动推送（本工具没有需要服务端主动发起
 //! 的场景）；MCP 规范允许服务器对每次 POST 直接回单个 JSON。
 //!
-//! # 信任边界（2026-10-23 安全审查后加固）
+//! # 信任边界
 //!
 //! 这个服务能**合成键鼠、截屏、读写剪贴板**，因此边界必须显式：
 //! 1. **token 为空 ⇒ 只许 loopback**。空 token 曾被当作「无需认证」，
@@ -284,7 +284,7 @@ fn write_simple(w: &mut TcpStream, status: u16, reason: &str, body: &str) -> Res
 mod tests {
     use super::*;
 
-    // ---- Host 头白名单（防 DNS rebinding）----
+    // ---- Host 头白名单（防 DNS rebinding） ----
 
     #[test]
     fn host_allows_only_loopback_literals() {
@@ -312,7 +312,7 @@ mod tests {
         assert!(!host_is_local("[2001:db8::1]:9123"));
     }
 
-    // ---- 行长度封顶（防 read_line 吃内存）----
+    // ---- 行长度封顶（防 read_line 吃内存） ----
 
     #[test]
     fn read_line_capped_rejects_lines_without_newline() {

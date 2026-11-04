@@ -299,7 +299,7 @@ impl BackdropFx {
     /// 前置条件：调用方已 `device_wait_idle`。
     ///
     /// 三个销毁点（关闭磨砂 / 交换链重建 / Drop）共用这一份：`pending`
-    /// 是 2026-10-27 加的字段，任何一处漏掉它就是一张泄漏的 DeviceImage
+    /// 是后加的字段，任何一处漏掉它就是一张泄漏的 DeviceImage
     /// （`DeviceImage` 没有 `Drop`，不会自己回收）。
     fn destroy(&mut self, gpu: &Gpu) {
         self.chain.destroy(&gpu.device);
@@ -369,8 +369,7 @@ impl<'a> Painter<'a> {
         // 用户纹理的**环绕**采样器：egui 的 `TextureOptions::wrap_mode =
         // Repeat` 要用（程序化质感 tile 靠它平铺，见 `crate::tex`）。
         // 缺了它，UV 超出 [0,1] 的部分被 clamp 到 tile 的角落像素 ⇒
-        // 整个窗口被一个像素拉伸铺满，「纹理没有纹理」（2026-10-18
-        // 纸质/星空主题的实际故障）。
+        // 整个窗口被一个像素拉伸铺满，「纹理没有纹理」。
         let sampler_linear_repeat =
             Sampler::from_egui(&gpu.device, &egui::TextureOptions::LINEAR_REPEAT)?;
         let uniform = UniformBuffer::new(gpu)?;
@@ -642,7 +641,7 @@ impl<'a> Painter<'a> {
 
     /// 清除玻璃参数（背景效果**不是**玻璃时每帧调用）。
     ///
-    /// # 为什么必须显式清（2026-10-28）
+    /// # 为什么必须显式清
     ///
     /// 参数只在玻璃模式下写入，且 `paint_inner` 只在「底图已上传」的帧
     /// 里消费它。于是从玻璃切到磨砂时，最后一份参数会**留在字段里**：
@@ -743,7 +742,7 @@ impl<'a> Painter<'a> {
             self.bindings_dirty = true;
         }
 
-        // ---- 渲染目标尺寸（超采样）---------------------------------------
+        // ---- 渲染目标尺寸（超采样） ---------------------------------------
         //
         // 界面先画到 `render_extent` 的离屏目标，再降采样到交换链。
         // `render_extent = 交换链尺寸 × 超采样倍率`。
@@ -1220,7 +1219,7 @@ impl<'a> Painter<'a> {
         let cb_level = self.card_blur.level;
         self.ensure_backdrop(fr, render_extent, swap_extent, divisor, format)?;
 
-        // ---- ① 运动观测（先于节流：节流帧也要喂预测器）----
+        // ---- ① 运动观测（先于节流：节流帧也要喂预测器） ----
         let now = Instant::now();
         if let Some(o) = client_origin(hwnd) {
             self.backdrop.predictor.observe(now, o);
@@ -1279,7 +1278,7 @@ impl<'a> Painter<'a> {
         } = &mut self.backdrop;
         let fx = fx.as_mut().expect("ensure_backdrop 刚确保存在");
 
-        // ---- 抓屏（工作线程，非阻塞）----
+        // ---- 抓屏（工作线程，非阻塞） ----
         //
         // 本帧发请求，结果可能本帧就到、也可能下一帧才到（`BitBlt`
         // 毫秒级 vs 帧间隔 16ms）。没抓到就沿用上一帧的底图——磨砂对
@@ -1523,7 +1522,7 @@ impl<'a> Painter<'a> {
     /// 倍率——与 `ensure_post` 同一套口径，`blur_a` 恒为交换链 1/4。
     /// 捕获图按**抓屏百分比**建（BitBlt 读的就是客户区物理像素）。
     ///
-    /// # 两级重建（2026-10-27 完善后处理）
+    /// # 两级重建
     ///
     /// 「链变了」（窗口尺寸 / 超采样倍率）必须整体重建：卷积目标尺寸、
     /// 描述符池、管线全部要换。但「只有捕获图尺寸变了」（用户拖抓屏
@@ -1648,8 +1647,7 @@ impl<'a> Painter<'a> {
         // IMPORTANT: 此处可以安全销毁——`rebuild_swapchain` 开头已
         // `wait_own_inflight` 等完**本窗口**的全部在途提交；这些离屏目标
         // 只会被本窗口的命令引用，因此本窗口排空即可（GFX-06：早先这里
-        // 写的是 `device_wait_idle`，2026-10-22 起实现已降级为本窗口等待，
-        // 注释随之修正——按旧注释推理会误以为「全局都排空了」）。
+        // 写的是 `device_wait_idle`，实现已降级为本窗口等待；按旧注释推理会误以为「全局都排空了」）。
         if let Some(mut b) = self.post.take() {
             b.chain.destroy(&self.gpu.device);
             b.pipeline.destroy(self.gpu);
@@ -1826,7 +1824,7 @@ impl<'a> Painter<'a> {
             }
         }
 
-        // ---- 第二趟：用户纹理（图片缩略图）------------------------------
+        // ---- 第二趟：用户纹理（图片缩略图） ------------------------------
         //
         // 只取每个 ID 的**最后一个** delta：同一 TextureId 的后一次
         // 增量覆盖前一次（egui 语义）。
@@ -1854,7 +1852,7 @@ impl<'a> Painter<'a> {
             }
             // CAUTION: 单张缩略图上传失败**就地降级**，不能往上冒泡。
             //
-            // 2026-10-17 实测：缩略图分辨率提到 512² 后，首帧「字体图集
+            // 实测：缩略图分辨率提到 512² 后，首帧「字体图集
             // + 多张缩略图 + 桌面底图」会挤满 staging arena，上传返回
             // Err ⇒ 一路冒泡到 `run_remote` ⇒ 界面进程退出，用户只看到
             // 「无法打开界面」。一张缩略图是观感增强，它没有这个权限

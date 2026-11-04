@@ -95,7 +95,7 @@ impl Solution {
 ///
 /// 现在 `solve` 与 `needed_width` / `comfortable_width` 都走这里，
 /// 口径由构造保证一致。（`required_width` 本身是第四份重复口径、
-/// 生产代码从不调用，已于 2026-10-17 删除——留着它就是给未来留一个
+/// 生产代码从不调用，已删除——留着它就是给未来留一个
 /// 「看起来能用、其实少算了 `CARD_AREA_INSET × 2 + 24pt` 余量」的坑。）
 pub fn layout_demand(ws: &Workspace) -> Vec<f32> {
     // IMPORTANT: 判据必须与 paint 一致：**内嵌的置顶卡片宽度必须是 0**。
@@ -143,7 +143,7 @@ pub fn solve_scaled(ws: &Workspace, area: Rect, scale: f32) -> Solution {
 
 /// [`solve_scaled`] 的主体：在**已算好的** `body` 内分配卡片宽度。
 ///
-/// 2026-10-15 第三轮曾在这里给「悬浮类型栏让位」加过一个带附加内缩的
+/// 第三轮曾在这里给「悬浮类型栏让位」加过一个带附加内缩的
 /// 变体（`solve_scaled_inset`），后来类型栏改成漂在窗外的独立弹窗，
 /// 卡片区不再需要让位，那个变体连同内缩一起删除。
 fn solve_body(ws: &Workspace, body: Rect, scale: f32) -> Solution {

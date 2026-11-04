@@ -88,13 +88,13 @@ pub(super) fn notice_schedule_repaint(ctx: &egui::Context, age: f32, k: f32) {
 /// 窄窗口也不会渲染到窗外），[`NOTICE_TTL`] 后自动消失；过期的那一帧
 /// 顺带把 `notice` 清掉（读取即消费，不需要额外的定时器）。
 ///
-/// # 弹窗模式（2026-10-20）
+/// # 弹窗模式
 ///
 /// `ui.notice_popup` 开启时本函数**不画窗内 toast**，只负责算好
 /// [`UiState::notice_panel`]（弹窗定位要用的面板矩形）——通知改由
 /// 独立弹窗显示（[`draw_notice_panel`]），不占窗口内的列表空间。
 ///
-/// # 出入场动效（2026-10-17）
+/// # 出入场动效
 ///
 /// 早前 toast 是「硬现、硬消失」——满不透明度瞬间出现在最终位置，
 /// 3 秒后瞬间蒸发，与其余界面元素（悬停/选中全部走补间）的观感
@@ -102,7 +102,7 @@ pub(super) fn notice_schedule_repaint(ctx: &egui::Context, age: f32, k: f32) {
 /// 线性淡出。alpha 走 [`fade_color`]（预乘缩放），三层（底/描边/文字）
 /// 同步淡，不会出现「底没了字还在」。
 ///
-/// # 换行修复（2026-10-20，用户实机反馈）
+/// # 换行修复
 ///
 /// 旧实现量宽度用 `layout(.., MAX_W - 16.0)`（换行到 264pt），**绘制**
 /// 却用 `painter.text(..)`——后者是 no-wrap 重排。于是长消息量着是
@@ -133,7 +133,7 @@ pub(super) fn draw_notice_toast(f: &mut Frame<'_>) {
         return;
     }
 
-    // ---- 弹窗面板矩形（两种模式都算，见字段说明）----
+    // ---- 弹窗面板矩形（两种模式都算，见字段说明） ----
     f.state.notice_panel = notice_panel_rect(f, &msg);
     if popup_mode {
         return; // 弹窗模式：窗内不画，交给独立弹窗

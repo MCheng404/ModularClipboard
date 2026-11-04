@@ -63,7 +63,7 @@ impl Uniforms {
     ///
     /// `scale` 是 egui 的 `pixels_per_point`（逻辑像素 → 物理像素的比例）。
     ///
-    /// 2026-10-17：删掉了恒为单位矩阵的 `clip_from_uv`（64 字节）。
+    /// 删掉了恒为单位矩阵的 `clip_from_uv`（64 字节）。
     /// 它从来只有单位矩阵一个值（有测试钉过），而着色器自己做
     /// 像素→NDC ⇒ 每顶点 16 个 FMA 的纯浪费，还留着一个
     /// 「谁把它设成非单位矩阵就二次变换」的陷阱。uniform 80 → 16 字节。
@@ -230,7 +230,7 @@ impl DescriptorLayout {
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-            // 用户纹理的**独立采样器**（2026-10-17）。
+            // 用户纹理的**独立采样器**。
             //
             // 字体图集必须点采样（`BINDING_SAMPLER` + nearest）：
             // 线性插值会把相邻字形的覆盖率渗进边缘，小字号糊成灰块。
@@ -479,7 +479,7 @@ impl GraphicsPipeline {
         // 直通公式给出 `255×0.7² + 242×0.3 = 197.5`——比白(255)和背景(242)
         // 都暗；而正确公式 `255×0.7 + 242×0.3 = 251` 才是应有的浅过渡。
         //
-        // 用户反馈的「圆角弧线末端一段深色短线」就是这个：弧线的羽化带
+        // 的「圆角弧线末端一段深色短线」就是这个：弧线的羽化带
         // 最长，偏色最明显。**这是全局性的渲染缺陷，不是某个控件的问题。**
         //
         // 与 egui 官方后端一致：`egui-wgpu` 用的正是
@@ -684,7 +684,6 @@ mod tests {
     fn uniform_layout_matches_wgsl() {
         // WGSL Uniforms: vec2(8) + f32(4) + f32(4) = 16
         // Rust 侧 [f32;2] + f32 + f32 同样应是 16 字节
-        // （2026-10-17 删掉了恒为单位矩阵的 clip_from_uv：80 → 16）
         assert_eq!(
             size_of::<Uniforms>(),
             16,

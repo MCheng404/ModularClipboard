@@ -92,7 +92,7 @@ impl<'a> SettingsWindow<'a> {
         // 早期实现是 `anchor.x + 780 + 12`（从主窗口左缘算起），
         // 主窗口居中时右侧放不下、左侧也没空间，设置窗口被钳到
         // 屏幕右缘——右侧内容贴屏幕边缘，观感上「内容文字位置
-        // 不对」（2026-10-11 用户反馈）。
+        // 不对」。
         let (mut x, y) = (
             ((anchor.x + main_w + 12.0) * s) as i32,
             (anchor.y * s) as i32,
@@ -212,7 +212,7 @@ impl<'a> SettingsWindow<'a> {
             // CAUTION: 按 `self.topmost`（本帧 `apply_topmost` 刚更新的
             // 簿记）选 band，不能写死置顶组——否则主窗口没开置顶时，设置
             // 窗口会在打开瞬间被按进置顶组且簿记不认，之后永远置顶
-            // （2026-10-21 用户反馈，见 `presence::raise_to_top`）。
+            // （见 `presence::raise_to_top`）。
             crate::presence::raise_to_top(self.window.hwnd(), self.topmost);
             crate::presence::focus_window(self.window.hwnd());
             // 新开时滚动归零：上次停在半截的设置项不该出现在顶部。
@@ -226,7 +226,7 @@ impl<'a> SettingsWindow<'a> {
             // 设置界面状态归零：每次打开都从「常规」分类、空搜索、
             // 非最近修改视图开始。
             //
-            // 实测（2026-10-11）同一样例 exe 两次启动，首次打开时
+            // 实测同一样例 exe 两次启动，首次打开时
             // 曾出现「外观」分类被选中——来源是打开瞬间被排空的
             // 积压输入里混入了落在导航项上的点击（窗口刚创建、
             // 位置/焦点尚未稳定）。这里显式复位三个状态位，配合
@@ -277,7 +277,7 @@ impl<'a> SettingsWindow<'a> {
         let frame_events = if just_opened {
             // 打开**首帧**把积压输入整个丢弃（不传进 egui）。
             //
-            // 实测（2026-10-11）：同一样例 exe 连续两次启动，首次
+            // 实测：同一样例 exe 连续两次启动，首次
             // 打开设置窗口偶发「外观」分类被选中——窗口刚创建、位置
             // 与焦点尚未稳定时，系统队列里可能混入落在导航项上的
             // 点击/移动（上一窗口激活、焦点抢夺产生的残留）。若把
@@ -302,7 +302,7 @@ impl<'a> SettingsWindow<'a> {
             self.close_requested = true;
         }
 
-        // ---- 重绘闸门（GFX-02）----
+        // ---- 重绘闸门（GFX-02） ----
         //
         // 判据与 `Popup` 完全一致（见 `RedrawGate` 的文档）。两条本项目
         // 特有的注意点：
@@ -421,7 +421,7 @@ impl<'a> SettingsWindow<'a> {
 
 impl<'a> Drop for SettingsWindow<'a> {
     fn drop(&mut self) {
-        // 顺序是硬性的（2026-10-19「连点设置按钮有概率未响应」根因修复，
+        // 顺序是硬性的（
         // 三个附属窗口同款）：
         //
         // 1. **先抽干残留消息**（此刻 hwnd 还有效）。`poll` 按 hwnd 过滤，

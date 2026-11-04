@@ -24,7 +24,7 @@ pub(super) fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate:
         (G::Ui, "hide_on_focus_lost") => cfg.ui.hide_on_focus_lost = v,
         (G::Ui, "show_tray") => cfg.ui.show_tray = v,
         (G::Ui, "start_minimized") => cfg.ui.start_minimized = v,
-        // ---- 第三轮新增（图片直显 / Markdown 渲染） ----
+        // ---- 图片直显 / Markdown 渲染 ----
         (G::Ui, "image_inline") => cfg.ui.image_inline = v,
         (G::Ui, "md_rendered") => cfg.ui.md_rendered = v,
         // 通知呈现：弹窗（true）/ 窗口内 toast（false）。
@@ -82,7 +82,7 @@ pub(super) fn set_text_field(cfg: &mut modular_clipboard_core::Config, g: crate:
     match (g, field) {
         (G::Mcp, "host") => cfg.mcp.host = v.trim().to_string(),
         (G::Mcp, "token") => cfg.mcp.token = v.trim().to_string(),
-        // 第三轮：双击跳转的调用路径。**不 trim 掉内部空格**——Windows
+        // 双击跳转的调用路径。**不 trim 掉内部空格**——Windows
         // 路径合法地包含空格（`C:\Program Files\...`），只去首尾。
         (G::Ui, "browser_path") => cfg.ui.browser_path = v.trim().to_string(),
         (G::Ui, "explorer_path") => cfg.ui.explorer_path = v.trim().to_string(),

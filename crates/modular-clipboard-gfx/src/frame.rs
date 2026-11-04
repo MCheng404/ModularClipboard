@@ -1068,7 +1068,7 @@ mod tests {
         );
     }
 
-    // -- 呈现信号量按图像分配（pSignalSemaphores-00067 的回归守卫）--------
+    // -- 呈现信号量按图像分配（pSignalSemaphores-00067 的回归守卫） --------
 
     #[test]
     fn present_semaphore_is_indexed_by_image_not_by_slot() {

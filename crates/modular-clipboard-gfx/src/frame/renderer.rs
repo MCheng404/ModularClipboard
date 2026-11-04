@@ -1230,7 +1230,7 @@ impl<'a> FrameRenderer<'a> {
         // 必须先等**本窗口**的 GPU 工作结束：旧交换链的 framebuffer、
         // 命令缓冲与 staging 都还被在飞命令引用。
         //
-        // # CAUTION: **不能**用 `gpu.wait_idle()`（2026-10-22 修复）
+        // # CAUTION: **不能**用 `gpu.wait_idle()`
         //
         // 那是 `device_wait_idle`，**设备级**同步——排空所有窗口的在途
         // GPU 工作。多窗口共享一台设备（见 `ui::multiwindow`），于是
@@ -1646,7 +1646,7 @@ impl<'a> FrameRenderer<'a> {
         }
         // 命令缓冲必须**显式归还池子**，不存在「随命令池一起回收」。
         //
-        // 2026-10-17 修的泄漏：命令池跨 rebuild 长期存活（只在 `Drop`
+        // 修的泄漏：命令池跨 rebuild 长期存活（只在 `Drop`
         // 里销毁），于是 `allocate_frame_resources` 每轮从池里
         // `allocate_command_buffers(image_count)` 而旧缓冲从未 reset 或
         // free ⇒ 池内句柄计数单调增长（每轮泄漏 swap_image_count 个）。

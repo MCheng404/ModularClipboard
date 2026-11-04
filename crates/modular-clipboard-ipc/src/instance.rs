@@ -90,7 +90,7 @@ impl UiInstanceGuard {
 /// `SetForegroundWindow`，那是同步跨进程调用——常驻进程同时是 IPC
 /// 服务端，界面线程那一刻又正阻塞在命名管道 `ReadFile` 上等回响应，
 /// 于是「常驻等界面泵消息、界面等常驻回响应」双向死锁
-/// （2026-10-13 dump 实锤）。改窗口状态的动作交给界面进程在自己的
+/// 改窗口状态的动作交给界面进程在自己的
 /// 消息循环里做（同线程调用立即返回）。
 fn post_to_main(msg: u32) -> bool {
     use windows::core::PCWSTR;

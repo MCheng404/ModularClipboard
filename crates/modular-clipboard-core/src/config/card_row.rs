@@ -39,7 +39,7 @@ pub struct CardShadowConfig {
 
 impl Default for CardShadowConfig {
     fn default() -> Self {
-        // 2026-10-15 定稿：预览页验收后的推荐参数。
+        // 定稿：预览页验收后的推荐参数。
         Self {
             enabled: true,
             blur: 8.0,

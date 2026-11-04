@@ -1,4 +1,4 @@
-//! 图片编辑窗口（2026-10-21 新增）。
+//! 图片编辑窗口。
 //!
 //! # 定位
 //!
@@ -77,7 +77,6 @@ const CLOSE_INSET: f32 = 22.0;
 /// 提成一个函数：绘制（`draw_ui`）与**拖动区挖空**（`drag_regions`）
 /// 必须用同一份几何，两处各写一次必然漂移——一旦拖动区没跟着改，
 /// 关闭按钮就被包进拖动区，点击被系统当拖动吞掉，表现为「✕ 点不动」
-/// （2026-10-22 用户反馈）。
 fn close_button_rect(window_w: f32) -> egui::Rect {
     egui::Rect::from_center_size(
         egui::pos2(window_w - CLOSE_INSET, TITLE_H * 0.5),
@@ -122,7 +121,6 @@ pub struct ImageEditor<'a> {
     /// 主循环空转约 125Hz ⇒ 编辑窗口以同样频率持续向共享的那条
     /// Vulkan 队列提交并 present，与主窗口的提交交替进行——这是
     /// 「编辑窗口一打开，它和主窗口一起闪」的持续负载来源
-    /// （2026-10-22 用户反馈）。
     gate: RedrawGate,
     /// 当前工具页。
     tool: ToolTab,
@@ -295,7 +293,7 @@ impl<'a> ImageEditor<'a> {
         }
         if just_opened {
             // 抬到自己所在 band 的顶部（按主窗口置顶状态选 band，
-            // 见 `presence::raise_to_top` 2026-10-21 的修复说明）。
+            // 见 `presence::raise_to_top` 的说明）。
             crate::presence::raise_to_top(self.window.hwnd(), self.topmost);
             crate::presence::focus_window(self.window.hwnd());
         }
@@ -400,12 +398,12 @@ impl<'a> ImageEditor<'a> {
     /// 标题行的拖动区（逻辑点、客户区坐标）。
     fn drag_regions(&self) -> Vec<egui::Rect> {
         let (w, _h) = self.window.inner_size_points();
-        // CAUTION: 必须挖空关闭按钮（2026-10-22 修复）。
+        // CAUTION: 必须挖空关闭按钮。
         //
         // `chrome::set_drag_regions` 的规则是「落在矩形内的按下会被系统
         // 拿走变成拖动，egui 收不到」。早前这里上报整行 `[0, w] × 36`，
         // 关闭按钮正好落在里面 ⇒ 点击被 Win32 当成拖动 ⇒ **✕ 点不动**
-        // （用户反馈）。主窗口顶栏的齿轮/搜索框能点，正是因为它上报的
+        // （）。主窗口顶栏的齿轮/搜索框能点，正是因为它上报的
         // 是「顶栏减去控件」的多段矩形。
         //
         // 关闭按钮贴着右缘，挖掉它只需把右边界收到它的左缘（再让 2pt
@@ -471,7 +469,7 @@ impl<'a> ImageEditor<'a> {
             return;
         }
 
-        // ---- 画布（剩余空间的上部）----
+        // ---- 画布（剩余空间的上部） ----
         let canvas = egui::Rect::from_min_max(
             egui::pos2(rect.min.x + 12.0, title_r.max.y + 12.0),
             egui::pos2(rect.max.x - 12.0, rect.max.y - 190.0),
@@ -1091,7 +1089,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 2026-10-22 新增：裁剪 / 调色 / 笔画
+    // 新增：裁剪 / 调色 / 笔画
     // ------------------------------------------------------------------
 
     /// 8×8 **不透明**纯灰（便于观察调色与笔画的影响）。

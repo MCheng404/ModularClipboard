@@ -2,7 +2,7 @@
 //!
 //! # 为什么是弹窗而不是「画在窗口内」
 //!
-//! 原型（`main-proto/index.html`，已于 2026-10-23 仓库瘦身移除，源码在
+//! 原型（`main-proto/index.html`，已从仓库移除，源码在
 //! `old` 分支）里这两个面板**漂在主窗口之外**：
 //! 搜索面板悬在窗口上方 12pt，类型过滤栏贴在窗口某一侧 12pt，间距
 //! 透出桌面。真实 Win32 窗口画不出自己的客户区（egui 的绘制被裁剪在
@@ -373,7 +373,7 @@ impl<'a> Popup<'a> {
     /// 簿记是最新的。写死 `HWND_TOPMOST` 会让「主窗口没开置顶」的
     /// 弹窗在打开那一帧被按进置顶组，而簿记仍是 false ⇒ 之后每次
     /// `apply_topmost(false)` 都被幂等去重跳过 ⇒ 弹窗永远置顶
-    /// （2026-10-21 用户反馈，见 `presence::raise_to_top` 的说明）。
+    /// （见 `presence::raise_to_top` 的说明）。
     fn raise_to_top(&self) {
         crate::presence::raise_to_top(self.window.hwnd(), self.topmost);
     }
@@ -572,7 +572,7 @@ impl Drop for Popup<'_> {
         // 表面由 Gpu 创建、FrameRenderer 不销毁——必须自己收，
         // 否则每次重建弹窗泄漏一个 vk::SurfaceKHR。
         //
-        // 2026-10-19 修（与设置窗口/卡片子窗同款，三处一起）：
+        // 修（与设置窗口/卡片子窗同款，三处一起）：
         // 先抽干残留 posted 消息（hwnd 还有效，窗口销毁后它们永远摘不走，
         // 线程队列会随弹窗开关累积到系统上限 ⇒ 系统判「未响应」），
         // 再等 GPU 空闲（in-flight 命令可能仍在读 surface），

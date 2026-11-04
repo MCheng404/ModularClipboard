@@ -97,7 +97,7 @@ const INK_FIT: f32 = 0.98;
 /// 图标语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Icon {
-    // ---- 已在用的----
+    // ---- 已在用的 ----
     /// 关闭 / 清除。
     Close,
     /// 已置顶（实心图钉）。
@@ -117,7 +117,7 @@ pub enum Icon {
     /// 文件类型条目。
     File,
 
-    // ---- 标题栏 / 布局----
+    // ---- 标题栏 / 布局 ----
     /// 最小化。
     Minimize,
     /// 折叠（收起面板）。
@@ -1003,7 +1003,7 @@ mod tests {
         assert!(verts.is_empty(), "零尺寸矩形不应产生顶点");
     }
 
-    // ---- Markdown 几何徽标（2026-10-20 重绘的守门测试）----
+    // ---- Markdown 几何徽标 ----
 
     /// 外框必须**铺满 rect**（与字体图标的 INK_FIT 0.98 同量级）。
     ///

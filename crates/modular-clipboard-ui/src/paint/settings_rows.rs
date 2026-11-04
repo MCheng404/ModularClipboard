@@ -31,8 +31,7 @@ const LANG_COMBO_W: f32 = 132.0;
 /// 132pt 会把每一项都截成「NVIDIA Ge...」——用户根本分不清两张同型号卡。
 ///
 /// CAUTION: 早前写 200 且**不截断**，`selected_text` 把按钮撑到 400pt，
-/// 左侧「GPU 适配器」标签被压住、说明文字折成三行（2026-10-28 实机
-/// 截图确认）。egui 的 `ComboBox::width` 是**最小宽度**，文字更长时它
+/// 左侧「GPU 适配器」标签被压住、说明文字折成三行。egui 的 `ComboBox::width` 是**最小宽度**，文字更长时它
 /// 会自己撑开——不截断就等于没有上限。
 const GPU_COMBO_W: f32 = 168.0;
 
@@ -57,8 +56,7 @@ fn lang_menu_indices(sel: usize) -> impl Iterator<Item = usize> {
 /// / `draw_text_field` / `draw_mini_button` 的「全圆角改版」）。
 ///
 /// 不改的后果就是同一行里混着两种形状：左边一枚 30pt 高的胶囊分段控件、
-/// 右边一枚 18pt 高的小圆角按钮——2026-10-28 用户反馈「适配器按钮不符合
-/// 设计语言」。
+/// 右边一枚 18pt 高的小圆角按钮——「适配器按钮不符合设计语言」。
 ///
 /// 弹层**不受影响**：`ComboBox::popup_style` 会显式覆盖菜单自己的 style
 /// （见 `lang_menu_style`），所以这里只改按钮。
@@ -231,7 +229,7 @@ fn draw_gpu_adapter(f: &mut Frame<'_>, ui: &mut Ui, label: Msg, desc: Msg) -> bo
 ///
 /// 下拉项用的是 egui 的 `Button::selectable`，它默认 `.frame(true)`——
 /// 每一项各画一圈描边，多条挨在一起就成了「一格一格」的菜单，正是
-/// 用户反馈的「有分界线」。
+/// 的「有分界线」。
 ///
 /// [`egui::containers::menu::menu_style`] 把各态的 `bg_stroke` 清成
 /// `NONE`、inactive 填充清成透明，只留悬停/选中的一层**满宽**底色——
@@ -322,7 +320,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 // 建好之后 `val` 处在可变借用里，再读它就 E0503。
                 // 后缀随下一帧的数值重算，切换即时。
                 let suffix = tp(val as i64, spec.unit_one, spec.unit);
-                // 全圆角改版（2026-10-25）：数字输入也做成胶囊——先铺
+                // 全圆角改版：数字输入也做成胶囊——先铺
                 // 底，再把 DragValue 放进内区。DragValue 没有
                 // `desired_width`（egui 0.37 未提供），宽度由本函数固定，
                 // 内 child 的 max_rect 兜住溢出。
@@ -571,7 +569,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             }
         }
         ItemKind::TokenOverrides => {
-            // 2026-10-19：入口行只负责打开二级面板（draw_token_panel），
+            // 入口行只负责打开二级面板（draw_token_panel），
             // 近 60 行令牌不再内联在主题卡里。
             draw_token_entry(f, ui);
         }
@@ -613,7 +611,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 record_recent(f, it.key);
             }
         }
-        // ---- 液态玻璃的四个参数（模糊 + 三个审美）----
+        // ---- 液态玻璃的四个参数（模糊 + 三个审美） ----
         //
         // 四者只在背景效果 = 玻璃时可用；其余模式下压暗（与磨砂强度同一
         // 套交互）。整包推 `Op::SetGlass`：四个值一起走，避免一帧内
@@ -622,7 +620,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
         // CAUTION: 推送时必须把**局部改动值**写回对应字段。早先这里读
         // 的是 `config` 里的旧值（`c.glass_refract` 等），于是拖动被
         // 整个丢弃——滑杆动了、数值显示变了，一松手全部回弹。
-        // 2026-10-24 用户反馈「玻璃参数无法拖动调整」正是这个：
+        // 「玻璃参数无法拖动调整」正是这个：
         // 三个滑块全都在推旧值。
         ItemKind::BackdropScale => {
             let cfg = &f.svc.state.config.ui;
@@ -859,12 +857,12 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                     draw_switch(f, ui, "type_rail_always", &mut cfg.always)
                 });
                 ui.add_space(2.0);
-                // 多选：按钮变开关，可同时点亮多个类型（2026-10-20 新增）。
+                // 多选：按钮变开关，可同时点亮多个类型。
                 changed |= setting_row(ui, msg("Multi-select"), msg("Select several types at once; the list shows entries matching any of them"), |ui| {
                     draw_switch(f, ui, "type_rail_multi", &mut cfg.multi)
                 });
                 ui.add_space(2.0);
-                // 文字标签：图标旁显示类型名称（2026-10-20 新增）。
+                // 文字标签：图标旁显示类型名称。
                 changed |= setting_row(ui, msg("Show type names"), msg("Text labels next to the icons: below them when vertical, to the right when horizontal"), |ui| {
                     draw_switch(f, ui, "type_rail_labels", &mut cfg.labels)
                 });
@@ -1010,7 +1008,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             let cur = slot.current(&f.svc.state.config);
             let mut changed = false;
             let _ = setting_row(ui, it.label, it.desc, |ui| {
-                // 胶囊输入框（2026-10-25 全圆角改版）：与
+                // 胶囊输入框：与
                 // `draw_text_field` 同一画法——先铺胶囊底，TextEdit 放进
                 // 内区（宽度基准 112 @ font_sm 15，等宽字体）。
                 let h = pal.control_height + 2.0;
@@ -1047,10 +1045,10 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 }
                 // 输入框与按钮之间留 8pt：设置卡片把
                 // `item_spacing.x` 归了 0（行与行才够呼吸），
-                // 同行控件零间距会挤成一团（用户实测反馈）。
+                // 同行控件零间距会挤成一团（反馈）。
                 ui.add_space(8.0);
                 // 「录制」按钮：egui 内置 `small_button` 换成自绘
-                // `draw_mini_button`（胶囊圆角，2026-10-25 全圆角改版）。
+                // `draw_mini_button`。
                 if draw_mini_button(f, ui, "hotkey_record", t("Record"), None) {
                     f.state.push(Op::StartRecording(*slot));
                 }
@@ -1093,7 +1091,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                 let sw = draw_switch(f, ui, "mcp_enabled", &mut v);
                 // 与 ⓘ 按钮之间留 8pt：设置卡片把 `item_spacing.x`
                 // 归了 0（行与行才够呼吸），同行控件零间距会**直接
-                // 贴在一起**——用户实测反馈「MCP 设置和开关挨得
+                // 贴在一起**——反馈「MCP 设置和开关挨得
                 // 太挤」。热键行的输入框与「录制」按钮同款修法。
                 ui.add_space(8.0);
                 let info = draw_mcp_info_btn(f, ui);
@@ -1245,7 +1243,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
             );
             let p = ui.painter_at(r);
             if resp.hovered() {
-                // 全圆角改版（2026-10-25）：radius_md → 胶囊（半高）。
+                // 全圆角改版：radius_md → 胶囊（半高）。
                 p.rect_filled(r, r.height() * 0.5, pal.surface_variant);
             }
             p.text(
@@ -1351,7 +1349,7 @@ pub(super) fn settings_item_row(f: &mut Frame<'_>, ui: &mut Ui, it: &SettingsIte
                         egui::RichText::new(t("Check")).color(pal.text),
                     )
                     .fill(pal.surface_variant)
-                    // 全圆角改版（2026-10-25）：胶囊（按钮高 28 的一半）。
+                    // 全圆角改版：胶囊（按钮高 28 的一半）。
                     .corner_radius(14.0),
                 );
                 f.hit_insert("settings_check_update", resp.rect);
@@ -1573,7 +1571,7 @@ pub(super) fn section(ui: &mut Ui, title: &str, pal: &Palette) {
 /// `available_width` 已是**净宽**，截断按净宽发生，两者不可能重叠。
 /// 字体缩放到这个倍率以上时，设置行改为**上下堆叠**（标签在上、控件在下）。
 ///
-/// # 为什么需要堆叠（用户反馈「字体调整太大导致布局错乱」）
+/// # 为什么需要堆叠（「字体调整太大导致布局错乱」）
 ///
 /// 并排时标签列与控件列争同一条行宽（544pt）。5 段的分段控件在 1.3×
 /// 时已占 300pt+，加上读数与间距后留给标签列的不足 160pt——描述只能
@@ -1627,7 +1625,7 @@ pub(super) fn head_line_height(ui: &Ui, label: &str) -> f32 {
 ///
 /// # 为什么不用 `Label::truncate()` / `.wrap()`
 ///
-/// - `truncate()` 只出**一行**，长说明被砍成半句（用户反馈「描述显示不全」）；
+/// - `truncate()` 只出**一行**，长说明被砍成半句（「描述显示不全」）；
 /// - `wrap()` 不限行数，超长说明能把一行设置撑到五六行高，整张卡片失去节奏。
 ///
 /// 用 `LayoutJob` 的 `wrap.max_rows` 才是「折行 + 到上限加省略号」——
@@ -1683,7 +1681,7 @@ pub(super) const CTRL_MIN_H: f32 = 24.0;
 /// # 为什么标签列宽度要减去控件宽
 ///
 /// 说明按这个宽度折行——**量出来的行数就是画出来的行数**。若按整行宽
-/// 量、按窄列画，说明会被挤成更多行而撑出卡片（用户反馈「描述跑到
+/// 量、按窄列画，说明会被挤成更多行而撑出卡片（「描述跑到
 /// 卡片外」的成因）。控件宽从 `min_rect` 取实际值，不靠猜。
 pub(super) fn setting_row(
     ui: &mut Ui,
@@ -1872,7 +1870,7 @@ mod tests {
     /// 是反向验证：那边从 Locale 出发查配置写法，这边从下拉框的配置值出发
     /// 查 Locale。两边都过，才说明「用户选的值」与「系统认的值」对得上。
     ///
-    /// 对不上时的症状正是 2026-10-23 修的那个 bug 的**另一种**成因：
+    /// 对不上时的症状正是那个 bug 的**另一种**成因：
     /// 选是选上了，但配置写进去读出来变成「跟随系统」。
     #[test]
     fn lang_choice_values_parse_back_to_the_same_locale() {

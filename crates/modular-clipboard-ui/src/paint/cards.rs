@@ -81,7 +81,7 @@ pub(super) fn draw_cards(f: &mut Frame<'_>, _body: Rect) {
 /// ```
 ///
 /// 三个相邻区域用了三种灰，再各加一道 1px 描边把它们切开 ——
-/// 读起来是「三块拼的」。用户反馈要求「强化整体界面的一体性」。
+/// 读起来是「三块拼的」。要求「强化整体界面的一体性」。
 ///
 /// 一体性版本的思路：**取消色块分割，层次改由「浮起」表达**。
 /// 顶栏与卡片区同色（`bg`），只靠一条分隔线区分顶栏；
@@ -149,7 +149,7 @@ pub(super) fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
 
     // 头部：标题 + 折叠/分离按钮。
     //
-    // NOTE: 历史栏的标题「历史」已按用户要求去掉——头部高度压为 0，
+    // NOTE: 历史栏的标题「历史」已按去掉——头部高度压为 0，
     // 列表从卡片顶部直接开始（不占位置）。其它卡片保留头部标题。
     let head_h = if card.kind == CardKind::History {
         0.0
@@ -177,7 +177,7 @@ pub(super) fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
             }
             // NOTE: 非一体性时历史栏整卡是「暗容器」：frame 底色也用
             // `list_bg`，否则列表四周仍露出 frame 的 `surface` 底色
-            // ——浅色主题下就是一圈白色（用户反馈「列表边上还是白色」）。
+            // ——浅色主题下就是一圈白色（「列表边上还是白色」）。
             f.ui.painter_at(r).rect_filled(r, CARD_RADIUS, pal.list_bg);
             // 置顶条目**就在这个列表里**（排在最前 + 底色微亮标记），
             // 不再有独立的「置顶区」，也没有第二段 body。
@@ -201,7 +201,7 @@ pub(super) fn draw_expanded_card(f: &mut Frame<'_>, card: &Card, r: Rect) {
 /// `collapse_priority`、`Solution::auto_collapsed`、`draw_collapsed_card`、
 /// `Op::ToggleCollapse` / `Detach` / `Dock`）都已移除——不是只删按钮。
 pub(super) fn draw_card_header(f: &mut Frame<'_>, card: &Card, head: Rect) {
-    // 历史栏标题按用户要求去掉：主窗口历史卡片不再显示「历史」两字，
+    // 历史栏标题按去掉：主窗口历史卡片不再显示「历史」两字，
     // 其头部高度也在 `draw_expanded_card` 压为 0，列表从卡片顶部直接
     // 开始（不占位置）。其它卡片（详情等）保留自己的标题。
     if card.kind == CardKind::History {

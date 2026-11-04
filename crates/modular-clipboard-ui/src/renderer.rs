@@ -74,7 +74,7 @@ pub fn texture_slot(id: egui::TextureId) -> u32 {
 
 /// 纹理增量是否为「整图更新」。
 ///
-/// # 这个判据曾经写反过（2026-10-16 修）
+/// # 这个判据曾经写反过
 ///
 /// `upload_font_delta` 早前写成 `let Some(_pos) = last.pos else { continue }`
 /// ——把 `pos == None`（**整图更新**，`ctx.load_texture` 的唯一形态）
@@ -1365,7 +1365,7 @@ mod tests {
         // 依据，顶点是逻辑点、视口是物理像素，`screen_rect * ppp ==
         // size_in_pixels` 是唯一不变式（详见 `uniforms_for` 的文档）。
         //
-        // 2026-10-17 前这里断言 `clip_from_uv` 是单位矩阵——该字段
+        // 前这里断言 `clip_from_uv` 是单位矩阵——该字段
         // （恒为单位矩阵的 64 字节 mat4x4）已删除：着色器自己完成
         // 像素→NDC，留它只会让「谁设非单位矩阵」变成二次变换陷阱。
         let u = uniforms_for(vk::Extent2D { width: 800, height: 600 }, 1.0);

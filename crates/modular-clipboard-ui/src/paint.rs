@@ -24,7 +24,7 @@
 //! 文字，其批次裁剪矩形就是**整屏**——裁剪等于没裁。要真正限制在
 //! 卡片内，必须显式传对应矩形给 `painter_at`。
 //!
-//! # 模块地图（2026-10-22 拆分）
+//! # 模块地图
 //!
 //! 本文件是模块根：只放**词汇表与帧骨架**——`Op` / `ConfigGroup` /
 //! `SettingsCat` / `HotkeySlot`（操作与设置目录词汇）、`UiState` +
@@ -147,7 +147,7 @@ pub enum Op {
     /// 「粘贴上一条」的行为模式。
     SetPastePreviousMode(modular_clipboard_core::config::PastePreviousMode),
 
-    // ---- 内容编辑（2026-10-21）----
+    // ---- 内容编辑 ----
     //
     // 三个入口一个闭环：BeginEdit 读载荷开编辑器 → CommitEdit 落地
     // （落地前由 App 负责备份原文）→ UndoEdit 用备份还原。
@@ -251,7 +251,7 @@ pub enum Op {
         ///
         /// 与磨砂强度（`SetBlurStrength`）分开：玻璃的光学合成会改变
         /// 底图观感，合适的模糊量与磨砂不同，共用一项会让改一个
-        /// 另一个跟着变（2026-10-24 用户反馈）。
+        /// 另一个跟着变。
         blur: u8,
     },
     /// 设置列表卡片阴影（开关 + 模糊 / 浓度 / 垂直偏移）。
@@ -324,7 +324,7 @@ pub enum Op {
     StartRecording(HotkeySlot),
     /// 确认并结束录制：把已按下的候选组合落为该槽位的绑定。
     ///
-    /// 在录制覆盖层上**点击任意位置**即触发（用户要求「点击任意位置
+    /// 在录制覆盖层上**点击任意位置**即触发（「点击任意位置
     /// 停止录制」）。若还没按过主键，等同取消。
     FinishRecording,
     /// 把输入框里的文本解析成绑定（`Ctrl+Shift+V` 形式）。
@@ -399,7 +399,7 @@ pub enum Op {
     ///
     /// 过滤在**界面侧**做（与 `query` 同为 UI 本地状态，不进快照）：
     /// 绘制时按 `paint_state` 的生效集合筛行，不触碰 store 查询与 IPC。
-    /// 2026-10-20：单选改多选后，Op 不再携带目标集合——集合的维护
+    /// 单选改多选后，Op 不再携带目标集合——集合的维护
     /// 规则（含「多选时清空单选字段」）只有一处，在
     /// [`UiState::toggle_type_filter`]。
     SetTypeFilterKind {
@@ -506,7 +506,7 @@ pub enum SettingsCat {
     /// 外观：主题（明暗 / 主题色 / 风格层 / 令牌覆盖）+ 文字 + 背景 +
     /// 行卡片 + 悬浮面板。
     ///
-    /// 2026-10-25「主题」分类并入：明暗、主题色、风格层本就是外观的
+    /// 「主题」分类并入：明暗、主题色、风格层本就是外观的
     /// 关注点，单独占一个导航位只会把「外观」拆成两半。原 Theme 分类
     /// 的设置项全部迁入 `SettingsCat::Appearance` 的卡片（主题 / 文字 /
     /// 窗口背景 / 液态玻璃 / 行卡片 / 悬浮面板六张）。
@@ -526,7 +526,7 @@ pub enum SettingsCat {
 impl SettingsCat {
     /// 全部分类（导航顺序）。
     ///
-    /// 2026-10-25：Theme 并入 Appearance，8 → 7。
+    /// Theme 并入 Appearance，8 → 7。
     pub const ALL: [SettingsCat; 7] = [
         SettingsCat::General,
         SettingsCat::Appearance,
@@ -629,7 +629,7 @@ pub struct UiState {
     ///
     /// 与 `query` 同为**界面本地状态**：不进配置、不进 IPC 快照，
     /// 由绘制层按它筛行（store 查询与常驻进程无感知）。
-    /// 2026-10-15 第三轮新增（悬浮类型过滤栏）。
+    /// 第三轮新增（悬浮类型过滤栏）。
     pub type_filter: Option<modular_clipboard_core::ClipKind>,
     /// 类型过滤的**多选**集合（`ui.type_rail.multi` 开启时使用）。
     ///
@@ -773,7 +773,7 @@ pub struct UiState {
     ///
     /// # 为什么不随纹理淘汰
     ///
-    /// 2026-10-17 改：原先与 `thumb_tex` 一起 retain，结果滚出屏就丢
+    /// 改：原先与 `thumb_tex` 一起 retain，结果滚出屏就丢
     /// ——而行高缓存以它的 `len()` 作为失效判据之一（见
     /// `RowHeightCache::dims_known`），丢一次就让整份行高缓存失效一次，
     /// 滚动时等于每帧重算全部行高。尺寸一条只有 16 字节，常驻更划算，
@@ -795,7 +795,7 @@ pub struct UiState {
     pub star_tex: Option<egui::TextureHandle>,
     /// 星空主题的星星列表（CPU 侧「一片星空」，见 [`crate::tex::StarField`]）。
     ///
-    /// 2026-10-19 起星空改「精灵逐颗绘制」：随机化（换一片星）、闪烁
+    /// 起星空改「精灵逐颗绘制」：随机化（换一片星）、闪烁
     /// （每帧 tint alpha 呼吸）、大小不规则（逐颗半径）三个可设参数都
     /// 要求 CPU 逐帧参与，静态 tile 做不到。列表按参数指纹重建，
     /// 没变就复用（只重算闪烁）。
@@ -813,7 +813,7 @@ pub struct UiState {
     pub accent_hex: String,
     /// 「高级微调」令牌编辑器是否展开（默认收起）。
     ///
-    /// 令牌**二级面板**是否打开（2026-10-19 语义升级）。
+    /// 令牌**二级面板**是否打开。
     ///
     /// 令牌表有近 60 行：平铺在主题卡里会把卡片撑到五屏以上，一屏内
     /// 连一个设置项都看不全。因此升级为二级视图——主题卡只留一行
@@ -839,7 +839,7 @@ pub struct UiState {
     /// 用来实现「离开后宽限一小会儿再折叠」。没有这个宽限期的话，
     /// 鼠标从图标移向输入框的途中（两者之间有 `space_md` 的间隙）
     /// 会瞬间判定「既不在图标上也不在输入框里」⇒ 立刻折叠，输入框
-    /// 在指针抵达前就消失——**永远进不去输入框**（用户反馈：
+    /// 在指针抵达前就消失——**永远进不去输入框**（
     /// 「根本不给输入的机会」）。
     pub search_leave_since: Option<f64>,
     /// 搜索面板文本框的自报 id（`draw_search_panel` 写入）。
@@ -868,14 +868,14 @@ pub struct UiState {
     /// 搜索面板**本次展开**的时刻（`input.time` 秒）。
     ///
     /// 展开后给一段宽限期（`SEARCH_OPEN_GRACE`），期间不判折叠。
-    /// 起因（2026-10-19 用户反馈「点一下搜索，闪一下就关闭」）：点击
+    /// 起因：点击
     /// 展开的那几帧里，焦点还没从弹窗回报回来、指针又可能已经离开图标
     /// ⇒ 折叠条件短暂全部成立，0.35s 宽限一到面板就自己收回去。
     /// 有了它，任何「刚打开」的面板都不可能被立刻判折叠。
     pub search_open_at: Option<f64>,
     /// 最近一次「输入内容变化」的时刻（`input.time` 秒）。
     ///
-    /// # 为什么焦点不能当「正在打字」的判据（2026-10-21 用户反馈修复）
+    /// # 为什么焦点不能当「正在打字」的判据
     ///
     /// 旧实现「输入框有 egui 焦点 ⇒ 永不折叠」过粘：generic interact
     /// 不抢焦点、用户点到列表/别的应用时 egui 内存里输入框**仍然持有
@@ -887,7 +887,7 @@ pub struct UiState {
     /// 搜索面板是**怎么**打开的（图标点击的切换语义要区分）。
     ///
     /// 悬停展开后面板可能「在用户察觉之前」就开了（0.18s），此时第一次
-    /// 点击图标的意图是「打开」，点击即关会重现 2026-10-19 的
+    /// 点击图标的意图是「打开」，点击即关会重现
     /// 「点一下、闪一下、关了」。所以悬停展开后的第一次点击只**确认**
     /// 并聚焦输入框，第二次点击才收起（见 `run_search_state_machine`）。
     pub search_opened_by: SearchOpenCause,
@@ -969,7 +969,7 @@ pub struct UiState {
     pub detail_image_orig:
         Option<(modular_clipboard_core::EntryId, egui::TextureHandle)>,
 
-    // ---- 设置界面状态（左右导航 + 卡片布局）----
+    // ---- 设置界面状态（左右导航 + 卡片布局） ----
     /// 当前选中分类（左侧导航）。
     pub settings_cat: SettingsCat,
     /// 设置搜索框文本。
@@ -997,7 +997,7 @@ pub struct UiState {
     /// CAUTION: 早先这里用「集合成员 异或 默认折叠表」判断，理由是
     /// 不想加 seed 标记。那个设计有个直接后果：**默认折叠的组永远
     /// 展不开**——点它走 `remove`，而它本就不在集合里（no-op），下一帧
-    /// 异或回来还是折叠。2026-10-24 用户反馈「液态玻璃无法展开」正是
+    /// 异或回来还是折叠。「液态玻璃无法展开」正是
     /// 这个。异或让「集合里有 key」的含义随组而反（默认折叠的组里
     /// 有 key = 展开，默认展开的组里有 key = 折叠），点击分支稍不留神
     /// 就写成单向的。快照语义下两者一致：有 key = 折叠，点击即切换。
@@ -1026,7 +1026,7 @@ pub struct UiState {
     /// 误标成「连接正常」。真值来自 [`crate::mcp_status::McpProbe`]。
     pub mcp_conn: crate::mcp_status::McpConn,
 
-    // ---- 交互热区（供自动化测试定位）----
+    // ---- 交互热区（供自动化测试定位） ----
     //
     // NOTE: 为什么让被测代码**自报坐标**而不是测试去算：
     //
@@ -1121,7 +1121,7 @@ struct RowHeightCache {
 struct RowFilterKey {
     /// 生效中的类型过滤集合（空 = 不过滤；单选模式是 0/1 个元素）。
     ///
-    /// CAUTION: 2026-10-20 多选过滤接入时由 `type_filter: Option<..>`
+    /// CAUTION: 多选过滤接入时由 `type_filter: Option<..>`
     /// 改写而来——单选与多选两个字段各判一次的写法必然在模式切换时
     /// 漏一处，统一集合是 [`UiState::active_type_kinds`] 的存在理由。
     type_kinds: Vec<modular_clipboard_core::ClipKind>,
@@ -1161,7 +1161,7 @@ pub struct HitTable(std::collections::HashMap<HitNs, HitMap>);
 
 /// 热区键 → 矩形。
 ///
-/// 2026-10-25 从 `&'static str` 改 `String`：分段控件的选项热区原来用
+/// 从 `&'static str` 改 `String`：分段控件的选项热区原来用
 /// **选项译文**当键（`draw_segmented` 的约定），而设置重组后同一分类里
 /// 出现了两处 `"无"`（风格主题 / 背景效果）——同名键后注册的覆盖先注册
 /// 的，自动化再也点不到前者。现在分段控件除译文集外还登记一枚
@@ -1303,7 +1303,7 @@ impl UiState {
         self.edit_backup = None;
     }
 
-    // ---- 热区（`Frame` 的便捷方法转到这儿来）----
+    // ---- 热区（`Frame` 的便捷方法转到这儿来） ----
     //
     // 显式带 ns 的版本留给 `Frame` 之外的使用方（测试）。
 
@@ -1364,7 +1364,7 @@ impl<'a> Frame<'a> {
     /// 点的是空气、甚至点到别的窗口上。部分可见的仍登记——用户能点到
     /// 露出来的那一部分。
     ///
-    /// `key` 收 `impl Into<String>`（2026-10-25）：分段控件的命名空间键
+    /// `key` 收 `impl Into<String>`：分段控件的命名空间键
     /// （`"{控件名}/{选项英文键}"`）是运行时拼的，见 `HitMap` 的说明。
     pub fn hit_insert(&mut self, key: impl Into<String>, r: Rect) {
         let sane = r.min.x.is_finite()
@@ -1398,7 +1398,7 @@ impl<'a> Frame<'a> {
     /// 本窗口**本帧**是否真的会被玻璃 pass 覆盖——即「这里该不该把底色
     /// 交给玻璃层、自己不画」的唯一判据。
     ///
-    /// # 为什么不能直接用 `glass_mode`（2026-10-28 修「玻璃有概率不渲染」）
+    /// # 为什么不能直接用 `glass_mode`
     ///
     /// 玻璃 pass 是**主窗口独享**的：`Frame::push_glass*` 有
     /// `hit_ns == Main` 闸门（弹窗/子窗口的坐标属于另一个客户区，混进
@@ -1439,7 +1439,7 @@ impl<'a> Frame<'a> {
     /// 必须在画该面板/卡片的**底色之前**：玻璃 pass 在 egui 内容之前跑
     /// （它是背景层），矩形只用于「这个像素属于哪张卡片」。玻璃模式下
     /// **不能**再自己画一层底色——底色随 `GlassRect` 一起交给着色器，
-    /// 再画一层会把折射/色散/边缘光整层盖死（2026-10-27 行卡片的病根）。
+    /// 再画一层会把折射/色散/边缘光整层盖死。
     ///
     /// # 超限行为
     ///
@@ -1616,7 +1616,7 @@ pub fn draw_child(f: &mut Frame<'_>) {
 /// 流程：背景 → 悬浮装饰布局 → 顶栏（搜索图标）→ 搜索状态机 →
 /// 卡片（Z 序）→ 类型过滤栏 → 悬浮搜索面板 → 通知 toast。
 ///
-/// 2026-10-15 第三轮起，搜索输入框与类型过滤栏都是**悬浮层**：
+/// 第三轮起，搜索输入框与类型过滤栏都是**悬浮层**：
 /// - 搜索面板贴在卡片区顶部（与顶栏/左右缘的间距即 `card_area` 的 12px
 ///   内缩），折叠时只占顶栏一枚放大镜；
 /// - 类型栏停靠卡片区某一侧，该侧通过 `FloatLayout::insets` 让列表收缩，
@@ -1692,7 +1692,7 @@ pub fn draw(f: &mut Frame<'_>) {
     //
     // NOTE: 设置界面同样不在这里画（独立窗口，见 `settingswin`）。
 
-    // ---- Enter 复制选中条目（键盘流，2026-10-20）----
+    // ---- Enter 复制选中条目 ----
     //
     // 为什么安全：主窗口**没有任何 TextEdit**（搜索框在弹窗自己的
     // Context、设置在另一个窗口），行内操作是裸 `ui.interact`、顶栏
@@ -1707,7 +1707,7 @@ pub fn draw(f: &mut Frame<'_>) {
     // CAUTION: 录制热键时除外——那时每个键都有意义（`capture_recording`
     // 正在等一个组合键）， Enter 复制会把它录进去。
     //
-    // CAUTION 2: **内联编辑中除外**（2026-10-21）。编辑器是主窗口里的
+    // CAUTION 2: **内联编辑中除外**。编辑器是主窗口里的
     // 第一个 TextEdit，Enter 归它（多行换行）；不排除的话「改内容按
     // 回车换行」会顺带把条目复制一遍，两个动作缠在一起。
     // Esc 同理：编辑中 = 取消编辑，不往外传。
@@ -1722,7 +1722,7 @@ pub fn draw(f: &mut Frame<'_>) {
             f.state.push(Op::Copy(id));
         }
     }
-    // Esc 取消内联编辑（2026-10-21）。放在 Enter 分支之后：两者互斥，
+    // Esc 取消内联编辑。放在 Enter 分支之后：两者互斥，
     // 但分开写读得清楚。弹窗里的 Esc 走弹窗自己的 Context（见
     // `draw_search_panel`），这里是主窗口 Context 的那一半。
     if f.state.editing.is_some() && f.state.hotkey_recording.is_none() {
@@ -2498,7 +2498,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     #[test]
     fn clicking_trash_does_not_clear() {
         // 破坏性操作（清空全部历史）**单击不得触发**——行为已改为
-        // 长按 5 秒（2026-10-22 用户要求），误点一下就清空历史是
+        // 长按 5 秒，误点一下就清空历史是
         // 不可接受的。这条守门防的是有人图省事把长按改回单击。
         //
         // 长按路径本身依赖真实时钟（`Instant::elapsed`），在单测里
@@ -2513,7 +2513,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 隐藏按钮在顶栏**最左**（2026-10-22 从右侧按钮组移出）。
+    /// 隐藏按钮在顶栏**最左**。
     ///
     /// 它的位置错了会连带拖动区挖空算错——隐藏按钮压在拖动区上时
     /// 「点隐藏 = 拖窗口」。用热区表的几何关系钉死相对位置。
@@ -2541,7 +2541,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 点击只 `request_repaint()` —— 看着像搜索框，实际**打不了字**。
     /// 这条测试守住它真的能输入。
     ///
-    /// 2026-10-15：面板改为独立弹窗，输入框住在**弹窗自己的 Context**
+    /// 面板改为独立弹窗，输入框住在**弹窗自己的 Context**
     /// 里，因此这里也走弹窗路径（`search_popup_frame_with`）——
     /// 主窗口的 `frame()` 里根本没有这个输入框。
     #[test]
@@ -2732,7 +2732,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 绘制层本地状态、不过 store ⇒ `list_version` 不变。而长度检查挡不住：
     /// 3 条 Text 与 3 条 Image，从「文本」切到「图片」行数都是 3 ⇒
     /// 缓存命中 ⇒ **图片行套用文本行的行高**（图被压扁/留白，无报错）。
-    /// 2026-10-20 多选接入后补一条：两个单选的集合 {Text} 与多选的
+    /// 多选接入后补一条：两个单选的集合 {Text} 与多选的
     /// {Text} 必须**相等**（同一过滤结果），否则模式切换会无故失效。
     #[test]
     fn row_height_cache_key_includes_filter() {
@@ -2805,7 +2805,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert_eq!(history_row_gap(&cfg_on(true, 99.0, 0.0)), 24.0);
     }
 
-    /// 类型徽标（2026-10-15 定稿）位于卡片**右下角**，与「类型 · 大小」
+    /// 类型徽标位于卡片**右下角**，与「类型 · 大小」
     /// 文字组合成一组、整组右对齐——不再占左侧文本宽度，因此
     /// `preview_width` / `preview_full_width` 不需要为徽标让位：
     /// 徽标缩进是「右下角文字右侧让出一个徽标位」，而不是减可用宽度。
@@ -2948,7 +2948,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// `SettingsCat::About` 有「关于」与「技术栈」两张卡片。早前
     /// `settings_category_cards` 用 `find(...)` 只取第一张匹配的卡片，
     /// 第二张永远不会被画出来——表现为「技术栈卡片加了却看不见」
-    /// （2026-10-22 用户反馈）。这里断言两张卡片的热区都在场：
+    /// 这里断言两张卡片的热区都在场：
     /// 关于卡的「退出程序」与技术栈卡的某个词条链接。
     #[test]
     fn about_category_renders_every_card_not_just_first() {
@@ -2986,7 +2986,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 录制覆盖层：录制态下整窗只认它，**任意位置**点击即确认。
     ///
-    /// 用户定稿交互（2026-10-13）：「录制完成后，点击任意位置停止
+    /// 用户定稿交互：「录制完成后，点击任意位置停止
     /// 录制」。这里连点三处——面板中心、面板外、左上角——都必须
     /// 产出同一条 `FinishRecording`。
     #[test]
@@ -3208,7 +3208,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 长消息必须**换行且装在框内**（2026-10-20 用户实机反馈的回归守卫）。
+    /// 长消息必须**换行且装在框内**。
     ///
     /// 旧实现的病症：量宽度用 `layout(.., 264pt)`（换行），绘制却用
     /// `painter.text(..)`（no-wrap 重排）⇒ 长消息以**一整行**居中，
@@ -3318,7 +3318,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 搜索面板停靠**下方** + 自定义高度（2026-10-20 新配置项）。
+    /// 搜索面板停靠**下方** + 自定义高度。
     #[test]
     fn search_panel_docks_below_window_with_custom_height() {
         use modular_clipboard_core::config::{SearchPanelConfig, SearchPanelPos};
@@ -3500,7 +3500,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 编辑态下 Enter **不复制**（那是换行），Esc **取消编辑**。
     ///
-    /// 回归守卫：Enter 复制（2026-10-20 加）早于内联编辑存在，两者
+    /// 回归守卫：Enter 复制早于内联编辑存在，两者
     /// 会在「改内容按回车」时同时触发——复制一条没保存的文字。
     #[test]
     fn enter_and_esc_belong_to_editor_while_editing() {
@@ -3684,7 +3684,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     }
 
 
-    /// Enter 复制选中条目（2026-10-20 键盘流）：选中一行后按 Enter
+    /// Enter 复制选中条目：选中一行后按 Enter
     /// 必须发出 `Op::Copy`——与行内复制按钮、双击复制同一落地。
     #[test]
     fn enter_key_copies_selected_row() {
@@ -4085,7 +4085,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// ⇒ `content_h` 远小于视口 ⇒ **根本没有滚动条**。
     ///
     /// 修法是让**行矩形**在可滚动时右缘内缩 `SCROLLBAR_RESERVE`
-    /// + `SCROLLBAR_GAP`（后者是 2026-10-17 加的呼吸空间），按钮与文字
+    /// + `SCROLLBAR_GAP`，按钮与文字
     ///   都以 `r.max.x` 为基准，于是自动全部避开。
     #[test]
     fn delete_button_is_clickable_when_list_is_scrollable() {
@@ -4106,7 +4106,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         let btn = h.pal.control_height * 0.55;
         let acts_w = acts_width(&h.pal);
         // 行矩形已内缩，按钮基准 = content.max.x - SCROLLBAR_RESERVE
-        // - SCROLLBAR_GAP - ROW_PAD_H（2026-10-17 起多让一项呼吸空间）。
+        // - SCROLLBAR_GAP - ROW_PAD_H。
         let right = body.max.x - LIST_PAD_X - SCROLLBAR_RESERVE - SCROLLBAR_GAP - ROW_PAD_H;
         // i=2 是删除（最右一个），中心偏左 acts_w - 2.5*(btn+space_xs)。
         let x = right - acts_w + 2.5 * (btn + h.pal.space_xs);
@@ -4196,7 +4196,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 新条目入场动画结束后，首行必须**精确归位**（点击落点不受动画残留影响）。
     ///
-    /// 回归守卫（2026-10-18）：入场滑入用 `anim::restart` 把 0→1 补间
+    /// 回归守卫：入场滑入用 `anim::restart` 把 0→1 补间
     /// 重启、行矩形按当前值从上方 12pt 归位。若补间卡在 0（忘了续帧、
     /// restart 目标写错、或闸门把动画饿死），行会**永远偏移 12pt**——
     /// 点击全部落空，而画面看着只是「歪一点」，极难自查。
@@ -4600,7 +4600,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
         // 搜索图标必须在**右侧功能组**左侧，且不得与任何按钮重叠。
         //
-        // NOTE: 隐藏按钮 2026-10-22 移到顶栏**最左**，它在搜索图标
+        // NOTE: 隐藏按钮移到顶栏**最左**，它在搜索图标
         // 的左边——所以这里只跟右侧组（清空/置顶/设置）比，不再跟
         // `rects[0]`（现在是隐藏按钮）比。
         let icon_r = hit(&h, "search_icon");
@@ -4728,8 +4728,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 行间缝隙是**一行一段**，段数随可见行数浮动；顶栏段原来是
     /// `extend` 上去的（排在末尾），行数一多就被截掉 ⇒ 顶栏恒为
     /// `HTCLIENT`，按住顶栏拖不动窗口，只有恰好按在行间缝隙/左右留白
-    /// 上才拖得动——用户感知就是「有概率拖不了」（2026-10-28 实测：
-    /// 拖动区 14 段，上限 8）。
+    /// 上才拖得动——用户感知就是「有概率拖不了」（拖动区 14 段，上限 8）。
     ///
     /// 判据直接对着**真实常量**取前 N 段，复刻 `set_drag_regions` 的
     /// 截断语义，而不是另写一套「应该有几段」的期望值。
@@ -4816,7 +4815,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 宽限期必须撑过「鼠标从图标走到输入框」这段行程。
     ///
-    /// 守着实机缺陷（用户反馈「根本不给输入的机会」）：输入框弹在图标
+    /// 守着实机缺陷（「根本不给输入的机会」）：输入框弹在图标
     /// **左侧**、中间隔着 `space_md` 的空隙。指针跨过那段空隙的帧既不
     /// 悬停图标、也不悬停输入框，若此刻立即折叠，输入框会在指针抵达
     /// 之前消失 —— 鼠标永远追不上，用户一次也点不进去。
@@ -4867,7 +4866,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 打字活跃期间面板**永不折叠**（打字打到一半弹窗不会自己没了）。
     ///
-    /// 2026-10-21 语义修订：钉住判据从「输入框有 egui 焦点」换成
+    /// 语义修订：钉住判据从「输入框有 egui 焦点」换成
     /// 「最近 SEARCH_TYPING_GRACE 内输入变过」——egui 焦点不因用户
     /// 点到别处而释放，拿它当判据会让面板永远收不回去（见
     /// `stale_focus_alone_no_longer_pins_search_panel` 的回归测试）。
@@ -4900,7 +4899,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         assert!(!h.state.search_expanded, "停手 2.5s + 宽限后应收起");
     }
 
-    /// 回归守卫（2026-10-21 用户反馈「搜索框打开后无法自动关闭」）：
+    /// 回归守卫：
     /// **陈旧的 egui 焦点不能再钉住面板**。
     ///
     /// 旧行为：`hold_open = search_popup_focus || query 非空 || 刚展开`。
@@ -4936,7 +4935,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     }
 
     /// 图标点击是开合切换，但悬停展开后的**首次点击只确认**（避免
-    /// 2026-10-19 的「点一下闪一下关了」），第二次点击才收起。
+    /// 的「点一下闪一下关了」），第二次点击才收起。
     #[test]
     fn search_icon_click_confirm_then_close() {
         let mut h = Harness::new("search-toggle-click", vec2(700.0, 500.0));
@@ -4982,7 +4981,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
 /// 搜索面板的弹窗矩形必须**整块在主窗口上方**（原型：漂在窗外）。
     ///
-    /// 这条是 2026-10-15 第三轮「独立弹窗」改造的核心不变式：面板
+    /// 这条是「独立弹窗」的核心不变式：面板
     /// 曾经被画在**窗口内**（贴卡片区顶部），与原型不符；现在它由
     /// `crate::popup` 单独开窗，位置由 `FloatLayout` 给——矩形整体
     /// 落在 `y <= 0`（窗口客户区坐标系），且与窗口顶边留 `RAIL_GAP`。
@@ -5409,10 +5408,10 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 文件型图片（从资源管理器复制的 `.png`）的行高也必须走图片算式。
     ///
-    /// 2026-10-17 实测缺陷：`row_height_for` 的图片分支只认
+    /// 实测缺陷：`row_height_for` 的图片分支只认
     /// `kind == ClipKind::Image`，文件型条目按**文件名文本**算行高
     /// （~24pt），而绘制侧受 `band.height()` 约束 ⇒ 缩略图被压成一条
-    /// 细带（用户反馈「尺寸太小」）。这条测试钉死「两类条目同一算式」。
+    /// 细带（「尺寸太小」）。这条测试钉死「两类条目同一算式」。
     #[test]
     fn row_height_uses_thumbnail_height_for_image_files() {
         let ctx = settled_ctx();
@@ -5471,7 +5470,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 老条目（载荷里没有 `dims`）：解码记下的尺寸也能把行高撑起来。
     ///
-    /// 这是 2026-10-17 那批「文件型图片」的兜底路径——入库侧
+    /// 这是「文件型图片」的兜底路径——入库侧
     /// `first_image_file_dims` 只对**新**条目补齐，此前已入库的老条目
     /// 只能等第一次解码后靠 `thumb_dims` 排版。
     #[test]
@@ -5506,7 +5505,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// `thumb_dims` **不随纹理淘汰**——它的 `len()` 是行高缓存的失效判据
     /// （[`RowHeightCache::dims_known`]）。
     ///
-    /// 回归守卫：2026-10-17 之前 `thumb_dims` 与 `thumb_tex` 一起
+    /// 回归守卫：早前 `thumb_dims` 与 `thumb_tex` 一起
     /// `retain`，滚出屏就丢。而 `dims_known` 的语义是
     /// 「数量变化 == 有新图刚拿到尺寸」——尺寸一丢，整份行高缓存
     /// 当帧失效；滚回来又拿到尺寸，数量再变一次 ⇒ **滚动时每帧重算
@@ -5565,7 +5564,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 缩略图纹理分辨率必须够「限高 × 2x DPI」，否则放大显示是糊的。
     ///
-    /// 2026-10-17：`IMG_MAX_H_LIST` 从 108 提到 160 时，`THUMB_MAX_EDGE`
+    /// `IMG_MAX_H_LIST` 从 108 提到 160 时，`THUMB_MAX_EDGE`
     /// 仍是 256 —— 200% 缩放下需要 320px，纹理不够就只能放大插值。
     /// 两个常量分开在两个文件里，改一个忘另一个不会编译报错，只能靠
     /// 这条测试钉住（`const` 块 ⇒ 编译期就失败）。
@@ -5586,7 +5585,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
-    // ---- 文件型图片（从资源管理器复制的图片文件）----
+    // ---- 文件型图片（从资源管理器复制的图片文件） ----
     //
     // 这类条目的载荷是**路径列表**，图在磁盘上。判据、读盘、行高三处
     // 都要单独关照，所以各自有一个测试。
@@ -5822,7 +5821,7 @@ fn with_pinned(mut self, n: usize) -> Self {
             info.max.x,
             sw.min.x
         );
-        // 两者之间必须留出呼吸间距（用户反馈「挨得太挤」）。
+        // 两者之间必须留出呼吸间距（「挨得太挤」）。
         // 设置卡片把 item_spacing.x 归了 0，不显式 add_space 就会贴上。
         assert!(
             sw.min.x - info.max.x >= 7.5,
@@ -5955,7 +5954,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 现在配置项走的是 `FontScale` 分段控件，点击必须产出带倍率的 Op。
     #[test]
     fn font_scale_segment_emits_scaled_number_op() {
-        // 2026-10-25：字体缩放移到「文字」卡（外观第 2 张），560pt 视口
+        // 字体缩放移到「文字」卡（外观第 2 张），560pt 视口
         // 只装得下「主题」卡——热区只登记可见控件，拔高夹具。
         let mut h = Harness::new("font-scale-seg", vec2(780.0, 900.0));
         h.state.show_settings = true;
@@ -6007,7 +6006,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// `settings_item_row` 的推送，界面点了毫无反应还静默通过。
     #[test]
     fn card_shadow_switch_emits_set_card_shadow() {
-        // 2026-10-25：卡片阴影移到「行卡片」卡（外观第 5 张，前面还有
+        // 卡片阴影移到「行卡片」卡（外观第 5 张，前面还有
         // 主题/文字/窗口背景三张 + 隐藏的液态玻璃），1600pt 视口才装得下。
         let mut h = Harness::new("card-shadow-sw", vec2(780.0, 1600.0));
         h.state.show_settings = true;
@@ -6062,7 +6061,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 不该把「找不到热区」当成失败。
     #[test]
     fn card_shadow_sliders_have_hit_regions_when_enabled() {
-        // 2026-10-25：组折叠随设置重组消失（液态玻璃改成条件卡），
+        // 组折叠随设置重组消失（液态玻璃改成条件卡），
         // 改用高视口让「行卡片」卡（外观第 5 张）整卡进首屏。
         let mut h = Harness::new("card-shadow-sl", vec2(780.0, 1600.0));
         h.state.show_settings = true;
@@ -6077,7 +6076,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
-    /// 玻璃模式下「卡片磨砂」行必须整项隐藏（2026-10-25 修「玻璃参数无效」）。
+    /// 玻璃模式下「卡片磨砂」行必须整项隐藏。
     ///
     /// 玻璃 pass 用「清晰 + 模糊」双底图折射充当卡片的身后内容
     /// （`row.rs` 在玻璃模式下跳过不透明的每卡磨砂补丁，捕获链也停了）
@@ -6114,7 +6113,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 组标题行点一次收起、再点一次展开（快照语义）。
     ///
-    /// 2026-10-24 用户反馈「液态玻璃无法展开」。根因是折叠状态用
+    /// 「液态玻璃无法展开」。根因是折叠状态用
     /// 「集合成员 异或 默认折叠表」判断，而点击分支只写了默认展开那
     /// 一支：默认折叠的组走 `remove`，可它本就不在集合里（no-op），
     /// 下一帧异或回来还是折叠 ⇒ 永远展不开。
@@ -6122,7 +6121,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 现在改成快照语义（seed 后有点 = 折叠、点击即切换），这条测试
     /// 守住「点一次收起、再点一次展开、收起时组内项没有热区」。
     ///
-    /// 2026-10-25：液态玻璃组随设置重组消失（改成条件卡，见
+    /// 液态玻璃组随设置重组消失（改成条件卡，见
     /// `SettingsCard::cond`），测试对象换成「关于」卡的「软件信息」
     /// 组——组折叠机制本身没动。
     #[test]
@@ -6183,7 +6182,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 折叠箭头必须是**补间推进**的，不能瞬间跳到目标角。
     ///
-    /// 2026-10-24 用户要求「`>` 到 `v` 的过程有动画」。这条测试守住两件事：
+    /// 「`>` 到 `v` 的过程有动画」。这条测试守住两件事：
     ///
     /// 1. 目标切换后，第一帧的角度**既不是旧值也不是新值**（说明真的在补间）；
     /// 2. 推进数帧后收敛到目标角（说明补间能走完，没被闸门饿死）。
@@ -6194,7 +6193,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 「图标瞬间跳变、没有动画」。
     #[test]
     fn fold_arrow_tweens_between_states() {
-        // 2026-10-25：液态玻璃组随设置重组消失，测试对象换成「关于」
+        // 液态玻璃组随设置重组消失，测试对象换成「关于」
         // 卡的「软件信息」组（补间键跟着组 key 走，机制不变）。
         let mut h = Harness::new("fold-tween", vec2(780.0, 900.0));
         h.state.show_settings = true;
@@ -6240,7 +6239,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 右下角信息编辑器：三个 chip（图标 / 类型 / 大小）都必须登记热区。
     #[test]
     fn row_meta_chips_have_hit_regions() {
-        // 2026-10-25：卡片角标移到「文字」卡（外观第 2 张），560pt 视口
+        // 卡片角标移到「文字」卡（外观第 2 张），560pt 视口
         // 装不下；组折叠键随重组消失，拔高夹具代替。
         let mut h = Harness::new("rowmeta-hits", vec2(780.0, 900.0));
         h.state.show_settings = true;
@@ -6385,7 +6384,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// `fade_color` 必须按**预乘**语义缩放：四通道一起乘 k。
     ///
-    /// 回归守卫（2026-10-17）：行悬停底色曾用 `from_rgba_unmultiplied`
+    /// 回归守卫：行悬停底色曾用 `from_rgba_unmultiplied`
     /// 重组 `to_array()` 的预乘分量，二次预乘把 11.8% 的悬停提亮压暗成
     /// 1.4%（`from_white_alpha(30)` 变成 rgb≈3），鼠标划过几乎看不出
     /// 反馈。k=1 恒等这条直接守那个 bug。
@@ -6487,7 +6486,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     ///
     /// 设置卡片的控件宽度大多是**按文字测量**算出来的（分段控件的段宽 =
     /// 最长文字 + 内边距），字体放大后总宽会超过卡片可用宽度，于是控件
-    /// 被画到卡片之外（用户反馈的「布局错乱」）；并排布局里标签列与控件
+    /// 被画到卡片之外（的「布局错乱」）；并排布局里标签列与控件
     /// 还会互相侵占。热区由绘制层自报，是唯一可信的坐标来源。
     #[test]
     fn settings_layout_survives_large_font_scale() {
@@ -6523,7 +6522,7 @@ fn with_pinned(mut self, n: usize) -> Self {
                 }
                 // 同一分类内的热区互不重叠（相邻分段共边不算重叠）。
                 //
-                // CAUTION: 先按**矩形去重**再两两比对——2026-10-25 起分段
+                // CAUTION: 先按**矩形去重**再两两比对——分段
                 // 选项登记两枚键（译文 + `"{控件名}/{选项英文键}"`，见
                 // `draw_segmented`），同选项的两枚键矩形全同，不去重会把
                 // 同一控件误判成「互相侵占」。
@@ -6547,7 +6546,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         }
     }
 
-    /// 设置内容区的控件必须让开浮动滚动条（2026-10-25 用户反馈）。
+    /// 设置内容区的控件必须让开浮动滚动条。
     ///
     /// egui 0.36+ 默认 `ScrollStyle::floating`：滚动条**不占布局宽度**，
     /// 浮在视口右缘 `[视口.max.x - 10, 视口.max.x]` 之上，且交互**后
@@ -6595,7 +6594,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// 守的是「并排时描述只剩 6 个字」这种可读性崩坏——堆叠后描述能拿到
     /// 整行宽度，控件也独占一行。
     ///
-    /// 2026-10-25：两个探针都换成**命名空间热键**（`"{控件名}/{选项英文键}"`，
+    /// 两个探针都换成**命名空间热键**（`"{控件名}/{选项英文键}"`，
     /// 见 `draw_segmented`）——重组后「无」这个选项译文在风格主题与背景
     /// 效果里各有一份，译文键互相覆盖，测到哪一份纯看注册顺序。探针改
     /// 用「文字」卡里相邻的两行（字体缩放 → 图片缩略图）：同卡相邻，
@@ -6640,7 +6639,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
 
     // ------------------------------------------------------------------
-    // 主题：强调色 / 二级主题 / 令牌覆盖（2026-10-18）
+    // 主题：强调色 / 二级主题 / 令牌覆盖
     // ------------------------------------------------------------------
 
     /// 点预设色板 ⇒ 推出 `SetAccent(Some(该色 HSV))`。
@@ -6717,8 +6716,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.settings_frame();
         assert!(settings_hit(&h, "paper_tint").width() > 0.0);
         assert!(settings_hit(&h, "paper_texture").width() > 0.0);
-        // 星空有六个旋钮（2026-10-19：随机化 / 闪烁 / 大小 / 光标互动
-        // 先后加入）——新增旋钮只靠 core 的 knobs() 表驱动，这里守住
+        // 星空有六个旋钮（随机化 / 闪烁 / 大小 / 光标互动）——新增旋钮只靠 core 的 knobs() 表驱动，这里守住
         // 「表里登记的都真的画出了热区」。
         h.svc.state.config.ui.secondary_theme =
             modular_clipboard_core::config::SecondaryTheme::Purple;
@@ -6793,7 +6791,6 @@ fn with_pinned(mut self, n: usize) -> Self {
 
 
     /// 令牌行高必须在**任意 font_scale** 下都装得下字形与滑条
-    /// （2026-10-19 用户实机反馈「文字向上且渲染不完整」的守门）。
     ///
     /// 根因：令牌行的 horizontal 三列里，左列格子曾写死 18pt——
     /// font_scale 调大后（滑条 cell = font_sm×1.07 涨过 18 ⇒ 左列被
@@ -6863,7 +6860,7 @@ fn with_pinned(mut self, n: usize) -> Self {
         h.state.settings_cat = SettingsCat::Appearance;
         h.svc.state.config.ui.theme_overrides.nums.insert("radius_md".into(), 12.0);
         h.settings_frame();
-        // 「全部重置」在**二级面板**里（2026-10-19）：先点入口行打开。
+        // 「全部重置」在**二级面板**里：先点入口行打开。
         let expand = settings_hit(&h, "token_expand");
         let _ops = h.settings_click_at(expand.center());
         h.settings_frame();
@@ -6905,7 +6902,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     /// MCP 覆盖层状态行：拆分两行后每行都必须在面板内缘放得下，
     /// 同时锁死「旧单行拼接放不下」——证明拆分不是空做。
     ///
-    /// 背景（用户反馈「文字渲染出界面」）：egui 的 Label 在**横向**
+    /// 背景（「文字渲染出界面」）：egui 的 Label 在**横向**
     /// 布局里默认 `TextWrapMode::Extend`——不换行也不截断，直接溢出
     /// 容器。最长的 detail（`Unconfigured`，约 25 个全角字）与标题挤
     /// 在同一行时实测 475pt > 面板内缘 448pt，文字画出面板。
@@ -6959,7 +6956,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     #[test]
     fn glass_strength_is_uniform_across_panels() {
-        // 2026-10-28：覆盖度曾经取自各面板自己的底色 alpha —— 行卡片是
+        // 覆盖度曾经取自各面板自己的底色 alpha —— 行卡片是
         // 「卡片不透明度」（默认 1.0），而顶栏/搜索/类型栏是
         // `with_backdrop_alpha` 算出的背景透明度（默认约 0.57）。
         // 同一屏里于是有两种强度的玻璃：chrome 的折射只有卡片六成，
@@ -6994,7 +6991,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     #[test]
     fn glass_overlay_evicts_rows_when_budget_is_full() {
-        // 覆盖范围回归（2026-10-27）：绘制顺序是「顶栏 → 行卡片 →
+        // 覆盖范围回归：绘制顺序是「顶栏 → 行卡片 →
         // 类型栏 → 搜索面板」，而行卡片数量随窗口高度增长。按 push 顺序
         // 截断时被丢掉的恰是**最后画的 chrome**（类型栏、搜索面板），
         // 于是高窗口里「第 20 行有玻璃、类型栏没有」。
@@ -7080,7 +7077,7 @@ fn with_pinned(mut self, n: usize) -> Self {
 
     /// 玻璃 pass 只覆盖主窗口，因此**只有主窗口**能省掉自己的底色。
     ///
-    /// # 这条守的是什么（2026-10-28「玻璃有概率不渲染」）
+    /// # 这条守的是什么
     ///
     /// 弹窗（搜索面板 / 类型过滤栏）是**独立 HWND**：`push_glass*` 的
     /// `hit_ns == Main` 闸门会拦下它们，主窗口玻璃 pass 铺的底图也到不了

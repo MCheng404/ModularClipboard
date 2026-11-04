@@ -213,7 +213,7 @@ pub fn peek_f32(ctx: &Context, id: Id) -> Option<f32> {
 /// CAUTION: `to_array()` 返回的是**预乘**分量（[`Color32`] 内部按预乘
 /// alpha 存储），补间后必须用 `from_rgba_premultiplied` 重组——用
 /// `from_rgba_unmultiplied` 会二次预乘，半透明色在补间途中整体发暗
-/// （2026-10-17 修，与 `paint::fade_color` 同一个坑）。
+/// （修，与 `paint::fade_color` 同一个坑）。
 pub fn tween_color(ctx: &Context, id: Id, target: Color32, dur: Duration) -> Color32 {
     let [r, g, b, a] = target.to_array();
     let r = tween_f32(ctx, id.with("r"), r as f32, dur, Ease::OutCubic) as u8;

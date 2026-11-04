@@ -140,7 +140,7 @@ static MENU_HOST: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 /// `WM_CONTEXTMENU` 都被 `is_context_menu_event` 认作右键），
 /// 于是消息循环会收到两条 `WM_TRAY_MENU`。若照单全收，第二条会在
 /// 第一条的 `TrackPopupMenu` **模态循环里**被派发 → 嵌套再弹一个菜单
-/// → 用户看到「菜单出现一帧就被顶掉」（2026-10-13 用户实测）。
+/// → 用户看到「菜单出现一帧就被顶掉」。
 static MENU_SHOWING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -445,7 +445,7 @@ pub fn set_hotkey(slot: hotkey::Slot, spec: hotkey::HotkeySpec) -> bool {
 /// 产生 `WM_KEYDOWN`，而是直接送给注册窗口。于是用户在设置里点
 /// 「录制」后按下**当前正绑着的组合**（比如想把 Win+V 换掉，先按
 /// 一下 Win+V 确认）时，设置窗口永远收不到这个按键——录制像卡死，
-/// 用户反馈就是「录制有问题」。
+/// 就是「录制有问题」。
 ///
 /// 恢复**不在本函数里做**：托盘线程不持有配置，「原来绑的什么」
 /// 只有调用方知道。恢复 = 按当前配置逐槽位调 [`set_hotkey`]。

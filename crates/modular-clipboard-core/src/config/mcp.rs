@@ -47,7 +47,7 @@ pub struct McpConfig {
     pub port: u16,
     /// 访问密钥（默认空 = 无需认证）。
     pub token: String,
-    // ---- 可调用能力（默认全部开启）----
+    // ---- 可调用能力（默认全部开启） ----
     /// 调节任意窗口的尺寸与位置。
     pub resize_window: bool,
     /// 读取界面元素的几何与层级信息。

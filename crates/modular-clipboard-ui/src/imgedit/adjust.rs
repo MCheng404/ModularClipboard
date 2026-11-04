@@ -23,7 +23,7 @@ pub const GAMMA_RANGE: std::ops::RangeInclusive<f32> = 0.2..=3.0;
 /// 「保存」两处，散参数必然有一处漏传或传错顺序（`flip_h` / `flip_v`
 /// 同为 bool，编译器根本不拦）。
 ///
-/// # 各步骤的执行顺序（2026-10-22）
+/// # 各步骤的执行顺序
 ///
 /// ```text
 /// 旋转/翻转 → 调色（亮度/对比度/饱和度/色温/伽马） → 裁剪 → 笔画
@@ -196,10 +196,10 @@ pub fn apply_transforms(src: &[u8], w: u32, h: u32, t: &ImgTransform) -> Option<
     if flip_v {
         img = img.flipv();
     }
-    // ---- 2. 调色（合并一次遍历）----
+    // ---- 2. 调色（合并一次遍历） ----
     let mut out = img.to_rgba8();
     apply_color(out.as_mut(), t);
-    // ---- 3. 裁剪（在调色之后 ⇒ 用户拖的框就是他看到的范围）----
+    // ---- 3. 裁剪（在调色之后 ⇒ 用户拖的框就是他看到的范围） ----
     if let Some(c) = crop {
         let (nw, nh) = out.dimensions();
         let (x, y, cw, ch) = c.to_pixels(nw, nh)?;

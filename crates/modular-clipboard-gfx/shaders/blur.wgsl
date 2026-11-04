@@ -92,7 +92,7 @@ fn vs_fullscreen(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 fn fs_blur(in: VertexOutput) -> @location(0) vec4<f32> {
     // 高斯核：g(k) = exp(-k² / (2σ²))。常数项被归一化约掉，故省略。
     //
-    // # 2026-10-17 优化：相邻 tap 双线性合并（仅宽核）
+    // # 优化：相邻 tap 双线性合并（仅宽核）
     //
     // 朴素写法是「逐个 tap 采样」：2r+1 次纹理采样 + 2r+1 次 exp
     // （默认 r=8 ⇒ 17/17）。模糊 pass 是**内存带宽瓶颈**，采样次数

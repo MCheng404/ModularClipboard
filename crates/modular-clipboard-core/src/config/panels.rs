@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use crate::i18n::msg;
 
-/// 类型过滤栏配置（第三轮原型移植项）。
+/// 类型过滤栏配置。
 ///
 /// 停靠某侧时该侧让出 `size + RAIL_GAP` 的条带（见 ui 侧
 /// `paint::FloatLayout`），浮动按钮不压列表内容。
@@ -60,7 +60,7 @@ pub(super) fn default_notice_popup() -> bool {
     false
 }
 
-/// 悬浮搜索面板配置（第三轮原型移植项）。
+/// 悬浮搜索面板配置。
 ///
 /// 面板本体是一条搜索输入框（ historically 固定 30pt 高、贴在
 /// 主窗口上方通栏）。两个参数都收拢进来：停靠位置决定它从哪一侧

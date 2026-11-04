@@ -52,7 +52,7 @@ pub(super) fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Respons
 
 /// 热键录制覆盖层。
 ///
-/// 结构（用户定稿，2026-10-13）：**整窗只画它**——设置内容作为 GPU
+/// 结构：**整窗只画它**——设置内容作为 GPU
 /// 模糊的底（`draw_settings` 在调用前放分割标记），本面板保持清晰。
 /// 用户看不到设置界面，只看到居中的大圆角正方形：
 ///
@@ -74,7 +74,7 @@ pub(super) fn draw_mcp_info_btn(f: &mut Frame<'_>, ui: &mut Ui) -> egui::Respons
 /// # 交互模型
 ///
 /// 按下的组合**只显示不应用**；点击任意位置 = 确认并停止
-/// （用户要求「点击任意位置停止录制」）。没按过主键就点击 = 取消。
+/// （「点击任意位置停止录制」）。没按过主键就点击 = 取消。
 /// Esc 也可取消（在 `App::capture_recording` 里处理）。
 pub(super) fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     let pal = f.pal;
@@ -99,7 +99,7 @@ pub(super) fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
         .painter_at(area)
         .rect_filled(area, 0.0, fade_color(shade, k));
 
-    // ---- 第一个圆角正方形：外层面板（居中）----
+    // ---- 第一个圆角正方形：外层面板（居中） ----
     //
     // 用**正方形**而非横幅：录制是「看一眼、按一下、点一下」的
     // 短动作，正方形把内容聚在视觉中心，横幅会让键帽散成一行、
@@ -123,7 +123,7 @@ pub(super) fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     let p = f.ui.painter_at(panel);
     p.rect_filled(panel, pal.radius_lg, pal.surface);
 
-    // ---- 布局：统一垂直节奏 + 两行等宽（2026-10-22 用户要求「对称对齐」）----
+    // ---- 布局：统一垂直节奏 + 两行等宽 ----
     //
     // 早前标题带 `y + 10` 的基线补偿、三段间距各不相等（34 / 46+16 /
     // 72+18），肉眼看就是「一高一低」。现在每块等间距 `vgap` 排布，
@@ -156,7 +156,7 @@ pub(super) fn draw_recording_overlay(f: &mut Frame<'_>, area: Rect) {
     // ---- 修饰键行：4 键等宽、行居中 ----
     //
     // 修饰键状态：**已确定主键就保持已录制的组合**，否则取实时按下。
-    // 用户口径（2026-10-22）：「在已经输入键后，修饰键录制状态保持
+    // 用户口径：「在已经输入键后，修饰键录制状态保持
     // 直至输入键再次更新后」——录完 Ctrl+V 松手，Ctrl 必须继续亮着，
     // 否则界面上看不出刚录了什么。下一次输入主键会重写
     // `recording_combo`，键帽随之更新。
@@ -332,7 +332,7 @@ pub(super) fn settings_mcp_overlay(f: &mut Frame<'_>, area: Rect) {
     // CAUTION: 必须拆成**两行**。`McpConn::detail()` 最长约 25 个
     // 全角字，与「MCP 服务：xx」挤在同一行会超出面板右缘——egui 的
     // Label 在**横向**布局（`ui.horizontal`）里默认 `TextWrapMode::
-    // Extend`：不换行也不截断，直接溢出容器（用户反馈「文字渲染出
+    // Extend`：不换行也不截断，直接溢出容器（「文字渲染出
     // 界面」）。放到纵向布局下才默认 Wrap。第一行只放短状态，
     // 第二行放长说明。
     {
