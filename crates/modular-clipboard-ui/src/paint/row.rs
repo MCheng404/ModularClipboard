@@ -1123,16 +1123,21 @@ pub(super) fn load_image_bytes(svc: &mut Service, item: &ClipItem) -> anyhow::Re
 ///
 /// # 为什么至少要 2 张才并行
 ///
-/// 单张时开线程的代价（约几十微秒）与解码同量级，纯粹白烧；而列表
-/// 一屏滚进多张图片时，串行解码会把首帧拖出肉眼可见的卡顿。
+/// 单张时跨线程分发的代价与解码同量级，纯粹白烧；而列表一屏滚进多张
+/// 图片时，串行解码会把首帧拖出肉眼可见的卡顿。
+///
+/// # 线程从哪来
+///
+/// `core::parallel::Pool::global()`：进程级固定线程池，空闲时工作线程
+/// 睡在条件变量上。早前这里是每次调用 `std::thread::scope` 新建 N 个
+/// OS 线程——那笔创建/销毁开销在「一屏滚动多次」时会被反复付。
 pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
-    // 并行度上限：解码是 CPU 密集，超过核数只会互相抢占。
-    const MAX_PARALLEL: usize = 4;
-
-    // 一条待解码任务：`(缓存键, 载荷尺寸, 原始字节)`。
-    type Job = (crate::thumbnail::CacheKey, Option<(u32, u32)>, Vec<u8>);
+    // 一条待解码任务：`(载荷尺寸, 原始字节)`。缓存键另存一份——
+    // `parallel_map` 会吃掉 jobs，回填时还要靠键写缓存。
+    type Job = (Option<(u32, u32)>, Vec<u8>);
 
     // 1) 顺序准备：命中缓存直接跳过；否则读字节（含 DB/文件 IO）。
+    let mut keys: Vec<crate::thumbnail::CacheKey> = Vec::new();
     let mut jobs: Vec<Job> = Vec::new();
     for item in items {
         let key = crate::thumbnail::CacheKey::new(item.id, item.hash.clone());
@@ -1147,7 +1152,10 @@ pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
             .and_then(|p| p.dims)
             .filter(|(w, h)| *w > 0 && *h > 0);
         match load_image_bytes(f.svc, item) {
-            Ok(bytes) => jobs.push((key, dims, bytes)),
+            Ok(bytes) => {
+                keys.push(key);
+                jobs.push((dims, bytes));
+            }
             Err(e) => tracing::debug!(id = item.id, %e, "预热缩略图：字节读取失败"),
         }
     }
@@ -1155,65 +1163,41 @@ pub(super) fn prefetch_thumbs(f: &mut Frame<'_>, items: &[&ClipItem]) {
         return;
     }
 
-    // 2) 并行解码：纯 CPU、无共享状态，结果按下标回填。
-    let mut decoded: Vec<Option<std::sync::Arc<crate::thumbnail::Thumbnail>>> =
-        vec![None; jobs.len()];
+    // 2) 并行解码：走**进程级线程池**（`core::parallel`），不是每次起一批
+    //    `std::thread::scope` 线程——后者每次调用都要创建/销毁 N 个 OS
+    //    线程（Windows 上每个几十微秒 + 1MB 栈），而池子的工作线程常驻、
+    //    空闲时睡在条件变量上。纯 CPU、无共享状态，结果按下标回填。
     let started = std::time::Instant::now();
-    let batch = jobs.len().div_ceil(MAX_PARALLEL.min(jobs.len()));
-    std::thread::scope(|s| {
-        let handles: Vec<_> = jobs
-            .chunks(batch)
-            .enumerate()
-            .map(|(ci, part)| {
-                s.spawn(move || {
-                    part.iter()
-                        .enumerate()
-                        .map(|(i, (_, dims, bytes))| {
-                            (
-                                ci * batch + i,
-                                crate::thumbnail::decode_auto(
-                                    bytes,
-                                    *dims,
-                                    crate::thumbnail::THUMB_MAX_EDGE,
-                                )
-                                .ok()
-                                .map(std::sync::Arc::new),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        for h in handles {
-            // 线程 panic 时放弃这一批（缩略图是可选的，不该杀死界面）。
-            if let Ok(rows) = h.join() {
-                for (i, t) in rows {
-                    if let Some(slot) = decoded.get_mut(i) {
-                        *slot = t;
-                    }
-                }
-            }
-        }
-    });
+    let decoded = modular_clipboard_core::parallel::Pool::global().parallel_map(
+        jobs,
+        |(dims, bytes)| {
+            crate::thumbnail::decode_auto(&bytes, dims, crate::thumbnail::THUMB_MAX_EDGE)
+                .ok()
+                .map(std::sync::Arc::new)
+        },
+    );
 
     // 3) 顺序回填：缓存（LRU + 字节预算的淘汰在 `insert` 里）+ 尺寸表。
     //
     // 尺寸必须在这里就记——文件型图片没有 `payload.dims`，行高只能靠
     // 解码得到的真实尺寸算。只写缓存不写尺寸的话，预热这一帧的图片行
     // 仍按「文本高度」排，下一帧才跳高（可见的抖动）。
-    let total = jobs.len();
+    //
+    // 外层 `None` = 该任务 panic（池子已隔离），内层 `None` = 解码失败。
+    let total = keys.len();
     let mut ok = 0usize;
-    for ((key, _, _), thumb) in jobs.into_iter().zip(decoded) {
-        if let Some(t) = thumb {
+    for (key, thumb) in keys.into_iter().zip(decoded) {
+        if let Some(Some(t)) = thumb {
             f.state.thumb_dims.insert(key.id, (t.width, t.height));
             f.state.thumb_cache.insert(key, t);
             ok += 1;
         }
     }
+    let pool = modular_clipboard_core::parallel::Pool::global();
     tracing::debug!(
         decoded = ok,
         total,
-        threads = total.div_ceil(batch),
+        threads = pool.threads(),
         ms = started.elapsed().as_secs_f32() * 1000.0,
         "并行预热缩略图完成"
     );

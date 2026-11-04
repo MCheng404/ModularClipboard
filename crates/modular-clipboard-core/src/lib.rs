@@ -3,6 +3,7 @@ pub mod i18n;
 pub mod event;
 pub mod item;
 pub mod media;
+pub mod parallel;
 
 pub use config::{
     ActionRule, CaptureConfig, Config, Hotkey, LayoutConfig, StorageConfig, UiConfig, WindowPos,
