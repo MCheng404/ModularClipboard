@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 
 use modular_clipboard_core::Config;
 
+mod hostlink;
+
 /// 命令行参数。
 struct Args {
     /// 数据目录，覆盖默认位置。
@@ -49,6 +51,8 @@ struct Args {
     ui: bool,
     /// 单进程模式：界面与后台同进程（旧行为，保留用于排查与回退）。
     single: bool,
+    /// 宿主联动子命令（早于实例锁与配置加载执行）。
+    host: Option<hostlink::HostCommand>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -62,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
         daemon: false,
         ui: false,
         single: false,
+        host: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -82,8 +87,19 @@ fn parse_args() -> Result<Args, String> {
                 show_message_box("模块化剪贴板 - 帮助", HELP_TEXT);
                 std::process::exit(0);
             }
-            other => return Err(format!("未知参数: {other}")),
+            other => match hostlink::HostCommand::parse(other) {
+                Some(cmd) => args.host = Some(cmd),
+                None => return Err(format!("未知参数: {other}")),
+            },
         }
+    }
+    // 宿主联动命令必须单独使用：它们要求「不碰实例锁、不读配置、不建托盘」，
+    // 与任何运行模式混用都会让「daemon 挂了也能自检」这条保证失效。
+    if args.host.is_some()
+        && (args.daemon || args.ui || args.single || args.mcp_server || args.mcp_http
+            || args.gpu_probe || args.version || args.no_capture || args.data_dir.is_some())
+    {
+        return Err("--host-* 不能与其它启动选项混用".into());
     }
     if args.daemon && args.ui {
         return Err("--daemon 与 --ui 不能同时使用".into());
@@ -112,8 +128,16 @@ const HELP_TEXT: &str = "ModularClipboard 剪贴板管理器
       --single             单进程模式（界面与后台同进程，排查用）
       --mcp-server         以 stdio 方式运行 MCP 服务
       --mcp-http           以 HTTP 方式运行 MCP 服务
+      --host-link          输出宿主联动清单（JSON）
+      --host-probe         自检并输出健康报告（JSON）
+      --host-publish       重新发布清单 / 快捷方式 / 注册表
+      --host-doctor        自检 + 自动修复 + 复检
+      --host-activate      唤起主窗口（常驻进程不在时拉起）
   -V, --version           显示版本
   -h, --help              显示帮助
+
+--host-* 的 JSON 同时写到 %APPDATA%/modular-clipboard/host-last.json，
+协议文档见项目 Wiki 的 HostLink-Protocol。
 
 默认（不带参数）会启动后台常驻进程并打开界面。";
 
@@ -200,6 +224,12 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // 宿主联动命令最优先：此时还没有实例锁、日志、配置、托盘，
+    // 所以「配置损坏 / daemon 崩溃 / 程序被搬到别的目录」都不影响自检。
+    if let Some(cmd) = args.host {
+        std::process::exit(hostlink::run(cmd));
+    }
 
     if args.version {
         // NOTE: GUI 子系统没有 stdout，`println!` 什么都不会显示。
@@ -382,6 +412,10 @@ fn run_daemon(args: Args, data_dir: Option<PathBuf>) {
         config = ?cfg_path,
         "ModularClipboard 常驻进程启动"
     );
+
+    // 每次常驻进程启动都刷新一次宿主清单：exe 可能在两次启动之间被搬走、
+    // 升级或换目录，清单里的路径必须由当前进程重新推导，不能沿用旧文件。
+    hostlink::publish_quiet();
 
     let start_ui = !args.daemon && !config.ui.start_minimized;
     if let Err(e) = modular_clipboard_app::daemon::run(config, data_dir.as_deref(), start_ui) {

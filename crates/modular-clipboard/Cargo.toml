@@ -20,12 +20,19 @@ modular-clipboard-ipc = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
+# 宿主联动清单：JSON 序列化 + exe 指纹（防止宿主读到被替换/搬走的旧程序）。
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 # 单实例保护用命名互斥体（见 main.rs 的 SingleInstanceGuard）。
 # 版本与 gfx/platform 一致（0.62），不引��� workspace 条目以免影响其他 crate。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    # hostlink：GUI 子系统没有 stdout，--host-* 的 JSON 要自己写标准句柄。
+    "Win32_System_Console",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     # `MessageBoxW`：GUI 子系统没有 stdout/stderr，
     # `--version` / `--help` / 启动失败只能靠它告知用户。
     "Win32_UI_WindowsAndMessaging",

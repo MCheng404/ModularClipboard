@@ -757,6 +757,8 @@ dependencies = [
  "modular-clipboard-ipc",
  "modular-clipboard-mcp",
  "modular-clipboard-ui",
+ "serde_json",
+ "sha2",
  "tracing",
  "tracing-subscriber",
  "windows",
