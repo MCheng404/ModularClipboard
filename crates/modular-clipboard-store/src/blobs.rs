@@ -40,10 +40,7 @@ fn is_safe_blob_name(file: &str) -> bool {
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
         "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
-    if DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d)) {
-        return false;
-    }
-    true
+    !DEVICES.iter().any(|d| stem.eq_ignore_ascii_case(d))
 }
 
 /// 把 DB 行里的 `blob_file` 收敛为「blobs 目录下的一个纯文件名」。
