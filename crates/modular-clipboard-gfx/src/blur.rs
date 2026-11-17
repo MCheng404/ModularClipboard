@@ -632,8 +632,8 @@ impl BlurPipeline {
                 sets.len()
             );
             // 升采样第 i 级的源是 mips[i]，tent 步长按**源**纹素算。
-            for i in 0..n {
-                let src = chain.mips[i].extent;
+            for src_mip in chain.mips.iter().take(n) {
+                let src = src_mip.extent;
                 let mut u = Buffer::new_host_visible(
                     gpu,
                     std::mem::size_of::<BlurUniforms>() as vk::DeviceSize,

@@ -77,12 +77,12 @@ pub fn find_memory_type(
     let count = (props.memory_type_count as usize).min(props.memory_types.len());
     let mut fallback = None;
 
-    for i in 0..count {
+    for (i, mt) in props.memory_types.iter().enumerate().take(count) {
         // 资源的 memory_type_bits 第 i 位为 0 表示不兼容该类型。
         if type_mask & (1 << i) == 0 {
             continue;
         }
-        let flags = props.memory_types[i].property_flags;
+        let flags = mt.property_flags;
         if !flags.contains(required) {
             continue;
         }
