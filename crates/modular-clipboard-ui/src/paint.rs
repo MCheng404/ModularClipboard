@@ -2699,7 +2699,8 @@ fn with_pinned(mut self, n: usize) -> Self {
         );
     }
 
-    /// 行高测量宽度必须与绘制宽度同源：都让出滚动条占位与呼吸空间。
+    /// Row measurement width must match rendering: reserve the scrollbar lane
+    /// when the bar is enabled, and use the full width when it is hidden.
     ///
     /// 回归守卫（L3）：测量早前用 `content.width()`，而绘制侧在「可
     /// 滚动」时把行矩形内缩 [`SCROLLBAR_RESERVE`] + [`SCROLLBAR_GAP`]
@@ -2709,7 +2710,7 @@ fn with_pinned(mut self, n: usize) -> Self {
     #[test]
     fn row_measure_width_reserves_scrollbar_like_rendering() {
         let content_w = 500.0;
-        let measured = row_measure_width(content_w);
+        let measured = row_measure_width(content_w, true);
         assert!(
             measured < content_w,
             "测量宽度必须让出滚动条占位与呼吸空间，否则测量比绘制宽"
@@ -2718,11 +2719,17 @@ fn with_pinned(mut self, n: usize) -> Self {
             (measured - (content_w - SCROLLBAR_RESERVE - SCROLLBAR_GAP)).abs() < 1e-4,
             "让出的量必须恰好等于 SCROLLBAR_RESERVE + SCROLLBAR_GAP（绘制侧同值）"
         );
+        assert_eq!(
+            row_measure_width(content_w, false),
+            content_w,
+            "隐藏滚动条时不得让位"
+        );
         // 单调性：内容越宽，测量宽度单调递增——这是「不会来回抖」的
         // 基础（行高随宽度单调不减 ⇒ 滚动条不会在两帧之间闪）。
-        assert!(row_measure_width(600.0) > row_measure_width(400.0));
+        assert!(row_measure_width(600.0, true) > row_measure_width(400.0, true));
         // 极窄内容区不得为负（否则 `preview_full_width` 拿到负宽度）。
-        assert!(row_measure_width(0.0) >= 20.0);
+        assert!(row_measure_width(0.0, true) >= 20.0);
+        assert!(row_measure_width(0.0, false) >= 20.0);
     }
 
     /// 行高缓存键必须包含过滤维度，否则长度相同的两次过滤会误命中。

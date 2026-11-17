@@ -241,6 +241,8 @@ Config:
     ("How visible the background stars are", "背景星点的明显程度"),
     ("How visible the fibers and grain are", "纤维与噪点的明显程度"),
     ("Hue", "色相"),
+    ("Hide scrollbar", "隐藏滚动条"),
+    ("Hide the main window scrollbar; wheel and drag scrolling still work", "隐藏主窗口滚动条；滚轮和拖动滚动仍然可用"),
     ("Icon", "图标"),
     ("Icon size", "图标大小"),
     ("Icon, type and size at the card's corner: click to toggle, drag to reorder", "卡片右下角的图标、类型与大小：单击显隐，拖动排序"),

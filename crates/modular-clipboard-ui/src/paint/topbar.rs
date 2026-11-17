@@ -4,6 +4,7 @@
 //! 过滤栏虽然是弹窗，其绘制函数住在主窗口的 `Frame` 上，由
 //! `app.rs` 在弹窗自己的 Context 里调用。
 
+use egui::Color32;
 use egui::CornerRadius;
 use egui::Rect;
 use egui::Sense;
@@ -28,6 +29,36 @@ use super::shadow::card_shadow_layers;
 use super::shadow::fade_color;
 use super::shadow::lerp_color;
 use modular_clipboard_core::i18n::msg;
+
+/// Curved-glass rim for standalone popup panels.
+///
+/// The main glass pass cannot reach these windows, so the same thick-edge
+/// language is painted with two inward strokes: a soft shadow band and a
+/// thin lit line. Geometry and hit rects stay unchanged.
+fn paint_curved_rim(painter: &egui::Painter, r: Rect, radius: f32, dark: bool) {
+    let shadow = if dark {
+        Color32::from_black_alpha(70)
+    } else {
+        Color32::from_black_alpha(45)
+    };
+    let lit = if dark {
+        Color32::from_white_alpha(72)
+    } else {
+        Color32::from_white_alpha(90)
+    };
+    painter.rect_stroke(
+        r.shrink(1.0),
+        (radius - 1.0).max(0.0),
+        Stroke::new(3.0, shadow),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_stroke(
+        r.shrink(3.0),
+        (radius - 3.0).max(0.0),
+        Stroke::new(1.0, lit),
+        egui::StrokeKind::Inside,
+    );
+}
 
 // ---------------------------------------------------------------- 顶栏
 
@@ -389,6 +420,7 @@ pub fn draw_search_panel(f: &mut Frame<'_>, r: Rect) {
         Stroke::new(1.0, pal.border),
         egui::StrokeKind::Inside,
     );
+    paint_curved_rim(&painter, r, radius, pal.is_dark);
 
     // 文字直接从左边距起排（放大镜在顶栏，不重复画）。
     let pad = pal.space_sm;
@@ -776,6 +808,7 @@ pub fn draw_type_rail(f: &mut Frame<'_>, rail: Rect, kinds: &[modular_clipboard_
         Stroke::new(1.0, pal.border),
         egui::StrokeKind::Inside,
     );
+    paint_curved_rim(&painter, rail, radius, pal.is_dark);
     // 按钮组从面板内侧起排（跳过 padding）——横竖两个方向都只需把
     // 起点各挪一个 `RAIL_PAD`。
     let (mut x, mut y) = (rail.min.x + RAIL_PAD, rail.min.y + RAIL_PAD);

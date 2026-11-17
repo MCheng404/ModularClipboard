@@ -185,6 +185,7 @@ impl Default for UiConfig {
             image_inline: true,
             notice_popup: false,
             md_rendered: true,
+            hide_scrollbar: false,
             type_rail: TypeRailConfig::default(),
             search_panel: SearchPanelConfig::default(),
             browser_path: String::new(),

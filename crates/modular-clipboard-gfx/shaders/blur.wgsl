@@ -64,6 +64,23 @@ var<immediate> copy_pc: CopyOffset;
 @group(0) @binding(1) var blur_sampler: sampler;
 @group(0) @binding(2) var src: texture_2d<f32>;
 
+// Out-of-range taps are dropped, not clamped or mirrored. Clamping repeats the
+// border pixel at both passes and turns corners into flat colour patches.
+fn uv_inside(p: vec2<f32>) -> bool {
+    return p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0;
+}
+
+// Integer hash dither, +/-0.5 of one 8-bit step. The 1/4-resolution blur texture
+// is upscaled on screen, so quantising a smooth gradient would show banding.
+// The same wrapping ops are mirrored in blur.rs and verified by a test.
+fn blur_dither(x: u32, y: u32) -> f32 {
+    var h = x * 1664525u + y * 1013904223u;
+    h = (h ^ (h >> 16u)) * 2246822519u;
+    h = (h ^ (h >> 13u)) * 3266489917u;
+    h = h ^ (h >> 16u);
+    return f32((h >> 24u) & 255u) / 255.0 - 0.5;
+}
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -133,16 +150,17 @@ fn fs_blur(in: VertexOutput) -> @location(0) vec4<f32> {
     let r = i32(u.radius);
     let s = max(u.sigma, 0.5);
     let s2 = s * s;
+    let xy = vec2<u32>(in.clip_position.xy);
 
-    // 是否启用相邻合并。σ ≥ 2.5（r ≥ 8）才值得付那点边缘误差。
+    // Merge only when both endpoints of a pair are inside the source. A merged
+    // midpoint near an edge is not the average of two real texels, so it must
+    // fall back to per-tap filtering with out-of-range taps discarded.
     let merge = s >= 2.5;
 
-    // 中心 tap（k = 0）。
+    // The centre tap is always inside the source.
     var acc = textureSampleLevel(src, blur_sampler, in.uv, 0.0);
     var weight_sum = 1.0;
 
-    // 其余 tap 成对处理。合并时 i 每次前进 2（一对一次采样打 ± 两侧），
-    // 否则逐 tap 前进 1。
     var i = 1;
     loop {
         if (i > r) {
@@ -150,9 +168,12 @@ fn fs_blur(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         let fi = f32(i);
         let w = exp(-0.5 * fi * fi / s2);
-        if (merge && i + 1 <= r) {
-            // 成对：权重 = g(i) + g(i+1)，采样点取两纹素中点
-            // （i + 0.5），线性过滤器自动给出 50/50 平均。
+        let off1 = u.dir * fi;
+        let off2 = u.dir * (fi + 1.0);
+        let can_merge = merge && i + 1 <= r
+            && uv_inside(in.uv + off1) && uv_inside(in.uv + off2)
+            && uv_inside(in.uv - off1) && uv_inside(in.uv - off2);
+        if (can_merge) {
             let wm = w + exp(-0.5 * (fi + 1.0) * (fi + 1.0) / s2);
             let off = u.dir * (fi + 0.5);
             let t = textureSampleLevel(src, blur_sampler, in.uv + off, 0.0)
@@ -161,18 +182,26 @@ fn fs_blur(in: VertexOutput) -> @location(0) vec4<f32> {
             weight_sum = weight_sum + 2.0 * wm;
             i = i + 2;
         } else {
-            // 逐 tap（低强度档，或奇数半径多出来的最后一个）。
-            let off = u.dir * fi;
-            let t = textureSampleLevel(src, blur_sampler, in.uv + off, 0.0)
-                  + textureSampleLevel(src, blur_sampler, in.uv - off, 0.0);
-            acc = acc + t * w;
-            weight_sum = weight_sum + 2.0 * w;
+            let plus = in.uv + off1;
+            let minus = in.uv - off1;
+            if (uv_inside(plus)) {
+                acc = acc + textureSampleLevel(src, blur_sampler, plus, 0.0) * w;
+                weight_sum = weight_sum + w;
+            }
+            if (uv_inside(minus)) {
+                acc = acc + textureSampleLevel(src, blur_sampler, minus, 0.0) * w;
+                weight_sum = weight_sum + w;
+            }
             i = i + 1;
         }
     }
 
-    // 归一化放在着色器里：CPU 端不必逐权重归一，也不怕浮点累积误差。
-    return acc / weight_sum;
+    // Renormalise by the weights that actually contributed. Dither in 8-bit
+    // units before the UNORM write; the hardware round-to-nearest follows.
+    let avg = acc / max(weight_sum, 1e-5);
+    let d = blur_dither(xy.x, xy.y);
+    let rgb = clamp(avg.rgb * 255.0 + vec3<f32>(d), vec3<f32>(0.0), vec3<f32>(255.0)) / 255.0;
+    return vec4<f32>(rgb, avg.a);
 }
 
 @fragment

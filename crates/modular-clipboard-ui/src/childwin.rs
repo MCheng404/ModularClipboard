@@ -281,13 +281,13 @@ impl<'a> ChildWindows<'a> {
     }
 }
 
-impl<'a> Default for ChildWindows<'a> {
+impl Default for ChildWindows<'_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<'a> Drop for ChildWindows<'a> {
+impl Drop for ChildWindows<'_> {
     fn drop(&mut self) {
         // 元素是 `ChildWindow`，它自己的 `Drop` 会销毁表面；
         // `Window` 的 `Drop` 也会销毁窗口。不需要在这里再做任何事——
@@ -297,7 +297,7 @@ impl<'a> Drop for ChildWindows<'a> {
     }
 }
 
-impl<'a> Drop for ChildWindow<'a> {
+impl Drop for ChildWindow<'_> {
     fn drop(&mut self) {
         // 顺序很重要：
         // 先抽干本窗口残留的 posted 消息（hwnd 还有效——窗口销毁后

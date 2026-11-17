@@ -224,6 +224,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("How visible the background stars are", "背景の星の目立ち具合"),
     ("How visible the fibers and grain are", "繊維と粒子の目立ち具合"),
     ("Hue", "色相"),
+    ("Hide scrollbar", "スクロールバーを隠す"),
+    ("Hide the main window scrollbar; wheel and drag scrolling still work", "メインウィンドウのスクロールバーを隠します。ホイールとドラッグによるスクロールは有効です"),
     ("Icon", "アイコン"),
     ("Icon size", "アイコンサイズ"),
     ("Icon, type and size at the card's corner: click to toggle, drag to reorder", "カード右下のアイコン・種類・サイズ：クリックで表示切替、ドラッグで並べ替え"),

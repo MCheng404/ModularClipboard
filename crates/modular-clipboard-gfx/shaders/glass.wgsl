@@ -41,7 +41,7 @@
 // | `fresnel` | `glass::fresnel_edge` |
 // | `bevel_weight` | `glass::bevel_weight` |
 // | `specular`（内联） | `glass::specular_rim` |
-// | `luma` / `adapt_luma` | `glass::luminance` / `glass::luminosity_adapt` |
+// | `luma` / `soft_light_adapt` | `glass::luminance` / `glass::soft_light_adapt` |
 // | `frost_scale` / `frost_mix` | `glass::frost_scale` / `glass::frost_mix` |
 // | `dispersion_scale` | `glass::dispersion_scale` |
 // | `refract_f` / `raise_normal` | `glass::refract_f` / `glass::raise_normal` |
@@ -269,18 +269,17 @@ const CONTENT_FEATHER: f32 = 6.0;
 /// 取 0.55 而不是 1.0：模糊图已经丢掉高频，位移太大只会让画面整体漂移。
 const BLUR_REFRACT: f32 = 0.55;
 
-/// 亮底压暗的**上限**（相对亮度 1.0 处压暗多少）。
-///
-/// HIG Materials 对 clear 变体的规定：背景明亮时叠一层 **35% 不透明度
-/// 的暗色调光层**。玻璃变透之后，这是可读性唯一的保险。
-const LUMA_DIM_MAX: f32 = 0.35;
-/// 暗底提亮的**上限**（相对亮度 0.0 处提亮多少）。
-///
-/// 对应 Apple 玻璃的 exposure boost：暗底上玻璃要「透光」而不是发灰。
-/// 取 0.20 而不是与压暗对称的 0.35：提亮过多会把纯黑壁纸洗成中灰。
-const LUMA_LIFT_MAX: f32 = 0.20;
-/// 亮度自适应的目标中灰。
-const LUMA_TARGET: f32 = 0.5;
+// Soft-light strength around the neutral source (0.5). The captured desktop's
+// low-frequency luma drives the source, so bright regions dim and dark regions
+// lift without a theme flag. Mirrored in glass.rs.
+const SOFT_LIGHT_STRENGTH: f32 = 0.5;
+
+// Curved glass rim around frosted edges. Width and bend arrive in the uniform
+// in physical pixels so the look is DPI-independent; gains are fixed here.
+const CURVED_RIM_LIT_GAIN: f32 = 0.38;
+const CURVED_RIM_DARK_GAIN: f32 = 0.32;
+const CURVED_RIM_BLUR_MIX: f32 = 0.55;
+const OUTER_RIM_GAIN: f32 = 0.60;
 
 struct GlassUniforms {
     /// 卡片矩形，`xy = 中心`、`zw = 半尺寸`，单位是**目标像素**。
@@ -722,21 +721,61 @@ fn saturation(c: vec3<f32>) -> f32 {
     return clamp((hi - lo) / hi, 0.0, 1.0);
 }
 
-/// 亮度自适应：**非对称**地压缩底图亮度（三通道同比例 ⇒ 只动亮度、
-/// 不动色相）。与 `glass::luminosity_adapt` 一致，理由见那里。
-///
-/// 亮底线性压暗到 `1 - dim_max`、暗底线性提亮到 `1 + lift_max`。
-/// 对称式的 `1 + gain·(target − luma)` 对「白底 + 深色文字」压得不够，
-/// 而玻璃变透之后可读性全靠这一层。
-fn adapt_luma(c: vec3<f32>, dim_max: f32, lift_max: f32) -> vec3<f32> {
-    let l = luma(c);
-    var k = 1.0;
-    if (l > LUMA_TARGET) {
-        k = 1.0 - dim_max * (l - LUMA_TARGET) / max(1.0 - LUMA_TARGET, 1e-3);
-    } else {
-        k = 1.0 + lift_max * (LUMA_TARGET - l) / max(LUMA_TARGET, 1e-3);
+// W3C Compositing and Blending Level 1, soft-light. 0.5 is the neutral source.
+fn soft_light(cb: f32, cs: f32) -> f32 {
+    let b = clamp(cb, 0.0, 1.0);
+    let s = clamp(cs, 0.0, 1.0);
+    if (s <= 0.5) {
+        return b - (1.0 - 2.0 * s) * b * (1.0 - b);
     }
-    return c * max(k, 0.0);
+    let d = select(sqrt(b), ((16.0 * b - 12.0) * b + 4.0) * b, b <= 0.25);
+    return clamp(b + (2.0 * s - 1.0) * (d - b), 0.0, 1.0);
+}
+
+// Pull the source toward the opposite side of neutral: bright backdrops dim,
+// dark backdrops lift. The result is content-driven, not theme-driven.
+fn soft_light_source(field_luma: f32, strength: f32) -> f32 {
+    return clamp(0.5 + (0.5 - field_luma) * strength, 0.0, 1.0);
+}
+
+fn soft_light_adapt(rgb: vec3<f32>, field_luma: f32, strength: f32) -> vec3<f32> {
+    let cs = soft_light_source(field_luma, strength);
+    return vec3<f32>(
+        soft_light(rgb.r, cs),
+        soft_light(rgb.g, cs),
+        soft_light(rgb.b, cs),
+    );
+}
+
+// Smooth 1 at the outline, 0 deeper than `width` physical pixels.
+fn curved_rim_weight(de: f32, width: f32) -> f32 {
+    let t = clamp(1.0 - de / max(width, 0.001), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// Lit sides brighten, shadow sides darken. The rim is geometry-driven: `nxy`
+// is the outward edge normal, not a screen-space gradient.
+fn curved_rim_shade(nxy: vec2<f32>, gain: f32) -> f32 {
+    let lam = dot(normalize(nxy), LIGHT_DIR);
+    let lit = max(lam, 0.0) * CURVED_RIM_LIT_GAIN;
+    let dark = max(-lam, 0.0) * CURVED_RIM_DARK_GAIN;
+    return select(-dark, lit, lam >= 0.0) * gain;
+}
+
+// Blend displaced blur into the edge and apply the directional shade. The
+// blur sample is supplied by the caller because the UV bend differs between
+// card rims and the outer window rim.
+fn curved_rim(rgb: vec3<f32>, blur_rgb: vec3<f32>, nxy: vec2<f32>, de: f32, width: f32, gain: f32) -> vec3<f32> {
+    let w = curved_rim_weight(de, width);
+    if (w <= 0.0) {
+        return rgb;
+    }
+    let s = clamp(curved_rim_shade(nxy, gain), -0.95, 0.95) * w;
+    let base = mix(rgb, blur_rgb, CURVED_RIM_BLUR_MIX * w);
+    if (s >= 0.0) {
+        return clamp(base + (vec3<f32>(1.0) - base) * s, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+    return clamp(base * (1.0 + s), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // ---- 卡片底色混色（tint）：吸收 + 散射 ----------------------------
@@ -838,13 +877,32 @@ fn glass_tint(rgb: vec3<f32>, tint: vec3<f32>, a: f32) -> vec3<f32> {
 fn bg_layer(uv: vec2<f32>) -> vec4<f32> {
     let blurred = textureSampleLevel(blur_tex, glass_sampler, uv, 0.0);
     let sharp = textureSampleLevel(sharp_tex, glass_sampler, uv, 0.0);
-    // 亮度自适应同样作用在背景层上：它是整窗面积最大的一块，亮壁纸
-    // 下不压一档的话前景文字的对比度全靠 egui 那层半透明 `bg` 撑着。
-    let rgb = adapt_luma(
+    // The blurred capture is the low-frequency field. It drives soft-light on
+    // the background layer, which is the largest area of the window.
+    var rgb = soft_light_adapt(
         mix(sharp.rgb, blurred.rgb, BG_FROST),
-        LUMA_DIM_MAX,
-        LUMA_LIFT_MAX,
+        luma(blurred.rgb),
+        SOFT_LIGHT_STRENGTH,
     );
+
+    // Outer window rim: same curved-blur language as the card rims, driven by
+    // the window outline instead of a GlassRect. Width/bend are in physical
+    // pixels from the uniform; the radius follows window size so DPI is safe.
+    let rim_width = select(0.0, u.radii[0].y, u.radii[0].w > 0.5);
+    if (rim_width > 0.0) {
+        let pixel = uv * u.size;
+        let half = u.size * 0.5;
+        let radius = min(half.x, half.y) * 0.24;
+        let sn = sdf_rr_n(pixel - half, half, radius);
+        let de = dist_edge(pixel - half, half, sn.d);
+        let w = curved_rim_weight(de, rim_width);
+        if (w > 0.0) {
+            let inv = vec2<f32>(1.0) / max(u.size, vec2<f32>(1.0));
+            let off = -normalize(sn.n) * (u.radii[0].z * w) * inv;
+            let rim_blur = textureSampleLevel(blur_tex, glass_sampler, uv + off, 0.0).rgb;
+            rgb = curved_rim(rgb, rim_blur, sn.n, de, rim_width, OUTER_RIM_GAIN);
+        }
+    }
     // CAUTION: 背景层的 alpha **不能**取 `blurred.a`（恒为 1）。那会把
     // 整个窗口铺成不透明底图，真实桌面一点都透不出来——用户报的
     // 「alpha 异常、渲染不出透明」就是这一处。
@@ -972,12 +1030,12 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         ).rgb;
         var rgb = mix(sharp_rgb, blur_rgb, frost);
 
-        // ---- 亮度自适应（Apple regular 变体） ----
+        // ---- Content-driven soft-light ----
         //
-        // 亮底压暗、暗底提亮：卡片上的前景文字对比度不随壁纸/桌面内容
-        // 漂移。放在混合**之后**、高光**之前**——高光是光源的反光，
-        // 不该被底图的亮度修正吃掉。内容区按 `clear` 线性退回原色。
-        rgb = adapt_luma(rgb, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        // The blurred capture supplies the low-frequency field. Bright areas
+        // dim and dark areas lift, so text contrast does not drift with the
+        // wallpaper. Keep this after mixing and before highlights.
+        rgb = soft_light_adapt(rgb, luma(blur_rgb), SOFT_LIGHT_STRENGTH);
 
         // ---- 卡片底色（tint）：玻璃层自己合成 ----
         //
@@ -1022,6 +1080,22 @@ fn fs_glass(in: VertexOutput) -> @location(0) vec4<f32> {
         let hair = thin_line(de, BEVEL_HAIRLINE_AT, BEVEL_HAIRLINE_WIDTH) * BEVEL_HAIRLINE_GAIN;
         let contact = thin_line(de, 0.0, BEVEL_CONTACT_WIDTH) * BEVEL_CONTACT_GAIN;
         rgb = rgb * (1.0 - dark - contact) + SPEC_TINT * (lit + hair);
+
+        // ---- Curved blurred rim ----
+        //
+        // The same low-frequency blur texture is sampled with a normal-driven
+        // UV bend, strongest at the outline. This keeps the rim attached to
+        // the geometry while giving it the thick, curved-glass shading.
+        let rim_width = select(0.0, u.radii[0].y, u.radii[0].w > 0.5);
+        if (rim_width > 0.0) {
+            let rw = curved_rim_weight(de, rim_width);
+            if (rw > 0.0) {
+                let rim_off = -raised.nxy * (u.radii[0].z * rw) * inv_size;
+                let rim_uv = uv_src + base_px * (inv_size * BLUR_REFRACT) + rim_off;
+                let rim_blur = textureSampleLevel(blur_tex, glass_sampler, rim_uv, 0.0).rgb;
+                rgb = curved_rim(rgb, rim_blur, raised.nxy, de, rim_width, 1.0);
+            }
+        }
 
         // ---- 输出：必须**预乘** ----
         //

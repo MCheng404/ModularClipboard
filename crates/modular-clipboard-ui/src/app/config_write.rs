@@ -27,6 +27,7 @@ pub(super) fn set_bool_field(cfg: &mut modular_clipboard_core::Config, g: crate:
         // ---- 图片直显 / Markdown 渲染 ----
         (G::Ui, "image_inline") => cfg.ui.image_inline = v,
         (G::Ui, "md_rendered") => cfg.ui.md_rendered = v,
+        (G::Ui, "hide_scrollbar") => cfg.ui.hide_scrollbar = v,
         // 通知呈现：弹窗（true）/ 窗口内 toast（false）。
         (G::Ui, "notice_popup") => cfg.ui.notice_popup = v,
         // 元素不参与玻璃计算（卡片内容区退出磨砂/混色/亮度自适应）。

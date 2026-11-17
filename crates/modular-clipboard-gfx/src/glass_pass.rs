@@ -124,6 +124,9 @@ pub struct GlassUniforms {
     /// （且不报任何错）。
     ///
     /// 用 `vec4` 而不是 `f32`：uniform 数组元素步长必须是 16 的倍数。
+    ///
+    /// `radii[0].yzw` carry the global curved-rim width/bend/enable in
+    /// physical pixels (see [`GlassParams::uniform`]).
     pub radii: [[f32; 4]; MAX_GLASS_CARDS],
     /// 目标图的像素尺寸 `(w, h)`（uv → 像素用）。
     pub size: [f32; 2],
@@ -495,6 +498,12 @@ impl GlassParams {
             // 压成 0（见字段文档）。
             u.radii[i] = [g.radius * ppp, 0.0, 0.0, 0.0];
         }
+        // Global curved-rim controls reuse the unused y/z/w lanes of the first
+        // radius slot. This keeps GlassUniforms at 1568 bytes: adding a real
+        // field would round naga's struct up to 1584.
+        u.radii[0][1] = crate::glass::CURVED_RIM_WIDTH_PT * ppp;
+        u.radii[0][2] = crate::glass::CURVED_RIM_BEND_PT * ppp;
+        u.radii[0][3] = 1.0;
         u.count = n as u32;
         u
     }
@@ -580,6 +589,24 @@ mod tests {
         assert_eq!(std::mem::size_of::<GlassUniforms>(), 1568);
         // 16 的倍数：WGSL uniform 结构体的 size 必须是最大成员对齐的倍数。
         assert_eq!(std::mem::size_of::<GlassUniforms>() % 16, 0);
+    }
+
+    #[test]
+    fn curved_rim_controls_use_first_radius_padding() {
+        let params = GlassParams {
+            rects: vec![GlassRect::new(
+                Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 40.0)),
+                0.0,
+                egui::Color32::from_rgb(0x10, 0x12, 0x15),
+                1.0,
+            )],
+            ..GlassParams::default()
+        };
+        let u = params.uniform(2.0, vk::Extent2D { width: 800, height: 600 });
+        assert_eq!(u.radii[0][0], 0.0, "topbar radius must stay in x");
+        assert!((u.radii[0][1] - crate::glass::CURVED_RIM_WIDTH_PT * 2.0).abs() < 1e-6);
+        assert!((u.radii[0][2] - crate::glass::CURVED_RIM_BEND_PT * 2.0).abs() < 1e-6);
+        assert_eq!(u.radii[0][3], 1.0);
     }
 
     /// 每块面板的底色**互不串染**。

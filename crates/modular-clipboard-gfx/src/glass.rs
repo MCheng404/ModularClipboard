@@ -273,6 +273,9 @@ pub fn specular_rim(normal: [f32; 2], light: [f32; 2], shininess: f32) -> f32 {
 /// 读不出来；太小则只在极小角度上亮，亮棱会断成几段。
 pub const LIGHT_Z: f32 = 0.55;
 
+/// XY light direction for the curved rim. Mirrors `LIGHT_DIR` in `glass.wgsl`.
+pub const LIGHT_DIR_XY: [f32; 2] = [-0.6, -0.8];
+
 /// 受光侧亮棱的增益（乘在 `RIM_TINT` 上）。
 pub const BEVEL_LIT_GAIN: f32 = 1.0;
 
@@ -404,23 +407,28 @@ pub fn saturation(rgb: [f32; 3]) -> f32 {
     ((max - min) / max).clamp(0.0, 1.0)
 }
 
-/// 亮度自适应的目标中灰，见 [`luminosity_adapt`]。
-pub const LUMA_TARGET: f32 = 0.5;
+/// Soft-light strength around the neutral source (0.5). The captured
+/// desktop's low-frequency luma drives the source, so bright regions dim and
+/// dark regions lift without a theme flag. Mirrored in `glass.wgsl`.
+pub const SOFT_LIGHT_STRENGTH: f32 = 0.5;
 
-/// 亮底压暗的**上限**（相对亮度 1.0 处压暗多少）。
-///
-/// 取自 HIG Materials 对 clear 变体的规定：背景明亮时叠一层
-/// **35% 不透明度的暗色调光层**。这一档比「对称压缩」更狠，但它是
-/// 玻璃变透之后唯一的可读性保险——中心磨砂从 0.85 降到 0.5 之后，
-/// 白底壁纸上的深色文字全靠这一层撑住对比度。
-pub const LUMA_DIM_MAX: f32 = 0.35;
+/// Width of the curved glass rim around frosted edges, in logical points.
+pub const CURVED_RIM_WIDTH_PT: f32 = 9.0;
 
-/// 暗底提亮的**上限**（相对亮度 0.0 处提亮多少）。
-///
-/// 对应 Apple 玻璃的 exposure boost：暗底上玻璃要「透光」而不是发灰。
-/// 取 0.20 而不是与压暗对称的 0.35：提亮过多会把纯黑壁纸洗成中灰，
-/// 玻璃反而失去「透」的观感（暗色反而更该保持深）。
-pub const LUMA_LIFT_MAX: f32 = 0.20;
+/// Maximum UV bend of the blurred backdrop inside the rim, in logical points.
+pub const CURVED_RIM_BEND_PT: f32 = 13.0;
+
+/// Lit-side gain of the curved rim. Mirrored in `glass.wgsl`.
+pub const CURVED_RIM_LIT_GAIN: f32 = 0.38;
+
+/// Shadow-side gain of the curved rim. Mirrored in `glass.wgsl`.
+pub const CURVED_RIM_DARK_GAIN: f32 = 0.32;
+
+/// How much displaced blur is mixed into the rim. Mirrored in `glass.wgsl`.
+pub const CURVED_RIM_BLUR_MIX: f32 = 0.55;
+
+/// Outer window rim gain. Mirrored in `glass.wgsl`.
+pub const OUTER_RIM_GAIN: f32 = 0.60;
 
 /// 磨砂尺度的**相对系数**：以卡片短半轴为基准的倍数。
 ///
@@ -515,18 +523,17 @@ pub const BG_ALPHA_DEFAULT: f32 = 0.35;
 /// 那是**卡片**的语义，与背景层无关。
 pub const BG_FROST: f32 = 0.10;
 
-/// 窗口背景层的合成：清晰桌面为主 + [`BG_FROST`] 比例的柔化，再过
-/// 亮度自适应。
+/// Window background compositing: mostly sharp desktop + [`BG_FROST`] blur,
+/// then content-driven soft-light using the blurred capture as the field.
 ///
-/// 与 `glass.wgsl` 的 `fs_glass` 里 `out` 初值的计算逐行对应。
-/// 抽成函数是为了能单测「背景层到底有多透」——着色器里那几行没法测，
-/// 而「玻璃模式看起来就是磨砂」这种故障恰恰只能靠数值判据发现。
+/// Mirrors `bg_layer` in `glass.wgsl`. Kept as a pure function so the
+/// background transparency and tone behaviour can be tested without a GPU.
 pub fn background_glass(sharp: [f32; 3], blur: [f32; 3]) -> [f32; 3] {
     let mut mixed = [0.0; 3];
     for i in 0..3 {
         mixed[i] = sharp[i] + (blur[i] - sharp[i]) * BG_FROST;
     }
-    luminosity_adapt(mixed, LUMA_DIM_MAX, LUMA_LIFT_MAX)
+    soft_light_adapt(mixed, luminance(blur), SOFT_LIGHT_STRENGTH)
 }
 
 /// 磨砂爬升的曲线指数。
@@ -561,35 +568,81 @@ pub fn frost_mix(de: f32, half: [f32; 2]) -> f32 {
     x.powf(FROST_GAMMA) * FROST_MAX
 }
 
-/// 亮度自适应：**非对称**地压缩底图亮度。
+/// W3C Compositing and Blending Level 1, soft-light. `cs = 0.5` is neutral.
 ///
-/// HIG 写得很直接：regular 变体「blurs and **adjusts the luminosity of
-/// background content** to maintain legibility」；clear 变体在内容偏亮时
-/// 建议叠一层 35% 的暗色；visionOS 的 glass「limits the range of background
-/// color information so a window can continue to provide contrast」。
-///
-/// # 为什么不是对称的 `1 + gain·(target − luma)`
-///
-/// 对称式在 `gain = 0.18` 时只把纯白压 9%、纯黑提 9%——对「白底上的
-/// 深色文字」这种最常见也最糟的组合不够。而玻璃变透之后，可读性全靠
-/// 这一层。所以按 HIG 的两条指引分开定档：
-///
-/// - 亮底：线性压暗，`luma = 1` 时压到 `1 - dim_max`（默认 0.35）；
-/// - 暗底：线性提亮，`luma = 0` 时提到 `1 + lift_max`（默认 0.20）。
-///
-/// 三通道**同比例**缩放：只动亮度，不动色相与饱和（逐通道各自拉向
-/// 中灰会把颜色一起洗掉）。
-pub fn luminosity_adapt(rgb: [f32; 3], dim_max: f32, lift_max: f32) -> [f32; 3] {
-    let l = luminance(rgb);
-    let k = if l > LUMA_TARGET {
-        // 亮底：l 从 target → 1 时，系数从 1 线性降到 1 - dim_max。
-        1.0 - dim_max * (l - LUMA_TARGET) / (1.0 - LUMA_TARGET).max(1e-3)
+/// Mirrors `soft_light` in `glass.wgsl`. Both implementations must stay in
+/// sync; a one-sided change would make the CPU golden model useless.
+pub fn soft_light(cb: f32, cs: f32) -> f32 {
+    let cb = cb.clamp(0.0, 1.0);
+    let cs = cs.clamp(0.0, 1.0);
+    if cs <= 0.5 {
+        cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
     } else {
-        // 暗底：l 从 target → 0 时，系数从 1 线性升到 1 + lift_max。
-        1.0 + lift_max * (LUMA_TARGET - l) / LUMA_TARGET.max(1e-3)
+        let d = if cb <= 0.25 {
+            ((16.0 * cb - 12.0) * cb + 4.0) * cb
+        } else {
+            cb.sqrt()
+        };
+        (cb + (2.0 * cs - 1.0) * (d - cb)).clamp(0.0, 1.0)
     }
-    .max(0.0);
-    [rgb[0] * k, rgb[1] * k, rgb[2] * k]
+}
+
+/// Source colour derived from the captured field. Bright fields produce a
+/// source below neutral (dimming); dark fields produce one above it (lifting).
+pub fn soft_light_source(field_luma: f32, strength: f32) -> f32 {
+    (0.5 + (0.5 - field_luma) * strength).clamp(0.0, 1.0)
+}
+
+/// Apply content-driven soft-light to an RGB triplet without changing the
+/// tint hue: the source is scalar, derived from the blurred desktop luma.
+pub fn soft_light_adapt(rgb: [f32; 3], field_luma: f32, strength: f32) -> [f32; 3] {
+    let cs = soft_light_source(field_luma, strength);
+    [
+        soft_light(rgb[0], cs),
+        soft_light(rgb[1], cs),
+        soft_light(rgb[2], cs),
+    ]
+}
+
+/// Rim weight: 1 at the outline, 0 beyond `width` physical pixels.
+pub fn curved_rim_weight(de: f32, width: f32) -> f32 {
+    let t = (1.0 - de / width.max(0.001)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Directional rim shade from the outward edge normal.
+pub fn curved_rim_shade(nxy: [f32; 2], gain: f32) -> f32 {
+    let len = nxy[0].hypot(nxy[1]).max(1e-5);
+    let lam = (nxy[0] / len) * LIGHT_DIR_XY[0] + (nxy[1] / len) * LIGHT_DIR_XY[1];
+    let lit = lam.max(0.0) * CURVED_RIM_LIT_GAIN;
+    let dark = (-lam).max(0.0) * CURVED_RIM_DARK_GAIN;
+    (if lam >= 0.0 { lit } else { -dark }) * gain
+}
+
+/// Blend the displaced blur into the edge and apply the curved-glass shade.
+pub fn curved_rim(
+    rgb: [f32; 3],
+    blur_rgb: [f32; 3],
+    nxy: [f32; 2],
+    de: f32,
+    width: f32,
+    gain: f32,
+) -> [f32; 3] {
+    let w = curved_rim_weight(de, width);
+    if w <= 0.0 {
+        return rgb;
+    }
+    let s = curved_rim_shade(nxy, gain).clamp(-0.95, 0.95) * w;
+    let mut out = [0.0; 3];
+    for i in 0..3 {
+        let base = rgb[i] + (blur_rgb[i] - rgb[i]) * (CURVED_RIM_BLUR_MIX * w);
+        out[i] = if s >= 0.0 {
+            (base + (1.0 - base) * s).clamp(0.0, 1.0)
+        } else {
+            (base * (1.0 + s)).clamp(0.0, 1.0)
+        };
+    }
+    out
 }
 
 // ---- 卡片底色混色（tint）：吸收 + 散射 ------------------------------
@@ -1167,41 +1220,63 @@ mod tests {
     }
 
     #[test]
-    fn luminosity_adapt_compresses_toward_mid_grey() {
-        // 非对称压缩：亮底最多压 dim_max（HIG clear 变体的 35% 调光层），
-        // 暗底最多提 lift_max（Apple 的 exposure boost）。
-        let bright = luminosity_adapt([0.9, 0.9, 0.9], LUMA_DIM_MAX, LUMA_LIFT_MAX);
-        let dark = luminosity_adapt([0.1, 0.1, 0.1], LUMA_DIM_MAX, LUMA_LIFT_MAX);
-        assert!(bright[0] < 0.9, "亮底应被压暗，实际 {bright:?}");
-        assert!(dark[0] > 0.1, "暗底应被提亮，实际 {dark:?}");
-        // 纯白压到 1 - dim_max、纯黑提到 1 + lift_max（两端的定档）。
-        let white = luminosity_adapt([1.0, 1.0, 1.0], LUMA_DIM_MAX, LUMA_LIFT_MAX);
-        assert!(
-            (white[0] - (1.0 - LUMA_DIM_MAX)).abs() < 1e-5,
-            "纯白应压到 {}，实际 {}",
-            1.0 - LUMA_DIM_MAX,
-            white[0]
+    fn soft_light_adapt_is_neutral_and_content_driven() {
+        for cb in [0.0, 0.1, 0.25, 0.5, 0.8, 1.0] {
+            assert!((soft_light(cb, 0.5) - cb).abs() < 1e-6, "cb={cb}");
+        }
+
+        let rgb = [0.6, 0.6, 0.6];
+        let bright = soft_light_adapt(rgb, 0.9, SOFT_LIGHT_STRENGTH);
+        let dark = soft_light_adapt(rgb, 0.1, SOFT_LIGHT_STRENGTH);
+        assert!(bright[0] < rgb[0], "bright field must dim: {bright:?}");
+        assert!(dark[0] > rgb[0], "dark field must lift: {dark:?}");
+        assert_eq!(
+            soft_light_adapt(rgb, 0.5, SOFT_LIGHT_STRENGTH),
+            rgb,
+            "mid-grey field must stay neutral"
         );
-        let black = luminosity_adapt([0.0, 0.0, 0.0], LUMA_DIM_MAX, LUMA_LIFT_MAX);
-        assert!(black[0] == 0.0, "纯黑乘任何系数仍是 0：{black:?}");
-        // 关闭时恒等。
-        assert_eq!(luminosity_adapt([0.7, 0.2, 0.4], 0.0, 0.0), [0.7, 0.2, 0.4]);
-        // 只动亮度、不动色相：三通道同比例 ⇒ 比值不变。
-        let src = [0.8, 0.4, 0.2];
-        let out = luminosity_adapt(src, LUMA_DIM_MAX, LUMA_LIFT_MAX);
-        assert!(
-            ((out[0] / out[1]) - (src[0] / src[1])).abs() < 1e-5,
-            "色相必须保持：{src:?} -> {out:?}"
+        assert_eq!(
+            soft_light_adapt(rgb, 0.9, 0.0),
+            rgb,
+            "zero strength must stay neutral"
         );
-        // 已经落在中灰上的输入几乎不动。
-        let mid = luminosity_adapt([0.5, 0.5, 0.5], LUMA_DIM_MAX, LUMA_LIFT_MAX);
-        assert!((mid[0] - 0.5).abs() < 1e-6, "中灰不该被推动：{mid:?}");
-        // 极端输入不得产生负比例（dim_max > 1 是配置外的输入，也不能出负数）。
-        assert!(
-            luminosity_adapt([1.0, 1.0, 1.0], 1.0, 1.0)
-                .iter()
-                .all(|c| *c >= 0.0)
+
+        for field in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let out = soft_light_adapt([0.9, 0.5, 0.1], field, SOFT_LIGHT_STRENGTH);
+            assert!(out.iter().all(|c| (0.0..=1.0).contains(c)), "out={out:?}");
+        }
+    }
+
+    #[test]
+    fn curved_rim_weight_is_band_limited() {
+        assert_eq!(curved_rim_weight(0.0, CURVED_RIM_WIDTH_PT), 1.0);
+        assert_eq!(curved_rim_weight(CURVED_RIM_WIDTH_PT, CURVED_RIM_WIDTH_PT), 0.0);
+        assert_eq!(curved_rim_weight(CURVED_RIM_WIDTH_PT * 2.0, CURVED_RIM_WIDTH_PT), 0.0);
+    }
+
+    #[test]
+    fn curved_rim_is_directional_and_bounded() {
+        let lit = curved_rim_shade(LIGHT_DIR_XY, 1.0);
+        let dark = curved_rim_shade([-LIGHT_DIR_XY[0], -LIGHT_DIR_XY[1]], 1.0);
+        assert!(lit > 0.0, "lit normal must brighten: {lit}");
+        assert!(dark < 0.0, "shadow normal must darken: {dark}");
+        assert_eq!(curved_rim_shade([0.0, 0.0], 1.0), 0.0);
+
+        let base = [0.5, 0.5, 0.5];
+        let bright = curved_rim(base, base, LIGHT_DIR_XY, 0.0, CURVED_RIM_WIDTH_PT, 1.0);
+        let shaded = curved_rim(
+            base,
+            base,
+            [-LIGHT_DIR_XY[0], -LIGHT_DIR_XY[1]],
+            0.0,
+            CURVED_RIM_WIDTH_PT,
+            1.0,
         );
+        let deep = curved_rim(base, [0.9, 0.9, 0.9], LIGHT_DIR_XY, 99.0, CURVED_RIM_WIDTH_PT, 1.0);
+        assert!(bright[0] > base[0], "lit rim must brighten: {bright:?}");
+        assert!(shaded[0] < base[0], "shadow rim must darken: {shaded:?}");
+        assert_eq!(deep, base, "outside the band must stay untouched");
+        assert!(bright.iter().chain(shaded.iter()).all(|c| (0.0..=1.0).contains(c)));
     }
 
     #[test]
@@ -1348,9 +1423,11 @@ mod tests {
             ("SURFACE_TILT", SURFACE_TILT),
             ("EDGE_NXY", EDGE_NXY),
             ("EDGE_FACTOR", EDGE_FACTOR),
-            ("LUMA_TARGET", LUMA_TARGET),
-            ("LUMA_DIM_MAX", LUMA_DIM_MAX),
-            ("LUMA_LIFT_MAX", LUMA_LIFT_MAX),
+            ("SOFT_LIGHT_STRENGTH", SOFT_LIGHT_STRENGTH),
+            ("CURVED_RIM_LIT_GAIN", CURVED_RIM_LIT_GAIN),
+            ("CURVED_RIM_DARK_GAIN", CURVED_RIM_DARK_GAIN),
+            ("CURVED_RIM_BLUR_MIX", CURVED_RIM_BLUR_MIX),
+            ("OUTER_RIM_GAIN", OUTER_RIM_GAIN),
             ("FROST_RATIO", FROST_RATIO),
             ("FROST_SCALE_MIN", FROST_SCALE_MIN),
             ("FROST_SCALE_MAX", FROST_SCALE_MAX),
@@ -1392,6 +1469,10 @@ mod tests {
                 "glass.wgsl 的 {name}={got} 与 Rust 侧的 {want} 不一致"
             );
         }
+        assert!(
+            src.contains("const LIGHT_DIR: vec2<f32> = vec2<f32>(-0.6, -0.8);"),
+            "glass.wgsl 的 LIGHT_DIR 与 Rust 侧不一致"
+        );
     }
 
     /// 斜边受光必须**有方向**：迎光侧为正（亮棱）、背光侧为负（暗棱）、
@@ -1570,7 +1651,7 @@ mod tests {
         let sharp = [1.0_f32, 0.0, 0.0];
         let blur = [0.0_f32, 0.0, 0.0];
         let got = background_glass(sharp, blur);
-        let pure_sharp = luminosity_adapt(sharp, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        let pure_sharp = soft_light_adapt(sharp, luminance(sharp), SOFT_LIGHT_STRENGTH);
         assert!(
             got[0] > pure_sharp[0] * 0.75,
             "背景层清晰分量只剩 {:.0}%，玻璃背景会退回磨砂",
@@ -1580,14 +1661,14 @@ mod tests {
         let same = [0.4_f32, 0.45, 0.5];
         assert_eq!(
             background_glass(same, same),
-            luminosity_adapt(same, LUMA_DIM_MAX, LUMA_LIFT_MAX)
+            soft_light_adapt(same, luminance(same), SOFT_LIGHT_STRENGTH)
         );
         // 清晰图与模糊图不同时，结果必须**不等于**纯磨砂那一侧——
         // 否则就是又退回「整窗铺模糊底图」。
         let sharp = [0.90_f32, 0.10, 0.20];
         let blur = [0.10_f32, 0.90, 0.20];
         let got = background_glass(sharp, blur);
-        let pure_blur = luminosity_adapt(blur, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        let pure_blur = soft_light_adapt(blur, luminance(blur), SOFT_LIGHT_STRENGTH);
         assert!(
             got.iter()
                 .zip(pure_blur.iter())
@@ -1595,7 +1676,7 @@ mod tests {
             "背景层与纯磨砂结果相同，说明清晰分量没进来: {got:?}"
         );
         // 且应当明显偏向清晰那一侧。
-        let pure_sharp = luminosity_adapt(sharp, LUMA_DIM_MAX, LUMA_LIFT_MAX);
+        let pure_sharp = soft_light_adapt(sharp, luminance(sharp), SOFT_LIGHT_STRENGTH);
         let d_sharp: f32 = got.iter().zip(pure_sharp.iter()).map(|(a, b)| (a - b).abs()).sum();
         let d_blur: f32 = got.iter().zip(pure_blur.iter()).map(|(a, b)| (a - b).abs()).sum();
         assert!(

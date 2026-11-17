@@ -224,6 +224,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("How visible the background stars are", "背景星點的明顯程度"),
     ("How visible the fibers and grain are", "纖維與噪點的明顯程度"),
     ("Hue", "色相"),
+    ("Hide scrollbar", "隱藏捲軸"),
+    ("Hide the main window scrollbar; wheel and drag scrolling still work", "隱藏主視窗捲軸；滾輪與拖曳捲動仍可使用"),
     ("Icon", "圖示"),
     ("Icon size", "圖示大小"),
     ("Icon, type and size at the card's corner: click to toggle, drag to reorder", "卡片右下角的圖示、類型與大小：點擊顯示隱藏，拖曳排序"),

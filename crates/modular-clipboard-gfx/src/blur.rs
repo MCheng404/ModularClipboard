@@ -390,10 +390,10 @@ pub struct BlurPipeline {
     sampler: Sampler,
     /// **卷积**用的采样器（`MIRRORED_REPEAT`）。
     ///
-    /// 只有 `fs_blur` 用它：核宽决定了采样点会越界多少，越界处取镜像
-    /// 邻域才不会把边缘纹素重复计入（那等于把边缘朝外拉伸半个核宽）。
-    /// 降采样与合成的采样点是精确 uv，不该用镜像——尤其是合成带 UV
-    /// 位移时，镜像会让越界那一小条出现可辨识的翻转图案。
+    /// `fs_blur` now discards out-of-range taps and renormalises, so this
+    /// sampler only ever sees in-range coordinates; mirror and clamp are
+    /// equivalent. Downsample/composite keep `CLAMP_TO_EDGE` because their UV
+    /// offset can cross the border and mirroring would show a flipped strip.
     sampler_mirror: Sampler,
     /// 横向卷积的 uniform。
     uniform_h: Buffer,
@@ -585,10 +585,10 @@ impl BlurPipeline {
             view_of(&chain.blur_a),
             view_of(&chain.scene),
         ];
-        // 两趟卷积换镜像采样器：核把采样点推出边界时，镜像邻域让边缘
-        // 与内部的模糊强度一致（见 [`Sampler::new_linear_mirrored`]）。
-        // 降采样与合成保持钳到边缘——它们的越界只来自合成的 UV 位移，
-        // 那时「拉伸最后一列」比「翻出一小块镜像」更不惹眼。
+        // The convolution sampler only sees in-range taps: `fs_blur` drops
+        // out-of-range taps and renormalises, so mirror and clamp are equivalent
+        // here. Keep mirror for resource stability; the edge policy lives in the
+        // shader and is mirrored by the CPU golden model in tests.
         for i in [SET_BLUR_H, SET_BLUR_V] {
             sources[i].sampler = self.sampler_mirror.handle();
         }
@@ -1389,6 +1389,99 @@ mod tests {
             }
         }
         acc / sum
+    }
+
+    /// Golden model for the edge-aware path in `fs_blur`.
+    ///
+    /// Out-of-range taps are discarded and the remaining weights renormalised.
+    /// A merged pair is used only when both of its endpoints are in range.
+    fn edge_aware_blur(signal: &[f32], radius: u32, sigma: f32, center: usize) -> f32 {
+        let r = clamp_radius(radius) as i32;
+        let s = sigma.max(0.5);
+        let len = signal.len() as i32;
+        let at = |k: i32| -> Option<f32> {
+            let p = center as i32 + k;
+            (p >= 0 && p < len).then(|| signal[p as usize])
+        };
+
+        let mut acc = at(0).expect("centre tap must exist");
+        let mut sum = 1.0;
+        let merge = s >= MERGE_SIGMA;
+        let mut i = 1i32;
+        while i <= r {
+            let fi = i as f32;
+            let w1 = (-0.5 * fi * fi / (s * s)).exp();
+            let pair_inside = [i, i + 1, -i, -i - 1]
+                .iter()
+                .all(|&k| at(k).is_some());
+            if merge && i < r && pair_inside {
+                let wm = w1
+                    + (-0.5 * (fi + 1.0) * (fi + 1.0) / (s * s)).exp();
+                let pos = 0.5 * (at(i).unwrap() + at(i + 1).unwrap());
+                let neg = 0.5 * (at(-i).unwrap() + at(-i - 1).unwrap());
+                acc += wm * (pos + neg);
+                sum += 2.0 * wm;
+                i += 2;
+            } else {
+                if let Some(t) = at(i) {
+                    acc += t * w1;
+                    sum += w1;
+                }
+                if let Some(t) = at(-i) {
+                    acc += t * w1;
+                    sum += w1;
+                }
+                i += 1;
+            }
+        }
+        acc / sum
+    }
+
+    /// Mirrors `blur_dither` in `blur.wgsl`. Wrapping u32 ops keep the two
+    /// implementations bit-identical, so the golden model stays meaningful.
+    fn dither_offset(x: u32, y: u32) -> f32 {
+        let mut h = x
+            .wrapping_mul(1_664_525)
+            .wrapping_add(y.wrapping_mul(1_013_904_223));
+        h = (h ^ (h >> 16)).wrapping_mul(2_246_822_519);
+        h = (h ^ (h >> 13)).wrapping_mul(3_266_489_917);
+        h ^= h >> 16;
+        f32::from(((h >> 24) & 255) as u8) / 255.0 - 0.5
+    }
+
+    #[test]
+    fn edge_taps_are_dropped_and_renormalised() {
+        let row: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        // A very broad kernel makes every valid tap weight ~1, so the expected
+        // result is the plain average of the taps that remain in range.
+        let sigma = 1000.0;
+        let left = edge_aware_blur(&row, 2, sigma, 0);
+        let right = edge_aware_blur(&row, 2, sigma, row.len() - 1);
+        assert!((left - 1.0).abs() < 1e-3, "left edge got {left}");
+        assert!((right - 14.0).abs() < 1e-3, "right edge got {right}");
+    }
+
+    #[test]
+    fn dither_offset_stays_within_one_lsb() {
+        for y in 0..17 {
+            for x in 0..23 {
+                let d = dither_offset(x, y);
+                assert!((-0.5..=0.5).contains(&d), "dither {d} out of range");
+                assert_eq!(d, dither_offset(x, y), "dither must be deterministic");
+            }
+        }
+    }
+
+    #[test]
+    fn dither_matches_shader_literals() {
+        let src = include_str!("../shaders/blur.wgsl");
+        for lit in ["1664525u", "1013904223u", "2246822519u", "3266489917u"] {
+            assert!(
+                src.contains(lit),
+                "blur.wgsl is missing dither literal {lit}"
+            );
+        }
+        assert!(src.contains("f32((h >> 24u) & 255u) / 255.0 - 0.5;"));
     }
 
     #[test]

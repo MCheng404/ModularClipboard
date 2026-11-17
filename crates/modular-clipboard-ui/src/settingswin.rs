@@ -419,7 +419,7 @@ impl<'a> SettingsWindow<'a> {
     }
 }
 
-impl<'a> Drop for SettingsWindow<'a> {
+impl Drop for SettingsWindow<'_> {
     fn drop(&mut self) {
         // 顺序是硬性的（
         // 三个附属窗口同款）：

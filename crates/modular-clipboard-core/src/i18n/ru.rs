@@ -226,6 +226,8 @@ pub(super) static TABLE: &[(&str, &str)] = &[
     ("How visible the background stars are", "Насколько заметны фоновые звёзды"),
     ("How visible the fibers and grain are", "Насколько заметны волокна и зерно"),
     ("Hue", "Оттенок"),
+    ("Hide scrollbar", "Скрыть полосу прокрутки"),
+    ("Hide the main window scrollbar; wheel and drag scrolling still work", "Скрыть полосу прокрутки главного окна; прокрутка колесом и перетаскиванием остаётся доступной"),
     ("Icon", "Значок"),
     ("Icon size", "Размер значка"),
     ("Icon, type and size at the card's corner: click to toggle, drag to reorder", "Значок, тип и размер в углу карточки: клик — вкл/выкл, перетаскивание — порядок"),

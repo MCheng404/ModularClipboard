@@ -211,6 +211,7 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
     // `text_w`、`scale`——全部相同才复用，否则重算并换新缓存。
     let pal = f.pal;
     let scale = f.scale;
+    let hide_scrollbar = f.svc.state.config.ui.hide_scrollbar;
     // IMPORTANT: 必须用 `preview_full_width`——与 `draw_item_row` 共用同一个算式。
     // 宽度取内容区（左右已扣边距），保证测量与渲染一致。
     //
@@ -234,7 +235,7 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
     //
     // 单调性保证不会来回抖：让出 16pt 只会让行变高，`content_h` 只增
     // 不减，所以「本来可滚动 ⇒ 让出后仍可滚动」，滚动条不会闪。
-    let text_w = preview_full_width(row_measure_width(content.width()));
+    let text_w = preview_full_width(row_measure_width(content.width(), !hide_scrollbar));
     let version = f.svc.state.list_version;
     // 解码得到的尺寸数：图片行高的输入之一，进缓存的失效判据
     // （见 [`RowHeightCache::dims_known`]）。
@@ -350,6 +351,11 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
         // `line_scroll_speed = 40`，即 40pt/刻度 ≈ 1 行，太慢；
         // ×3 对齐 Windows 的「一个刻度滚 3 行」惯例。
         .wheel_scroll_multiplier(egui::vec2(1.0, 3.0))
+        .scroll_bar_visibility(if hide_scrollbar {
+            egui::scroll_area::ScrollBarVisibility::AlwaysHidden
+        } else {
+            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+        })
         .auto_shrink([false, false])
         .show(&mut list_ui, |ui| {
             // 内容高度决定滚动条比例，必须显式给出，否则 egui 按
@@ -436,7 +442,8 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
             //
             // 让出量 = 滚动条热区（`SCROLLBAR_RESERVE`）+ 呼吸空间
             // （`SCROLLBAR_GAP`）：滑块与卡片之间不再零距相贴
-            let row_w = if content_h > content.height() {
+            let scrollbar_visible = !hide_scrollbar && content_h > content.height();
+            let row_w = if scrollbar_visible {
                 content.width() - SCROLLBAR_RESERVE - SCROLLBAR_GAP
             } else {
                 content.width()
@@ -585,7 +592,14 @@ pub(super) fn draw_history_body(f: &mut Frame<'_>, body: Rect, only_pinned: Opti
                 if gap_bottom > gap_top && gap_segs < GAP_SEG_BUDGET {
                     f.state.drag_regions.push(Rect::from_min_max(
                         pos2(content.min.x, gap_top.max(content.min.y)),
-                        pos2(content.max.x - SCROLLBAR_RESERVE - SCROLLBAR_GAP, gap_bottom),
+                        pos2(
+                            if hide_scrollbar {
+                                content.max.x
+                            } else {
+                                content.max.x - SCROLLBAR_RESERVE - SCROLLBAR_GAP
+                            },
+                            gap_bottom,
+                        ),
                     ));
                     gap_segs += 1;
                 }
@@ -648,9 +662,10 @@ pub(super) fn preview_full_width(body_w: f32) -> f32 {
     (body_w - ROW_PAD_H * 2.0).max(20.0)
 }
 
-/// 行**测量**用的内容宽度：内容区宽度**无条件**让出滚动条占位与呼吸空间。
+/// Row measurement width. It reserves the scrollbar lane only when the
+/// scrollbar can be drawn; `hide_scrollbar` passes false.
 ///
-/// # 为什么必须让出，以及为什么无条件
+/// # Why the lane is reserved unconditionally when the bar is enabled
 ///
 /// 绘制侧的行矩形在「可滚动」时会内缩 [`SCROLLBAR_RESERVE`] +
 /// [`SCROLLBAR_GAP`]（见 `draw_history_body` 里的 `row_w`；不缩的话
@@ -670,8 +685,12 @@ pub(super) fn preview_full_width(body_w: f32) -> f32 {
 ///
 /// 且单调：让出只会让行变高，`content_h` 只增不减 ⇒ 滚动条不会在两
 /// 帧之间来回闪。
-pub(super) fn row_measure_width(content_w: f32) -> f32 {
-    (content_w - SCROLLBAR_RESERVE - SCROLLBAR_GAP).max(20.0)
+pub(super) fn row_measure_width(content_w: f32, reserve_scrollbar: bool) -> f32 {
+    if reserve_scrollbar {
+        (content_w - SCROLLBAR_RESERVE - SCROLLBAR_GAP).max(20.0)
+    } else {
+        content_w.max(20.0)
+    }
 }
 
 /// 行内**顶部一行**的高度：左侧「来源·时间」与右侧操作按钮取较高者。

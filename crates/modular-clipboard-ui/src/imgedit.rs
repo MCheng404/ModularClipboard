@@ -942,7 +942,7 @@ impl<'a> ImageEditor<'a> {
     }
 }
 
-impl<'a> Drop for ImageEditor<'a> {
+impl Drop for ImageEditor<'_> {
     fn drop(&mut self) {
         // 与 `Popup` / `ChildWindow` 同款三件事，顺序不能换：
         // 抽干残留 posted 消息 → 等 GPU 空闲 → 销毁表面。

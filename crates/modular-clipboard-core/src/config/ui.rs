@@ -268,6 +268,12 @@ pub struct UiConfig {
     /// 关闭后按等宽纯文本显示源码。
     #[serde(default = "default_true")]
     pub md_rendered: bool,
+    /// Hide the main window scrollbar while keeping wheel and drag scrolling.
+    ///
+    /// Default false preserves the existing layout. When enabled, row measuring
+    /// and rendering stop reserving `SCROLLBAR_RESERVE + SCROLLBAR_GAP`.
+    #[serde(default)]
+    pub hide_scrollbar: bool,
     /// 主窗口悬浮类型过滤栏（默认开、停靠右侧、32pt、仅显示已有类型）。
     ///
     /// 四个参数收拢成一个结构体而不是四个平铺字段：它们在设置界面

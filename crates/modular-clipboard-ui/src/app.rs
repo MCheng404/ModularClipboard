@@ -1844,6 +1844,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn hide_scrollbar_config_field_is_written() {
+        let mut cfg = modular_clipboard_core::Config::default();
+        assert!(!cfg.ui.hide_scrollbar, "default must keep the scrollbar");
+        set_bool_field(
+            &mut cfg,
+            crate::paint::ConfigGroup::Ui,
+            "hide_scrollbar",
+            true,
+        );
+        assert!(cfg.ui.hide_scrollbar, "settings toggle must persist");
+    }
+
     /// 数值字段的越界值必须被夹到合法区间。
     #[test]
     fn numeric_config_fields_are_clamped() {

@@ -946,6 +946,12 @@ pub(super) static SETTINGS_CARDS: &[SettingsCard] = &[
                 desc: msg("The content area goes fully clear - no backdrop at all, so text and icons float over real glass"),
                 kind: ItemKind::Bool(ConfigGroup::Ui, "glass_skip_content"),
             },
+            SettingsItem {
+                key: "ui.hide_scrollbar",
+                label: msg("Hide scrollbar"),
+                desc: msg("Hide the main window scrollbar; wheel and drag scrolling still work"),
+                kind: ItemKind::Bool(ConfigGroup::Ui, "hide_scrollbar"),
+            },
         ],
     },
     // 「行卡片」卡：每一条历史条目长什么样（从原外观卡拆出）。
@@ -1269,6 +1275,7 @@ pub(super) fn get_bool(cfg: &modular_clipboard_core::config::Config, g: ConfigGr
         // ---- 第三轮新增 ----
         (G::Ui, "image_inline") => cfg.ui.image_inline,
         (G::Ui, "md_rendered") => cfg.ui.md_rendered,
+        (G::Ui, "hide_scrollbar") => cfg.ui.hide_scrollbar,
         (G::Ui, "glass_skip_content") => cfg.ui.glass_skip_content,
         // NOTE: type_rail 的四个参数走 `Op::SetTypeRail` 整包替换
         // （ItemKind::TypeRail），这里不再按字段名分发。
