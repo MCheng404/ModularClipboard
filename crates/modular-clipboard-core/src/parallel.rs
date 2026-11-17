@@ -397,9 +397,11 @@ mod tests {
             assert_eq!(out.len(), 12);
         }
         assert_eq!(p.threads(), 3);
-        // 每轮 3 块（12 项 / 3 线程 ⇒ 每块 4 项）⇒ 共 15 块。
-        assert_eq!(p.stats().completed, 15, "任务块应全部完成");
         p.shutdown();
+        // 每轮 3 块（12 项 / 3 线程 ⇒ 每块 4 项）⇒ 共 15 块。
+        // A worker bumps `completed` after the task sends its result, so the
+        // counter is only exact once shutdown has joined every worker.
+        assert_eq!(p.stats().completed, 15, "任务块应全部完成");
     }
 
     /// 停机后队列里的任务也应跑完（不是丢弃）。
